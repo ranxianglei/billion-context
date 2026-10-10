@@ -147,14 +147,30 @@ export const DSH_CHECKPOINT_PREAMBLE_PREFIX =
 // missing ids are ordinary drift (edit/truncate), not a region replacement.
 export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
 
-/** True when any RESENT core message carries dsh checkpoint framing (preamble
+/** True when a resent core message carries dsh checkpoint framing (preamble
  *  at message start, or the open tag anywhere — the tag sits mid-message after
  *  preamble + blank line). Used by the prepare-openai detector (#2432) to tell
  *  a landed native compaction apart from ordinary history churn. Reads the
  *  core-flattened text first (BiliMessage/CoreMessage carry prose in `.text`),
- *  falling back to a raw wire content field for direct callers. */
-export function carriesDshLocalCompactionSummary(msgs: readonly { text?: unknown; content?: unknown }[]): boolean {
+ *  falling back to a raw wire content field for direct callers.
+ *
+ *  #2621 producer gate: a LANDED checkpoint is dsh-compaction-basic replacing
+ *  exactly one user/message with plain text, so only a role=user TEXT message
+ *  can carry real framing. Quotes from every other producer — assistant prose,
+ *  reasoning, tool results, tool-call arguments, bili's own compress summaries
+ *  echoed back in resent history — must NOT fire the detector: with the old
+ *  any-message scan, "history mentions the tag" + "ordinary fold drift" was
+ *  enough to rebase ACP state with no host compaction in sight, and the
+ *  longest sessions (lowest kept ratio) were the most exposed. The
+ *  contentType check is load-bearing on its own: anthropic-lane tool results
+ *  flatten to role=user with contentType "tool-result". A role-less or
+ *  non-user caller shape now reads false — the safe degradation direction
+ *  this file pins everywhere (a miss rides the #2432 unannounced-rewrite
+ *  archive path; a false positive resets live fold state). */
+export function carriesDshLocalCompactionSummary(msgs: readonly { text?: unknown; content?: unknown; role?: unknown; contentType?: unknown }[]): boolean {
     for (const m of msgs) {
+        if (m.role !== "user") continue;
+        if (m.contentType !== undefined && m.contentType !== "text") continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
         if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;

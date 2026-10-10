@@ -170,11 +170,26 @@ test("drift pin: dsh checkpoint framing bytes are versioned (#2432)", () => {
 
 test("unit: carriesDshLocalCompactionSummary matches framing, never ordinary prose", () => {
     assert.equal(carriesDshLocalCompactionSummary([]), false, "empty history");
-    assert.equal(carriesDshLocalCompactionSummary([{ text: "plain prose" }]), false);
-    assert.equal(carriesDshLocalCompactionSummary([{ text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag mid-message");
-    assert.equal(carriesDshLocalCompactionSummary([{ text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " of the conversation…" }]), true, "preamble at message start");
-    assert.equal(carriesDshLocalCompactionSummary([{ content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), true, "raw wire content fallback");
-    assert.equal(carriesDshLocalCompactionSummary([{ text: "compacted summary mentioned without tags" }]), false, "the WORD 'compacted' alone is not framing");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "plain prose" }]), false);
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag mid-message");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " of the conversation…" }]), true, "preamble at message start");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), true, "raw wire content fallback (user text)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "compacted summary mentioned without tags" }]), false, "the WORD 'compacted' alone is not framing");
+});
+
+test("unit #2621: only user TEXT messages can carry framing — quotes from any other producer read false", () => {
+    // Real-world carriers from the #2621 session: 19 assistant prose quotes,
+    // 9 tool-call args, 8 tool results (transcript reads), 0 user messages.
+    // Every one of them must read false, or ordinary fold drift + "someone
+    // talked about the marker" rebases ACP state with no host compaction.
+    const QUOTE = `the transcript literally contains ${DSH_CHECKPOINT_OPEN_TAG} at line 40`;
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "text", text: `checking: ${QUOTE}` }]), false, "assistant prose quoting the marker");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "reasoning", text: QUOTE }]), false, "assistant reasoning quoting the marker");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "tool-result", text: QUOTE }]), false, "tool result flattened to role=user (anthropic lane) quoting the marker");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "tool", contentType: "tool-result", text: QUOTE }]), false, "openai role=tool result quoting the marker");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "tool-call", text: QUOTE }]), false, "assistant tool-call args quoting the marker (bili's own compress echoes ride here)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "text", text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " that a colleague pasted for reference" }]), false, "preamble quoted by the assistant");
+    assert.equal(carriesDshLocalCompactionSummary([{ text: QUOTE }]), false, "role-less bare shape reads false (safe miss, #2621 direction)");
 });
 
 test("e2e #2432: dsh replaying [checkpoint, retained tail] rebases the ACP state instead of drifting forever", async () => {
@@ -286,6 +301,38 @@ test("negative #2432: decimated history WITHOUT checkpoint framing stays on the 
         await r.text();
         const s = getSession(conv)!;
         assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no rebase without the checkpoint framing (gap alone is ordinary churn)");
+    } finally {
+        await rig.close();
+    }
+});
+
+test("negative #2621: quoting the framing from a non-user message + fold drift does NOT rebase", async () => {
+    // The false positive as reported: dsh lane, active fold, resent history
+    // decimated by ordinary drift, and the ONLY framing hit is an assistant
+    // message quoting the marker (a transcript read / reasoning quote). Pre-fix
+    // this fired "dsh native compaction detected" and rebased 667 covered ids
+    // onto a compaction that never happened.
+    const rig = await startRig({ injectTool: true, injectNudge: false });
+    const conv = "dshc-openai-quote-fp";
+    try {
+        await seedAndFold(rig, conv);
+        const r = await fetch(chatUrl(rig), {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL,
+                messages: [
+                    { role: "assistant", content: `While debugging I read the transcript and saw ${DSH_CHECKPOINT_OPEN_TAG} in the log — quoting it here for reference, not a compaction.` },
+                    seedInput()[12],
+                    seedInput()[13],
+                ],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "quoting the marker from a non-user message never rebases (#2621)");
+        assert.ok(!conflictEventsOf(s).some((c) => c.kind === "native-compaction"), "no misattributed native-compaction conflict entry");
     } finally {
         await rig.close();
     }

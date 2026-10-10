@@ -13,6 +13,15 @@ jobs:
     name: real dsh headless profile lane vs deterministic fake upstream (zero tokens)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
     steps:
       - uses: actions/checkout@v4
 

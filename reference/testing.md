@@ -67,7 +67,33 @@ Rules:
   — an acp-kernel pin bump IS a pipeline change) plus manual dispatch for anything
   else. It needs repo secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`; a hosted
   runner cannot reach `127.0.0.1` upstreams, and events without secret access
-  (fork PRs) skip the run gracefully instead of failing.
+   (fork PRs) skip the run gracefully instead of failing.
+
+## CI: registry installs must be retry-protected (#2611)
+
+A transient runner↔registry blip (`ECONNRESET` / `network aborted`) during a
+setup-phase `npm i -g <cli>` or `npm ci` used to red an otherwise-green PR with
+no test code ever running (#2541 run 38032380794; rerun-failed-jobs turned it
+green on the same head). Root cause: npm's built-in fetch retry defaults to only
+2 tries. Every job that touches the npm registry therefore carries this
+job-level `env:` block — it raises the retry budget so a ~10s jitter rides out
+instead of aborting setup, and because it is job-level it covers EVERY registry
+op in the job (the global CLI install AND `npm ci`, plus any build-time fetch):
+
+```yaml
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
+```
+
+Bounded by design: worst case ~+2 min of backoff before a genuine sustained
+outage still fails fast (each job also carries its own `timeout-minutes`). Copy
+the block verbatim into any NEW e2e/setup lane that installs from the registry so
+the pattern never re-scatters unpinned. Deliberately NOT applied around
+`npm publish` (the artifact/release lanes): a publish is non-idempotent — if the
+first upload commits server-side but its response resets, a fetch-retry re-POSTs
+and can trip E409 / double-publish, which is worse than the original failure mode.
 
 ## E2E: Real-Image Billing Lane (`npm run test:e2e:image`)
 

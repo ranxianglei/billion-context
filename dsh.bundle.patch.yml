@@ -14,3 +14,19 @@
 - id: compaction-basic
   config:
     auto: false
+# #2605: DSH's default retry whitelist omits MALFORMED_RESPONSE, so one
+# sampling flake that breaks a tool-call argument JSON kills the whole turn
+# unretried. A patch replaces the targeted row's WHOLE config (no deep
+# merge), so each row restates every default code plus MALFORMED_RESPONSE —
+# dropping any default code silently removes its retries. Rows absent on a
+# given DSH version are skipped with a warning, never a boot failure.
+- id: llm-deepseek
+  config:
+    retryPolicy:
+      mode: normal
+      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]
+- id: llm-deepseek-account
+  config:
+    retryPolicy:
+      mode: normal
+      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]

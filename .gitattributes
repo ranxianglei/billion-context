@@ -2,3 +2,7 @@
 # Without this, Git-for-Windows' default autocrlf=true converts them to CRLF at
 # checkout and the byte-equal golden gates fail on every Windows CI run.
 tests/golden/wire-contract/*.json text eol=lf
+
+# #2631: same failure class for tests doing byte-exact multi-line includes
+# against this shipped bundle (Git-for-Windows checks it out CRLF otherwise).
+dsh.bundle.patch.yml text eol=lf

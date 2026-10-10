@@ -9,8 +9,14 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-06",
+    "updated": "2026-10-10",
     "releases": [
+      {
+        "version": "0.1.191",
+        "date": "2026-10-10",
+        "tier": "recommended",
+        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus ordinary fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
+      },
       {
         "version": "0.1.186",
         "date": "2026-10-06",

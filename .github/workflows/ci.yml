@@ -20,6 +20,17 @@ on:
   # (#772, #1744).
   workflow_dispatch: {}
 
+# Same-ref runs cancel superseded in-flight runs: a follow-up push to a
+# branch (bump -> merge master into a release branch, rapid PR pushes,
+# back-to-back master merges) no longer queues a full ~30-job matrix
+# behind its own predecessor. Groups are per workflow+ref, so different
+# branches and different workflows never cancel each other. Approved by
+# owner 2026-10-10 after the release-v0.1.191 CI queue piled up behind
+# same-ref reruns.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
