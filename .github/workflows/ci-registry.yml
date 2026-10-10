@@ -44,13 +44,13 @@ jobs:
         run: echo "BILI_E2E_REAL_BASELINE=$(npm view billion-context version)" >> "$GITHUB_ENV"
 
       - name: Run hermetic registry E2E
-        run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
+        run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts tests/e2e/e2e-lane-autorestart.test.ts
 
       - name: Collect E2E artifacts
         if: failure()
         run: |
           mkdir -p tmp/e2e-artifacts
-          for d in tmp/e2e-registry-* tmp/e2e-advisory-* tmp/e2e-npm-global-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+          for d in tmp/e2e-registry-* tmp/e2e-advisory-* tmp/e2e-lane-autorestart-* tmp/e2e-npm-global-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
 
       - uses: actions/upload-artifact@v4
         if: failure()
