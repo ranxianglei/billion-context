@@ -245,6 +245,17 @@ export function gcSettings(): GcSettings {
     };
 }
 
+// --- abuse audit lane (#2504; both switches default OFF) ---
+
+/** BILI_AUDIT_OFFLINE_ENABLED > audit.offline.enabled > false. Switch A of
+ *  the #2504 audit lane: metrics-only offline re-review of persisted session
+ *  files (boot scan + loopback admin readout). No alerts, no model calls. */
+export function auditOfflineEnabled(): boolean {
+    const envRaw = process.env.BILI_AUDIT_OFFLINE_ENABLED;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return loadConfigFile().audit?.offline?.enabled === true;
+}
+
 // --- updater (was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS env-only) ---
 
 /** BILI_UPDATE_REGISTRY > update.registry > undefined (caller applies normalizeRegistryBase). */

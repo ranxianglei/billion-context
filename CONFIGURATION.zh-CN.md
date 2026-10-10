@@ -154,6 +154,7 @@
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
 | `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
 | `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
+| `audit.offline.enabled` | boolean | false | BILI_AUDIT_OFFLINE_ENABLED | 滥用审计通道（#2504）开关 A：对已持久化会话文件做仅计数的离线复查。启动时扫描加 loopback 管理端点读取；只报计数——无告警、无模型调用、内容不离开 sessions 目录。 |
 
 **更新与公告**
 
@@ -866,6 +867,13 @@
 - **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
+
+### `audit` (#2504)
+
+- **Type:** `{ offline?: { enabled?: boolean } }`
+- **Default:** `{ offline: { enabled: false } }`
+- **Status:** ACTIVE（opt-in，默认 OFF）
+- **Description:** 运维侧对已持久化会话材料的滥用审计通道。开关 A（`offline.enabled`）在启动时对 sessions 目录执行一次 fire-and-forget 扫描，并在 loopback-only 管理端点 `GET /__bili/audit/offline` 提供仅计数报告（扫描完成前或开关关闭时返回 `202 pending`）。它读取与 SessionStore 持久化相同的文件——plain JSON / `BILIZSTD1` / `BILIENC1`，遵守 `BILI_ENCRYPTION_KEY` 与 `persist.zstd`——并报告文件/可读性计数、曾压缩 vs 从未压缩的会话、`blockContents` 中逐字保留的折叠原文 token、持久化尾快照 token、CCR 伴随存储 token。对话内容不会进入日志行或读取结果；无告警、无模型调用、无写入。覆盖模型：会话只要压缩过至少一次，其折叠范围就逐字保留在 `blockContents`；从未压缩的会话只保留有界的近期尾部（`persist.tailTokens`）。扫描失败降级为一条 warn 日志，从不延迟或破坏启动。
 
 ---
 
@@ -1598,6 +1606,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
+| `BILI_AUDIT_OFFLINE_ENABLED` | `audit.offline.enabled` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
@@ -1745,6 +1754,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_GC_MAX_TOKENS` | 清理资格的大小上限（token 数，默认 `1000000` = 1M，#1082 owner 拍板）。按**解码后**的上下文判断，绝不看文件字节数（加密/zstd 文件在盘上小得多）：记录了最近一次请求体 token 估算值（`rawInputTokens`，每轮记录）时以它为准；未记录的旧文件用 `stats.contextTokens`；伴随的内容存储占用（#1097：唯一内容经内核 CJK-aware `defaultCountTokens` 计数，与 `rawInputTokens` 同一估算器，#1180）叠加其上，防止小会话携带大存储钻过上限。仅适用于从未被压缩过的会话 —— 含折叠块的文件无论多大都保留，因为其摘要无法从重新发送中无损重建。 |
 | `BILI_SESSION_GC_INTERVAL_MS` | 后台清理扫描间隔（毫秒，默认 `3600000` = 1 小时）。启动时会先扫一次。 |
 | `BILI_ENCRYPTION_KEY` | 会话文件静态加密（#708），适用于部署在不可信节点的场景。密钥必须恰好 32 字节，hex（64 字符）或 base64；未设置 = 不加密的纯 JSON 文件（设 `BILI_PERSIST_ZSTD=1` 时为 `BILIZSTD1`——参见 `BILI_PERSIST_ZSTD`）。设置后：每个会话文件均以 `BILIENC1` 格式写入，即对 JSON 施加 AES-256-GCM 加密，JSON 仅在 `BILI_PERSIST_ZSTD=1` 时以 zstd 压缩（Node ≥ 22.15 使用 zstd，其余情况写入原始数据）——启用压缩还可将文件体积缩小约 5–10 倍。加密与压缩现为独立的配置项（#1080）。密钥只从该环境变量读取——永不落盘、永不进日志——请确保它不受同一文件系统上的其他进程触及。非法值会导致启动中止（快速失败，绝不静默明文运行）。用错误的密钥启动时，受影响的会话按损坏文件跳过（有日志，不崩溃）。丢失密钥将使已加密的会话永久不可读。对称加密为刻意设计（同一进程既加密又解密）。已有的未编码文件从不在启动时改写——在其下一次保存时自然加密（降级安全；参见 `BILI_PERSIST_ZSTD`）。威胁模型（#708，owner 确认）：防的是**离线/机械性**的文件获取——云厂商换盘、节点镜像漂移后的离线磁盘快照、磁盘镜像失窃、备份泄露、被云同步的状态目录——离线第三方拿不到密钥即无法读取内容。不防御对活节点有访问权的定向攻击者；那一档应把信任根移出 proxy（KMS / TEE / 机密虚拟机 + 强化权限体系），而不是在 proxy 本身想办法——到了那个程度暴露的远不止密钥，proxy 层不是该守的边界（`BILI_PERSIST=0` 可彻底关闭持久化）。用同一进程/环境中的第二把密钥对密钥做二次加密不增加任何安全性：所有离线失窃场景里攻击者缺的始终只有一个工件——你的非落盘秘密——无论它叫数据密钥还是包裹密钥；只有把包裹密钥放进不同信任域（KMS/TPM/TEE）才能提高门槛，而那属于上面的场景 2。 |
+| `BILI_AUDIT_OFFLINE_ENABLED` | 设 `1`/`true` 启用滥用审计通道（#2504）的**开关 A**：启动时对持久化 sessions 目录做仅计数的扫描。复用会话持久化的同一套读取栈（遵守 `BILI_ENCRYPTION_KEY` 与 `BILI_PERSIST_ZSTD`），只报计数——扫描/可读/不可读文件数、CCR 伴随存储、曾压缩 vs 从未压缩会话、逐字保留内容的 token 合计（`blockContents` 折叠原文 + 持久化消息尾部）。无告警、无模型调用、无内容外发、无任何写入；扫描只读，失败降级为一条 warn 日志——绝不影响启动。读取方式：扫描完成时的 info 日志行 + `GET /__bili/audit/offline`（与其他 `/__bili/` 路由同受 loopback/trusted-origin 门禁；首次扫描完成前返回 `202 {"status":"pending"}`）。覆盖范围按设计有限：压缩过的会话把折叠原文逐字保留在 `blockContents`，但从未压缩的会话只持久化最新 `persist.tailTokens` 尾部——所以它度量的是持久化保留了什么，而非代理经手过的每一个字节。文件孪生键：`audit.offline.enabled`；环境变量优先。默认 OFF。 |
 | `BILLION_CONTEXT_PROXY` | launcher 会导出它；客户端侧 bili 插件/扩展检测到后自禁用自身压缩（避免双重压缩）。 |
 | `BILLION_CONTEXT_PLUGIN` | 设 `0` 彻底关闭插件模式（恢复 wire 层工具注入）。 |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | 内部使用：launcher 把客户端自身配置里的逐模型上下文窗口（pi `models.json`、omp `models.yml`、opencode `models.<id>.limit`、codex `model_context_window`）以 JSON 传给自己拉起的代理，让 nudge 分母对自托管模型也用真实窗口。只有 launcher 会设置，无需用户配置。 |

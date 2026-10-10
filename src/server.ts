@@ -87,6 +87,7 @@ import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClien
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
+import { runAuditOfflineScan } from "./audit-offline.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
@@ -129,6 +130,7 @@ import { handleAdminRoute } from "./server/admin.js";
 import { handle } from "./server/handle.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import {
+    auditOfflineEnabled,
     clientErrorBackstopMs as knobClientErrorBackstopMs,
     countTokensPassthrough as knobCountTokensPassthrough,
     exposureLogIntervalMs as knobExposureLogIntervalMs,
@@ -423,6 +425,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             void gcSessionFiles().catch((err) => log("warn", `[gc] sweep failed: ${String(err)}`));
         }, gcCfg.intervalMs);
         gcTimer.unref?.();
+    }
+    // #2504 switch A: metrics-only audit scan over persisted session files —
+    // fire-and-forget (never delays boot), counts-only log line, default OFF.
+    if (auditOfflineEnabled()) {
+        runAuditOfflineScan();
     }
     // #405 (silent env knobs): the tunnel allowlist is security-relevant —
     // surface it at startup so a remote-client deployment shows WHY private

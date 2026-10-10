@@ -1707,6 +1707,15 @@ type FileConfig = {
         max?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
+    /** Abuse audit lane (#2504, owner-approved 2026-10-09). Operator-side
+     *  forensic lane over persisted session material; every switch defaults
+     *  OFF and nothing here ever alters request behavior (bypass-only). */
+    audit?: {
+        /** Switch A: metrics-only offline re-review of persisted session
+         *  files — boot scan + loopback admin readout (`GET /__bili/audit/offline`).
+         *  No alerts, no model calls, counts only. Env BILI_AUDIT_OFFLINE_ENABLED. */
+        offline?: { enabled?: boolean };
+    };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
      *  wire-history snapshot retained per plugin session for the public
      *  fork API — beyond the cap the session stops being forkable (409)
@@ -1785,6 +1794,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
+    // #2504 audit lane:
+    "audit",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

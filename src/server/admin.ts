@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
+import { getAuditOfflineReport } from "../audit-offline.js";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
@@ -149,6 +150,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
+    if (req.method === "GET" && req.url === "/__bili/audit/offline") return sendAuditOffline(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
@@ -588,6 +590,20 @@ function sendResignStatus(res: http.ServerResponse): void {
         pending: readPendingRefusals(),
         unresolved: Object.keys(unresolvedRefusals()),
     }, null, 2));
+}
+
+// #2504 switch A — counts-only readout for the offline audit lane. Inherits
+// every gate above (loopback + trusted origin + tunnel marker); content never
+// leaves the sessions dir — only token/file counts are reported here.
+function sendAuditOffline(res: http.ServerResponse): void {
+    const report = getAuditOfflineReport();
+    if (report === null) {
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "pending", note: "offline audit scan not completed yet for this process (audit.offline.enabled off, or scan still running)" }, null, 2));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(report, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {

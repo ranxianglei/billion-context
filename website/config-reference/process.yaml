@@ -211,3 +211,10 @@ entries:
     desc_zh: "提供给原生插件的 fork API 公共快照大小上限。"
     site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
     site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"
+  - key: audit.offline.enabled
+    type: boolean
+    default: "false"
+    env: BILI_AUDIT_OFFLINE_ENABLED
+    group: process
+    desc_en: "Switch A of the abuse-audit lane (#2504): metrics-only offline re-review of persisted session files. Boot scan plus loopback admin readout; counts only - no alerts, no model calls, no content leaves the sessions dir."
+    desc_zh: "滥用审计通道（#2504）开关 A：对已持久化会话文件做仅计数的离线复查。启动时扫描加 loopback 管理端点读取；只报计数——无告警、无模型调用、内容不离开 sessions 目录。"
