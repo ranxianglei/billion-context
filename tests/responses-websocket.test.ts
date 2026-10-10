@@ -512,12 +512,19 @@ test("Responses WS: tool argument fragments and completed arguments are byte-exa
  *  miss lines that are logically already emitted. Poll until every positive
  *  pattern has landed (bounded), then vet the settled snapshot against the
  *  negative pattern — the CI legs showed 1-2 random WS fault tests failing per
- *  run purely on this read race (#1968). */
+ *  run purely on this read race (#1968). ENOENT is part of the same race:
+ *  the first read can beat the server process's log-file creation, so it
+ *  polls too instead of throwing (observed on windows-22 CI). */
 async function readLogUntil(logPath: string, patterns: readonly RegExp[], notMatch?: RegExp, timeoutMs = 10000): Promise<string> {
     const deadline = Date.now() + timeoutMs;
     let log = "";
     for (;;) {
-        log = fs.readFileSync(logPath, "utf8");
+        try {
+            log = fs.readFileSync(logPath, "utf8");
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+            log = "";
+        }
         if (patterns.every(pattern => pattern.test(log))) break;
         if (Date.now() > deadline) {
             assert.ok(false, `timed out waiting for log patterns ${patterns.map(String).join(" ; ")}\n--- log tail ---\n${log.split("\n").slice(-40).join("\n")}`);
