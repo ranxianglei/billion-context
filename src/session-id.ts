@@ -214,20 +214,25 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
  *  - the plugin lane owns the identity (the winning conversation header is
  *    the bili-internal one, not a header the upstream could read itself);
  *  - the client sent no prompt_cache_key of its own (client value wins);
- *  - the destination is admin-configured (provider-rewritten route) or
- *    loopback — deliberate relay/local deployments. Strict direct APIs can
- *    400 unknown body params (#1403), so unrouted non-loopback forwards
- *    stay unstamped.
+ *  - the DESTINATION is loopback — a deliberate local relay deployment.
+ *    Strict direct APIs can 400 unknown body params (#1403), so any remote
+ *    forward stays unstamped.
+ *
+ * #2645 correction: this gate used to short-circuit to `true` whenever a URL
+ * had been embedded/rewritten (`route.rewrittenUrl`). The /bili/ tunnel and
+ * forward-proxy lanes set rewrittenUrl for the user's OWN remote destination
+ * too, so that leg stamped strict remote APIs (NVIDIA NIM answers 400 on
+ * `prompt_cache_key`) and broke every turn. rewrittenUrl always co-references
+ * route.upstream, so the destination origin is the only trustworthy signal —
+ * gate on IT being loopback, never on whether a URL was embedded.
  */
 export function shouldStampRelayAffinityPck(
     identityHeaderName: string | undefined,
     clientPck: unknown,
-    routeRewrittenUrl: string | undefined,
     upstreamOrigin: string,
 ): boolean {
     if (identityHeaderName !== "x-bili-plugin-conversation") return false;
     if (clientPck !== undefined) return false;
-    if (routeRewrittenUrl !== undefined) return true;
     try {
         const hostname = new URL(upstreamOrigin).hostname;
         // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1

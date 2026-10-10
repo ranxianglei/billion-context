@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import os from "node:os";
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
@@ -98,23 +99,26 @@ function chatBody(extra: Record<string, unknown> = {}): Record<string, unknown> 
     };
 }
 
-test("#2218 unit: shouldStampRelayAffinityPck gate matrix", () => {
+test("#2218/#2645 unit: shouldStampRelayAffinityPck gate matrix", () => {
     const loop = "http://127.0.0.1:7864/v1";
-    const remote = "https://relay.example.com/v1";
-    // plugin lane + no client pck + admin-rewritten route → stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, loop, remote), true);
-    // plugin lane + no client pck + loopback destination without a route → stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, loop), true);
-    // plugin lane + no client pck + unrouted non-loopback (strict direct API risk, #1403) → no stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, remote), false);
+    const localhost = "http://localhost:7864/v1";
+    const nvidia = "https://integrate.api.nvidia.com/v1/chat/completions";
+    // plugin lane + no client pck + loopback destination → stamp
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, loop), true);
+    // literal "localhost" counts as loopback (#2218)
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, localhost), true);
+    // plugin lane + no client pck + REMOTE destination (strict direct API, NVIDIA NIM #2645) → no stamp
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, nvidia), false);
+    // the tunnel / forward-proxy lane sets a full destination URL (path included) for the
+    // user's OWN remote host too — that must NOT flip the gate to stamp (#2645)
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://relay.example.com/v1"), false);
     // client's own prompt_cache_key always wins
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop, loop), false);
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop), false);
     // non-plugin identity sources (codex session-id header, plain clients) stay unstamped
-    assert.equal(shouldStampRelayAffinityPck("session-id", undefined, loop, loop), false);
-    assert.equal(shouldStampRelayAffinityPck(undefined, undefined, loop, loop), false);
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "http://localhost:7864/v1"), true);
+    assert.equal(shouldStampRelayAffinityPck("session-id", undefined, loop), false);
+    assert.equal(shouldStampRelayAffinityPck(undefined, undefined, loop), false);
     // unparseable origin is not a deliberate deployment → no stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "not-a-url"), false);
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, "not-a-url"), false);
 });
 
 test("#2218 regression: plain client body pck still forwards x-session-id + body pck", async () => {
@@ -213,5 +217,101 @@ test("#2218 regression: readable client conversation headers still suppress the 
         assert.equal(b.body.prompt_cache_key, undefined);
     } finally {
         await h.close();
+    }
+});
+
+// #2645 regression: a dsh plugin-lane request tunneled to a REMOTE (non-loopback)
+// destination must NOT carry a stamped prompt_cache_key — strict-schema upstreams
+// (NVIDIA NIM) answer 400 on the unknown field. The mock below enforces exactly
+// that schema, so the pre-fix behaviour reproduces as a real 400 rather than a
+// mere missing-field check.
+function nonLoopbackIPv4(): string | undefined {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+        for (const i of ifaces[name] ?? []) {
+            if (i.family === "IPv4" && !i.internal) return i.address;
+        }
+    }
+    return undefined;
+}
+
+test("#2645 regression: dsh plugin lane to a strict REMOTE upstream is not stamped (no 400)", async (t) => {
+    const destIp = nonLoopbackIPv4();
+    if (!destIp) { t.skip("no non-loopback IPv4 interface available in this environment"); return; }
+
+    const captured: Captured[] = [];
+    // Strict upstream: rejects the unknown param, mirroring NVIDIA NIM's
+    // `Validation: Unsupported parameter(s): prompt_cache_key` 400.
+    const strictUpstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            let body: Record<string, unknown> = {};
+            try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { /* keep {} */ }
+            captured.push({ headers: req.headers, body });
+            if ("prompt_cache_key" in body) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: "Validation: Unsupported parameter(s): `prompt_cache_key`", type: "Bad Request", code: 400 } }));
+                return;
+            }
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            res.end(chatSse());
+        });
+    });
+    await new Promise<void>((resolve) => strictUpstream.listen(0, "0.0.0.0", resolve));
+    const upstreamPort = (strictUpstream.address() as { port: number }).port;
+
+    _resetSessionsForTest();
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy: Server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {},
+        modelContextLimit: 100_000,
+        kernelConfig: defaultConfig(100_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        log: false,
+        sessionHeader: "x-acp-session",
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+    });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        // Tunnel to the machine's NON-loopback address: bili sees a remote
+        // destination (isLoopbackAddress=false) even though the socket lands on
+        // this same host — exactly the NVIDIA NIM shape from the issue.
+        const base = `http://127.0.0.1:${proxyPort}/bili/http://${destIp}:${upstreamPort}/v1/chat/completions`;
+        const r = await fetch(base, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "dsh-nvidia-1" },
+            body: JSON.stringify(chatBody()),
+        });
+        // Before the fix bili stamped prompt_cache_key → the strict upstream 400'd.
+        assert.equal(r.status, 200);
+        await r.text();
+        const [b] = captured;
+        assert.ok(b, "request reached the strict upstream");
+        assert.ok(!("prompt_cache_key" in b.body), "prompt_cache_key must NOT be stamped onto a remote destination");
+        // header relay still works (workbuddy hub / sub2api read x-session-id)
+        assert.equal(b.headers["x-session-id"], "dsh-nvidia-1");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        strictUpstream.close();
+        await once(strictUpstream, "close");
     }
 });

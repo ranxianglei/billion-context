@@ -333,13 +333,15 @@ export async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
-    // #2218: body-only relay affinity for plugin hosts. dsh desktop's only
-    // identity signal is the bili-internal x-bili-plugin-conversation header
-    // (already forwarded as x-session-id by buildForwardTarget); body-keyed
-    // relays (workbuddy panel) can't read headers, so stamp the conversation
-    // id into prompt_cache_key too. Gated to admin-rewritten or loopback
-    // destinations — strict direct APIs can 400 unknown body params (#1403).
-    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin)) {
+    // #2218/#2645: body-only relay affinity for plugin hosts. dsh desktop's
+    // only identity signal is the bili-internal x-bili-plugin-conversation
+    // header (already forwarded as x-session-id by buildForwardTarget);
+    // body-keyed relays (workbuddy panel) can't read headers, so stamp the
+    // conversation id into prompt_cache_key too. Gated to LOOPBACK
+    // destinations only — strict direct APIs can 400 unknown body params
+    // (#1403), and the /bili/ tunnel sets a route for the user's own REMOTE
+    // destination too (#2645), so "a URL was embedded" must NOT imply stamping.
+    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, upstreamOrigin)) {
         rebuilt.prompt_cache_key = session.id;
     }
     // OpenAI Chat Completions only emits a usage object in the final stream
