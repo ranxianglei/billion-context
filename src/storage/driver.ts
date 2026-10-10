@@ -1,9 +1,11 @@
 /**
  * Minimal SQLite driver seam for the unified storage layer (#2671).
  *
- * Primary engine: better-sqlite3 (synchronous, prebuilt binaries for the
- * platforms the proxy ships to — chosen in the #2671 design thread because
- * native builds must never become an install-time failure mode).
+ * Primary engine: better-sqlite3 (synchronous, prebuilt binaries where
+ * available) — an OPTIONAL dependency (#2671): native builds must never
+ * become an install-time failure mode (Windows runners without a VS
+ * toolchain, minimal containers). When the package is absent or broken,
+ * require() throws and the driver falls through to node:sqlite.
  * Fallback engine: node:sqlite (DatabaseSync, stable since Node 23.4) so
  * environments that cannot compile/download native modules still run.
  *

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
@@ -112,7 +113,20 @@ function runCase(engine: SqliteEngineName, name: string): void {
 
 const ENGINES: SqliteEngineName[] = ["better-sqlite3", "node:sqlite"];
 
-test("storage unified: corpus round-trip digests equal the legacy manifest (better-sqlite3)", () => {
+/** better-sqlite3 is an optional native dep — when its install was skipped
+ *  (Windows runners without a VS toolchain, minimal containers) the corpus
+ *  runs still cover node:sqlite, and the better-sqlite3 leg skips loudly. */
+function betterSqliteAvailable(): boolean {
+    const req = createRequire(import.meta.url);
+    try {
+        req("better-sqlite3");
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+test("storage unified: corpus round-trip digests equal the legacy manifest (better-sqlite3)", { skip: !betterSqliteAvailable() && "better-sqlite3 not installed (optional native dependency)" }, () => {
     for (const name of Object.keys(CASE_META)) runCase("better-sqlite3", name);
 });
 

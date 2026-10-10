@@ -56,7 +56,6 @@
     "url": "https://github.com/ranxianglei/billion-context/issues"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
     "zod": "4.1.8"
   },
   "devDependencies": {
@@ -116,6 +115,7 @@
     }
   },
   "optionalDependencies": {
+    "better-sqlite3": "^13.0.3",
     "sharp": "^0.35.4"
   }
 }
