@@ -186,8 +186,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | Stop injecting the acp_compress tool definition into requests. |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | Stop appending the compression doctrine to system prompts. |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | Forward /v1/messages/count_tokens to the upstream instead of answering locally. |
- | `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | ACP injection surface for compression: native tools (default) or legacy prompt markers. |
- | `diagnostics.forkStoreAudit` | boolean | false | BILI_FORK_STORE_AUDIT | Opt-in whole-CCR-store integrity audit on the snapshot/fork path (#2675): re-hashes every stored payload and cross-checks every index entry (orphan payloads, byte mismatches, alias inconsistencies anywhere in the store), failing closed on any inconsistency. Off by default — the hot path audits only the refs the snapshot uses, and content-addressing pins their bytes; enable for triage at O(store) cost. Read live per request. |
+| `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | ACP injection surface for compression: native tools (default) or legacy prompt markers. |
+| `diagnostics.forkStoreAudit` | boolean | false | BILI_FORK_STORE_AUDIT | Opt-in whole-CCR-store integrity audit on the snapshot/fork path (#2675): re-hashes every stored payload and cross-checks all index entries, failing closed on any mismatch. Off by default — the hot path only structurally audits the refs the snapshot uses; enable for O(store) troubleshooting depth. |
 | `fakeCompletion` | object | {} (all defaults) | — | Retry loop that re-requests when a final chunk arrives truncated. |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | How many times a truncated final completion may be re-requested; 0 disables the loop. |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | Buffer size cap for the retry loop's accumulated stream. |
@@ -1620,8 +1620,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
- | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
- | `BILI_FORK_STORE_AUDIT` | `diagnostics.forkStoreAudit` | false |
+| `BILI_FORK_ADOPTION` | `forkAdoption` | false |
+| `BILI_FORK_STORE_AUDIT` | `diagnostics.forkStoreAudit` | false |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |

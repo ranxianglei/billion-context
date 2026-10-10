@@ -187,7 +187,7 @@
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | 停止向系统提示词附加压缩教条文本。 |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | 把 /v1/messages/count_tokens 转发给上游，而不是本地应答。 |
 | `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | 压缩的 ACP 注入面：原生工具（默认）或旧版提示词标记。 |
-| `diagnostics.forkStoreAudit` | boolean | false | BILI_FORK_STORE_AUDIT | snapshot/fork 路径上的全量 CCR store 完整性审计（#2675）：重新哈希每条已存 payload 并交叉核对全部索引项，任一不一致即 fail-closed。默认关闭——热路径只审计快照用到的 refs；开启后以 O(store) 代价用于排障。每次请求实时读取。 |
+| `diagnostics.forkStoreAudit` | boolean | false | BILI_FORK_STORE_AUDIT | snapshot/fork 路径上的全量 CCR store 完整性审计（#2675）：重新哈希每条已存 payload 并交叉核对全部索引项，任一不一致即 fail-closed。默认关闭——热路径只对快照用到的 refs 做结构校验；开启后以 O(store) 代价获得完整审计深度。 |
 | `fakeCompletion` | object | {} (all defaults) | — | 末块被截断时重新发起请求的重试环。 |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
