@@ -214,6 +214,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
+| `compress.protectedContentMarkers` | string[] | none | — | User-declared content-carrier substrings: any text message containing one survives every fold (#2446); proxy-mode complement to plugin-mode durable guards. |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.stripImages` | boolean | false | — | Strip image payloads from foldable history. |
@@ -1234,6 +1235,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - **Independent content** — each instance carries unique information no later result supersedes (opencode/pi `skill` loads, one-shot references): use `protectedTools`. Folding an old load loses its content permanently; protection keeps every load in context (#1109). Use `skill/<name>` path patterns to protect ONE orchestrator skill's every load while letting lighter skills fold (`protectedTools: ["skill/release-orchestrator"]`, #1947).
   - **Cumulative snapshots** — each newer result supersedes the older ones (a client's todo/task list): use `protectedLatestTools`. Protecting **all** instances of such a tool makes its history grow unboundedly — the exact failure #639 worked around by protecting only the latest.
   - Rule of thumb: low-frequency, high-value tools → `protectedTools`; chatty tools → never full-history protect (context grows without bound); cumulative-snapshot tools → `protectedLatestTools`.
+
+#### `protectedContentMarkers`
+
+- **Type:** `string[]` (substrings)
+- **Default:** unset → no content-marker protection
+- **Status:** ACTIVE
+- **Description:** Substrings that mark a TEXT message as a durable content carrier. Any text message **containing** any listed substring is protected from every fold — the same HARD exclusion as `protectedTools` (renders untagged with a `BLOCKED` ref, covered by neither suggested nor explicit compress ranges, both compression modes, every wire) — but keyed on message TEXT instead of tool name. This is the proxy-mode escape hatch for third-party hosts that inject standing instructions into user-role turns bili knows nothing about (#2446): instead of bili hard-coding a guard per host, the user declares the carrier signature once — e.g. dsh's system-reminder carriers `"Instructions from:"` or `` `<mcp_catalog>` ``. Prefer the host-native mechanisms when available (plugin `protect` endpoint, #2556; `bili-durable` first-line markers, #2555): those are per-message and self-identifying, while substring-anywhere matching is a heuristic. **⚠ Over-pinning risk:** a user paste that happens to contain a marker is pinned forever (unbounded growth) — keep markers long and specific, and note that markers can NEVER be retroactively "unprotected" for messages already sent (changing the list does not resurrect folded context either; it only affects protection of messages seen afterwards). Empty array is rejected as a typo (as with `protectedTools`); non-string or blank entries reject loudly at config parse. Whole-array replace at the deepest defined level. Example: `{ "compress": { "protectedContentMarkers": ["Instructions from:", "<mcp_catalog>"] } }`.
 
 #### `neverPreserveRecentTools`
 

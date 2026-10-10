@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
-import { biliDurableMarkerGuard, durableMessageGuards } from "./durable-message-guards.js";
+import { biliDurableMarkerGuard, durableMessageGuards, protectedContentMarkerGuard } from "./durable-message-guards.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -442,9 +442,29 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // session-keyed raw ids, persisted via metadata; composes with the marker
     // (#2555) and lane guards. Same read-time re-resolution as the guards.
     const registered = registeredProtectedRawIds(session);
+    // #2446 方案A: operator-declared content markers — stamped onto the
+    // session by the wire path from the request-resolved compress settings
+    // (clone-safe string array, same metadata discipline as the registration
+    // set), so this request-context-free reader sees the newest config.
+    const cfgGuard = protectedContentMarkerGuard(protectedContentMarkersOf(session));
     const guard: (msg: CoreMessage) => boolean =
-        laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id) : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
+        cfgGuard
+            ? (msg) => (laneGuard ? laneGuard(msg) : false) || biliDurableMarkerGuard(msg) || registered.has(msg.id) || cfgGuard(msg)
+            : laneGuard
+              ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id)
+              : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
     return !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+}
+
+/** #2446 方案A: the operator-declared marker list as read from session
+ *  metadata. The wire path (server/handle.ts) stamps it per request from the
+ *  three-level-resolved compress settings, so plugin-tool / status readers —
+ * which have no request context — resolve the same protection the wire used.
+ * Empty array removes the key (config dropped the markers → stop pinning;
+ * the session reflects current config, not historical config). */
+export function protectedContentMarkersOf(session: Session | undefined): string[] {
+    const raw = session?.metadata["protectedContentMarkers"];
+    return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
 }
 
 /** #2556: the protect-tool registration as a membership set. Reading it from

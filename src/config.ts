@@ -270,6 +270,21 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /** Text markers (plain substrings) that pin ANY text message containing
+     *  one from folding — the user-config lane of the durable-message
+     *  protocol (#2446 方案A). Works in proxy mode and plugin mode alike:
+     *  matched messages join the same `isMessageProtected` guard chain as
+     *  the built-in lane table, the `\x3cbili-durable\x3e` first-line marker
+     *  (#2555) and `POST /__bili/plugin/protect` registrations (#2556).
+     *  Built for hosts bili has no lane entry for (proxy mode carries no
+     *  client identity at all): the user declares the carrier text himself
+     *  (e.g. `["Instructions from:", "\x3cmcp_catalog\x3e"]` for dsh's
+     *  core carriers in proxy mode). ⚠ Markers match as raw substrings
+     *  anywhere in the message text — a pasted message containing the marker
+     *  pins too, so use distinctive strings, not prose fragments. Deepest
+     *  level wins (global → provider → model), whole-array replace. Default:
+     *  none. */
+    protectedContentMarkers?: string[];
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel
@@ -1795,7 +1810,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "nudgeGrowthTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent",
-    "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
+    "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools", "protectedContentMarkers",
     "neverPreserveRecentTools", "preserveRecentTools", "stripImages",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
@@ -2252,7 +2267,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
     }
-    for (const key of ["protectedLatestTools", "protectedTools"] as const) {
+    for (const key of ["protectedLatestTools", "protectedTools", "protectedContentMarkers"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
         const v = obj[key];
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;

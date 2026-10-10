@@ -183,6 +183,16 @@ entries:
     desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。"
     site_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
     site_zh: "只保护累积快照类工具的「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
+  - key: compress.protectedContentMarkers
+    type: "string[]"
+    default: "none"
+    group: compress
+    id: ct.pcm
+    render: compress-row
+    desc_en: "User-declared content-carrier substrings: any text message containing one survives every fold (#2446); proxy-mode complement to plugin-mode durable guards."
+    desc_zh: "用户自报的内容载体子串：含任一子串的文本消息在每次折叠中存活（#2446）；插件模式硬编码守卫的 proxy 模式补位。"
+    site_en: "User-declared content-carrier substrings: any text message containing one is hard-excluded from every fold (untagged BLOCKED ref, both compression modes). Proxy-mode complement to the host-native durable guards (#2555/#2556); prefer those when available. Empty array rejects as a typo."
+    site_zh: "用户自报的内容载体子串：含任一子串的文本消息被硬排除于每次折叠（不带 tag 的 BLOCKED ref，两种压缩模式一致）。是 host 原生持久守卫（#2555/#2556）的 proxy 模式补位，能用原生时优先用原生。空数组按笔误拒绝。"
   - key: compress.neverPreserveRecentTools
     type: "string[] ([] valid)"
     default: "[\"decompress\", \"search_context\", \"read\", \"bash\"] (kernel)"

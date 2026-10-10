@@ -14,7 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
-import { biliDurableMarkerGuard, durableMessageGuards } from "../durable-message-guards.js";
+import { biliDurableMarkerGuard, durableMessageGuards, protectedContentMarkerGuard } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, registeredProtectedRawIds, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -1746,8 +1746,20 @@ export async function handle(
         // resolution as session.ts effectiveConfig, so a registration via POST
         // /__bili/plugin/protect protects the very next fold on the wire path.
         const registered = registeredProtectedRawIds(session);
+        // #2446 方案A: fold in operator-declared content markers, resolved
+        // through the standard three-level compress cascade for THIS request
+        // and stamped onto the session (clone-safe strings) so the read path
+        // (effectiveConfig) sees the same list without request context.
+        const cfgMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress).protectedContentMarkers;
+        if (cfgMarkers && cfgMarkers.length > 0) session.metadata["protectedContentMarkers"] = cfgMarkers;
+        else delete session.metadata["protectedContentMarkers"];
+        const cfgGuard = protectedContentMarkerGuard(cfgMarkers ?? []);
         const durableGuard: (msg: CoreMessage) => boolean =
-            laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id) : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
+            cfgGuard
+                ? (msg) => (laneGuard ? laneGuard(msg) : false) || biliDurableMarkerGuard(msg) || registered.has(msg.id) || cfgGuard(msg)
+                : laneGuard
+                  ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id)
+                  : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
         reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0

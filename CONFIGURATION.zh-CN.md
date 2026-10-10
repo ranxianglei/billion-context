@@ -214,6 +214,7 @@
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
+| `compress.protectedContentMarkers` | string[] | none | — | 用户自报的内容载体子串：含任一子串的文本消息在每次折叠中存活（#2446）；插件模式硬编码守卫的 proxy 模式补位。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
@@ -1237,6 +1238,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。用 `skill/<name>` 路径模式可只保护某个编排 skill 的全部装载、让轻量 skill 照常折叠（`protectedTools: ["skill/release-orchestrator"]`，#1947）。
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
+
+#### `protectedContentMarkers`
+
+- **类型：** `string[]`（子串）
+- **默认值：** 未设置 → 无内容标记保护
+- **状态：** ACTIVE
+- **说明：** 标记「持久内容载体」的子串列表：任何**包含**任一子串的 text 消息在每次折叠中受保护 —— 与 `protectedTools` 同为硬排除（渲染为不带 tag 的 `BLOCKED` ref，推荐范围与显式范围都无法覆盖；两种压缩模式、所有 wire 一致生效），但匹配键是消息**文本**而非工具名。这是为「第三方 host 往 user 轮次里注入常驻指令、bili 无从知晓」的 proxy 模式场景准备的逃生门（#2446）：不再由 bili 为每个 host 硬编码守卫，用户一次性声明载体签名 —— 例如 dsh 的 system-reminder 载体 `"Instructions from:"` 或 `` `<mcp_catalog>` ``。能用 host 原生机制时优先用原生（插件 `protect` 端点 #2556；`bili-durable` 首行标记 #2555）：它们按消息自识别，而子串任意位置匹配只是启发式。**⚠ 过度钉住风险：** 用户粘贴的内容若碰巧含标记子串也会被永久钉住（上下文无界增长）—— 标记要长且具体；且标记不能对已发消息追溯"解除保护"（改列表也不会复活已折叠的上下文，只影响之后的消息）。空数组按笔误拒绝（同 `protectedTools`）；非字符串/空白项在配置解析时大声拒绝。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedContentMarkers": ["Instructions from:", "<mcp_catalog>"] } }`。
 
 #### `neverPreserveRecentTools`
 
