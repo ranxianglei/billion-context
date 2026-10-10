@@ -625,10 +625,13 @@ Caveats worth knowing:
   omits the ACP tool names — all seven builtin roles ship like this (e.g.
   `delegate` lists `read,grep,find,ls,bash,edit,write,contact_supervisor`) —
   no longer loses interactive compression after the #2185 named-plugin fix.
-  bili detects such children per request (pi-subagents stamps every child
-  session's system prompt with an `<active_agent name="…">` marker; the gate
-  also requires the request's tools array to expose none of the names bili
-  would inject) and serves them through the **proxy-style compression
+   bili detects such children per request (pi-subagents stamps every child
+   session's system prompt with a complete `<active_agent name="…">` marker;
+   detection is scoped to the system-prompt carriers, so a main session whose
+   history merely quotes the marker keeps its own channel (#2694); the gate
+   also requires the request's tools array — including namespace-wrapped
+   declarations — to expose none of the names bili would inject) and serves
+   them through the **proxy-style compression
   channel**: wire-injected ACP tools + nudge, server-side execution,
   `acp_summary` carrier — while keeping the named plugin-session identity
   from #2185. No configuration change required; the role's original allowlist

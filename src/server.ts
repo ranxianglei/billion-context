@@ -153,7 +153,6 @@ import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } 
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
-import { piSubagentChannelFallback } from "./server/pi-subagent-channel.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 export { forward } from "./server/relay.js";
 
