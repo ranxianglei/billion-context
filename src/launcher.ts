@@ -909,7 +909,13 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
-    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"] },
+    claude: {
+        caKeys: ["NODE_EXTRA_CA_CERTS"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+        baseUrlKeys: ["ANTHROPIC_BASE_URL"],
+    },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its

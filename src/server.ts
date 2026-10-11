@@ -243,9 +243,18 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // client-side billion-context extensions (billion-context-pi / opencode-acp)
     // can detect it in their own baseUrl and self-disable, avoiding double
     // compression.
+    let path = reqUrl;
+    if (reqUrl.startsWith("http://") || reqUrl.startsWith("https://")) {
+        try {
+            const u = new URL(reqUrl);
+            if (u.pathname.startsWith("/bili/")) path = u.pathname + u.search;
+        } catch {
+            // malformed absolute URL
+        }
+    }
     const KNOWN_PROTOCOLS = ["responses", "anthropic", "openai", "google"] as const;
-    if (reqUrl.startsWith("/bili/")) {
-        let rest = reqUrl.slice(6);
+    if (path.startsWith("/bili/")) {
+        let rest = path.slice(6);
         let explicitProtocol: WireProtocol | undefined;
         for (const p of KNOWN_PROTOCOLS) {
             const prefix = `${p}/`;

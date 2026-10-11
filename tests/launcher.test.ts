@@ -264,11 +264,13 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
     assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
 });
 
-test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
+test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS + loopback NO_PROXY, preserves baseEnv", () => {
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
     assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.ANTHROPIC_API_KEY, "sk-x");
     assert.equal(env.SSL_CERT_FILE, undefined);
@@ -2848,13 +2850,15 @@ test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the r
     );
 });
 
-test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
+test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA + loopback NO_PROXY", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
     ];
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/anthropic");
 });
 
