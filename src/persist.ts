@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
@@ -22,6 +22,7 @@ import { markDirty, scrubTurnSeparatorIds } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
+import { sha256Hex, type CheckpointRow } from "./storage/store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -738,6 +739,82 @@ export class SessionStore {
         const envelope = this.loadEnvelope(id);
         if (!envelope) return null;
         return mergeState(envelope.payload.state);
+    }
+
+    /** Phase 2 (#2671): replica/checkpoint operations. All throw on error —
+     *  unlike the shadow mirrors, these are explicit operator actions, and a
+     *  half-completed replica must surface, not log-and-degrade. Requires the
+     *  unified sidecar (shadow or full mode); legacy mode fails fast with a
+     *  clear message so the HTTP layer can 501. */
+    replicasAvailable(): boolean {
+        return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+    private liveShadow(): UnifiedShadow {
+        if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
+        return this.shadow as UnifiedShadow;
+    }
+
+    /** Freezes the session's CURRENT persisted state as a checkpoint. Callers
+     *  holding a resident (in-memory) session must saveNow() it first — this
+     *  snapshots exactly what the unified index last ingested. */
+    createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
+        const shadow = this.liveShadow();
+        const view = shadow.viewFor(sessionId);
+        if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
+        const record = viewToRecord(view);
+        const cpId = `cp-${randomUUID()}`;
+        const activeBlockIds = view.state.blocks
+            .filter((b) => (b as { active?: boolean }).active !== false)
+            .map((b) => b.blockId)
+            .sort();
+        shadow.createCheckpoint({
+            cpId,
+            sessionId,
+            seqAt: this.shadow!.sessionTipSeq(sessionId),
+            blockSetHash: sha256Hex(JSON.stringify(activeBlockIds)),
+            kind: opts.kind ?? "replica",
+            label: opts.label ?? null,
+            pinned: opts.pinned === true,
+            createdAt: Date.now(),
+            stateJson: JSON.stringify(record),
+        });
+        const row = shadow.getCheckpoint(cpId);
+        if (!row) throw new Error(`[storage] checkpoint ${cpId} missing right after insert (index inconsistency)`);
+        return row;
+    }
+
+    listReplicas(sessionId?: string): CheckpointRow[] {
+        return this.liveShadow().listCheckpoints(sessionId);
+    }
+
+    /** Blob size of one checkpoint's frozen record (for detail views). */
+    replicaByteLen(cpId: string): number {
+        return this.liveShadow().checkpointState(cpId).byteLen;
+    }
+
+    /** Materializes a checkpoint as a NEW session (the original is never
+     *  touched). The frozen record is written through the normal dual path —
+     *  legacy JSON file + unified ingest — so the restored session is a
+     *  first-class citizen from the first read. */
+    async restoreReplica(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; seqAt: number }> {
+        const shadow = this.liveShadow();
+        const cp = shadow.getCheckpoint(cpId);
+        if (!cp) throw new Error(`[storage] checkpoint not found: ${cpId}`);
+        const { stateJson } = shadow.checkpointState(cpId);
+        const record = JSON.parse(stateJson) as PersistedSession;
+        const newId = opts.sessionId ?? `restore-${randomUUID().slice(0, 8)}`;
+        record.id = newId;
+        record.savedAt = Date.now();
+        record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
+        await this.store.writeNow(newId, () => record);
+        shadow.record(record);
+        return { sessionId: newId, restoredFrom: cp.session_id, seqAt: cp.seq_at };
+    }
+
+    /** Drops a checkpoint. Explicit operator action overrides `pinned` —
+     *  pinning protects against GC, not against deletion. */
+    deleteReplica(cpId: string): boolean {
+        return this.liveShadow().deleteCheckpoint(cpId);
     }
 
     /** #1937: sessions directory this store resolves against (the web summary

@@ -4,6 +4,17 @@ All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
 ## [Unreleased]
+- **Storage Phase 2a: replica/checkpoint REST (#2671)** — any unified lane (shadow or full) can now freeze a
+  session's persisted state and bring it back later as a new session. `POST /__bili/replicas` flushes the resident
+  session and writes one content-addressed checkpoint (full record blob in the CAS store + `checkpoints` row with
+  `state_hash` refcount); `GET` lists/details, `POST /<cpId>/restore` re-materializes the checkpoint through the normal
+  dual write path (legacy JSON + unified ingest) under a fresh id (`meta.restoredFrom` records provenance), and
+  `DELETE` drops it. Pinned checkpoints survive `deleteSession` GC — the copy taken before the destructive experiment
+  outlives the experiment; explicit delete still removes pinned ones. `deleteSession` now sweeps the session's
+  unpinned checkpoints with their blobs; legacy-only lanes get a 501 with the knob hint instead of a silent no-op.
+  Whole-blob snapshots trade space for simplicity (CAS dedupes identical consecutive states); an events-table slimming
+  is deferred to Phase 3. Tests: create/list/detail round-trip, restore-after-original-deleted digest equality,
+  pinned-survives-GC/unpinned-swept, legacy 501 + pinned delete override.
 - **storage.unified config key: file tier for the unified-storage switch (#2671)** — `BILI_STORAGE_UNIFIED` no
   longer needs a shell: `{"storage":{"unified":"legacy|shadow|full"}}` in billion-context.json selects the same
   modes for the whole lane (strict spellings), and the env — when set — still wins (it additionally accepts the

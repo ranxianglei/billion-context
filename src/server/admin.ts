@@ -17,8 +17,9 @@ import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePlug
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
+import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
-import { listSessions, splitSessionWarnings, totalInFlight } from "../session.js";
+import { listSessions, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
@@ -347,6 +348,108 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    // #2671 Phase 2: replica/checkpoint management over the unified store.
+    // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
+    // operator knows the knob, not the URL, is what is missing.
+    if (req.method === "GET" && (req.url === "/__bili/replicas" || req.url?.startsWith("/__bili/replicas?"))) return await sendReplicasList(res, req.url);
+    if (req.method === "POST" && req.url === "/__bili/replicas") {
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
+            if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { sessionId: string, label?: string, pinned?: boolean }" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            // Freshest snapshot first: a resident session is force-flushed so
+            // the checkpoint freezes what the caller just saw, not the last
+            // debounced write.
+            const resident = peekSession(parsed.sessionId);
+            if (resident) await store.writeNow(resident);
+            try {
+                const row = store.createReplica(parsed.sessionId, {
+                    label: typeof parsed.label === "string" ? parsed.label : undefined,
+                    pinned: parsed.pinned === true,
+                });
+                res.writeHead(201, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
+            } catch (err) {
+                const msg = String(err);
+                res.writeHead(msg.includes("not in the unified index") ? 404 : 500, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg }));
+            }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "GET" && req.url?.startsWith("/__bili/replicas/") && !req.url.endsWith("/restore")) return await sendReplicaDetail(res, req.url);
+    if (req.method === "POST" && req.url?.startsWith("/__bili/replicas/") && req.url.endsWith("/restore")) {
+        try {
+            const cpId = replicaIdFromUrl(req.url, "/restore");
+            if (!cpId) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>/restore" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+                return;
+            }
+            let newSessionId: string | undefined;
+            const raw = await readBody(req);
+            if (raw.byteLength > 0) {
+                const parsed = JSON.parse(raw.toString("utf8")) as { sessionId?: unknown };
+                if (parsed.sessionId !== undefined && (typeof parsed.sessionId !== "string" || !parsed.sessionId)) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: "sessionId must be a non-empty string" }));
+                    return;
+                }
+                newSessionId = parsed.sessionId as string | undefined;
+            }
+            try {
+                const out = await store.restoreReplica(cpId, { sessionId: newSessionId });
+                res.writeHead(201, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, ...out }));
+            } catch (err) {
+                const msg = String(err);
+                res.writeHead(msg.includes("checkpoint not found") ? 404 : 500, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: msg }));
+            }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "DELETE" && req.url?.startsWith("/__bili/replicas/")) {
+        const cpId = replicaIdFromUrl(req.url);
+        if (!cpId) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+            return;
+        }
+        const store = getStore();
+        if (!store.replicasAvailable()) {
+            res.writeHead(501, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+            return;
+        }
+        const deleted = store.deleteReplica(cpId);
+        res.writeHead(deleted ? 200 : 404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: deleted, deleted }));
+        return;
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
             const body = await readBody(req);
@@ -502,6 +605,69 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
     log("info", `[conflict] ledger cleared via web UI: ${cleared.events} event(s) across ${cleared.sessions} session(s)${sessionId ? ` (session ${sessionId})` : ""}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }, null, 2));
+}
+
+// ---- #2671 Phase 2: replica (checkpoint) helpers --------------------------
+
+/** checkpoints row (snake_case) → HTTP payload (camelCase). */
+function serializeReplica(row: {
+    cp_id: string;
+    session_id: string;
+    seq_at: number;
+    block_set_hash: string;
+    kind: string;
+    created_at: number;
+    pinned: number;
+    label: string | null;
+}): { cpId: string; sessionId: string; seqAt: number; blockSetHash: string; kind: string; createdAt: number; pinned: boolean; label: string | null } {
+    return { cpId: row.cp_id, sessionId: row.session_id, seqAt: row.seq_at, blockSetHash: row.block_set_hash, kind: row.kind, createdAt: row.created_at, pinned: row.pinned === 1, label: row.label };
+}
+
+function replicaIdFromUrl(url: string, suffix = ""): string | null {
+    const id = url.slice("/__bili/replicas/".length, url.length - suffix.length);
+    return id && !id.includes("/") ? decodeURIComponent(id) : null;
+}
+
+async function sendReplicasList(res: http.ServerResponse, url: string): Promise<void> {
+    const store = getStore();
+    if (!store.replicasAvailable()) {
+        res.writeHead(501, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        return;
+    }
+    const q = new URL(url, "http://localhost").searchParams.get("sessionId");
+    const rows = store.listReplicas(q ?? undefined);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, replicas: rows.map(serializeReplica) }, null, 2));
+}
+
+async function sendReplicaDetail(res: http.ServerResponse, url: string): Promise<void> {
+    const store = getStore();
+    if (!store.replicasAvailable()) {
+        res.writeHead(501, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        return;
+    }
+    const cpId = replicaIdFromUrl(url);
+    if (!cpId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+        return;
+    }
+    try {
+        const row = store.listReplicas().find((r) => r.cp_id === cpId);
+        if (!row) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `checkpoint not found: ${cpId}` }));
+            return;
+        }
+        const byteLen = store.replicaByteLen(cpId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, replica: { ...serializeReplica(row), byteLen } }, null, 2));
+    } catch (err) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: String(err) }));
+    }
 }
 
 function sendStats(res: http.ServerResponse): void {

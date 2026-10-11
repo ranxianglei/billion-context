@@ -135,7 +135,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     block_set_hash  TEXT NOT NULL,
     kind            TEXT NOT NULL,
     created_at      INTEGER NOT NULL,
-    pinned          INTEGER NOT NULL DEFAULT 0
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    label           TEXT,
+    -- Phase 2 (#2671): the full serialized session record this checkpoint
+    -- freezes, in the content CAS. The row owns one refcount on the blob;
+    -- pinned checkpoints therefore outlive deleteSession (GC protection).
+    state_hash      TEXT NOT NULL REFERENCES content(hash)
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -157,6 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(session_id, msg_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_dead_refs_session ON dead_refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_refs_session ON refs(session_id, ord);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, created_at);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */

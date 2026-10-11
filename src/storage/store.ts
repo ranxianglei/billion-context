@@ -101,6 +101,20 @@ export interface CcrEntryRow {
     content: string;
 }
 
+/** One checkpoint/replica row (Phase 2, #2671). `state_hash` never leaves
+ *  the store — list/get return this projection only; the blob itself is
+ *  read via checkpointState() when restoring. */
+export interface CheckpointRow {
+    cp_id: string;
+    session_id: string;
+    seq_at: number;
+    block_set_hash: string;
+    kind: "auto" | "manual" | "replica" | "fork_base";
+    created_at: number;
+    pinned: number;
+    label: string | null;
+}
+
 export interface IngestSessionInput {
     session: SessionRow;
     messages: MessageRow[];
@@ -125,7 +139,6 @@ export class UnifiedStore {
     }
 
     static open(path: string, engine?: SqliteEngineName): UnifiedStore {
-        console.trace("[DBG] UnifiedStore.open:", path);
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used } = openSqliteDatabase(path, engine);
         for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
@@ -354,7 +367,10 @@ export class UnifiedStore {
 
     /** Deletes one session and releases every CAS refcount it holds
      *  (GC parity with the legacy path's file removal). Rows that other
-     *  sessions also reference survive via their own refcounts. */
+     *  sessions also reference survive via their own refcounts. Checkpoints
+     *  of the session: PINNED ones survive (their state blob keeps its
+     *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
+     *  swept here together with the session. */
     deleteSession(sessionId: string): void {
         this.db.transaction(() => {
             const refs: string[] = [];
@@ -370,6 +386,14 @@ export class UnifiedStore {
             for (const e of this.db
                 .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
                 .all(sessionId) as { content_hash: string }[]) refs.push(e.content_hash);
+            // Checkpoints: pinned replicas keep their rows + CAS refcounts; the
+            // rest die with the session.
+            for (const cp of this.db
+                .prepare("SELECT cp_id, state_hash FROM checkpoints WHERE session_id = ? AND pinned = 0")
+                .all(sessionId) as { cp_id: string; state_hash: string }[]) {
+                this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cp.cp_id);
+                refs.push(cp.state_hash);
+            }
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
@@ -379,6 +403,74 @@ export class UnifiedStore {
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+        });
+    }
+
+    /** Freezes one session record as a checkpoint row + CAS blob. The row
+     *  owns exactly one refcount on the blob; identical consecutive states
+     *  dedup to a single CAS entry (the CoW behind cheap repeated
+     *  checkpoints). Single transaction: the checkpoint is either fully
+     *  visible or not at all. */
+    insertCheckpoint(cp: {
+        cpId: string;
+        sessionId: string;
+        seqAt: number;
+        blockSetHash: string;
+        kind: "auto" | "manual" | "replica" | "fork_base";
+        label?: string | null;
+        pinned: boolean;
+        createdAt: number;
+        stateJson: string;
+    }): void {
+        this.db.transaction(() => {
+            const stateHash = this.putContent(cp.stateJson);
+            this.db
+                .prepare(
+                    "INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(cp.cpId, cp.sessionId, cp.seqAt, cp.blockSetHash, cp.kind, cp.createdAt, cp.pinned ? 1 : 0, cp.label ?? null, stateHash);
+        });
+    }
+
+    listCheckpoints(sessionId?: string): CheckpointRow[] {
+        const cols = "cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label";
+        return sessionId
+            ? (this.db.prepare(`SELECT ${cols} FROM checkpoints WHERE session_id = ? ORDER BY created_at, cp_id`).all(sessionId) as CheckpointRow[])
+            : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
+    }
+
+    getCheckpoint(cpId: string): CheckpointRow | undefined {
+        return this.db
+            .prepare("SELECT cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label FROM checkpoints WHERE cp_id = ?")
+            .get(cpId) as CheckpointRow | undefined;
+    }
+
+    /** The frozen record blob (state_hash → CAS bytes). Throws if the row or
+     *  the blob is missing — callers treat that as a corrupt checkpoint. */
+    checkpointState(cpId: string): { stateJson: string; byteLen: number } {
+        const row = this.db.prepare("SELECT state_hash FROM checkpoints WHERE cp_id = ?").get(cpId) as
+            | { state_hash: string }
+            | undefined;
+        if (!row) throw new Error(`checkpoint not found: ${cpId}`);
+        const blob = this.db.prepare("SELECT bytes, byte_len FROM content WHERE hash = ?").get(row.state_hash) as
+            | { bytes: Uint8Array; byte_len: number }
+            | undefined;
+        if (!blob) throw new Error(`checkpoint blob missing (CAS leak): ${cpId}`);
+        return { stateJson: Buffer.from(blob.bytes).toString("utf8"), byteLen: blob.byte_len };
+    }
+
+    /** Drops a checkpoint row and releases its CAS refcount. Explicit delete
+     *  overrides `pinned` — pinning protects against GC, not the operator. */
+    deleteCheckpoint(cpId: string): boolean {
+        return this.db.transaction((): boolean => {
+            const row = this.db.prepare("SELECT state_hash FROM checkpoints WHERE cp_id = ?").get(cpId) as
+                | { state_hash: string }
+                | undefined;
+            if (!row) return false;
+            this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cpId);
+            this.releaseContent(row.state_hash);
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            return true;
         });
     }
 

@@ -23,7 +23,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, loadLegacyView, type LegacySessionLike } from "./ingest.ts";
-import { UnifiedStore } from "./store.ts";
+import { UnifiedStore, type CheckpointRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -180,6 +180,49 @@ export class UnifiedShadow {
         } catch (err) {
             loggerLog("warn", `[storage] unified remove failed for ${id} (${String(err)})`);
         }
+    }
+
+    // ---- Phase 2 checkpoints/replicas (#2671) -------------------------------
+    // Thin pass-throughs so callers never touch the raw UnifiedStore. All
+    // throw (never log-and-swallow): replica management is an explicit
+    // operator action, unlike the never-throw shadow mirrors above.
+
+    createCheckpoint(cp: Parameters<UnifiedStore["insertCheckpoint"]>[0]): void {
+        this.assertLive();
+        this.store.insertCheckpoint(cp);
+    }
+
+    listCheckpoints(sessionId?: string): CheckpointRow[] {
+        this.assertLive();
+        return this.store.listCheckpoints(sessionId);
+    }
+
+    getCheckpoint(cpId: string): CheckpointRow | undefined {
+        this.assertLive();
+        return this.store.getCheckpoint(cpId);
+    }
+
+    checkpointState(cpId: string): { stateJson: string; byteLen: number } {
+        this.assertLive();
+        return this.store.checkpointState(cpId);
+    }
+
+    deleteCheckpoint(cpId: string): boolean {
+        this.assertLive();
+        return this.store.deleteCheckpoint(cpId);
+    }
+
+    /** Absolute-seq tip of the session's message log (+1 = next free seq).
+     *  Used as a checkpoint's seq_at. */
+    sessionTipSeq(sessionId: string): number {
+        this.assertLive();
+        let tip = 0;
+        for (const m of this.store.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
+        return tip;
+    }
+
+    private assertLive(): void {
+        if (this.stats.disabled) throw new Error("[storage] unified sidecar is disabled (repeated failures) — replica operations are unavailable");
     }
 
     close(): void {
