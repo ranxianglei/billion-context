@@ -24,7 +24,7 @@ import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/s
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
 import type { WireProtocol } from "./util.js";
-import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
+import { currentContextObservation, rehydrateSeamSlot, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -1183,7 +1183,7 @@ function buildSession(parsed: PersistedSession): Session {
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};
     const stats = parsed.stats ?? {};
-    return {
+    const session: Session = {
         id: parsed.id,
         meta: {
             protocol: meta.protocol ?? parsed.protocol,
@@ -1277,6 +1277,11 @@ function buildSession(parsed: PersistedSession): Session {
         persisted: true,
         pendingRetrievals: [],
     };
+    // #2773: rehydrate the last-settled seam slot so the first post-restart
+    // sample keeps its #2131 be/bl/bs attribution (no-op without a valid,
+    // fresh projection).
+    rehydrateSeamSlot(session);
+    return session;
 }
 
 export function isValidRecord(parsed: unknown): parsed is PersistedSession {

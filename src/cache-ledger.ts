@@ -237,6 +237,12 @@ interface CacheLedger {
     invUp?: { seq: number; at: number; from: string | null; to: string };
     invKey?: { seq: number; at: number; from: string | null; to: string };
     invSp?: { seq: number; at: number; from: string | null; to: string };
+    /** #2773: durable projection of the last SETTLED seam slot — persisted so
+     *  the first post-restart sample still gets its #2131 be/bl/bs
+     *  attribution (the WeakMap pairing source is process-local). Written by
+     *  settleUsageReport's slot roll-forward; read once per loaded Session by
+     *  rehydrateSeamSlot. Capped-head payload, never the full body. */
+    seamSlot?: PersistedSeamSlot;
 }
 
 const LEDGER_KEY = "cacheLedger";
@@ -312,6 +318,57 @@ interface SeamSlot {
 const seamLastSent = new WeakMap<Session, SeamSlot>();
 const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
+
+/** #2773: durable projection of the last SETTLED seam slot, persisted inside
+ *  the session record so a restarted process can pair the first post-restart
+ *  sample against the pre-restart body (the WeakMaps are process-local). Only
+ *  the SEAM_BODY_CAP-capped head is stored, never `full`: a head complete
+ *  under the cap classifies exactly like a live full body; a truncated one
+ *  degrades to digest-only "unknown", same as the live over-cap case. */
+interface PersistedSeamSlot {
+    v: 1;
+    /** Epoch ms of the settle that produced this snapshot — the rehydration
+     *  age guard's clock. */
+    at: number;
+    digest: string;
+    msgs: number | null;
+    str: string;
+}
+
+/** #2773 epoch guard: how long a persisted slot may stay pairable after its
+ *  settle. Crash/auto-update restarts take seconds-to-minutes, so resuming
+ *  within this window pairs soundly; past it the upstream cache is certainly
+ *  cold, host-side volatile content may have drifted, and requests served
+ *  elsewhere during the downtime are invisible — pairing the stale slot would
+ *  manufacture a false seam. Hardcoded constant (no new config surface), same
+ *  discipline as WARM_HIT_PCT / LEARNED_IMAGE_COST_TTL_MS. */
+export const SEAM_SLOT_RESTART_WINDOW_MS = 30 * 60 * 1000;
+
+/** #2773: rehydrate the last-settled seam slot from the persisted projection,
+ *  once per loaded Session object (persist.buildSession is the single choke
+ *  point: boot / loadSync / web-detail loads). Seeds ONLY seamLastSettled —
+ *  the live WeakMap flow stays untouched, and the next settle roll-forward
+ *  replaces both the in-memory slot and the on-disk projection. A missing,
+ *  malformed, or stale projection is dropped silently: absence means "no
+ *  attribution for the first post-restart pair", exactly today's behavior,
+ *  never a crash. Reads metadata RAW (no getCacheLedger): probing must not
+ *  bootstrap an empty ledger into sessions that never had one. */
+export function rehydrateSeamSlot(session: Session): void {
+    if (seamLastSettled.has(session)) return;
+    const led = session.metadata?.[LEDGER_KEY];
+    if (!led || typeof led !== "object") return;
+    const p = (led as { seamSlot?: unknown }).seamSlot;
+    if (!p || typeof p !== "object") return;
+    const cand = p as Partial<PersistedSeamSlot>;
+    if (cand.v !== 1) return;
+    if (typeof cand.at !== "number" || !Number.isFinite(cand.at)) return;
+    if (typeof cand.digest !== "string" || cand.digest.length !== 64) return;
+    if (typeof cand.str !== "string" || cand.str.length === 0) return;
+    // Epoch guard: a slot older than the window cannot pair across a long
+    // downtime without manufacturing a false seam.
+    if (Date.now() - cand.at > SEAM_SLOT_RESTART_WINDOW_MS) return;
+    seamLastSettled.set(session, { str: cand.str, msgs: typeof cand.msgs === "number" ? cand.msgs : null, digest: cand.digest, full: null });
+}
 
 interface ContextObservation {
     sessionId: string;
@@ -1105,13 +1162,18 @@ export function settleUsageReport(
                     curLine.be = 1;
                 } else {
                     curLine.be = 0;
-                    if (curSlot.full !== null && prevSlot.full !== null) {
-                        const lcp = byteLcp(prevSlot.full, curSlot.full);
+                    // #2773: a rehydrated (post-restart) prev slot carries no
+                    // `full` — its capped head still classifies exactly when
+                    // complete under SEAM_BODY_CAP; a truncated head degrades
+                    // to digest-only "unknown" like the live over-cap case.
+                    const prevBody = prevSlot.full ?? (prevSlot.str.length < SEAM_BODY_CAP ? prevSlot.str : null);
+                    if (curSlot.full !== null && prevBody !== null) {
+                        const lcp = byteLcp(prevBody, curSlot.full);
                         curLine.bl = lcp;
                         // Append/trim first: "the whole shorter payload survives"
                         // is anchored to the END of the payload and stays true on
                         // small bodies where the head threshold alone would lie.
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
+                        curLine.bs = lcp >= Math.min(prevBody.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1128,7 +1190,13 @@ export function settleUsageReport(
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
     const seamBody = seamLastSent.get(session);
-    if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
+    if (seamBody !== undefined) {
+        seamLastSettled.set(session, seamBody);
+        // #2773: durable projection for cross-restart pairing — rides the
+        // ledger's own persistence (same record, same debounce save), so no
+        // separate dirty mark is needed here.
+        led.seamSlot = { v: 1, at: Date.now(), digest: seamBody.digest, msgs: seamBody.msgs, str: seamBody.str };
+    }
     seamLastSent.delete(session);
 }
 
