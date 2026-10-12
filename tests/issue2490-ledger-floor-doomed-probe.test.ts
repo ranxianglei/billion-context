@@ -14,7 +14,13 @@
 //       some tokenizer might make the payload fit. Beyond window×7.5 BYTES
 //       of core text (densest live-route billing observed: ~6.8 B/token,
 //       #2122) no tokenizer can, so the probe is a guaranteed 400 with an
-//       8MB body — fail fast instead of paying it.
+//       8MB body — never pay it. #2915 refined the verdict: a payload that
+//       is provably unable to FORWARD as-is is still recoverable while
+//       anything outside the protected recent zone is foldable (an
+//       over-window conversation — typical after a model switch to a
+//       smaller window on another upstream), and those now digest-fold
+//       instead of 502ing; only a payload with NOTHING foldable there keeps
+//       the terminal trim-it 502 (pinned below as e2e d).
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -275,20 +281,70 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
 // ---------------------------------------------------------------------------
 // (b) doomed probe
 
-test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead of paying the probe 400", async () => {
+test("e2e #2490 b: multi-MB core text beyond both doom bars never forwards raw; a foldable conversation digest-folds hard and verdicts honestly (#2915)", async () => {
     const { ctx, calls, close } = await setup();
     try {
         await seedStuckMeter(ctx, "s-2490-b");
 
-        // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
-        // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
-        const r = await post(ctx, bigMessages(500, 4_400));
-        assert.equal(r.status, 502, "doomed probe fails fast, not forwarded");
-        const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
+        // 520 msgs × 4.8K chars ≈ 2.5MB raw ASCII core text. Every message
+        // clears truncateLargeToolOutputs' minOutputTokens (1000 tok), so at
+        // usage ≥ 95% the kernel's emergency-truncate node caps each to a
+        // ~4.05K-char prefix/suffix preview BEFORE preflight sees it — ~2.1MB
+        // still stands past the absolute 2MB bar (and the 20K window × 7.5
+        // B/token = 150KB ratio bar), with every truncated turn (~1013 tok)
+        // still above minCompressRange and therefore foldable (#2915 shape:
+        // hundreds of old turns + a small protected recent zone). At ~27x
+        // overshoot the walk rides the zero-cost digest regime; this mass is
+        // unrecoverable in one pass even in principle (its digest blocks alone
+        // exceed the 20K window), so the pinned contract is: fall through,
+        // fold as far as possible at zero upstream cost, persist progress,
+        // and refuse with the HONEST futility verdict — pre-fix this exact
+        // request answered the misleading trim-it 502 before any fold ran.
+        const r = await post(ctx, bigMessages(520, 4_800));
+        assert.equal(r.status, 502, "one pass cannot close a 27x gap — but the refusal is post-fold, not at the guard");
+        const parsed = JSON.parse(await r.text()) as { error?: { message?: string } };
+        assert.match(parsed.error?.message ?? "", /futile round/, "honest verdict: folding ran and the math says the remainder cannot fit");
+        assert.doesNotMatch(parsed.error?.message ?? "", /Remove or trim the oversized content/, "no longer tells the user to trim a giant paste that does not exist");
 
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
+        // The load-bearing #2490 invariant survives: the doomed RAW payload is
+        // never paid as a forward or a probe. Only the seed turn reaches the
+        // upstream.
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 1, `only the seed turn forwards (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
+        assert.equal(calls.filter((c) => c.summary).length, 0, "~27x overshoot exceeds the LLM fold path's coverage bound — deterministic digests spend zero upstream calls (#2383)");
+
+        const s = getSession("s-2490-b");
+        assert.ok(s);
+        assert.ok(s.state.blocks.some((b) => b.active), "the walk's folds persisted as compression block(s) — the next request starts from the reduced state");
+    } finally {
+        await close();
+    }
+});
+
+test("e2e #2490 d: a doomed payload with NOTHING foldable outside the protected zone keeps the terminal trim-it 502 (#2915)", async () => {
+    const { ctx, calls, close } = await setup();
+    try {
+        await seedStuckMeter(ctx, "s-2490-d");
+
+        // One giant paste as the most recent user message: every over-window
+        // byte sits INSIDE the protected recent zone (recent messages + the
+        // newest user message), so folding cannot remove it — the genuine
+        // uncompressible-blob case the doomed guard exists for.
+        const blob = `turn 0: ` + "x".repeat(2_500_000 - 8);
+        const r = await post(ctx, [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "forwarded answer" },
+            { role: "user", content: blob },
+        ]);
+        assert.equal(r.status, 502, "untrimmable blob fails fast, not forwarded");
+        const body = await r.text();
+        assert.match(body, /NOT forwarded even for evidence/, "the evidence wording is present");
+        assert.match(body, /nothing outside the protected recent zone is compressible/, "the verdict explains WHY folding cannot help");
+        assert.match(body, /Remove or trim the oversized content/, "the remedy is the operator-trim one");
+        const parsed = JSON.parse(body) as { error?: { retryable?: boolean } };
+        assert.equal(parsed.error?.retryable, false, "identical retries hit the identical wall — no retry advertised");
+
+        assert.equal(calls.length, 1, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — zero summary calls, no raw forward`);
     } finally {
         await close();
     }

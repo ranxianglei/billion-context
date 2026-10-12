@@ -2662,13 +2662,40 @@ export async function preflightCompressIfNeeded(
         const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
         const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-            const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 502 (retryable=false): ${doomedMessage}`);
-            return { failFast: true, status: 502, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            // #2915: being provably unable to FORWARD as-is does not make the
+            // session unrecoverable — this guard's job is to skip the wasteful
+            // doomed probe, not to abandon a payload the fold machinery below
+            // could bring under the window. The dead-end carved out here: a
+            // mid-session switch to a DIFFERENT upstream origin with a SMALLER
+            // window than the live context (incident: ~530K live vs a 225K
+            // window) demotes the usage baseline via #1933 F2 above, arms
+            // probeForEvidence, and BOTH exits of this branch returned before
+            // any fold ran — terminal 502 retryable=false, identical on every
+            // retry, session unusable until restart or switching back. #2490's
+            // assumption ("provably-doomed ⇒ uncompressible giant paste ⇒ tell
+            // the user to trim") holds only while NOTHING outside the protected
+            // recent zone is foldable. Judge foldability exactly as the walk
+            // below does (same minCompressRange filter as preflight.ts) and let
+            // it run: its #1841 futility gate spends zero calls when folding
+            // genuinely cannot close the gap, and the caller's post-fold fit
+            // gate then forwards or fails fast with the honest diagnosis —
+            // falling through can only help. No foldable ranges means every
+            // over-window byte sits INSIDE the protected zone (a giant
+            // paste/turn the model must see): folding cannot remove it, keep
+            // the trim-it verdict.
+            const minChars = config.compress.minCompressRange;
+            const foldableCount = (prepared.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars).length;
+            if (foldableCount === 0) {
+                const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence, and nothing outside the protected recent zone is compressible to fold away. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("error", `[${session.id}] preflight fail-fast 502 (retryable=false): ${doomedMessage}`);
+                return { failFast: true, status: 502, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            }
+            log("warn", `[${session.id}] doomed-probe bar exceeded (~${coreTextBytes} bytes core text vs window ${limit}) but ${foldableCount} compressible range(s) sit outside the protected zone — an over-window conversation (typical after a model switch to a smaller window on another upstream), not an untrimmable blob: running the preflight fold instead of refusing (#2915)`);
+        } else {
+            log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
+            return prepared;
         }
-        log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
-        return prepared;
     }
     const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
