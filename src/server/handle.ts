@@ -2207,12 +2207,15 @@ async function handleRequest(
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
-                    ? async (realWindow: number | undefined): Promise<string | Buffer | null> => {
+                    ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
-                          return next.body;
+                          // #2777: hand back the refold pipeline's Prepared as well —
+                          // forward() must adopt it locally or its internal loop keeps
+                          // the pre-refold message view for tool continuations.
+                          return { body: next.body, prepared: next.prepared };
                       }
                     : undefined;
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);

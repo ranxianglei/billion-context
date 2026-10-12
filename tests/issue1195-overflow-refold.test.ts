@@ -179,6 +179,68 @@ test("e2e #1195 A: stated-window overflow is rescued within the SAME request —
     assert.equal(s!.stats.lastInputTokensSource, "usage");
 });
 
+// #2777: the model answers the accepted folded retry with a compress call whose
+// refs do not exist (the stale pre-refold view's numbering). The proxy executes
+// it (FAILED), skips the post-compress fold refresh, and must rebuild the
+// internal continuation from the ACCEPTED folded view — not from the stale
+// Prepared captured before the refold.
+function compressInvalidRefsSse(): string {
+    const args = JSON.stringify({ startId: "m00042", endId: "m00099", summary: "stale-view compress attempt" });
+    return (
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m2", role: "assistant", usage: { input_tokens: 5000 } } })}\n\n` +
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_refold_d1", name: "compress", input: {} } })}\n\n` +
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: args } })}\n\n` +
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 3 } })}\n\n` +
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
+    );
+}
+
+test("e2e #2777: an internal tool continuation after an ACCEPTED overflow refold rebuilds from the accepted folded view, not the stale pre-refold Prepared", async (t) => {
+    const upstream = await recordedUpstream((call, res) => {
+        if (call === 0) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(STATED_OVERFLOW_BODY_128K);
+        } else if (call === 1) {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(compressInvalidRefsSse());
+        } else {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(okSse());
+        }
+    });
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer(proxyBaseOptions(upstream.port, 400_000));
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    t.after(async () => {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.server.close();
+        await once(upstream.server, "close");
+    });
+
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`;
+    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+    const headers = { "content-type": "application/json", "x-acp-session": "refold-d" };
+
+    const r1 = await fetch(url, { method: "POST", headers, body });
+    assert.equal(r1.status, 200, "the rescued turn completes despite the failed compress");
+    const r1text = await r1.text();
+    assert.ok(r1text.includes("text_delta"), "the continuation's completion reaches the client");
+
+    // bodies: [0] original 400'd forward, [1] summarization call, [2] accepted
+    // folded retry, [3] the internal continuation after the failed compress.
+    assert.equal(upstream.bodies.length, 4, `one overflow + one summary + one retry + one continuation: ${upstream.bodies.length}`);
+    assert.ok(upstream.bodies[2].includes(SUMMARY_TEXT), "the accepted retry carried the fold");
+    const cont = upstream.bodies[3]!;
+    assert.ok(cont.includes(SUMMARY_TEXT), "#2777: the continuation retains the accepted folded summary");
+    assert.ok(cont.includes("MARKER_11_"), "the continuation keeps the recent tail");
+    assert.ok(!cont.includes("MARKER_1_"), "#2777: the continuation must not resurrect the folded early range from the stale Prepared");
+});
+
 test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 through verbatim — the refold is not a client-visible change", async (t) => {
     const upstream = await recordedUpstream((_call, res) => {
         res.writeHead(400, { "content-type": "application/json" });
