@@ -6,6 +6,11 @@ import { maxSessions as knobMaxSessions } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
+// #2920: type-only (erased at runtime — no cycle despite the runtime imports
+// running the other direction); these caches anchor on the Session graph so
+// eviction frees them with the session and #2803's metering counts them.
+import type { RememberedMessages } from "./plugin.js";
+import type { SeamSlot } from "./cache-ledger.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -399,6 +404,25 @@ export type Session = {
      *  retry callbacks to correlate a transient upstream rejection with the
      *  rewrite that preceded it (#189). A fresh process has none. */
     lastCompress?: LastCompressInfo;
+    /** #2920 in-memory only (NOT persisted — buildRecord omits it): the plugin
+     *  tool API's last prepared view (rememberPluginMessages, src/plugin.ts).
+     *  Was a module-level Map keyed by session id — an evicted session's
+     *  processed/original histories lingered until the NEXT remember call and
+     *  the whole table sat outside the #2803 object-graph metering. On the
+     *  session now: eviction frees it with the session and the resident byte
+     *  budget counts it. Written under the session lock; read under the same
+     *  lock (status + tool API both gate on a resident session first). */
+    pluginRemembered?: RememberedMessages;
+    /** #2920 in-memory only (NOT persisted — buildRecord omits it): seam
+     *  forensics slots for the last sent / last settled upstream round
+     *  (noteForwardedBody / settleUsageReport, src/cache-ledger.ts). Were two
+     *  WeakMaps keyed by Session — invisible to the #2803 metering, and their
+     *  str/full strings were views/aliases pinning the FULL request backing
+     *  store behind 512 KiB diagnostic heads. On the session now: eviction
+     *  frees them with it, the budget counts them, and retained strings are
+     *  independent copies bounded by SEAM_BODY_CAP. */
+    seamLastSent?: SeamSlot;
+    seamLastSettled?: SeamSlot;
     /** Promise chain for per-session serialization. Two concurrent requests
      *  sharing a session id would interleave processTurn / stream-rewriter
      *  mutations on session.state, corrupting it. withSessionLock chains each

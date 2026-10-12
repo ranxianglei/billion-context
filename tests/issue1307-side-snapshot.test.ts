@@ -28,6 +28,12 @@ const MODEL = "claude-sonnet-4-5";
 
 test("rememberPluginMessages: a zero-overlap smaller view never evicts the snapshot (#1307)", () => {
     _resetPluginStateForTest();
+    _resetSessionsForTest();
+    // #2920: the snapshot anchors on the Session object — anchor the ids to
+    // resident sessions so rememberPluginMessages has somewhere to write.
+    getSession("iso-a");
+    getSession("iso-b");
+    getSession("iso-c");
     const msg = (id: string, text: string) => ({ id, role: "user", contentType: "text", text }) as const;
     const mainView = Array.from({ length: 8 }, (_, i) => msg(`raw-${i}`, `main ${i}`));
     // Fresh session: a 1-message view writes (no previous snapshot to protect).
@@ -66,6 +72,7 @@ test("rememberPluginMessages: a zero-overlap smaller view never evicts the snaps
     rememberPluginMessages("iso-b", [msg("b0", "solo")], [msg("b0", "solo")]);
     assert.equal(_rememberedForTest().get("iso-b")?.processed.length, 1);
     _resetPluginStateForTest();
+    _resetSessionsForTest();
 });
 
 type Rig = { proxyPort: number; upstreamPort: number; proxy: http.Server; upstream: http.Server };

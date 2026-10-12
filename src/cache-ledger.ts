@@ -155,14 +155,14 @@ interface LedgerLine {
      *  request's body (e.g. a transport retry), 0 iff it diverged. Sparse:
      *  omitted without a comparable predecessor. */
     be?: 0 | 1;
-    /** #2131: first diverging byte offset when be=0 and both full bodies were
-     *  retained under BODY_FULL_CAP. Sparse. */
+    /** #2131: first diverging byte offset when be=0 and both bodies fit
+     *  SEAM_BODY_CAP (#2920: was the 8 MiB full-retention cap). Sparse. */
     bl?: number;
     /** #2131: divergence class of a be=0 pair — "head": change within the first
      *  1 KiB (model/tools/sampling-params/system region → host-side parameter
      *  change, not a history rewrite); "append": the whole shorter payload
      *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
-     *  mid-history rewrite; "unknown": bodies above BODY_FULL_CAP (inequality
+     *  mid-history rewrite; "unknown": bodies above SEAM_BODY_CAP (inequality
      *  proven by digest, offset unavailable). Sparse. */
     bs?: "head" | "append" | "mid" | "unknown";
 }
@@ -317,20 +317,23 @@ export interface SeamEvent {
 const SEAM_BODY_CAP = 512 * 1024;
 const SEAM_EVENTS_CAP = 8;
 
-// #2131 reachability: full-body retention cap for per-call body-stability
-// forensics. Bodies above it are digest-only — SHA-256 still proves byte
-// equality/inequality, the LCP offset just becomes unavailable. 8 MiB covers
-// multi-MiB plugin-mode sessions (the #2131 log ran ~3.3 MiB outbound).
-const BODY_FULL_CAP = 8 * 1024 * 1024;
+// #2920 retired the #2131 full-body retention regime (up to 8 MiB): retaining
+// the sent payload scaled per-call memory with request size — exactly the leak
+// this issue fixes (the capped-head SlicedString pinned the whole backing
+// store, and the ≤8 MiB alias kept the payload itself alive on the session).
+// Bodies above SEAM_BODY_CAP are now digest-only: SHA-256 still proves byte
+// equality/inequality, the LCP offset just stops at the diagnostic head.
 
 /** #2131: stored body PLUS exact outbound message count. A body clipped at
  *  SEAM_BODY_CAP parses to zero messages, so count-based classification needs
  *  the count captured at the send chokepoint where the full body is in hand.
  *  `null` = unknown (wire shape without a message array). `digest` hashes the
- *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB);
- *  `full` keeps the whole payload while it fits BODY_FULL_CAP so divergent
- *  pairs can report their first-diverging byte offset. */
-interface SeamSlot {
+ *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB).
+ *  #2920: `str`/`full` are independent allocations (never views into a larger
+ *  parent string) and the slot lives on the Session graph — retention is
+ *  bounded by SEAM_BODY_CAP and dies with the session; `full` is non-null only
+ *  while the WHOLE body fits the cap (above it: digest-only). */
+export interface SeamSlot {
     str: string;
     msgs: number | null;
     digest: string;
@@ -340,8 +343,6 @@ interface SeamSlot {
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
 }
-const seamLastSent = new WeakMap<Session, SeamSlot>();
-const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
 interface ContextObservation {
@@ -407,22 +408,36 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
  *  settle re-noting the same wireBody), the earlier count is kept. `keyFp` is
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. */
+// #2920: per-code-unit mechanical copy — lone surrogates survive verbatim,
+// which a utf8 round-trip would corrupt to U+FFFD and shift byte-LCP evidence.
+function independentUtf16Copy(s: string): string {
+    return Buffer.from(s, "utf16le").toString("utf16le");
+}
+
 export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
-    const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
+    // #2920: never retain a view into a bigger parent string — V8 SlicedStrings
+    // pin the WHOLE backing store, so body.slice(0, cap) kept multi-MiB bodies
+    // alive through their 512 KiB diagnostic prefix. Under the cap the body IS
+    // the diagnostic region (no copy); above it the prefix is copied
+    // independently so per-call retention follows SEAM_BODY_CAP, not the
+    // original length.
+    const str = body.length <= SEAM_BODY_CAP ? body : independentUtf16Copy(body.slice(0, SEAM_BODY_CAP));
+    const full = body.length <= SEAM_BODY_CAP ? body : null;
     // #2131: hash the FULL body — the capped head alone cannot tell two payloads
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
-    // non-streaming settle path) reuses the prior slot's count/full instead of
-    // re-deriving them.
+    // non-streaming settle path) reuses the prior slot's count/keyFp instead of
+    // re-capturing them (full needs none: identical digest implies identical
+    // length, hence the same cap branch).
     const digest = createHash("sha256").update(body, "utf8").digest("hex");
-    const prior = seamLastSent.get(session);
+    const prior = session.seamLastSent;
     const samePayload = prior !== undefined && prior.digest === digest;
-    seamLastSent.set(session, {
+    session.seamLastSent = {
         str,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
-        full: body.length <= BODY_FULL_CAP ? body : samePayload ? prior.full : null,
+        full,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
-    });
+    };
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -555,8 +570,8 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = seamLastSent.get(session);
-    const prev = seamLastSettled.get(session);
+    const cur = session.seamLastSent;
+    const prev = session.seamLastSettled;
     let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
         f = seamLcp(prev.str, cur.str);
@@ -1145,7 +1160,7 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = seamLastSent.get(session)?.keyFp;
+    const curKeyFp = session.seamLastSent?.keyFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
@@ -1165,12 +1180,12 @@ export function settleUsageReport(
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = seamLastSent.get(session);
+    const curSlot = session.seamLastSent;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = seamLastSettled.get(session);
+            const prevSlot = session.seamLastSettled;
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1198,9 +1213,9 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = seamLastSent.get(session);
-    if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
-    seamLastSent.delete(session);
+    const seamBody = session.seamLastSent;
+    if (seamBody !== undefined) session.seamLastSettled = seamBody;
+    session.seamLastSent = undefined;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1270,7 +1285,7 @@ interface BodyStability {
     append: number;
     /** Mid-history byte change — the shape a real rewrite has. */
     mid: number;
-    /** Diverged but offset unknown (bodies above BODY_FULL_CAP, digest-only mode). */
+    /** Diverged but offset unknown (bodies above SEAM_BODY_CAP, digest-only mode). */
     unknownOffset: number;
     /** Median/min hit rate per 20K-token input-size bucket — flat across sizes argues against KV-pool capacity thrashing. */
     sizeBuckets: Array<{ lo: number; hi: number; n: number; hitMedian: number; hitMin: number }>;

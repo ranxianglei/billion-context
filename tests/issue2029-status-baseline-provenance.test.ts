@@ -15,7 +15,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import { zeroStats, _resetSessionsForTest, getSession, statusInputBaseline, type Session } from "../src/session.ts";
 import { handleAcpStatus } from "../src/acp-status.ts";
-import { handlePluginStatus, _resetPluginStateForTest, _rememberedForTest } from "../src/plugin.ts";
+import { handlePluginStatus, _resetPluginStateForTest } from "../src/plugin.ts";
 
 const WINDOW = 150000;
 
@@ -140,7 +140,7 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", ()
             const messages = twelveMessages();
             const refs = assignRefs(messages, { existing: emptyRefMap(), nextIndex: 0 });
             session.state.messageRefs = refs.map;
-            _rememberedForTest().set(session.id, { processed: messages, original: messages });
+            session.pluginRemembered = { processed: messages, original: messages };
 
             const deps = { core: createCore(), config: defaultConfig(WINDOW), log: () => {} };
             const seen = captureTokenCounts(deps.core);
