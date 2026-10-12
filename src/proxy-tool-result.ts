@@ -42,6 +42,11 @@ export interface ProxyToolResult {
     // `parse:missing-content`, `gate:cannot-anchor`) — outcome=refused alone
     // never says WHY in the [plugin] execution line.
     reason?: string;
+    // #2780: exact original for a large exported CCR retrieve, returned inline so
+    // the caller never depends on reading <stateDir>/retrieve/<ref>.txt — remote
+    // callers can't read that local path, and identical refs across sessions collide
+    // on it. Additive: `text` (the framed pointer) is unchanged.
+    retrievalExport?: { path: string; text: string };
 }
 
 export function toolOk(text: string): ProxyToolResult {

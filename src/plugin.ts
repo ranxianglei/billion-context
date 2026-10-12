@@ -1774,8 +1774,11 @@ export async function handlePluginTool(
     // this session's host owns the bili compression tools, so bind it to plugin mode
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
     // tools. Guarded: only flips a session with NO existing agent binding, never
-    // overriding a pi/omp/opencode plugin or a launcher-registered agent.
-    if (typeof session.metadata.pluginAgent !== "string") {
+    // overriding a pi/omp/opencode plugin or a launcher-registered agent. #2780: a
+    // retrieval-only call is NOT that evidence — an adapter that registers only the
+    // CCR retrieve tool must not inherit full plugin ownership and thereby suppress
+    // the proxy's own compression tooling, so the retrieve tool never triggers it.
+    if (typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session)) {
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
@@ -1795,6 +1798,9 @@ export async function handlePluginTool(
     const body: Record<string, unknown> = { ok: true, tool, conversationId };
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
+    // #2780: additive native field — the exact original for a large exported CCR
+    // retrieve, so callers never depend on reading the local export file.
+    if (result.retrievalExport !== undefined) body.retrievalExport = result.retrievalExport;
     body.result = sentResult;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(body));

@@ -169,17 +169,25 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
     recordRetrieveHit(session, ref);
-    if (result.export !== undefined && !writeRetrievalExport(result.export)) {
+    // #2780: capture the exact original once, under the session lock this runs in,
+    // so it rides back inline regardless of whether the shared export-file write
+    // succeeds or collides with another session's identical ref.
+    const exported = result.export === undefined ? undefined : { path: result.export.path, text: result.export.text };
+    if (exported !== undefined && !writeRetrievalExport(exported)) {
         // The pointer names a file we could not write — degrade to a bounded
         // head preview instead of handing the model a dead path.
-        return toolFail(`[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`);
+        const failed = toolFail(`[${retrieveToolName(session)} FAILED: could not write ${exported.path} — head preview follows]\n${result.entry.head}`);
+        failed.retrievalExport = exported;
+        return failed;
     }
     // Delivery is the tool result itself (the #1343 queued-injection
     // lifecycle is retired for CCR): the hit is delivered the moment this
     // returns, so it counts as delivered now — nothing left to queue.
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
-    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
-    return toolOk(result.toolResultText);
+    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${exported ? `, exported ${exported.path}` : ""})`);
+    const ok = toolOk(result.toolResultText);
+    if (exported !== undefined) ok.retrievalExport = exported;
+    return ok;
 }
 
 /** Host side of the kernel RetrievalExport effect: exports land under
