@@ -60,10 +60,12 @@ function chatSse(): string {
 interface MockUpstream {
     server: http.Server;
     port: number;
+    requests: { headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[];
     close(): Promise<void>;
 }
 
 async function startMockUpstream(): Promise<MockUpstream> {
+    const requests: MockUpstream["requests"] = [];
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -74,6 +76,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
                 res.end(JSON.stringify({ error: { message: "mock upstream: unsupported" } }));
                 return;
             }
+            requests.push({ headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> });
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             if (url.endsWith("/v1/messages")) res.end(anthropicSse());
             else if (url.endsWith("/responses")) res.end(responsesSse());
@@ -87,6 +90,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
     return {
         server,
         port,
+        requests,
         close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
     };
 }
@@ -181,6 +185,43 @@ function anthropicBody(): Record<string, unknown> {
 
 function chatBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
     return { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }], ...extra };
+}
+
+for (const protocol of ["responses", "anthropic", "openai"] as const) {
+    for (const pluginMode of [false, true]) {
+        test(`native OpenCode identity: ${protocol} ${pluginMode ? "plugin" : "proxy"} isolates siblings sharing parent cache affinity`, async () => {
+            const h = await startHarness();
+            const parent = "ses_native_parent";
+            const childA = "ses_native_child_a";
+            const childB = "ses_native_child_b";
+            const path = protocol === "responses" ? "/v1/responses" : protocol === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
+            const body = protocol === "responses" ? responsesBody({ prompt_cache_key: parent }) : protocol === "anthropic" ? anthropicBody() : chatBody({ prompt_cache_key: parent });
+            const headers = (id: string): Record<string, string> => ({
+                "x-opencode-session-id": id,
+                ...(id === parent ? {} : { "x-opencode-parent-session-id": parent }),
+                "x-session-affinity": parent,
+                "x-session-id": parent,
+                "x-opencode-session": parent,
+                ...(pluginMode ? { "x-bili-plugin": "opencode" } : {}),
+            });
+            try {
+                await post(h, 0, path, body, headers(parent));
+                await Promise.all([post(h, 0, path, body, headers(childA)), post(h, 0, path, body, headers(childB))]);
+                await post(h, 0, path, body, headers(parent));
+                await post(h, 0, path, body, headers(childA));
+                const sessions = await getSessions(h);
+                assert.deepEqual(new Map(sessions.map(s => [s.id, s.requests])), new Map([[parent, 2], [childA, 2], [childB, 1]]));
+                assert.equal(h.upstreams[0]!.requests.length, 5);
+                for (const request of h.upstreams[0]!.requests) {
+                    assert.equal(request.headers["x-session-affinity"], parent);
+                    assert.equal(request.headers["x-session-id"], parent);
+                    if (protocol !== "anthropic") assert.equal(request.body.prompt_cache_key, parent);
+                }
+            } finally {
+                await h.close();
+            }
+        });
+    }
 }
 
 test("e2e session identity: responses body.session_id survives bearer rotation; id is the value verbatim (#286, #280)", async () => {

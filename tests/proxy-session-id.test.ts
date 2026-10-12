@@ -90,6 +90,31 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({}), undefined);
 });
 
+test("clientConversationHeader: native OpenCode session wins over shared parent affinity", () => {
+    const headers = {
+        "x-opencode-session-id": "ses_child_a",
+        "x-opencode-parent-session-id": "ses_parent",
+        "x-session-affinity": "ses_parent",
+        "x-session-id": "ses_parent",
+        "x-opencode-session": "ses_parent",
+    };
+    assert.equal(clientConversationHeader(headers), "ses_child_a");
+    assert.equal(clientConversationHeader({ ...headers, "x-opencode-session-id": "ses_child_b" }), "ses_child_b");
+    assert.equal(clientConversationHeader({ ...headers, "x-session-affinity": "rotated-cache-affinity" }), "ses_child_a");
+});
+
+test("clientConversationHeader: blank native OpenCode ID falls back, parent ID is not an identity", () => {
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "  ", "x-session-affinity": "legacy" }), "legacy");
+    assert.equal(clientConversationHeader({ "x-opencode-parent-session-id": "ses_parent" }), undefined);
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "  ses_child  " }), "ses_child");
+});
+
+test("clientConversationHeader: marked plugin conversation keeps precedence over native OpenCode ID", () => {
+    const headers = { "x-bili-plugin-conversation": "plugin-child", "x-opencode-session-id": "native-child" };
+    assert.equal(clientConversationHeader({ ...headers, "x-bili-plugin": "opencode" }), "plugin-child");
+    assert.equal(clientConversationHeader(headers), "native-child");
+});
+
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
     // affinityToken receives only the resolved identity object
     // ({ value, source, clientProvided }) — never raw headers or the
