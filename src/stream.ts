@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -7,7 +7,7 @@ import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRa
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
-import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
+import { adoptContentStore, contentStoreOf, ccrEnabled, ccrLoopConfig, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
@@ -91,52 +91,72 @@ function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
 
-/** #1026: recovery hint appended to failed-compress receipts — the raw-ref
- *  span NOT covered by active blocks right now. Kernel errors tell the model
- *  to run acp_status; a model that retries blind keeps anchoring on refs an
- *  earlier fold already consumed (01a0b0c4, 2026-09-18: three consecutive
- *  failed compresses, two full T1 checkpoints wasted, then it gave up and
- *  let the nudge re-fire every turn). Handing the live span over kills the
- *  retry loop without another round-trip. Boundary counts ACTIVE blocks
- *  only — after a decompress (blocks inactive) the restored span shows as
- *  compressible again, which is exactly the recoverable truth. */
-export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs" | "blocks" | "deadRefs">): string {
-    const refs = Object.keys(state.messageRefs?.byRef ?? {});
-    const highest = refs.reduce((m, r) => Math.max(m, r.startsWith("m") ? Number(r.slice(1)) || 0 : 0), 0);
-    const boundary = state.blocks.reduce((m, b) => (b.active && b.endRef?.startsWith("m") ? Math.max(m, Number(b.endRef.slice(1)) || 0) : m), 0);
-    const fmt = (n: number) => `m${String(n).padStart(5, "0")}`;
-    if (highest <= boundary) {
-        const actives = state.blocks.filter((b) => b.active).map((b) => b.blockId);
-        const span = actives.length >= 2 ? ` (e.g. startId ${actives[0]}, endId ${actives[actives.length - 1]})` : "";
-        return ` No raw refs are directly compressible right now — compress a run of ACTIVE blocks instead${span}: fold their summaries into one higher-tier block. acp_status lists the current active blocks.`;
+/** #2778: LIVE eligibility source shared by the failure receipts and acp_status.
+ *  Runs processTurn read-only with the SAME call + args acp_status uses, so both
+ *  surfaces derive compressible/protected ranges from ONE result instead of two
+ *  divergent calculations. The old arithmetic hint (highest-ref minus block
+ *  boundary, #1026/#1366/#2362) advertised spans the apply-side gate
+ *  deterministically refuses — a protected tail, a covered prefix, or a
+ *  sub-minimum range — so "Retry NOW" pointed at a guaranteed refusal and turned
+ *  one bad call into a self-amplifying retry loop. processTurn is pure; the
+ *  returned state is deliberately NOT adopted here (the receipt must not mutate
+ *  session state as a side effect of reporting failure). */
+type LiveEligibilitySource = { core: CompressionCore; config: Config; messages: CoreMessage[]; session: Session };
+
+export function liveNudgeDecision(src: LiveEligibilitySource): NudgeDecision | undefined {
+    try {
+        const turn = src.core.processTurn({
+            messages: src.messages,
+            state: src.session.state,
+            config: ccrLoopConfig(src.session, src.config),
+            tokenCount: statusInputBaseline(src.session),
+            renderTags: "none",
+            contentStore: contentStoreOf(src.session),
+        });
+        return turn.nudge;
+    } catch {
+        return undefined;
     }
-    // #1366: blocks need not be contiguous — a gap below the highest block end
-    // (e.g. m05027–m05052 between two blocks) is still compressible raw space, so
-    // claiming "everything up to N is inside blocks" misleads models into skipping it.
-    const covered = boundary > 0 ? ` (refs up to ${fmt(boundary)} are largely inside active blocks; isolated free gaps may still exist below it)` : "";
-    // #2362: dead refs (the client history no longer carries their messages)
-    // can never compress — subtract them from the advertised span so a retry
-    // does not steer the model back into a doomed range (self-amplifying loop).
-    const dead = new Set<number>();
-    for (const r of state.deadRefs ?? []) {
-        const n = Number(r.replace(/\D/g, ""));
-        if (Number.isFinite(n) && n > boundary && n <= highest) dead.add(n);
+}
+
+/** #847 submit gate, shared verbatim with acp_status: a range is only worth
+ *  advertising when it clears BOTH the viability floor (>=200 tokens) and the
+ *  apply-side minCompressRange char count — otherwise the kernel atomically
+ *  rejects it and the model burns another round-trip on the refusal. */
+export function submitGatedRanges(config: Config, nudge: NudgeDecision): CompressibleRange[] {
+    const minChars = config.compress.minCompressRange;
+    return viableRanges(nudge.compressibleRanges).filter(
+        (r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars,
+    );
+}
+
+/** #2778: single-line recovery hint built from LIVE eligibility (the same source
+ *  acp_status advertises). Offers only ranges that clear the viability floor AND
+ *  the apply-side size gate, so "Retry NOW" can no longer point at a protected
+ *  tail / covered prefix / sub-minimum range. When nothing raw is eligible it
+ *  falls through to block distillation (>=2 active blocks) or an honest stop —
+ *  never a fabricated span. Stays on one line: buildVisibilityMarker keeps only
+ *  line 1 for the client ❌ marker (#1029), so no multi-line formatRanges here. */
+export function liveSpanHint(ctx: RewriteCtx): string {
+    const nudge = liveNudgeDecision(ctx);
+    if (!nudge) {
+        return ` Run acp_status to see the current compressible refs before retrying — do not guess a range.`;
     }
-    const spans: string[] = [];
-    let cursor = boundary + 1;
-    for (const d of [...dead].sort((a, b) => a - b)) {
-        if (d > cursor) spans.push(cursor === d - 1 ? fmt(cursor) : `${fmt(cursor)}–${fmt(d - 1)}`);
-        cursor = d + 1;
-        if (cursor > highest) break;
+    const ranges = submitGatedRanges(ctx.config, nudge);
+    if (ranges.length > 0) {
+        return ` Live compressible refs right now: ${ranges.map(spanText).join(", ")}. Retry NOW in this same turn using one of these exact ranges — each clears the size and protection gates.`;
     }
-    if (cursor <= highest) spans.push(cursor === highest ? fmt(cursor) : `${fmt(cursor)}–${fmt(highest)}`);
-    if (spans.length === 0) {
-        return ` No live raw refs right now: every ref between ${fmt(boundary + 1)} and ${fmt(highest)} is DEAD — the client history no longer carries those messages (host-native compaction or a bulk rewrite), so no range citing them can ever compress. Compress a run of ACTIVE blocks instead or work within your current visible context.`;
+    const actives = ctx.session.state.blocks.filter((b) => b.active).map((b) => b.blockId);
+    if (actives.length >= 2) {
+        return ` No raw refs are directly compressible right now — compress a run of ACTIVE blocks instead (startId ${actives[0]}, endId ${actives[actives.length - 1]}): fold their summaries into one higher-tier block. acp_status lists the current active blocks.`;
     }
-    const deadNote = dead.size > 0
-        ? ` Excluded as DEAD (${dead.size} ref(s) whose messages the client no longer sends — they can never compress): ${[...dead].sort((a, b) => a - b).slice(0, 4).map(fmt).join(", ")}${dead.size > 4 ? ", …" : ""}.`
-        : "";
-    return ` Live compressible refs: ${spans.join(", ")}${covered}. Retry NOW in this same turn with startId/endId inside that span.${deadNote}`;
+    return ` No compressible ranges right now — recent messages are protected and/or everything else is already folded, so nothing clears the compression gates yet. Continue the task without compressing; a range re-offers once enough new content accumulates.`;
+}
+
+function spanText(r: { startRef: string; endRef: string }): string {
+    return refNum(r.startRef) <= refNum(r.endRef)
+        ? `${r.startRef}\u2013${r.endRef}`
+        : `${r.endRef}\u2013${r.startRef}`;
 }
 
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
@@ -635,7 +655,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
             return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation.${liveSpanHint(ctx)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -746,10 +766,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
                 : "";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}${revs.length > 0 ? " [reversed refs]" : ""}]`);
-            // #1036 span hint names boundary+1..highest ("still raw") — it
-            // duplicates the snapshot's lo–hi exactly when no fold covers
-            // anything, so only append it when active blocks exist.
-            const spanHint = ctx.session.state.blocks.some((b) => b.active) ? compressibleSpanHint(ctx.session.state) : "";
+            const spanHint = liveSpanHint(ctx);
             // #1112: when the ENTIRE visible context is under the minimum, no
             // COMBINATION of ranges can succeed either (the kernel sums chars
             // across ranges against one threshold) — the generic "combine more

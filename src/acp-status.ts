@@ -3,7 +3,6 @@ import {
     countMessageTokens,
     defaultCountTokens,
     formatRanges,
-    viableRanges,
     type CompressionCore,
     type Config,
     type CoreMessage,
@@ -11,10 +10,10 @@ import {
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
-import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
+import { ccrEnabled, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
-import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
+import { compressBreakerDetail, compressLastFailureCause, liveNudgeDecision, submitGatedRanges } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
@@ -143,15 +142,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
-        const turn = ctx.core.processTurn({
-            messages: ctx.messages,
-            state: ctx.session.state,
-            config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: statusInputBaseline(ctx.session),
-            renderTags: "none",
-            contentStore: contentStoreOf(ctx.session),
-        });
-        const nudge = turn.nudge;
+        const nudge = liveNudgeDecision(ctx);
         if (nudge) {
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
@@ -165,8 +156,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
-            const minChars = ctx.config.compress.minCompressRange;
-            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+            const ranges = submitGatedRanges(ctx.config, nudge);
             const protectedRanges = nudge.protectedRanges ?? [];
             // #2451 review (v2): the table is ALWAYS reported. It is live by
             // construction — buildCompressibleRanges (kernel/src/recommend.ts)
