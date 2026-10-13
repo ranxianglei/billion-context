@@ -991,3 +991,73 @@ test("e2e: google-lane dsh side request resolves verbatim — no kernel state, n
         await once(upstream, "close");
     }
 });
+
+// #2731 follow-up: the google-lane persona gate carries the SAME empty-system
+// non-anchoring guard as the openai lane — a dsh main request with NO
+// systemInstruction rides the verbatim conversation key and never enters the
+// persona order resolver (a cold shallow history there would fork onto
+// |sub:aux). Pinned here because the gate conjunct sits on the sideRequestLike
+// line in handle.ts (lane-guard #2170).
+test("e2e: google-lane dsh persona with empty system rides verbatim — resolver never consulted (#2731)", async () => {
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }], modelVersion: "gemini-test", usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetSessionsForTest();
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const CONV = "dsh-google-empty-system";
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:generateContent`;
+    const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+    try {
+        // A dsh MAIN turn (full output budget → not a side request) with NO
+        // systemInstruction: the persona gate's personaSystemText !== "" conjunct
+        // must keep it on the verbatim key — empty system is non-anchoring.
+        const contents = Array.from({ length: 4 }, (_, i): { role: string; parts: { text: string }[] } => ({ role: i % 2 === 0 ? "user" : "model", parts: [{ text: `main-${i + 1}-` + "z".repeat(2000) }] }));
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s = peekSession(CONV);
+        assert.ok(s, "the empty-system main turn resolved onto the RAW conversation key");
+        assert.ok(Object.keys(s.state.messageRefs.byRaw).length >= 4, "refs assigned under the bare id");
+        // The exact regression shape: without the call-site guard a cold
+        // shallow history through personaConversationOrder lands on |sub:aux.
+        assert.equal(peekSession(`${CONV}|sub:aux`), undefined, "empty system must not fork onto |sub:aux");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});

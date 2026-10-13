@@ -265,7 +265,20 @@ export type Refusal = { status: number; body: unknown };
 const REFUSAL_MESSAGE =
     `dsh native compaction call refused by billion-context: bili owns compression on this lane (#1729, cf. #1772/#1206). ` +
     `A landed dsh compaction checkpoint durably shadows the raw conversation history, which destroys the proxy's compression substrate. ` +
-    `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
+    `This refusal is terminal for the session (bili_final) — the same call will be refused every time, so stop retrying (#3013: one session burned 5069 refused retries). ` +
+    `To manage context use bili's compress; to stop dsh's retry pressure disable its auto-compaction (profile recipe #2474); ` +
+    `to run dsh native compaction anyway opt in explicitly: "allowDshCompaction": true in the bili config file or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
+
+/** #3013/#3022 (A1): the refusal is a DECISION, not a transient error — dsh's
+ * retry loop is driven by its own raw pressure ledger which nothing on bili's
+ * side can shrink (#2490), so every retry of the same call fails identically.
+ * `bili_final: true` gives clients an unambiguous machine-readable terminal
+ * marker to latch and stop retrying (consumption needs dsh-upstream
+ * coordination; `retryable:false` alone did not stop the field-reported
+ * 5038-retry storm). Present at the top level of both protocol shapes and,
+ * for the openai error envelope (where `retryable` lives), inside `error`
+ * too. */
+const BILI_FINAL_FIELD = "bili_final" as const;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
  * clients render it natively). 422: a policy refusal of this one request — not
@@ -276,18 +289,29 @@ export function dshCompactionRefusal(protocol: string): Refusal {
     if (protocol === "anthropic") {
         return {
             status: 422,
-            body: { type: "error", error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
+            body: { type: "error", [BILI_FINAL_FIELD]: true, error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
         };
     }
     return {
         status: 422,
         body: {
+            [BILI_FINAL_FIELD]: true,
             error: {
                 type: "server_error",
                 code: "dsh_compaction_refused",
                 message: REFUSAL_MESSAGE,
                 retryable: false,
+                [BILI_FINAL_FIELD]: true,
             },
         },
     };
 }
+
+/** #3013/#3022 (A3): cadence for the pipeline-lane storm log. The first
+ * refusal warns once (once-warn dedup on session.metadata), then refusals are
+ * silent unless this many more arrive — the field-reported storm re-fired
+ * every ~328ms for hours with ZERO log lines after the first, leaving the
+ * user staring at a stuck "生成中" with no clue (#3013). Same cadence caps the
+ * passthrough lane's per-refusal warn so an agentless storm cannot spam the
+ * log either. Constant, not config (#2155 precedent). */
+export const DSH_REFUSAL_STORM_LOG_EVERY = 100;
