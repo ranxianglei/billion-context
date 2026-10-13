@@ -17,7 +17,7 @@ import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports,
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, retireCrossModelBaselines, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -1862,6 +1862,18 @@ async function handleRequest(
         // pre-self-heal and only for plugin sessions, so wire-mode panels fell
         // back to a hardcoded 200K.
         session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+        // #2683: a real model change between consecutive requests invalidates
+        // the billing-grade baseline measured under the previous model — retire
+        // it here, before prepare sizes the nudge and before forward() runs the
+        // preflight trigger. lastModel is only ever stamped with a known id, so
+        // an absent prev is "unknown", not a switch; same-model window moves
+        // keep the bill valid and never fire this.
+        if (reqModelId !== undefined && session.metadata.lastModel !== undefined && session.metadata.lastModel !== reqModelId) {
+            const retired = retireCrossModelBaselines(session);
+            if (retired > 0) {
+                log("warn", `[${session.id}] model switched ${session.metadata.lastModel} -> ${reqModelId} — retired cross-model input baseline (${retired} tokens billed under ${session.metadata.lastModel}); next usage report re-anchors (#2683)`);
+            }
+        }
         // #955 runtime-info: record the model id + window source for this
         // session so /__bili/plugin/status can show them pre-first-request and
         // post-hoc forensics can tell which source sized the window.
