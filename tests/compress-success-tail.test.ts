@@ -135,8 +135,11 @@ test("#2404: a rejected range keeps advertising the still-offered remainder (rec
 });
 
 test("#1387: clean success that drains every compressible range emits the stop signal (pi #521)", () => {
-    // Default preserveRecentMessages: 5 → after folding m00001–m00002 the rest
-    // (m00003–m00007) sits in the protected recent zone: nothing actionable left.
+    // Pinned preserveRecentMessages: 5 (not the kernel default — owner-tuned 3
+    // as of #3058): after folding m00001–m00002 the rest (m00003–m00007) sits
+    // in the protected recent zone: nothing actionable left. The contract under
+    // test is the stop signal, not the default tuning (that is pinned by the
+    // wire-contract golden).
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -146,7 +149,7 @@ test("#1387: clean success that drains every compressible range emits the stop s
         textMsg("raw_6", "assistant", "x".repeat(5000)),
         textMsg("raw_7", "user", "x".repeat(5000)),
     ];
-    const ctx = withRefs(makeCtx(msgs));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 5, preserveRecentTokens: 0 }));
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
@@ -213,9 +216,11 @@ test("#2029: estimate-grade baseline must not suppress the stop signal via phant
 });
 
 test("#1387: partial failure (some ranges rejected) keeps the old silent tail", () => {
-    // m00003–m00007 sit entirely in the protected recent zone under the default
-    // config; pairing that range with a valid one exercises the partial-failure
-    // gate: no stop verdict while errors are still owed an answer (pi #521).
+    // m00003–m00007 sit entirely in the protected recent zone when
+    // preserveRecentMessages is pinned to 5 (the legacy tuning this geometry
+    // was designed under, NOT the owner-tuned default 3 of #3058); pairing
+    // that range with a valid one exercises the partial-failure gate: no stop
+    // verdict while errors are still owed an answer (pi #521).
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -225,7 +230,7 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
         textMsg("raw_6", "assistant", "x".repeat(5000)),
         textMsg("raw_7", "user", "x".repeat(5000)),
     ];
-    const ctx = withRefs(makeCtx(msgs));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 5, preserveRecentTokens: 0 }));
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [
         { startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
