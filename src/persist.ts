@@ -776,9 +776,17 @@ export class SessionStore {
     private async removeLegacyFile(id: string, session: Session): Promise<void> {
         // #2671 GC parity: when the legacy file goes, the unified sidecar's
         // rows go with it (deleteSession releases CAS refcounts too).
+        await this.removeSessionFiles(id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin });
+    }
+
+    /** #2935: public disk-side teardown for explicit session deletion — same
+     *  candidate set as removeLegacyFile (unified rows + session file + CCR
+     *  content-store companion) but takes optional meta, so a non-resident id
+     *  (evicted from memory) can still be swept without a live Session. */
+    async removeSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<void> {
         this.shadow?.remove(id);
         const candidates = new Set([
-            relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+            relPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             relPathFor(id),
             flatFileNameFor(id),
         ]);
@@ -786,7 +794,7 @@ export class SessionStore {
             await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
         }
         for (const rel of [
-            contentStoreRelPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             contentStoreRelPathFor(id),
         ]) {
             await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
