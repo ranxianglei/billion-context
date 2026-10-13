@@ -892,6 +892,25 @@ export type ProxyOptions = {
      *  `{ "dsh": { "allowDshCompaction": true } }` in the config file, or env
      *  BILI_ALLOW_DSH_COMPACTION=1. */
     allowDshCompaction?: boolean;
+    /** #2612/#2728: opt-in to letting Claude Code's native compaction
+     *  (manual /compact, auto-compact, precomputed compression) run through
+     *  bili instead of being refused by the wire guard
+     *  (src/server/claude-compaction-guard.ts, the claude twin of #1729's
+     *  dsh guard). Default OFF (= guard active): a CC compaction envelope
+     *  (final user message = the CC summarize template) is refused locally
+     *  with 403 — not forwarded, kernel state untouched, CC's transcript
+     *  preserved verbatim. When ON the call is forwarded: on success CC
+     *  rewrites its transcript to the summary while bili's fold ledger still
+     *  anchors the raw history — the unannounced-rewrite desync family
+     *  (#2728) — which is why this stays off by default. The managed install
+     *  block separately sets DISABLE_AUTO_COMPACT=1 (applyClaudeManagedBlock,
+     *  "bili owns compression"), so under a bili-managed CC auto-compact does
+     *  not fire at all; the guard is the wire backstop covering manual
+     *  /compact, users who re-enabled the env, and CC installs routed through
+     *  bili without the managed block. Enable with `{ "claude": {
+     *  "allowNativeCompaction": true } }` in the config file, or env
+     *  BILI_ALLOW_CLAUDE_COMPACTION=1. */
+    allowClaudeCompaction?: boolean;
 };
 
 /** #2028: dsh client-lane settings namespace — home for dsh-specific file
@@ -1166,6 +1185,15 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
 export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
     const fileAllow = loadConfigFile().dsh?.allowDshCompaction === true;
     if (env.BILI_ALLOW_DSH_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_DSH_COMPACTION !== "0", source: "env" };
+    return { enabled: fileAllow, source: fileAllow ? "file" : null };
+}
+
+// #2612: resolved claude-native-compaction opt-in state, the claude twin of
+// allowDshCompactionState (same "0-off" env semantics; single source of truth
+// for loadOptions and future web-config consumers).
+export function allowClaudeCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
+    const fileAllow = loadConfigFile().claude?.allowNativeCompaction === true;
+    if (env.BILI_ALLOW_CLAUDE_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_CLAUDE_COMPACTION !== "0", source: "env" };
     return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
@@ -1447,6 +1475,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // #2028: default OFF keeps the #1729 wire refusal unconditional unless
         // explicitly opted out — see the Options.allowDshCompaction docstring.
         allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.dsh?.allowDshCompaction === true ? "1" : "0")) !== "0",
+        // #2612: default OFF keeps the claude compaction wire guard
+        // unconditional unless explicitly opted out — see the
+        // Options.allowClaudeCompaction docstring.
+        allowClaudeCompaction: (env.BILI_ALLOW_CLAUDE_COMPACTION ?? (fileConfig.claude?.allowNativeCompaction === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -1664,7 +1696,14 @@ type FileConfig = {
      *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
      *  Env BILI_CLAUDE_NATIVE_PORT wins over the file. */
-    claude?: { nativePort?: number };
+    claude?: { nativePort?: number; allowNativeCompaction?: boolean };
+    /** Claude-native native-compaction opt-in (#2612/#2728), the claude twin
+     *  of dsh.allowDshCompaction (#2028): `"claude": {
+     *  "allowNativeCompaction": true }` in the config file lifts bili's local
+     *  403 refusal of Claude Code native compaction requests (/compact,
+     *  auto-compact, precomputed compression — final user message carrying
+     *  the CC summarize template). Default OFF (= guard active). Env
+     *  BILI_ALLOW_CLAUDE_COMPACTION wins over the file. */
     /** Built-in pi-lane sub-agents (#2230 config-home): the `pi.subagents`
      *  section owns the acp_delegate surface for the pi lane (embedded wiring
      *  src/agent/pi-subagents.ts; the standalone package

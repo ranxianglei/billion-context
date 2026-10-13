@@ -83,8 +83,10 @@ function textOfContent(content: unknown): string {
 
 /** Text of the LAST role=user message for the messages-shaped protocols
  * (openai chat/completions, anthropic messages). Google's contents/parts
- * shape stays out of scope — dsh speaks no Google wire. */
-function lastUserMessageText(protocol: string, parsed: unknown): string | undefined {
+ * shape stays out of scope — dsh speaks no Google wire. Exported for the
+ * claude compaction twin (src/server/claude-compaction-guard.ts), which
+ * reads the same final-user slot for Claude Code's instruction template. */
+export function lastUserMessageText(protocol: string, parsed: unknown): string | undefined {
     if (parsed === null || typeof parsed !== "object") return undefined;
     const messages = (parsed as Rec).messages;
     if (!Array.isArray(messages)) return undefined;
@@ -100,8 +102,9 @@ function lastUserMessageText(protocol: string, parsed: unknown): string | undefi
 /** Text of the LAST role=user item on the Responses wire (parsed.input).
  * Items are typed objects ({type:"message", role, content: string | parts[]});
  * function_call / function_call_output / reasoning items never carry user
- * prose, so a role check plus the type guard is enough (#2360). */
-function lastResponsesInputUserText(parsed: unknown): string | undefined {
+ * prose, so a role check plus the type guard is enough (#2360). Exported for
+ * the claude compaction twin (src/server/claude-compaction-guard.ts). */
+export function lastResponsesInputUserText(parsed: unknown): string | undefined {
     if (parsed === null || typeof parsed !== "object") return undefined;
     const input = (parsed as Rec).input;
     if (!Array.isArray(input)) return undefined;

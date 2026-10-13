@@ -578,7 +578,7 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
     if (dac === undefined || dac === null || dac === "1") {
         if (dac !== "1") {
             env.DISABLE_AUTO_COMPACT = "1";
-            notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+            notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact is refused by the wire guard, #2612)");
         }
     } else {
         notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);

@@ -51,6 +51,7 @@ import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandar
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { claudeCompactionRefusal, isClaudeCompactionCall } from "./claude-compaction-guard.js";
 import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -1611,6 +1612,40 @@ async function handleRequest(
             session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;
             markDirty(session);
             const refusal = dshCompactionRefusal(protocol);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                res.writeHead(refusal.status, { "content-type": "application/json" });
+                res.end(JSON.stringify(refusal.body));
+            }
+            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+            return;
+        }
+        // #2612/#2728: Claude Code native compaction (manual /compact, precomputed
+        // compression, auto-compact when the managed DISABLE_AUTO_COMPACT=1 block
+        // is not in force) is refused the same way as the dsh twin above — but the
+        // refusal rationale is the mirror image. dsh's checkpoint landing would
+        // durably shadow the raw history; CC's compaction SUCCEEDING rewrites CC's
+        // local transcript to the summary while bili's fold ledger still anchors
+        // the raw history: an unannounced history rewrite. The three read faces
+        // split (status blocks vs what CC actually sends, search misses,
+        // decompress returns text CC can no longer place) and the session drifts
+        // into the silent-desync family (#2728). And the moment users reach for
+        // /compact is exactly when things are already broken (folds lost, context
+        // re-inflated): the envelope re-sends the FULL raw history — multi-M
+        // tokens upstream, 400 or real money — for a summary bili would have
+        // folded for free. Refusal channel = 403 API error, not text: CC's
+        // "Error during compaction" surface renders the message, the transcript
+        // stays verbatim, nothing executes. allowClaudeCompaction (config
+        // claude.allowNativeCompaction / env BILI_ALLOW_CLAUDE_COMPACTION) lifts
+        // it for users who accept that trade. Runs before the #388 side-request
+        // lane for the same reason as the dsh guard: full-budget request.
+        if (protocol !== null && opts.allowClaudeCompaction !== true && isClaudeCompactionCall(protocol, parsed)) {
+            if (session.metadata.claudeCompactionRefused !== true) {
+                session.metadata.claudeCompactionRefused = true;
+                log("warn", `[${session.id}] Claude Code native compaction call identified (final user message = CC summarize template, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a native <summary> rewrite desynchronizes CC's transcript from the fold ledger and re-sends the full raw history (#2612/#2728)`);
+            }
+            session.metadata["claudeCompactionRefusals"] = (typeof session.metadata["claudeCompactionRefusals"] === "number" ? session.metadata["claudeCompactionRefusals"] as number : 0) + 1;
+            markDirty(session);
+            const refusal = claudeCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                 res.writeHead(refusal.status, { "content-type": "application/json" });
                 res.end(JSON.stringify(refusal.body));

@@ -356,6 +356,13 @@ entries:
     group: behavior
     desc_en: "Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly)."
     desc_zh: "claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。"
+  - key: claude.allowNativeCompaction
+    type: boolean
+    default: "false"
+    env: BILI_ALLOW_CLAUDE_COMPACTION
+    group: behavior
+    desc_en: "Lift bili's local 403 refusal of Claude Code native compaction calls (manual /compact, precomputed compression, auto-compact behind a non-managed install — final user message carrying the CC summarize template) on every wire lane bili serves — anthropic natively, openai/responses behind CC-router installs (#2612/#2728): when true the call forwards; on success CC rewrites its transcript to the summary while bili's fold ledger still anchors the raw history (unannounced-rewrite desync family), so this is an explicit opt-out of bili-owned compression. Default OFF keeps the guard active; the managed install block separately sets DISABLE_AUTO_COMPACT=1 so auto-compact does not fire under a bili-managed CC."
+    desc_zh: "解除 bili 对 Claude Code 原生压缩调用的本地 403 拒绝（手动 /compact、预计算压缩、非托管安装下的 auto-compact —— 尾部 user 消息携带 CC 摘要模板），覆盖 bili 服务的全部线路 —— CC 原生走 anthropic，经 CC-router 的安装走 openai/responses（#2612/#2728）：为 true 时调用照常转发；一旦成功 CC 会把本地转录改写为摘要，而 bili 的折叠账本仍锚定原始历史（无告知改写 / 静默失同步家族），因此这是对 bili 自管压缩的显式 opt-out。默认关闭（守卫生效）；托管安装块另行设置 DISABLE_AUTO_COMPACT=1，bili 托管下的 CC 不会触发 auto-compact。"
   - key: pi.subagents
     type: "object | boolean"
     default: "{} (acp_delegate enabled with package defaults)"
