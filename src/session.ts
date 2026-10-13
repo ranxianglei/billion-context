@@ -657,32 +657,40 @@ let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
 
+/** #3050 step ①: shared retained-byte measurer for resident estimates —
+ *  counts object bytes without serializing a second copy; a reference shared
+ *  inside ONE measurement is counted once. Strings are re-counted at every
+ *  occurrence site (they are value-typed and inline in V8). */
+function measureValue(value: unknown, seen: WeakSet<object>): number {
+    if (typeof value === "string") return 32 + value.length * 2;
+    if (!value || typeof value !== "object") return 8;
+    if (seen.has(value)) return 0;
+    seen.add(value);
+    if (Buffer.isBuffer(value)) return 64 + value.byteLength;
+    let bytes = 64;
+    if (value instanceof Map) {
+        for (const [key, item] of value) bytes += measureValue(key, seen) + measureValue(item, seen) + 32;
+    } else if (value instanceof Set) {
+        for (const item of value) bytes += measureValue(item, seen) + 16;
+    } else if (Array.isArray(value)) {
+        for (const item of value) bytes += measureValue(item, seen) + 8;
+    } else {
+        for (const key of Object.keys(value)) bytes += measureValue(key, seen) + measureValue((value as Record<string, unknown>)[key], seen) + 16;
+    }
+    return bytes;
+}
+
+function measureBytes(value: unknown): number {
+    return measureValue(value, new WeakSet());
+}
+
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
 function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
-    const seen = new WeakSet<object>();
-    const size = (value: unknown): number => {
-        if (typeof value === "string") return 32 + value.length * 2;
-        if (!value || typeof value !== "object") return 8;
-        if (seen.has(value)) return 0;
-        seen.add(value);
-        if (Buffer.isBuffer(value)) return 64 + value.byteLength;
-        let bytes = 64;
-        if (value instanceof Map) {
-            for (const [key, item] of value) bytes += size(key) + size(item) + 32;
-        } else if (value instanceof Set) {
-            for (const item of value) bytes += size(item) + 16;
-        } else if (Array.isArray(value)) {
-            for (const item of value) bytes += size(item) + 8;
-        } else {
-            for (const key of Object.keys(value)) bytes += size(key) + size((value as Record<string, unknown>)[key]) + 16;
-        }
-        return bytes;
-    };
-    const bytes = size(session);
+    const bytes = measureBytes(session);
     residentWeights.set(session, { revision, bytes });
     return bytes;
 }
@@ -691,6 +699,48 @@ function residentBytes(): number {
     let bytes = 0;
     for (const session of sessions.values()) bytes += sessionWeight(session);
     return bytes;
+}
+
+type SessionMemoryBreakdown = {
+    id: string;
+    /** Whole-session estimate (one deduped pass over the object graph). */
+    total: number;
+    lastMessages: number;
+    pluginSnapshot: number;
+    blockContents: number;
+    contentStore: number;
+    state: number;
+    transient: number;
+    /** total minus the named buckets, floored at 0. Buckets are measured on
+     *  independent passes, so an object shared between two named fields
+     *  counts in BOTH — when the parts exceed total, other reads 0 rather
+     *  than going negative. */
+    other: number;
+    inFlight: number;
+};
+
+/** #3050 step ①: per-session resident split feeding GET /__bili/memory —
+ *  where do the bytes of one session actually live? Each named field is an
+ *  independent measurement pass (see SessionMemoryBreakdown.other for the
+ *  shared-reference caveat). The total is measured FRESH, not from the
+ *  eviction-budget cache: that cache is keyed on revisionEpoch and may lag
+ *  un-bumped mutations, while a diagnosis must reflect the live graph. */
+export function sessionMemoryBreakdown(session: Session): SessionMemoryBreakdown {
+    const lastMessages = measureBytes(session.lastMessages);
+    const pluginSnapshot = measureBytes(session.pluginSnapshot);
+    const blockContents = measureBytes(session.blockContents);
+    const contentStore = measureBytes(session.contentStore);
+    const state = measureBytes(session.state);
+    const transient = measureBytes(session.transient);
+    const total = measureBytes(session);
+    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - contentStore - state - transient);
+    return { id: session.id, total, lastMessages, pluginSnapshot, blockContents, contentStore, state, transient, other, inFlight: session.inFlight };
+}
+
+/** #3050 step ①: current admission limits of the resident pool (tests can
+ *  lower them via _resetSessionsForTest). */
+export function sessionPoolLimits(): { maxSessions: number; maxResidentBytes: number } {
+    return { maxSessions: MAX_SESSIONS, maxResidentBytes: MAX_RESIDENT_BYTES };
 }
 
 function makeResidentRoom(incoming = 0): void {

@@ -21,7 +21,7 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { listSessions, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
+import { listSessions, peekSession, sessionMemoryBreakdown, sessionPoolLimits, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
@@ -153,6 +153,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && req.url === "/__bili/memory") return sendMemory(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
@@ -751,6 +752,33 @@ function sendStats(res: http.ServerResponse): void {
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+}
+
+/** #3050 step ①: resident memory plane. Per-session split (lastMessages /
+ *  pluginSnapshot / blockContents / contentStore / state / transient / other)
+ *  plus pool totals and process RSS/heap/peak — the numbers that decide which
+ *  residents go lazy-load next. Loopback-only like every other admin route;
+ *  it walks live object graphs, so keep it manual (no polling). */
+function sendMemory(res: http.ServerResponse): void {
+    const sessions = listSessions().map((s) => sessionMemoryBreakdown(s));
+    const mu = process.memoryUsage();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        process: { rss: mu.rss, heapTotal: mu.heapTotal, heapUsed: mu.heapUsed, external: mu.external, arrayBuffers: mu.arrayBuffers, peakRss: readVmHwm() },
+        pool: { count: sessions.length, ...sessionPoolLimits(), residentBytes: sessions.reduce((n, s) => n + s.total, 0) },
+        sessions,
+    }, null, 2));
+}
+
+/** Peak RSS (VmHWM) from /proc on Linux; null elsewhere — Node has no
+ *  portable peak-RSS API and the V8 heap high-water is not what we want here. */
+function readVmHwm(): number | null {
+    try {
+        const m = /VmHWM:\s+(\d+)\s+kB/.exec(fs.readFileSync("/proc/self/status", "utf8"));
+        return m ? Number(m[1]) * 1024 : null;
+    } catch {
+        return null;
+    }
 }
 
 /** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
