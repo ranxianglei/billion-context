@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, coveredMessageIds } from "acp-kernel";
+import { buildStatusPanel } from "acp-kernel/panel";
 import type { Session } from "../src/session.ts";
 import { prepareCountTokens, isCountTokensRequest } from "../src/server.ts";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
@@ -193,4 +194,38 @@ test("isCountTokensRequest honors ACP_COUNT_TOKENS_PASSTHROUGH=1 escape hatch", 
         else process.env.ACP_COUNT_TOKENS_PASSTHROUGH = prev;
     }
     assert.ok(isCountTokensRequest("POST", "/v1/messages/count_tokens", true), "restored env re-enables compression");
+});
+
+// #2798 (in-passing): the count_tokens preview is forwarded to upstream for
+// measurement, so it must measure what prepareAnthropic forwards — panels and
+// ephemeral marker lines included. The main lane strips both before projection.
+test("#2798 prepareCountTokens strips ACP panels + status markers before measuring", () => {
+    const session = makeSession();
+    const core = createCore();
+    const config = defaultConfig(200000);
+    const logs: string[] = [];
+    const panel = buildStatusPanel({
+        version: "billion-context@0.1.64",
+        tokenCount: 100000,
+        systemPromptTokens: 0,
+        state: createInitialState(),
+        nudge: undefined,
+        modelContextLimit: 200000,
+    });
+    const body: AnthropicRequestBody = {
+        model: "claude-test",
+        messages: [
+            { role: "user", content: panel },
+            { role: "assistant", content: `answer\n❌ [ACP] Compression FAILED: no valid ranges parsed.` },
+            { role: "user", content: "count me" },
+        ],
+    };
+    const prepared = prepareCountTokens(body, core, config, (_l, m) => logs.push(m), session);
+    const out = JSON.parse(prepared.body.toString()) as { messages: unknown[] };
+    assert.equal(out.messages.length, 2, "panel message not measured");
+    assert.ok(!JSON.stringify(out.messages).includes("ACP Context Analysis"), "panel absent from measured payload");
+    assert.ok(!JSON.stringify(out.messages).includes("[ACP]"), "markers absent from measured payload");
+    assert.ok(logs.some((l) => /stripped 1 ACP panel message\(s\) before projection/.test(l)), "panel strip logged");
+    assert.ok(logs.some((l) => /stripped 1 ACP status marker line\(s\) from incoming history/.test(l)), "marker strip logged");
+    assert.equal(session.state.blocks.length, 0, "count_tokens stays read-only");
 });

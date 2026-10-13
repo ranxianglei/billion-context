@@ -105,6 +105,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normali
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { stripAcpPanelMessages, stripAcpStatusMarkers } from "./acp-panel.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
@@ -1969,6 +1970,16 @@ export function prepareCountTokens(
 ): Prepared {
     const sessionId = session.id;
     try {
+        // The measurement must match what prepareAnthropic forwards (#2798):
+        // upstream counts the payload the proxy would actually send.
+        const strippedPanels = stripAcpPanelMessages(parsed.messages);
+        if (strippedPanels > 0) {
+            log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+        }
+        const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
+        if (strippedMarkerLines > 0) {
+            log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+        }
         const { msgs, cacheControls } = anthropicToCore(parsed);
         // Read-only preview: same policy as the google twin above.
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });

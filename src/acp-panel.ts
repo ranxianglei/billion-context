@@ -276,3 +276,77 @@ export function stripAcpPanelResponsesInput(input: unknown): number {
     }
     return stripped;
 }
+
+// Gemini-native wire variants (#2798): contents are {role, parts: [{text}]},
+// so the messages-array strippers above are silent no-ops on /v1beta traffic
+// (no `content` field; model role is "model", not "assistant"). Same
+// whole-message panel discipline as stripAcpPanelMessages; the marker pass
+// additionally skips signature-verified thinking-family parts — Gemini
+// validates thoughtSignature byte-for-byte on replay (KDD #10), so those
+// parts are never rewritten even though they carry a text field.
+
+function googleContentText(parts: unknown): string | undefined {
+    if (!Array.isArray(parts)) return undefined;
+    let joined = "";
+    for (const part of parts) {
+        const p = part as Record<string, unknown> | null;
+        if (p === null || typeof p !== "object") return undefined;
+        if (typeof p.text !== "string") return undefined;
+        if (Object.keys(p).some((k) => k !== "text")) return undefined;
+        joined += p.text;
+    }
+    return joined;
+}
+
+// Strip ACP panel user contents from a Gemini contents array (in place);
+// returns the count removed. A content is panel-eligible only when every part
+// is a plain {text} object — any image/function/thinking/signature part makes
+// it real conversation content that must survive.
+export function stripAcpPanelGoogleContents(contents: unknown): number {
+    if (!Array.isArray(contents)) return 0;
+    let stripped = 0;
+    for (let i = contents.length - 1; i >= 0; i--) {
+        const rec = contents[i] as Record<string, unknown> | null;
+        if (rec === null || typeof rec !== "object") continue;
+        if (rec.role !== "user") continue;
+        const text = googleContentText(rec.parts);
+        if (text !== undefined && isAcpPanelText(text)) {
+            contents.splice(i, 1);
+            stripped++;
+        }
+    }
+    return stripped;
+}
+
+// Strip ACP status markers from user/model text parts of a Gemini contents
+// array (in place); returns the head-line count removed. Role-less contents
+// count as user side (the wire default). Parts are never deleted — a
+// marker-only text degrades to a single space. Block semantics (acp_status
+// head + wrapped/legacy report body, #2789) are shared verbatim with
+// stripAcpStatusMarkers above via stripAcpStatusBlocks.
+export function stripAcpStatusMarkersGoogleContents(contents: unknown): number {
+    if (!Array.isArray(contents)) return 0;
+    let stripped = 0;
+    for (const rec of contents) {
+        if (rec === null || typeof rec !== "object") continue;
+        const c = rec as Record<string, unknown>;
+        const role = c.role;
+        if (role !== "user" && role !== "model" && role !== undefined) continue;
+        const parts = c.parts;
+        if (!Array.isArray(parts)) continue;
+        for (const part of parts) {
+            if (part === null || typeof part !== "object") continue;
+            const p = part as Record<string, unknown>;
+            if (p.thought === true) continue;
+            if (p.thoughtSignature !== undefined && p.thoughtSignature !== null) continue;
+            const text = p.text;
+            if (typeof text !== "string") continue;
+            const out = stripAcpStatusBlocks(text);
+            if (out !== text) {
+                p.text = out.trim().length > 0 ? out : " ";
+                stripped += countMarkerLines(text);
+            }
+        }
+    }
+    return stripped;
+}

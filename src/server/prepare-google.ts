@@ -20,7 +20,7 @@ import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
+import { stripAcpPanelGoogleContents, stripAcpStatusMarkersGoogleContents } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
@@ -92,6 +92,18 @@ export async function prepareGoogle(
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
     const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
+    // Same incoming-history strip pass as the openai/anthropic/responses lanes:
+    // panels (#359) and ephemeral [ACP] status markers (#717/#1029) are proxy-
+    // injected artifacts, not conversation content — without this pass they
+    // ride into the compression state on every /v1beta turn (#2798).
+    const strippedPanels = stripAcpPanelGoogleContents(parsed.contents);
+    if (strippedPanels > 0) {
+        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+    const strippedMarkerLines = stripAcpStatusMarkersGoogleContents(parsed.contents);
+    if (strippedMarkerLines > 0) {
+        log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+    }
     const strippedCarriers = stripEmbeddedChainCarriers(parsed, "google");
     if (strippedCarriers > 0) {
         log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
@@ -312,6 +324,16 @@ export function prepareGoogleCountTokens(
 ): Prepared {
     const sessionId = session.id;
     try {
+        // The measurement must match what prepareGoogle forwards (#2798):
+        // upstream counts the payload the proxy would actually send.
+        const strippedPanels = stripAcpPanelGoogleContents(parsed.contents);
+        if (strippedPanels > 0) {
+            log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+        }
+        const strippedMarkerLines = stripAcpStatusMarkersGoogleContents(parsed.contents);
+        if (strippedMarkerLines > 0) {
+            log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+        }
         const { msgs } = googleToCore(parsed);
         // Read-only preview: the store rides in so placeholder substitution is
         // counted, but nothing is adopted (state is discarded here too).

@@ -1,6 +1,6 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
 import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
+import { stripAcpPanelGoogleContents, stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers, stripAcpStatusMarkersGoogleContents } from "./acp-panel.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { replaceBiliCompactionItems } from "./codex-compact.js";
@@ -101,7 +101,8 @@ interface ForkAdoptionPlan {
  *  mutations IN ORDER (compaction-echo replacement → type stamping → id
  *  sanitize → whitespace drop → panel/marker strip → chain-carrier strip)
  *  before converting with the same tool-images wrapper prepare uses; google
- *  mirrors prepareGoogle (chain-carrier strip → googleToCore). Id parity
+ *  mirrors prepareGoogle (panel/marker strip → chain-carrier strip →
+ *  googleToCore, #2798). Id parity
  *  with the kernel's processTurn input is the whole point: an id this pass
  *  misses drops a parent ref from the inheritance; an id it invents matches
  *  nothing (harmless superset). The plugin-mode mid-history sys/developer
@@ -125,6 +126,8 @@ export function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): C
         return responsesToCoreWithToolImages(clone as Parameters<typeof responsesToCoreWithToolImages>[0]).msgs;
     }
     if (protocol === "google") {
+        stripAcpPanelGoogleContents(clone.contents);
+        stripAcpStatusMarkersGoogleContents(clone.contents);
         stripEmbeddedChainCarriers(clone, "google");
         return googleToCore(clone as Parameters<typeof googleToCore>[0]).msgs;
     }
