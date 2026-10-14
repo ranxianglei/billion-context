@@ -46,6 +46,13 @@ interface AdminCtx {
      *  completed — the bind precedes it, so health must not claim readiness
      *  before discovery can find this instance. */
     bootReady: () => boolean;
+    /** #3059: stamp the watcher-churn event clock when a registration lands —
+     *  the parent-gone watchdog reads it, so a sub-tick-lifetime owner still
+     *  counts as presence even after its pid exits. */
+    noteWatcherRegistration: () => void;
+    /** #3059: watchdog sampling telemetry for /__bili/health (triage surface —
+     *  additive fields; absent values are 0 while unarmed). */
+    watchdogTelemetry: () => { lastTickAt: number; lastRegistrationAt: number };
 }
 
 // #1537: reduce a Host-header value or a URL hostname to its bare lowercase
@@ -114,7 +121,7 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
 const splitWarnedBases = new Set<string>();
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
-    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid } = ctx;
+    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, noteWatcherRegistration, watchdogTelemetry } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
     // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
@@ -191,7 +198,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers], ...watchdogTelemetry() } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -360,6 +367,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
             } else {
                 proxyWatchers.add(pid);
+                noteWatcherRegistration();
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, watchers: proxyWatchers.size }));
             }

@@ -470,6 +470,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const initialWatcherPid = Number.isInteger(parentWatchPid) && parentWatchPid > 0 && parentWatchPid !== process.pid ? parentWatchPid : null;
     const proxyWatchers = new Set<number>();
     if (initialWatcherPid !== null) proxyWatchers.add(initialWatcherPid);
+    // #3059: event-side record of watcher churn, read by the watchdog below.
+    // Short-lived CLI owners (pi -p / claude -p one-shots) register, work for
+    // less than one tick, and exit — their pids may never be sampled alive by
+    // the kill-0 loop, so "the set is empty right now" does not prove "every
+    // owner is gone". When an owner registered recently, owners are cycling
+    // and the proxy must stay up; the empty-set grace only runs once
+    // registrations have actually stopped.
+    let lastWatcherRegistrationAt = 0;
+    let lastWatcherTickAt = 0;
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -517,7 +526,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
+    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady, noteWatcherRegistration: () => { lastWatcherRegistrationAt = Date.now(); }, watchdogTelemetry: () => ({ lastTickAt: lastWatcherTickAt, lastRegistrationAt: lastWatcherRegistrationAt }) };
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -1284,6 +1293,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
         const watcher = setInterval(() => {
+            const now = Date.now();
+            lastWatcherTickAt = now;
             const dead: number[] = [];
             for (const pid of proxyWatchers) {
                 if (!isPidAlive(pid)) {
@@ -1292,15 +1303,22 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 }
             }
             if (dead.length > 0) lastDead = dead;
-            if (proxyWatchers.size > 0) {
+            // #3059: presence is judged by events too, not just by who the
+            // sampler happens to catch alive. An owner that registered within
+            // the grace window counts as present even when its pid already
+            // exited — sub-tick lifetimes are invisible to the kill-0 loop,
+            // and CI forensics showed 100 ms owner blips between 2 s ticks
+            // leaving the set observably empty for >5 s while clients were
+            // actively attached (premature self-exit mid-workload).
+            if (proxyWatchers.size > 0 || now - lastWatcherRegistrationAt < WATCHER_IDLE_GRACE_MS) {
                 idleSince = null;
                 return;
             }
             if (idleSince === null) {
-                idleSince = Date.now();
+                idleSince = now;
                 return;
             }
-            if (Date.now() - idleSince >= WATCHER_IDLE_GRACE_MS) {
+            if (now - idleSince >= WATCHER_IDLE_GRACE_MS) {
                 const reason = lastDead.length === 1 && lastDead[0] === initialWatcherPid ? `parent-gone (pid ${lastDead[0]})` : `watchers-gone (pids: ${lastDead.join(", ")})`;
                 shutdown(reason);
             }

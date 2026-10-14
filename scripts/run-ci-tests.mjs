@@ -60,6 +60,10 @@ const LIVE_FILES = [
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
+    // #3059: child proxy binds an ephemeral port (port 0); all XDG dirs and
+    // env are per-spawn isolated under tmpdir() — no fixed ports or shared
+    // state, safe at c=4 alongside the other live suites.
+    "tests/issue3059-watchdog-short-lived-owners.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
     "tests/kimi-native.test.ts",
