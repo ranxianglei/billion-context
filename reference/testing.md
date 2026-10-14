@@ -37,6 +37,16 @@ rides c=4 unreviewed.
 Scheduling only — same tests, same assertions, same env vars; local
 `npm test` is untouched.
 
+Since #3143 the `test` job also SHARDS across the matrix: each leg runs one of
+three balanced slices (`CI_TEST_SHARD="i/3"`), partitioned by
+`scripts/run-ci-tests.mjs` with deterministic LPT bin-packing over file size —
+total (union of shards == every file) and disjoint (no file in two shards), so no
+test is ever skipped and the LIVE_FILES tripwire still scans the full set in every
+shard. The suite had grown past one runner's ~c=4 ceiling (~656 files / ~190k LOC →
+~20 min wall on windows), so sharding cut the wall ~3x (~7 min) at zero coverage
+cost. Tune by editing the `shard:` list in `.github/workflows/ci.yml` AND its `/3`
+denominator together (they must stay equal).
+
 The `static-gates` job (same os×node matrix) runs typecheck + kernel suite +
 pi-subagents suite + build IN PARALLEL with the `test` job; they used to be
 sequential steps ahead of the tests (~90s of critical path per leg).

@@ -37,6 +37,14 @@ jobs:
   # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
   # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
   # on guard failure the required legs show pending (not red); merge blocked.
+  # #3143: the suite outgrew one runner — ~656 top-level files (~190k LOC) now
+  # serialize through c=4 on a single 4-core leg for ~17-20 min (windows slowest;
+  # measured 1225s on the last full green run). Sharding spreads the SAME files
+  # across more legs: each runs a balanced slice (scripts/run-ci-tests.mjs partitions
+  # deterministically + totally, so union of shards == allFiles, nothing skipped,
+  # same tests/assertions/env, c=4 within each shard). Wall drops ~3x (~20 -> ~7min)
+  # with zero coverage loss. To go faster, add entries to the list AND bump the "/3"
+  # below together (they must stay equal).
   test:
     needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
     strategy:
@@ -44,6 +52,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         node-version: [22, 24]
+        shard: [1, 2, 3]   # keep in sync with CI_TEST_SHARD "<i>/3" below
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +76,7 @@ jobs:
       - run: node scripts/run-ci-tests.mjs
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
+          CI_TEST_SHARD: "${{ matrix.shard }}/3"   # denominator MUST equal matrix.shard length
 
   # #2816: typecheck + the in-repo component suites + the bundle build used
   # to run sequentially in front of the test job (~90s of critical path per
