@@ -389,35 +389,57 @@ function renderSummary(anchor: SummaryAnchor): CoreMessage {
   };
 }
 
+/**
+ * Defense-in-depth for tool-result pairing. Pairing is by ORDER and
+ * MULTIPLICITY, never by id-set membership: host-minted tool-call ids are not
+ * guaranteed unique (a host that numbers calls `name:index` re-issues the same
+ * id on later turns), and a set cannot tell one instance from another — a
+ * result whose own call was folded into a summary then survives because a
+ * DIFFERENT call with the same id is still visible, and the wire carries a
+ * `tool` message before any assistant declares its `tool_call_id`. Strict
+ * upstreams reject that whole request with HTTP 400.
+ */
 function stripOrphanedToolResults(messages: CoreMessage[]): CoreMessage[] {
-  const knownCallIds = new Set<string>();
+  const openCalls = new Map<string, number>();
+  const kept: CoreMessage[] = [];
   for (const m of messages) {
     if (m.contentType === "tool-call" && m.toolCallId) {
-      knownCallIds.add(m.toolCallId);
+      openCalls.set(m.toolCallId, (openCalls.get(m.toolCallId) ?? 0) + 1);
+    } else if (m.contentType === "tool-result" && m.toolCallId) {
+      const open = openCalls.get(m.toolCallId) ?? 0;
+      if (open <= 0) continue;
+      openCalls.set(m.toolCallId, open - 1);
     }
+    kept.push(m);
   }
-  return messages.filter(
-    (m) =>
-      m.contentType !== "tool-result" ||
-      !m.toolCallId ||
-      knownCallIds.has(m.toolCallId),
-  );
+  return kept;
 }
 
+/**
+ * Mirror of {@link stripOrphanedToolResults} for the call side: drop tool-calls
+ * that no visible tool-result answers. Scanned from the tail so a call only
+ * claims a result that actually FOLLOWS it. `compress` calls carry their own
+ * receipt and stay regardless.
+ */
 function stripOrphanedToolCalls(messages: CoreMessage[]): CoreMessage[] {
-  const knownResultIds = new Set<string>();
-  for (const m of messages) {
+  const openResults = new Map<string, number>();
+  const kept: CoreMessage[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
     if (m.contentType === "tool-result" && m.toolCallId) {
-      knownResultIds.add(m.toolCallId);
+      openResults.set(m.toolCallId, (openResults.get(m.toolCallId) ?? 0) + 1);
+    } else if (
+      m.contentType === "tool-call" &&
+      m.toolCallId &&
+      m.toolName !== "compress"
+    ) {
+      const open = openResults.get(m.toolCallId) ?? 0;
+      if (open <= 0) continue;
+      openResults.set(m.toolCallId, open - 1);
     }
+    kept.push(m);
   }
-  return messages.filter(
-    (m) =>
-      m.contentType !== "tool-call" ||
-      !m.toolCallId ||
-      m.toolName === "compress" ||
-      knownResultIds.has(m.toolCallId),
-  );
+  return kept.reverse();
 }
 
 /**
