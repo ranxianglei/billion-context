@@ -39,6 +39,14 @@ export const WIRE_RULES: readonly WireRule[] = [
             "bili #3063 production silent failure (codex 0.162.0-alpha.17.2 through /bili/<chatgpt.com> prefix routing on bili 0.1.183+: upstream counted input tokens, produced zero output, turn ended completed; identical via --passthrough). Cross-checked against openai/codex source: codex-rs/codex-api/src/common.rs ResponseCreateWsRequest declares stream: bool as a required serialized field (no skip_serializing_if) and serializes stream_options when present; codex-rs/core/tests/suite/client_websockets.rs asserts body[\"stream\"] == true on the wire. Repair: src/responses-ws.ts re-attaches the client's transport fields at egress (egressTransportFields); supersedes WC-013's over-generalized scope for the codex lane.",
     },
     {
+        id: "WC-018",
+        wire: "openai-chat",
+        summary:
+            'openai-chat pairs assistant tool_calls with tool results BY ORDER, not by id-set membership: every role:"tool" message must be preceded by an assistant message declaring its tool_call_id, and every declared tool_calls[].id must be answered by exactly one later role:"tool" message for that id — a premature/undeclared tool result and an unanswered or double-answered declaration are both 400s',
+        provenance:
+            'bili 0.1.195/0.1.196 production traffic (upstream Kimi via the OpenAI-chat wire), two mirror 400 envelopes: \'Invalid request: tool_call_id  is not found\' — the offending body carried a role:"tool" message BEFORE the assistant message declaring that tool_call_id — and \'Invalid request: an assistant message with \\\'tool_calls\\\' must be followed by tool messages responding to each \\\'tool_call_id\\\'. The following tool_call_ids did not have response messages: send_message:1\' — an assistant tool_calls entry no later tool message answered. Trigger: DSH Agent Teams re-issues a per-tool index as the id (send_message:0 / send_message:1, list_agents:0), so one id names several distinct calls. Why half a pair reaches the wire: kernel/src/prune.ts stripOrphanedToolResults / stripOrphanedToolCalls pair by id-SET membership, not by order or multiplicity — each first collects every tool-call id (resp. every tool-result id) into one Set with position ignored, then filters — so a role:"tool" result survives whenever ANY assistant call carries its id, even one declared later or a same-id duplicate from another turn, and an assistant tool_calls survives whenever ANY earlier same-id result exists; both halves of a pair can therefore be split across turns and only one side is dropped.',
+    },
+    {
         id: "WC-016",
         wire: "anthropic",
         summary:
@@ -285,7 +293,34 @@ function validateAnthropicBody(body: unknown): string[] {
 /** WC-004 on an OpenAI chat/completions body (only function-typed entries). */
 export function validateOpenAiChatBody(body: unknown): string[] {
     const out: string[] = [];
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!isPlainObject(body)) return out;
+    // WC-018: runs before the tools early-return — tool/assistant pairing binds
+    // on any messages array. Order + multiplicity, never id-set membership:
+    // host-minted ids repeat (a name:index id names several distinct calls).
+    if (Array.isArray(body.messages)) {
+        const declared = new Map<string, number>();
+        const answered = new Map<string, number>();
+        body.messages.forEach((m, i) => {
+            if (!isPlainObject(m)) return;
+            const calls = m.role === "assistant" ? m.tool_calls : undefined;
+            if (Array.isArray(calls)) {
+                for (const tc of calls) {
+                    if (!isPlainObject(tc) || typeof tc.id !== "string") continue;
+                    declared.set(tc.id, (declared.get(tc.id) ?? 0) + 1);
+                }
+            } else if (m.role === "tool") {
+                const id = typeof m.tool_call_id === "string" ? m.tool_call_id : "";
+                const pending = (declared.get(id) ?? 0) - (answered.get(id) ?? 0);
+                if (pending <= 0)
+                    out.push(`WC-018 messages[${i}]: tool_call_id "${id}" is not declared by a preceding assistant tool_calls (upstream: "tool_call_id ${id} is not found")`);
+                else answered.set(id, (answered.get(id) ?? 0) + 1);
+            }
+        });
+        const unanswered = [...declared].filter(([id, n]) => (answered.get(id) ?? 0) < n).map(([id]) => id);
+        if (unanswered.length > 0)
+            out.push(`WC-018 messages: assistant tool_calls ids not answered by a later tool message: ${unanswered.join(", ")} (upstream: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id')`);
+    }
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
         const fn = t.function;

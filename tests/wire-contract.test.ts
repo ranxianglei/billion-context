@@ -155,6 +155,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
             { tools: [{ type: "function", function: { name: "x".repeat(65), parameters: { type: "object", properties: {} } } }] },
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
+            // WC-018: the production shape — a tool result positioned before the assistant declaring its id.
+            { messages: [{ role: "tool", tool_call_id: "send_message:0", content: "r" }, { role: "assistant", tool_calls: [{ id: "send_message:0", type: "function", function: { name: "send_message", arguments: "{}" } }] }] },
         ],
         responses: [
             { type: "response.create", input: [], stream: true },
