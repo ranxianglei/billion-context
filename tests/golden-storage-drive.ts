@@ -499,11 +499,30 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         await flushAllSessions();
         const session = store.loadSync(sessionId);
         if (!session) throw new Error(`${wire}: session not persisted`);
+        // metadata is a bookkeeping MAP, not an ordered wire artifact: which
+        // lifecycle stage inserted a key (creation-time stamps #3093/#3094 vs
+        // save-time re-stamps) is implementation churn, not render contract —
+        // pin its CONTENT with sorted keys so an insertion-order flip does not
+        // invalidate the golden (release 0.1.197 was blocked by exactly that:
+        // #3094 moved `biliVersion` from last-inserted to first-inserted and
+        // only the metadata section digest moved). state/blockContents/stats
+        // stay order-strict.
+        const sortDeep = (v: unknown): unknown => {
+            if (Array.isArray(v)) return v.map(sortDeep);
+            if (v && typeof v === "object") {
+                const out: Record<string, unknown> = {};
+                for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+                    out[k] = sortDeep((v as Record<string, unknown>)[k]);
+                }
+                return out;
+            }
+            return v;
+        };
         const lastView = JSON.stringify(canonicalize({
             state: session.state,
             blockContents: [...session.blockContents.entries()],
             stats: session.stats,
-            metadata: session.metadata,
+            metadata: sortDeep(session.metadata),
         }))
             // Ephemeral environment, not contract: the judge upstream's
             // ephemeral port and this drive's session id appear inside ledger
@@ -523,7 +542,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             state: sha256(norm(session.state)).slice(0, 16),
             blockContents: sha256(norm([...session.blockContents.entries()])).slice(0, 16),
             stats: sha256(norm(session.stats)).slice(0, 16),
-            metadata: sha256(norm(session.metadata)).slice(0, 16),
+            metadata: sha256(norm(sortDeep(session.metadata))).slice(0, 16),
         };
         const stateKeyDigests: Record<string, string> = {};
         for (const [k, v] of Object.entries(session.state as unknown as Record<string, unknown>)) {
