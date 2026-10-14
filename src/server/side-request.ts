@@ -102,28 +102,55 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
 // The caller must gate on x-bili-plugin=dsh (evidence-per-client discipline,
 // cf. dshPersonaFingerprintApplies in src/session-id.ts).
 export const DSH_TITLE_SYSTEM_PREFIX = "Create a concise title for an AI coding-assistant session";
+
+function pushBlockTexts(out: string[], blocks: unknown[]): void {
+    for (const part of blocks) {
+        if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
+            out.push((part as Record<string, unknown>).text as string);
+        }
+    }
+}
+
+// #2503 follow-up: the predicate MUST see every system carrier, not just
+// messages[role=system]. dsh's native lane resolves to the anthropic wire,
+// where the title prompt rides the TOP-LEVEL `system` field (string or
+// text-block array) while `messages` holds only the user blob; scanning
+// messages alone left the title request looking like a main turn, so it
+// claimed the raw session anchor and forked the real conversation onto a
+// |sub:<fp> ghost (#2156/#2160). Carrier list mirrors systemCarrierTexts
+// (src/server/pi-subagent-channel.ts) and estimateWireOverhead
+// (src/server/budget.ts).
+function systemCarrierTexts(p: Record<string, unknown>): string[] {
+    const out: string[] = [];
+    const sys = p.system;
+    if (typeof sys === "string") out.push(sys);
+    else if (Array.isArray(sys)) pushBlockTexts(out, sys);
+    if (typeof p.instructions === "string") out.push(p.instructions);
+    const si = p.systemInstruction;
+    if (si && typeof si === "object") {
+        const parts = (si as Record<string, unknown>).parts;
+        if (Array.isArray(parts)) pushBlockTexts(out, parts);
+    }
+    for (const key of ["messages", "input"]) {
+        const arr = p[key];
+        if (!Array.isArray(arr)) continue;
+        for (const entry of arr) {
+            if (!entry || typeof entry !== "object") continue;
+            const rec = entry as Record<string, unknown>;
+            if (rec.role !== "system" && rec.role !== "developer") continue;
+            const c = rec.content;
+            if (typeof c === "string") out.push(c);
+            else if (Array.isArray(c)) pushBlockTexts(out, c);
+        }
+    }
+    return out;
+}
+
 export function isDshTitleRequest(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
-    const msgs = p.messages;
-    if (!Array.isArray(msgs)) return false;
-    for (const m of msgs) {
-        if (!m || typeof m !== "object" || (m as Record<string, unknown>).role !== "system") continue;
-        const c = (m as Record<string, unknown>).content;
-        let text = "";
-        if (typeof c === "string") {
-            text = c;
-        } else if (Array.isArray(c)) {
-            for (const part of c) {
-                if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-                    text += (part as Record<string, unknown>).text as string;
-                }
-            }
-        }
-        if (text.startsWith(DSH_TITLE_SYSTEM_PREFIX)) return true;
-    }
-    return false;
+    return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have

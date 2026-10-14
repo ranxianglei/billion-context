@@ -54,7 +54,10 @@ async function harness() {
             req.on("end", () => {
                 forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({ id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }));
+                const anthropicWire = (req.url ?? "").includes("/messages");
+                res.end(JSON.stringify(anthropicWire
+                    ? { id: "msg_test", type: "message", role: "assistant", model: "fake-a", content: [{ type: "text", text: "answer" }], stop_reason: "end_turn", usage: { input_tokens: 10000, output_tokens: 10 } }
+                    : { id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }));
             });
         });
         server.listen(0, "127.0.0.1", () => resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.close(); } }));
@@ -71,10 +74,16 @@ async function harness() {
         const response = await fetch(`${origin}/bili/${upstream.url}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify(body) });
         assert.equal(response.status, 200, await response.text());
     };
+    const dshSendAnthropic = async (conversationId: string, body: Record<string, unknown>, agent?: string) => {
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId };
+        if (agent !== undefined) headers["x-bili-plugin-agent"] = agent;
+        const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify(body) });
+        assert.equal(response.status, 200, await response.text());
+    };
     const sessionIds = async () => ((await (await fetch(origin + "/__bili/sessions")).json()) as { sessions: { id: string }[] }).sessions.map((s) => s.id);
     const subSessions = async (prefix: string) => (await sessionIds()).filter((id) => id.startsWith(prefix + "|sub:"));
     const status = async (conversationId: string) => (await (await fetch(`${origin}/__bili/plugin/status?conversationId=${conversationId}`)).json()) as { contextTokens: number | null; inputTokens: number };
-    return { forwarded, dshSend, subSessions, status, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
+    return { forwarded, dshSend, dshSendAnthropic, subSessions, status, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
 }
 
 test("dsh alpha.2 title sidecar rides the #388 passthrough under the raw key (no |sub: ghost)", async () => {
@@ -114,6 +123,47 @@ test("dsh alpha.2 title sidecar rides the #388 passthrough under the raw key (no
         assert.equal(statusAfter.contextTokens, statusBefore.contextTokens, "sidecar must not touch the context estimate");
         assert.ok(!JSON.stringify(session.pluginSnapshot).includes(DSH_TITLE_SYSTEM_PREFIX), "title instruction never lands in the kernel session");
         assert.deepEqual(await h.subSessions("conv1"), [], "still no |sub: ghost after anchoring");
+    } finally {
+        await h.close();
+    }
+});
+
+// #2503 follow-up: dsh's native lane resolves to the ANTHROPIC wire, where the title
+// prompt rides the TOP-LEVEL `system` field and `messages` holds only the user
+// blob. The original #2503 predicate scanned messages[role=system] only, so on
+// this wire the sidecar still looked like a main turn: it claimed the raw
+// anchor with the title system prompt and the real conversation forked onto a
+// persisted |sub:<fp> ghost (one DSH session listed TWICE in the Web UI).
+test("dsh alpha.2 title sidecar on the anthropic wire keeps the raw key — no |sub: ghost (#2503 follow-up)", async () => {
+    const h = await harness();
+    try {
+        const history = [
+            { role: "user", content: "set up the workspace" },
+            { role: "assistant", content: "done" },
+        ];
+        // 1. title sidecar first, anthropic shape: budget 4096, no tools, no
+        //    agent header, system at the top level (nothing in messages[]).
+        const t1Body = { model: "fake-a", max_tokens: 4096, system: TITLE_SYSTEM, messages: [{ role: "user", content: `[${JSON.stringify(history)}]` }] };
+        await h.dshSendAnthropic("conv-anthropic", t1Body);
+        assert.deepEqual(h.forwarded.at(-1), t1Body, "title sidecar forwarded verbatim on the anthropic wire");
+        assert.deepEqual(await h.subSessions("conv-anthropic"), [], "the anthropic sidecar mints no |sub: ghost");
+        const sideSession = resolveConversation("conv-anthropic").session;
+        assert.equal(sideSession?.stats.requests ?? 0, 0, "the sidecar claims no anchor and runs no kernel request");
+
+        // 2. first real main turn — real top-level system + tools; it must claim
+        //    the raw key rather than fork behind a title-prompt anchor.
+        const mainBody = {
+            model: "fake-a",
+            max_tokens: 8192,
+            system: MAIN_SYSTEM,
+            messages: [...history, { role: "assistant", content: "ok" }, { role: "user", content: "now configure ci" }],
+            tools: [{ name: "bash", description: "run a command", input_schema: { type: "object", properties: {} } }],
+        };
+        await h.dshSendAnthropic("conv-anthropic", mainBody, "main");
+        const session = resolveConversation("conv-anthropic").session;
+        assert.ok(session, "raw-key session exists");
+        assert.equal(session.stats.requests, 1, "the main turn runs the full pipeline exactly once on the raw key");
+        assert.deepEqual(await h.subSessions("conv-anthropic"), [], "the main conversation stays on the raw key — no |sub:<fp> ghost");
     } finally {
         await h.close();
     }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { demoteGate, isSideRequest, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
+import { demoteGate, DSH_TITLE_SYSTEM_PREFIX, isDshTitleRequest, isSideRequest, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 
 // #2170 measure 1: exhaustive truth-table pin for the two extracted lane
 // decision functions. These tables ARE the regression net: any future edit to
@@ -122,3 +122,32 @@ test("isSideRequest: dsh auto-review shape over the Responses wire stays off the
     assert.equal(isSideRequest({ max_output_tokens: 384_000 }, undefined), false);
     assert.equal(isSideRequest({}, undefined), false);
 });
+
+// #3149: the dsh title sidecar is a LANE input, and every wire carries its
+// system text differently — dsh's native lane resolves to anthropic (title text
+// in the TOP-LEVEL system field, messages[] holds only the user blob) while
+// #2503 covered the OpenAI carrier only (messages[role=system]). This table
+// pins every carrier the predicate must read, plus the closures that keep a
+// main turn out of the lane. The lane-guard job (#2170) demands this land with
+// the gate edit.
+const TITLE_TEXT = `${DSH_TITLE_SYSTEM_PREFIX} from the supplied human messages.`;
+const TITLE_CARRIER_ROWS: [string, Record<string, unknown>, boolean][] = [
+    ["openai: messages system string", { messages: [{ role: "system", content: TITLE_TEXT }, { role: "user", content: "hi" }] }, true],
+    ["openai: messages system parts array", { messages: [{ role: "system", content: [{ type: "text", text: TITLE_TEXT }] }] }, true],
+    ["openai: developer-role carrier", { messages: [{ role: "developer", content: TITLE_TEXT }] }, true],
+    ["anthropic: top-level system string", { system: TITLE_TEXT, messages: [{ role: "user", content: "[]" }] }, true],
+    ["anthropic: top-level system text-block array", { system: [{ type: "text", text: TITLE_TEXT }], messages: [{ role: "user", content: "[]" }] }, true],
+    ["responses: top-level instructions", { instructions: TITLE_TEXT, input: [{ role: "user", content: "hi" }] }, true],
+    ["responses: input system entry", { input: [{ role: "system", content: TITLE_TEXT }] }, true],
+    ["google: systemInstruction parts", { systemInstruction: { parts: [{ text: TITLE_TEXT }] }, contents: [{ role: "user", parts: [{ text: "hi" }] }] }, true],
+    ["anthropic: no title text", { system: "MAIN SYSTEM", messages: [{ role: "user", content: "[]" }] }, false],
+    ["anthropic: a tool-carrying main turn is vetoed", { tools: [{ name: "bash" }], system: TITLE_TEXT, messages: [{ role: "user", content: "[]" }] }, false],
+    ["no system carrier at all", { messages: [{ role: "user", content: "hi" }] }, false],
+];
+
+test("isDshTitleRequest: every wire's system carrier is read (the #3149 anthropic blind spot)", () => {
+    for (const [name, body, want] of TITLE_CARRIER_ROWS) {
+        assert.equal(isDshTitleRequest(body), want, name);
+    }
+});
+

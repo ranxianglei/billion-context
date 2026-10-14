@@ -51,6 +51,45 @@ test("isDshTitleRequest accepts parts-array system content", () => {
     assert.equal(isDshTitleRequest(body), true);
 });
 
+// #2503 follow-up: dsh's native lane resolves to the anthropic wire, where the title
+// prompt rides the TOP-LEVEL `system` field and `messages` carries only the
+// user blob. Scanning messages alone let the sidecar claim the raw anchor and
+// fork the real conversation onto a |sub:<fp> ghost (#2156/#2160).
+function dshAnthropicTitleBody(extra: Record<string, unknown> = {}) {
+    return {
+        model: "fake-a",
+        max_tokens: 4096,
+        system: TITLE_SYSTEM,
+        messages: [{ role: "user", content: `[{"seq":8,"text":"hello"}]` }],
+        ...extra,
+    };
+}
+
+test("isDshTitleRequest matches the anthropic wire (top-level system string)", () => {
+    assert.equal(isDshTitleRequest(dshAnthropicTitleBody()), true);
+});
+
+test("isDshTitleRequest matches a top-level system text-block array", () => {
+    assert.equal(isDshTitleRequest(dshAnthropicTitleBody({ system: [{ type: "text", text: TITLE_SYSTEM }] })), true);
+});
+
+test("isDshTitleRequest matches the responses/google system carriers", () => {
+    assert.equal(isDshTitleRequest({ model: "fake-a", max_output_tokens: 4096, instructions: TITLE_SYSTEM, input: [{ role: "user", content: "hi" }] }), true);
+    assert.equal(isDshTitleRequest({ model: "fake-a", systemInstruction: { parts: [{ text: TITLE_SYSTEM }] }, contents: [{ role: "user", parts: [{ text: "hi" }] }] }), true);
+});
+
+test("isDshTitleRequest matches a developer-role carrier inside messages", () => {
+    const body = dshAnthropicTitleBody({ system: undefined, messages: [{ role: "developer", content: TITLE_SYSTEM }, { role: "user", content: "hi" }] });
+    assert.equal(isDshTitleRequest(body), true);
+});
+
+test("isDshTitleRequest stays closed on the anthropic wire (no title, or a tool-carrying turn)", () => {
+    assert.equal(isDshTitleRequest(dshAnthropicTitleBody({ system: "MAIN OPERATING SYSTEM" })), false);
+    assert.equal(isDshTitleRequest(dshAnthropicTitleBody({ tools: [{ name: "bash", input_schema: { type: "object" } }] })), false);
+    assert.equal(isDshTitleRequest({ model: "fake-a", system: TITLE_SYSTEM }), true, "a bare system carrier is still a title carrier");
+    assert.equal(isDshTitleRequest({ model: "fake-a", messages: [{ role: "user", content: "hi" }] }), false);
+});
+
 test("resolveSideLane: sideIntent=true still resolves the verbatim side lane (reason string unchanged)", () => {
     const r = resolveSideLane({ countTokens: false, responsesCompact: false, protocol: "openai", stripApplied: false, sideIntent: true, requestAgent: undefined });
     assert.equal(r.lane, "side");
