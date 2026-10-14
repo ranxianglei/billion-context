@@ -64,9 +64,12 @@ test("forceEnabled parses BILI_TEST_FORCE truthy/opt-out table", () => {
 
 test("resolveLockPath mirrors paths.ts cacheDir() under XDG_CACHE_HOME", () => {
     const dir = "/tmp/x/cache-home";
+    // Both sides resolve the XDG value (paths.ts xdg() and resolveLockPath do),
+    // so the expectation must use resolve too — on win32 a POSIX-style value
+    // resolves against the current drive, where join() would not (#3166 review).
     assert.equal(
         lck.resolveLockPath({ XDG_CACHE_HOME: dir } as NodeJS.ProcessEnv),
-        join(dir, "billion-context", "test-suite.lock"),
+        resolve(dir, "billion-context", "test-suite.lock"),
     );
     assert.ok(
         lck.resolveLockPath({} as NodeJS.ProcessEnv).startsWith(join(homedir(), ".cache")),
