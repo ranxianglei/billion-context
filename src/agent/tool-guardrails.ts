@@ -229,14 +229,17 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     const bashTimeout = opts.bashTimeout ?? DEFAULT_TOOL_BASH_TIMEOUT;
     const maxBytes = opts.maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
 
+    // #3166 review: events may carry no context at all (harnesses fire
+    // session_shutdown with undefined; hosts omit ctx on shutdown paths) —
+    // every ctx read below stays null-safe instead of crashing the plugin.
     pi.on("tool_call", (event, rawCtx) => {
-        const ctx = rawCtx as unknown as GuardrailCtx;
+        const ctx = rawCtx as unknown as GuardrailCtx | undefined;
         const e = event as unknown as ToolCallEventLike;
         if (isBashToolCall(e)) {
             const t = resolveBashTimeout(e.input, bashTimeout);
             if (t !== undefined) e.input.timeout = t;
         }
-        if (!repCfg.enabled) return;
+        if (!ctx || !repCfg.enabled) return;
         const sid = ctx.sessionManager?.getSessionId?.() ?? "";
         let tracker = trackers.get(sid);
         if (!tracker) {
@@ -283,12 +286,12 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     });
 
     pi.on("input", (event, rawCtx) => {
-        const ctx = rawCtx as unknown as GuardrailCtx;
+        const ctx = rawCtx as unknown as GuardrailCtx | undefined;
         if ((event as unknown as { source?: string }).source === "extension") return;
-        trackers.get(ctx.sessionManager?.getSessionId?.() ?? "")?.reset();
+        trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.reset();
     });
     pi.on("session_shutdown", (_e, rawCtx) => {
-        const ctx = rawCtx as unknown as GuardrailCtx;
-        trackers.delete(ctx.sessionManager?.getSessionId?.() ?? "");
+        const ctx = rawCtx as unknown as GuardrailCtx | undefined;
+        trackers.delete(ctx?.sessionManager?.getSessionId?.() ?? "");
     });
 }
