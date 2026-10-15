@@ -227,6 +227,12 @@ export interface LauncherDeps {
      *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
     resolveAttachExternal?: () => boolean;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
+    /** Spawn-poll discovery of the instance this launch started. The
+     *  single proxy-origin file is last-writer-wins, so a concurrent lane
+     *  launch can leave it naming another lane's live proxy; the registry
+     *  is per-instance and still identifies our own child by pid.
+     *  Default: discoverLiveInstances. */
+    discoverInstances?: () => ProxyInstanceFile[];
     spawnImpl?: SpawnFn;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -2808,6 +2814,7 @@ export async function ensureProxyRunning(
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
+    const discoverInstances = deps.discoverInstances ?? discoverLiveInstances;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -3032,6 +3039,18 @@ export async function ensureProxyRunning(
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
+            }
+            // A concurrent launch of another lane overwrites the single
+            // proxy-origin pointer, so that file can name a live proxy that is
+            // not ours. The registry is per-instance, and our own child is the
+            // entry whose pid matches — the file view cannot vouch for either
+            // child when two lanes start together.
+            const own = child.pid === undefined
+                ? undefined
+                : discoverInstances().find((live) => live.pid === child.pid);
+            if (own !== undefined && (await probeHealth(own.origin, fetchImpl))) {
+                settleZonePort(own.port);
+                return { origin: own.origin, port: own.port, child, logPath };
             }
             // Fallback for a child that cannot write the instance file (broken
             // state dir) or an old pre-handshake binary: only trust the preferred

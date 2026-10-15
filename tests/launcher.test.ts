@@ -978,6 +978,49 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     assert.ok(probes >= 2);
 });
 
+test("ensureProxyRunning: finds its own child when a concurrent lane overwrote proxy-origin", async () => {
+    const spawnImpl: SpawnFn = () => makeFakeChild(42499);
+    const fetchImpl = async (url: string) => ({ ok: url.includes("18799") });
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "dsh-dev" },
+        {
+            fetchImpl,
+            spawnImpl,
+            sleep: () => Promise.resolve(),
+            // The single pointer belongs to a DIFFERENT lane's live launch.
+            readInstanceFile: () => ({
+                origin: "http://127.0.0.1:18790",
+                instanceId: "other-lane",
+                pid: 1,
+                startedAt: 1,
+                host: "127.0.0.1",
+                port: 18790,
+                passthrough: false,
+                mitmDomains: [],
+                modelWindows: {},
+                launchToken: "other-launch-token",
+                lane: "dsh-prod",
+            }),
+            // The registry still identifies OUR child by pid.
+            discoverInstances: () => [{
+                origin: "http://127.0.0.1:18799",
+                instanceId: "our-lane",
+                pid: 42499,
+                startedAt: 2,
+                host: "127.0.0.1",
+                port: 18799,
+                passthrough: false,
+                mitmDomains: [],
+                modelWindows: {},
+                lane: "dsh-dev",
+            }],
+        },
+    );
+    assert.equal(handle.origin, "http://127.0.0.1:18799");
+    assert.equal(handle.port, 18799);
+    assert.equal(handle.attached, undefined);
+});
+
 test("ensureProxyRunning: throws when never healthy within deadline", async () => {
     const fetchImpl = async () => ({ ok: false });
     const spawnImpl: SpawnFn = () => makeFakeChild(42422);
