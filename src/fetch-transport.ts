@@ -9,6 +9,10 @@ export function withFetchTransport<T>(transport: FetchTransport, run: () => T): 
     return transports.run(transport, run);
 }
 
+export function withoutFetchTransport<T>(run: () => T): T {
+    return transports.exit(run);
+}
+
 export function currentFetchTransport(): FetchTransport | undefined {
     return transports.getStore();
 }

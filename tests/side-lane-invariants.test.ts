@@ -14,6 +14,7 @@ import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts"
 import { _resetSessionsForTest, listSessions, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import * as ac from "../src/async-compress.ts";
 
 // #2170 measure 2: behavioral invariants of the #388 side lane, on the dsh
 // plugin wire (the host whose regression started this — #2156/#2157/#2164).
@@ -30,7 +31,11 @@ const testRoot = mkdtempSync(join(tmpdir(), "bili-side-inv-"));
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 
-async function harness() {
+const FORK_MARK = "Background compression pass (job ";
+const ASYNC_SUMMARY = "ASYNC-SIDE-SUMMARY: the early main turns repeated the main-turn filler text.";
+type ForkReply = (forkBody: string) => Record<string, unknown>;
+
+async function harness(forkReply?: ForkReply) {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -40,12 +45,22 @@ async function harness() {
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
+    const forks: string[] = [];
     const upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
         const server = http.createServer((req, res) => {
             const chunks: Buffer[] = [];
             req.on("data", (c: Buffer) => chunks.push(c));
             req.on("end", () => {
-                forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+                const raw = Buffer.concat(chunks).toString("utf8");
+                const parsed = JSON.parse(raw) as Record<string, unknown>;
+                const items = (parsed.messages ?? parsed.input ?? []) as unknown[];
+                if (forkReply && JSON.stringify(items.slice(-1)).includes(FORK_MARK)) {
+                    forks.push(raw);
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify(forkReply(raw)));
+                    return;
+                }
+                forwarded.push(parsed);
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify(req.url?.endsWith("/chat/completions")
                     ? { id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }
@@ -64,10 +79,10 @@ async function harness() {
         return { status: r.status, body: await r.json() };
     };
     // dsh-shaped request sender (anthropic wire: system TOP-LEVEL, messages replay raw)
-    const dshSend = async (conversationId: string, msgs: unknown[], agent: string | undefined, system: string, maxTokens = 1024) => {
+    const dshSend = async (conversationId: string, msgs: unknown[], agent: string | undefined, system: string, maxTokens = 1024, extra: Record<string, unknown> = {}) => {
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId };
         if (agent !== undefined) headers["x-bili-plugin-agent"] = agent;
-        const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: maxTokens, stream: false, system, messages: msgs }) });
+        const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: maxTokens, stream: false, system, messages: msgs, ...extra }) });
         assert.equal(response.status, 200, await response.text());
     };
     // dsh-shaped request sender (responses wire: instructions is the system carrier)
@@ -76,7 +91,7 @@ async function harness() {
         const response = await fetch(`${origin}/bili/${upstream.url}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_output_tokens: maxTokens, instructions, input }) });
         assert.equal(response.status, 200, await response.text());
     };
-    return { request, forwarded, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
+    return { request, forwarded, forks, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
 }
 
 const mainMsg = (n: number) => ({ role: "user", content: `main turn ${n} `.repeat(120) });
@@ -341,4 +356,131 @@ test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)",
         /\b(resolveSideLane|demoteGate|SideLaneDecision|demotedSide|sideRequestLike|SIDE_REQUEST_MAX_TOKENS|isSideRequest|stripLeakedBiliTools|hasLeakedBiliToolsOnly|restoreOutputBudget|sideRequestGuard)\b/,
         "relay.ts must stay decoupled from the side-lane engine symbols",
     );
+});
+
+function refsOf(body: string): string[] {
+    const ids: string[] = [];
+    const re = /\x3cacp[^\x3e]*\x3e\s*(m\d+)\s*\x3c\/acp\x3e/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(body)) !== null) if (!ids.includes(m[1]!)) ids.push(m[1]!);
+    return ids;
+}
+
+async function until(cond: () => boolean, what: string, ms = 5000, detail?: () => string): Promise<void> {
+    const end = Date.now() + ms;
+    while (!cond()) {
+        if (Date.now() > end) throw new Error(`timed out waiting for ${what}${detail ? ` (${detail()})` : ""}`);
+        await new Promise((r) => setTimeout(r, 5));
+    }
+}
+
+const forkCompress: ForkReply = (body) => {
+    const msgs = (JSON.parse(body) as { messages: unknown[] }).messages;
+    const refs = refsOf(JSON.stringify(msgs.slice(0, -1)));
+    assert.ok(refs.length >= 4, `fork body carries refs (${refs.length})`);
+    return { id: "msg_fork", role: "assistant", content: [{ type: "tool_use", id: "toolu_fork", name: "compress", input: { content: [{ startId: refs[0], endId: refs[2], summary: ASYNC_SUMMARY }] } }], stop_reason: "tool_use", usage: { input_tokens: 9000, output_tokens: 40 } };
+};
+
+const TOOLS = { tools: [{ name: "compress", description: "compress", input_schema: { type: "object", properties: { content: {} } } }, { name: "bash", description: "run", input_schema: { type: "object", properties: { command: { type: "string" } } } }] };
+
+const sideShapes = (history: unknown[]) => [
+    { label: "title-gen (declared side agent)", msgs: [...history, { role: "user", content: "Generate a title." }], agent: "title" as string | undefined, system: "You generate short titles.", maxTokens: 1024 },
+    { label: "tiny budget (no agent header)", msgs: [...history, { role: "user", content: "summarize" }], agent: undefined, system: "MAIN OPERATING SYSTEM", maxTokens: 64 },
+];
+
+test("(I) background compression ignores side requests: no capture, apply or note on the side lane; the next main request does each", async () => {
+    ac.configureAsyncCompress({});
+    try {
+        const h = await harness(forkCompress);
+        try {
+            const conv = "async-side";
+            const base = [mainMsg(0), { role: "assistant", content: "a0" }, mainMsg(1), { role: "assistant", content: "a1" }, mainMsg(2), { role: "assistant", content: "a2" }, mainMsg(3)];
+            await h.dshSend(conv, base, "main", "MAIN OPERATING SYSTEM", 256, TOOLS);
+            const session = resolveConversation(conv).session!;
+            const sessionIds0 = listSessions().map((s) => s.id).sort();
+            const state = ac._asyncCompressStateForTest();
+
+            const queued = ac.triggerAsyncCompress(session)!.text;
+            const job = state.jobs.get(session.id)!;
+            assert.equal(job.phase, "awaiting-capture");
+            const withResult = [...base,
+                { role: "assistant", content: [{ type: "tool_use", id: "toolu_q", name: "compress", input: { content: [] } }] },
+                { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_q", content: queued }] }];
+
+            // (I-1) side requests that replay the trigger result must not capture the job
+            const requests0 = session.stats.requests;
+            const rev0 = ((await h.request("/__bili/plugin/snapshot?conversationId=" + conv)).body as { parentRevision: string }).parentRevision;
+            for (const side of sideShapes(withResult)) {
+                const hits = h.forwarded.length;
+                await h.dshSend(conv, side.msgs, side.agent, side.system, side.maxTokens);
+                assert.equal(h.forwarded.length, hits + 1, `${side.label}: reaches the upstream once`);
+                const sent = JSON.stringify(h.forwarded.at(-1));
+                assert.ok(sent.includes(job.tag), `${side.label}: the forwarded side body does carry the trigger result`);
+                assert.ok(!sent.includes(FORK_MARK) && !sent.includes(ac.ASYNC_COMPRESS_TOOL_NOTE.trim().slice(0, 60)), `${side.label}: no directive or async tool note`);
+                assert.equal(h.forks.length, 0, `${side.label}: no background request`);
+                assert.equal(state.jobs.get(session.id), job, `${side.label}: same job still pending`);
+                assert.equal(job.phase, "awaiting-capture", `${side.label}: not captured`);
+            }
+            assert.equal(state.jobs.size, 1, "no job under any other key");
+            assert.deepEqual(listSessions().map((s) => s.id).sort(), sessionIds0, "side requests mint no session");
+            assert.equal(resolveConversation(conv).session, session, "the conversation stays bound to the main session");
+            assert.equal(session.stats.requests, requests0, "side requests do not count as main requests");
+            assert.equal(((await h.request("/__bili/plugin/snapshot?conversationId=" + conv)).body as { parentRevision: string }).parentRevision, rev0, "snapshot unchanged");
+
+            // positive control: the main request carrying the same result captures it
+            await h.dshSend(conv, withResult, "main", "MAIN OPERATING SYSTEM", 256, TOOLS);
+            await until(() => job.phase === "ready", "the job to become ready", 5000, () => `phase=${job.phase} forks=${h.forks.length} jobs=${state.jobs.size} note=${state.notes.get(session.id)?.text ?? ""}`);
+            assert.equal(h.forks.length, 1, "exactly one background request");
+
+            // (I-2) a side request must not apply the ready result
+            const blocks0 = structuredClone(session.state.blocks);
+            const refs0 = structuredClone(session.state.messageRefs);
+            const afterResult = [...withResult, { role: "assistant", content: "a3" }, mainMsg(4)];
+            for (const side of sideShapes(afterResult)) {
+                await h.dshSend(conv, side.msgs, side.agent, side.system, side.maxTokens);
+                assert.deepEqual(h.forwarded.at(-1), { model: "claude-test", max_tokens: side.maxTokens, stream: false, system: side.system, messages: side.msgs }, `${side.label}: the side body is forwarded exactly as the client sent it`);
+                assert.ok(!JSON.stringify(h.forwarded.at(-1)).includes(ASYNC_SUMMARY), `${side.label}: no summary on the side wire`);
+                assert.deepEqual(session.state.blocks, blocks0, `${side.label}: no block committed`);
+                assert.deepEqual(session.state.messageRefs, refs0, `${side.label}: refs untouched`);
+                assert.equal(state.jobs.get(session.id), job, `${side.label}: result still pending`);
+                assert.equal(job.phase, "ready");
+            }
+            // positive control: the next main request applies it
+            await h.dshSend(conv, afterResult, "main", "MAIN OPERATING SYSTEM", 256, TOOLS);
+            assert.equal(session.state.blocks.filter((b) => b.active).length, 1, `applied on the main request (jobs=${state.jobs.size} phase=${job.phase} note=${state.notes.get(session.id)?.text ?? /did not apply \(([^)]*)\)/.exec(JSON.stringify(h.forwarded.at(-1)))?.[1] ?? "none"})`);
+            assert.ok(JSON.stringify(h.forwarded.at(-1)).includes(ASYNC_SUMMARY), "the main wire carries the summary");
+            assert.equal(state.jobs.size, 0, "job consumed");
+
+            // (I-3) an owed note must not ride a side request
+            const queued2 = ac.triggerAsyncCompress(session)!.text;
+            const tag2 = state.jobs.get(session.id)!.tag;
+            const declined = [...afterResult,
+                { role: "assistant", content: [{ type: "tool_use", id: "toolu_q2", name: "compress", input: { content: [] } }] },
+                { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_q2", content: queued2 }] }];
+            const res = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv, "x-bili-plugin-agent": "main" },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 256, stream: false, system: "MAIN OPERATING SYSTEM", messages: declined, ...TOOLS, context_management: { edits: [{ type: "clear_tool_uses_20250919" }] } }) });
+            assert.equal(res.status, 200, await res.text());
+            assert.equal(state.jobs.size, 0, "the non-replayable capture is declined");
+            const note = state.notes.get(session.id);
+            assert.ok(note && note.text.includes(tag2), "a note is owed");
+            const noteNeedle = `job ${tag2} did not apply`;
+            const nextTurn = [...declined, { role: "assistant", content: "a4" }, mainMsg(5)];
+            for (const side of sideShapes(nextTurn)) {
+                await h.dshSend(conv, side.msgs, side.agent, side.system, side.maxTokens);
+                assert.ok(!JSON.stringify(h.forwarded.at(-1)).includes(noteNeedle), `${side.label}: note not attached`);
+                assert.equal(state.notes.get(session.id), note, `${side.label}: note still owed`);
+            }
+            // positive control: the next main request carries it exactly once
+            await h.dshSend(conv, nextTurn, "main", "MAIN OPERATING SYSTEM", 256, TOOLS);
+            assert.ok(JSON.stringify(h.forwarded.at(-1)).includes(noteNeedle), "the main request carries the note");
+            assert.equal(state.notes.get(session.id), undefined, "note consumed");
+            await h.dshSend(conv, [...nextTurn, { role: "assistant", content: "a5" }, mainMsg(6)], "main", "MAIN OPERATING SYSTEM", 256, TOOLS);
+            assert.ok(!JSON.stringify(h.forwarded.at(-1)).includes(noteNeedle), "and not again");
+        } finally {
+            await h.close();
+        }
+    } finally {
+        ac.configureAsyncCompress(false);
+        ac.disposeAsyncCompress("test end");
+    }
 });

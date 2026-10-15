@@ -7,6 +7,8 @@ import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import type { SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
+import { isPluginFoldCallId } from "./plugin-fold-callid.js";
+import { asyncCompressEnabled, isAsyncCompressTrigger, supersedeAsyncCompress, triggerAsyncCompress } from "./async-compress.js";
 
 // Re-exported for callers that historically imported it here; the canonical
 // home is the leaf module (kept import-graph-light for display surfaces).
@@ -34,6 +36,14 @@ function withOptionalSummaries(input: unknown): unknown {
 
 /** Called under the host session lock; generation is separate from kernel commit. */
 export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
+    if (!asyncCompressEnabled()) return applyCompressionNow(input, ctx, callId, signal);
+    if (isAsyncCompressTrigger(input)) return triggerAsyncCompress(ctx.session, isPluginFoldCallId(callId) ? undefined : callId) ?? applyCompressionNow(input, ctx, callId, signal);
+    const result = await applyCompressionNow(input, ctx, callId, signal);
+    if ((result.blocksCreated ?? 0) > 0) supersedeAsyncCompress(ctx.session);
+    return result;
+}
+
+async function applyCompressionNow(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
     if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).

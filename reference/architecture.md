@@ -114,6 +114,9 @@ billion-context/
 │   ├── external-summary-runtime.ts # Configured candidate plan and shared executor
 │   ├── external-summary-compress.ts # External summary fold coordinator and state checks
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
+│   ├── plugin-fold-callid.ts     # Plugin-fold synthetic callId prefix + predicate (leaf helper)
+│   ├── google-model-path.ts      # Gemini model id from the request URL path (leaf helper)
+│   ├── async-compress.ts         # Internal-only delayed same-model compress fork (inert unless configureAsyncCompress() is called)
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)

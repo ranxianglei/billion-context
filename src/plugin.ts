@@ -12,6 +12,7 @@ import { acquireInFlight, createSession, getSession, publishForkSession, diagnos
 import { clientConversationHeader } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
+import { withAsyncCompressTools } from "./async-compress.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
@@ -68,6 +69,7 @@ import { awaitDrain } from "./server/stream-io.js";
 import { incomingCoreMessages } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
+import { PLUGIN_FOLD_CALLID_PREFIX } from "./plugin-fold-callid.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
 // via tsx and bundled via tsup). Shown in the /acp panel header, aligned with
@@ -127,14 +129,7 @@ const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
-/** #1567: folds executed through POST /__bili/plugin/tool are minted this
- *  synthetic callId, which the client can never echo back — its own re-sent
- *  compress pair is the summary carrier for such blocks, so the kernel's
- *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
-const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
-export function isPluginFoldCallId(callId: string | undefined): boolean {
-    return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
-}
+export { isPluginFoldCallId } from "./plugin-fold-callid.js";
 
 const VERSION = (() => {
     try {
@@ -830,13 +825,13 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
     const externalSummary = externalSummaryEnabled(config);
-    const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
-    const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
+    const acpAnthropic = withAsyncCompressTools(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary));
+    const acpOpenai = withAsyncCompressTools(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary));
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary);
+    const acpResponses = withAsyncCompressTools(withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,

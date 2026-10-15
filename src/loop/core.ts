@@ -3,6 +3,7 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
@@ -41,6 +42,7 @@ import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
+import { asyncCompressEnabled, observeOutboundSend } from "../async-compress.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -175,6 +177,9 @@ export interface LoopCtx {
     compressMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
+    /** Prepare-time kernel offer for async-compress suggestions only. Deliberately not `lastNudge`: this ctx is
+     *  also handed to applyRanges, whose receipt must keep the loop path's live recompute. */
+    asyncOffer?: NudgeDecision;
     proxyUrl?: string;
     /** #2809: diagnostic-only — the proxy the auto chain would have picked
      *  while default-direct mode ran this session's upstream directly. Names
@@ -229,6 +234,8 @@ export interface RequestOptions {
      *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
      *  the body, so a signature computed for an earlier round is stale. */
     resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** The armed re-sign lane is active (a re-sent body needs a fresh signature). */
+    signed?: boolean;
 }
 
 // #1960: one round's assistant message parts, in STREAM order. The rebuilt
@@ -463,7 +470,10 @@ export async function* runCompressLoop(
                 });
             }
         }
-        return fetchWithRetry(
+        const asyncSettle = asyncCompressEnabled()
+            ? observeOutboundSend(ctx.session, { url: requestOptions.url, headers: requestOptions.headers, body: wireBodyStr, proxyUrl: ctx.proxyUrl, protocol: ctx.protocol, messages: ctx.compressMessages ?? ctx.messages, signed: requestOptions.signed === true, config: ctx.config, offer: ctx.asyncOffer })
+            : undefined;
+        const sent = fetchWithRetry(
             requestOptions.url,
             {
                 method: "POST",
@@ -481,6 +491,8 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
+        if (asyncSettle) sent.then((r) => asyncSettle(r.response.status), (err: unknown) => asyncSettle(err instanceof UpstreamHttpError ? err.status : undefined));
+        return sent;
     };
 
     // #1455: single adoption point for every loop-originated upstream body so

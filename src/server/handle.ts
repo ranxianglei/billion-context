@@ -64,6 +64,7 @@ import { handleIncrementalTurn, INCREMENTAL_TURN_PATH } from "../incremental-lan
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { applyReadyAsyncCompress, asyncCompressEnabled, attachAsyncNote } from "../async-compress.js";
 
 export async function handle(
     req: http.IncomingMessage,
@@ -2107,6 +2108,10 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                if (asyncCompressEnabled() && !countTokens && !responsesCompact && prepared && !prepared.sidePassthrough && applyReadyAsyncCompress(session, {
+                    core, config: reqConfig, protocol: prepared.protocol, upstreamUrl: forwardUpstreamUrl(req, opts, route), model: requestModel,
+                    originalMessages: prepared.originalMessages, processedMessages: prepared.processedMessages, log: (m) => log("info", `[${session.id}] ${m}`),
+                })) prepared = await runPrepare();
                 // #2607: prepare just assigned numeric refs to this turn's new
                 // messages (archivable media folds by default) — archive their
                 // pixels before preflight or the model can fold them away.
@@ -2230,6 +2235,7 @@ async function handleRequest(
                         gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
+                if (asyncCompressEnabled() && !countTokens && !responsesCompact && !prepared!.sidePassthrough) prepared!.body = attachAsyncNote(prepared!, session, prepared!.protocol, prepared!.body);
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };

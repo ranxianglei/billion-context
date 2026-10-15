@@ -57,6 +57,7 @@ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, outboundContextEstimates, repairResponsesAssistantOrdering, resignSettingsFor, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { asyncCompressEnabled, observeOutboundSend, settleAsyncNote } from "../async-compress.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -589,6 +590,9 @@ export async function forward(
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
         throw new Error(`upstream circuit open: ${circuitBlock}`);
     }
+    const asyncSettle = asyncCompressEnabled() && prepared?.session && !prepared.sidePassthrough && req.method === "POST"
+        ? observeOutboundSend(prepared.session, { url: upstreamUrl, headers, body: typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"), proxyUrl, protocol: prepared.protocol, messages: prepared.originalMessages, signed: resignCtx !== undefined, config, offer: prepared.nudge })
+        : undefined;
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
         upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -609,6 +613,7 @@ export async function forward(
         // [#1343] no response means the attached full text never reached the model —
         // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
+        asyncSettle?.(undefined);
         throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
@@ -884,6 +889,8 @@ export async function forward(
         }
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
+    asyncSettle?.(upstream.status);
+    if (prepared) settleAsyncNote(prepared, upstream.ok);
     // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
     // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is
     // already out to the agent, so a failure must be observable + correctable, not silent.
@@ -1504,9 +1511,9 @@ export async function forward(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, asyncOffer: prepared.nudge, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, signed: resignCtx !== undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
