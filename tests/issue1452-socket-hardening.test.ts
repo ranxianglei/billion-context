@@ -400,7 +400,14 @@ test("retired stall guard: mid-stream silence survives any short window even wit
             },
         );
         req.end(STREAM_BODY);
-        await new Promise((r) => setTimeout(r, 2000));
+        // Poll for the first byte instead of a fixed 2s sleep: on loaded CI
+        // runners the first byte can legitimately take longer (observed flake,
+        // windows shard 2026-10-15, rerun green); a real non-streaming bug
+        // still fails here at the 15s deadline.
+        const firstByteDeadline = Date.now() + 15_000;
+        while (seen.length === 0 && Date.now() < firstByteDeadline) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
         assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);

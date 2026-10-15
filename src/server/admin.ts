@@ -6,7 +6,7 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
-import { applyCompressSettings } from "../compress-settings.js";
+import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
@@ -317,7 +317,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }));
+        // #3243: pass the pack surface's tool descriptions too — resolved from the SAME
+        // global settings (no route/model context exists at manifest time), so registered
+        // tool descriptions follow the top-level promptPack while per-request system prompts
+        // may still honor deeper provider/model levels.
+        const packSurface = resolveCompressSurfaceDetailed(opts.compress ?? {});
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);

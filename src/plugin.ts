@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -803,7 +803,7 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
-export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
     // proxy's config leaves disabled guarantees a rejected call the moment the
@@ -813,6 +813,12 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
     // #1359: the advertised name is the base-config toolName, matching the
     // plugin-lane gate (which adjudicates the same base block).
+    // #3243: toolPrompts is the pack surface's tool descriptions, resolved by the
+    // caller from the GLOBAL compress settings — the manifest has no route/model
+    // context (hosts fetch it before any request arrives), so provider/model-level
+    // promptPack still shapes each request's system prompt while registered tool
+    // descriptions follow the top-level pack only. Applied exactly like the wire
+    // injector (applyAcpToolOverrides on the ACP core arrays before extras merge).
     const absorbOn = absorbEnabled(config);
     const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
     const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
@@ -830,13 +836,13 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
     const externalSummary = externalSummaryEnabled(config);
-    const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
-    const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
+    const acpAnthropic = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary);
+    const acpOpenai = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary);
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary);
+    const acpResponses = withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
