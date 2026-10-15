@@ -198,8 +198,9 @@ test("#841 cold-loaded historical session: read-only, file untouched, no save sc
         _setStoreForTest(reader);
 
         const allFiles: string[] = [];
-        for (const d of readdirSync(dir)) {
-            if (!d.startsWith(".")) for (const f of readdirSync(path.join(dir, d))) allFiles.push(path.join(dir, d, f));
+        for (const d of readdirSync(dir, { withFileTypes: true })) {
+            // the unified store keeps index.db (+WAL siblings) at the top level (#2772) — only session subdirectories hold files
+            if (!d.name.startsWith(".") && d.isDirectory()) for (const f of readdirSync(path.join(dir, d.name))) allFiles.push(path.join(dir, d.name, f));
         }
         assert.ok(allFiles.length > 0, "session file must exist");
         const before = allFiles.map((f) => readFileSync(f, "utf8"));
