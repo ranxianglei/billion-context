@@ -12,7 +12,7 @@ import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { recordConflict } from "../conflict-watch.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { detectDshLocalCompactionCheckpoint, storedDshCheckpointFingerprint, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
@@ -138,16 +138,32 @@ export async function prepareGoogle(
         // checkpoint framing in resent history AND decimated fold coverage;
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
+        // #3033: set when the detector recognized a REPLAY of the checkpoint the
+        // last rebase already consumed — the rewrite is witnessed, not silent, so
+        // the unannounced-rewrite path must not re-classify it either.
+        let dshReplaySuppressed = false;
         if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            const dshCheckpoint = dshGap
+                ? detectDshLocalCompactionCheckpoint(msgs, undefined, storedDshCheckpointFingerprint(session.metadata))
+                : null;
+            if (dshGap && dshCheckpoint) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    if (dshCheckpoint.suppressed) {
+                        // #3033: replay of the checkpoint the last rebase already
+                        // consumed — another reset would only destroy the accepted
+                        // fold and manufacture the next detection.
+                        dshReplaySuppressed = true;
+                        log("info", `[${sessionId}] dsh native compaction replay suppressed (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint unchanged since the last rebase) — ACP state left intact (#3033)`);
+                    } else {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                        session.metadata.dshCompactionFingerprint = dshCheckpoint.fingerprint;
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
+                    }
                 }
             }
         }
@@ -205,8 +221,10 @@ export async function prepareGoogle(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
-        // deactivated the blocks whose sources left the context.
-        {
+        // deactivated the blocks whose sources left the context. #3033: skipped
+        // when the detector recognized a REPLAY of the checkpoint the last rebase
+        // already consumed — that rewrite is witnessed, not silent.
+        if (!dshReplaySuppressed) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);

@@ -28,7 +28,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { conflictEventsOf } from "../src/conflict-watch.ts";
-import { carriesDshLocalCompactionSummary, DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
+import { carriesDshLocalCompactionSummary, dshCheckpointFingerprint, detectDshLocalCompactionCheckpoint, normalizeDshCheckpointText, DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
 
 const MODEL = "deepseek-flash";
 const NUDGE_PREFIX = "This is an efficiency nudge";
@@ -137,6 +137,13 @@ function checkpointMessage() {
 
 const FOLD_SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
 
+/** A retained-tail message: deterministic (so every turn re-sends the SAME raw
+ *  id) and large enough that a post-replay compress of the pair clears the
+ *  kernel's 5000-char minimum. */
+function retainedTail(label: string) {
+    return { role: "user", content: `Retained tail ${label} after the native compaction. ` + `FILLER_${label}_content_`.repeat(230) };
+}
+
 async function seedAndFold(rig: Rig, conv: string): Promise<void> {
     const r1 = await fetch(chatUrl(rig), {
         method: "POST",
@@ -238,6 +245,10 @@ test("e2e #2432: dsh replaying [checkpoint, retained tail] rebases the ACP state
         assert.ok(boundary, "native-compaction boundary recorded");
         assert.equal(boundary?.pendingRebase, false, "rebase consumed within the same request");
         assert.ok(s.metadata.nativeCompactionAt, "nativeCompactionAt recorded by the reset");
+        // #3033: the reset persists WHICH checkpoint it consumed, so the
+        // re-minted replay of that same compaction stops re-firing the detector.
+        assert.equal(typeof s.metadata.dshCompactionFingerprint, "string", "rebase records the consumed checkpoint's fingerprint");
+        assert.equal(s.metadata.dshCompactionFingerprint, dshCheckpointFingerprint(checkpointMessage().content), "…of exactly the checkpoint that landed");
         // #2592/F5: 3 re-seeded entries + the pinned ref floor.
         assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 4, "refs re-seeded onto exactly the compacted view (checkpoint + 2 retained + ref-floor)");
 
@@ -454,6 +465,171 @@ test("#2432: per-turn nudge injection goes quiet while the compress breaker is a
         assert.equal(r.status, 200);
         await r.text();
         assert.ok(!rig.bodies[rig.bodies.length - 1].includes(NUDGE_PREFIX), "armed session: the nudge that would invite failing compresses is suppressed");
+    } finally {
+        await rig.close();
+    }
+});
+
+// ---------- #3033: a replay of the already-consumed checkpoint must not re-rebase ----------
+
+/** A checkpoint summary that CITES prior refs the way real ones do — "summaries
+ *  cite tags across turns" (kernel contract) — so its text carries bili's own
+ *  render tags. A #2432 rebase re-issues those numbers, which is exactly what
+ *  made the #3033 detector re-fire forever: same compaction, fresh message id. */
+function checkpointCiting(refs: string[], prose = "The work established the harness, drove one fold, and then dsh compacted natively."): { role: string; content: string } {
+    const citations = refs.map((r) => `\x3cacp tokens="1" type="text"\x3e${r}\x3c/acp\x3e`).join(" ");
+    return {
+        role: "user",
+        content: `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation so far, as context for continuing. ${prose} Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## Primary Request and Intent\n- drive a fold, then replay the compacted view\n- earlier context: ${citations}`,
+    };
+}
+
+test("unit #3033: the checkpoint fingerprint survives ref re-minting (the loop's root cause)", () => {
+    const gen1 = checkpointCiting(["m00002", "m00005"]).content;
+    const gen2 = checkpointCiting(["m00007", "m00011"]).content; // same compaction, re-minted numbering
+    assert.notEqual(gen1, gen2, "the re-minted checkpoint is a DIFFERENT message — a fresh id, so the novelty gate stays open");
+    assert.equal(dshCheckpointFingerprint(gen1), dshCheckpointFingerprint(gen2), "…but the SAME compaction: the fingerprint ignores the numbering churn");
+    assert.equal(normalizeDshCheckpointText(gen1).includes("m00002"), false, "normalization strips the volatile ref numbers");
+    assert.notEqual(
+        dshCheckpointFingerprint(gen1),
+        dshCheckpointFingerprint(checkpointCiting(["m00002"], "a later, different compaction").content),
+        "different content ⇒ different fingerprint — the suppression is per-compaction, never blanket");
+});
+
+test("unit #3033: detect reports suppressed ONLY for the checkpoint the last rebase consumed", () => {
+    const replay = checkpointCiting(["m00007"]).content;
+    const hit = detectDshLocalCompactionCheckpoint([{ id: "fresh", role: "user", contentType: "text", text: replay }], new Set(["old"]), dshCheckpointFingerprint(checkpointCiting(["m00002"]).content));
+    assert.ok(hit, "the re-minted replay still passes the carrier + novelty gates");
+    assert.equal(hit!.suppressed, true, "…and is recognized as the already-rebased checkpoint");
+    assert.equal(carriesDshLocalCompactionSummary([{ id: "fresh", role: "user", contentType: "text", text: replay }], new Set(["old"]), dshCheckpointFingerprint(checkpointCiting(["m00002"]).content)), false, "a suppressed replay reads false to the boolean wrapper");
+    assert.equal(detectDshLocalCompactionCheckpoint([{ id: "fresh", role: "user", contentType: "text", text: replay }], new Set(["old"]), dshCheckpointFingerprint(checkpointCiting(["m00009"], "an unrelated compaction").content))!.suppressed, false, "a DIFFERENT checkpoint is not suppressed");
+    assert.equal(detectDshLocalCompactionCheckpoint([{ id: "fresh", role: "user", contentType: "text", text: replay }], new Set(["old"]))!.suppressed, false, "no stored fingerprint ⇒ never suppressed");
+});
+
+/** Drive one full #2432 rebase (iteration 1), let the session keep running on
+ *  the rebuilt generation, and re-establish a live fold there — the sustain
+ *  condition of the field loop (66 detections, not one). Returns the refs the
+ *  new fold covers plus the refs of the retained tail (still citable after a
+ *  suppressed replay, which is what proves no second reset happened). */
+async function rebaseThenRefold(rig: Rig, conv: string): Promise<{ foldStart: string; foldEnd: string; tailStart: string; tailEnd: string }> {
+    await seedAndFold(rig, conv);
+    const gen1 = checkpointCiting(["m00002", "m00005"]);
+    const r1 = await fetch(chatUrl(rig), {
+        method: "POST",
+        headers: dshHeaders(conv),
+        // brand-new tail: the field signature is retained=0 — the replayed view
+        // shares NO id with the pre-compaction fold.
+        body: JSON.stringify({ model: MODEL, messages: [gen1, retainedTail("A"), retainedTail("B")] }),
+    });
+    assert.equal(r1.status, 200);
+    await r1.text();
+    const s1 = getSession(conv)!;
+    assert.equal(conflictEventsOf(s1).filter((e) => e.kind === "native-compaction").length, 1, "iteration 1 rebases and records exactly one native-compaction entry");
+    assert.equal(s1.metadata.dshCompactionFingerprint, dshCheckpointFingerprint(gen1.content), "the rebase persists the consumed checkpoint's fingerprint");
+
+    // The session keeps running on the rebuilt generation: the client resends
+    // the compacted view and the conversation continues on top of it (blocks
+    // are empty right after the reset, so no rewrite is misread here), and the
+    // agent compresses again — the fold the next replay must not destroy.
+    const grown = [
+        gen1,
+        retainedTail("A"),
+        retainedTail("B"),
+        ...seedInput(),
+    ];
+    const reseed = await fetch(chatUrl(rig), {
+        method: "POST",
+        headers: dshHeaders(conv),
+        body: JSON.stringify({ model: MODEL, messages: grown }),
+    });
+    assert.equal(reseed.status, 200);
+    await reseed.text();
+    // byRaw maps rawId → refId; the VALUES are the refs in first-seen order, so
+    // the rebase's re-based view comes first (floor + the re-anchored turn) and
+    // the messages that landed after it take the last refs.
+    const vals = Object.values(getSession(conv)!.state.messageRefs.byRaw);
+    const fresh = vals.slice(-14);
+    const foldStart = fresh[0];
+    const foldEnd = fresh[8];
+    assert.ok(/^m\d{5}$/.test(foldStart) && /^m\d{5}$/.test(foldEnd), `post-rebase refs available (${foldStart}..${foldEnd} of ${vals.length})`);
+    assert.equal(Number(foldEnd.slice(1)) - Number(foldStart.slice(1)), 8, "the folded run is contiguous");
+    const refold = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId: conv, tool: "compress", args: { content: [{ startId: foldStart, endId: foldEnd, summary: FOLD_SUMMARY }] } }),
+    });
+    const refoldJson = (await refold.json()) as { ok: boolean; result?: string };
+    assert.ok(refoldJson.ok, `post-rebase fold accepted (${refold.status})`);
+    assert.ok(!refoldJson.result?.includes("[Compression FAILED"), `post-rebase fold succeeded: ${refoldJson.result?.slice(0, 200)}`);
+    assert.ok(getSession(conv)!.state.blocks.length > 0, "the rebuilt generation carries a live fold — the detector path is armed");
+    return { foldStart, foldEnd, tailStart: vals[2], tailEnd: vals[3] };
+}
+
+test("e2e #3033: the loop's SECOND iteration — a re-minted replay of the already-rebased checkpoint does not reset again", async () => {
+    const rig = await startRig({ injectTool: true, injectNudge: false });
+    const conv = "dshc-openai-replay";
+    try {
+        const { foldStart, foldEnd, tailStart, tailEnd } = await rebaseThenRefold(rig, conv);
+        // Iteration 2: the SAME compaction replayed with its citations re-minted
+        // by the rebase's ref re-issue — a fresh id, identical normalized content.
+        const r2 = await fetch(chatUrl(rig), {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({ model: MODEL, messages: [checkpointCiting(["m00007", "m00011"]), retainedTail("A"), retainedTail("B")] }),
+        });
+        assert.equal(r2.status, 200, "the re-minted replay is served");
+        await r2.text();
+
+        const s2 = getSession(conv)!;
+        assert.equal(conflictEventsOf(s2).filter((e) => e.kind === "native-compaction").length, 1, "NO second rebase — the loop is broken (#3033)");
+        assert.equal(conflictEventsOf(s2).filter((e) => e.kind === "unannounced-rewrite").length, 0, "the replay is a WITNESSED rewrite, not a silent one");
+        // A second rebase would resetImageFullState(createInitialState()) and wipe
+        // the ref space (that re-issue is what manufactures the next detection);
+        // the refs the post-rebase fold used must still be citable.
+        assert.ok(foldStart in s2.state.messageRefs.byRef && foldEnd in s2.state.messageRefs.byRef, `the ref space was NOT restarted (${foldStart}..${foldEnd} still citable) — no second reset (#3033)`);
+
+        // The session keeps working afterwards (and its refs stay citable): the
+        // conversation continues on the rebuilt generation, pushing the retained
+        // tail out of the kernel's protected zone so the agent can compress it.
+        const r3 = await fetch(chatUrl(rig), {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({ model: MODEL, messages: [checkpointCiting(["m00007", "m00011"]), retainedTail("A"), retainedTail("B"), ...Array.from({ length: 6 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `Post-replay message ${i}. ` + `FILLER_post_${i}_content_`.repeat(230) }))] }),
+        });
+        assert.equal(r3.status, 200, "post-replay turn succeeds");
+        await r3.text();
+        // The recovery mechanism is ref stability: the retained tail is still
+        // citable, so the agent's next compress anchors instead of failing
+        // "cannot be anchored" (the #2432 spiral).
+        const compress = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: conv, tool: "compress", args: { content: [{ startId: tailStart, endId: tailEnd, summary: FOLD_SUMMARY }] } }),
+        });
+        const compressJson = (await compress.json()) as { ok: boolean; result?: string };
+        assert.ok(compressJson.ok && !compressJson.result?.includes("[Compression FAILED"), `post-replay compress is answerable: ${compressJson.result?.slice(0, 200)}`);
+    } finally {
+        await rig.close();
+    }
+});
+
+test("control #3033: a replay of a DIFFERENT checkpoint still rebases (suppression is per-fingerprint)", async () => {
+    const rig = await startRig({ injectTool: true, injectNudge: false });
+    const conv = "dshc-openai-replay-control";
+    try {
+        await rebaseThenRefold(rig, conv);
+        // A genuinely NEW compaction: different prose ⇒ different fingerprint.
+        const fresh = checkpointCiting(["m00007", "m00011"], "A later compaction covering different ground.");
+        const r2 = await fetch(chatUrl(rig), {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({ model: MODEL, messages: [fresh, retainedTail("A"), retainedTail("B")] }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const s = getSession(conv)!;
+        assert.equal(conflictEventsOf(s).filter((e) => e.kind === "native-compaction").length, 2, "a DIFFERENT checkpoint still rebases");
+        assert.equal(s.metadata.dshCompactionFingerprint, dshCheckpointFingerprint(fresh.content), "and the rebase persists ITS fingerprint");
     } finally {
         await rig.close();
     }

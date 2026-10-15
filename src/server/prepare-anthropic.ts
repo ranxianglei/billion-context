@@ -12,7 +12,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { detectDshLocalCompactionCheckpoint, storedDshCheckpointFingerprint, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -192,17 +192,39 @@ export async function prepareAnthropic(
         // detectUnannouncedHistoryRewrite below). Title-gen side requests are
         // skipped like on the openai lane (same tiny-budget heuristic).
         let dshRebased = false;
+        // #3033: set when the detector recognized a REPLAY of the checkpoint the
+        // last rebase already consumed — the rewrite is witnessed, not silent, so
+        // the unannounced-rewrite path must not re-classify it either.
+        let dshReplaySuppressed = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
         if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            // #3033: the rebased-checkpoint fingerprint suppresses a REPLAY of
+            // the checkpoint this session already rebased onto (its ids were
+            // re-minted by that rebase's ref re-issue — see the guard).
+            const dshCheckpoint = dshGap
+                ? detectDshLocalCompactionCheckpoint(msgs, undefined, storedDshCheckpointFingerprint(session.metadata))
+                : null;
+            if (dshGap && dshCheckpoint) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
-                    markNativeCompactionBoundary(session);
-                    dshRebased = reconcileNativeCompactionBoundary(session);
+                    if (dshCheckpoint.suppressed) {
+                        // #3033: the state was already rebased onto this exact
+                        // checkpoint. The id churn is the rebase's own ref
+                        // re-issue, so another reset would only destroy the fold
+                        // the client already accepted and manufacture the next
+                        // detection; order-centric reconcileFoldCoverage below
+                        // re-anchors the churned-but-same messages instead.
+                        dshReplaySuppressed = true;
+                        log("info", `[${sessionId}] dsh native compaction replay suppressed (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint unchanged since the last rebase) — ACP state left intact (#3033)`);
+                    } else {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                        session.metadata.dshCompactionFingerprint = dshCheckpoint.fingerprint;
+                        markNativeCompactionBoundary(session);
+                        dshRebased = reconcileNativeCompactionBoundary(session);
+                    }
                 }
             }
         }
@@ -267,7 +289,10 @@ export async function prepareAnthropic(
         // (#2432/#2658): it is already recorded as "native-compaction" and
         // rebased — a second "unannounced-rewrite" entry beside it would present
         // the substrate destruction as "another compressor fighting you".
-        if (!dshRebased) {
+        // #3033: equally skipped when the detector recognized a REPLAY of the
+        // checkpoint the last rebase already consumed — that rewrite is
+        // witnessed, not silent.
+        if (!dshRebased && !dshReplaySuppressed) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 // #2709: attribute a framing-absent rewrite to client-native compaction when bili witnessed the client's own compaction being refused — stops the phantom-second-compressor errand.

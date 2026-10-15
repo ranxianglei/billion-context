@@ -51,6 +51,8 @@
  * ("step compaction failed: <message>; continuing the turn").
  */
 
+import { createHash } from "node:crypto";
+
 /** Stable opening sentence of dsh's COMPACTION_INSTRUCTION template
  * (verbatim from @deepseek-ai/dsh-compaction-basic, tracked per dsh release
  * like MAIN_SYSTEM_PREFIXES tracks Claude Code's system prompts, #970). */
@@ -207,6 +209,73 @@ export const DSH_CHECKPOINT_PREAMBLE_PREFIX =
 // missing ids are ordinary drift (edit/truncate), not a region replacement.
 export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
 
+// #3033: bili's own render tags (`\x3cacp tokens="…" type="…"\x3emNNNNN\x3c/acp\x3e`,
+// KDD #2) ride inside resent prose — a checkpoint summary cites prior refs
+// ("summaries cite tags across turns", kernel contract) — and every native-
+// compaction rebase RE-ISSUES those numbers, so the SAME checkpoint hashes to
+// a FRESH message id on each replay: the novelty gate stays open forever, the
+// detector re-fires, and each reset manufactures the next detection (the #3033
+// loop: 66 detections, compress rejected 40/40, session wedged). Fingerprint
+// the checkpoint CONTENT with the volatile numbering normalized away.
+const ACP_RENDER_TAG_SPAN = /\x3cacp\b[^\x3e]*\x3e[\s\S]*?\x3c\/acp\x3e/g;
+const ACP_RENDER_TAG_REMNANT = /\x3c\/?acp\b[^\x3e]*\x3e/g;
+const ACP_RENDER_TAG_PLACEHOLDER = "\x3cacp/\x3e";
+
+/** #3033: strip the ref-number churn out of a checkpoint text so its
+ *  fingerprint identifies the COMPACTION, not this generation's numbering. */
+export function normalizeDshCheckpointText(text: string): string {
+    return text.replace(ACP_RENDER_TAG_SPAN, ACP_RENDER_TAG_PLACEHOLDER).replace(ACP_RENDER_TAG_REMNANT, ACP_RENDER_TAG_PLACEHOLDER);
+}
+
+/** #3033: numbering-invariant content fingerprint of a checkpoint text. */
+export function dshCheckpointFingerprint(text: string): string {
+    return createHash("sha256").update(normalizeDshCheckpointText(text), "utf8").digest("hex").slice(0, 16);
+}
+
+/** #3033: read back the fingerprint persisted by the session's last dsh-native
+ *  rebase (session.metadata.dshCompactionFingerprint). */
+export function storedDshCheckpointFingerprint(metadata: Record<string, unknown>): string | undefined {
+    const fp = metadata.dshCompactionFingerprint;
+    return typeof fp === "string" && fp !== "" ? fp : undefined;
+}
+
+type DshCheckpointMatch = {
+    /** numbering-invariant fingerprint of the landed checkpoint's text */
+    fingerprint: string;
+    /** true when this checkpoint is the one the last rebase already consumed */
+    suppressed: boolean;
+};
+
+/** #3033: full verdict of the #2432 framing scan — the carrier and novelty
+ *  gates exactly as before, plus the fingerprint of the matched checkpoint and
+ *  whether it is a REPLAY of the checkpoint this session already rebased onto
+ *  (`rebasedFingerprint`). A replay must NOT rebase again: the reset re-issues
+ *  the very ref numbers that made the ids churn, so every further rebase
+ *  manufactures the next detection while the fold the client already accepted
+ *  is destroyed again (the #3033 death spiral). Returns null when no candidate
+ *  passes the gates. */
+export function detectDshLocalCompactionCheckpoint(
+    msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
+    knownIds?: ReadonlySet<string>,
+    rebasedFingerprint?: string,
+): DshCheckpointMatch | null {
+    for (const m of msgs) {
+        // ① CARRIER (#2621): only a user-role plain-text message can be a
+        // checkpoint. Exclude every other producer of the marker string.
+        if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
+        // ② NOVELTY (#2621): a freshly-landed checkpoint is a NEW id; a quoted
+        // or replayed mention is an old id already in the pre-turn ref map.
+        if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
+        const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
+        if (text === "") continue;
+        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) {
+            const fingerprint = dshCheckpointFingerprint(text);
+            return { fingerprint, suppressed: rebasedFingerprint !== undefined && fingerprint === rebasedFingerprint };
+        }
+    }
+    return null;
+}
+
 /** True when a freshly-LANDED dsh checkpoint is present in the resent history.
  *  Used by the prepare-openai / prepare-responses detectors (#2432) to tell a
  *  landed native compaction apart from ordinary history churn.
@@ -238,26 +307,25 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *      residual of ①: a user who literally typed/pasted the framing into a
  *      user message in an EARLIER turn is replayed as an old id, not a landing.
  *
+ *  #3033 adds a third argument: `rebasedFingerprint` (the checkpoint
+ *  fingerprint the session's last rebase persisted). A candidate whose content
+ *  fingerprint EQUALS it is a replay of a compaction the state was already
+ *  rebased onto — it reads false here and the caller skips the reset, which is
+ *  what breaks the detect→reset→detect loop.
+ *
  *  Reads the core-flattened text first (BiliMessage/CoreMessage carry prose in
  *  `.text`), falling back to a raw wire content field for direct callers. When
  *  `knownIds` is omitted the novelty gate is skipped (carrier gate only) —
- *  every in-repo caller passes it. */
+ *  the google lane omits it (dsh speaks no google wire); the in-repo detectors
+ *  that can pin the checkpoint's identity use
+ *  `detectDshLocalCompactionCheckpoint` directly. */
 export function carriesDshLocalCompactionSummary(
     msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
     knownIds?: ReadonlySet<string>,
+    rebasedFingerprint?: string,
 ): boolean {
-    for (const m of msgs) {
-        // ① CARRIER (#2621): only a user-role plain-text message can be a
-        // checkpoint. Exclude every other producer of the marker string.
-        if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
-        // ② NOVELTY (#2621): a freshly-landed checkpoint is a NEW id; a quoted
-        // or replayed mention is an old id already in the pre-turn ref map.
-        if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
-        const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
-        if (text === "") continue;
-        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
-    }
-    return false;
+    const hit = detectDshLocalCompactionCheckpoint(msgs, knownIds, rebasedFingerprint);
+    return hit !== null && !hit.suppressed;
 }
 
 export type Refusal = { status: number; body: unknown };

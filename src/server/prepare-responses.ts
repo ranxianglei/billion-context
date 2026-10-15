@@ -15,7 +15,7 @@ import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcile
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { detectDshLocalCompactionCheckpoint, storedDshCheckpointFingerprint, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
@@ -234,20 +234,34 @@ export async function prepareResponses(
             // checkpoint is a NEW id; historical quotes/replays hit old ids.
             const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
             const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
-            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact);
-            if (localGap && (codexHit || dshHit)) {
+            // #3033: the detect variant returns the matched checkpoint's
+            // fingerprint; a candidate equal to the one the last rebase persisted
+            // is a replay of an already-consumed compaction (its ids re-minted by
+            // that rebase's ref re-issue) and must not reset again.
+            const dshCheckpoint = dshLane && localGap
+                ? detectDshLocalCompactionCheckpoint(msgs, knownIdsBeforeLocalCompact, storedDshCheckpointFingerprint(session.metadata))
+                : null;
+            if (localGap && (codexHit || dshCheckpoint)) {
                 const missing = localGap.expected - localGap.matched;
-                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
+                const minMissing = dshCheckpoint ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
                 if (missing >= minMissing && missing * 2 >= localGap.expected) {
-                    if (dshHit) {
+                    if (dshCheckpoint?.suppressed) {
+                        // #3033: replay of the checkpoint the last rebase already
+                        // consumed — another reset would only destroy the accepted
+                        // fold and manufacture the next detection.
+                        log("info", `[${sessionId}] dsh native compaction replay suppressed (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint unchanged since the last rebase) — ACP state left intact (#3033)`);
+                    } else if (dshCheckpoint) {
                         recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
                         log("warn", `[${sessionId}] dsh native compaction detected (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                        session.metadata.dshCompactionFingerprint = dshCheckpoint.fingerprint;
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
                     } else {
                         recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
                         log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
                     }
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
                 }
             }
         }
