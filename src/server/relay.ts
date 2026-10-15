@@ -1,4 +1,4 @@
-import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
+import { checkOutboundBody, MAX_REQUEST_BYTES, OutboundBodyTooLargeError } from "../request-body-budget.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -481,7 +481,7 @@ export async function forward(
         if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", err.message, undefined, opts.streamErrorShape);
         else {
             res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "request_too_large", stage: "forward", message: err.message } }));
+            res.end(JSON.stringify({ error: { type: "request_too_large", stage: "forward", message: err.message, limitBytes: MAX_REQUEST_BYTES, seenBytes: err.bytes } }));
         }
         return;
     }

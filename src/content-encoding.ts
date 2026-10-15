@@ -8,7 +8,7 @@ import { Decompress as ZstdDecompress } from "fzstd";
  *  body so callers reject an oversized payload (413) while relaying genuinely
  *  undecodable ones verbatim (#619). */
 export class DecompressedTooLargeError extends Error {
-    constructor(public readonly limit: number) {
+    constructor(public readonly limit: number, public readonly seenBytes?: number) {
         super(`decompressed request exceeds ${limit} bytes`);
         this.name = "DecompressedTooLargeError";
     }
@@ -36,7 +36,7 @@ function streamDecode(factory: () => Duplex, input: Buffer, max: number, options
             if (decoder.destroyed) return;
             size += chunk.length;
             try {
-                if (size > max) throw new DecompressedTooLargeError(max);
+                if (size > max) throw new DecompressedTooLargeError(max, size);
                 options?.onBytes?.(size);
                 chunks.push(chunk);
             } catch (err) {
@@ -58,7 +58,7 @@ async function decodeZstd(input: Buffer, max: number, options?: DecodeOptions): 
     let size = 0;
     const decoder = new ZstdDecompress((chunk) => {
         size += chunk.byteLength;
-        if (size > max) throw new DecompressedTooLargeError(max);
+        if (size > max) throw new DecompressedTooLargeError(max, size);
         options?.signal?.throwIfAborted();
         options?.onBytes?.(size);
         chunks.push(Buffer.from(chunk));
@@ -97,7 +97,7 @@ export async function decodeRequestBody(
     let body = input;
     for (const coding of codings.reverse()) {
         body = await decodeOne(coding, body, maxOutputBytes, options);
-        if (body.byteLength > maxOutputBytes) throw new DecompressedTooLargeError(maxOutputBytes);
+        if (body.byteLength > maxOutputBytes) throw new DecompressedTooLargeError(maxOutputBytes, body.byteLength);
     }
     return { body, decoded: true };
 }

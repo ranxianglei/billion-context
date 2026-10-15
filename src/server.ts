@@ -3417,14 +3417,30 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
 }
 
 /** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
- *  handle() catches this and attempts a 413 response; readBody also destroys
- *  the request socket so a client that keeps streaming a pathological body
- *  cannot hold the connection open. */
+ *  `seenBytes` is the count observed when the limit was crossed — NOT the full
+ *  body length (the client may still be streaming). handle() catches this and
+ *  answers via respondRequestTooLarge(); readBody stops consuming WITHOUT
+ *  destroying the socket (#3128), so the client can actually READ the 413
+ *  instead of meeting an ECONNRESET. The still-arriving body parks under TCP
+ *  backpressure (bounded by the stream high-water mark + kernel buffer, no
+ *  unbounded heap growth) while the response goes out. */
 export class BodyTooLargeError extends Error {
-    constructor(public readonly limit: number) {
+    constructor(public readonly limit: number, public readonly seenBytes: number) {
         super(`request body exceeds ${limit} bytes`);
         this.name = "BodyTooLargeError";
     }
+}
+
+/** Structured 413 for an over-limit request body. Connection: close is
+ *  REQUIRED, not cosmetic: the rejected request still has unread body bytes
+ *  in flight, so this connection cannot serve another request on keep-alive
+ *  (the next request would parse over the residual). Closing after the
+ *  response routes Node's destroySoon through the #1982 post-response linger
+ *  arm — graceful peer-close wait + bounded backstop — which also drains the
+ *  residual instead of racing it into an RST. */
+export function respondRequestTooLarge(res: http.ServerResponse, json: string): void {
+    res.writeHead(413, { "content-type": "application/json", "connection": "close" });
+    res.end(json);
 }
 
 export function readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -3432,17 +3448,22 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
         const chunks: Buffer[] = [];
         let size = 0;
         let aborted = false;
-        req.on("data", (c: Buffer) => {
+        const onData = (c: Buffer) => {
             if (aborted) return;
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                req.destroy();
-                reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
+                // #3128: stop consuming without destroying — removing the data
+                // listener and pausing leaves the remaining body to backpressure
+                // while the caller delivers the structured 413.
+                req.off("data", onData);
+                req.pause();
+                reject(new BodyTooLargeError(MAX_REQUEST_BYTES, size));
                 return;
             }
             chunks.push(c);
-        });
+        };
+        req.on("data", onData);
         req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
         req.on("error", (e) => { if (!aborted) reject(e); });
     });

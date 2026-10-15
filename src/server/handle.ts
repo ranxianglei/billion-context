@@ -63,7 +63,7 @@ import { adminGateDenial, handleAdminRoute } from "./admin.js";
 import { handleIncrementalTurn, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, respondRequestTooLarge, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
 
 export async function handle(
     req: http.IncomingMessage,
@@ -241,9 +241,15 @@ async function handleRequest(
             return;
         }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError) {
-            log("warn", `413: request body exceeds ${err.limit} bytes`);
-            res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
+            const stage = err instanceof BodyTooLargeError ? "receive" : "decode";
+            log("warn", `413 [${stage}]: request body exceeds ${err.limit} bytes`);
+            const detail: Record<string, unknown> = { type: "request_too_large", stage, message: err.message, limitBytes: err.limit };
+            if (typeof err.seenBytes === "number") detail.seenBytes = err.seenBytes;
+            if (err instanceof BodyTooLargeError) respondRequestTooLarge(res, JSON.stringify({ error: detail }));
+            else {
+                res.writeHead(413, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: detail }));
+            }
             return;
         }
         log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
