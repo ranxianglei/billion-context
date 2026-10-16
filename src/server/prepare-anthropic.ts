@@ -189,7 +189,10 @@ export async function prepareAnthropic(
         if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            // #2621: pass the pre-turn ref map so the framing match also demands
+            // NOVELTY — a freshly-landed checkpoint is a NEW id, while every
+            // historical quote/replay of the marker string hits an old id.
+            if (dshGap && carriesDshLocalCompactionSummary(msgs, knownRefsBefore)) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
                     recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);

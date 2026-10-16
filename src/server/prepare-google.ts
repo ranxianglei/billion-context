@@ -133,16 +133,20 @@ export async function prepareGoogle(
         // checkpoint framing in resent history AND decimated fold coverage;
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
+        let dshRebased = false;
         if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            // #2621: pass the pre-turn ref map so the framing match also demands
+            // NOVELTY — a freshly-landed checkpoint is a NEW id, while every
+            // historical quote/replay of the marker string hits an old id.
+            if (dshGap && carriesDshLocalCompactionSummary(msgs, knownRefsBefore)) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
                     recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
                     log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
                     markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    dshRebased = reconcileNativeCompactionBoundary(session);
                 }
             }
         }
@@ -198,8 +202,12 @@ export async function prepareGoogle(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
-        // deactivated the blocks whose sources left the context.
-        {
+        // deactivated the blocks whose sources left the context. Skipped when
+        // the rewrite was just classified as dsh native compaction above
+        // (#2432/#2658): it is already recorded as "native-compaction" and
+        // rebased — a second "unannounced-rewrite" entry beside it would present
+        // the substrate destruction as "another compressor fighting you".
+        if (!dshRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);

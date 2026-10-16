@@ -15,6 +15,10 @@
 // (pluginAgent === "dsh" + framing + decimated coverage) is shared across all
 // four lanes, so those shapes are re-pinned here per wire only where the lane
 // adds its own twist (the anthropic unannounced-rewrite double-record skip).
+// #2775 adds the #2621 novelty-gate negative per wire: a SEEDED user message
+// quoting the framing, replayed byte-identical (old id) under real fold drift,
+// must not rebase — pre-#2775 neither lane passed knownRefsBefore, so the
+// carrier gate alone fired on the quote.
 
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -324,6 +328,8 @@ test("e2e #2658: dsh replaying [checkpoint, retained tail] on generateContent re
         await r.text();
 
         assertRebased(conv, rig);
+        const s = getSession(conv)!;
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "unannounced-rewrite"), "no double-record as unannounced-rewrite beside the native-compaction entry (#2775)");
 
         // The session keeps working afterwards (append + forward).
         const r2 = await fetch(rig.url, { method: "POST", headers: dshHeaders(conv), body: JSON.stringify({ ...replay(), contents: [...replay().contents as unknown[], { role: "user", parts: [{ text: "Post-compaction turn continues fine." }] }] }) });
@@ -384,6 +390,77 @@ test("negative #2658: google decimated history WITHOUT checkpoint framing stays 
         await r.text();
         const s = getSession(conv)!;
         assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no rebase without the checkpoint framing (gap alone is ordinary churn)");
+    } finally {
+        await rig.close();
+    }
+});
+
+test("negative #2775: anthropic seeded user quote replayed byte-identical + real fold gap does NOT rebase", async () => {
+    const rig = await startAnthropicRig();
+    const conv = "dshc-ant-quoteold";
+    try {
+        // The quote sits inside the folded span (m00005): the decimated replay
+        // below retains exactly 1 of the 9 covered ids → missing = 8 (≥ the 8-id
+        // floor, missing*2 ≥ expected) — signal ② fully armed by plain drift.
+        const quoteText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX} that I pasted from another session's transcript for reference — not a compaction boundary here.`;
+        const seedMessages = Array.from({ length: 14 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: i === 4 ? quoteText : seedText(i),
+        }));
+        await seedAndFold(rig, conv, { model: MODEL_ANTHROPIC, max_tokens: 8192, stream: true, messages: seedMessages });
+
+        const r = await fetch(rig.url, {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL_ANTHROPIC, max_tokens: 8192, stream: true,
+                messages: [
+                    { role: "user", content: quoteText },
+                    { role: "user", content: seedText(12) },
+                    { role: "assistant", content: seedText(13) },
+                ],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "a byte-identical replay of an already-seen user quote must NOT trigger a native-compaction rebase (#2775/#2621)");
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "native-compaction"), "no misattributed native-compaction conflict recorded (#2775)");
+        assert.ok((s.state.blocks ?? []).some((b) => b.active), "the live fold survives the drift — no rebase reset happened");
+    } finally {
+        await rig.close();
+    }
+});
+
+test("negative #2775: google seeded user quote replayed byte-identical + real fold gap does NOT rebase", async () => {
+    const rig = await startGoogleRig();
+    const conv = "dshc-gem-quoteold";
+    try {
+        const quoteText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX} that I pasted from another session's transcript for reference — not a compaction boundary here.`;
+        const seedContents = Array.from({ length: 14 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "model",
+            parts: [{ text: i === 4 ? quoteText : seedText(i) }],
+        }));
+        await seedAndFold(rig, conv, { model: MODEL_GOOGLE, generationConfig: { maxOutputTokens: 8192 }, contents: seedContents });
+
+        const r = await fetch(rig.url, {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL_GOOGLE, generationConfig: { maxOutputTokens: 8192 },
+                contents: [
+                    { role: "user", parts: [{ text: quoteText }] },
+                    { role: "user", parts: [{ text: seedText(12) }] },
+                    { role: "model", parts: [{ text: seedText(13) }] },
+                ],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "a byte-identical replay of an already-seen user quote must NOT trigger a native-compaction rebase (#2775/#2621)");
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "native-compaction"), "no misattributed native-compaction conflict recorded (#2775)");
+        assert.ok((s.state.blocks ?? []).some((b) => b.active), "the live fold survives the drift — no rebase reset happened");
     } finally {
         await rig.close();
     }
