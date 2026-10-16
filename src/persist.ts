@@ -207,7 +207,7 @@ type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 
 /** Forward-compat: merge a parsed state with a fresh one so missing fields
  * (added in later versions) get sane defaults instead of `undefined`. */
-function mergeState(parsed: CompressionState): CompressionState {
+export function mergeState(parsed: CompressionState): CompressionState {
     const fresh = createInitialState();
     return {
         // #2627: heal persisted state written before the turn-separator fix —

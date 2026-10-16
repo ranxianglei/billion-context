@@ -25,5 +25,11 @@ export function mergeCompressionState(
     rules: parsed.rules ?? fresh.rules,
     nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
     terminalStreak: parsed.terminalStreak,
+    // #2388/#2370: bare passthrough like terminalStreak above — none of these
+    // three optional fields is seeded by createInitialState, and without a line
+    // here a standalone acp-kernel consumer loses it on restart.
+    hiddenOrphanRefs: parsed.hiddenOrphanRefs,
+    deadRefs: parsed.deadRefs,
+    lastPassIds: parsed.lastPassIds,
   };
 }
