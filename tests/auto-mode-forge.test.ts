@@ -55,10 +55,16 @@ const SEVERITY_SYS = "You are a safety classifier. 50 is exactly the allow/block
 const BLOCK_SYS = 'Respond with <block>yes</block> or <block>no</block>.';
 const TRANSCRIPT_USER = [{ type: "text" as const, text: "<transcript>\n[user] run deploy\n[assistant] done\n</transcript>" }];
 
-test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences are sufficient alone", () => {
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"] })));
+test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences corroborate inside the conjunction gate", () => {
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+});
+
+test("isAutoModeClassifier: #3359 — magic stop sequences WITHOUT the transcript wrapper no longer forge", () => {
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })), "stop-only, no transcript");
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</block>"], system: "some unrelated system prompt" })), "stop + unrelated system");
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"] })), "stop buried in a longer list, no transcript");
 });
 
 test("isAutoModeClassifier: no-stop shapes (stage-1-fast / stage-2) — policy wording AND <transcript> wrapper", () => {

@@ -131,13 +131,19 @@ export function requestText(parsed: AnthropicRequestBody): string {
 /** True for BOTH stages and BOTH flavors — see the module header for why each
  *  signal exists and which shapes carry it. */
 export function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
+    const text = requestText(parsed);
+    // The structural arm is MANDATORY (module-header contract: either signal
+    // alone can appear in legitimate traffic; the conjunction cannot
+    // reasonably be faked). The magic stop sequences are corroboration INSIDE
+    // the gate, never a standalone trigger — #3359: returning true on stops
+    // alone forged allow-verdicts onto ANY request carrying them, replacing
+    // whatever real model that request was actually asking for. A request
+    // without the transcript wrapper passes through untouched.
+    if (!text.includes(TRANSCRIPT_MARKER)) return false;
     const stops = parsed.stop_sequences;
     if (Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s))) {
         return true;
     }
-    const text = requestText(parsed);
-    const hasTranscript = text.includes(TRANSCRIPT_MARKER);
-    if (!hasTranscript) return false;
     return [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
         .some((marker) => text.includes(marker));
 }
