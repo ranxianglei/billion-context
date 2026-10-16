@@ -176,6 +176,26 @@ entries:
     desc_zh: "按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。"
     site_en: "Per-route k̂ calibration policy (#3211): `disabled` suppresses the learned factor on this route; `max` clamps it (0 < max ≤ 4). Applied at publication time — the learned ring stays raw."
     site_zh: "按路由的 k̂ 校准策略（#3211）：`disabled` 在该线路禁用学习系数；`max` 钳制学习系数（0 < max ≤ 4）。作用于发布环节——学习环保持原始值。"
+  - key: firstContentTimeoutMs
+    type: number
+    default: "unset (→ global, else 720000 builtin)"
+    group: providers
+    id: cr.fcdeadline
+    render: route-row
+    desc_en: "Per-route model-content deadline, phase 1 (#3254): max ms without model content from response start before bili aborts the stalled upstream and ends the turn in-band. On by default via the built-in (unset falls through to global then the 720000 builtin); set here to override per route, or 0 to disable for this route. Also settable per model under models[<m>]; cascade model > route > global network.*, explicit 0 wins at its level. Once the route has ≥8 healthy attempts the resolved value becomes a ceiling and the effective deadline tightens to clamp(3 × p95 of this route's recent healthy first-content durations, 120s, that resolved ceiling); stalled/killed attempts are never sampled. File-only (no env)."
+    desc_zh: "按线路的模型内容期限，阶段一（#3254）：响应开始后无模型内容的上限毫秒数；超时则中止卡死上游并以带内错误结束回合。通过内置值默认开启（缺省落到 global 再到内置 720000）；在此按线路覆盖，或设 0 对该线路关闭。也可在 models[<m>] 按模型设置；级联 model > route > global network.*，显式 0 在所在层生效。线路积累 ≥8 次健康尝试后，解析值转为上限，有效期限收紧为 clamp(该线路近期健康首内容耗时的 3 × p95, 120s, 该解析上限)；卡死或被中止的尝试从不采样。仅配置文件可设（无 env）。"
+    site_en: "Model-content deadline, phase 1 (#3254), per route and per model (`models[<m>]`); on expiry bili aborts the stalled upstream stream and ends the turn with one clean in-band error — no internal refetch. On by default via the built-in (unset → global → 720000 builtin); explicit 0 disables for this route. Cascade model > route > global `network.*`; once warmed (≥8 healthy attempts) the resolved value acts as a ceiling tightened toward the route's measured first-content pace (clamp 3×p95, floor 120s, capped at the resolved value); file-only."
+    site_zh: "模型内容期限，阶段一（#3254），按线路与按模型（`models[<m>]`）；到期则中止卡死的上游流并以一条干净的带内错误结束回合——不做内部盲重取。通过内置值默认开启（缺省 → global → 内置 720000）；显式 0 对该线路关闭。级联 model > route > global `network.*`；线路预热后（≥8 次健康尝试）解析值转为上限，向该线路实测首内容水位收紧（clamp 3×p95，下限 120s，上限为解析值）；仅文件可设。"
+  - key: contentGapTimeoutMs
+    type: number
+    default: "unset (inherits firstContentTimeoutMs)"
+    group: providers
+    id: cr.gapdeadline
+    render: route-row
+    desc_en: "Per-route model-content deadline, phase 2 (#3254): max ms between consecutive model-content events after the first arrived; re-armed on every content event. Absent inherits the resolved firstContentTimeoutMs; explicit 0 disables the gap phase only. Same cascade, same route-adaptive ceiling (its own inter-content-gap samples) and file-only rationale as firstContentTimeoutMs."
+    desc_zh: "按线路的模型内容期限，阶段二（#3254）：首个内容之后相邻模型内容事件间的上限毫秒数，逐事件重新计时。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。级联、线路自适应上限（用自己的内容间隔样本）与仅文件可设的理由同 firstContentTimeoutMs。"
+    site_en: "Model-content deadline, phase 2 (#3254), per route and per model (`models[<m>]`); bounds silence between content events after the first arrived (pings/comments never count); absent inherits the resolved `firstContentTimeoutMs`; same route-adaptive ceiling as `firstContentTimeoutMs`. File-only."
+    site_zh: "模型内容期限，阶段二（#3254），按线路与按模型（`models[<m>]`）；约束首个内容之后相邻内容事件间的静默（ping/注释不算内容）；缺省继承解析后的 `firstContentTimeoutMs`；线路自适应上限同 `firstContentTimeoutMs`。仅文件可设。"
   - key: compactionOptIn
     type: boolean
     default: "false"

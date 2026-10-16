@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>."
-    site_zh: "<code>network</code> —— 传输超时与重放：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>。"
+    site_en: "<code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · firstContentTimeoutMs 720000 on-by-default (#3254, file-only) · contentGapTimeoutMs inherits/720000 (#3254, file-only)</span>."
+    site_zh: "<code>network</code> —— 传输超时与重放：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · firstContentTimeoutMs 720000 默认开启（#3254，仅文件）· contentGapTimeoutMs 继承/默认 720000（#3254，仅文件）</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -68,6 +68,18 @@ entries:
     group: process
     desc_en: "Cooldown after a dead-end preflight before retrying reconciliation for the same session."
     desc_zh: "死胡同 preflight 后，对同一会话重试校准的冷却时长。"
+  - key: network.firstContentTimeoutMs
+    type: number
+    default: "720000 (on by default)"
+    group: process
+    desc_en: "Model-content deadline, phase 1 (#3254): max ms an upstream attempt may go with zero model content from response start before bili aborts the stalled stream and ends the turn with one clean in-band error (no internal refetch — the turn fails cleanly; clients with a retry ladder back off and retry, clients without one simply stop). On by default at 720000ms so every deployment is bounded out of the box; set a value to tighten/override, or 0 to disable (opt-out override of the built-in). Also settable per route / per model under providers; cascade model > route > global, explicit 0 wins at its level. Once a route has ≥8 healthy attempts the resolved value becomes a ceiling and the effective deadline tightens to clamp(3 × p95 of the route's recent healthy first-content durations, 120s, that resolved ceiling); stalled/killed attempts are never sampled. File-only by design."
+    desc_zh: "模型内容期限，阶段一（#3254）：上游一次尝试从响应开始到首个模型内容之间的最长毫秒数；超时则 bili 中止卡死流并以一条干净的带内错误结束回合（不做内部盲重取——回合干净失败：有重试梯的客户端退避后重试，没有的则直接停止）。默认以 720000ms 开启，让每个部署开箱即用即有界；设值可收紧/覆盖，或设 0 关闭（对内置值的显式豁免）。providers 内也可按线路/按模型设置；级联 model > route > global，显式 0 在所在层生效。线路积累 ≥8 次健康尝试后，解析值转为上限，有效期限收紧为 clamp(该线路近期健康首内容耗时的 3 × p95, 120s, 该解析上限)；卡死或被中止的尝试从不采样。按设计仅配置文件可设。"
+  - key: network.contentGapTimeoutMs
+    type: number
+    default: "inherits firstContentTimeoutMs (720000 default)"
+    group: process
+    desc_en: "Model-content deadline, phase 2 (#3254): max ms between consecutive model-content events after the first arrived; re-armed on every content event (pings/comments never count). Absent inherits the resolved firstContentTimeoutMs; explicit 0 disables the gap phase only. Same three-level cascade, same route-adaptive ceiling (per-phase samples) and file-only rationale as firstContentTimeoutMs."
+    desc_zh: "模型内容期限，阶段二（#3254）：首个内容到达之后，相邻两个模型内容事件之间的最长毫秒数；每个内容事件重新计时（ping/注释不算内容）。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。三级级联、线路自适应上限（按阶段各自采样）与仅文件可设的理由同 firstContentTimeoutMs。"
   - key: network.replayRetryMax
     type: number
     default: "3 (1 disables replays)"

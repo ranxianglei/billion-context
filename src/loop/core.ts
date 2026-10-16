@@ -38,6 +38,7 @@ import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { FC_ADAPTIVE_WINDOW } from "../config.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -208,6 +209,21 @@ export interface LoopCtx {
      *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
+    /** #3254: model-content deadlines resolved per request (three-level
+     *  cascade via resolveFirstContentDeadlines, optionally refined by the
+     *  route's adaptive samples). Present iff at least one phase is enabled;
+     *  undefined keeps the legacy path byte-identical (no timers armed, zero
+     *  overhead). */
+    firstContentDeadline?: {
+        initialMs?: number;
+        gapMs?: number;
+        initialSource?: "config" | "adaptive" | "builtin";
+        gapSource?: "config" | "adaptive" | "builtin";
+    };
+    /** #3254 follow-up: route key (providers URL prefix, else host) under
+     *  which this session's healthy first-content durations are sampled in
+     *  metadata — feeds the route's adaptive deadline on later requests. */
+    fcRouteKey?: string;
 }
 
 export interface RequestOptions {
@@ -395,6 +411,78 @@ function recordUsage(
     }
 }
 
+// #3254: wrapper that lets the model-content deadline KILL a body stream from
+// the outside. Plain ReadableStream.cancel() is unusable here: the adapter's
+// SSE iterator holds the only reader, and cancel() on a LOCKED stream rejects
+// with "Invalid state: ReadableStream is locked" (verified empirically on
+// Node 22/24), silently no-oping the kill. So the wrapper owns its own
+// controller — kill() errors it (the pending/next read rejects) and releases
+// the inner body through ITS OWN reader.cancel (the legal path). Pull-driven
+// passthrough keeps backpressure intact (one outstanding inner read).
+function interruptibleBody(src: ReadableStream<Uint8Array>): { stream: ReadableStream<Uint8Array>; kill: () => void } {
+    let innerReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let outerController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let killed = false;
+    const killReason = new Error("bili model-content deadline (#3254)");
+    const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+            outerController = c;
+            innerReader = src.getReader();
+        },
+        async pull(c) {
+            if (killed) { c.error(killReason); return; }
+            try {
+                const r = await innerReader!.read();
+                if (killed) return;
+                if (r.done) c.close();
+                else c.enqueue(r.value);
+            } catch (e) {
+                if (!killed) c.error(e instanceof Error ? e : new Error("upstream body read failed"));
+            }
+        },
+        cancel(reason) {
+            void innerReader?.cancel(reason).catch(() => {});
+        },
+    });
+    return {
+        stream,
+        kill: () => {
+            if (killed) return;
+            killed = true;
+            outerController?.error(killReason);
+            void innerReader?.cancel(killReason).catch(() => {});
+        },
+    };
+}
+
+// #3254 follow-up: per-route healthy-latency samples live in session
+// metadata (persisted with the session record) so adaptive deadlines
+// survive restarts. One row per route key; each phase keeps its own window.
+const FC_SAMPLES_META_KEY = "firstContentSamples";
+
+export function readFcSamples(session: Session, routeKey: string): { init: number[]; gap: number[] } | undefined {
+    const table = session.metadata[FC_SAMPLES_META_KEY] as Record<string, { init?: unknown; gap?: unknown }> | undefined;
+    const row = table?.[routeKey];
+    if (!row) return undefined;
+    const clean = (v: unknown): number[] => Array.isArray(v) ? v.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0) : [];
+    return { init: clean(row.init), gap: clean(row.gap) };
+}
+
+export function recordFcSample(session: Session, routeKey: string, initMs: number, gapMs?: number): void {
+    const table = (session.metadata[FC_SAMPLES_META_KEY] ?? {}) as Record<string, { init: number[]; gap: number[] }>;
+    const row = table[routeKey] ?? { init: [], gap: [] };
+    if (initMs >= 0) {
+        row.init.push(initMs);
+        if (row.init.length > FC_ADAPTIVE_WINDOW) row.init.shift();
+    }
+    if (gapMs !== undefined && gapMs >= 0) {
+        row.gap.push(gapMs);
+        if (row.gap.length > FC_ADAPTIVE_WINDOW) row.gap.shift();
+    }
+    table[routeKey] = row;
+    session.metadata[FC_SAMPLES_META_KEY] = table;
+}
+
 export async function* runCompressLoop(
     upstream: ReadableStream<Uint8Array>,
     ctx: LoopCtx,
@@ -422,6 +510,64 @@ export async function* runCompressLoop(
     // in client-stored history (incoming-history stripping removes it next turn,
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
+    // #3254: model-content deadline. Byte-level silence is already bounded by
+    // the upstream idle timer, but SSE keep-alive comments/pings keep it armed
+    // forever — without this bound a relay that streams pings for 13 minutes
+    // per attempt leaves the CLIENT's content watchdog as the de-facto circuit
+    // breaker (the incident: 775s + 773s + 27s). Firing kills the wrapped body
+    // stream (interruptibleBody: controller.error rejects the pending read;
+    // every adapter's SSE iterator swallows that rejection as EOF, so the
+    // consumption loop below exits cleanly) and the turn ends
+    // with ONE clean in-band error — deliberately NO internal refetch
+    // (#3254 decision C-rejected: an in-band error fails the turn cleanly and
+    // lets clients that HAVE a retry ladder back off and retry, instead of
+    // hammering the same stalled slot; clients without one simply stop).
+    let activeKill: (() => void) | null = null;
+    let contentDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let contentDeadlineArmedAt = 0;
+    let contentDeadlineInfo: { ms: number; phase: "initial" | "gap"; round: number; source: "config" | "adaptive" | "builtin" } | null = null;
+    let contentDeadlineKilled = false;
+    let contentDeadlineSettled = true;
+    let upstreamAttemptNo = 0;
+    // #3254 follow-up: per-attempt healthy-latency sampling for the route's
+    // adaptive deadline (recorded only when a request completes cleanly).
+    let fcAttemptStartAt = 0;
+    let fcFirstContentAt = 0;
+    let fcLastContentAt = 0;
+    let fcWorstGapMs = 0;
+    let fcGapMeasured = false;
+    const deadlineHost = (() => { try { return new URL(requestOptions.url).host; } catch { return requestOptions.url; } })();
+    const clearContentDeadline = () => {
+        if (contentDeadlineTimer) {
+            clearTimeout(contentDeadlineTimer);
+            contentDeadlineTimer = null;
+        }
+    };
+    const fireContentDeadline = () => {
+        contentDeadlineTimer = null;
+        if (contentDeadlineSettled || !contentDeadlineInfo) return;
+        contentDeadlineKilled = true;
+        const info = contentDeadlineInfo;
+        const waitedMs = Date.now() - contentDeadlineArmedAt;
+        const line = `content-deadline fired: no model content for ${waitedMs}ms (limit ${info.ms}ms, phase=${info.phase}, source=${info.source}, upstream attempt ${upstreamAttemptNo}, round ${info.round}) — aborting stalled upstream stream (#3254)`;
+        ctx.log(`[acp-proxy: ${line}]`);
+        loggerLog("warn", `[acp-loop] session ${ctx.session.id} ${line}`);
+        activeKill?.();
+    };
+    const armContentDeadline = (ms: number, phase: "initial" | "gap", roundNo: number, source: "config" | "adaptive" | "builtin") => {
+        clearContentDeadline();
+        contentDeadlineInfo = { ms, phase, round: roundNo, source };
+        contentDeadlineArmedAt = Date.now();
+        contentDeadlineSettled = false;
+        contentDeadlineTimer = setTimeout(fireContentDeadline, ms);
+    };
+    // #3254: wrap the initial body so the deadline can kill it from outside
+    // (see interruptibleBody for why plain stream.cancel() cannot do this).
+    if (ctx.firstContentDeadline !== undefined) {
+        const wrapped = interruptibleBody(upstream);
+        activeKill = wrapped.kill;
+        currentUpstream = wrapped.stream;
+    }
 
     const fetchUpstream = (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
@@ -496,6 +642,15 @@ export async function* runCompressLoop(
         // consumer parses — the dump twin above keeps RAW upstream bytes,
         // mirroring the outer request's pre-unwrap tee order in relay.ts.
         if (body && requestOptions.responseStreamTransform) body = requestOptions.responseStreamTransform(body);
+        // #3254: wrap the post-#3280-unwrap stream as the OUTERMOST body so
+        // the deadline kill errors exactly the reads parseStream is making
+        // and the cancel propagates down through the unwrap transform to the
+        // raw body (a tee dump branch dying early is acceptable).
+        if (ctx.firstContentDeadline !== undefined) {
+            const wrapped = interruptibleBody(body);
+            activeKill = wrapped.kill;
+            return wrapped.stream;
+        }
         return body;
     };
 
@@ -675,8 +830,39 @@ export async function* runCompressLoop(
                 sawSignedThinkingThisAttempt = false;
                 fwdBytes = 0;
 
+                // #3254: arm this attempt's initial-phase model-content deadline
+                // (gap-only configs arm nothing until first content arrives).
+                upstreamAttemptNo += 1;
+                contentDeadlineKilled = false;
+                fcAttemptStartAt = Date.now();
+                fcFirstContentAt = 0;
+                fcLastContentAt = 0;
+                fcWorstGapMs = 0;
+                fcGapMeasured = false;
+                if (ctx.firstContentDeadline?.initialMs !== undefined && ctx.firstContentDeadline.initialMs > 0) {
+                    armContentDeadline(ctx.firstContentDeadline.initialMs, "initial", round, ctx.firstContentDeadline.initialSource ?? "config");
+                } else {
+                    clearContentDeadline();
+                }
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
                     if (signal?.aborted) break;
+                    // #3254: any MODEL CONTENT event re-arms the inter-content
+                    // deadline (owner-tiered like the client's own watchdog);
+                    // pings/comments/meta/usage/diag never count as content.
+                    const fcHasContent = (ev.kind === "text" || ev.kind === "reasoning") ? ev.delta.length > 0
+                        : ev.kind === "tool_call" || ev.kind === "redacted_thinking" || ev.kind === "standalone_signature";
+                    if (fcHasContent && ctx.firstContentDeadline !== undefined) {
+                        const now = Date.now();
+                        if (fcFirstContentAt === 0) fcFirstContentAt = now;
+                        else {
+                            fcWorstGapMs = Math.max(fcWorstGapMs, now - fcLastContentAt);
+                            fcGapMeasured = true;
+                        }
+                        fcLastContentAt = now;
+                    }
+                    if (fcHasContent && ctx.firstContentDeadline?.gapMs !== undefined && ctx.firstContentDeadline.gapMs > 0) {
+                        armContentDeadline(ctx.firstContentDeadline.gapMs, "gap", round, ctx.firstContentDeadline.gapSource ?? "config");
+                    }
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         let tp = roundParts[roundParts.length - 1];
@@ -754,6 +940,38 @@ export async function* runCompressLoop(
                             yield fwd(ev.chunk, false, ev.stateless === true);
                         }
                     }
+                }
+                // #3254: if WE cancelled the body, every adapter's SSE iterator
+                // swallowed the read rejection as EOF and the loop exited
+                // cleanly — end in-band exactly once, BEFORE any retry gate:
+                // a deadline kill must never trigger an internal refetch
+                // (#3254 decision C-rejected; the client's ladder re-arms).
+                contentDeadlineSettled = true;
+                clearContentDeadline();
+                if (contentDeadlineKilled && !signal?.aborted) {
+                    // explicit assertion: TS flow analysis does not see the
+                    // closure reassignment inside armContentDeadline, so without
+                    // it the read below is narrowed to the `null` initializer
+                    const info = contentDeadlineInfo as { ms: number; phase: "initial" | "gap"; round: number } | null;
+                    const sec = Math.max(1, Math.round((info?.ms ?? 0) / 1000));
+                    const phaseDesc = info?.phase === "gap"
+                        ? `no model content for ${sec}s between content events`
+                        : `no model content within ${sec}s of the response starting`;
+                    const msg = `model content deadline exceeded — upstream ${deadlineHost} produced ${phaseDesc} (limit ${info?.ms ?? "?"}ms); your context is intact, resend your last message to continue`;
+                    ctx.log(`[acp-proxy: ${msg}]`);
+                    loggerLog("warn", `[acp-loop] session ${ctx.session.id} content-deadline reached (upstream attempt ${upstreamAttemptNo}, round ${info?.round ?? "?"}); ending turn in-band instead of stalling the client's watchdog (#3254)`);
+                    yield adapter.emitError(msg);
+                    return;
+                }
+                // #3254 follow-up: a cleanly completed attempt (done, not
+                // truncated, not deadline-killed, produced content) is a
+                // HEALTHY sample of this route's normal latency — feed the
+                // per-route ring that drives adaptive deadlines later.
+                if (ctx.fcRouteKey !== undefined && ctx.firstContentDeadline !== undefined
+                    && sawDone && !truncatedDone && fcFirstContentAt > 0) {
+                    // A measured sub-millisecond duration is a legitimate fast
+                    // sample — record it; only unmeasured phases are omitted.
+                    recordFcSample(ctx.session, ctx.fcRouteKey, fcFirstContentAt - fcAttemptStartAt, fcGapMeasured ? fcWorstGapMs : undefined);
                 }
 
                 // #2701: threads acceptance. This round's response started ⇔
@@ -1480,6 +1698,7 @@ export async function* runCompressLoop(
                 recordThreadTail(ctx.session, id);
             }
         }
+        clearContentDeadline();
         if (activeClearTimer) {
             activeClearTimer();
             activeClearTimer = null;

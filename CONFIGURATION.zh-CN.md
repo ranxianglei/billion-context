@@ -147,6 +147,8 @@
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | 模型块之间的下游流保活心跳间隔；0 禁用心跳。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | preflight 失败后，允许请求未校准放行的持有时长。 |
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
+| `network.firstContentTimeoutMs` | number | 720000 (on by default) | — | 模型内容期限，阶段一（#3254）：上游一次尝试从响应开始到首个模型内容之间的最长毫秒数；超时则 bili 中止卡死流并以一条干净的带内错误结束回合（不做内部盲重取——回合干净失败：有重试梯的客户端退避后重试，没有的则直接停止）。默认以 720000ms 开启，让每个部署开箱即用即有界；设值可收紧/覆盖，或设 0 关闭（对内置值的显式豁免）。providers 内也可按线路/按模型设置；级联 model > route > global，显式 0 在所在层生效。线路积累 ≥8 次健康尝试后，解析值转为上限，有效期限收紧为 clamp(该线路近期健康首内容耗时的 3 × p95, 120s, 该解析上限)；卡死或被中止的尝试从不采样。按设计仅配置文件可设。 |
+| `network.contentGapTimeoutMs` | number | inherits firstContentTimeoutMs (720000 default) | — | 模型内容期限，阶段二（#3254）：首个内容到达之后，相邻两个模型内容事件之间的最长毫秒数；每个内容事件重新计时（ping/注释不算内容）。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。三级级联、线路自适应上限（按阶段各自采样）与仅文件可设的理由同 firstContentTimeoutMs。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
@@ -308,6 +310,8 @@
 | `apiKeyEnv` | string (env var name) | unset | — | 通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。 |
 | `credentialRef` | string (store name) | unset | — | 经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。 |
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | 按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。 |
+| `firstContentTimeoutMs` | number | unset (→ global, else 720000 builtin) | — | 按线路的模型内容期限，阶段一（#3254）：响应开始后无模型内容的上限毫秒数；超时则中止卡死上游并以带内错误结束回合。通过内置值默认开启（缺省落到 global 再到内置 720000）；在此按线路覆盖，或设 0 对该线路关闭。也可在 models[<m>] 按模型设置；级联 model > route > global network.*，显式 0 在所在层生效。线路积累 ≥8 次健康尝试后，解析值转为上限，有效期限收紧为 clamp(该线路近期健康首内容耗时的 3 × p95, 120s, 该解析上限)；卡死或被中止的尝试从不采样。仅配置文件可设（无 env）。 |
+| `contentGapTimeoutMs` | number | unset (inherits firstContentTimeoutMs) | — | 按线路的模型内容期限，阶段二（#3254）：首个内容之后相邻模型内容事件间的上限毫秒数，逐事件重新计时。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。级联、线路自适应上限（用自己的内容间隔样本）与仅文件可设的理由同 firstContentTimeoutMs。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
 
 **仅环境变量（无配置文件键）**
@@ -787,6 +791,8 @@
     "preflightDeadEndCooldownMs": 300000, // preflight 死路判定后的冷却
     "proxyKeepAliveMaxMs": 55000,         // 经上游代理的连接复用上限；0 不限
     "postResponseLingerMs": 5000,         // 响应后关闭的优雅关闭预算（#1982）
+    "firstContentTimeoutMs": 180000,      // #3254：响应开始后无模型内容的上限毫秒数；默认以 720000 开启（此处示例收紧）；显式 0 关闭；providers 内可按线路/模型覆盖
+    "contentGapTimeoutMs": 600000,        // #3254：首个内容之后相邻内容事件间的上限毫秒数；缺省继承 firstContentTimeoutMs（未设时其默认 720000）；显式 0 仅禁用本阶段
     "allowPrivateHttpProviders": false    // 私网明文 HTTP provider 可选放行（#2984）
   },
 
@@ -845,10 +851,10 @@
 
 ### `network`
 
-- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number; allowPrivateHttpProviders?: boolean }`
-- **默认：** `{}`（内置值依次为：`720000`、`2× 上游超时`、`3`、`1500`、未设置、`5000`、`30000`、`3600000`、`15000`、`30000`、`300000`、`55000`、`5000`、`false`）
+- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number; firstContentTimeoutMs?: number; contentGapTimeoutMs?: number; allowPrivateHttpProviders?: boolean }`
+- **默认：** `{}`（内置值依次为：`720000`、`2× 上游超时`、`3`、`1500`、未设置、`5000`、`30000`、`3600000`、`15000`、`30000`、`300000`、`55000`、`5000`、`720000`、`720000`、`false`）
 - **状态：** ACTIVE
-- **说明：** 进程级传输与重试时序（毫秒）。每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 进程级传输与重试时序（毫秒）。除 `firstContentTimeoutMs`/`contentGapTimeoutMs`（#3254，仅文件可设——见下）外，每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变；`firstContentTimeoutMs`/`contentGapTimeoutMs` 是仅文件可设的模型内容期限（#3254）：阶段一约束上游一次尝试从响应开始到首个模型内容（文本/推理增量、工具调用、签名）的最长等待，阶段二（`contentGapTimeoutMs`，每个内容事件重新计时——ping/注释不算内容）约束首个内容之后相邻内容事件间的静默；到期则 bili 中止卡死的上游流并以一条干净的带内错误结束回合（上下文完好，重发最后一条消息即可继续）——不做内部盲重取，回合干净失败：有重试梯的客户端退避后重试，没有的则直接停止；默认以 `720000` 内置值开启（任意层显式 `0` 即豁免）；级联 model > provider route > global `network.*`，显式 0 在所在层生效，gap 缺省继承解析后的 initial 上限；刻意不设 env 层，因为按线路/按模型的取值无法用单一进程级变量表达；**线路自适应收紧**（#3254 follow-up）：某线路积累 ≥8 次健康尝试（正常完成、无截断/错误——卡死或被期限中止的尝试从不采样）后，每个解析阶段值转为上限，有效期限按阶段收紧为 `clamp(该线路近期健康首内容耗时的 3 × p95, 120s, 该解析上限)`（gap 阶段用自己的内容间隔样本）；样本存于会话 metadata（跨重启持久化，环形窗口 32），触发日志记录 `source=config|adaptive`，可追溯触发值来自哪一类。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
 
 ### `persist`
 

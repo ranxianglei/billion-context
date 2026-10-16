@@ -15,7 +15,7 @@ import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSyst
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
-import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
+import { findRoute, findRouteKey, loadConfigFile, resolveDeclaredProtocol, resolveFirstContentDeadlines, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
@@ -28,7 +28,7 @@ import { dumpReqAllowed as knobDumpReqAllowed, rawDumpDir as knobRawDumpDir } fr
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
-import { pickAdapter, runCompressLoop } from "../loop/index.js";
+import { pickAdapter, readFcSamples, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
@@ -1495,9 +1495,17 @@ export async function forward(
             // the loop has no access to the provider route table. Same billing
             // upstream expression as outboundPayloadBreakdown.
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
+            // #3254: model-content deadlines — three-level cascade (model >
+            // route > global network.*), resolved per request so config edits
+            // apply without a restart; absent everywhere → undefined → legacy.
+            // The Google wire carries its model in the PATH, not the body
+            // (prepared.google.model) — without the fallback the model tier
+            // could never match a Gemini-native request.
+            const fcRouteKey = findRouteKey(opts.routes, loopBillingUpstream) ?? (() => { if (!loopBillingUpstream) return "unknown"; try { return new URL(loopBillingUpstream).host; } catch { return loopBillingUpstream; } })();
+            const firstContentDeadline = resolveFirstContentDeadlines(opts.routes, loopBillingUpstream, (parsedReq as { model?: string }).model ?? prepared.google?.model, loadConfigFile().network, readFcSamples(prepared.session, fcRouteKey));
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` }, firstContentDeadline, fcRouteKey },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
