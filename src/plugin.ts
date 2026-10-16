@@ -10,6 +10,7 @@ import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
+import { otherForwardsInFlight } from "./concurrent-forwards.js";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
@@ -1848,7 +1849,7 @@ export async function handlePluginTool(
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
 // part of the context size, but NOT a cache hit (#790).
-type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number };
+type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number; reasoningTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -1907,6 +1908,10 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         if (creation !== undefined && creation > 0) sample.creationTokens = creation;
         const output = num(usage["output_tokens"]);
         if (output !== undefined) sample.outputTokens = output;
+        // Relays that split the Anthropic thinking share out of output_tokens
+        // expose it as thinking_tokens (#3102 diagnostic).
+        const thinking = num(usage["thinking_tokens"]);
+        if (thinking !== undefined) sample.reasoningTokens = thinking;
         return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "response.completed") {
@@ -1928,6 +1933,11 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
             // DeepSeek-style upstreams report KV-cache hits as top-level
             // prompt_cache_hit_tokens instead of the standard details field (#779).
             cachedTokens: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ?? num(usage["prompt_cache_hit_tokens"]),
+            // Reasoning gateways bill the thinking share inside completion_tokens
+            // and expose it under completion_tokens_details (top-level spelling on
+            // some relays) — the only self-classifying signal for a length-finish
+            // turn that spent its whole budget before any prose (#3102).
+            reasoningTokens: num((usage["completion_tokens_details"] as Record<string, unknown> | undefined)?.["reasoning_tokens"]) ?? num(usage["reasoning_tokens"]),
         };
     }
     return undefined;
@@ -1977,6 +1987,7 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.cachedTokens !== undefined) acc.cachedTokens = sample.cachedTokens;
     if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
+    if (sample.reasoningTokens !== undefined) acc.reasoningTokens = sample.reasoningTokens;
 }
 
 /** Terminal reasons after which the model genuinely finished its turn. A
@@ -2050,6 +2061,10 @@ export async function pipePluginChatWithStrip(
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    // #3102: wall-clock start for the degenerate-terminal diagnostic line — the
+    // elapsed time distinguishes a fast "produced nothing" turn from one that
+    // ran its whole budget before ending length.
+    const pipeStartedAt = Date.now();
     let sawStrippedEcho = false;
     // #2405(c): one warn line per event, session-prefixed — the former second
     // write through the request logger landed in the SAME tee file, doubling
@@ -2223,7 +2238,7 @@ export async function pipePluginChatWithStrip(
         const answerChars = answerProse.trim().length;
         if (!draftTail && (answerChars > 0 || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) {
-            if (!sawToolUse && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            if (!sawToolUse && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars}, outputTokens=${acc.outputTokens ?? "?"}, reasoningTokens=${acc.reasoningTokens ?? "?"}, sawThinking=${sawThinking}, elapsedMs=${Date.now() - pipeStartedAt}, sessConcurrentForwards=${session ? otherForwardsInFlight(session.id) : "?"} (#2756/#3102)`);
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;

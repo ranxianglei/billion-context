@@ -16,6 +16,7 @@ import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
+import { beginForward, endForward } from "../concurrent-forwards.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
@@ -166,7 +167,36 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     }
 }
 
+// #3102: counts in-flight model forwards per session so the degenerate-terminal
+// diagnostic line can report whether another same-session forward (the dsh
+// title-gen sidecar, #2503) was in flight when the turn ended. Thin wrapper —
+// forwardInner keeps its original body and indentation (pure rename).
 export async function forward(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    opts: ProxyOptions,
+    body: Buffer | string,
+    prepared: Prepared | null,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    route: ReturnType<typeof resolveUpstream>,
+    instanceId: string,
+    affinity?: string,
+    overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
+    v1Meta?: Record<string, unknown>,
+): Promise<void> {
+    const sid = prepared?.session.id;
+    const counted = sid !== undefined && req.method !== "GET" && req.method !== "HEAD";
+    if (counted) beginForward(sid);
+    try {
+        await forwardInner(req, res, opts, body, prepared, core, config, log, route, instanceId, affinity, overflowRefold, v1Meta);
+    } finally {
+        if (counted) endForward(sid);
+    }
+}
+
+async function forwardInner(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     opts: ProxyOptions,
