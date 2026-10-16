@@ -1310,6 +1310,89 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     return true;
 }
 
+// #3033: convergence guards for the native-compaction rebase (dsh + codex). The
+// reset above wipes session.state.messageRefs.byRaw — the very map the id-novelty
+// gate (#2621) reads to know "this checkpoint is already here". So an unstable
+// resent history (dsh desktop re-serializes → content-hash id churns each replay)
+// makes the SAME landed checkpoint look novel on every turn: detection → rebase →
+// reset wipes the novelty memory → next replay looks novel again. Self-sustaining:
+// dsh landed 2 real compactions yet the loop fired 66 resets in 84 min and bricked
+// live sessions (every compress then fails "no ref resolved"). Two independent
+// guards break it; both persist in metadata so they survive BOTH the reset AND a
+// proxy restart (the ref-map memory does neither).
+export type NativeRebaseLedger = {
+    /** Text fingerprint of the checkpoint we last actually rebased onto. */
+    fingerprint?: string;
+    /** Wall clock of the last actual rebase. */
+    lastAt?: number;
+    /** Consecutive rebases within NATIVE_REBASE_COOLDOWN_MS of each other. */
+    consecutive?: number;
+    /** Set when the breaker arms; no further rebase until it lapses. */
+    breakerArmedUntil?: number;
+};
+
+// Internal safety thresholds, deliberately NOT user config (#3033 owner direction:
+// no wire / no config-surface change). COOLDOWN bounds what counts as "one
+// episode"; MAX_CONSECUTIVE caps resets per episode; BREAKER_COOLDOWN is the
+// suppression window once the cap trips. A legitimate second compaction is spaced
+// by real work (minutes), well under the cap; only a tight self-retriggering loop
+// reaches MAX_CONSECUTIVE inside one cooldown.
+const NATIVE_REBASE_COOLDOWN_MS = 5 * 60 * 1000;
+export const NATIVE_REBASE_MAX_CONSECUTIVE = 3;
+const NATIVE_REBASE_BREAKER_COOLDOWN_MS = 30 * 60 * 1000;
+
+/** Decide + perform the native-compaction rebase with the #3033 convergence
+ *  guards, replacing the raw mark+reconcile pair the prepare* lanes used to call
+ *  back-to-back. Returns true iff a real reset happened, so callers announce
+ *  "rebased" (warn + conflict-ledger entry) ONLY when it did — preserving the
+ *  old flood-free log contract instead of warning on every suppressed attempt.
+ *
+ *   ① breaker armed → suppress silently (loud warn already fired at arming);
+ *   ② fingerprint dedup — same checkpoint text as the last rebase is a
+ *      re-detection of ONE landing, never a new compaction → skip the second
+ *      reset (timing-independent, catches stable-prose/id-churn);
+ *   ③ consecutive cap — more than NATIVE_REBASE_MAX_CONSECUTIVE rebases inside
+ *      one cooldown window (regardless of cause; covers full prose-churn where
+ *      even the fingerprint moves) → arm the breaker for BREAKER_COOLDOWN.
+ *
+ *  `checkpointFingerprint` is undefined for producers without a stable text
+ *  (codex), which still get the ③ timing protection. `label` names the producer
+ *  for the armed-breaker warn. */
+export function performNativeCompactionRebase(
+    session: Session,
+    opts: { checkpointFingerprint?: string; label: string },
+): boolean {
+    const now = Date.now();
+    const prev = (session.metadata.nativeRebaseLedger ?? {}) as NativeRebaseLedger;
+    if (typeof prev.breakerArmedUntil === "number" && prev.breakerArmedUntil > now) {
+        loggerLog("debug", `[${session.id}] ${opts.label} native-compaction rebase suppressed (breaker armed)`);
+        return false;
+    }
+    if (opts.checkpointFingerprint && opts.checkpointFingerprint === prev.fingerprint) {
+        loggerLog("info", `[${session.id}] ${opts.label} native-compaction rebase skipped: identical to the checkpoint already rebased (fp ${opts.checkpointFingerprint})`);
+        return false;
+    }
+    const consecutive =
+        typeof prev.lastAt === "number" && now - prev.lastAt < NATIVE_REBASE_COOLDOWN_MS
+            ? (prev.consecutive ?? 0) + 1
+            : 1;
+    if (consecutive > NATIVE_REBASE_MAX_CONSECUTIVE) {
+        session.metadata.nativeRebaseLedger = { ...prev, breakerArmedUntil: now + NATIVE_REBASE_BREAKER_COOLDOWN_MS };
+        loggerLog(
+            "warn",
+            `[${session.id}] ${opts.label} native-compaction rebase CIRCUIT-BREAKER ARMED: ${consecutive} rebases within ${NATIVE_REBASE_COOLDOWN_MS}ms — suppressing further rebases for ${NATIVE_REBASE_BREAKER_COOLDOWN_MS}ms to stop a self-sustaining reset loop (#3033)`,
+        );
+        markDirty(session);
+        return false;
+    }
+    markNativeCompactionBoundary(session);
+    const done = reconcileNativeCompactionBoundary(session);
+    if (done) {
+        session.metadata.nativeRebaseLedger = { fingerprint: opts.checkpointFingerprint, lastAt: now, consecutive };
+    }
+    return done;
+}
+
 /** Mark a client-side native compaction (omp /compact on the anthropic wire).
  *  The sid does NOT rotate on in-session compaction, so the per-sid registry
  *  reuses the same key with stale state. Consumed by the NEXT processTurn via

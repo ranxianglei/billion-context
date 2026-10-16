@@ -10,9 +10,9 @@ import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, performNativeCompactionRebase, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { recordConflict } from "../conflict-watch.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { carriesDshLocalCompactionSummary, dshCheckpointFingerprint, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { RULE_TOOL_GOOGLE, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
@@ -136,13 +136,17 @@ export async function prepareGoogle(
         if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            // #2621/#3033: pre-turn ref map for the NOVELTY gate (this lane was
+            // carrier-only before) and the source of the text fingerprint for rebase dedup.
+            const dshKnownIds = new Set(Object.keys(session.state.messageRefs.byRaw));
+            if (dshGap && carriesDshLocalCompactionSummary(msgs, dshKnownIds)) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    const didRebase = performNativeCompactionRebase(session, { checkpointFingerprint: dshCheckpointFingerprint(msgs, dshKnownIds), label: "dsh" });
+                    if (didRebase) {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    }
                 }
             }
         }

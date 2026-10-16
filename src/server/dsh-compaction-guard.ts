@@ -51,6 +51,8 @@
  * ("step compaction failed: <message>; continuing the turn").
  */
 
+import { createHash } from "node:crypto";
+
 /** Stable opening sentence of dsh's COMPACTION_INSTRUCTION template
  * (verbatim from @deepseek-ai/dsh-compaction-basic, tracked per dsh release
  * like MAIN_SYSTEM_PREFIXES tracks Claude Code's system prompts, #970). */
@@ -242,10 +244,14 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *  `.text`), falling back to a raw wire content field for direct callers. When
  *  `knownIds` is omitted the novelty gate is skipped (carrier gate only) —
  *  every in-repo caller passes it. */
-export function carriesDshLocalCompactionSummary(
+/** Locate the single user-role plain-text message that carries a freshly-LANDED
+ *  dsh checkpoint framing, returning its text, or null. The ① CARRIER + ② NOVELTY
+ *  gates live here so that carriesDshLocalCompactionSummary and
+ *  dshCheckpointFingerprint can never drift apart (#3033). */
+function findDshCheckpointText(
     msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
     knownIds?: ReadonlySet<string>,
-): boolean {
+): string | null {
     for (const m of msgs) {
         // ① CARRIER (#2621): only a user-role plain-text message can be a
         // checkpoint. Exclude every other producer of the marker string.
@@ -255,9 +261,37 @@ export function carriesDshLocalCompactionSummary(
         if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
-        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
+        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return text;
     }
-    return false;
+    return null;
+}
+
+export function carriesDshLocalCompactionSummary(
+    msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
+    knownIds?: ReadonlySet<string>,
+): boolean {
+    return findDshCheckpointText(msgs, knownIds) !== null;
+}
+
+// #3033: fingerprint of the LANDED checkpoint's TEXT, for rebase dedup. The id-
+// based novelty gate (#2621) reads session.state.messageRefs.byRaw — which a
+// rebase RESET wipes — so an unstable resent history (dsh desktop re-serializes →
+// content-hash id churns each replay) re-triggers the same rebase every turn:
+// the detector's own corrective action destroys its "already saw this" memory
+// (the 66-resets-in-84-min loop that bricked live sessions). A TEXT fingerprint
+// persists in session.metadata independent of the ref map (survives both the
+// reset and a proxy restart), giving the detector memory across resets. It is
+// whitespace-normalized so trivial re-serialization diffs don't move it; a
+// genuinely regenerated summary DOES move it, in which case the consecutive-
+// rebase circuit breaker in session.ts bounds the loop instead.
+export function dshCheckpointFingerprint(
+    msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
+    knownIds?: ReadonlySet<string>,
+): string | undefined {
+    const text = findDshCheckpointText(msgs, knownIds);
+    if (text === null) return undefined;
+    const normalized = text.replace(/\s+/g, " ").trim();
+    return createHash("sha256").update(normalized, "utf8").digest("hex").slice(0, 16);
 }
 
 export type Refusal = { status: number; body: unknown };
