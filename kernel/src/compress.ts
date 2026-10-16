@@ -440,20 +440,31 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // retry (the self-amplifying failure loop). Tombstone-with-clear: refs
     // are never removed from byRef (Kernel Contract), and a tombstone lifts
     // once its message reappears in the view.
+    // #3137: an EMPTY view is not evidence of disappearance — it means this
+    // call carried no messages at all (proxy resident-pool eviction between
+    // model requests, process restarts, any consumer calling with []). Under
+    // [] every requested ref trivially "backs no visible message", so marking
+    // them DEAD would poison the intact refs table until the next model
+    // request restores the view, lying in every receipt in between ("can
+    // NEVER compress"). An empty view therefore creates NO new tombstones;
+    // existing ones are merely not lifted either ([] proves nothing in that
+    // direction) and clear on reappearance as usual.
     const visibleIdsForDead = new Set(input.messages.map((m) => m.id));
     let deadRefs: string[] = (state.deadRefs ?? []).filter((ref) => {
       const rawId = state.messageRefs.byRef[ref];
       return !(rawId !== undefined && visibleIdsForDead.has(rawId));
     });
     const danglingBySpec = new Map<(typeof input.ranges)[number], string[]>();
-    for (const spec of input.ranges) {
-      const resolution = classifications.get(spec);
-      if (resolution === undefined || resolution.status !== "consumed") continue;
-      const dangling = danglingMessageRefs(state, input.messages, spec);
-      if (dangling.length === 0) continue;
-      danglingBySpec.set(spec, dangling);
-      for (const ref of dangling) {
-        if (!deadRefs.includes(ref)) deadRefs.push(ref);
+    if (input.messages.length > 0) {
+      for (const spec of input.ranges) {
+        const resolution = classifications.get(spec);
+        if (resolution === undefined || resolution.status !== "consumed") continue;
+        const dangling = danglingMessageRefs(state, input.messages, spec);
+        if (dangling.length === 0) continue;
+        danglingBySpec.set(spec, dangling);
+        for (const ref of dangling) {
+          if (!deadRefs.includes(ref)) deadRefs.push(ref);
+        }
       }
     }
     if (deadRefs.length > 0) {

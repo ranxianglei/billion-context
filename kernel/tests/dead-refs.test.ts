@@ -178,6 +178,83 @@ test("mixed batch: live range compresses, dead range warns DEAD instead of 'alre
   assert.deepEqual(result.state.deadRefs, ["m00005", "m00006"]);
 });
 
+// #3137: an empty view carries no visibility evidence — it must create no new
+// tombstones and lift none; the refs table stays intact until the next model
+// request restores the view (tombstone-with-clear).
+
+test("empty view marks no refs DEAD even when every requested ref is uncovered (#3137)", () => {
+  const core = createCore();
+  const { state } = vanishedScenario();
+  const result = core.applyCompression({
+    ranges: [{ startRef: "m00005", endRef: "m00006", summary: "the vanished pair" }],
+    messages: [],
+    state,
+    config: config(),
+  });
+
+  assert.equal(result.result.blocksCreated, 0);
+  assert.deepEqual(result.state.deadRefs, undefined, "empty view creates no tombstones");
+  assert.doesNotMatch(result.result.errors.join("\n"), /DEAD/);
+});
+
+test("existing tombstones survive an empty-view call unlifted and unchanged (#3137)", () => {
+  const core = createCore();
+  const { state } = vanishedScenario();
+  state.deadRefs = ["m00005", "m00006"];
+  const result = core.applyCompression({
+    ranges: [{ startRef: "m00001", endRef: "m00004", summary: "live span recap" }],
+    messages: [],
+    state,
+    config: config(),
+  });
+
+  assert.deepEqual(
+    result.state.deadRefs,
+    ["m00005", "m00006"],
+    "an empty view lifts nothing ([] proves nothing either way)",
+  );
+});
+
+test("mixed request under an empty view: the uncovered range adds no tombstone (#3137)", () => {
+  const core = createCore();
+  const state = createInitialState();
+  state.messageRefs = {
+    byRaw: { a1: "m00001", a2: "m00002", v3: "m00003", v4: "m00004" },
+    byRef: { m00001: "a1", m00002: "a2", m00003: "v3", m00004: "v4" },
+  };
+  state.blocks.push({
+    blockId: "b1",
+    runId: "r1",
+    tier: 1,
+    topic: "t",
+    summary: "s",
+    directMessageIds: ["a1", "a2"],
+    effectiveMessageIds: ["a1", "a2"],
+    directBlockIds: [],
+    createdAt: 0,
+    survivedCount: 0,
+    generation: "young",
+    active: true,
+  });
+
+  const result = core.applyCompression({
+    ranges: [
+      { startRef: "m00001", endRef: "m00002", summary: "covered pair" },
+      { startRef: "m00003", endRef: "m00004", summary: "uncovered pair" },
+    ],
+    messages: [],
+    state,
+    config: config(),
+  });
+
+  assert.deepEqual(
+    result.state.deadRefs,
+    undefined,
+    "the uncovered part of a mixed request adds no tombstone under an empty view",
+  );
+  assert.doesNotMatch(result.result.errors.join("\n"), /DEAD/);
+});
+
 test("covered endpoints keep the 'already compressed' verdict; nothing is marked dead", () => {
   const core = createCore();
   const state = createInitialState();
