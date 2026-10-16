@@ -130,6 +130,16 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
     return new Set(names);
 }
 
+/** #3343: the management-plane prefix test — the two internal prefixes the
+ *  loopback + trusted-origin + anti-tunnel gate protects (handleAdminRoute).
+ *  Shared with the incremental-lane marker divert in handle.ts, which must
+ *  never accept these paths: a diverted turn re-enters the pipeline carrying
+ *  the ORIGINAL request URL, so an unfiltered divert hands a non-loopback
+ *  caller a request onto the management prefixes. */
+export function isManagementPath(url: string | undefined): boolean {
+    return url !== undefined && (url === "/__bili/" || url.startsWith("/__bili/") || url === "/__acp/" || url.startsWith("/__acp/"));
+}
+
 // #2170 split-session canary: one log line per conversation base per process.
 const splitWarnedBases = new Set<string>();
 
@@ -145,7 +155,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #1073/#3245: self-addressed absolute-form requests arrive already
     // rewritten to origin form by handle() (selfAddressedLocalPath), so the
     // gates below always judge a path, never a full URL.
-    const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
+    const isAdminPath = isManagementPath(req.url);
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates
     // from the proxy itself, so the remoteAddress gate alone is satisfied and

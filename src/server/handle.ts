@@ -60,7 +60,7 @@ import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
-import { adminGateDenial, handleAdminRoute } from "./admin.js";
+import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
@@ -133,16 +133,23 @@ export async function handle(
         // #3248 marker divert: a native extension may stamp
         // `x-bili-plugin-turn: 1` on an ORDINARY model request (any /bili/…
         // or bare path, provider baseURL untouched) to send only the delta.
-        // Trust class = the plugin marker header (x-bili-plugin must be
-        // present too, same as every plugin-lane signal). The marker only
-        // declares intent — the BODY SHAPE is the final word, because a
-        // marker'd host may still send full-resend turns (retries, dead
-        // conversations, side lanes); those must ride the normal pipeline.
-        // So: buffer once (the pipeline re-buffers every JSON body anyway),
-        // shape-test, then divert or replay. The synthetic re-entries above
-        // call handleRequest DIRECTLY (never this divert), so no loops.
+        // Trust class = the plugin marker headers (x-bili-plugin must be
+        // present too) AND the management-plane gate (adminGateDenial — same
+        // loopback + anti-tunnel + trusted-origin checks as the direct
+        // /__bili/plugin/turn entry): the diverted turn re-enters the
+        // pipeline carrying the ORIGINAL request URL and writes canonical
+        // session state under a caller-chosen conversationId, so a header
+        // alone could not bound who reaches applyTurn (#3343). Management
+        // prefixes (/__bili/, /__acp/) never ride the divert at all. The
+        // marker only declares intent for MODEL paths — the BODY SHAPE is
+        // the final word, because a marker'd host may still send full-resend
+        // turns (retries, dead conversations, side lanes); those ride the
+        // normal pipeline regardless of source address. So: buffer once (the
+        // pipeline re-buffers every JSON body anyway), shape-test, then
+        // divert or replay. The synthetic re-entries above call handleRequest
+        // DIRECTLY (never this divert), so no loops.
         if (req.method === "POST"
-            && !(req.url ?? "").startsWith("/__bili/")
+            && !isManagementPath((req.url ?? "").split("?", 2)[0])
             && req.headers["x-bili-plugin"] !== undefined
             && req.headers[INCREMENTAL_TURN_MARKER_HEADER] !== undefined) {
             let raw: Buffer;
@@ -166,6 +173,19 @@ export async function handle(
                 return;
             }
             if (incrementalTurnBodyShape(raw)) {
+                // #3343: shaped turns are lane traffic — loopback-only, same
+                // trust class as the direct /__bili/plugin/turn entry. A
+                // non-loopback / tunnel / untrusted-origin caller gets 403
+                // here instead of reaching applyTurn (which writes canonical
+                // session state under a caller-chosen conversationId).
+                // Well-behaved remote hosts never send deltas: their GET
+                // probe already 403s, so they stay full-resend (replay below).
+                const denial = adminGateDenial(req, opts.host);
+                if (denial) {
+                    res.writeHead(403, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: denial }));
+                    return;
+                }
                 if (!incrementalTurnsEnabled()) {
                     res.writeHead(503, { "content-type": "application/json" });
                     res.end(JSON.stringify({ error: "incremental turns disabled on this lane (rollout feature pluginIncrementalTurns off, or unified sidecar unavailable)" }));
