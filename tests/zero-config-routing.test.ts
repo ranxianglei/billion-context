@@ -44,6 +44,38 @@ test("zero-config /bili/ route: works with trailing path segments", () => {
 test("zero-config /bili/ ignores malformed embedded URL", () => {
     assert.equal(resolveUpstream(BASE_OPTS, "/bili/not-a-url"), undefined);
 });
+test("zero-config /bili/ route: absolute-form URL unwraps embedded upstream", () => {
+    const r = resolveUpstream(BASE_OPTS, "http://127.0.0.1:18787/bili/https://api.anthropic.com/v1/messages");
+    assert.ok(r, "should resolve");
+    assert.equal(r!.rewrittenUrl, "https://api.anthropic.com/v1/messages");
+    assert.equal(r!.upstream, "https://api.anthropic.com");
+    assert.equal(r!.tunnel, true);
+});
+
+test("zero-config /bili/ route: absolute-form URL preserves query parameters", () => {
+    const r = resolveUpstream(BASE_OPTS, "http://127.0.0.1:18787/bili/https://api.anthropic.com/v1/messages?beta=true");
+    assert.ok(r, "should resolve");
+    assert.equal(r!.rewrittenUrl, "https://api.anthropic.com/v1/messages?beta=true");
+    assert.equal(r!.upstream, "https://api.anthropic.com");
+    assert.equal(r!.tunnel, true);
+});
+
+test("zero-config /bili/ route: absolute-form URL recognizes explicit wire protocol", () => {
+    const r = resolveUpstream(BASE_OPTS, "http://127.0.0.1:18787/bili/anthropic/https://api.anthropic.com/v1/messages");
+    assert.ok(r, "should resolve");
+    assert.equal(r!.rewrittenUrl, "https://api.anthropic.com/v1/messages");
+    assert.equal(r!.upstream, "https://api.anthropic.com");
+    assert.equal(r!.explicitProtocol, "anthropic");
+    assert.equal(r!.tunnel, true);
+});
+
+test("forward-proxy mode: non-/bili/ absolute URL routes to external destination", () => {
+    const r = resolveUpstream(BASE_OPTS, "http://example.com/api/v1/chat");
+    assert.ok(r, "should resolve");
+    assert.equal(r!.rewrittenUrl, "http://example.com/api/v1/chat");
+    assert.equal(r!.upstream, "http://example.com");
+    assert.equal(r!.tunnel, true);
+});
 
 test("non-/bili/ requests return undefined (no named routing anymore)", () => {
     // The old /<name>/... named-routing is gone. Anything without /bili/ is
