@@ -1931,7 +1931,7 @@ Run `codex login` as usual; the OAuth token travels in the `Authorization` heade
 "baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
-**Claude Code** — set the `ANTHROPIC_BASE_URL` env var to the `/bili/` URL. (claude's undici fetch ignores `HTTPS_PROXY`, so the `/bili/` URL form is the only manual option — cert MITM cannot intercept it.)
+**Claude Code** — set the `ANTHROPIC_BASE_URL` env var to the `/bili/` URL. (The `/bili/` form is the manual option: older claude builds ignored proxy env vars entirely, while newer builds (e.g. 2.1.301) honour `HTTPS_PROXY` — if your environment routes loopback traffic through a proxy, include the loopback hosts in `NO_PROXY` so this URL connects directly instead of being routed back through the proxy (#3446).)
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
@@ -2012,14 +2012,14 @@ How each client is pointed at the proxy (set automatically in the child env):
 | pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
-| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL (+ `NO_PROXY`/`no_proxy` loopback merge, #3446) | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | `HTTPS_PROXY` (plain-http rides absolute-form forward-proxy requests) | `SSL_CERT_FILE` → `combined-ca.pem` (+ legacy `HERMES_CA_BUNDLE` → `root-ca.pem`) |
 | dsh | `HTTPS_PROXY` (+ `HTTP_PROXY` for plain-http) + `DEEPSEEK_BASE_URL`; **loopback-only** isolated `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex/dsh/hermes it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the OS trust store and the Node public roots. The OS-store merge matters because some launched clients treat this file as their *entire* trust pool (codex's rustls HTTP stack replaces rather than appends, #1807): any direct, non-proxied connection of theirs must validate against this file alone, so the file must be a superset of what the OS itself trusts (Windows cert stores via PowerShell, macOS keychains via `security(1)`; Linux already reads the filesystem bundle; rebuilt at most once per 24 h). Keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env is the original reason for the bundle (#152; hermes since #1375, because current hermes resolves ambient trust only through `SSL_CERT_FILE`; OS-store merge since #1807).
 
-Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert MITM cannot intercept it. Every claude upstream — including a pre-configured `ANTHROPIC_BASE_URL` relay — is routed through the `/bili/` URL form via `ANTHROPIC_BASE_URL` instead; no CA trust is required.
+Claude Code is routed through the `/bili/` URL form via `ANTHROPIC_BASE_URL` rather than cert MITM — every upstream, including a pre-configured `ANTHROPIC_BASE_URL` relay; no CA trust is required. Older builds ignored proxy env vars outright, but newer ones (e.g. 2.1.301) honour `HTTPS_PROXY`, so the launcher merges the loopback hosts into `NO_PROXY`/`no_proxy` (preserving any value already set) to keep the `/bili/` leg direct regardless of which behavior the child has (#3446).
 
 Where upstreams are discovered from (read-only):
 

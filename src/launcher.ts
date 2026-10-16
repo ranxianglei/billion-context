@@ -537,10 +537,13 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     };
 
     if (client === "claude") {
-        // Claude Code's undici fetch ignores HTTPS_PROXY, so cert MITM cannot
-        // intercept it. Route every upstream — raw HTTP, raw HTTPS, or already
-        // wrapped at a previous proxy origin — through the /bili/ URL form via
-        // ANTHROPIC_BASE_URL instead (claude honors that env var natively).
+        // Route every upstream — raw HTTP, raw HTTPS, or already wrapped at a
+        // previous proxy origin — through the /bili/ URL form via
+        // ANTHROPIC_BASE_URL instead of cert MITM (claude honors that env var
+        // natively). Old builds ignored proxy envs outright; newer builds
+        // (e.g. 2.1.301) honour HTTPS_PROXY, so buildClientEnv merges the
+        // loopback hosts into NO_PROXY/no_proxy to keep the /bili/ leg direct
+        // regardless of which behavior the child has (#3446).
         // Unparseable base URL: leave routes empty (proxy still runs; claude
         // falls back to its own default endpoint).
         relayWrapRoute(acc, config.claude?.anthropicBaseUrl, "https://api.anthropic.com", "ANTHROPIC_BASE_URL");
@@ -974,6 +977,37 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     antigravity: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["CLOUD_CODE_URL"] },
 };
 
+/** #3446: when the base-URL override buildClientEnv writes points back at our
+ *  own loopback origin (the /bili/ form), the child must be able to reach it
+ *  DIRECTLY. Recent client builds honour proxy envs — Claude Code ≥2.1.301
+ *  routes its base-URL traffic through HTTPS_PROXY, so the /bili/ request
+ *  tunnels into this same listener (pre-#3251: 403 self-tunnel denial; with
+ *  it: a wasted forward-proxy hop). Merge the loopback hosts into
+ *  NO_PROXY/no_proxy preserving whatever the user already set in either case
+ *  variant (the claude lane spawns with raw process.env), never overwrite. */
+function mergeLoopbackNoProxy(env: NodeJS.ProcessEnv): void {
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of [env.NO_PROXY, env.no_proxy]) {
+        if (typeof raw !== "string") continue;
+        for (const host of raw.split(",")) {
+            const h = host.trim();
+            if (h.length === 0 || seen.has(h.toLowerCase())) continue;
+            seen.add(h.toLowerCase());
+            parts.push(h);
+        }
+    }
+    for (const host of LAUNCHER_LOOPBACK_NO_PROXY.split(",")) {
+        if (!seen.has(host.toLowerCase())) {
+            seen.add(host.toLowerCase());
+            parts.push(host);
+        }
+    }
+    const value = parts.join(",");
+    env.NO_PROXY = value;
+    env.no_proxy = value;
+}
+
 function buildClientEnv(
     preset: EnvClientPreset,
     origin: string,
@@ -989,12 +1023,20 @@ function buildClientEnv(
     env.BILLION_CONTEXT_PROXY = origin;
     for (const [k, v] of preset.extras ?? []) env[k] = v;
     const baseUrlKeys = preset.baseUrlKeys ?? [];
+    let wrappedBaseUrl = false;
     if (baseUrlKeys.length > 0 && rewrites !== undefined) {
         const r = rewrites.httpRewrites.find((rw) => rw.key === baseUrlKeys[0]);
-        if (r) for (const k of baseUrlKeys) env[k] = wrapUpstream(origin, r.realUpstream);
+        if (r) {
+            for (const k of baseUrlKeys) env[k] = wrapUpstream(origin, r.realUpstream);
+            wrappedBaseUrl = true;
+        }
         const hr = rewrites.httpsRewrites.find((rw) => rw.key === baseUrlKeys[0]);
-        if (hr) for (const k of baseUrlKeys) env[k] = hr.realUpstream;
+        if (hr) {
+            for (const k of baseUrlKeys) env[k] = hr.realUpstream;
+            wrappedBaseUrl = false;
+        }
     }
+    if (wrappedBaseUrl) mergeLoopbackNoProxy(env);
     return env;
 }
 

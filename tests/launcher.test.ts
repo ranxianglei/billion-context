@@ -2856,7 +2856,7 @@ test("discoverRoutes: claude with http ANTHROPIC_BASE_URL → httpRewrites entry
     ]);
 });
 
-test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; undici ignores HTTPS_PROXY)", () => {
+test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; loopback NO_PROXY merged by buildClientEnv, #3446)", () => {
     const routes = discoverRoutes("claude", {});
     assert.deepEqual(routes.httpsDomains, []);
     assert.deepEqual(routes.httpsRewrites, []);
@@ -3071,6 +3071,58 @@ test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL u
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("buildClaudeEnv: /bili/-wrapped ANTHROPIC_BASE_URL → NO_PROXY/no_proxy loopback merge (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+});
+
+test("buildClaudeEnv: NO_PROXY merge unions both case variants, preserves user entries, dedupes (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], {
+        PATH: "/usr/bin",
+        NO_PROXY: "corp.example.com, 10.0.0.5 ",
+        no_proxy: "localhost,internal.corp",
+    });
+    assert.equal(env.NO_PROXY, "corp.example.com,10.0.0.5,localhost,internal.corp,127.0.0.1,::1");
+    assert.equal(env.no_proxy, env.NO_PROXY);
+});
+
+test("buildClaudeEnv: NO_PROXY already covering all loopback hosts → value unchanged (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], {
+        PATH: "/usr/bin",
+        NO_PROXY: "localhost,127.0.0.1,::1",
+    });
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+});
+
+test("buildClaudeEnv: httpsRewrites raw upstream wins → no NO_PROXY merge (#3446)", () => {
+    const httpsRewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://relay.local/anthropic" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], httpsRewrites, { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "https://relay.local/anthropic");
+    assert.equal(env.NO_PROXY, undefined);
+    assert.equal(env.no_proxy, undefined);
+});
+
+test("buildCodexEnv: no base-URL lane → NO_PROXY untouched even with proxy set (#3446)", () => {
+    const env = buildCodexEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, undefined);
+    assert.equal(env.no_proxy, undefined);
 });
 
 test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-free routing)", () => {
@@ -5239,6 +5291,16 @@ test("buildCodebuddyEnv: no CODEBUDDY_BASE_URL rewrite → env.CODEBUDDY_BASE_UR
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
 });
 
+test("buildCodebuddyEnv: /bili/-wrapped CODEBUDDY_BASE_URL → NO_PROXY/no_proxy loopback merge (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "https://api.codebuddy.cn/v2" },
+    ];
+    const env = buildCodebuddyEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.CODEBUDDY_BASE_URL, "http://127.0.0.1:8787/bili/https://api.codebuddy.cn/v2");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+});
+
 test("discoverRoutes: codebuddy default → CODEBUDDY_BASE_URL /bili/ rewrite (CN platform endpoint)", () => {
     const routes = discoverRoutes("codebuddy", {});
     assert.deepEqual(routes.httpsDomains, []);
@@ -6253,10 +6315,20 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
     return clientEnvs[0]!;
 }
 
-function assertInheritedProxyStripped(seenEnv: NodeJS.ProcessEnv, origin: string): void {
+function assertInheritedProxyStripped(
+    seenEnv: NodeJS.ProcessEnv,
+    origin: string,
+    launcherOwned?: Partial<Record<"NO_PROXY" | "no_proxy", string>>,
+): void {
     assert.equal(seenEnv.HTTPS_PROXY, origin, "HTTPS_PROXY points at bili");
     for (const k of INHERITED_PROXY_TEST_VARS) {
         if (k === "HTTPS_PROXY") continue;
+        if ((k === "NO_PROXY" || k === "no_proxy") && launcherOwned && k in launcherOwned) {
+            // #3446: base-URL lanes get a launcher-owned loopback NO_PROXY value;
+            // inherited entries must still be gone from it.
+            assert.equal(seenEnv[k], launcherOwned[k], `${k} carries only the launcher-owned value`);
+            continue;
+        }
         assert.equal(seenEnv[k], undefined, `inherited ${k} stripped`);
     }
     assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
@@ -6308,7 +6380,12 @@ test("runLaunch codebuddy: inherited proxy vars stripped so loopback traffic can
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
     assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
     assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
-    assertInheritedProxyStripped(seenEnv, String(origin));
+    // #3446: codebuddy's base URL is bili's own /bili/ loopback form, so the launcher
+    // injects the loopback NO_PROXY triple; the inherited ".corp" entries stay stripped.
+    assertInheritedProxyStripped(seenEnv, String(origin), {
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    });
 });
 
 async function runAiderLaunch(
