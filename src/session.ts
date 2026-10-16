@@ -245,6 +245,13 @@ export type Session = {
          *  bili's rebuild. */
         inBody?: InboundSlot;
         settledInBody?: InboundSlot;
+        /** [#3198-C] The #651 reasoning-drop ids ACTUALLY applied to the
+         *  outbound view (frozen between folds under flush:"fold"; see
+         *  settleReasoningDropPlan in src/server.ts). Memory-only by design:
+         *  a restart resets it, reasoning reappears on the wire, and the
+         *  restart re-bill is already attributed — same event class as the
+         *  drop:false kill-switch flip. */
+        reasoningDropped?: Set<string>;
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */

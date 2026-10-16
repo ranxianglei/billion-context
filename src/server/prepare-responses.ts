@@ -5,7 +5,8 @@ import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputIt
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, settleReasoningDropPlan, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { noteReasoningDropPlan } from "../cache-ledger.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
@@ -272,8 +273,15 @@ export async function prepareResponses(
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
         reasoningPlan = planReasoningDrop(msgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        const reasoningBlockIdsBefore = new Set(session.state.blocks.map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        // #3198-C: settle the applied drop set AFTER processTurn — a fold that
+        // landed in this request flushes the pending closed-round reasoning in
+        // the SAME request, riding the fold's re-billed region instead of
+        // opening a new prefix-cache seam at every round close.
+        reasoningPlan = settleReasoningDropPlan(session, reasoningPlan, msgs, reasoning, reasoningBlockIdsBefore, session.state.blocks, log, sessionId);
+        noteReasoningDropPlan(session, reasoningPlan);
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.

@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
-import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { dropCompressReasoningIds, REASONING_FLUSH_CAP, resolveReasoningDrop, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -1697,6 +1697,64 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** [#3198-C] Decide the EFFECTIVE #651 drop plan for this request under the
+ *  flush policy (#3198: the legacy close-timing drop rewrites mid-history
+ *  bytes once per round close — a fresh prefix-cache seam the ledger could
+ *  not attribute). `candidate` is planReasoningDrop's pre-turn pass (anchors
+ *  intact); this runs AFTER core.processTurn, comparing block ids before/
+ *  after to see whether a fold landed in THIS request. Under flush:"fold"
+ *  (default) the applied set (session.transient.reasoningDropped) only
+ *  grows at flush moments — a fold in this request (the reclaim rides the
+ *  fold's own re-billed region: the flushed reasoning sits inside or beside
+ *  the covered range, so the first differing byte is the fold's, not a new
+ *  seam), the pending-mass cap (REASONING_FLUSH_CAP — sessions that never
+ *  fold must not grow the floor unboundedly; one attributed seam per
+ *  crossing), or a gate opening (candidate empty ⇒ applied resets: gates are
+ *  presence-based and per-request, reasoning returns to the wire exactly as
+ *  before this mechanism existed). flush:"close" is the legacy timing —
+ *  applied follows every candidate. Restart resets the applied set
+ *  (memory-only transient): reasoning reappears once, and the restart
+ *  re-bill is already attributed by the ledger. */
+export function settleReasoningDropPlan(
+    session: Session,
+    candidate: Set<string>,
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    blockIdsBefore: Set<string>,
+    blocksAfter: readonly { blockId: string }[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): Set<string> {
+    const t = (session.transient ??= {});
+    if (candidate.size === 0) {
+        // Gate closed / disabled / no match: nothing applies, and any earlier
+        // applied ids stop applying (presence-based gates, per-request).
+        t.reasoningDropped = new Set();
+        return t.reasoningDropped;
+    }
+    const prev = t.reasoningDropped ?? new Set<string>();
+    const flush = resolveReasoningDrop(reasoning).flush;
+    if (flush === "close") {
+        t.reasoningDropped = candidate;
+        return candidate;
+    }
+    const folded = blocksAfter.some((b) => !blockIdsBefore.has(b.blockId));
+    if (folded) {
+        t.reasoningDropped = candidate;
+        return candidate;
+    }
+    let pendingMass = 0;
+    for (const m of msgs) {
+        if (candidate.has(m.id) && !prev.has(m.id)) pendingMass += (m.text ?? "").length;
+    }
+    if (pendingMass > REASONING_FLUSH_CAP) {
+        log("info", `[${sessionId}] compress-reasoning: pending ${pendingMass} chars > ${REASONING_FLUSH_CAP} cap — flushing outside a fold (one attributed re-bill; compress.reasoning.flush:"close" opts into the legacy per-round timing) (#3198)`);
+        t.reasoningDropped = candidate;
+        return candidate;
+    }
+    return prev;
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see

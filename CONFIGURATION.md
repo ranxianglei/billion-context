@@ -250,7 +250,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
+| `compress.reasoning` | { drop?, threshold?, flush? } | drop true · threshold 2048 · flush "fold" | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. "flush" decides WHEN dropped reasoning leaves the wire (see compress.reasoning.flush). |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
@@ -283,6 +283,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
+| `compress.reasoning.flush` | "fold" \| "close" | "fold" | — | When closed-round reasoning leaves the forwarded view (#3198). "fold" (default): the drop set is frozen between folds and flushes in the same request as a fold — the wire stays byte-stable across round closes, so the reclaim rides the fold's own re-billed prefix-cache region instead of opening a fresh seam per round. A 64 KB pending-mass cap flushes early for sessions that never fold (one attributed re-bill per crossing, shown in the cache ledger under the compress-reasoning bucket). "close" (legacy timing, opt-in): flush on the first request after each round closes — reclaims the floor one fold earlier, but every round close rewrites mid-history bytes and pays a NEW cache miss; enabling it means accepting those seams, reasonable only where misses are cheap (e.g. local endpoints). |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
 
 **Provider route fields**

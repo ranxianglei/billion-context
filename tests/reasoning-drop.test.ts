@@ -97,11 +97,14 @@ test("idempotence: a second pass changes nothing", () => {
 });
 
 test("resolveReasoningDrop: defaults, validation, and passthrough", () => {
-    assert.deepEqual(resolveReasoningDrop(undefined), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({}), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({ drop: false, threshold: 0 }), { drop: false, threshold: 0 });
-    assert.deepEqual(resolveReasoningDrop({ threshold: -3 }), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({ threshold: 512.9 }), { drop: true, threshold: 512 });
+    assert.deepEqual(resolveReasoningDrop(undefined), { drop: true, threshold: 2048, flush: "fold" });
+    assert.deepEqual(resolveReasoningDrop({}), { drop: true, threshold: 2048, flush: "fold" });
+    assert.deepEqual(resolveReasoningDrop({ drop: false, threshold: 0 }), { drop: false, threshold: 0, flush: "fold" });
+    assert.deepEqual(resolveReasoningDrop({ threshold: -3 }), { drop: true, threshold: 2048, flush: "fold" });
+    assert.deepEqual(resolveReasoningDrop({ threshold: 512.9 }), { drop: true, threshold: 512, flush: "fold" });
+    // #3198-C: flush timing — "close" is the legacy opt-in, anything else folds.
+    assert.deepEqual(resolveReasoningDrop({ flush: "close" }), { drop: true, threshold: 2048, flush: "close" });
+    assert.deepEqual(resolveReasoningDrop({ flush: "nonsense" as unknown as "fold" }), { drop: true, threshold: 2048, flush: "fold" });
 });
 
 test("multiple closed compress rounds all get stripped (distinct toolCallIds)", () => {

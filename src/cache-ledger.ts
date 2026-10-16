@@ -113,13 +113,16 @@ interface LedgerLine {
     /** #2929: which attribution arm detectSeam booked this sample's residual
      *  into — "ttl" (long-idle byte-stable miss, normal ageing), "side"
      *  (short-idle byte-stable miss, abnormal provider failure), "rewind"
-     *  (client revert/trim re-bill) or "client" (#3023: the client's own
+     *  (client revert/trim re-bill), "client" (#3023: the client's own
      *  resent history broke mid-list — host-side insert/rewrite, e.g. another
      *  plugin or paste hoisting; the outbound seam is bili's faithful rebuild
-     *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
+     *  of host churn) or "reasoning" (#651/#3198: a compress-reasoning round
+     *  newly closed — the drop pass removed that round's reasoning from the
+     *  outbound view, a known once-per-round mid-history rewrite). Sparse:
+     *  omitted unless booked. The seam arm sets `seam`
      *  above instead. Lets the web trajectory chart paint the same bucket
      *  membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind" | "client";
+    prov?: "ttl" | "side" | "rewind" | "client" | "reasoning";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -275,6 +278,13 @@ interface CacheLedger {
          *  abort/retry churn correlates with prefix misses (the retried
          *  request carries a rewritten tail). Correlation, not causation. */
         abortCorrelated: number;
+        /** #651/#3198: re-bills on the request where a compress-reasoning
+         *  round newly closed — the drop pass removed that round's reasoning
+         *  from the outbound view, a known once-per-round mid-history
+         *  rewrite. Expected cost of `compress.reasoning.drop` (default on),
+         *  never an unexplained seam. */
+        reasoningDropMisses: number;
+        reasoningDropMissed: number;
     };
     /** #1592-family: bounded forensic log of suspected mid-history cache-seam
      *  breaks (consecutive outbound bodies diverged with no structural
@@ -475,6 +485,9 @@ function firstDivergentInboundMsg(prev: InboundSlot, cur: InboundSlot): number |
 }
 const lastClientAbort = new WeakMap<Session, number>();
 
+const lastReasoningDrop = new WeakMap<Session, number>();
+const lastReasoningDropKey = new WeakMap<Session, string>();
+
 interface ContextObservation {
     sessionId: string;
     tokens: number;
@@ -508,6 +521,21 @@ export function currentContextObservation(session: Session): ContextObservation 
  *  session reads it to mark abort-correlated samples. */
 export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
+}
+
+/** #651/#3198: track the compress-reasoning drop plan between requests.
+ *  Called by prepare-* right after planReasoningDrop. When the plan GROWS
+ *  (a compress round newly closed since the previous request) the outbound
+ *  view drops that round's reasoning mid-history exactly once — the miss it
+ *  bills is a known cause, booked by detectSeam into the reasoningDrop
+ *  bucket. The first observation in a process only primes the key: after a
+ *  restart the dropped view is already steady, so no rewrite happens and a
+ *  later unrelated miss must not borrow the attribution. */
+export function noteReasoningDropPlan(session: Session, plan: Set<string>): void {
+    const key = plan.size === 0 ? "" : `${plan.size}:${[...plan].sort().join("\x00")}`;
+    const prev = lastReasoningDropKey.get(session);
+    lastReasoningDropKey.set(session, key);
+    if (prev !== undefined && prev !== key && plan.size > 0) lastReasoningDrop.set(session, Date.now());
 }
 
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
@@ -758,6 +786,25 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
+    // #651/#3198: a compress-reasoning round closed on THIS request — the
+    // drop pass removed the closed round's reasoning from the outbound view,
+    // a known once-per-round mid-history rewrite. Consume the stamp so a
+    // later unrelated miss can never borrow it, and book the re-bill as a
+    // known cause instead of an unexplained seam. Full-hit rounds leave the
+    // stamp in place; the 120s window bounds any stale read.
+    const rdAt = lastReasoningDrop.get(session);
+    if (rdAt !== undefined) {
+        lastReasoningDrop.delete(session);
+        if (Math.abs(line.at - rdAt) < 120_000) {
+            line.prov = "reasoning";
+            agg.reasoningDropMisses += 1;
+            agg.reasoningDropMissed += line.tr;
+            if (agg.reasoningDropMisses === 1) {
+                loggerLog("info", `[${session.id}] [cache-seam] compress-reasoning round-close rewrite (#651): hit ${line.hitPct}% (input=${line.input}, re-paid=${Math.round(line.tr)} tok) — the closed round's reasoning left the outbound view (not a seam; default flush:'fold' rides the next fold's re-billed region, flush:'close'/cap = this once-per-round/out-of-fold re-bill; compress.reasoning.drop:false disables the drop)`);
+            }
+            return;
+        }
+    }
     const cur = session.transient?.sentBody;
     const prev = session.transient?.settledBody;
     // #2929: split the provider-side arms by idle gap — a byte-stable miss
@@ -906,6 +953,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
+            "reasoningDropMisses", "reasoningDropMissed",
             "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
@@ -923,7 +971,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, reasoningDropMisses: 0, reasoningDropMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1619,7 +1667,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "reasoning" }>;
     modelSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
@@ -1641,7 +1689,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number } };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; reasoningDrop: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1825,7 +1873,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed } },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, reasoningDrop: { count: a.reasoningDropMisses, missed: a.reasoningDropMissed } },
     };
 }
 
@@ -1995,6 +2043,10 @@ function formatSeam(r: BiliCacheReport): string {
         for (const e of r.seam.events) {
             if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
+    }
+    if (r.seam.reasoningDrop.count > 0) {
+        out.push("℞ COMPRESS-REASONING DROP (#651/#3198) — reasoning reclaimed off the wire (default rides the next fold's re-billed region; flush:'close' = once-per-round re-bill)");
+        out.push(`  ${r.seam.reasoningDrop.count} sample(s) · ${fmtTok(r.seam.reasoningDrop.missed)} tok re-billed where a closed compress round's reasoning left the outbound view — expected cost of compress.reasoning.drop (default on): the drop rewrites that stretch of history exactly once per round. Not a seam; set compress.reasoning.drop=false to keep reasoning (larger prompts, no re-bill).`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");

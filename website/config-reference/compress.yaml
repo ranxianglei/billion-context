@@ -246,15 +246,15 @@ entries:
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
   - key: compress.reasoning
-    type: "{ drop?, threshold? }"
-    default: "drop true · threshold 2048"
+    type: "{ drop?, threshold?, flush? }"
+    default: "drop true · threshold 2048 · flush \"fold\""
     group: compress
     id: ct.rz
     render: compress-row
-    desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
-    desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
-    site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
-    site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+    desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. \"flush\" decides WHEN dropped reasoning leaves the wire (see compress.reasoning.flush)."
+    desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。\"flush\" 决定被丢弃的推理何时离开转发视图（见 compress.reasoning.flush）。"
+    site_en: "{ drop?, threshold?, flush? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
+    site_zh: "{ drop?, threshold?, flush? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -479,6 +479,12 @@ entries:
     group: compress
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
+  - key: compress.reasoning.flush
+    type: "\"fold\" | \"close\""
+    default: "\"fold\""
+    group: compress
+    desc_en: "When closed-round reasoning leaves the forwarded view (#3198). \"fold\" (default): the drop set is frozen between folds and flushes in the same request as a fold — the wire stays byte-stable across round closes, so the reclaim rides the fold's own re-billed prefix-cache region instead of opening a fresh seam per round. A 64 KB pending-mass cap flushes early for sessions that never fold (one attributed re-bill per crossing, shown in the cache ledger under the compress-reasoning bucket). \"close\" (legacy timing, opt-in): flush on the first request after each round closes — reclaims the floor one fold earlier, but every round close rewrites mid-history bytes and pays a NEW cache miss; enabling it means accepting those seams, reasonable only where misses are cheap (e.g. local endpoints)."
+    desc_zh: "已结束轮次的推理何时从转发视图移除（#3198）。\"fold\"（默认）：丢弃集合在两次折叠之间冻结，随折叠所在的那次请求一起冲刷 —— 回合结束时线上字节保持不变，回收搭折叠自身已重计费的前缀缓存区域，不再每回合开一条新接缝。对从不折叠的会话有 64 KB 积压上限（超限即冲刷，每次越界一笔已归因重计费，记在缓存账本的压缩思考桶）。\"close\"（旧时序，主动开启）：每回合结束后的第一条请求即冲刷 —— 地板早一个折叠周期回收，但每次回合结束都会改写中段历史字节、付出一次全新的缓存 miss；开启即表示接受这些接缝，只适合 miss 代价低的场景（如本地端点）。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"

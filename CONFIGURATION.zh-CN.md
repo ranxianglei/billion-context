@@ -250,7 +250,7 @@
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
+| `compress.reasoning` | { drop?, threshold?, flush? } | drop true · threshold 2048 · flush "fold" | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"flush" 决定被丢弃的推理何时离开转发视图（见 compress.reasoning.flush）。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
@@ -283,6 +283,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
+| `compress.reasoning.flush` | "fold" \| "close" | "fold" | — | 已结束轮次的推理何时从转发视图移除（#3198）。"fold"（默认）：丢弃集合在两次折叠之间冻结，随折叠所在的那次请求一起冲刷 —— 回合结束时线上字节保持不变，回收搭折叠自身已重计费的前缀缓存区域，不再每回合开一条新接缝。对从不折叠的会话有 64 KB 积压上限（超限即冲刷，每次越界一笔已归因重计费，记在缓存账本的压缩思考桶）。"close"（旧时序，主动开启）：每回合结束后的第一条请求即冲刷 —— 地板早一个折叠周期回收，但每次回合结束都会改写中段历史字节、付出一次全新的缓存 miss；开启即表示接受这些接缝，只适合 miss 代价低的场景（如本地端点）。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
 
 **路由表字段**

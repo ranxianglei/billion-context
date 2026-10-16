@@ -26,9 +26,26 @@ export interface CompressReasoningConfig {
      *  `compress` call must total STRICTLY more than this to be dropped.
      *  Default: 2048. `0` drops any non-empty run. */
     threshold?: number;
+    /** When closed rounds' reasoning leaves the OUTBOUND view (#3198-C):
+     *  - "fold" (default): the applied drop set is frozen between folds and
+     *    flushes only when a fold lands in the same request (or the pending
+     *    mass cap trips) — the wire stays byte-stable across round closes, so
+     *    each flush rides the fold's own re-billed region instead of opening
+     *    a NEW prefix-cache seam;
+     *  - "close": legacy timing — flush on the first request after each round
+     *    close. Reclaims the floor one fold earlier, but every round close
+     *    rewrites mid-history bytes and pays a fresh cache miss (fine where
+     *    misses are cheap, e.g. local endpoints). */
+    flush?: "fold" | "close";
 }
 
-export const DEFAULT_COMPRESS_REASONING: Required<CompressReasoningConfig> = { drop: true, threshold: 2048 };
+export const DEFAULT_COMPRESS_REASONING: Required<CompressReasoningConfig> = { drop: true, threshold: 2048, flush: "fold" };
+
+/** Pending-mass backstop for flush:"fold": chars of closed-but-unflushed
+ *  reasoning beyond which the flush fires even without a fold, so sessions
+ *  that never fold do not grow the floor unboundedly. One attributed seam
+ *  per crossing (the ledger's compress-reasoning bucket, #3198). */
+export const REASONING_FLUSH_CAP = 64 * 1024;
 
 export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<CompressReasoningConfig> {
     let threshold = DEFAULT_COMPRESS_REASONING.threshold;
@@ -38,7 +55,8 @@ export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<Co
             threshold = Math.floor(t);
         }
     }
-    return { drop: cfg?.drop !== false, threshold };
+    const flush = cfg?.flush === "close" ? "close" : "fold";
+    return { drop: cfg?.drop !== false, threshold, flush };
 }
 
 /** Request-time pass: remove reasoning messages attached to a `compress`
