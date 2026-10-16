@@ -12,7 +12,7 @@ import { recordThreadTail } from "./server/thread-tracking.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
-import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
+import { compressResult, toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
@@ -669,6 +669,92 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
+// #3185: cap on refs listed per category in a dry-run receipt — a wide range
+// can fold hundreds of messages; the model needs the shape and the count, not
+// the full list (it already holds the refs in context).
+const PREVIEW_REF_CAP = 20;
+
+function fmtPreviewRefs(refs: string[]): string {
+    return refs.length > PREVIEW_REF_CAP
+        ? `${refs.slice(0, PREVIEW_REF_CAP).join(", ")} (+${refs.length - PREVIEW_REF_CAP} more)`
+        : refs.join(", ");
+}
+
+// #3185: dryRun preview lane — runs the kernel's pre-commit planning on a
+// throwaway clone and reports what a real call would do. Zero side effects by
+// construction: no blocks, no ref allocation, no ledger write, and none of the
+// failure/loop tracking below (a preview is not an attempt).
+function previewRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): ProxyToolResult {
+    const { ranges } = parsed;
+    // Same reversal detection + normalization order as the real path so the
+    // previewed ranges are exactly what a re-issued call would submit.
+    const revs = reversedRanges(ranges);
+    const swappedRanges = normalizeRangeOrder(ranges);
+    if (swappedRanges > 0) {
+        ctx.log(`[acp-proxy: compress dry-run normalized ${swappedRanges} reversed range(s) to ascending ref order (#1001)]`);
+    }
+    ctx.log(`[acp-proxy: compress dry-run requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
+    if (revs.length > 0) {
+        ctx.log(`[acp-proxy: reversed range(s) in compress dry-run: ${revs.map((rg) => `${rg.startRef}->${rg.endRef}`).join(", ")}]`);
+    }
+    const report = ctx.core.previewCompression({
+        ranges,
+        messages: ctx.compressMessages ?? ctx.messages,
+        state: ctx.session.state,
+        config: ctx.config,
+    });
+    const revNote = revs.length > 0
+        ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed and normalized to ascending order before evaluation.`
+        : "";
+    const lines: string[] = [`[Compress dry-run — validated only, NOTHING committed. No blocks were created, no refs allocated.${revNote}]`];
+    if (report.batchError) {
+        lines.push(`BATCH REJECTED (a real call would fail before evaluating any range): ${report.batchError}`);
+    }
+    let savedTotal = 0;
+    for (const r of report.ranges) {
+        const head = `${r.startRef}–${r.endRef}`;
+        if (r.error) {
+            lines.push(`${head}: WOULD FAIL — ${r.error}`);
+            continue;
+        }
+        if (r.skippedOverlap) {
+            lines.push(`${head}: SKIPPED (overlaps an earlier range in the same call)${r.warnings?.length ? ` — ${r.warnings.join(" ")}` : ""}`);
+            continue;
+        }
+        if (r.alreadyCovered) {
+            lines.push(`${head}: ALREADY COVERED by active blocks — ${r.warnings?.join(" ") ?? ""}`);
+            continue;
+        }
+        if (r.wouldRefold) {
+            lines.push(`${head}: WOULD REFOLD block(s) ${r.wouldRefold.join(", ")}`);
+            continue;
+        }
+        const parts: string[] = [];
+        if (r.wouldFold?.length) parts.push(`would fold ${fmtPreviewRefs(r.wouldFold)}`);
+        if (r.excluded?.protectedTools?.length) parts.push(`excluded protected tools: ${fmtPreviewRefs(r.excluded.protectedTools)}`);
+        if (r.excluded?.recentZone?.length) parts.push(`excluded recent zone: ${fmtPreviewRefs(r.excluded.recentZone)}`);
+        if (r.excluded?.checkpointCarriers?.length) parts.push(`excluded checkpoint carriers: ${fmtPreviewRefs(r.excluded.checkpointCarriers)}`);
+        if (r.excluded?.media?.length) parts.push(`excluded unrecoverable media: ${fmtPreviewRefs(r.excluded.media)}`);
+        if (r.withdrawn) parts.push(`withdrawn for turn integrity: ${fmtPreviewRefs(r.withdrawn.refs)} (${r.withdrawn.splitTurns} turn(s), ${r.withdrawn.splitPairs} pair(s))`);
+        if (r.consumedBlocks?.length) parts.push(`absorbs block(s) ${r.consumedBlocks.join(", ")}`);
+        if (typeof r.estimatedTokensSaved === "number") {
+            savedTotal += r.estimatedTokensSaved;
+            parts.push(`~${r.estimatedTokensSaved} tokens saved`);
+        }
+        lines.push(`${head}: ${parts.length > 0 ? parts.join("; ") : "nothing to fold"}${r.warnings?.length ? ` [warnings: ${r.warnings.join(" ")}]` : ""}`);
+    }
+    if (!report.batchError && savedTotal > 0) {
+        const view = ctx.compressMessages ?? ctx.messages;
+        let viewTokens = 0;
+        for (const m of view) viewTokens += countMessageTokens(m, defaultCountTokens);
+        const post = Math.max(0, viewTokens - savedTotal);
+        const windowNote = ctx.config.modelContextLimit > 0 ? ` / window ${ctx.config.modelContextLimit}` : "";
+        lines.push(`After a real commit: est-view ~${post} tok (was ~${viewTokens})${windowNote}. Local token estimates.`);
+    }
+    lines.push("Re-issue the same call WITHOUT dryRun (and WITH your summary) to actually compress.");
+    return toolOk(lines.join("\n"));
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
@@ -679,6 +765,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
+        // #3185 review: a malformed PREVIEW is still not an attempt — report
+        // the shape error so the model can correct it, but never arm the
+        // failure streak or the loop breaker (nothing was committed).
+        if (parsed.dryRun) {
+            const reasons = rawReasons.slice(0, 3).map((r) => (r.length > 160 ? safePrefix(r, 160) + "..." : r));
+            const why = reasons.length > 0 ? ` Rejected entries: ${reasons.join(" | ")}.` : "";
+            return compressResult(
+                `[Compression PREVIEW FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} Fix the refs/argument shape and re-issue the dryRun call — a preview never counts against the compress failure guard.`,
+                "refused", 0, `parse:${diagnostics.kind}`,
+            );
+        }
         // #1029: keep the ENTIRE failure on ONE line. buildVisibilityMarker
         // (the ❌ status line streamed to the client) keeps only line 1, so the
         // old multi-line "Rejected entries:" list reached clients as a dangling
@@ -728,6 +825,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
         const retry = recovery.canRetry ? " Re-issue the compress call with a valid content array using those eligible refs." : "";
         return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+    }
+    // #3185: dryRun previews validate without committing — route BEFORE any
+    // failure-tracking/loop-guard side effect (a preview is not an attempt).
+    if (parsed.dryRun) {
+        return previewRanges(parsed, ctx);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).

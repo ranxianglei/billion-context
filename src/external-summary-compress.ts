@@ -35,6 +35,10 @@ function withOptionalSummaries(input: unknown): unknown {
 /** Called under the host session lock; generation is separate from kernel commit. */
 export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
     if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
+    // #3185: a dryRun preview needs no external summarizer — route the RAW
+    // input (no placeholder summaries) straight to the zero-side-effect lane.
+    const dryParsed = parseCompressInput(input, callId);
+    if (dryParsed.dryRun) return applyRanges(dryParsed, ctx);
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).
     let plan;

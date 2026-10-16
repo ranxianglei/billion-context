@@ -442,6 +442,19 @@ export type CompressSettings = {
      *  enabled at some level. Deepest-wins like every other scalar field. */
     rules?: boolean;
 
+    /** #3185: expose the compress tool's `dryRun` preview capability. When
+     *  true, the served tool schema gains the `dryRun` parameter and the prompt
+     *  advertises the preview-then-commit strategy, and a `compress` call with
+     *  `dryRun: true` routes to a zero-side-effect preview instead of folding.
+     *  When false (the default) the surface is byte-identical to pre-#3185 — no
+     *  `dryRun` field, no prompt sentence, no preview routing, and a
+     *  summary-less payload is rejected exactly as before. Global only (a
+     *  process-wide tool-surface toggle, not a per-field compression tuning
+     *  knob), so it is honored from the top-level `compress` block regardless
+     *  of provider/model level. Resolved via knobs.dryRunPreviewEnabled()
+     *  (env BILI_COMPRESS_DRYRUN > file > false). */
+    dryRunPreview?: boolean;
+
     /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
      *  tool calls at request time (src/reasoning-drop.ts, aligned with
      *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
@@ -1551,7 +1564,7 @@ type FileConfig = {
      *  (`injectTool` / `injectNudge`, honored globally) plus the tuning fields
      *  (see CompressSettings), overridden per-field by provider- and model-level
      *  `compress`. */
-    compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
+    compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean; dryRunPreview?: boolean };
     promptCache?: { routing?: string };
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
@@ -1905,7 +1918,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "rules", "injectTool", "injectNudge", "dryRunPreview",
     "acknowledgePromptsRisk", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
@@ -2490,6 +2503,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("rules" in obj) {
         if (typeof obj.rules !== "boolean") ok = false;
         else out.rules = obj.rules;
+    }
+    if ("dryRunPreview" in obj) {
+        if (typeof obj.dryRunPreview !== "boolean") ok = false;
+        else out.dryRunPreview = obj.dryRunPreview;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

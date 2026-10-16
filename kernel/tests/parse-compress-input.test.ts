@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseCompressArgs } from "../src/parse-compress-input.js";
+import { COMPRESS_PARAMETERS, COMPRESS_PARAMETERS_DRYRUN, COMPRESS_TOOL_GOOGLE, COMPRESS_TOOL_GOOGLE_DRYRUN } from "../src/compress-tools.js";
 import { rebuildCompressionState } from "../src/rebuild.js";
 import { createInitialState } from "../src/state.js";
 import { defaultConfig } from "../src/config.js";
@@ -1234,5 +1235,168 @@ test("line-form split still breaks on headers after blank lines and element resi
       ["m00006", "m00008", "summary two."],
       ["m00009", "m00010", "summary three."],
     ],
+  );
+});
+
+// #3185: dryRun previews carry no summaries by contract. The parser only honors
+// the flag when the host opts in via { allowDryRun: true }; by default (switch
+// OFF) a summary-less entry is rejected exactly as on the commit path.
+test("dryRun:true accepts object entries without summaries", () => {
+  const parsed = parseCompressArgs(
+    {
+      content: [
+        { startId: "m00001", endId: "m00002" },
+        { startId: "m00003", endId: "m00004" },
+      ],
+      dryRun: true,
+    },
+    { allowDryRun: true },
+  );
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.diagnostics.kind, "ok");
+  assert.equal(parsed.diagnostics.invalidItems, 0);
+  assert.deepEqual(
+    parsed.ranges.map((r) => [r.startRef, r.endRef, r.summary]),
+    [
+      ["m00001", "m00002", ""],
+      ["m00003", "m00004", ""],
+    ],
+  );
+});
+
+test("missing summary is still rejected when dryRun is absent or false", () => {
+  for (const input of [
+    { content: [{ startId: "m00001", endId: "m00002" }] },
+    { content: [{ startId: "m00001", endId: "m00002" }], dryRun: false },
+  ]) {
+    const parsed = parseCompressArgs(input);
+    assert.equal(parsed.dryRun, undefined, JSON.stringify(input));
+    assert.equal(parsed.ranges.length, 0, JSON.stringify(input));
+    assert.equal(parsed.diagnostics.invalidItems, 1, JSON.stringify(input));
+    assert.ok(
+      parsed.diagnostics.invalidReasons?.[0]!.includes("missing summary"),
+      JSON.stringify(parsed.diagnostics),
+    );
+  }
+});
+
+test("dryRun:true is ignored without allowDryRun (default-off rejects summary-less)", () => {
+  const parsed = parseCompressArgs({
+    content: [{ startId: "m00001", endId: "m00002" }],
+    dryRun: true,
+  });
+  assert.equal(parsed.dryRun, undefined, "flag not surfaced when the switch is off");
+  assert.equal(parsed.ranges.length, 0);
+  assert.equal(parsed.diagnostics.invalidItems, 1);
+});
+
+test("dryRun:true accepts flat top-level refs without a summary", () => {
+  const parsed = parseCompressArgs(
+    { startId: "m00001", endId: "m00002", dryRun: true },
+    { allowDryRun: true },
+  );
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.deepEqual([parsed.ranges[0]!.startRef, parsed.ranges[0]!.summary], [
+    "m00001",
+    "",
+  ]);
+});
+
+test("string input detects the dryRun flag for JSON-shaped arguments", () => {
+  const parsed = parseCompressArgs(
+    '{"content":[{"startId":"m00001","endId":"m00002"}],"dryRun":true}',
+    { allowDryRun: true },
+  );
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.equal(parsed.ranges[0]!.summary, "");
+});
+
+test("truncated string input keeps the dryRun flag through salvage", () => {
+  const parsed = parseCompressArgs(
+    '{"dryRun":true,"content":[{"startId":"m00001","endRef":"m00002","summary":"s"},{"startId":"m00003","endRef":"m00004","summ',
+    { allowDryRun: true },
+  );
+  assert.equal(parsed.dryRun, true);
+  const first = parsed.ranges.find((r) => r.startRef === "m00001");
+  assert.ok(first, "salvage kept the complete entry");
+});
+
+test("line-form header-only entries are accepted under dryRun only", () => {
+  const preview = parseCompressArgs(
+    { content: ["m00001-m00005"], dryRun: true },
+    { allowDryRun: true },
+  );
+  assert.equal(preview.dryRun, true);
+  assert.equal(preview.ranges.length, 1);
+  assert.deepEqual(
+    [preview.ranges[0]!.startRef, preview.ranges[0]!.endRef, preview.ranges[0]!.summary],
+    ["m00001", "m00005", ""],
+  );
+
+  const real = parseCompressArgs({ content: ["m00001-m00005"] });
+  assert.equal(real.ranges.length, 0);
+  assert.equal(real.diagnostics.invalidItems, 1);
+});
+
+// ---------------------------------------------------------------------------
+// #3193 review: schema-shape guards (byte goldens alone missed these)
+// ---------------------------------------------------------------------------
+
+const SCHEMA_TOP_KEYS = new Set(["type", "properties", "required"]);
+
+test("compress schemas keep every declared field INSIDE properties (base + dryRun variants)", () => {
+  for (const [label, schema] of [
+    ["COMPRESS_PARAMETERS", COMPRESS_PARAMETERS],
+    ["COMPRESS_TOOL_GOOGLE.parameters", COMPRESS_TOOL_GOOGLE.parameters],
+    ["COMPRESS_PARAMETERS_DRYRUN", COMPRESS_PARAMETERS_DRYRUN],
+    ["COMPRESS_TOOL_GOOGLE_DRYRUN.parameters", COMPRESS_TOOL_GOOGLE_DRYRUN.parameters],
+  ] as const) {
+    const strays = Object.keys(schema).filter((k) => !SCHEMA_TOP_KEYS.has(k));
+    assert.deepEqual(strays, [], `${label} has keys outside type/properties/required: ${strays.join(", ")}`);
+  }
+  // Base surface carries NO dryRun field (switch OFF == pre-feature bytes);
+  // only the _DRYRUN variants declare it, always inside properties.
+  assert.equal(COMPRESS_PARAMETERS.properties["dryRun"], undefined, "base must not expose dryRun");
+  assert.equal(COMPRESS_TOOL_GOOGLE.parameters.properties["dryRun"], undefined, "base google must not expose dryRun");
+  assert.ok(COMPRESS_PARAMETERS_DRYRUN.properties["dryRun"] !== undefined, "dryRun variant declares dryRun");
+  assert.ok(COMPRESS_TOOL_GOOGLE_DRYRUN.parameters.properties["dryRun"] !== undefined, "google dryRun variant declares dryRun");
+});
+
+test("batch object branches: base forces summary, dryRun variant does not (parser enforces on commits)", () => {
+  const branchesOf = (p: { properties: Record<string, unknown> }) => {
+    const content = p.properties["content"] as { anyOf: Array<{ items?: unknown }> };
+    const arrayBranch = content.anyOf.find((b) => b.items !== undefined) as { items: { anyOf: Array<{ required?: string[] }> } };
+    return arrayBranch.items.anyOf.filter((b) => Array.isArray(b.required)) as Array<{ required: string[] }>;
+  };
+  const baseBranches = branchesOf(COMPRESS_PARAMETERS);
+  const dryBranches = branchesOf(COMPRESS_PARAMETERS_DRYRUN);
+  assert.ok(baseBranches.length >= 2, "base: both bound spellings present");
+  assert.ok(dryBranches.length >= 2, "dryRun: both bound spellings present");
+  for (const branch of baseBranches) {
+    assert.ok(branch.required.includes("summary"), "base: summary required in a batch object branch");
+  }
+  for (const branch of dryBranches) {
+    assert.ok(!branch.required.includes("summary"), "dryRun: summary must not be required in a batch object branch");
+  }
+});
+
+test("batch dryRun without summaries parses to summary-less ranges", () => {
+  const parsed = parseCompressArgs(
+    {
+      dryRun: true,
+      content: [
+        { startId: "m00001", endId: "m00005" },
+        { startId: "m00006", endId: "m00010" },
+      ],
+    },
+    { allowDryRun: true },
+  );
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 2);
+  assert.deepEqual(
+    parsed.ranges.map((r) => r.summary),
+    ["", ""],
   );
 });

@@ -37,8 +37,13 @@ import {
     ACP_SEARCH_CLOSE,
     ACP_DECOMPRESS_OPEN,
     ACP_DECOMPRESS_CLOSE,
-    buildCompressSystemPrompt,
-    buildCompressHybridSystemPrompt,
+    buildCompressSystemPrompt as kBuildCompressSystemPrompt,
+    buildCompressHybridSystemPrompt as kBuildCompressHybridSystemPrompt,
+    COMPRESS_TOOL_DRYRUN,
+    COMPRESS_TOOL_OPENAI_DRYRUN,
+    COMPRESS_TOOL_RESPONSES_DRYRUN,
+    COMPRESS_TOOL_GOOGLE_DRYRUN,
+    COMPRESS_DRYRUN_PROMPT_SENTENCE,
     defaultPrompts,
     ACP_TOOL_NAMES,
     COMPRESS_TOOL_NAME,
@@ -47,6 +52,7 @@ import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } fr
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
+import { dryRunPreviewEnabled } from "./knobs.js";
 
 export {
     COMPRESS_TOOL_NAME,
@@ -65,6 +71,10 @@ export {
     COMPRESS_TOOL_OPENAI,
     COMPRESS_TOOL_RESPONSES,
     COMPRESS_TOOL_GOOGLE,
+    COMPRESS_TOOL_DRYRUN,
+    COMPRESS_TOOL_OPENAI_DRYRUN,
+    COMPRESS_TOOL_RESPONSES_DRYRUN,
+    COMPRESS_TOOL_GOOGLE_DRYRUN,
     DECOMPRESS_TOOL,
     DECOMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_RESPONSES,
@@ -82,13 +92,37 @@ export {
     ACP_TOOLS_RESPONSES,
     ACP_TOOLS_GOOGLE,
     ACP_READONLY_TOOLS_RESPONSES,
-    buildCompressSystemPrompt,
     buildCompressTextSystemPrompt,
-    buildCompressHybridSystemPrompt,
     RULE_TOOL_NAME,
 } from "acp-kernel";
 export type { ParsedRange } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
+
+// #3185: the dryRun preview is opt-in (compress.dryRunPreview / BILI_COMPRESS_DRYRUN,
+// default off). Off, the served schema and prompt are byte-identical to master; on,
+// the compress tool gains the dryRun schema and the strategy sentence. The knob can
+// come from file config loaded after module init, so every serving point resolves it
+// per request instead of baking it into a module-level const.
+const DRYRUN_PROMPT_ANCHOR = "Never split a batch into one call per range.";
+function withDryRunStrategy(prompt: string): string {
+    return dryRunPreviewEnabled() && prompt.includes(DRYRUN_PROMPT_ANCHOR)
+        ? prompt.replace(DRYRUN_PROMPT_ANCHOR, DRYRUN_PROMPT_ANCHOR + COMPRESS_DRYRUN_PROMPT_SENTENCE)
+        : prompt;
+}
+export function buildCompressSystemPrompt(prompts?: Prompts, sections?: CompressPromptSections): string {
+    return withDryRunStrategy(kBuildCompressSystemPrompt(prompts, sections));
+}
+export function buildCompressHybridSystemPrompt(prompts?: Prompts, sections?: CompressPromptSections): string {
+    return withDryRunStrategy(kBuildCompressHybridSystemPrompt(prompts, sections));
+}
+function compressNameOf(tool: unknown): string | undefined {
+    const t = tool as { name?: string; function?: { name?: string } };
+    return t?.function?.name ?? t?.name;
+}
+export function withDryRunCompress<T>(tools: readonly T[], dryRunTool: T): T[] {
+    if (!dryRunPreviewEnabled()) return [...tools];
+    return tools.map((t) => (compressNameOf(t) === COMPRESS_TOOL_NAME ? dryRunTool : t));
+}
 
 // #1881: the ACP-TAGS NEVER-echo prohibition must not disappear with injectTool.
 // renderTags runs independent of injectTool — tags keep being rendered into history,
@@ -131,8 +165,8 @@ export function buildAcpTagsOnlyPrompt(
     ]) if (eff !== null) lead.push(eff);
     const prefix = lead.length > 0 ? `${lead.join("\n\n")}\n\n` : "";
     const full = family === "hybrid"
-        ? buildCompressHybridSystemPrompt(p, overrides)
-        : buildCompressSystemPrompt(p, overrides);
+        ? kBuildCompressHybridSystemPrompt(p, overrides)
+        : kBuildCompressSystemPrompt(p, overrides);
     if (!full.startsWith(prefix)) return "";
     return full.slice(prefix.length);
 }
@@ -429,7 +463,7 @@ export function normalizeCompressInput(input: unknown): unknown {
 }
 
 export function parseCompressInput(input: unknown, callId?: string) {
-    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId });
+    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId, allowDryRun: dryRunPreviewEnabled() });
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
@@ -444,7 +478,11 @@ export function parseCompressInput(input: unknown, callId?: string) {
         // so it needs the explicit kind arm.
         loggerLog("warn", `[acp-compress-input] partial: ${parsed.ranges.length} range(s) applied, ${parsed.diagnostics.invalidItems} rejected (kind=${parsed.diagnostics.kind}) reasons=[${(parsed.diagnostics.invalidReasons ?? []).join(" | ")}]`);
     }
-    return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
+    // #3185: dryRun previews are routed to the kernel's previewCompression —
+    // the flag must survive this boundary or the call silently commits. When the
+    // preview is disabled allowDryRun already forces parsed.dryRun false; the
+    // second guard keeps "off never previews" true even if that ever regresses.
+    return { ranges: parsed.ranges, diagnostics: parsed.diagnostics, dryRun: parsed.dryRun === true && dryRunPreviewEnabled() };
 }
 
 // #1439: shared by the streaming Responses adapter AND the non-streaming JSON
