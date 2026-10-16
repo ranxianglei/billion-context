@@ -132,6 +132,12 @@ export interface NativeInterceptState {
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
     resignCredentialFor?: (url: string, scheme: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    /** #2791: durability hook — fired with each full diagnostic line whenever
+     *  the fetch-chain integrity watchdog repairs an eviction the setter guard
+     *  cannot see (property delete/redefine behind the guard). GUI hosts swallow
+     *  stderr (#1158 lesson), so dsh-native wires this to persistClientEvent to
+     *  keep the event in the shared bili.log. Undefined hosts stay console-only. */
+    onFetchIntegrityEvent?: (line: string) => void;
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
@@ -955,7 +961,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             }
             throw err;
         }
-    });
+    }, { onIntegrityEvent: state.onFetchIntegrityEvent });
     g[INTERCEPT_FLAG] = true;
     return true;
 }

@@ -174,6 +174,13 @@ export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" 
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
+// #2791: the fetch-chain integrity watchdog runs inside the shared interceptor;
+// dsh web swallows stderr (#1158 lesson), so every eviction/reinstall event is
+// persisted into the shared bili.log like the other [dsh-client] lines. The
+// [bili-native] prefix is dropped — [dsh-client] already identifies the source.
+state.onFetchIntegrityEvent = (line) =>
+    persistClientEvent(line.startsWith("[bili-native]") ? line.slice("[bili-native]".length).trimStart() : line);
+
 // One registration lifecycle per process. toolsReady is the ONLY gate for
 // header stamping (pi.ts discipline): stamped headers flip the proxy into
 // plugin mode, which suppresses wire tool injection — stamping before the

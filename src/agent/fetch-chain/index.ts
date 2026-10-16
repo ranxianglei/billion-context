@@ -70,6 +70,44 @@ export function isDeadClosureError(err: unknown): boolean {
     return err instanceof TypeError && /is not a function$/.test(err.message);
 }
 
+// #2791: integrity-watchdog state. The setter guard sees every ASSIGNMENT to
+// globalThis.fetch, but the property is configurable — a third party can also
+// DELETE or REDEFINE it (defineProperty bypasses setters entirely), which
+// evicts the whole chain SILENTLY: no setter write, no #1158 diagnostic. The
+// dsh anthropic-messages lane shape (#2791): model traffic then leaves
+// un-stamped and the proxy mints an anonymous pfa-* session per cross-protocol
+// switch (fold ledger orphaned, cold full-history re-fold). A periodic
+// descriptor identity check detects exactly that eviction and re-installs over
+// whatever the evictor left behind (adopted as downstream — same policy as the
+// setter arm). One check closure per install cycle; resetFetchChainForTest
+// stops it so tests never leak timers or stale checks.
+let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+let watchdogCheck: (() => void) | undefined;
+const WATCHDOG_INTERVAL_MS = 30_000;
+const WATCHDOG_MAX_REINSTALLS = 8;
+
+function stopWatchdog(): void {
+    if (watchdogTimer !== undefined) { clearInterval(watchdogTimer); watchdogTimer = undefined; }
+    watchdogCheck = undefined;
+}
+
+/** Test seam: run one integrity check synchronously. Returns false when no
+ *  watchdog is armed (classic install / reclaim disabled / already reset). */
+export function runFetchIntegrityCheckForTest(): boolean {
+    if (watchdogCheck === undefined) return false;
+    watchdogCheck();
+    return true;
+}
+
+interface FetchChainOptions {
+    /** #2791: integrity-watchdog tick period in ms (default 30s). */
+    watchdogIntervalMs?: number;
+    /** #2791: durability hook — receives each full watchdog diagnostic line so
+     *  GUI hosts can persist it where stderr is invisible (#1158 lesson; dsh
+     *  wires persistClientEvent → shared bili.log). Undefined stays console-only. */
+    onIntegrityEvent?: (line: string) => void;
+}
+
 function noteFetch(f: unknown): void {
     if (typeof f !== "function") return;
     const fn = f as typeof globalThis.fetch;
@@ -83,7 +121,7 @@ function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch 
     return observedFetches.find((f) => !knownDeadFetches.has(f));
 }
 
-export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch): void {
+export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch, opts?: FetchChainOptions): void {
     const orig = globalThis.fetch;
     noteFetch(orig);
     const makeChain = (downstream: typeof globalThis.fetch) => {
@@ -212,6 +250,47 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         };
         installedDesc = accessor;
         Object.defineProperty(globalThis, "fetch", accessor);
+        // #2791: arm the integrity watchdog — the setter above cannot see a
+        // delete/redefine (both bypass setters on a configurable property), so
+        // re-verify descriptor identity periodically and heal that eviction
+        // shape with the same adopt-as-downstream policy.
+        let reinstalls = 0;
+        let givenUp = false;
+        const check = (): void => {
+            if (givenUp) return;
+            const cur = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+            if (cur !== undefined && cur.get === accessor.get && cur.set === accessor.set) return;
+            const report = (line: string): void => {
+                console.warn(line);
+                opts?.onIntegrityEvent?.(line);
+            };
+            const current = typeof globalThis.fetch === "function" ? globalThis.fetch : undefined;
+            const downstream = current ?? moduleAnchor;
+            if (downstream === undefined) {
+                givenUp = true;
+                report("[bili-native] globalThis.fetch lost the bili guarded accessor (#2791) and no live fetch remains to re-anchor onto — intercept offline until host restart");
+                return;
+            }
+            if (reinstalls >= WATCHDOG_MAX_REINSTALLS) {
+                givenUp = true;
+                report(`[bili-native] globalThis.fetch still being evicted after ${reinstalls} integrity reinstalls (#2791) — giving up; model traffic may route around bili until host restart`);
+                return;
+            }
+            try {
+                noteFetch(downstream);
+                top = makeChain(downstream);
+                Object.defineProperty(globalThis, "fetch", accessor);
+                reinstalls += 1;
+                report(`[bili-native] globalThis.fetch lost the bili guarded accessor (#2791) — a third party deleted/redefined the property behind the setter guard; re-installed over its value as downstream (reinstall ${reinstalls})`);
+            } catch {
+                givenUp = true;
+                report("[bili-native] cannot re-install the bili guarded accessor (#2791): the property is no longer configurable — intercept offline until host restart");
+            }
+        };
+        stopWatchdog();
+        watchdogCheck = check;
+        watchdogTimer = setInterval(check, opts?.watchdogIntervalMs ?? WATCHDOG_INTERVAL_MS);
+        watchdogTimer.unref?.();
     } else {
         // Non-configurable host property or reclaim disabled
         // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
@@ -221,6 +300,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
 }
 
 export function resetFetchChainForTest(opts: { anchor?: typeof globalThis.fetch } = {}): void {
+    stopWatchdog();
     if (opts.anchor !== undefined) moduleAnchor = opts.anchor;
     observedFetches = moduleAnchor !== undefined ? [moduleAnchor] : [];
     knownDeadFetches.clear();
