@@ -110,9 +110,16 @@ const TEXT_LEAF_KEYS: ReadonlySet<string> = new Set([
     "content", "text", "thinking", "reasoning", "reasoning_content", "delta",
 ]);
 // Branches whose strings are NEVER model output. Tool-call arguments are user intent
-// (#1039): a write-tool payload of 300 '=' must not abort the turn.
+// (#1039): a write-tool payload of 300 '=' must not abort the turn. The exclusion is
+// key-propagated, so every wire's argument container needs its own key here: openai
+// chat tool_calls[].function.arguments ("arguments"), anthropic tool_use.input
+// ("input"), responses function_call_arguments (skipped by event type in processParsed).
+// Google has NEITHER a type field NOR an excluded container key — its calls ride
+// parts[].functionCall.args with payload leaves named content/text (#3358: the #3946-
+// class incident shape on the one wire the original list missed).
 const EXCLUDED_BRANCHES: ReadonlySet<string> = new Set([
-    "arguments", "input", "partial_json", "tool_calls", "tools", "functions", "system",
+    "arguments", "args", "parameters", "functionCall", "input", "partial_json",
+    "tool_calls", "tools", "functions", "system",
     "instructions", "metadata", "usage", "usageMetadata", "logprobs", "annotations",
     "error", "id", "url",
 ]);

@@ -195,3 +195,28 @@ test("wrapStreamWithRunawayGuard aborts on runaway: onTrip once, clean early EOF
     const forwarded = out.toString("utf8");
     assert.match(forwarded, /^\x3cacp tokens="0" type="text">m02040\x3c\/acp$/m);
 });
+
+// #3358 regression: Google-wire tool calls ride parts[].functionCall.args with payload
+// leaves named content/text — argument bytes are user intent (#1039) and must never be
+// counted by the text-run lane, exactly like openai arguments / anthropic input.
+test("google functionCall.args with 300 identical chars does NOT trip the text-run lane", async () => {
+    const argRun = "=".repeat(300);
+    const body = JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: "write_file", args: { path: "/tmp/x", content: argRun } } }] } }] });
+    const frame = `data: ${body}\n\n`;
+    const src = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(enc.encode(frame)); c.close(); } });
+    let tripped = false;
+    const out = await collect(wrapStreamWithRunawayGuard(src, () => (tripped = true)));
+    assert.equal(tripped, false, "tool-call argument run must not abort the turn");
+    assert.equal(out.toString("utf8"), frame, "byte-exact forward");
+});
+
+// Control for #3358: the SAME wire's genuine model output (parts[].text) must still trip.
+test("google parts[].text with 250 identical chars still trips as text-run", async () => {
+    const textRun = "-".repeat(250);
+    const body = JSON.stringify({ candidates: [{ content: { parts: [{ text: textRun }] } }] });
+    const frame = `data: ${body}\n\n`;
+    const src = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(enc.encode(frame)); c.close(); } });
+    let tripReason: string | undefined;
+    await collect(wrapStreamWithRunawayGuard(src, (v) => (tripReason = v.reason)));
+    assert.equal(tripReason, "text-run", "real model-output runs must still be caught");
+});
