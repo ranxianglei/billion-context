@@ -27,6 +27,13 @@ function jsonFilesUnder(dir: string): string[] {
     return out;
 }
 
+/** #2671: with no storage tier configured the unified store defaults to
+ *  shadow mode and opens <dir>/index.db (+ -wal/-shm) beside the namespace
+ *  dirs — legitimate top-level entries, not stray files. */
+function nonSqliteTopLevel(dir: string): string[] {
+    return readdirSync(dir).filter((n) => !/^index\.db(-wal|-shm)?$/.test(n));
+}
+
 function makeSession(id: string): Session {
     return {
         id,
@@ -131,7 +138,7 @@ await withTempStore("scheduleSave debounces and eventually writes", async (store
     // land well past the 5ms debounce. Deadline covers the retry ladder
     // (~1.5s) with headroom.
     const loaded = await waitFor(() => store.loadSync("debounce-1"), 5000, "debounced write to land");
-    assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
+    assert.equal(nonSqliteTopLevel(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
     assert.equal(loaded!.stats.requests, 3, "latest value persisted");
 });
 
@@ -148,7 +155,7 @@ await withTempStore("flushSync writes immediately (for eviction)", async (store,
     const s = makeSession("evict-1");
     s.stats.tokensSaved = 555;
     store.flushSync(s);
-    assert.equal(readdirSync(dir).length, 1);
+    assert.equal(nonSqliteTopLevel(dir).length, 1);
     assert.equal(store.loadSync("evict-1")!.stats.tokensSaved, 555);
 });
 

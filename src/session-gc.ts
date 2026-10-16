@@ -9,6 +9,7 @@ import { dropSessionForGc, peekSession } from "./session.js";
 import { stateDir } from "./paths.js";
 import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
 import { gcSettings as knobGcSettings } from "./knobs.js";
+import { isValidSystemSurface, SYSTEM_SURFACE_SUFFIX } from "./system-surface.js";
 
 /**
  * Session-file garbage collection (#1082). OPT-IN: disabled unless
@@ -62,10 +63,14 @@ import { gcSettings as knobGcSettings } from "./knobs.js";
  *   - its token footprint (unique-content via the kernel's CJK-aware
  *     defaultCountTokens, same estimator as rawInputTokens) counts toward the
  *     size gate, so a tiny session with a huge store does not slip under it;
- *   - attached to a kept session → kept untouched; an unreadable/foreign
- *     companion next to an otherwise-eligible session → both kept (never
- *     guess at unreadable files).
- */
+  *   - attached to a kept session → kept untouched; an unreadable/foreign
+  *     companion next to an otherwise-eligible session → both kept (never
+  *     guess at unreadable files).
+  *
+  * #3201: the system-surface sidecar (.system-surface.json) follows the same
+  * co-delete / twin-fallback / orphan-sweep rules; being a bounded derived
+  * artifact its size does NOT count toward the token gate.
+  */
 
 interface GcConfig {
     enabled: boolean;
@@ -148,6 +153,31 @@ export function contentStoreTokens(parsed: unknown): number | null {
     return tokens;
 }
 
+/** #1180/#3201: true when a surviving TWIN of `file`'s session id still reads
+ *  its companion through this stale duplicate's sibling — meta fill-once can
+ *  migrate _unknown/ -> ns/ without cleaning the old path, and loaders probe
+ *  the namespaced rel first then fall back, so co-deleting here would lose
+ *  live companion bytes. `readable` probes the twin's own sibling and must
+ *  check SHAPE, not mere existence (an unreadable own-sibling means the stale
+ *  one is still loadable). Never guesses: any probe failure keeps it. */
+async function survivingTwinNeedsCompanion(file: string, suffix: string, sessionFiles: string[], deletedSessions: Set<string>, readable: (absPath: string) => Promise<boolean>): Promise<boolean> {
+    const stem = path.basename(file, ".json");
+    for (const sf of sessionFiles) {
+        if (sf === file || deletedSessions.has(sf)) continue;
+        if (!path.basename(sf).endsWith(stem + ".json")) continue;
+        let ownReadable: boolean;
+        try {
+            ownReadable = await readable(sf.slice(0, -".json".length) + suffix);
+        } catch {
+            // Probe failure (twin vanished mid-sweep, EACCES, …): keep —
+            // never guess at bytes we cannot inspect.
+            return true;
+        }
+        if (!ownReadable) return true;
+    }
+    return false;
+}
+
 export function isGcEligible(view: FileView, now: number, cfg: Pick<GcConfig, "maxAgeMs" | "maxTokens">): boolean {
     if (now - view.savedAt < cfg.maxAgeMs) return false;
     if (view.everCompressed) return false;
@@ -176,7 +206,8 @@ interface GcResult {
     kept: number;
     unreadable: number;
     bytesFreed: number;
-    /** #1180: content-store companion files removed (co-deletions + orphan sweeps) */
+    /** #1180/#3201: companion files removed — content stores + system-surface
+     *  sidecars (co-deletions + orphan sweeps) */
     companionsRemoved: number;
     /** #1995: image-spill directories removed (co-deletions + stale-mtime sweep) */
     imgDirsRemoved: number;
@@ -196,13 +227,15 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     } catch {
         return result;
     }
-    // #1180: split sessions from CCR companions (#1097); companion path is the
-    // deterministic sibling per contentStoreRelPathFor — no decode to pair them.
+    // #1180: split sessions from CCR companions (#1097), plus #3201
+    // system-surface sidecars; companion paths are deterministic siblings —
+    // no decode to pair them.
     const companionSuffix = ".content-store.json";
+    const companionSuffixes = [companionSuffix, SYSTEM_SURFACE_SUFFIX];
     const sessionFiles: string[] = [];
     const companions: string[] = [];
     for (const f of files) {
-        if (f.endsWith(companionSuffix)) companions.push(f);
+        if (companionSuffixes.some((s) => f.endsWith(s))) companions.push(f);
         else sessionFiles.push(f);
     }
     const deletedSessions = new Set<string>();
@@ -245,6 +278,14 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             }
             view.storedTokens = stored;
         }
+        // #3201: system-surface sidecar — bounded derived artifact (no token
+        // gate), co-deleted with the same twin-fallback rule below.
+        const surfaceCompanion = file.slice(0, -".json".length) + SYSTEM_SURFACE_SUFFIX;
+        let surfSt: Stats | undefined;
+        try {
+            const s = await stat(surfaceCompanion);
+            if (s.isFile()) surfSt = s;
+        } catch { /* no surface sidecar */ }
         if (!isGcEligible(view, now, cfg)) {
             result.kept++;
             continue;
@@ -294,36 +335,13 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (compSt) {
             // Co-delete the companion so the sweep never leaves orphans. On
             // failure it surfaces as an orphan on the very next pass below.
-            // Cross-namespace exception: meta fill-once can migrate a session
-            // _unknown/<h>.json -> ns/host_<h>.json without cleaning the old
-            // path (kernel writes never delete the previous relPath), and
-            // saveContentStore only rewrites when dirty — so a moved session
-            // whose store was not re-saved since the move still reads its LIVE
-            // store from this stale duplicate's sibling (loadContentStore
-            // probes _unknown/ when the namespaced store is absent, and stops
-            // at the first EXISTING candidate). Co-deleting it here would lose
-            // retrievable originals. Skip when a surviving twin shares the
-            // hash stem and has no store of its own; the bytes stay referenced
-            // until the twin is swept, then the orphan pass collects them.
-            const stem = path.basename(file, ".json");
-            let keepCompanion = false;
-            for (const sf of sessionFiles) {
-                if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
-                let twinHasOwnStore = false;
-                try {
-                    const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
-                    // Existence alone is not adoption: loadContentStore falls
-                    // through to _unknown/ when the namespaced store exists but
-                    // is UNREADABLE — the stale sibling stays the twin's live
-                    // store. Probe the shape, not the inode.
-                    twinHasOwnStore = s2.isFile() && contentStoreTokens(await store.readRawFile(sf.slice(0, -".json".length) + companionSuffix)) !== null;
-                } catch { /* no sibling, or unreadable: keep — never guess */ }
-                if (!twinHasOwnStore) {
-                    keepCompanion = true;
-                    break;
-                }
-            }
+            // Cross-namespace exception: see survivingTwinNeedsCompanion — a
+            // stale duplicate's sibling may still be a surviving twin's live
+            // fallback store; skip it then, the orphan pass collects it later.
+            const keepCompanion = await survivingTwinNeedsCompanion(file, companionSuffix, sessionFiles, deletedSessions, async (p) => {
+                const s2 = await stat(p);
+                return s2.isFile() && contentStoreTokens(await store.readRawFile(p)) !== null;
+            });
             if (keepCompanion) {
                 loggerLog("info", `[gc] kept content store ${path.relative(dir, companion)} (${compSt.size} B): live fallback store of a surviving twin`);
             } else {
@@ -333,6 +351,25 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                     result.bytesFreed += compSt.size;
                     result.companionsRemoved++;
                     coDeleted.add(companion);
+                } catch { /* orphan pass retries */ }
+            }
+        }
+        if (surfSt) {
+            // #3201: system-surface sidecar — same lifecycle rules as the
+            // content store above (twin-fallback keep, orphan pass retry).
+            const keepSurface = await survivingTwinNeedsCompanion(file, SYSTEM_SURFACE_SUFFIX, sessionFiles, deletedSessions, async (p) => {
+                const s2 = await stat(p);
+                return s2.isFile() && isValidSystemSurface(await store.readRawFile(p));
+            });
+            if (keepSurface) {
+                loggerLog("info", `[gc] kept system surface ${path.relative(dir, surfaceCompanion)} (${surfSt.size} B): live fallback surface of a surviving twin`);
+            } else {
+                try {
+                    await rm(surfaceCompanion, { force: true });
+                    loggerLog("info", `[gc] removed system surface ${path.relative(dir, surfaceCompanion)} (${surfSt.size} B)`);
+                    result.bytesFreed += surfSt.size;
+                    result.companionsRemoved++;
+                    coDeleted.add(surfaceCompanion);
                 } catch { /* orphan pass retries */ }
             }
         }
@@ -358,8 +395,9 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // namespaced `host_<hash>.json` and flat `_unknown/<hash>.json` both end
         // with `<hash>.json`, and meta fill-once can migrate a session between
         // those namespaces without cleaning the old path: sibling-only matching
-        // would false-orphan (delete live store bytes) across that move.
-        const stem = path.basename(companion).slice(0, -companionSuffix.length);
+        // would false-orphan (delete live companion bytes) across that move.
+        const suffix = companionSuffixes.find((s) => companion.endsWith(s)) ?? "";
+        const stem = suffix ? path.basename(companion).slice(0, -suffix.length) : path.basename(companion, ".json");
         let referenced = false;
         for (const sf of sessionFiles) {
             if (deletedSessions.has(sf)) continue;
@@ -378,7 +416,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             result.kept++;
             continue;
         }
-        loggerLog("info", `[gc] removed orphaned content store ${path.relative(dir, companion)} (${st.size} B)`);
+        loggerLog("info", `[gc] removed orphaned companion file ${path.relative(dir, companion)} (${st.size} B)`);
         // Companions count in their own field — `removed` stays "session files".
         result.companionsRemoved++;
         result.bytesFreed += st.size;
@@ -414,7 +452,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     } catch { /* no spill tree yet — nothing to sweep */ }
     if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0 || result.imgDirsRemoved > 0) {
         loggerLog(result.unreadable > 0 ? "warn" : "info",
-            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""}${result.imgDirsRemoved > 0 ? ` + ${result.imgDirsRemoved} image spill dir(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
+            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} companion file(s)` : ""}${result.imgDirsRemoved > 0 ? ` + ${result.imgDirsRemoved} image spill dir(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
     }
     return result;
 }

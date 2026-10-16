@@ -52,7 +52,7 @@ test("markdown: mask=false reveals the raw title", () => {
 
 test("markdown: renders every section heading + key metrics (zh default)", () => {
     const md = buildSessionReportMd(D);
-    for (const h of ["# billion-context session report", "基本信息", "用量统计", "上下文轨迹", "缓存经济学"]) {
+    for (const h of ["# billion-context session report", "基本信息", "用量统计", "上下文曲线", "缓存经济学"]) {
         assert.ok(md.includes(h), "missing section: " + h);
     }
     assert.ok(md.includes("900K"), "input tokens formatted");

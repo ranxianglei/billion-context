@@ -22,6 +22,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttribut
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
+import { captureSystemSurface } from "../system-surface.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
@@ -398,6 +399,9 @@ export async function prepareAnthropic(
     // SysPrompt row — the kernel breakdown classifies messages only, and on
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
+    // #3201: persist the system+tools surface text (web trajectory view) at
+    // the same point the overhead is measured, so both stay in lockstep.
+    captureSystemSurface(session, extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
     markDirty(session);
 

@@ -22,6 +22,7 @@ import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
+import { captureSystemSurface } from "../system-surface.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { renderNone as knobRenderNone } from "../knobs.js";
@@ -388,6 +389,10 @@ export async function prepareOpenai(
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(openaiOutboundSystem, toolsOut);
+        // #3201: persist the system+tools surface text (web trajectory view);
+        // same skip guard as the measurement above — title-gen side requests
+        // carry their own tiny system and must not clobber it.
+        captureSystemSurface(session, openaiOutboundSystem, toolsOut);
     }
     // #728: record this turn's outbound payload upper bound as the fallback
     // token source for upstreams that never report usage (see effectiveTokenCount).

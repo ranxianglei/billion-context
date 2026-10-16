@@ -8,6 +8,7 @@ import { durableMessageToolPaths, withDurableProtection } from "./durable-messag
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
+import type { SystemSurfaceRecord } from "./system-surface.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -527,8 +528,20 @@ export type Session = {
     *  full-state rebase). In-memory only here; buildRecord omits it. */
     contentStore?: MessageContentStore;
     /** In-memory only (NOT persisted): content-store.json is rewritten only
-     *  while this is set (adopt grew entries / reset cleared the store). */
+      *  while this is set (adopt grew entries / reset cleared the store). */
     contentStoreDirty?: boolean;
+    /** #3201 In-memory only (NOT persisted — buildRecord omits it): last
+     *  outbound system surface, captured per request by captureSystemSurface;
+     *  persisted as the .system-surface.json sidecar (same pattern as
+     *  contentStore). Lazily loaded from disk on first web-view need. */
+    systemSurface?: SystemSurfaceRecord;
+    /** #3201 In-memory only (NOT persisted): true once the sidecar probe has
+     *  run for this process lifetime (found or absent) so repeated web views
+     *  do not re-stat the file per render. */
+    systemSurfaceLoaded?: boolean;
+    /** In-memory only (NOT persisted): the system-surface sidecar is
+     *  rewritten only while this is set (capture saw a changed hash). */
+    systemSurfaceDirty?: boolean;
     /** #1336 in-memory only (NOT persisted — buildRecord omits it): acp_retrieve
      *  hit count per ref, used by plan-aware search steering to flag refs the
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart

@@ -1,4 +1,4 @@
-import { orderedRefPair } from "acp-kernel";
+import { defaultCountTokens, orderedRefPair } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
@@ -12,6 +12,7 @@ import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
+import { SYSTEM_SURFACE_SUFFIX } from "../system-surface.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
@@ -209,6 +210,12 @@ interface WebSessionDetail extends WebSessionSummary {
          *  summary chain — the web block badge mirrors /acp's "⚡ext". */
         external?: true;
     }>;
+    /** #3201: dsh-style trajectory ledger of the LAST outbound context — the
+     *  persisted system+tools surface plus a per-message view of the client's
+     *  re-sent history with fold markers anchored at active-block endRefs.
+     *  Absent when the session holds no outbound snapshot (older sessions or
+     *  none received yet). */
+    trajectory?: WebTrajectory;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,11 +252,11 @@ function yieldToGc(): Promise<void> {
 
 /** Recursive *.json walk under the sessions dir, stat-based (metadata only,
  *  no decoding). Excludes dotfiles (.bili-migration-* markers), temp files
- *  (.tmp-* kernel temps, *.tmp-enc-* codec temps) and CCR content-store
- *  envelopes (*.content-store.json — payload bytes, not session records; they
- *  would fail validation anyway and can be huge). A TOP-LEVEL failure (missing
- *  dir / EACCES) throws so callers can distinguish "no data" from "unreadable";
- *  subdirectory failures skip that subtree. */
+ *  (.tmp-* kernel temps, *.tmp-enc-* codec temps) and sidecar envelopes
+ *  (*.content-store.json CCR payload bytes #1097, *.system-surface.json #3201
+ *  — not session records; they would fail validation anyway). A TOP-LEVEL
+ *  failure (missing dir / EACCES) throws so callers can distinguish "no data"
+ *  from "unreadable"; subdirectory failures skip that subtree. */
 async function walkSessionFiles(dir: string): Promise<Array<{ abs: string; mtimeMs: number; size: number }>> {
     await readdir(dir);
     const out: Array<{ abs: string; mtimeMs: number; size: number }> = [];
@@ -271,7 +278,7 @@ async function walkSessionFiles(dir: string): Promise<Array<{ abs: string; mtime
             // startsWith, not includes: parity with kernel walkJsonFiles — canonical names may
             // legitimately contain ".tmp-" mid-string (host labels keep dots); enc temps lack
             // the .json suffix so the gate above drops them anyway (#1939 review).
-            if (e.name.startsWith(".tmp-") || e.name.endsWith(".content-store.json")) continue;
+            if (e.name.startsWith(".tmp-") || e.name.endsWith(".content-store.json") || e.name.endsWith(SYSTEM_SURFACE_SUFFIX)) continue;
             if (!e.isFile()) continue;
             try {
                 const st = await stat(abs);
@@ -977,6 +984,14 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // Recording (acp_status #2261 calm footer) is unchanged.
     const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail))));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
+    // #3201: disk sessions never saw captureSystemSurface in this process —
+    // probe the sidecar once per process; an in-memory surface always wins
+    // (a live session may hold not-yet-flushed new bytes).
+    if (!session.systemSurfaceLoaded) {
+        session.systemSurfaceLoaded = true;
+        if (!session.systemSurface) session.systemSurface = getDiskStore().loadSystemSurface(session) ?? undefined;
+    }
+    const trajectory = buildTrajectory(session);
 
     return {
         ...summaryOf(session, live),
@@ -1039,5 +1054,174 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 ...(isExternalSummaryBlock(b) ? { external: true } : {}),
             };
         }),
+        ...(trajectory !== undefined ? { trajectory } : {}),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// #3201: trajectory ledger — reconstructs what the LAST outbound request
+// carried, without packet capture. Two sources, both already persisted:
+//   - the system+tools surface sidecar (captureSystemSurface at every
+//     systemPromptTokens stamp site — same guard as the measurement);
+//   - session.lastMessages: the client's full history as re-sent this turn
+//     (the PRE-compression view; fold markers below show where summaries ride).
+// Protocol-neutral by design: the four wire shapes differ (top-level system vs
+// developer message vs systemInstruction), so this ledger shows normalized
+// content, never byte-exact wire bodies.
+// ---------------------------------------------------------------------------
+
+interface WebTrajectoryRecord {
+    /** 1-based position in the outbound context order. */
+    n: number;
+    kind: "user" | "assistant" | "system" | "tool" | "tool-call" | "tool-result" | "reasoning" | "compacted";
+    /** mNNNNN ref when resolvable from state.messageRefs.byRaw. */
+    ref?: string;
+    toolName?: string;
+    toolCallId?: string;
+    thinkingTokens?: number;
+    /** Token estimate over the FULL (untruncated) text. */
+    tokens?: number;
+    /** Display text after per-record / total caps. */
+    text: string;
+    truncated: boolean;
+    turn: number;
+    // compacted records only:
+    blockId?: string;
+    tier?: number;
+    topic?: string;
+    compressedTokens?: number;
+}
+
+interface WebTrajectory {
+    records: WebTrajectoryRecord[];
+    turns: number;
+    /** Chars actually included across record texts (post-cap). */
+    totalChars: number;
+    truncatedTotal: boolean;
+    recordsCapped?: boolean;
+    /** Built from a bounded folded snapshot — ref ids may be missing. */
+    folded?: boolean;
+    /** Active blocks whose endRef could not be anchored to a visible record. */
+    unanchoredBlocks?: string[];
+    system?: {
+        text: string;
+        truncated: boolean;
+        toolNames: string[];
+        toolsJson: string;
+        toolsTruncated: boolean;
+        updatedAt: number;
+        /** Measured sys+tools overhead tokens (metadata.systemPromptTokens). */
+        tokens?: number;
+    };
+}
+
+export const TRAJ_RECORD_CAP = 64_000;
+export const TRAJ_TOTAL_CAP = 2_000_000;
+export const TRAJ_RECORDS_CAP = 5_000;
+
+export function capText(text: string, budget: { totalChars: number; truncatedTotal: boolean }): { text: string; truncated: boolean } {
+    if (text.length <= TRAJ_RECORD_CAP && budget.totalChars + text.length <= TRAJ_TOTAL_CAP) {
+        budget.totalChars += text.length;
+        return { text, truncated: false };
+    }
+    const room = Math.max(0, Math.min(TRAJ_RECORD_CAP, TRAJ_TOTAL_CAP - budget.totalChars));
+    const out = text.slice(0, room);
+    // The consumed chars must count against the total even when capped —
+    // otherwise every oversized record gets the full room again and the total
+    // cap stops meaning anything past the first truncation.
+    budget.totalChars += out.length;
+    return { text: out, truncated: true };
+}
+
+export function buildTrajectory(session: Session): WebTrajectory | undefined {
+    const msgs = session.lastMessages;
+    if (!msgs || msgs.length === 0) return undefined;
+    const byRaw = session.state.messageRefs?.byRaw ?? {};
+    const budget = { totalChars: 0, truncatedTotal: false };
+    let turn = 0;
+    let recordsCapped = false;
+    const records: WebTrajectoryRecord[] = [];
+    for (const m of msgs) {
+        if (records.length >= TRAJ_RECORDS_CAP) { recordsCapped = true; break; }
+        if (m.role === "user" && m.contentType === "text") turn++;
+        const full = m.text ?? "";
+        const capped = capText(full, budget);
+        if (capped.truncated) budget.truncatedTotal = true;
+        records.push({
+            n: 0,
+            kind: m.contentType === "tool-call" ? "tool-call"
+                : m.contentType === "tool-result" ? "tool-result"
+                : m.contentType === "reasoning" ? "reasoning"
+                : m.role,
+            ...(byRaw[m.id] !== undefined ? { ref: byRaw[m.id] } : {}),
+            ...(m.toolName !== undefined ? { toolName: m.toolName } : {}),
+            ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+            ...(typeof m.thinkingTokens === "number" ? { thinkingTokens: m.thinkingTokens } : {}),
+            ...(full.length > 0 ? { tokens: defaultCountTokens(full) } : {}),
+            text: capped.text,
+            truncated: capped.truncated,
+            turn,
+        });
+    }
+    // Fold markers: each ACTIVE block's summary rides where its span ends in
+    // the outbound context (true for both compression modes — the proxy-mode
+    // acp_summary carrier and plugin-mode folds both replace the span), so a
+    // compacted record is inserted right after the anchor record carrying
+    // endRef. Blocks whose endRef resolves to nothing visible stay honest:
+    // they are listed separately instead of guessed into a position.
+    let unanchoredBlocks: string[] = [];
+    const activeBlocks = session.state.blocks.filter((b) => b.active && b.endRef !== undefined);
+    if (activeBlocks.length > 0) {
+        const refIndex = new Map<string, number>();
+        records.forEach((r, i) => { if (r.ref !== undefined && !refIndex.has(r.ref)) refIndex.set(r.ref, i); });
+        const sorted = [...activeBlocks].sort((a, b) => (a.endRef as string) < (b.endRef as string) ? -1 : (a.endRef as string) > (b.endRef as string) ? 1 : a.tier - b.tier);
+        const inserts: Array<{ at: number; block: (typeof activeBlocks)[number] }> = [];
+        for (const b of sorted) {
+            const idx = refIndex.get(b.endRef as string);
+            if (idx === undefined) unanchoredBlocks.push(b.blockId);
+            else inserts.push({ at: idx, block: b });
+        }
+        for (let k = inserts.length - 1; k >= 0; k--) {
+            const { at, block } = inserts[k];
+            const full = block.summary ?? "";
+            const capped = capText(full, budget);
+            if (capped.truncated) budget.truncatedTotal = true;
+            records.splice(at + 1, 0, {
+                n: 0,
+                kind: "compacted",
+                ...(block.endRef !== undefined ? { ref: block.endRef } : {}),
+                ...(full.length > 0 ? { tokens: defaultCountTokens(full) } : {}),
+                text: capped.text,
+                truncated: capped.truncated,
+                turn: records[at]?.turn ?? turn,
+                blockId: block.blockId,
+                tier: block.tier,
+                ...(block.topic !== undefined ? { topic: block.topic } : {}),
+                compressedTokens: block.compressedTokens,
+            });
+        }
+    }
+    records.forEach((r, i) => { r.n = i + 1; });
+    const surface = session.systemSurface;
+    const sysPromptTok = typeof session.metadata["systemPromptTokens"] === "number" ? (session.metadata["systemPromptTokens"] as number) : undefined;
+    return {
+        records,
+        turns: turn,
+        totalChars: budget.totalChars,
+        truncatedTotal: budget.truncatedTotal,
+        ...(recordsCapped ? { recordsCapped: true } : {}),
+        ...(session.lastMessagesFolded ? { folded: true } : {}),
+        ...(unanchoredBlocks.length > 0 ? { unanchoredBlocks } : {}),
+        ...(surface ? {
+            system: {
+                text: surface.systemText,
+                truncated: surface.systemTruncated,
+                toolNames: surface.toolNames,
+                toolsJson: surface.toolsJson,
+                toolsTruncated: surface.toolsTruncated,
+                updatedAt: surface.updatedAt,
+                ...(sysPromptTok !== undefined ? { tokens: sysPromptTok } : {}),
+            },
+        } : {}),
     };
 }
