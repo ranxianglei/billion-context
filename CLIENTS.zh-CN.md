@@ -4,7 +4,6 @@
 
 ---
 
-
 ## dsh(deepseek-harness)
 
 两条通道，同一个插件(#941):
@@ -112,15 +111,29 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 **窗口对齐。** 客户端 plugin/runtime 上报及启动器传递的窗口优先于发布时的 Codex 模型表。没有上报时，本机代理只读其 `CODEX_HOME`（默认 `~/.codex`）下的 `models_cache.json` 和基础 `config.toml`，将 `model_context_window` 限制在匹配模型的 `max_context_window` 内，再应用 `effective_context_window_percent`（Codex 默认 95）；后续请求会跟随缓存更新。元数据缺失、不可读或无效时，保留内置表及未知模型 272K 的既有回退。远程代理或其他客户端 profile 应通过现有启动器/runtime 机制传递实际窗口，或设置既有的 `compress.modelContextLimit`；代理本机缓存不能证明另一台机器的配置。输出预留仍正常生效。
 
-Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:
+Codex 现在有四个彼此独立的集成面。`bili plugin install codex` 会写入 `[mcp_servers.bili]` 块以提供 ACP 工具，默认添加由 bili 所有的模型路由（经 `<loopback>/bili/<upstream>` 转发原生 Codex CLI 请求），写入一个 `[[hooks.SessionStart]]` 条目运行 `dist/codex/bootstrap-hook.js`，并把 ACP 技能写到 `~/.codex/skills/bili/SKILL.md`。普通 Codex 配置使用顶层 `openai_base_url`；若明确检测到 CC Switch Direct，则改写当前生效的 `[model_providers.<name>].base_url`，保留原生账号与 provider 选择，且不写 CC Switch 数据库。路由目标、原值和 bili 写入的精确值记录在 sidecar；卸载时只还原仍与记录完全一致的字段，后续用户编辑会保留。外部路由冲突或 CC Switch 已重写该字段时会报告冲突并保留现值。CC Switch 切换 provider/模式或同步配置时可能重写路由；bili 不运行 watcher 与之抢写。
 
-| 姿势 | 你能得到什么 |
-|---|---|
-| `bili codex`(启动器) | 全功能零配置:自管 lane 代理(#1660 端口区,粘性口)+ 注入 codex 的证书 MITM env —— 工具与压缩兼得 |
-| `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
-| 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
+| 方式 | 能力 |
+| --- | --- |
+| `bili codex`(启动器) | 受管 lane 代理与证书 MITM；工具 + 压缩 |
+| `bili plugin install codex` | 原生 Codex 模型路由 + ACP 工具 + SessionStart hook + ACP 技能 |
 
-安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
+**四个面各证各的。** MCP 块只证明工具可用，绝不证明模型流量经过 bili；hook 只做 attach（从不 spawn 代理，失败即放行）并把本会话 runtime 上报给已在运行的代理；技能只是告诉模型有哪些 ACP 工具及其用法；只有路由面（外加观测到的真实请求）才与压缩有关。`bili plugin status` 与 `bili doctor` 分别报告这四项，缺哪一项都不会被读成完整安装。
+
+**Hook 与技能的所有权。** `[[hooks.SessionStart]]` 是**数组表**，所以别人写的条目（lean-ctx 之类就住在这里）是**兄弟条目**而不是竞争者：bili **追加**自己的一条、保留全部已有条目，只刷新/删除命令指向自己脚本的那一条。技能同理：同名但非 bili 所有的 `SKILL.md` 完全不碰。
+
+**条目形状有两处硬要求，两种失败模式完全不同：**
+
+- Codex 把 `hooks` 反序列化为**序列**，写成 `[hooks.SessionStart]` + `hooks = [{…}]` 的 map 形式会让整份配置无法加载，进而拖垮宿主（实测 Codex 桌面端只报一个看似无关的 `AbsolutePathBuf deserialized without a base path in model_catalog json`）。这一种是**响的**。
+- 每个条目是 `MatcherGroup`——`{ matcher?, hooks = [ { type = "command", command, timeout } ] }`。把 `type`/`command`/`timeout` 直接写在条目上，这些键在 `MatcherGroup` 上是未知字段，会被 Codex **静默丢弃**：配置照常加载、`codex mcp list` 照常成功，hook 却根本不会注册。这一种是**哑的**，任何"能不能加载"的探测都发现不了——只有 Codex 自己的 `hooks/list` app-server RPC 能看见。
+
+安装器拒绝写入任何一种已知会失败的形状，并会把发现的旧扁平条目**就地升级**。`[features] hooks = true` 是 Codex 的 hook 总开关：没有开启时 bili 会写入 hook 条目并明确提示需要打开，不会替你改写既有的开关值。卸载时 bili 只删自己的条目/文件；技能目录里另有用户文件时目录保留。
+
+`bili service install` 会注册当前用户级的常驻代理服务——Windows 上是 Task Scheduler 登录任务，Linux 上是 systemd 用户单元；其他平台会明确报告服务不受支持，手动方式仍然可用。可用 `bili service status|restart|enable|disable|remove` 管理；注册失败会明确报告。代理关闭时，Codex 配置的 URL 仍是 loopback，请求会在本地端点失败，不会静默回退到上游直连。`bili doctor` 会报告 `proxy-ready`、`configured`、`verified`、`bypassed` 或 `unknown`；只有观测到真实 Codex 模型请求才会标记 `verified`，健康代理或已写配置本身都不能证明已验证。
+
+CC Switch Direct 仅在当前 Codex provider 的 `config.toml` 路由层受支持：这是可撤销的配置写入，不代表 bili 与 CC Switch 的 provider 数据库或同步机制已集成。Routing/Aggregation 仍只检测并报告，不自动改写；发现模式不代表 API 级兼容。bili 不修改 CC Switch 数据库，也不会安装 watcher。ChatGPT 订阅/Desktop 集成仍标为 `待完成/可实现`：实现不会读取、复制、持久化或注入 `auth.json`、cookies 或 session token；Desktop MCP 与模型路由分开，官方登录渠道保持不变。
+
+MCP shell 仍在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理，或 `bili start` 守护)> 8787 用户区默认。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`，插件 shell 否则绑定下一个新会话；逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id；shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定)，优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
 **Responses 原生链式(一个坑)。** bili 靠重放完整 `input` 来压缩,因此无法跟随 OpenAI 原生的 `previous_response_id` 链式续传:只带增量的续传请求会在上游丢失之前的轮次,却仍返回 200。对 codex 而言今天这不是问题 —— 观察到的构建都发 `store:false` 且从不设置 `previous_response_id`(是观察不是证明;E2E 未覆盖该形态)。若你把走原生链式的 Responses 客户端指向 bili,要么重发完整 input/output 历史,要么设 `ACP_KEEP_RESPONSE_ID=1`;bili 剥掉非空 `previous_response_id` 时现在会记一条 `warn`(#1954)。完整链式支持跟踪在 #1973。见[官方迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)。
 
@@ -149,7 +162,7 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 **WebSocket 覆盖(#2073,#2111 实现)。** WebSocket 连接从不经过 `globalThis.fetch`,所以原生扩展在加载时(首个模型连接之前)同时包装 `globalThis.WebSocket`(pi 的 Node 分支每次调用都读全局,Bun 分支首次调用时缓存子类——两个运行时的安装时序都因此安全)。只重写受支持的 Codex Responses 模型连接——其余 WebSocket(devtools、第三方库、已路由 URL)原样通过:
 
 | Provider / 传输 | 状态 |
-|---|---|
+| --- | --- |
 | 全部 HTTP provider | ✅ 覆盖 —— 具名 plugin-mode 会话 |
 | `openai-codex-responses`(ChatGPT backend-api),`transport: "sse"` | ✅ 覆盖 —— 与任何 HTTP provider 无异 |
 | `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ✅ 覆盖(#2111)—— 构造器 URL 被重写为 `<proxy-ws>/bili/<https-upstream>`(例:`wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`)。构造器参数、子协议、请求头全部保留,pi 在 SSE 上发的同一个 `session-id` 随升级握手到达,会话标识跨传输字节一致;子代理各用自己的会话 ID。`previous_response_id` 增量续传在该车道可用(代理先展开 delta 再进管线,回上游前再优化回 delta) |
@@ -179,7 +192,7 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 修复后矩阵(pi 0.83.6 + pi-subagents 0.76.0 实机验证,HTTP 传输;WS 行依据 #2073 记录,无实机格):
 
 | 格子 | 修复前 | 修复后 |
-|---|---|---|
+| --- | --- | --- |
 | native × 前台 × 默认配置 | 匿名 `pfa-*` proxy 模式;ACP 工具仅靠代理 wire 注入 | **具名 child-sid plugin 模式会话**;ACP 工具首个请求起本地注册;压缩记在 child 自己的 id 下 |
 | native × 后台 × 默认配置 | ambient 运气——settings packages 恰好加载时才是具名 plugin 模式 | 同上,但现在是确定性的(child launch-resolved extensions 里 `required: ["bili"]`) |
 | native × 后台 × agent 定义 `extensions: []` / `denyExtensions` | **静默直连**——代理零可见性、无压缩 | 确定性必需路径加载;具名 plugin 会话。(若运行时能力上限硬性拒绝扩展,pi-subagents 0.76.0 会让 child 启动大声失败——fail-fast 而非静默) |
@@ -201,7 +214,7 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 已核实的入口(社区维护清单——机制本身是通用的):
 
 | 客户端 | baseURL 所在 |
-|---|---|
+| --- | --- |
 | **Cline / Roo Code / Kilo Code**(VS Code) | provider 设置 —— "OpenAI Compatible" Base URL,或 Anthropic provider 的 base URL |
 | **Continue** | `~/.continue/config.yaml` —— 各模型的 `apiBase` |
 | **OpenHands** | `llm.base_url`(配置或 env) |
@@ -247,7 +260,7 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
 
 | 路径 | 命令 | 适用 |
-|---|---|---|
+| --- | --- | --- |
 | 启动器(最省事) | `bili opencode` | 一条命令拉起代理 + 客户端;不碰真实配置 |
 | 原生(免启动器) | `bili plugin install opencode` | 自拉起插件写进真实配置;照常启动 `opencode` |
 | 纯代理(兜底) | baseURL 加 `/bili/` 前缀 | 无插件 —— wire 级工具注入 |
@@ -311,7 +324,7 @@ OpenAI/ChatGPT 凭据。
 
 `/acp` 面板在所有模式下都绑定当前会话,`acp_status` 工具是其宿主内等价手段。在命令编辑器支持新增条目的宿主(2.0.x 稳定版,`editor.add`)上,V2 插件额外注册 `/acp` 斜杠命令 —— 以合成非模型消息渲染,面板优先(与 `acp_status` 工具一致);旧形状上该注册保持惰性。注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)—— 请用 TUI。
 
-同一接缝还承载 `/acp-cache`(#1146)—— prompt-cache 对账报告的人侧入口(输出与 `acp_cache` 工具一致):pi/omp 原生注册(`/acp-cache [full]` 出逐行清单);opencode V1 渲染为一条被忽略的消息,代理在到达 wire 前从模型上下文剥离;opencode V2 渲染为合成消息(报告最多可见 ~8 KB);dsh(两条泳道)显示默认摘要台账——dsh 的命令 API 不传参数,故无 `full`。旧 opencode-acp 会话(#920)收到显式的不可用提示(其流量绕过本代理的压缩状态)。Claude Code 没有进程内命令 API:`bili plugin install claude` 写一个模型中介的 `commands/acp-cache.md` markdown 命令,其 prompt 驱动 `acp_cache` MCP 工具并把报告逐字贴回。codex/kimi/hermes 没有用户可输入的命令接缝——直接让模型调用它的 `acp_cache` 工具。每次折叠的盈亏判定按可选的 `compress.priceProfile`(以输入 token 单价为基准的归一化倍率)计价;任何层级都未设置时,取请求模型在 models.dev 的价格行按绝对 $/Mtok 计(仅无法解析的模型回退内核比率默认值)——因此 breakeven/PAID BACK 开箱即反映你上游的真实经济账;对带自定义加价的中转站可按 provider 覆盖(CONFIGURATION.zh-CN.md,#1279)。
+同一接缝还承载 `/acp-cache`(#1146)—— prompt-cache 对账报告的人侧入口(输出与 `acp_cache` 工具一致):pi/omp 原生注册(`/acp-cache [full]` 出逐行清单);opencode V1 渲染为一条被忽略的消息,代理在到达 wire 前从模型上下文剥离;opencode V2 渲染为合成消息(报告最多可见 ~8 KB);dsh(两条泳道)显示默认摘要台账——dsh 的命令 API 不传参数,故无 `full`。旧 opencode-acp 会话(#920)收到显式的不可用提示(其流量绕过本代理的压缩状态)。Claude Code 没有进程内命令 API:`bili plugin install claude` 写一个模型中介的 `commands/acp-cache.md` markdown 命令,其 prompt 驱动 `acp_cache` MCP 工具并把报告逐字贴回。codex 同样没有用户可输入的命令接缝,因此 `bili plugin install codex` 会写一个 ACP 技能(`~/.codex/skills/bili/SKILL.md`),告诉模型何时该取用 `acp_cache`/`acp_status`/`decompress`;kimi/hermes 不装技能——直接让模型调用它的 `acp_cache` 工具。每次折叠的盈亏判定按可选的 `compress.priceProfile`(以输入 token 单价为基准的归一化倍率)计价;任何层级都未设置时,取请求模型在 models.dev 的价格行按绝对 $/Mtok 计(仅无法解析的模型回退内核比率默认值)——因此 breakeven/PAID BACK 开箱即反映你上游的真实经济账;对带自定义加价的中转站可按 provider 覆盖(CONFIGURATION.zh-CN.md,#1279)。
 
 同一接缝还承载 `/acp-rule`(#1251/#1399)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册,操作集与工具完全一致 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用),`/acp-rule remove <id>` 删除一条,裸 `/acp-rule clear` 清空全部(`clear <文本>` 是记录而非清空——一个手误不该毁掉所有规则)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。
 

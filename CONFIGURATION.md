@@ -352,6 +352,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | Test hook: retry interval for model-info lookups. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | Test hook: retry interval for dsh lane operations. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | Test hook: recovery sweep interval for the dsh lane. |
+| `BILI_CODEX_HOOK_ORIGIN` | string | unset (route origin, then lane discovery) | — | Test hook: explicit proxy origin for the Codex SessionStart bootstrap hook to probe and report to; falls back to the route bili wrote into config.toml, then sticky lane-port discovery. |
 | `ACP_DUMP_DIR` | string | unset | — | Base directory override for wire dump output (path relocation). |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | Stall-detection timeout for committed upstream streams (no-byte silence before abort). |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | Explicit binary override for the launched client (resolved on PATH). |
@@ -1732,6 +1733,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MODEL_INFO_RETRY_MS` | Cooldown (ms) before the dsh native plugin re-resolves the current model's context window after a resolve that failed or returned no window (#1812/#1836): a cached entry without a window is not final — instead of latching headerless for the process lifetime, the next request after this cooldown triggers a retry. Default `30000`; non-numeric or negative values fall back to `30000`. Test hook — shortened by the dsh-native unit test so it never waits wall-clock; leave unset in production. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | Back-off (ms) between dsh native plugin tool-registration retries (#2082): after a manifest fetch or tool registration fails transiently, the next retry happens no sooner than this cooldown. Default `10000`; non-numeric or non-positive values fall back to `10000`. Test hook — shortened by the dsh-native unit tests so they never wait wall-clock; leave unset in production. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | Interval (ms) of the dsh native plugin's detached recovery timer (#2082): while the tools are down it keeps driving registration retries with zero model traffic — the case where the model already gave up on the missing tools and nothing else re-arms the loop. Defaults to following `BILI_DSH_RETRY_INTERVAL_MS` (`10000`). Test hook — under NODE_TEST_CONTEXT the timer never starts unless this var is set explicitly; leave unset in production. |
+| `BILI_CODEX_HOOK_ORIGIN` | Explicit origin for the codex SessionStart bootstrap hook's health probe and runtime report (#3176). Fallback chain when unset: the route bili wrote into `~/.codex/config.toml`, then the sticky lane-port discovery. Attach-only and fail-open — if the probe is not healthy within its deadline the hook exits silently instead of blocking the session. Tests/odd setups; leave unset in production. |
 | `BILI_ADVISORY_CHECK` | Set to `0` to disable the critical-defect advisory watcher (#1481). Default ON — it runs independently of `ACP_AUTO_UPDATE` so that installs with auto-update off still get force-updated out of a known-broken version range. Fail-open: an unreachable/malformed source only warns, never blocks model traffic. File-config key: `advisoryCheck`. |
 | `BILI_ADVISORY_URL` | Override for the advisory document URL. Default: the companion package `billion-context-advisories` on the configured registry (`BILI_UPDATE_REGISTRY` aware). File-config key: `advisoryUrl`. |
 | `BILI_RELEASE_NOTES_CHECK` | Set to `0` to disable the release-notes visibility watcher (#1870). Default ON — pure visibility, silent by default (#1977): fetches the companion release-notes doc and surfaces "CRITICAL update ready — restart to finish" (disk newer than running) or "critical update available" on `acp_status` and the `/acp` panel ONLY when the pending span contains a `critical`-tier entry; routine/recommended releases never surface. Never installs, never restarts; fail-open. File-config key: `releaseNotesCheck`. |
@@ -1855,6 +1857,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili plugin install <agent>` | Install the native-tool plugin / MCP bridge into a host — see [Plugin Mode](#plugin-mode-native-tools) |
 | `bili plugin remove <agent>` | Remove it again |
 | `bili plugin list` | Show install status for every host |
+| `bili service install\|status\|restart\|enable\|disable\|remove` | Manage the persistent per-user proxy service (Task Scheduler logon task on Windows, systemd user unit on Linux) that zero-touch lanes like codex rely on; JSON output, exit code 1 when the desired state is not reached (#3176) |
 | `bili mcp` | Run the bili MCP server standalone on stdio |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | Pre-bind a conversation id to plugin mode (advanced) |
 | `bili --version` / `bili --help` | Print version / help |
@@ -2081,7 +2084,7 @@ bili plugin install pi      # add this billion-context install to pi's settings.
 bili plugin install omp     # same for omp (config.yml extensions)
 bili plugin install claude  # register the bili MCP server (claude mcp add, user scope) + write
                                    # <configdir>/commands/acp-cache.md (model-mediated /acp-cache)
-bili plugin install codex   # append [mcp_servers.bili] to ~/.codex/config.toml
+bili plugin install codex   # manage codex's MCP+ACP tools / model route / SessionStart hook / ACP skill in ~/.codex/config.toml (+ auto-start proxy service) — see CLIENTS.md (Codex)
 bili plugin install opencode  # self-spawning native plugin (+ tools) in ~/.config/opencode/opencode.json
                                   # --with-mcp also adds the mcp.bili MCP face (no origin pin — live discovery)
 bili plugin list            # install status for every supported host

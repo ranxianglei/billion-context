@@ -1,4 +1,4 @@
-import http from "node:http";
+import type http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
@@ -19,6 +19,7 @@ import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { isCodexClient } from "../codex-compact.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
@@ -777,6 +778,9 @@ function sendStats(res: http.ServerResponse): void {
         const js = readProjSwitchStats(s);
         return {
             id: s.id,
+            codexClient:
+                typeof s.metadata.clientHint === "string" &&
+                isCodexClient({ "user-agent": s.metadata.clientHint }),
             protocol: s.meta.protocol,
             upstream: s.meta.upstreamOrigin,
             label: s.meta.label,

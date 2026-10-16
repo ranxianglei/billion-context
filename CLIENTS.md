@@ -75,7 +75,7 @@ Two lanes, same plugin (#941):
   loaded plugin and the proxy never drift apart again (#953); profiles
   pinned to a local source are left alone. The refresh is best-effort,
   retries next cycle on failure, and never fails the update or the proxy.
- - **Reported: zero proxy traffic for some transports under profile install
+- **Reported: zero proxy traffic for some transports under profile install
    (#1158, under investigation):** sessions served by some of dsh's
    `llm-pi-ai`-layer transports show NO model request ever reaching the proxy
    (no `processTurn` logged; bili tools 404 with "no model request has
@@ -90,7 +90,7 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
- - **Web-profile caveat (#1772, corrected by #2474):** when a profile's
+- **Web-profile caveat (#1772, corrected by #2474):** when a profile's
    bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
    instance lives inside an agent preset (`preset-standard.config.plugins`).
    No patch layer can address that NESTED row by id — dsh's patch engine
@@ -109,7 +109,7 @@ Two lanes, same plugin (#941):
    freezes the roster until re-copied after a dsh preset update. The plugin
    logs a one-time `[dsh-client]` warning naming this recipe at boot in such
    profiles; ACP compression is unaffected.
-  - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+- **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
     profile's `node_modules`. So if a machine-global `billion-context` exists
@@ -399,30 +399,87 @@ the client's window through the existing launcher/runtime reporting mechanism
 or set the existing `compress.modelContextLimit`; the proxy's local cache is not
 evidence of another machine's configuration. Output headroom still applies.
 
-Codex is the one client a plugin install cannot make self-sufficient. The seam
-matrix explains why: claude has a `SessionStart` hook + managed settings block,
-zcode has a provider store whose `baseURL` can be rewritten — codex has neither.
-Its model traffic routes via environment variables only (`HTTPS_PROXY` /
-`SSL_CERT_FILE` — this is how `bili codex` works); the default
-ChatGPT-login provider has no config-file routing seam, and a managed
-`model_providers` block would force `env_key` API-key auth and **drop the
-subscription login**. An MCP server cannot inject env into its parent process,
-so the plugin can never route codex's own traffic. Three postures:
+Codex now has four distinct integration faces. `bili plugin install codex` writes
+the `[mcp_servers.bili]` block for ACP tools, adds a bili-owned Codex model route
+through `<loopback>/bili/<upstream>`, installs a `[[hooks.SessionStart]]` entry
+running `dist/codex/bootstrap-hook.js`, and writes the ACP skill to
+`~/.codex/skills/bili/SKILL.md`. For ordinary Codex configuration the route is
+the top-level `openai_base_url`. When the current
+Codex config is positively detected as CC Switch Direct, bili instead routes
+the active `[model_providers.<name>].base_url`, which Codex actually uses. It
+preserves the native Codex account and provider selection and never writes the
+CC Switch database. The route's target, previous value and exact written value
+are recorded in a bili sidecar; removal restores only the value that still
+exactly matches bili's record, and leaves later user edits intact. A foreign
+route or a provider field changed by CC Switch is reported as a conflict and
+left untouched. CC Switch may rewrite the field during provider/mode changes;
+bili does not run a watcher to compete with those writes.
 
 | Posture | What you get |
-|---|---|
-| `bili codex` (launcher) | Full zero-config: a self-managed lane proxy (#1660 zone, sticky port) + cert-MITM env injected into codex — tools *and* compression |
-| `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
-| `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
+| --- | --- |
+| `bili codex` (launcher) | Managed lane proxy and cert-MITM; tools + compression |
+| `bili plugin install codex` | Native Codex model route + ACP tools + SessionStart hook + ACP skill |
 
-The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
-(command = node, args = dist/mcp.js). #1660 removed the install-time origin bake
-(#403: a baked URL went stale after drift/reboot and left the tools pointing at
-a dead port); the shell resolves the proxy at session start — env
-`BILI_MCP_PROXY` > the live-instance record (any lane's proxy, or a
-`bili start` daemon) > the 8787 user-zone default — so a drifted or rebooted
-proxy never strands a dead URL, and the shell simply attaches to whatever is
-alive. Session binding is headless: the launcher passes
+**Each face proves only itself.** The MCP block proves TOOLS, never that model
+traffic reaches bili. The hook is attach-only (it never spawns a proxy, and
+fails open) and reports this session's runtime to an already-running proxy. The
+skill only tells the model which ACP tools exist. Only the route face — plus an
+observed real request — says anything about compression. `bili plugin status`
+and `bili doctor` report all four separately, so a lane missing one of them can
+never read as a complete install.
+
+**Ownership of the hook and skill faces.** `[[hooks.SessionStart]]` is an ARRAY
+of tables, so a foreign entry (lean-ctx and friends live there) is a sibling,
+not a competitor: bili APPENDS its own entry, keeps every existing one, and
+refreshes/removes only the entry whose command names its own script. The same
+rule covers the skill: a same-named `SKILL.md` bili does not own is left alone.
+
+**The shape of bili's entry is load-bearing in two separate ways**, and each
+failure mode is different:
+
+- Codex deserializes `hooks` as a SEQUENCE, so the `[hooks.SessionStart]` +
+  `hooks = [{…}]` map form makes the whole config unloadable — and an unloadable
+  config takes the host down (observed on Codex Desktop, surfacing only an
+  unrelated-looking `AbsolutePathBuf deserialized without a base path in
+  model_catalog json`). This one is LOUD.
+- Each entry is a `MatcherGroup` — `{ matcher?, hooks = [ { type = "command",
+  command, timeout } ] }`. Handler fields written DIRECTLY on the entry are
+  unknown keys, so Codex drops them **silently**: the config loads, `codex mcp
+  list` succeeds, and the hook simply never registers. This one is SILENT, and a
+  load probe can never detect it — only Codex's own `hooks/list` app-server RPC
+  can.
+
+The installer refuses to write any shape known to fail either way, and upgrades
+an older flat entry it finds in place. `[features] hooks = true` is Codex's
+master switch for hook execution — when it is off, bili writes its entry and
+says so rather than editing a switch value the user set. Uninstall deletes only
+bili's own entry and file, and keeps the skill directory when the user has other
+files in it.
+
+`bili service install` registers a persistent per-user proxy service — a Task
+Scheduler logon task on Windows, a systemd user unit on Linux; other platforms
+report that the service is unsupported and the manual postures still work.
+`bili service status|restart|enable|disable|remove` manage it; failed
+registration is reported explicitly.
+When the proxy is down, Codex's configured URL remains loopback and requests
+fail at the local endpoint; there is no direct-upstream fallback. `bili doctor`
+reports `proxy-ready`, `configured`, `verified`, `bypassed`, or `unknown`.
+`verified` requires an observed Codex model request, while a healthy proxy or a
+written config alone cannot claim verification.
+
+CC Switch Direct is supported only at the current Codex config route layer:
+when Direct is positively detected, bili can wrap the active provider's
+`base_url` with reversible ownership. This is not integration with CC Switch's
+provider database or synchronization mechanism. Routing and Aggregation remain
+detection-only; discovery does not prove API-level compatibility. No CC Switch
+files are modified and bili does not install a competing watcher. ChatGPT subscription/Desktop integration stays
+`待完成/可实现`: the implementation does not read, copy, persist, or inject
+`auth.json`, cookies, or session tokens; Desktop MCP is separate from model
+routing, and official login channels remain intact.
+
+The MCP shell still resolves its proxy at session start — env `BILI_MCP_PROXY`
+> the live-instance record (any lane's proxy, or a `bili start` daemon) > the
+8787 user-zone default. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
 (#760). Codex ≥0.160 additionally stamps the real thread id on every
@@ -590,7 +647,7 @@ plugin-mode session.
 **WebSocket coverage (#2073, implemented in #2111).** A WebSocket connection never goes through `globalThis.fetch`, so the native extension also wraps `globalThis.WebSocket` at load time — before pi's first model connection (pi's Node branch reads the global per call; its Bun branch caches a subclass on first call, which is why install-time ordering is safe on both runtimes). Only supported Codex Responses model connections are rewritten — every other WebSocket (devtools, third-party libraries, already-routed URLs) passes through untouched:
 
 | Provider / transport | Status |
-|---|---|
+| --- | --- |
 | All HTTP providers | ✅ covered — named plugin-mode session |
 | `openai-codex-responses` (ChatGPT backend-api), `transport: "sse"` | ✅ covered — identical to any HTTP provider |
 | `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ✅ covered (#2111) — the constructor URL is rewritten to `<proxy-ws>/bili/<https-upstream>` (e.g. `wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`). Constructor args, subprotocols and request headers are preserved, so the same `session-id` pi sends on SSE rides the upgrade and the session identity is byte-identical across transports; subagents keep their own ids. `previous_response_id` incremental continuation works over the lane (the proxy expands deltas before the pipeline and re-optimizes them back upstream) |
@@ -654,7 +711,7 @@ Post-fix matrix (real-machine verified: pi 0.83.6 + pi-subagents 0.76.0,
 HTTP transports; WS row documented from #2073, no live cell):
 
 | Cell | Pre-fix | Post-fix |
-|---|---|---|
+| --- | --- | --- |
 | native × foreground × default config | anonymous `pfa-*` proxy mode; ACP tools only via proxy wire injection | **named child-sid plugin-mode session**; ACP tools registered locally from the first request; compression recorded under the child's own id |
 | native × background × default config | ambient luck — named plugin mode when the settings packages happened to load | same, now deterministic (`required: ["bili"]` in the child's launch-resolved extensions) |
 | native × background × agent def `extensions: []` / `denyExtensions` | **silent direct connect** — zero proxy visibility, no compression | deterministic required-path load; named plugin session. (If a runtime capability ceiling hard-denies extensions, pi-subagents 0.76.0 fails the child launch loudly instead — fail-fast, not silent) |
@@ -703,7 +760,7 @@ Every client that lets you **edit its model endpoint and carries an API key** (r
 Verified entry points (community-maintained list — the mechanism is generic):
 
 | Client | Where the base URL lives |
-|---|---|
+| --- | --- |
 | **Cline / Roo Code / Kilo Code** (VS Code) | provider settings — "OpenAI Compatible" Base URL, or the Anthropic provider's base URL |
 | **Continue** | `~/.continue/config.yaml` — per-model `apiBase` |
 | **OpenHands** | `llm.base_url` (config or env) |
@@ -768,7 +825,7 @@ is the recommended context manager. Everything below is verified end-to-end
 on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
 
 | Path | Command | When |
-|---|---|---|
+| --- | --- | --- |
 | Launcher (easiest) | `bili opencode` | one command brings up proxy + client; real config untouched |
 | Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
 | Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
@@ -900,8 +957,11 @@ sessions (#920) get an explicit unavailable notice instead (their traffic
 bypasses this proxy's compression state). Claude Code has no in-process command
 API: `bili plugin install claude` writes a model-mediated
 `commands/acp-cache.md` markdown command whose prompt drives the `acp_cache`
-MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
-user-typable command seam — ask the model to call its `acp_cache` tool directly.
+MCP tool and pastes the report back verbatim. Codex has no user-typable command
+seam either, so `bili plugin install codex` writes the ACP skill
+(`~/.codex/skills/bili/SKILL.md`) telling the model when to reach for
+`acp_cache`/`acp_status`/`decompress`; kimi/hermes ship no skill at all — ask
+the model to call its `acp_cache` tool directly.
 Per-fold P&L verdicts are priced by the optional `compress.priceProfile`
 (normalized multipliers over the input-token unit); when no level sets it, the
 request model's models.dev price row applies in absolute $/Mtok (kernel ratio
@@ -961,4 +1021,3 @@ returns `[Block … not found]`, new refs restart from m00001).
   eliminates kernel-version drift between agent and proxy; it does not rely
   on the plugin API being unable to mutate context (that capability varies
   by 2.x build).
-

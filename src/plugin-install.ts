@@ -6,7 +6,14 @@
 //   pi       ~/.pi/agent/settings.json   packages: [<abs package root>]
 //   omp      ~/.omp/agent/config.yml     extensions: [<abs>/dist/agent/omp-native.js]
 //   claude   `claude mcp add` (user scope; writes ~/.claude.json)
-//   codex    ~/.codex/config.toml        [mcp_servers.bili]
+//   codex    ~/.codex/config.toml  [mcp_servers.bili] (stdio MCP) + the
+//            bili-owned model route (top-level `openai_base_url`, or the active
+//            provider's `base_url` under CC Switch Direct; sidecar-recorded
+//            ownership), + a [hooks.SessionStart] entry running
+//            dist/codex/bootstrap-hook.js (#ticket 08), + the ACP skill written
+//            to ~/.codex/skills/bili/SKILL.md. MCP, route, hook and skill are
+//            reported SEPARATELY: MCP proves tools, never that model traffic is
+//            compressed.
 //   opencode <cfg>/opencode.json{c}|config.json (highest-precedence existing; #927)
 //            mcp.bili + native plugin dir + compaction.auto=false
 //          (plugin entry #925: bare "billion-context" for npm installs — opencode
@@ -34,17 +41,22 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { parseCodexToml, resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
+import { detectCcSwitch } from "./codex-integration/cc-switch.js";
+import { assertCodexConfigLoads, codexHooksEnabledNote, findBiliCodexHook, planCodexHook, stripCodexHook } from "./codex-integration/hooks.js";
+import { codexSkillFile, codexSkillStatus, installCodexSkill, removeCodexSkill } from "./codex-integration/skill.js";
+import { codexRouteOrigin, desiredCodexRoute, planCodexRoute, readCodexRoute, readCodexRouteRecord, removeCodexRouteRecord, restoreCodexRoute, codexRouteRecordPath, writeCodexRouteRecord } from "./codex-integration/route.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
+import { installProxyService, removeProxyService } from "./proxy-service/service.js";
 
 /** Build a SessionStart hook command line that parses in every shell the
  *  supported agents run hooks through. Two Windows traps, both measured on
@@ -915,10 +927,159 @@ function malformedCodexArgs(block: string): boolean {
     return /^[ \t]*args[ \t]*=[ \t]*["']/m.test(block);
 }
 
+/** Force every line ending in `text` to the convention `reference` already
+ *  uses. The individual renderers (codexBlock, codexHookTable) emit `\n`, so
+ *  without this a CRLF config — the norm on Windows — would come back with a
+ *  mixed-ending bili block spliced into it. Follows the repo convention
+ *  (src/kimi/toml-edit.ts:21, src/launcher.ts:2466): never convert the user's
+ *  file, never mix endings into it. */
+function normalizeCodexEol(text: string, reference: string): string {
+    const lf = text.replace(/\r\n/g, "\n");
+    return reference.includes("\r\n") ? lf.replace(/\n/g, "\r\n") : lf;
+}
+
+/** The model-route face of the codex lane (ticket 01). Distinct from the MCP
+ *  face above and reported separately: `[mcp_servers.bili]` proves TOOLS,
+ *  never that model traffic reaches bili. Ownership is content-based
+ *  (codex-integration/route.ts) so a user- or CC-Switch-owned
+ *  `openai_base_url` is never overwritten — a conflict is REPORTED instead. */
+function codexRouteSync(
+    text: string,
+    file: string,
+): {
+    text: string;
+    note: string;
+    conflicted: boolean;
+    record?: ReturnType<typeof readCodexRouteRecord>;
+} {
+    const recordPath = codexRouteRecordPath(file);
+    const previous = readCodexRouteRecord(recordPath);
+    const defaultHomeConfig = path.resolve(file).toLowerCase() === path.resolve(path.join(os.homedir(), ".codex", "config.toml")).toLowerCase();
+    const ccSwitchMode = defaultHomeConfig ? detectCcSwitch().mode : "unknown";
+    const plan = planCodexRoute(text, {
+        origin: codexRouteOrigin(process.env),
+        ownedValue: previous?.writtenValue,
+        ownedRecord: previous,
+        ccSwitchMode,
+    });
+    if (plan.action === "keep") return { text, note: `model route: ${plan.note}`, conflicted: false, record: previous };
+    if (plan.action === "conflict") return { text, note: `model route: ${plan.note}`, conflicted: true, record: previous };
+    const value = plan.value!;
+    const route = value.slice(value.indexOf("/bili/") + "/bili/".length);
+    const target = plan.target ?? { kind: "top-level" as const };
+    const previousTarget = previous?.target ?? { kind: "top-level" as const };
+    const targetMatches = previousTarget.kind === target.kind && (target.kind === "top-level" || (previousTarget.kind === "provider" && previousTarget.provider === target.provider));
+    const previousValue = targetMatches ? (previous?.previousValue ?? null) : target.kind === "provider" ? (parseCodexToml(text).providers?.[target.provider]?.baseUrl ?? null) : (parseCodexToml(text).openaiBaseUrl ?? null);
+    return {
+        text: plan.text,
+        note: `model route: ${plan.note}`,
+        conflicted: false,
+        record: { schemaVersion: 1, writtenValue: value, previousValue, upstream: route, target },
+    };
+}
+
+/** The SessionStart-hook face of the codex lane (ticket 08). Codex reads
+ *  `[[hooks.SessionStart]]` entries from config.toml and gates them behind
+ *  `[features] hooks`; bili owns exactly one entry identified by its command
+ *  (codex-integration/hooks.ts). A foreign hook table is REPORTED, never
+ *  rewritten — same ownership rule as the model route. */
+function codexHookSync(
+    text: string,
+    warn: (message: string) => void,
+): { text: string; note: string; changed: boolean } {
+    const root = selfPackageRoot();
+    const hookScript = path.join(root, "dist", "codex", "bootstrap-hook.js");
+    if (!fs.existsSync(hookScript)) {
+        warn(`codex: hook script missing at ${hookScript} — skipping the SessionStart hook face (rebuild bili)`);
+        return { text, note: "hook: skipped (dist/codex/bootstrap-hook.js missing)", changed: false };
+    }
+    const command = portableHookCommand("node", [hookScript]);
+    const plan = planCodexHook(text, command);
+    const shape = assertCodexConfigLoads(plan.text);
+    if (shape !== undefined) {
+        warn(`codex: ${shape} — SessionStart hook NOT written`);
+        return { text, note: `hook: skipped (${shape})`, changed: false };
+    }
+    const featureNote = codexHooksEnabledNote(plan.text);
+    if (featureNote !== "" && plan.action !== "keep")
+        warn(`codex: SessionStart hook written, but hook execution is not enabled — ${featureNote}`);
+    const note = featureNote === "" ? `hook: ${plan.note}` : `hook: ${plan.note} — ${featureNote}`;
+    return { text: plan.text, note, changed: plan.action !== "keep" };
+}
+
+/** The ACP-skill face of the codex lane (ticket 08): `<CODEX_HOME>/skills/bili/
+ *  SKILL.md`, Codex's own discovered-skill extension point. Reported as a
+ *  THIRD face next to mcp/hook, because a skill changes what the model does,
+ *  not whether traffic is compressed. */
+function codexSkillSync(warn: (message: string) => void): { note: string; changed: boolean } {
+    const result = installCodexSkill(process.env);
+    if (result.state === "foreign") warn(`codex: ${result.note}`);
+    return { note: `skill: ${result.note}`, changed: result.written };
+}
+
+/** Best-effort service hook for `bili plugin install|remove <agent>`.
+ *
+ *  "Installed" must mean USABLE: the MCP face only DISCOVERS a proxy
+ *  (resolveProxyOrigin in src/mcp.ts) and never starts one, so an install that
+ *  leaves no proxy running produces `bili proxy unreachable` on the first tool
+ *  call. Registering the per-user service (Windows Task Scheduler task /
+ *  Linux systemd user unit) closes that gap.
+ *
+ *  Deliberately FAIL-SOFT and never throwing: a host that cannot register a
+ *  service (no systemd user bus, an unprivileged/container session, a policy
+ *  that bans scheduled tasks) must still have a complete, working config — the
+ *  caller degrades to a printed hint and the user starts the proxy by hand.
+ *  That keeps this hook from turning a successful config install into a
+ *  reported failure. */
+async function serviceSync(action: "install" | "remove"): Promise<{ note: string; warning?: string }> {
+    try {
+        const result = action === "install" ? await installProxyService() : await removeProxyService();
+        if (result.ok)
+            return {
+                note:
+                    result.action === "already-installed"
+                        ? "service: already registered"
+                        : action === "install"
+                            ? "service: registered for logon + started"
+                            : "service: removed",
+            };
+        if (result.action === "already-absent") return { note: "service: none registered" };
+        if (result.action === "unsupported")
+            return { note: "service: not applicable", warning: `${result.message}; start the proxy yourself with \`bili start\`` };
+        return { note: "service: NOT registered", warning: `${result.message}; start the proxy yourself with \`bili start\`` };
+    } catch (error) {
+        return { note: "service: NOT registered", warning: `service registration failed (${error instanceof Error ? error.message : String(error)}); start the proxy yourself with \`bili start\`` };
+    }
+}
+
+/** `bili plugin install codex`: the config faces PLUS the service face.
+ *  Kept as a wrapper so the synchronous config writers above stay synchronous
+ *  (and unit-testable without a live scheduler/bus); the CLI layer awaits this
+ *  one and prints a single line. */
+export async function codexInstallWithService(): Promise<string> {
+    const base = codexInstall();
+    const service = await serviceSync("install");
+    return service.warning !== undefined ? `${base}; ${service.note}\n  ! ${service.warning}` : `${base}; ${service.note}`;
+}
+
+/** `bili plugin remove codex`: config faces plus service teardown, so an
+ *  uninstall does not leave a proxy running behind the user's back. */
+export async function codexRemoveWithService(): Promise<string> {
+    const base = codexRemove();
+    const service = await serviceSync("remove");
+    return service.warning !== undefined ? `${base}; ${service.note}\n  ! ${service.warning}` : `${base}; ${service.note}`;
+}
+
 function codexInstall(): string {
     const file = codexToml();
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const warnings: string[] = [];
+    const warn = (message: string): void => {
+        warnings.push(message);
+    };
     const existing = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
+    let next = text;
+    let mcpNote: string;
     if (existing !== null) {
         // End the block at the next TABLE header line (optional indent + `[`),
         // matching codexRemove. A plain indexOf("\n[") misses an indented next
@@ -929,43 +1090,83 @@ function codexInstall(): string {
         const blockEnd = nextTable >= 0 ? existing.index + firstNewline + 1 + nextTable : text.length;
         const block = text.slice(existing.index, blockEnd);
         const canonical = codexBlock().replace(/^\n/, "");
-        if (block.trimEnd() === canonical.trimEnd()) return `codex: already installed (${file})`;
-        const refreshed = text.slice(0, existing.index) + canonical + text.slice(existing.index + block.length);
-        writeConfigText(file, refreshed);
-        const healed = malformedCodexArgs(block) ? " (repaired args: was not an array)" : "";
-        return `codex: refreshed [mcp_servers.bili] -> ${file}${healed}`;
+        if (block.trimEnd() === canonical.trimEnd()) {
+            mcpNote = "mcp: already installed";
+        } else {
+            next = text.slice(0, existing.index) + canonical + text.slice(existing.index + block.length);
+            mcpNote = `mcp: refreshed [mcp_servers.bili]${malformedCodexArgs(block) ? " (repaired args: was not an array)" : ""}`;
+        }
+    } else {
+        next = text + (text.endsWith("\n") || text.length === 0 ? "" : "\n") + codexBlock();
+        mcpNote = "mcp: installed [mcp_servers.bili]";
     }
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    backupBeforeWrite(file);
-    fs.writeFileSync(file, text + (text.endsWith("\n") || text.length === 0 ? "" : "\n") + codexBlock());
-    try {
-        fs.writeFileSync(`${file}.bili-last`, `${hashText(fs.readFileSync(file, "utf8"))}\n`);
-    } catch {}
-    return `codex: installed -> ${file} [mcp_servers.bili]`;
+    const route = codexRouteSync(next, file);
+    next = route.text;
+    const hook = codexHookSync(next, warn);
+    next = hook.text;
+    const skill = codexSkillSync(warn);
+    // Single write exit: every renderer above emits "\n", so normalize once
+    // against the file we started from. Without this a CRLF config (the norm on
+    // Windows) came back with a mixed-ending bili block spliced in.
+    const finalText = normalizeCodexEol(next, text);
+    if (finalText === text && existing !== null && mcpNote === "mcp: already installed" && !hook.changed && !skill.changed) {
+        return `codex: already installed (${file}) — ${mcpNote}; ${route.note}; ${hook.note}; ${skill.note}`;
+    }
+    writeConfigText(file, finalText);
+    if (route.record !== undefined) writeCodexRouteRecord(codexRouteRecordPath(file), route.record);
+    const conflictNote = route.conflicted ? " (NOT routed — see note)" : "";
+    const detail = `${mcpNote}; ${route.note}${conflictNote}; ${hook.note}; ${skill.note}`;
+    const tail = warnings.length > 0 ? `\n${warnings.map((w) => `  ! ${w}`).join("\n")}` : "";
+    if (mcpNote.startsWith("mcp: refreshed")) return `codex: refreshed [mcp_servers.bili] -> ${file} — ${detail}${tail}`;
+    if (mcpNote.startsWith("mcp: installed")) return `codex: installed -> ${file} — ${detail}${tail}`;
+    return `codex: refreshed -> ${file} — ${detail}${tail}`;
 }
 
 function codexRemove(): string {
     const file = codexToml();
-    if (!fs.existsSync(file)) return `codex: not installed (${file})`;
+    const skill = removeCodexSkill(process.env);
+    if (!fs.existsSync(file)) return `codex: not installed (${file}) — skill: ${skill.note}`;
     const text = fs.readFileSync(file, "utf8");
+    const routeRecordPath = codexRouteRecordPath(file);
+    const routeRecord = readCodexRouteRecord(routeRecordPath);
+    const restoredRoute = restoreCodexRoute(text, routeRecord);
+    const hook = stripCodexHook(restoredRoute.text);
+    const stripped = hook.text;
     const start = (() => {
-        const m = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
+        const m = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(stripped);
         return m === null ? -1 : m.index;
     })();
-    if (start < 0) return `codex: not installed (${file})`;
-    const lineStart = text.lastIndexOf("\n", start - 1) + 1;
-    const after = text.slice(start);
+    const faces = [hook.removed ? "hook removed" : "no hook", `skill: ${skill.removed ? "removed" : skill.note}`];
+    if (start < 0) {
+        if (stripped === text) return `codex: not installed (${file}) — ${faces.join("; ")}`;
+        writeConfigText(file, stripped);
+        removeCodexRouteRecord(routeRecordPath);
+        return `codex: model route restored from ${file} (no MCP block present) — ${faces.join("; ")}`;
+    }
+    const lineStart = stripped.lastIndexOf("\n", start - 1) + 1;
+    const after = stripped.slice(start);
     const firstNewline = after.indexOf("\n");
     const nextTable = firstNewline < 0 ? -1 : after.slice(firstNewline + 1).search(/^[ \t]*\[/m);
-    const end = nextTable >= 0 ? start + firstNewline + 1 + nextTable : text.length;
-    const cleaned = (text.slice(0, lineStart).replace(/\n+$/, "\n") + text.slice(end)).replace(/^\n+/, "");
+    const end = nextTable >= 0 ? start + firstNewline + 1 + nextTable : stripped.length;
+    const cleaned = (stripped.slice(0, lineStart).replace(/\n+$/, "\n") + stripped.slice(end)).replace(/^\n+/, "");
     writeConfigText(file, cleaned);
-    return `codex: removed from ${file}`;
+    removeCodexRouteRecord(routeRecordPath);
+    return `codex: removed from ${file} — ${faces.join("; ")}`;
 }
 
 function codexStatus(): string {
-    const text = fs.existsSync(codexToml()) ? fs.readFileSync(codexToml(), "utf8") : "";
-    return /^\[mcp_servers\.bili\]\s*$/m.test(text) ? "installed" : "not installed";
+    const file = codexToml();
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const mcp = /^\[mcp_servers\.bili\]\s*$/m.test(text);
+    const owned = readCodexRouteRecord(codexRouteRecordPath(file));
+    const route = readCodexRoute(text, owned);
+    const routeText = route.conflict !== undefined ? `route blocked (${route.conflict.kind})` : route.routed ? (route.value === desiredCodexRoute(text, codexRouteOrigin(process.env)) ? "route installed" : `route drifted (${route.value})`) : "route not installed";
+    const hookInstalled = findBiliCodexHook(text) !== undefined;
+    const hookText = hookInstalled ? (codexHooksEnabledNote(text) === "" ? "hook installed" : `hook installed but disabled (${codexHooksEnabledNote(text)})`) : "hook not installed";
+    const skillState = codexSkillStatus(process.env);
+    const skillText = skillState === "installed" ? "skill installed" : skillState === "outdated" ? "skill outdated (rerun install)" : skillState === "foreign" ? "skill not ours (left untouched)" : "skill not installed";
+    if (!mcp && !route.routed && !hookInstalled && skillState !== "installed") return "not installed";
+    return `${mcp ? "mcp installed" : "mcp missing"}; ${routeText}; ${hookText}; ${skillText}`;
 }
 
 // — opencode ————————————————————————————————————————————————————————————
@@ -1524,7 +1725,12 @@ function readKimiInstalledRegistry(file: string): { version: number; plugins: Ki
         if ((err as { code?: string }).code === "ENOENT") return { version: 1, plugins: [] };
         throw err;
     }
-    const parsed = JSON.parse(text) as { version?: unknown; plugins?: unknown };
+    let parsed: { version?: unknown; plugins?: unknown };
+    try {
+        parsed = JSON.parse(text) as { version?: unknown; plugins?: unknown };
+    } catch (err) {
+        throw new Error(`${file} is corrupt (invalid JSON) — fix or remove it, then retry`, { cause: err });
+    }
     if (!Array.isArray(parsed.plugins)) throw new Error(`${file} is corrupt (no plugins array) — fix or remove it, then retry`);
     return { version: typeof parsed.version === "number" ? parsed.version : 1, plugins: parsed.plugins as KimiInstalledRecord[] };
 }
@@ -2081,13 +2287,27 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         }
         const targets = args.filter((a) => path.isAbsolute(a) && /\.js$/.test(a));
         const first = targets[0];
-        return {
+        const out: LanePresence = {
             installed: true,
             pointers: [`[mcp_servers.bili] command=${command || "?"} args=[${args.join(", ")}]`],
             targets,
             form: "managed-block",
             copyVersion: first !== undefined ? pkgVersionAt(rootFromDistFile(first)) : undefined,
         };
+        // Ticket 08 faces, reported next to (never instead of) the MCP block: a
+        // session hook and the ACP skill are separate integration surfaces, so a
+        // lane missing only one of them must not read as fully installed.
+        const hookCommand = findBiliCodexHook(text);
+        if (hookCommand !== undefined) {
+            out.pointers.push(`hooks.SessionStart: ${hookCommand}`);
+            const hookDisabled = codexHooksEnabledNote(text);
+            if (hookDisabled !== "") out.pointers.push(`hooks disabled — ${hookDisabled}`);
+        } else {
+            out.pointers.push("hooks.SessionStart: not installed");
+        }
+        const skillState = codexSkillStatus(process.env);
+        out.pointers.push(skillState === "installed" ? `skill: ${codexSkillFile(process.env)}` : skillState === "outdated" ? "skill: outdated (rerun install)" : skillState === "foreign" ? "skill: not owned by bili (left untouched)" : "skill: not installed");
+        return out;
     }
     if (agent === "opencode") {
         const file = opencodeTargetFile();
