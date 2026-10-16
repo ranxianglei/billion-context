@@ -595,7 +595,7 @@ export type Session = {
 type AnonymousPrefixAffinityStamp = {
     depth: number;
     tailHash: string;
-    via: "prefix" | "new";
+    via: "prefix" | "new" | "simhash";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
     /** #2879: first-writer provenance of the mint request (see anon-provenance.ts). */
     producer?: AnonymousProvenance;
