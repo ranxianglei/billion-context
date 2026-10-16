@@ -1476,6 +1476,10 @@ export type Prepared = {
      *  retry wrapper, the compress loop, and every usage-sniffing pipe; the
      *  #460 strip pipes in forward() run with session=undefined. */
     sidePassthrough?: boolean;
+    /** #1916: preflight compressed ranges for THIS request before rebuild —
+     *  the outbound payload is post-fold reality, so its usage report may
+     *  lower the session baseline (writer-authority explanation). */
+    preflightFolded?: boolean;
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
@@ -3250,6 +3254,7 @@ export async function preflightCompressIfNeeded(
         // to this single client request.
         session.stats.requests -= 1;
         outbound = rebuilt;
+        outbound.preflightFolded = true;
         // #1987: anchor the usage baseline to what ACTUALLY ships — the rebuilt
         // normal-config payload (text + wire overhead; images excluded per the
         // #857 never-persist-the-image-floor rule: a bytes-mode image floor

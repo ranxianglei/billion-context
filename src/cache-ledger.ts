@@ -16,7 +16,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
-import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { admitUsageSample, clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -1346,12 +1346,28 @@ export function canonicalSysFpForSettle(session: Session, protocol?: string): st
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; incomingMsgCount?: number; postFold?: boolean },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        // #1916: writer authority — a sample may lower an established
+        // usage-grade baseline only with a shrink explanation (see
+        // admitUsageSample). Quarantine skips EVERYTHING below: stats, nudge
+        // re-anchor, cached aggregates, ledger sample, image learning and seam
+        // pairing — a foreign stream's report leaves no trace on this session.
+        // Lane-level outputTokens accumulation outside this function is
+        // intentionally unaffected (billed output stays counted).
+        const led = getCacheLedger(session);
+        const proto = typeof s.protocol === "string" && s.protocol !== "" ? s.protocol : undefined;
+        const up = typeof s.upstream === "string" && s.upstream !== "" ? s.upstream : undefined;
+        const model = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        const identityChanged =
+            (proto !== undefined && led.lastKnownProto !== undefined && proto !== led.lastKnownProto) ||
+            (up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp) ||
+            (model !== undefined && led.lastKnownModel !== undefined && model !== led.lastKnownModel);
+        if (!admitUsageSample(session, s.total, s.incomingMsgCount, s.postFold, identityChanged)) return;
         session.stats.inputTokens += s.total;
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the

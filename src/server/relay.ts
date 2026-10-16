@@ -1151,6 +1151,8 @@ export async function forward(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        prepared.originalMessages.length,
+                        prepared.preflightFolded === true,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -1178,10 +1180,12 @@ export async function forward(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        prepared.originalMessages.length,
+                        prepared.preflightFolded === true,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText, prepared.originalMessages.length, prepared.preflightFolded === true);
             }
         } finally {
             clearUpstreamTimer();
@@ -1497,7 +1501,7 @@ export async function forward(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` }, incomingMsgCount: prepared.originalMessages.length, postFold: prepared.preflightFolded === true },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
@@ -1598,7 +1602,7 @@ export async function forward(
                     // prepare); the main chokepoint above already noted it, this
                     // keeps the pair byte-exact if that ever moves (#1891).
                     noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, incomingMsgCount: prepared.originalMessages.length, postFold: prepared.preflightFolded === true });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
