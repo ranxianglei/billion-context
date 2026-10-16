@@ -342,6 +342,55 @@ entries:
     group: behavior
     desc_en: "Prompt-cache routing posture for cache-aware lane selection."
     desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+  - key: cacheKeepalive.enabled
+    type: boolean
+    default: "false"
+    env: BILI_CACHE_KEEPALIVE
+    group: behavior
+    desc_en: "Master switch for idle prompt-cache keepalive on the Anthropic wire (#3376): while a session goes idle, bili replays the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; hits are verified via usage.cache_read_input_tokens; stops on miss/429/error-streak/duration cap. Also settable per provider route and per model."
+    desc_zh: "Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。"
+  - key: cacheKeepalive.ttlFactor
+    type: number
+    default: "0.9"
+    env: BILI_CACHE_KEEPALIVE_TTL_FACTOR
+    group: behavior
+    desc_en: "Cadence factor applied to the detected/assumed cache TTL tier (ping interval = tier x factor; 0.9 gives roughly one ping per 4.5 min on the 5-min tier and per 54 min on the 1-hour tier). Must be in (0, 1]."
+    desc_zh: "作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。"
+  - key: cacheKeepalive.maxDurationMs
+    type: number
+    default: "86400000"
+    env: BILI_CACHE_KEEPALIVE_MAX_DURATION_MS
+    group: behavior
+    desc_en: "Per-session keepalive lifetime cap, measured from the session's last real request (default 24 h); past it, keepalive disarms even while still hitting."
+    desc_zh: "单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。"
+  - key: cacheKeepalive.maxConcurrentPings
+    type: number
+    default: "4"
+    env: BILI_CACHE_KEEPALIVE_MAX_PINGS
+    group: behavior
+    desc_en: "Cap on simultaneously armed sessions; when exceeded, the longest-idle armed session is evicted first."
+    desc_zh: "同时武装的会话数上限；超限时先驱逐空闲最久的已武装会话。"
+  - key: cacheKeepalive.assumeTtl
+    type: "\"5m\" | \"1h\""
+    default: "null (detect from body breakpoints)"
+    env: BILI_CACHE_KEEPALIVE_ASSUME_TTL
+    group: behavior
+    desc_en: "Skip body breakpoint detection and derive the cadence from this tier directly - for relays that inject or rewrite cache_control TTL downstream of bili, leaving the forwarded body breakpoint-less or mis-tiered."
+    desc_zh: "跳过 body 断点检测，直接按该档位推导节奏——面向会在 bili 下游注入或改写 cache_control TTL、导致转发 body 无断点（或档位不对）的中继/代理。"
+  - key: cacheKeepalive.armWithoutBreakpoints
+    type: boolean
+    default: "false"
+    env: BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS
+    group: behavior
+    desc_en: "Arm keepalive even when the forwarded body carries no cache_control breakpoint at all (off by default - without breakpoints there is no explicit break-pointed content to refresh; pair with assumeTtl/intervalMs when your relay manages breakpoints itself)."
+    desc_zh: "转发 body 无任何 cache_control 断点时也武装保活（默认关——没有断点就没有显式打断点的内容可刷新；断点由你的中继自管时配合 assumeTtl/intervalMs 使用）。"
+  - key: cacheKeepalive.intervalMs
+    type: number
+    default: "null (derive from TTL tier)"
+    env: BILI_CACHE_KEEPALIVE_INTERVAL_MS
+    group: behavior
+    desc_en: "Absolute ping interval in milliseconds; wins over ttlFactor, assumeTtl and the detected tier. For fixed cadences that do not follow the upstream TTL policy."
+    desc_zh: "绝对 ping 间隔（毫秒）；优先于 ttlFactor、assumeTtl 与检测档位。用于不随上游 TTL 策略变化的固定节奏。"
   - key: native.attachExternal
     type: boolean
     default: "false"

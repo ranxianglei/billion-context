@@ -135,8 +135,47 @@ export type ProviderRoute = {
      *    (higher is inert anyway — the publication clamp already caps at 4).
      *  Invalid values reject the config load loudly (strict #1909 discipline). */
     calibration?: { disabled?: boolean; max?: number };
+    /** #3376: idle prompt-cache keepalive overrides for this route (per-field
+     *  deepest wins over the global `cacheKeepalive`; env still wins over
+     *  both). See {@link CacheKeepaliveSettings}. */
+    cacheKeepalive?: CacheKeepaliveSettings;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
+
+/** #3376: idle prompt-cache keepalive settings (Anthropic wire only, v1).
+ *  While a session is idle, bili replays the EXACT last accepted upstream
+ *  body (max_tokens=1, stream=false) at cadence ≈ TTL tier × ttlFactor so the
+ *  upstream prefix cache survives user pauses. Verdict per ping:
+ *  usage.cache_read_input_tokens > 0 → reschedule; 0 → stop (prefix dead);
+ *  HTTP 429 → immediate stop; ≥3 consecutive other failures → stop.
+ *  Configurable at two levels — global (config root `cacheKeepalive`) and
+ *  per-provider (`providers[url].cacheKeepalive`) — merged per-field
+ *  provider-wins by resolveCacheKeepalive (src/cache-keepalive.ts); env BILI_
+ *  CACHE_KEEPALIVE* wins over both. All fields optional; unset = default. */
+export interface CacheKeepaliveSettings {
+    /** Master switch. Default false (opt-in feature). */
+    enabled?: boolean;
+    /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
+     *  every ~4.5 min, 1h tier every ~54 min). Must be in (0, 1]. */
+    ttlFactor?: number;
+    /** Max wall-clock keepalive after the LAST REAL request, ms (default
+     *  86400000 = 24h). Beyond it the session disarms even if still hitting. */
+    maxDurationMs?: number;
+    /** Max simultaneously armed sessions (default 4; oldest armed evicted on
+     *  overflow). */
+    maxConcurrentPings?: number;
+    /** Skip body tier detection and assume this TTL tier regardless of what
+     *  cache_control breakpoints the snapshot carries (CPA-style proxies may
+     *  re-stamp breakpoints downstream of bili, or strip them entirely). */
+    assumeTtl?: "5m" | "1h";
+    /** Arm even when the snapshot carries NO cache_control breakpoints at all
+     *  (pairs with assumeTtl; without it the tier falls back to 5m). */
+    armWithoutBreakpoints?: boolean;
+    /** Absolute cadence in ms — wins over tier × ttlFactor and implies
+     *  armWithoutBreakpoints. For environments where the effective upstream
+     *  TTL is neither Anthropic tier (custom CPA proxies). */
+    intervalMs?: number;
+}
 
 /** Per-model declaration under a provider route. `context` / `output` are the
  *  legacy fields; `compress` is the level-3 override (deepest, highest priority). */
@@ -153,6 +192,9 @@ export type ModelEntry = {
      *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
      *  this like every other knob. */
     benefit?: boolean;
+    /** #3376 per-model idle-cache-keepalive override — the deepest config
+     *  tier (env > model > provider > global) for that model's snapshots. */
+    cacheKeepalive?: CacheKeepaliveSettings;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -1553,6 +1595,10 @@ type FileConfig = {
      *  `compress`. */
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
+    /** #3376: global idle prompt-cache keepalive block (level 1 of 2);
+     *  per-provider overrides live at `providers[url].cacheKeepalive`.
+     *  Resolved by src/cache-keepalive.ts; env BILI_CACHE_KEEPALIVE* wins. */
+    cacheKeepalive?: CacheKeepaliveSettings;
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
@@ -1893,6 +1939,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
     "autoModeForge",
+    // #3376:
+    "cacheKeepalive",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -2263,13 +2311,22 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
         if (declaredProtocol !== undefined) route.protocol = declaredProtocol;
         if (obj.compress) route.compress = obj.compress;
+        const cacheKeepalive = parseCacheKeepaliveSettings(obj.cacheKeepalive);
+        if (cacheKeepalive) route.cacheKeepalive = cacheKeepalive;
+        // Per-model keepalive blocks share the same strict parser (#1909
+        // stance) — validation only; well-formed entries pass through as-is.
+        for (const raw of Object.values(obj.models ?? {})) {
+            if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, "cacheKeepalive")) {
+                parseCacheKeepaliveSettings(raw.cacheKeepalive);
+            }
+        }
         const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) compat.roles = compatRoles;
@@ -2361,6 +2418,54 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
     if (out.disabled === undefined && out.max === undefined)
         throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
     return out;
+}
+
+// #3376: strict #1909-stance validation — an invalid cacheKeepalive value
+// THROWS (config-load failure) instead of being silently dropped, so a
+// typo'd keepalive config can't leave the user wondering why idle sessions
+// cold-rebuild every time.
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+
+export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
+    if (v === undefined) return undefined;
+    if (!v || typeof v !== "object" || Array.isArray(v))
+        throw new Error(`[acp-config] cacheKeepalive must be an object of optional fields (got ${JSON.stringify(v)})`);
+    const obj = v as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+        if (!(CACHE_KEEPALIVE_FIELDS as readonly string[]).includes(key))
+            throw new Error(`[acp-config] cacheKeepalive has unknown key "${key}" (allowed: ${CACHE_KEEPALIVE_FIELDS.join(", ")})`);
+    }
+    const out: CacheKeepaliveSettings = {};
+    if ("enabled" in obj) {
+        if (typeof obj.enabled !== "boolean")
+            throw new Error(`[acp-config] cacheKeepalive.enabled must be a boolean (got ${JSON.stringify(obj.enabled)})`);
+        out.enabled = obj.enabled;
+    }
+    if ("ttlFactor" in obj) {
+        const n = obj.ttlFactor;
+        if (typeof n !== "number" || !Number.isFinite(n) || !(n > 0 && n <= 1))
+            throw new Error(`[acp-config] cacheKeepalive.ttlFactor must be a number in (0, 1] (got ${JSON.stringify(n)})`);
+        out.ttlFactor = n;
+    }
+    for (const key of ["maxDurationMs", "maxConcurrentPings", "intervalMs"] as const) {
+        if (key in obj) {
+            const n = obj[key];
+            if (typeof n !== "number" || !Number.isInteger(n) || n <= 0)
+                throw new Error(`[acp-config] cacheKeepalive.${key} must be a positive integer ms/count (got ${JSON.stringify(n)})`);
+            out[key] = n;
+        }
+    }
+    if ("assumeTtl" in obj) {
+        if (obj.assumeTtl !== "5m" && obj.assumeTtl !== "1h")
+            throw new Error(`[acp-config] cacheKeepalive.assumeTtl must be "5m" or "1h" (got ${JSON.stringify(obj.assumeTtl)})`);
+        out.assumeTtl = obj.assumeTtl;
+    }
+    if ("armWithoutBreakpoints" in obj) {
+        if (typeof obj.armWithoutBreakpoints !== "boolean")
+            throw new Error(`[acp-config] cacheKeepalive.armWithoutBreakpoints must be a boolean (got ${JSON.stringify(obj.armWithoutBreakpoints)})`);
+        out.armWithoutBreakpoints = obj.armWithoutBreakpoints;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {

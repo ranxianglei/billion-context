@@ -8,6 +8,7 @@ import {
     collectNamedProviders,
     loadNamedProviders,
     normalizeLegacyAllowDshCompaction,
+    parseCacheKeepaliveSettings,
     parseCompressSettings,
     parseNamedProviderRecipe,
     parseRouteEntry,
@@ -215,6 +216,7 @@ export async function handleConfigPut(
         }
         if (next.upstreamProxyMode !== undefined && (typeof next.upstreamProxyMode !== "string" || !["auto", "manual", "direct"].includes(next.upstreamProxyMode))) return sendError(res, 400, "upstreamProxyMode must be auto, manual, or direct");
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
+        if (next.cacheKeepalive !== undefined && next.cacheKeepalive !== null && parseCacheKeepaliveSettings(next.cacheKeepalive) === undefined) return sendError(res, 400, "invalid cacheKeepalive settings");
         // The chain references named recipes — validate the expansion against
         // the providers table BEING SAVED (not the on-disk one), so a save
         // cannot strand the config on a dangling reference. Only enabled

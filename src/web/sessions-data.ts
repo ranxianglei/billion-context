@@ -7,6 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
@@ -102,6 +103,9 @@ interface WebSessionSummary {
     /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
      *  grossSaved that is frozen rather than accruing. */
     coverageLostFrozenTokens?: number;
+    /** #3376: idle prompt-cache keepalive snapshot state — live sessions only
+     *  (the snapshot lives in memory and dies with the process). */
+    keepalive?: KeepaliveStatus;
 }
 
 interface WebOverview {
@@ -688,6 +692,8 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    // #3376: idle cache-keepalive state — memory-only, so live rows only.
+    const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
     return {
         id: s.id,
@@ -713,6 +719,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
+        ...(keepalive ? { keepalive } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),

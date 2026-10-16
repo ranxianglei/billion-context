@@ -7,6 +7,7 @@ import path from "node:path";
 import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
+import { noteSuccessfulForward } from "../cache-keepalive.js";
 import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
@@ -1030,6 +1031,24 @@ export async function forward(
     // When the #568 hold already committed an early 200, the upstream's own
     // headers (x-request-id etc.) are dropped — informational only.
     if (!res.headersSent) res.writeHead(upstream.status, respHeaders);
+    // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
+    // and arm the TTL-refresh timer. Pipeline-prepared requests only
+    // (passthrough stays out of scope); internally gated to anthropic-wire
+    // POSTs and never throws into the response path.
+    if (prepared) {
+        noteSuccessfulForward({
+            sessionId: prepared.session.id,
+            protocol: prepared.protocol,
+            reqMethod: req.method ?? "",
+            sidePassthrough: prepared.sidePassthrough === true,
+            resignLane: resignCtx !== undefined,
+            wireBody: typeof wireBody === "string" ? wireBody : undefined,
+            upstreamUrl,
+            headers,
+            dispatcher,
+            routes: opts.routes,
+        });
+    }
     if (!upstream.body) {
         res.end();
         clearUpstreamTimer();

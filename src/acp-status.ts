@@ -10,6 +10,7 @@ import {
     type NudgeDecision,
     type CompressibleRange,
 } from "acp-kernel";
+import { keepaliveStatusFor } from "./cache-keepalive.js";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
@@ -210,6 +211,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (estTotal > 0 && billed / estTotal >= 1.5) {
             extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
         }
+    }
+    // #3376: idle cache-keepalive state — only-when-observed (absent = zero
+    // bytes), so a long-idle cache hit is explainable instead of reading as luck.
+    const keepalive = keepaliveStatusFor(ctx.session.id);
+    if (keepalive) {
+        const cadLabel = keepalive.cadenceMs >= 60_000 ? `${Math.round(keepalive.cadenceMs / 60_000)}min` : `${Math.round(keepalive.cadenceMs / 1000)}s`;
+        let kaLine = `CACHE KEEPALIVE: armed tier=${keepalive.tierLabel} cadence=${cadLabel} · pings=${keepalive.pingCount}`;
+        if (keepalive.lastHitAt !== undefined) kaLine += ` · last-hit ${Math.max(0, Math.round((Date.now() - keepalive.lastHitAt) / 60_000))}m ago`;
+        extra.push("");
+        extra.push(kaLine);
     }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and

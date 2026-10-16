@@ -117,6 +117,13 @@
 | `dsh.allowDshCompaction` | boolean | false | BILI_ALLOW_DSH_COMPACTION | 解除 bili 对 dsh 原生压缩调用的本地 422 拒绝——覆盖 bili 服务的全部线路：openai、anthropic、responses（#1729/#2028；responses 由 #2360 补上，正是 dsh 桌面端压缩实际走的线路）：为 true 时 dsh 的 compaction-basic 可经 bili 执行；其 checkpoint 会永久覆盖原始历史，属显式的不可逆 opt-in。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
+| `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。 |
+| `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | 作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。 |
+| `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | 单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。 |
+| `cacheKeepalive.maxConcurrentPings` | number | 4 | BILI_CACHE_KEEPALIVE_MAX_PINGS | 同时武装的会话数上限；超限时先驱逐空闲最久的已武装会话。 |
+| `cacheKeepalive.assumeTtl` | "5m" \| "1h" | null (detect from body breakpoints) | BILI_CACHE_KEEPALIVE_ASSUME_TTL | 跳过 body 断点检测，直接按该档位推导节奏——面向会在 bili 下游注入或改写 cache_control TTL、导致转发 body 无断点（或档位不对）的中继/代理。 |
+| `cacheKeepalive.armWithoutBreakpoints` | boolean | false | BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS | 转发 body 无任何 cache_control 断点时也武装保活（默认关——没有断点就没有显式打断点的内容可刷新；断点由你的中继自管时配合 assumeTtl/intervalMs 使用）。 |
+| `cacheKeepalive.intervalMs` | number | null (derive from TTL tier) | BILI_CACHE_KEEPALIVE_INTERVAL_MS | 绝对 ping 间隔（毫秒）；优先于 ttlFactor、assumeTtl 与检测档位。用于不随上游 TTL 策略变化的固定节奏。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — | 本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。 |
 | `native.attachPolicy` | "own-lane" \| "global-fallback" | own-lane | BILI_NATIVE_ATTACH_POLICY | native hook 附着的 lane 亲和，也是是否发生跨 lane 搭车的总闸（#2877）。own-lane（默认）：lane 型 hook 只搭同 lane 的守护；没有时自行派生，而不是回落到无 lane / 手动启动的 bili start 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话）；已武装的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。global-fallback 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护，以及（配 attachLanePriority）列出的外部 lane。 |
@@ -597,6 +604,18 @@
 - **默认值：** `{ routing: "auto" }`（无法识别的值一律解析为 `"auto"`）
 - **状态：** ACTIVE
 - **说明：** Responses wire `prompt_cache_key` 盖章的路由策略。客户端显式提供的 `prompt_cache_key` 永远原样优先；否则 bili 按模式决定是否加盖自己从会话身份派生的稳定 key：`"enabled"` = 总是盖，`"disabled"` = 从不盖，`"auto"`（默认）= 仅当上游 host 恰好是 `api.openai.com` 时盖。可由 `ACP_PROMPT_CACHE_ROUTING` 覆盖。
+
+### `cacheKeepalive`
+
+- **类型：** `{ enabled?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
+- **默认值：** `{}`（功能关闭）
+- **状态：** ACTIVE（#3376）
+- **说明：** Anthropic 线路的空闲期提示缓存保活（#3376）。Anthropic 前缀缓存按 TTL 过期（每个断点 5 分钟或 1 小时）；会话空闲期间（午休、过夜）缓存失效，下一个真实请求就要为整个已缓存前缀付全价冷重建。启用后，bili 对每个会话快照其最后一次成功转发的请求体——到达上游的精确字节，含其中的 `cache_control` 断点——并在会话保持空闲时以 `max_tokens=1` 按 TTL 推导的节奏重放；命中缓存的响应只需一次最小补全即可刷新 TTL。每次 ping 以上游返回的 `usage.cache_read_input_tokens` 验证：命中则排定下一次；读数为 0 说明前缀已死，立即停止。
+  - **武装条件。** 只有成功的（2xx）Anthropic 线路 POST 才会武装/刷新快照。透传请求、重签名通道（存下的签名对应旧字节）、非字符串请求体、超过 64 MiB 的请求体、以及无任何 `cache_control` 断点的请求都不会武装（除非用下面的开关覆盖）。快照仅存内存：重启即清空，下一个真实请求重新武装。
+  - **节奏。** `档位 × ttlFactor`：body 中任一断点声明 `ttl: "1h"` 则档位为 `1h`，否则 `5m`；默认因子 `0.9` → 约 4.5 分钟 / 54 分钟一次。可用 `assumeTtl` 覆盖（跳过 body 检测——面向会在 bili 下游注入或改写 `cache_control` TTL 的中继），或用绝对值 `intervalMs`（优先级最高）；`armWithoutBreakpoints: true` 让无断点的 body 也武装（配合 `assumeTtl` 使用）。
+  - **停止条件。** 该会话出现真实请求立即取消（真实请求自己就会刷新缓存）；到点时该会话有在途请求则延迟约 5 秒再试；`cache_read_input_tokens = 0` → 停（`prefix-dead`）；HTTP 429 → 立即停；连续 3 次其他错误 → 停；距该会话最后一次真实请求超过 `maxDurationMs`（默认 24 小时）→ 停；`maxConcurrentPings`（默认 4）限制同时武装的会话数，超限时先驱逐空闲最久者。
+  - **成本与可观测性。** ping 完全绕过代理管线，因此不会进入 `/acp-cache` 命中率台账（合成流量不得污染健康判定），也不会产生任何缓存归因样本——miss 归因计算跑的请求序列与不开保活时完全一致。每次武装/ping/解除武装都记录 `[keepalive] …` 日志行；`acp_status` 对已武装会话输出一行 `CACHE KEEPALIVE: armed tier=… cadence=… · pings=N [· last-hit Mm ago]`（未武装时不出现）；Web UI 在会话列表显示保活徽标、详情页显示完整状态行，其原始 JSON 配置编辑器可直接写入本配置节（保存时服务端校验）。
+  - **逐 provider / 逐模型覆盖。** 所有字段也可写在 provider 路由下（`providers.<url>.cacheKeepalive`），或写在该路由的某个具体模型下（`providers.<url>.models.<model>.cacheKeepalive`）——同一上游后的不同模型可以跑不同的档位/节奏。逐字段优先级：环境变量 > 模型 > 路由 > 全局块 > 内置默认值。
 
 ### `autoUpdate`
 
@@ -1622,6 +1641,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
 | `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
+| `BILI_CACHE_KEEPALIVE` | `cacheKeepalive.enabled` | false |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive.armWithoutBreakpoints` | false |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `cacheKeepalive.assumeTtl` | null (detect from body breakpoints) |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | `cacheKeepalive.intervalMs` | null (derive from TTL tier) |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | `cacheKeepalive.maxDurationMs` | 86400000 |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | `cacheKeepalive.maxConcurrentPings` | 4 |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | `cacheKeepalive.ttlFactor` | 0.9 |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
@@ -1765,6 +1791,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STABLE_SYSTEM_ANCHOR` | 设为 `1` 开启稳定 system 锚定（#1085）—— **wire 层兜底（best-effort）**：根治在客户端（会话历史与指令变更的呈现方式由客户端决定），本开关只是阻止代理因头部变化而使整个已缓存前缀失效。**仅限 plain-proxy 模式**：plugin-mode agent（`x-bili-plugin`）自管上下文、永不参与锚定，避免对已自带 cache-friendly 更新注入的客户端（如 claude-code 的 system-reminder）做双重处理。开启后，bili 按会话记住客户端首次发送的头部 system/instructions 块并持续原样重发。**局部变更**（文件式编辑，与当前生效版本共享 ≥70% 行）追加末尾 `[System context update] …` user 注记，内含紧凑行级 diff（`-` 删除 / `+` 新增；每条注记顺序叠加在前一条之上）。**非局部变更**（结构性重排、tool 定义增删、带时间戳的 banner、超 400 行的头部）直接采用新文本 —— 一次有意的缓存失效好过追加会误导模型的噪声 diff。防抖保护：累积超过 8 条注记同样直接替换锚点为最新文本并清空日志。锚点与注记日志随会话持久化，不受压缩/compaction 影响（session metadata 而非 kernel state）。已知残留限制：客户端自放的 `cache_control` 断点在换头后仍可能错位。不参与锚定的请求：标题生成微请求（OpenAI/Google）、Responses compaction-trigger 请求、auto-mode classifier 请求。客户端自身已实现同类机制（稳定 prompt + 历史内更新）时零额外注入 —— 这类更新作为普通历史透传。默认关闭。配置文件中设 `"stableSystemAnchor": true` 效果相同；环境变量优先。 |
 | `BILI_ALLOW_DSH_COMPACTION` | 设为 `1` 放行 dsh 内置自动压缩（#2028）。默认由 wire 级守卫（#1729）**在本地拒绝 dsh 原生压缩调用**（422），覆盖 bili 服务的全部线路——openai、anthropic、responses（responses 由 #2360 补上：此前的协议白名单在检查标记之前就把 responses 短路了，而 dsh 桌面端的压缩恰好走这条线路，调用因此静默穿过）：dsh 的 `compaction-basic` 应对上下文压力时会重放会话前缀、并把固定摘要指令作为最后一条 user 消息发出，此类调用一旦落地，其 checkpoint 会永久覆盖原始历史——不可逆，且摧毁代理的压缩基底。本开关解除该拒绝，让 dsh 原生压缩真正执行。作用范围：非 web profile 下随附 bundle patch（`auto: false`）仍抑制**自动**触发，因此那里只有手动 `/compact` 受益；web profile 下任何 patch 层都无法按 id 直寻 preset 嵌套行（#1772），因此放行后自动触发照常工作——除非在你的 profile `cordis.patch.yml` 里按 #2474 施加对 preset-standard 的完整快照覆盖。网页配置页提供同一开关；环境变量优先于文件。在配置文件的 `"dsh"` 段下设 `"allowDshCompaction": true` 效果相同（旧文件里裸写在顶层的 `"allowDshCompaction"` 会在加载时自动迁移到该位置）。 |
 | `BILI_NO_CACHE_CONTROL` | 设为 `1` 关闭 bili 在 Anthropic 通道上的 `cache_control` 断点标注(#1637,随 #1639 落地)。默认开启:Anthropic 系上游只缓存被显式打断点的内容(每请求最多 4 个,按 system + tools + 消息块合并计数),因此 bili 会标注 system 块加上至多 3 个累积消息断点——被标注的消息保持标注(前缀字节稳定),断点只随折叠消亡,最近 3 条稳定消息承载推进前沿。客户端自设的任何 `cache_control`(消息块、tools 条目)都会完全抑制 bili 的标注——客户端自管缓存优先。断点随会话持久化。本开关是逃生阀:用于拒绝该字段的上游或有自己断点策略的中继。仅限 plain-proxy Anthropic 通道;OpenAI/Responses 通道隐式缓存,从不标注。配置文件对应项:[`compat.noCacheControl`](#compat) —— 环境变量优先。 |
+| `BILI_CACHE_KEEPALIVE` | 设为 `1` 开启 Anthropic 线路的空闲期提示缓存保活(#3376)——完整机制、停止规则与成本说明见 [`cacheKeepalive`](#cachekeepalive)。配置文件对应项:`"cacheKeepalive": { "enabled": true }`;环境变量优先。默认关闭。 |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 作用于检测/假定缓存 TTL 档位的节奏因子(默认 `0.9` → 5 分钟档约每 4.5 分钟一次,1 小时档约每 54 分钟一次)。取值须在 `(0, 1]`。配置文件对应项:`cacheKeepalive.ttlFactor`。 |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | 单会话保活时长上限,自其最后一次真实请求起算(默认 `86400000` = 24 小时);超过后即使仍在命中也会解除武装。配置文件对应项:`cacheKeepalive.maxDurationMs`。 |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | 同时武装的会话数上限(默认 `4`);超限时先驱逐空闲最久的会话。配置文件对应项:`cacheKeepalive.maxConcurrentPings`。 |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `"5m"` 或 `"1h"`:跳过 body 断点检测,直接按该档位推导节奏——面向会在 bili 下游注入或改写 `cache_control` TTL、导致转发 body 无断点(或档位不对)的中继/代理。配置文件对应项:`cacheKeepalive.assumeTtl`。 |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | 设为 `1` 让转发 body 无任何 `cache_control` 断点时也武装保活(默认关——没有断点就没有显式打断点的内容可刷新;断点由你的中继自管时配合 `assumeTtl`/`intervalMs` 使用)。配置文件对应项:`cacheKeepalive.armWithoutBreakpoints`。 |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | 绝对 ping 间隔(毫秒);优先于 `ttlFactor`、`assumeTtl` 与检测档位。用于不随上游 TTL 策略变化的固定节奏。配置文件对应项:`cacheKeepalive.intervalMs`。 |
 | `BILI_CHAIN_CONTENT` | 设为 `1` 开启 bili→bili 链感知的 ACP 产物 / `<bili-chain …/>` 检查点**正文内容**检测（#1086/#1421）：当入站请求的正文携带压缩产物（渲染标签 / 历史 `acp_status`+`search_context` 工具调用）或带摘要的检查点，但既无 `x-bili-hop` 头、本实例也无该会话的压缩状态时，bili 记录一次告警性观察和/或应用「首个处理器优先」透传。**默认关闭**（#1683 后续）：默认下只有 `x-bili-hop` 头驱动链识别，因为扫描请求正文可能把 CCR/文件引入的文本和模型回声标签误判为真实标记。仅在中间盒子剥掉 `x-bili-hop`、且你接受该误判风险的狭窄多 bili 中继场景下才启用。配置文件中设 `"chainContentDetection": true` 效果相同；环境变量优先。`x-bili-hop` 信号本身不受此开关影响。 |
 | `BILI_CHAIN_STAMP` | 设为 `1` 开启**模型可见**的 `<bili-chain …/>` 链完整性检查点载体的出站注入（#1683，默认关闭）：开启后，本实例实际处理的每个请求都携带一个带摘要的戳，使下游 bili 即使 `x-bili-hop` 头在传输中被剥离也能应用「首个处理器优先」（first-processor-wins）（#1421）。该载体落在终端模型同样会读取的位置（OpenAI/Responses 上是一条尾部 `user` 消息，Anthropic/Google 上是尾部文本 part），因此模型会把它当作幽灵用户输入并花 token 去评论它——这正是它默认关闭的原因。仅在多 bili 中继、且中间盒子剥掉 `x-bili-hop`、带摘要校验的 body-stamp 是防止双重处理的唯一手段这一狭窄场景下才启用。与 `BILI_CHAIN_CONTENT`（入站正文检测同样默认关闭）及 `x-bili-hop` 透传相互独立（后者无论如何都生效）。配置文件中设 `"chainEgressStamp": true` 效果相同；环境变量优先。 |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | 校验链检查点 `issued-at` 时间戳时容忍的最大未来偏斜（毫秒）（#1395 step 2）：戳在比当前时间未来超过此值的检查点会被判为 `stale`（重放 / 时钟偏斜），即使其摘要校验通过。默认 `120000`（2 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
