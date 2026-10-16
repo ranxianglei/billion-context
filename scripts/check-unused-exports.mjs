@@ -24,6 +24,7 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",

@@ -221,6 +221,7 @@ test("bootstrapZcodeNative attaches to a healthy proxy and routes", async () => 
             assert.equal(out.mode, "active");
             if (out.mode !== "active") return;
             assert.equal(out.attached, true);
+            assert.equal(out.externallyOwned, true);
             assert.ok(out.routed);
             assert.equal(out.routed.origin, origin);
         });
@@ -256,8 +257,29 @@ test("bootstrapZcodeNative spawns through the injected ensureProxy seam", async 
             assert.equal(out.mode, "active");
             if (out.mode !== "active") return;
             assert.equal(out.attached, false);
+            assert.equal(out.externallyOwned, false);
             assert.ok(out.routed);
             assert.equal(out.routed.origin, origin);
+        });
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("bootstrap marks a lane-owned instance found alive at bootstrap as NOT externally owned (#1821)", async () => {
+    const dir = dataDir();
+    try {
+        await withHealthServer(async (origin) => {
+            const out = await bootstrapZcodeNative({
+                env: {},
+                dataDir: dir,
+                log: () => {},
+                ensureProxy: async () => ({ origin, attached: true }),
+            });
+            assert.equal(out.mode, "active");
+            if (out.mode !== "active") return;
+            assert.equal(out.attached, true);
+            assert.equal(out.externallyOwned, false);
         });
     } finally {
         rmrf(dir);
