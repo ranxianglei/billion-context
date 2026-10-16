@@ -928,8 +928,8 @@ export const WEB_CLIENT = `(function () {
         // the same bucket membership the economics card aggregates. The gap
         // heuristic remains only as the legacy fallback for old ledgers whose
         // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rd: "#8250df", rest: "#9aa1a8" };
+        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rd: "det.leg_reasoning", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
         const causes = lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
@@ -957,6 +957,7 @@ export const WEB_CLIENT = `(function () {
             if (l.prov === "side") return "ps";
             if (l.prov === "rewind") return "rw";
             if (l.prov === "client") return "ci";
+            if (l.prov === "reasoning") return "rd";
             // Legacy fallback only: no attribution fields on this line.
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
@@ -1080,6 +1081,7 @@ export const WEB_CLIENT = `(function () {
             providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
             rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
             client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            reasoningDrop: { count: (raw.reasoningDrop && Number(raw.reasoningDrop.count)) || 0, missed: (raw.reasoningDrop && Number(raw.reasoningDrop.missed)) || 0 },
             abortCorrelated: Number(raw.abortCorrelated) || 0,
         };
     }
@@ -1501,6 +1503,7 @@ export const WEB_CLIENT = `(function () {
                 if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
                 if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
                 if (seam.client.count > 0) sub.push(legendItem("background:#0969da", t("det.leg_client")));
+                if (seam.reasoningDrop.count > 0) sub.push(legendItem("background:#8250df", t("det.leg_reasoning")));
                 sub.push(legendItem("background:#9aa1a8", t("det.leg_rest")));
                 parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
                     + legendItem("background:#8250df", t("det.cause_unattrib"))
