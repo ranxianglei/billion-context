@@ -1008,13 +1008,44 @@ function sessionRevisionOf(session: Session): string {
     return revision;
 }
 
+/** #3011: pick the raw view forkSnapshot serves. pluginSnapshot is the
+ *  canonical guarded copy (#2077), but it is only PERSISTED after a fork
+ *  receipt or explicit retention — any residency gap (LRU evict / host
+ *  restart) loses it until the parent's next model request, which is exactly
+ *  when a fork child needs it most (the child's adoption window precedes its
+ *  first forwarded request). session.lastMessages — written by EVERY prepare*
+ *  with the raw incoming view and persisted unconditionally — covers that
+ *  gap. It also wins when its head diverges from a stale snapshot: after a
+ *  full-cover native compaction the zero-overlap guard freezes pluginSnapshot
+ *  pre-compaction while the state rebase re-issues the refs, so serving the
+ *  stale copy fails closed on "raw/ref mapping inconsistent" forever; the
+ *  head-divergent tail is the freshest raw view the client will replay next.
+ *  A folded tail (lastMessagesFolded) is never a raw source. An EMPTY retained
+ *  copy is still a valid source: a zero-branchpoint fork child legitimately
+ *  holds pluginSnapshot === [] and its own forkSnapshot() (childRevision) must
+ *  serve that emptiness, not report "unavailable". */
+function forkSourceMessages(session: Session): { messages: CoreMessage[]; fromTail: boolean } | null {
+    const primary = Array.isArray(session.pluginSnapshot) ? session.pluginSnapshot : undefined;
+    const tail = session.lastMessages && session.lastMessagesFolded !== true && session.lastMessages.length > 0 ? session.lastMessages : undefined;
+    if (!primary) return tail ? { messages: tail, fromTail: true } : null;
+    if (tail && primary.length > 0 && forkMessageIdentityHash(tail[0]!) !== forkMessageIdentityHash(primary[0]!)) return { messages: tail, fromTail: true };
+    return { messages: primary, fromTail: false };
+}
+
 function forkSnapshot(session: Session) {
-    const messages = session.pluginSnapshot;
-    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
+    // The retention cap stays a hard refusal even when a recent raw view is
+    // available: serving around it would make the cap unenforceable (#2433).
+    if (session.metadata.publicSnapshotCapped === true) throw new Error("raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy");
+    const source = forkSourceMessages(session);
+    const messages = source?.messages;
+    if (!messages) throw new Error("raw snapshot unavailable (no retained raw copy and no recent raw view); send a fresh plugin model request");
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
-    if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
+    // The stored-ref list is bookkeeping for the RETAINED copy; on the tail
+    // path it describes a different (older or reset) view, so only the
+    // per-message CCR checks below apply to what is actually served (#3011).
+    if (!source!.fromTail && Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
     if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
@@ -1172,6 +1203,134 @@ function forkChildHeldBySameParent(child: string, parent: string): boolean {
     return registeredIds.get(child)?.parentConversationId === parent;
 }
 
+/** #3025: materialize fork inheritance onto `child` — shared by the fresh-fork
+ *  path (`late=false`, target just minted) and the late-completion path
+ *  (`late=true`, an existing UNFORKED child whose stamped request landed
+ *  before adoption and latched it behind CHILD_CONFLICT). A late child already
+ *  ran a real request: its own rules/nudge/stats/metadata/transient
+ *  bookkeeping stay untouched (overwriting would regress measured values) —
+ *  what it receives is exactly the inheritance: blocks, refs, counters, raw
+ *  baseline, content store, receipt. Returns false after replying 409 when the
+ *  parent state cannot support the inheritance; replies 201 on success. */
+function completeForkTarget(res: ServerResponse, child: Session, parent: Session, snapshot: ReturnType<typeof forkSnapshot>, request: ForkRequest, requestHash: string, late: boolean): boolean {
+    const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
+    const rawIds = new Set(prefix.map((m) => m.rawId));
+    const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
+    const blocks = parent.state.blocks.filter((b) => b.effectiveMessageIds.length > 0 && b.effectiveMessageIds.every((id) => rawIds.has(id)));
+    const blockIds = new Set(blocks.map((b) => b.blockId));
+    const expandedChildren = new Set(crossing.flatMap((b) => b.directBlockIds));
+    for (const b of [...blocks, ...crossing]) {
+        const content = parent.blockContents.get(b.blockId);
+        if (!content || !content.full || typeof content.full.text !== "string" || !content.full.text || b.directBlockIds.some((id) => !parent.state.blocks.some((childBlock) => childBlock.blockId === id))) { forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block/original content unavailable" }); return false; }
+    }
+    for (const b of blocks) {
+                if (b.directBlockIds.some((id) => !blockIds.has(id))) { forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block outside matched prefix" }); return false; }
+        child.state.blocks.push({ ...structuredClone(b), ...(expandedChildren.has(b.blockId) ? { active: false, expanded: true } : {}) });
+        child.blockContents.set(b.blockId, structuredClone(parent.blockContents.get(b.blockId)!));
+    }
+    // Keep the issued ref namespace reserved, including dead refs, to prevent reuse.
+    child.state.messageRefs = structuredClone(parent.state.messageRefs);
+    for (const { rawId, ref } of prefix) {
+        // #2620: ref null = intentionally unaddressable; keep the raw id reserved under
+        // the kernel sentinel exactly as the parent holds it. byRef/tokenSnapshot are
+        // numeric-ref spaces and never see the sentinel.
+        child.state.messageRefs.byRaw[rawId] = ref ?? BLOCKED_REF;
+        if (ref !== null) {
+            child.state.messageRefs.byRef[ref] = rawId;
+            if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
+        }
+    }
+    child.state.nextBlockId = parent.state.nextBlockId;
+    child.state.nextRunId = parent.state.nextRunId;
+    child.state.lastPassIds = prefix.map((m) => m.rawId);
+    if (!late) child.state.rules = structuredClone(parent.state.rules);
+    if (!late) child.state.nextRuleId = parent.state.nextRuleId;
+    child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+    // #2362: inverse of the orphan filter — a dead ref whose message IS
+    // in the forked prefix is visible again in the child; refs outside
+    // it stay dead (their messages are absent from the child too).
+    child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
+    child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
+    child.state.stats.compressionCount = blocks.length;
+    if (!late && prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
+    // #3011: the child's raw baseline must come from the SAME source
+    // view the snapshot was served from — the retained copy may be
+    // absent (residency gap) while the recent raw view is not.
+    const parentSource = forkSourceMessages(parent);
+    if (!parentSource) { forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: "raw snapshot unavailable; send a fresh plugin model request" }); return false; }
+    child.pluginSnapshot = structuredClone(parentSource.messages.slice(0, request.branchPoint.messageCount));
+    const forkView = prune(child.pluginSnapshot, child.state);
+    // Hiding the original pair is safe only if its summary survives the fork.
+    child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
+        rawIds.has(a.callMessageId) && rawIds.has(a.resultMessageId) && (
+            (a.absorbCallId !== undefined && forkView.some((m) => m.contentType === "tool-call" && m.toolCallId === a.absorbCallId)) ||
+            child.state.blocks.some((b) => b.active && !b.expanded && a.summary.length > 0 && b.summary.includes(a.summary))
+        )) ?? []);
+    child.lastMessages = structuredClone(child.pluginSnapshot);
+    child.lastMessagesFolded = false;
+    const parentStore = contentStoreOf(parent);
+    for (const { ref, rawId } of prefix) {
+        if (ref === null) continue;
+        const entry = parentStore.byRef[ref];
+                if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) { forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" }); return false; }
+    }
+    child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
+    child.metadata.publicSnapshotTextComparable = true;
+    child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
+    child.metadata.parentConversationId = request.parentConversationId;
+    child.metadata.parentRevision = request.parentRevision;
+    if (!late) {
+        // Fresh children start cold: clone the parent's resolution context and
+        // seed the nudge sizing fallback (#728 lane). The receipt starts the
+        // child on a FRESH stats block: no usage-grade baseline (billing
+        // isolation is deliberate) and no per-turn localInputEstimate yet, so
+        // effectiveTokenCount feeds the kernel tokenCount 0 and every nudge
+        // trigger goes dark on the child's first turn — exactly when the
+        // inherited context is at its fullest. The receipt's own estimate
+        // describes the child's exact next outbound view: seeding it keeps
+        // the nudge live from turn 1. It errs EARLY only (char-count upper
+        // bound), a real usage report takes precedence immediately (#728
+        // invariant), and every prepare* overwrites it with the measured
+        // outbound each turn. Late children skip all of this: they already
+        // ran a real request and own valid measured values.
+        for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+        child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
+        child.stats.contextTokensSource = "estimate";
+        recordContextObservation(child, child.stats.contextTokens, "estimate");
+        child.stats.localInputEstimate = child.stats.contextTokens;
+    }
+    const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false, ...(late ? { lateAdopted: true } : {}) };
+    child.metadata.publicForkReceipt = { requestHash, response };
+    if (late) {
+        // Late children are ALREADY RESIDENT (they carried traffic): the
+        // fresh-session guard in publishForkSession would reject them. Flush
+        // eagerly instead so the receipt and the materialized inheritance
+        // land in one write (#2077 continuity — a crash between the two would
+        // leave blocks without a receipt and re-latch the 409).
+        if (!getStore().flushSync(child)) loggerLog("warn", `fork ${request.childConversationId}: late-adopted child flush failed (${child.id}); the debounced save will retry`);
+    } else {
+        publishForkSession(child);
+    }
+    recordPluginSession(request.childConversationId, child.id);
+    // [#2399 stage 2] the host's session_start identity register claimed
+    // this id with the same parent (see forkChildHeldBySameParent) — the
+    // fork-created conversation supersedes it; a lingering entry would
+    // re-bind plugin mode on the child's next request, which the map
+    // binding already does without dragging the derived-parent path in.
+    registeredIds.delete(request.childConversationId);
+    if (!late) (child.transient ??= {}).pluginMessages = { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) };
+    // #2077: the parent snapshot is now an external contract — this child
+    // was cut from it, and later forks/replays depend on its continuity.
+    // The receipt lives on the CHILD only, so without this sticky flag a
+    // lazily-persisted parent would drop its snapshot on disk and the next
+    // restart would 409. Flush eagerly (publishForkSession precedent) so
+    // the flag and the snapshot land in one write.
+    parent.metadata.publicSnapshotRetained = true;
+    if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
+    forkReply(res, 201, response);
+    return true;
+}
+
 export async function handlePluginFork(payload: string, res: ServerResponse): Promise<void> {
     let request: ForkRequest;
     try { request = parseForkRequest(payload); }
@@ -1181,19 +1340,33 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         const existing = resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
-        if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
-        else forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
-        return true;
+        if (receipt?.requestHash === requestHash) { forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true }); return true; }
+        // #3025: an existing child WITHOUT a matching receipt is not settled
+        // here — it may be a stamped-first race victim still eligible for
+        // in-place late completion. The locked section decides under both
+        // locks; genuine conflicts still end in CHILD_CONFLICT.
+        return false;
     };
     if (replay()) return;
-    if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+    // #3025: recordPluginSession runs during the child's FIRST stamped request
+    // (before forwarding), so a race-lost adoption latches the child behind
+    // the registration gates below forever. An UNFORKED child (no receipt,
+    // never materialized, zero self-blocks) may bypass them — the strict
+    // eligibility re-check happens under both locks. Eligibility only ever
+    // degrades across the window, so the cheap pre-lock peek is sound.
+    const lateCandidate = (): boolean => {
+        const candidate = resolveForkConversation(request.childConversationId);
+        return !!candidate && candidate.metadata.publicForkReceipt === undefined && candidate.metadata.parentConversationId === undefined && candidate.state.blocks.length === 0;
+    };
+    const registrationConflict = (): boolean => conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId));
+    if (!lateCandidate() && registrationConflict()) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
-        await withSessionLock(parent, () => {
+        await withSessionLock(parent, async () => {
             if (replay()) return;
-            if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+            if (!lateCandidate() && registrationConflict()) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
@@ -1207,107 +1380,37 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
-            const rawIds = new Set(prefix.map((m) => m.rawId));
-            const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
-            const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
-            const blocks = parent.state.blocks.filter((b) => b.effectiveMessageIds.length > 0 && b.effectiveMessageIds.every((id) => rawIds.has(id)));
-            const blockIds = new Set(blocks.map((b) => b.blockId));
-            const expandedChildren = new Set(crossing.flatMap((b) => b.directBlockIds));
-            for (const b of [...blocks, ...crossing]) {
-                const content = parent.blockContents.get(b.blockId);
-                if (!content || !content.full || typeof content.full.text !== "string" || !content.full.text || b.directBlockIds.some((id) => !parent.state.blocks.some((childBlock) => childBlock.blockId === id))) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block/original content unavailable" });
-            }
-            for (const b of blocks) {
-                if (b.directBlockIds.some((id) => !blockIds.has(id))) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block outside matched prefix" });
-                child.state.blocks.push({ ...structuredClone(b), ...(expandedChildren.has(b.blockId) ? { active: false, expanded: true } : {}) });
-                child.blockContents.set(b.blockId, structuredClone(parent.blockContents.get(b.blockId)!));
-            }
-            // Keep the issued ref namespace reserved, including dead refs, to prevent reuse.
-            child.state.messageRefs = structuredClone(parent.state.messageRefs);
-            for (const { rawId, ref } of prefix) {
-                // #2620: ref null = intentionally unaddressable; keep the raw id reserved under
-                // the kernel sentinel exactly as the parent holds it. byRef/tokenSnapshot are
-                // numeric-ref spaces and never see the sentinel.
-                child.state.messageRefs.byRaw[rawId] = ref ?? BLOCKED_REF;
-                if (ref !== null) {
-                    child.state.messageRefs.byRef[ref] = rawId;
-                    if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
+            const lateChild = resolveForkConversation(request.childConversationId);
+            if (lateChild) {
+                // #3025 late completion: the child's stamped request landed before
+                // adoption. Complete the inheritance IN PLACE only while the child
+                // is provably still the pure prefix — strict full-length identity
+                // (any own turn or self-fold disqualifies) plus a per-ref
+                // consistency assertion: numbering divergence means refuse, never
+                // corrupt. Re-checked after taking the child lock: state may have
+                // moved meanwhile. Parent → child is the only two-lock order in
+                // the proxy, so this cannot deadlock.
+                const eligible = (): boolean => lateChild.metadata.publicForkReceipt === undefined
+                    && lateChild.metadata.parentConversationId === undefined
+                    && lateChild.state.blocks.length === 0
+                    && Array.isArray(lateChild.lastMessages)
+                    && lateChild.lastMessages.length === request.orderedMessages.length
+                    && lateChild.lastMessages.every((m, i) => forkMessageIdentityHash(m) === request.orderedMessages[i]!.identityHash)
+                    && request.orderedMessages.every(({ rawId, ref }) => lateChild.state.messageRefs.byRaw[rawId] === (ref ?? BLOCKED_REF));
+                if (!eligible()) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
+                acquireInFlight(lateChild);
+                try {
+                    await withSessionLock(lateChild, () => {
+                        if (!eligible()) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
+                        completeForkTarget(res, lateChild, parent, snapshot, request, requestHash, true);
+                    });
+                } finally {
+                    releaseInFlight(lateChild);
                 }
+                return;
             }
-            child.state.nextBlockId = parent.state.nextBlockId;
-            child.state.nextRunId = parent.state.nextRunId;
-            child.state.lastPassIds = prefix.map((m) => m.rawId);
-            child.state.rules = structuredClone(parent.state.rules);
-            child.state.nextRuleId = parent.state.nextRuleId;
-            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
-            // #2362: inverse of the orphan filter — a dead ref whose message IS
-            // in the forked prefix is visible again in the child; refs outside
-            // it stay dead (their messages are absent from the child too).
-            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
-            child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
-            child.state.stats.compressionCount = blocks.length;
-            if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount));
-            const forkView = prune(child.pluginSnapshot, child.state);
-            // Hiding the original pair is safe only if its summary survives the fork.
-            child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
-                rawIds.has(a.callMessageId) && rawIds.has(a.resultMessageId) && (
-                    (a.absorbCallId !== undefined && forkView.some((m) => m.contentType === "tool-call" && m.toolCallId === a.absorbCallId)) ||
-                    child.state.blocks.some((b) => b.active && !b.expanded && a.summary.length > 0 && b.summary.includes(a.summary))
-                )) ?? []);
-            child.lastMessages = structuredClone(child.pluginSnapshot);
-            child.lastMessagesFolded = false;
-            const parentStore = contentStoreOf(parent);
-            for (const { ref, rawId } of prefix) {
-                if (ref === null) continue;
-                const entry = parentStore.byRef[ref];
-                if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
-            }
-            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
-            child.metadata.publicSnapshotTextComparable = true;
-            child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
-            child.metadata.parentConversationId = request.parentConversationId;
-            child.metadata.parentRevision = request.parentRevision;
-            child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
-            child.stats.contextTokensSource = "estimate";
-            recordContextObservation(child, child.stats.contextTokens, "estimate");
-            // Seed the nudge sizing fallback (#728 lane). The receipt starts
-            // the child on a FRESH stats block: no usage-grade baseline (billing
-            // isolation is deliberate) and no per-turn localInputEstimate yet,
-            // so effectiveTokenCount feeds the kernel tokenCount 0 and every
-            // nudge trigger goes dark on the child's first turn — exactly when
-            // the inherited context is at its fullest. A mid-history model
-            // switch onto a smaller window then falls straight into the
-            // preflight summarization marathon on every request (field repro:
-            // dsh fork at branch point 93, 671 msgs, "nudge idle: usage=0%
-            // (0/936000)" with 929710 pending, 19-round preflight per request).
-            // The receipt's own estimate describes the child's exact next
-            // outbound view: seeding it keeps the nudge live from turn 1. It
-            // errs EARLY only (char-count upper bound), a real usage report
-            // takes precedence immediately (#728 invariant), and every prepare*
-            // overwrites it with the measured outbound each turn.
-            child.stats.localInputEstimate = child.stats.contextTokens;
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
-            child.metadata.publicForkReceipt = { requestHash, response };
-            publishForkSession(child);
-            recordPluginSession(request.childConversationId, child.id);
-            // [#2399 stage 2] the host's session_start identity register claimed
-            // this id with the same parent (see forkChildHeldBySameParent) — the
-            // fork-created conversation supersedes it; a lingering entry would
-            // re-bind plugin mode on the child's next request, which the map
-            // binding already does without dragging the derived-parent path in.
-            registeredIds.delete(request.childConversationId);
-            (child.transient ??= {}).pluginMessages = { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) };
-            // #2077: the parent snapshot is now an external contract — this child
-            // was cut from it, and later forks/replays depend on its continuity.
-            // The receipt lives on the CHILD only, so without this sticky flag a
-            // lazily-persisted parent would drop its snapshot on disk and the next
-            // restart would 409. Flush eagerly (publishForkSession precedent) so
-            // the flag and the snapshot land in one write.
-            parent.metadata.publicSnapshotRetained = true;
-            if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
-            forkReply(res, 201, response);
+            const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
+            completeForkTarget(res, child, parent, snapshot, request, requestHash, false);
         });
     } catch (err) {
         forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) });
