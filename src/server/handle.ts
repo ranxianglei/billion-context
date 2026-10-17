@@ -223,6 +223,19 @@ export async function handle(
     }
 }
 
+// #3386: staged heap probes over the local processing window. One oversized
+// request can abort the whole process mid-turn (#3386: 25 MiB / 1372 msgs →
+// 4 GB heap), and attributing WHICH stage materialized it (raw buffer vs
+// toString+JSON.parse graph vs kernel/processTurn rebuild) needs a heap
+// sample at each boundary. Gated on the existing --debug flag: zero new
+// config surface, zero behavior change when off.
+function memProbe(debug: boolean, log: (level: string, msg: string) => void, sessionId: string, stage: string, payloadBytes?: number): void {
+    if (!debug) return;
+    const mu = process.memoryUsage();
+    const mi = (n: number): string => `${Math.round(n / 1048576)}MiB`;
+    log("debug", `[${sessionId}] mem-probe ${stage}: heap=${mi(mu.heapUsed)} external=${mi(mu.external)} rss=${mi(mu.rss)}${payloadBytes !== undefined ? ` payload=${payloadBytes}B` : ""}`);
+}
+
 async function handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1323,6 +1336,7 @@ async function handleRequest(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
+        memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -2294,6 +2308,7 @@ async function handleRequest(
                     const mode = codexCompactMode();
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
                     if (mode === "intercept" && gatePre) prepared = await runPrepare();
+                    if (prepared) memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         return { body: prepared.body, prepared };
@@ -2311,6 +2326,7 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
