@@ -77,7 +77,7 @@ function makeEl(tag: string, chartRect: Rect): El {
         closest() { return null; },
         select() {},
         click() { el.dispatch("click"); },
-        getBoundingClientRect() { return el.id === "traj-chart" ? chartRect : { left: 0, top: 0, width: 100, height: 20 }; },
+        getBoundingClientRect() { return el.id === "traj-chart" || el.id === "hit-chart" ? chartRect : { left: 0, top: 0, width: 100, height: 20 }; },
     };
     return el;
 }

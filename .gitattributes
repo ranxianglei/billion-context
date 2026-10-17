@@ -10,6 +10,9 @@ dsh.bundle.patch.yml text eol=lf
 # #2489: same failure class for the multi-line trajectory SVG golden.
 tests/golden/web-trajectory/*.svg text eol=lf
 
+# #3484: same failure class for the multi-line hit-rate SVG golden.
+tests/golden/web-hitrate/*.svg text eol=lf
+
 # #1305 class again, new path: the Vertex fixture's manifest pins each artifact's
 # byte size and sha256, and turn-streaming.meta.json is 42 lines — Git-for-Windows'
 # autocrlf=true checked it out at 1941 bytes against the recorded 1899, so

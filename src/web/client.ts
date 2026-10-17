@@ -818,8 +818,7 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
-        trajState = null;
-        trajRange = null;
+        chartZooms.forEach((z) => { z.state = null; z.range = null; });
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
@@ -898,52 +897,26 @@ export const WEB_CLIENT = `(function () {
     // #2489: chart geometry shared by the renderer and the brush interaction below.
     const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
     const TRAJ_MIN_SAMPLES = 5;
-    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
-        lines = (lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return "";
-        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
-        const iw = W - PL - PR, ih = H - PT - PB;
-        let maxY = 0;
-        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
-        if (win && win > maxY) maxY = win * 1.05;
-        if (maxY <= 0) maxY = 1;
-        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
-        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
-        const dt = (ms) => fmtDT(ms);
-        let grid = "", ticks = "";
-        for (let g = 0; g <= 4; g++) {
-            const v = (maxY / 4) * g;
-            const yy = y(v);
-            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
-            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
-        }
-        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
-        let stroke = "";
-        lines.forEach((l, i) => {
-            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
-            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
-        });
-        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
-        // Cache-gap causes: color each sample's un-cached band (input − cached)
-        // by its most likely cause so gaps on the chart explain themselves.
-        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
-        // first sample after it AND the cold continuation (hit < 85%) up to 4
-        // samples, closing on the first warm line. Ledger lines carry foldSeq
-        // directly; the fold-between-times heuristic stays as the opener and
-        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
-        // arms ONLY on that opener path: foldSeq-stamped lines are the
-        // ledger's own attribution and must not re-arm, or the chart keeps
-        // coloring comp up to 4 lines past the ledger retiring the window.
+    // #3484: per-sample miss-cause palette + labels shared by the trajectory gap bands
+    // (#2929) and the hit-rate line markers — one definition so both charts paint the
+    // same bucket membership the economics card aggregates.
+    const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
+    const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
+    // #2929/#3484: per-sample causes follow the LEDGER's authoritative attribution
+    // (foldSeq / seam / prov), not a parallel heuristic — the charts paint the same
+    // bucket membership the economics card aggregates. The gap heuristic remains only
+    // as the legacy fallback for old ledgers whose lines carry no attribution fields.
+    // The fold cold-tail window mirrors the ledger's own: a fold owns the first sample
+    // after it AND the cold continuation (hit < 85%) up to 4 samples, closing on the
+    // first warm line. Ledger lines carry foldSeq directly; the fold-between-times
+    // heuristic stays as the opener and for pre-#2929 ledgers without foldSeq. The
+    // tail counter arms ONLY on that opener path: foldSeq-stamped lines are the
+    // ledger's own attribution and must not re-arm, or the chart keeps coloring comp
+    // up to 4 lines past the ledger retiring the window.
+    function classifyLineCauses(lines, folds) {
         const GAP_MS = 600_000;
-        // #2929: per-sample causes follow the LEDGER's authoritative attribution
-        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
-        // the same bucket membership the economics card aggregates. The gap
-        // heuristic remains only as the legacy fallback for old ledgers whose
-        // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
-        const causes = lines.map((l, i) => {
+        return lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
@@ -973,6 +946,102 @@ export const WEB_CLIENT = `(function () {
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
+    }
+    // #2489/#3484: vertical event marks shared by both detail charts. Folds stay
+    // dashed red, seams solid red (#1609 visual language); burst-folds share
+    // (near-)identical timestamps and thus the same pixel — merge them into one
+    // marker per pixel-bucket so stacked marks don't ghost into doubled lines.
+    function foldMarkLines(folds, lines, x, PT, ih) {
+        let foldMarks = "";
+        const foldBuckets = [];
+        (folds || []).forEach((f) => {
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
+            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
+        });
+        foldBuckets.forEach((bk) => {
+            const n = bk.items.length;
+            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
+            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
+                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + fmtDT(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
+        });
+        return foldMarks;
+    }
+    // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
+    // the divergence time — folds stay dashed, so both read in the same visual language.
+    function seamMarkLines(seamEvents, lines, x, PT, ih) {
+        let seamMarks = "";
+        (seamEvents || []).forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
+            const lcp = fmtB(ev.lcpBytes || 0);
+            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
+            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
+            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
+            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
+                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: fmtDT(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
+        });
+        return seamMarks;
+    }
+    // #2929/#3484: pixel-driven seq ticks shared by both detail charts — every band must map
+    // to a visible index, not "somewhere between 5 and 10". Thinning is PIXEL-driven, not
+    // count-driven: real sessions carry hundreds/thousands of samples (~0.4px/sample), where
+    // any flat count step either mosaics the axis or drops to two naked numbers. Vertical
+    // (rotated) ticks reclaim the unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+    // NO Math.max(barW,1) floor — that clamps sub-pixel bars UP to 1 and silently disables
+    // thinning exactly on the dense sessions this exists for.
+    function seqTickLines(lines, x, W, H, PL, PR) {
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
+        const xtTime =
+            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[0].at) + "</text>" : "")
+            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
+        return xt + xtTime;
+    }
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        let maxY = 0;
+        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
+        if (win && win > maxY) maxY = win * 1.05;
+        if (maxY <= 0) maxY = 1;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
+        const dt = (ms) => fmtDT(ms);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = (maxY / 4) * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
+        }
+        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
+        let stroke = "";
+        lines.forEach((l, i) => {
+            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
+            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
+        });
+        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
+        // Cache-gap causes: color each sample's un-cached band (input − cached)
+        // by its most likely cause so gaps on the chart explain themselves.
+        // Classification lives in classifyLineCauses (#2929/#3484) — shared with
+        // the hit-rate line markers so both charts name the same buckets.
+        const causes = classifyLineCauses(lines, folds);
         let bands = "", hovers = "";
         const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
         lines.forEach((l, i) => {
@@ -992,41 +1061,8 @@ export const WEB_CLIENT = `(function () {
                 + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitPctLine
                 + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
         });
-        let foldMarks = "";
-        // Burst-folds share (near-)identical timestamps and thus the same pixel — merge them
-        // into one marker per pixel-bucket so stacked marks don't ghost into doubled lines.
-        const foldBuckets = [];
-        (folds || []).forEach((f) => {
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
-            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
-        });
-        foldBuckets.forEach((bk) => {
-            const n = bk.items.length;
-            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
-            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
-                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + dt(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
-        });
-        // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
-        // the divergence time — folds stay dashed, so both read in the same visual language.
-        let seamMarks = "";
-        (seamEvents || []).forEach((ev) => {
-            if (!ev || !(ev.at > 0)) return;
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
-            const lcp = fmtB(ev.lcpBytes || 0);
-            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
-            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
-            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
-            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
-                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: dt(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
-        });
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -1048,32 +1084,69 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        // #2929: per-sample seq labels — every band must map to a visible
-        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
-        // not count-driven: real sessions carry hundreds/thousands of samples
-        // (~0.4px/sample), where any flat count step either mosaics the axis
-        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
-        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
-        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
-        // sub-pixel bars UP to 1 and silently disables thinning exactly on
-        // the dense sessions this exists for.
-        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
-        const tStep = Math.max(1, Math.ceil(24 / barW));
-        const xtArr = [];
-        for (let i = lines.length - 1; i >= 0; i -= tStep) {
-            const l = lines[i];
-            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
-        }
-        const xt = xtArr.join("");
-        const xtTime =
-            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
-            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
+            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + "</svg>";
+    }
+    // #3484: per-request cache hit-rate line — the trend view the numeric cards lack
+    // (overview/list/card show one aggregate; this shows which rounds dipped and how far).
+    // Y axis is fixed 0–100% so drops read at a glance; non-"new" samples get a cause dot
+    // from the exact ledger-backed classification the trajectory bands paint, and the
+    // hover column names the cause. Same geometry and brush-zoom contract as trajectorySvg.
+    function hitRateSvg(lines, folds, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (pct) => PT + ih - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+        const dt = (ms) => fmtDT(ms);
+        // Ledger lines carry hitPct; older ledgers compute it from input/cached.
+        // Zero-input samples have no defined rate — break the line there.
+        const hp = (l) => l.hitPct != null ? l.hitPct : ((l.input || 0) > 0 ? ((l.cached || 0) / l.input) * 100 : null);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = 25 * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + v + "%</text>";
+        }
+        const causes = classifyLineCauses(lines, folds);
+        let stroke = "", started = false;
+        lines.forEach((l, i) => {
+            const v = hp(l);
+            if (v == null) { started = false; return; }
+            stroke += (started ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1) + " ";
+            started = true;
+        });
+        let dots = "", hovers = "";
+        const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
+        lines.forEach((l, i) => {
+            const c = causes[i];
+            const v = hp(l);
+            const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
+            if (v != null && c !== "new") dots += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="2.5" fill="' + CAUSE_COLOR[c] + '"/>';
+            const hitTxt = v == null ? t("common.none") : v.toFixed(1) + "%";
+            hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
+                + (l.seq != null ? "#" + l.seq + " · " : "") + dt(l.at)
+                + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitTxt
+                + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
+        });
+        // Accent placeholder dot only when the sample carries no cause dot of its own —
+        // a 1-line cold session must keep its cold color, not an accent dot on top.
+        const singleDot = lines.length === 1 && hp(lines[0]) != null && causes[0] === "new"
+            ? '<circle cx="' + x(0).toFixed(1) + '" cy="' + y(hp(lines[0])).toFixed(1) + '" r="3" fill="var(--accent)"/>'
+            : "";
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
+            + (stroke.trim() ? '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>' : "")
+            + dots + singleDot + hovers + foldMarks + seamMarks + ticks + xt + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
@@ -1098,142 +1171,157 @@ export const WEB_CLIENT = `(function () {
     function detailSeamActive(seam) {
         return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
     }
-    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // #2489/#3484: zoom-to-selection over the detail charts. The data is already
     // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
     // server round-trip, and an un-zoomed view stays byte-identical to the full render.
-    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
-    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
-    let trajDrag = null;    // in-flight brush gesture
-    function trajVisible() {
-        if (!trajState) return null;
-        const L = trajState.lines;
-        let a = 0, b = L.length - 1;
-        if (trajRange) {
-            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
-            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
-        }
-        const lines = L.slice(a, b + 1);
-        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
-        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
-        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
-        // ZOOMED window, where a foreign mark would land on the wrong sample.
-        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
-        const t0 = lines[0] ? (lines[0].at || 0) : 0;
-        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
-        return {
-            lines,
-            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
-            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
-            offset: a,
-        };
-    }
-    function trajRender() {
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v) return;
-        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
-        trajUpdateStatus(v);
-    }
-    function trajUpdateStatus(v) {
-        const st = $("traj-status");
-        if (!st) return;
-        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
-        const L = trajState.lines;
-        const a = v.offset, b = v.offset + v.lines.length - 1;
-        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
-        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
-        const times = v.lines.map((l) => l.at).filter(Boolean);
-        st.hidden = false;
-        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
-            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
-        const rb = $("traj-reset");
-        if (rb) rb.addEventListener("click", () => trajSetRange(null));
-    }
-    function trajSetRange(r) {
-        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
-        trajRender();
-    }
-    function trajIdxFromX(x, n) {
+    // One gesture machinery serves both charts (context trajectory + cache hit rate):
+    // identical geometry and interaction; each instance supplies element ids, its
+    // state and its renderer.
+    function chartIdxFromX(x, n) {
         if (n <= 1) return 0;
         const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
         return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
     }
-    function trajLocalX(wrap, ev) {
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return null;
-        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
-        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
+    function makeChartZoom(cfg) {
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        const z = { range: null, drag: null, state: null, cfg };
+        z.visible = function visible() {
+            if (!z.state) return null;
+            const L = z.state.lines;
+            let a = 0, b = L.length - 1;
+            if (z.range) {
+                a = Math.max(0, Math.min(L.length - 1, z.range[0]));
+                b = Math.max(a, Math.min(L.length - 1, z.range[1]));
+            }
+            const lines = L.slice(a, b + 1);
+            // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+            // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+            // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+            // ZOOMED window, where a foreign mark would land on the wrong sample.
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            const t0 = lines[0] ? (lines[0].at || 0) : 0;
+            const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+            return {
+                lines,
+                folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+                seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                offset: a,
+            };
+        };
+        function updateStatus(v) {
+            const st = $(cfg.statusId);
+            if (!st) return;
+            if (!z.range || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+            const L = z.state.lines;
+            const a = v.offset, b = v.offset + v.lines.length - 1;
+            const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+            const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+            const times = v.lines.map((l) => l.at).filter(Boolean);
+            st.hidden = false;
+            st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+                + '<button id="' + cfg.resetId + '" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+            const rb = $(cfg.resetId);
+            if (rb) rb.addEventListener("click", () => z.setRange(null));
+        }
+        z.render = function render() {
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v) return;
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            updateStatus(v);
+        };
+        z.setRange = function setRange(r) {
+            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            z.render();
+        };
+        function localX(wrap, ev) {
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return null;
+            const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+            return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+        }
+        function overlayShow(wrap, xa, xb) {
+            if (!z.drag || !z.drag.overlay) return;
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return;
+            const o = z.drag.overlay;
+            o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+            o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+        }
+        function onDown(ev) {
+            if (!z.state || ev.button !== 0) return;
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+            ev.preventDefault();
+            const x0 = localX(wrap, ev);
+            if (x0 == null) return;
+            const o = document.createElement("div");
+            o.className = "chart-brush";
+            wrap.appendChild(o);
+            z.drag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+            overlayShow(wrap, x0, x0);
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        }
+        function onMove(ev) {
+            if (!z.drag) return;
+            const x = localX($(cfg.elId), ev);
+            if (x == null) return;
+            z.drag.cur = x;
+            overlayShow($(cfg.elId), z.drag.x0, x);
+        }
+        function onUp(ev) {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            if (!z.drag) return;
+            const d0 = z.drag;
+            z.drag = null;
+            if (d0.overlay) d0.overlay.remove();
+            const x1 = localX($(cfg.elId), ev);
+            if (x1 == null) return;
+            const i0 = chartIdxFromX(Math.min(d0.x0, x1), d0.n);
+            const i1 = chartIdxFromX(Math.max(d0.x0, x1), d0.n);
+            if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+            if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+            z.setRange([d0.offset + i0, d0.offset + i1]);
+        }
+        z.bind = function bind(state) {
+            z.state = state && state.lines.length ? state : null;
+            z.range = null;
+            const wrap = $(cfg.elId);
+            if (!wrap || !z.state) { z.render(); return; }
+            wrap.addEventListener("mousedown", onDown);
+            wrap.addEventListener("dblclick", () => z.setRange(null));
+            z.render();
+        };
+        chartZooms.push(z);
+        return z;
     }
-    function trajOverlayShow(wrap, xa, xb) {
-        if (!trajDrag || !trajDrag.overlay) return;
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return;
-        const o = trajDrag.overlay;
-        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
-        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
-    }
-    function trajOnDown(ev) {
-        if (!trajState || ev.button !== 0) return;
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
-        ev.preventDefault();
-        const x0 = trajLocalX(wrap, ev);
-        if (x0 == null) return;
-        const o = document.createElement("div");
-        o.className = "chart-brush";
-        wrap.appendChild(o);
-        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
-        trajOverlayShow(wrap, x0, x0);
-        document.addEventListener("mousemove", trajOnMove);
-        document.addEventListener("mouseup", trajOnUp);
-    }
-    function trajOnMove(ev) {
-        if (!trajDrag) return;
-        const x = trajLocalX($("traj-chart"), ev);
-        if (x == null) return;
-        trajDrag.cur = x;
-        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
-    }
-    function trajOnUp(ev) {
-        document.removeEventListener("mousemove", trajOnMove);
-        document.removeEventListener("mouseup", trajOnUp);
-        if (!trajDrag) return;
-        const d0 = trajDrag;
-        trajDrag = null;
-        if (d0.overlay) d0.overlay.remove();
-        const x1 = trajLocalX($("traj-chart"), ev);
-        if (x1 == null) return;
-        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
-        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
-        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
-        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
-        trajSetRange([d0.offset + i0, d0.offset + i1]);
-    }
+    const trajAux = { win: 0, baseIn: 0 };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
-        trajState = null;
-        trajRange = null;
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return;
         const seam = detailSeam(ledger);
-        trajState = {
-            lines,
-            folds: ledger.folds || [],
-            seams: detailSeamActive(seam) && seam ? seam.events : [],
-            win: d.contextWindow || 0,
-            baseIn: d.systemPromptTokens || 0,
-        };
-        const wrap = $("traj-chart");
-        if (!wrap) return;
-        wrap.addEventListener("mousedown", trajOnDown);
-        wrap.addEventListener("dblclick", () => trajSetRange(null));
-        trajRender();
+        trajAux.win = d.contextWindow || 0;
+        trajAux.baseIn = d.systemPromptTokens || 0;
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+    }
+    function bindHitRateChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const seam = detailSeam(ledger);
+        hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
     window.bili_trajSvg = trajectorySvg;
-    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
+    window.bili_hitSvg = hitRateSvg;
+    window.bili_causes = classifyLineCauses;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1492,7 +1580,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
             parts.push('<div class="chart-status" id="traj-status" hidden></div>');
-            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // #2489: the wrap starts empty — bindTrajectoryBrush() fills it on bind,
             // so every chart state (full and zoomed) comes from the single render path.
             parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
@@ -1523,6 +1611,29 @@ export const WEB_CLIENT = `(function () {
                 parts.push(legendItem("background:#9aa1a8", t("det.cause_ttl")));
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
+            parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
+            if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
+        }
+        parts.push("</div></div>");
+        // #3484: hit-rate trend — same data as the trajectory chart above, plotted as
+        // per-request hit % so dips (and their causes) read at a glance.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.hitrate") + '</span><span class="hint">' + t("det.hitrate_sub") + '</span></div><div class="card-b">');
+        if (!lines.length) {
+            parts.push('<div class="chart-empty">' + t("det.hitrate_empty") + "</div>");
+        } else {
+            parts.push('<div class="chart-status" id="hit-status" hidden></div>');
+            parts.push('<div class="chart-wrap" id="hit-chart"></div>');
+            const hrCauses = classifyLineCauses(lines, ledger.folds || []);
+            const present = {};
+            hrCauses.forEach((c) => { if (c !== "new") present[c] = true; });
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:var(--accent)", t("det.legend_hitline")));
+            ["comp", "cold", "seam", "pt", "ps", "rw", "ci", "rest"].forEach((c) => {
+                if (present[c]) parts.push(legendItem("background:" + CAUSE_COLOR[c], t(CAUSE_KEY[c])));
+            });
+            if ((ledger.folds || []).length > 0) parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
+            if (seamActive && seam.events.length > 0) parts.push(legendItem("#cf222e", t("det.legend_seam")));
             parts.push("</div>");
             parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
@@ -1729,6 +1840,7 @@ export const WEB_CLIENT = `(function () {
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
+            bindHitRateChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -2704,7 +2816,7 @@ export const WEB_CLIENT = `(function () {
     }
     window.addEventListener("hashchange", route);
     // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
-    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") chartZooms.forEach((z) => { if (z.range) z.setRange(null); }); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");
