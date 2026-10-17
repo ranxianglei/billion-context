@@ -791,6 +791,49 @@ export class UnifiedStore {
         return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
     }
 
+    /** #3301: message rows for the given ids — EVERY seq row matching an id
+     *  (edits append; callers keep the latest per id) plus, when
+     *  includeNeighbors, the seq±1 rows so split-form rc pairs stay adjacent
+     *  for turn-key derivation. Content bytes resolved via CAS; rows whose
+     *  blob is gone are skipped. Read-only. */
+    messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
+        if (msgIds.length === 0) return [];
+        const CHUNK = 500;
+        const rows = new Map<number, { seq: number; msgId: string; contentHash: string }>();
+        const neighborSeqs = new Set<number>();
+        for (let i = 0; i < msgIds.length; i += CHUNK) {
+            const chunk = msgIds.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ? AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as { seq: number; msg_id: string; content_hash: string }[]) {
+                if (!rows.has(r.seq)) rows.set(r.seq, { seq: r.seq, msgId: r.msg_id, contentHash: r.content_hash });
+                if (includeNeighbors) {
+                    neighborSeqs.add(r.seq - 1);
+                    neighborSeqs.add(r.seq + 1);
+                }
+            }
+        }
+        if (neighborSeqs.size > 0) {
+            const seqs = [...neighborSeqs];
+            for (let i = 0; i < seqs.length; i += CHUNK) {
+                const chunk = seqs.slice(i, i + CHUNK);
+                const ph = chunk.map(() => "?").join(",");
+                for (const r of this.db
+                    .prepare(`SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ? AND seq IN (${ph})`)
+                    .all(sessionId, ...chunk) as { seq: number; msg_id: string; content_hash: string }[]) {
+                    if (!rows.has(r.seq)) rows.set(r.seq, { seq: r.seq, msgId: r.msg_id, contentHash: r.content_hash });
+                }
+            }
+        }
+        const out: { seq: number; msgId: string; content: string }[] = [];
+        for (const r of [...rows.values()].sort((a, b) => a.seq - b.seq)) {
+            const content = this.getContent(r.contentHash);
+            if (content !== null) out.push({ seq: r.seq, msgId: r.msgId, content });
+        }
+        return out;
+    }
+
     /** Deletes one session and releases every CAS refcount it holds
      *  (GC parity with the legacy path's file removal). Rows that other
      *  sessions also reference survive via their own refcounts. Checkpoints

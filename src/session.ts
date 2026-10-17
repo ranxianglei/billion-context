@@ -514,6 +514,11 @@ export type Session = {
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: original message decompositions supplied by an external state
+     *  converter (e.g. opencode-acp migration) at import time. Transient
+     *  import payload: consumed once by the unified ingest (rows land in the
+     *  index for fold re-anchor backfill) and never written back to records. */
+    decompositionLog?: CoreMessage[];
     /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
      *  bumped by markDirty after every mutation. Keys the fork-revision cache
      *  below so status polling skips re-hashing the whole history (#2017). */

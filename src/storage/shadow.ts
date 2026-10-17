@@ -346,6 +346,13 @@ export class UnifiedShadow {
         return tip;
     }
 
+    /** #3301: message rows for specific ids (+ seq±1 neighbors) — stored
+     *  decompositions for fold-anchor backfill after a wire-shape flip. */
+    messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
+        this.assertLive();
+        return this.store.messagesForIds(sessionId, msgIds, includeNeighbors);
+    }
+
     /** All sessions row ids present in the index (#2960 R2.1). Used by the
      *  full-mode boot union so rows whose legacy file disappeared remain
      *  enumerable. */

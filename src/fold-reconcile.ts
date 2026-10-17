@@ -139,7 +139,7 @@ import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js"
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
-const METADATA_ANCHORS = "foldAnchors";
+export const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
 /** #2480: positional identity copy — canonical fingerprint per message,
  *  aligned 1:1 with foldAnchorOrder (same rolling window, same cap, written
@@ -1262,6 +1262,13 @@ export interface ReconcileOptions {
      *  cleans the resend — benign churn that must not feed the #2193 destroy
      *  streak. #2815/#2789. */
     markerStripped?: number;
+    /** #3301: stored message decompositions for anchors that predate turn-key
+     *  backfill (pre-#2644) — after a wire-shape flip the wire-side backfill
+     *  can never fire (the old id is gone from the wire), so eligible anchors
+     *  are rebuilt from these rows BEFORE the reconciliation plan runs and the
+     *  flip pass itself claims. Latest-seq-per-id, neighbors included;
+     *  undefined = no source available (legacy-only mode). */
+    storedMessages?: CoreMessage[];
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1294,7 +1301,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
 
-    const anchors: Record<string, FoldAnchor> =
+    let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
     const oldOrder: string[] = (session.metadata[METADATA_ORDER] as string[] | undefined) ?? [];
     // #2480: self-contained positional copy {ids, canon} (#2487's storage
@@ -1310,6 +1317,35 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         positions = { ids: storedRaw.ids as string[], canon: storedRaw.canon as string[] };
     }
 
+    const byId = new Map<string, CoreMessage>();
+    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    // #3301: a wire-shape flip puts legacy (pre-#2644, no p/x) ids off the wire
+    // on the FIRST post-flip pass — and this same pass rolls the order backbone
+    // forward without them, so any backfill landing later can never claim (the
+    // claim passes only iterate ids still in the backbone). Rebuild eligible
+    // anchors from the stored decomposition BEFORE the plan runs so the flip
+    // pass itself can claim. Wire bytes always win: an id present on this pass
+    // keeps its live-bytes path untouched.
+    if (opts.storedMessages !== undefined && opts.storedMessages.length > 0) {
+        const sById = new Map<string, CoreMessage>();
+        for (const m of opts.storedMessages) if (m.id !== undefined) sById.set(m.id, m);
+        const sCtx = turnContexts(opts.storedMessages);
+        let changed = false;
+        const upgraded: Record<string, FoldAnchor> = {};
+        for (const [id, a] of Object.entries(anchors)) {
+            if (a.p === undefined && a.r === "assistant" && a.t === undefined && !byId.has(id)) {
+                const sm = sById.get(id);
+                if (sm !== undefined) {
+                    upgraded[id] = anchorFrom(sm, sCtx.get(id));
+                    changed = true;
+                    continue;
+                }
+            }
+            upgraded[id] = a;
+        }
+        if (changed) anchors = upgraded;
+    }
+
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
@@ -1321,8 +1357,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // freshly claimed ones — the next churn must re-anchor from post-churn
     // bytes), prune anchors for ids no longer covered, and roll the order
     // backbone forward to this pass.
-    const byId = new Map<string, CoreMessage>();
-    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
     // #2636: turn keys for freshly seeded anchors — built lazily so
     // steady-state passes (no churn) never pay the per-core normalization
     // (#2334). Only bare assistant cores can carry a turn key

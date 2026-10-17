@@ -200,6 +200,9 @@ interface PersistedSession {
      *  history and must still be pruned at export time. */
     messagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: external-converter import payload (see Session.decompositionLog) —
+     *  accepted on read; buildRecord deliberately does not emit it. */
+    decompositionLog?: CoreMessage[];
     forkContentStore?: MessageContentStore;
 }
 
@@ -1216,6 +1219,20 @@ export class SessionStore {
         }
     }
 
+    /** #3301: stored message decompositions (+ seq±1 neighbors) for
+     *  fold-anchor backfill after a wire-shape flip (consumed by
+     *  fold-decomposition-lookup → reconcileFoldCoverage.storedMessages).
+     *  Full mode only (same gate as the other unified reads); null when
+     *  unavailable — callers fall back to wire-side backfill. Never throws. */
+    unifiedMessageRows(sessionId: string, msgIds: readonly string[]): { seq: number; msgId: string; content: string }[] | null {
+        if (!this.shadow?.readsUnified || msgIds.length === 0) return null;
+        try {
+            return this.shadow.messagesForIds(sessionId, msgIds, true);
+        } catch {
+            return null;
+        }
+    }
+
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
@@ -1631,6 +1648,14 @@ export class SessionStore {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
+                // #3301: external-converter import payload rides exactly ONE
+                // save into the unified index (first-open imports take the
+                // importRecord path), then is consumed so steady saves keep
+                // the delta fast path (#3133) instead of paying full
+                // re-ingests forever. buildRecord omits it, so the disk file
+                // never carries it.
+                const payload = session.decompositionLog;
+                if (payload !== undefined) session.decompositionLog = undefined;
                 // #2960 ⑤: the table holds the RAW tail (full fidelity); the
                 // envelope keeps its bounded folded view for legacy readers.
                 // ②a caveat: once foldResidentTail has folded the resident
@@ -1644,9 +1669,10 @@ export class SessionStore {
                 // folded saves present the envelope render (no override),
                 // which the delta path already routes to the full ingest.
                 const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
-                this.shadow?.record(record, tail && tail.length > 0
-                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                    : undefined, session.contentStore ?? undefined);
+                this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
+                    tail && tail.length > 0
+                        ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                        : undefined, session.contentStore ?? undefined);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -1711,6 +1737,7 @@ export class SessionStore {
         session.lastMessages = fresh.lastMessages ?? session.lastMessages;
         session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
         session.pluginSnapshot = fresh.pluginSnapshot;
+        session.decompositionLog = fresh.decompositionLog ?? session.decompositionLog;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
         if (!session.meta.upstreamOrigin && fresh.meta.upstreamOrigin) session.meta.upstreamOrigin = fresh.meta.upstreamOrigin;
@@ -2129,6 +2156,7 @@ function buildSession(parsed: PersistedSession): Session {
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
         pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
+        decompositionLog: Array.isArray(parsed.decompositionLog) ? parsed.decompositionLog : undefined,
         contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,
