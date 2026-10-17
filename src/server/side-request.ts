@@ -115,6 +115,29 @@ export function isDshTitleRequest(parsed: unknown): boolean {
     return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
+// #3168: pi-claude-bridge routes Pi's /compact through a one-off Claude Code
+// process (persistSession:false, tools:[], systemPrompt REPLACED by Pi's fixed
+// SUMMARIZATION_SYSTEM_PROMPT — earendil-works/pi packages/coding-agent/src/
+// core/compaction/utils.ts; forks such as prime-agent share the opening clause).
+// It stamps no persona header and its output budget is host-sized, so every
+// structural #388 check misses it and it rides the full pipeline: tags + ACP
+// tool injection (~2x body) and the model calls compress instead of writing
+// the summary, which the bridge then saves as Pi's compaction summary. Match
+// on the stable opening clause of the summarizer prompt in any SYSTEM CARRIER
+// (top-level `system` string/text-block array on the anthropic wire plus the
+// other wires' carriers via systemCarrierTexts — the same pattern
+// isDshTitleRequest moved to in #3149), with the same no-tools veto as
+// isSideRequest. Tracked per pi release like DSH_TITLE_SYSTEM_PREFIX (#2503):
+// a reworded prompt silently returns to the pre-fix behavior (documented
+// drift mode).
+export const PI_SUMMARIZER_SYSTEM_PREFIX = "You are a context summarization assistant";
+export function isPiSummarizerRequest(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    return systemCarrierTexts(p).some((t) => t.startsWith(PI_SUMMARIZER_SYSTEM_PREFIX));
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the

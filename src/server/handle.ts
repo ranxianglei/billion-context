@@ -52,7 +52,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isPiSummarizerRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -1897,8 +1897,15 @@ async function handleRequest(
         // dsh 0.2.1-alpha.2 (preset maxOutputTokens 64 -> 4096); recognize it by
         // system text so it keeps the raw key instead of forking onto a persisted
         // |sub: ghost (#2241 scenario A). Explicit main intent still vetoes.
+        // #3168: pi-claude-bridge's /compact summarizer is the same class — a
+        // header-less one-shot utility call recognized by its fixed system
+        // prompt. No plugin-header gate exists for this traffic (proxy-mode
+        // bridge calls stamp none), so the body shape IS the evidence; the
+        // no-tools veto bounds false positives to tool-less clients whose
+        // system carrier literally opens with that sentence.
         const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
+        const piSummarizerSidecar = requestAgent !== "main" && isPiSummarizerRequest(parsed);
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || piSummarizerSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request 409
         // discipline above has already accepted this request (inherited prefix
@@ -1922,7 +1929,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : piSummarizerSidecar ? "pi /compact summarizer sidecar (#3168)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
