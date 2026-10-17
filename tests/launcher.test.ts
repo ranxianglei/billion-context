@@ -84,6 +84,8 @@ import {
     ensureProxyRunning,
     resolveNodeRuntime,
     probeNodeWrapperTarget,
+    probeNodeMajor,
+    MIN_PROXY_NODE_MAJOR,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
@@ -4421,7 +4423,7 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
     );
     // an override pointing at a missing file is ignored — the PATH search still runs
     assert.equal(
-        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node"),
+        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node", undefined, undefined, () => 20),
         "/usr/local/bin/node",
     );
 });
@@ -4429,13 +4431,13 @@ test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override w
 test("resolveNodeRuntime: PATH search finds node for non-Node hosts (posix + win32 shapes)", () => {
     const posixExists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists),
+        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists, undefined, undefined, () => 20),
         "/opt/host/bin/node",
     );
     // forward-slash fake paths keep the join platform-independent on any CI host
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists, undefined, undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4456,6 +4458,8 @@ test("resolveNodeRuntime: GUI/Electron host finds node in a well-known dir its P
             "linux",
             exists,
             "33.0.0",
+            undefined,
+            () => 20,
         ),
         "/usr/local/bin/node",
     );
@@ -4477,7 +4481,7 @@ test("resolveNodeRuntime: Electron host with no Node anywhere falls back to its 
 test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429)", () => {
     const exists = (p: string): boolean => p === "/opt/host/bin/node";
     assert.equal(
-        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0"),
+        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0", undefined, () => 20),
         "/opt/host/bin/node",
     );
 });
@@ -4485,7 +4489,7 @@ test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429
 test("resolveNodeRuntime: win32 GUI host finds node in Program Files not on PATH (#1429)", () => {
     const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
     assert.equal(
-        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0"),
+        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0", undefined, () => 20),
         "C:/Program Files/nodejs/node.exe",
     );
 });
@@ -4504,7 +4508,7 @@ test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves 
     const probe = (c: string): string | undefined => { probed.push(c); return real; };
     const exists = (p: string): boolean => p === shim || p === real;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         real,
     );
     // the discovered candidate is consulted exactly once, on the wrapper itself
@@ -4516,7 +4520,7 @@ test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unc
     const probe = (): string | undefined => undefined;
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4526,7 +4530,7 @@ test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back
     const probe = (): string | undefined => "C:/gone/node.exe";
     const exists = (p: string): boolean => p === shim;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe, () => 20),
         shim,
     );
 });
@@ -4536,7 +4540,7 @@ test("resolveNodeRuntime: win32 real node whose probe reports itself is left unc
     const probe = (c: string): string | undefined => c;
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe, () => 20),
         node,
     );
 });
@@ -4547,7 +4551,7 @@ test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () =>
     const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
     const exists = (p: string): boolean => p === node;
     assert.equal(
-        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe, () => 20),
         node,
     );
     assert.equal(calls, 0);
@@ -4573,6 +4577,87 @@ test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored v
         override,
     );
     assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a PATH candidate that cannot prove it is Node is skipped, not accepted (#3383)", () => {
+    // Microsoft HPC Pack's cluster CLI: named node.exe, ignores -p/--version,
+    // prints help text and exits 0. Pre-fix it was accepted verbatim and
+    // crash-looped every spawn forever; now the scan must reject it.
+    const fake = "C:/Program Files/Microsoft HPC Pack 2019/Bin/node.exe";
+    const env = { PATH: "C:/Program Files/Microsoft HPC Pack 2019/Bin" };
+    const helpText = "Node Commands\n\nSyntax:\n    node {operator} [options] [arguments]\n";
+    const probeWrapperStub = (): string | undefined => helpText;
+    const probeNodeStub = (): number | undefined => undefined;
+    const exists = (p: string): boolean => p === fake;
+    // Electron host: the fake is skipped, nothing else exists → host-binary fallback
+    assert.equal(
+        resolveNodeRuntime(
+            "E:/DSH Desktop/DSH Desktop.exe",
+            env,
+            "win32",
+            exists,
+            "33.0.0",
+            probeWrapperStub,
+            probeNodeStub,
+        ),
+        "E:/DSH Desktop/DSH Desktop.exe",
+    );
+    // non-Electron host: nothing usable resolves → actionable throw, not a doomed spawn
+    assert.throws(
+        () => resolveNodeRuntime("C:/opencode/opencode.exe", env, "win32", exists, undefined, probeWrapperStub, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: scanning continues past a rejected candidate to a good Node later (#3383)", () => {
+    const fake = "C:/hpc/Bin/node.exe";
+    const real = "C:/Program Files/nodejs/node.exe";
+    const probeNodeStub = (c: string): number | undefined => (c === real ? 22 : undefined);
+    const exists = (p: string): boolean => p === fake || p === real;
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/opencode/opencode.exe",
+            { PATH: "C:/hpc/Bin" },
+            "win32",
+            exists,
+            "33.0.0",
+            () => undefined,
+            probeNodeStub,
+        ),
+        real,
+    );
+});
+
+test("resolveNodeRuntime: a valid Node below the engines floor is rejected (#3383)", () => {
+    const old = "/opt/host/bin/node";
+    const probeNodeStub = (): number | undefined => 18;
+    const exists = (p: string): boolean => p === old;
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/opt/host/bin" }, "linux", exists, undefined, undefined, probeNodeStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: a wrapper answer that is not a node-shaped path is ignored, candidate validated itself (#3383)", () => {
+    const shim = "C:/shims/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    const probeNodeStub = (c: string): number | undefined => (c === shim ? 20 : undefined);
+    // relative fragment → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "relative/helper.exe", probeNodeStub),
+        shim,
+    );
+    // absolute path but wrong basename → invalid answer, hop ignored
+    assert.equal(
+        resolveNodeRuntime("C:/app/app.exe", { PATH: "C:/shims" }, "win32", exists, "33.0.0", () => "C:/tools/helper.exe", probeNodeStub),
+        shim,
+    );
+});
+
+test("probeNodeMajor: the running Node reports its major version, missing executable yields undefined (#3383)", () => {
+    const major = probeNodeMajor(process.execPath, { ...process.env });
+    assert.ok(major !== undefined && major >= MIN_PROXY_NODE_MAJOR, `expected a major version >= ${MIN_PROXY_NODE_MAJOR}, got ${major}`);
+    assert.equal(probeNodeMajor("/definitely/not/a/node", { ...process.env }), undefined);
 });
 
 test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
