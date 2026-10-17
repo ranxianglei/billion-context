@@ -397,11 +397,14 @@ function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | unde
 /** #2924 direction 1: protocol-shaped local refusal — 422 per the #2709
  *  precedent (not 401/403 credential-class, not 408/429/5xx transient-class),
  *  so hosts and SDKs treat it as a policy refusal of this ONE request and
- *  surface it instead of retrying or disabling a credential. */
+ *  surface it instead of retrying or disabling a credential. Reachable only via
+ *  the threw+oversized arm (the host's agent scope died mid-request): while it
+ *  stays dead, retrying the same call keeps failing, so the remedy is a host
+ *  restart (session state is persisted on disk), not another attempt (#3589). */
 function oversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: host attribution failed mid-request and the request body cannot fit the model's context window — sending it uncompressed would be rejected upstream (#2924). " +
-        "Retry the turn; if it persists, the session's local history has outgrown the window and needs compaction or a fresh session.";
+        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), so this body cannot be folded into the model's context window — forwarding it uncompressed would be rejected upstream (#2924). " +
+        "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
