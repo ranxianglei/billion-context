@@ -22,6 +22,62 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { flushAllSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
+
+/**
+ * #3325 lesson — the drive renders digests from `node_modules/acp-kernel/dist`
+ * (a BUILD PRODUCT, resolved via package exports) while bili side-by-side runs
+ * from live TS via tsx. A stale kernel dist silently changes persisted state
+ * (e.g. post-#3266 it still stamped metadata.effectiveConfig.imageCompression
+ * + state.stats.image* fields), so a locally regenerated golden bakes digests
+ * no fresh build can reproduce — CI then fails every leg that runs this file.
+ * Fail fast with the rebuild instruction instead of letting a stale workspace
+ * mint bad goldens.
+ */
+export function kernelDistStale(root: string): { stale: boolean; distAt?: number; srcAt?: number; newestSrc?: string } {
+    const distEntry = path.join(root, "node_modules", "acp-kernel", "dist", "index.js");
+    try {
+        const distAt = fs.statSync(distEntry).mtimeMs;
+        let srcAt = 0;
+        let newestSrc = "";
+        const walk = (dir: string) => {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) walk(p);
+                else if (/\.(ts|tsx|mjs)$/.test(e.name)) {
+                    const m = fs.statSync(p).mtimeMs;
+                    if (m > srcAt) { srcAt = m; newestSrc = p; }
+                }
+            }
+        };
+        walk(path.join(root, "kernel", "src"));
+        const tsup = path.join(root, "kernel", "tsup.config.ts");
+        if (fs.existsSync(tsup)) {
+            const m = fs.statSync(tsup).mtimeMs;
+            if (m > srcAt) { srcAt = m; newestSrc = tsup; }
+        }
+        return { stale: srcAt > distAt, distAt, srcAt, newestSrc };
+    } catch {
+        // dist absent or unreadable — tsx will surface the module-not-found; not our error.
+        return { stale: false };
+    }
+}
+const __goldenGuard = (() => {
+    // Call-time (not import-time): the guard's own unit test imports this
+    // module from a possibly-stale workspace; only actual drives must refuse.
+    let armed = false;
+    return () => {
+        if (armed) return;
+        armed = true;
+        const s = kernelDistStale(path.resolve(import.meta.dirname, ".."));
+        if (s.stale) {
+            throw new Error(
+                `golden drive: node_modules/acp-kernel/dist is older than kernel/src (${s.newestSrc}) — ` +
+                `a stale kernel dist produces digests no fresh build can reproduce (#3325). ` +
+                `Rebuild first: npm run build`,
+            );
+        }
+    };
+})();
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { configureLogger, closeLogger } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -407,6 +463,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
     storageUnified?: "shadow" | "full";
     reloadAfterEdit?: "keepFile" | "dropFile";
 } = {}): Promise<GoldenRecord> {
+    __goldenGuard();
     fs.mkdirSync(SCRATCH_ROOT, { recursive: true });
     const tmp = fs.mkdtempSync(path.join(SCRATCH_ROOT, `${wire}-`));
     const sessionsDir = path.join(tmp, "sessions");
