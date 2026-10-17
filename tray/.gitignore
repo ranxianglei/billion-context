@@ -1,0 +1,7 @@
+/target
+*.dmg
+*.deb
+*.rpm
+*.AppImage
+/nsis-out
+/test-tmp-*

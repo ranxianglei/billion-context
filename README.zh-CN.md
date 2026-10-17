@@ -145,6 +145,10 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
+## 桌面托盘(BiliTray)
+
+不想开浏览器标签页、想常驻桌面的实时状态?**BiliTray** 是独立的系统托盘指示器(macOS / Windows / Linux),轮询本机管理接口,在托盘悬停提示和菜单里显示实时会话数、上下文压力与缓存命中率。只通过 GitHub Releases 分发 —— 不进 npm 包、不进任何插件通道,安装体积与方式完全不变。文档:[tray/README.md](tray/README.md)。
+
 ## 快速上手
 
 3种方式 —— 任选其一:

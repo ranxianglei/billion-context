@@ -151,6 +151,10 @@ This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
 (pass the flag again on any future npm reinstall of `bili`) — that is the
 permanent fix; avoid `sudo`.
 
+## Desktop tray (BiliTray)
+
+Prefer always-on desktop stats over a browser tab? **BiliTray** is a standalone system-tray indicator (macOS / Windows / Linux) that polls the loopback admin API and shows live sessions, context pressure and cache hit rate in your tray tooltip and menu. It ships via GitHub Releases only — not part of the npm package or any plugin lane, so installs stay unchanged. Docs: [tray/README.md](tray/README.md).
+
 ## Quickstart
 
 Three ways to use it — pick one:

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["core", "app"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ranxianglei/billion-context"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

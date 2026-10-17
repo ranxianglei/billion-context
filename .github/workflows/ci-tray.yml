@@ -1,0 +1,140 @@
+name: Tray CI
+
+# #3217: standalone system-tray app under tray/ (Tauri 2, windowless). It ships
+# ONLY via GitHub Releases (tag namespace tray-v*, parallel to kernel-v*) —
+# never through npm (package.json "files" allowlist excludes it) and never
+# through the dsh/plugin lanes, so this workflow is its entire delivery chain.
+on:
+  # NOTE: no `paths` filter on push — a paths filter also gates TAG pushes
+  # (tag refs are excluded whenever only `branches` is listed), which would
+  # make the tray-v* release lane below unreachable. Tag pushes skip cheaply
+  # anyway: core-tests is skipped on tag refs, so master pushes only pay the
+  # ubuntu core job.
+  push:
+    branches: [master]
+    tags: ["tray-v*"]
+  pull_request:
+    paths:
+      - "tray/**"
+      - ".github/workflows/ci-tray.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # Pure-Rust core (bili-tray-core): compiles and tests anywhere with a Rust
+  # toolchain, no GUI system libs needed — so it gates every tray change on
+  # every platform-independent CI leg. The Tauri app crate itself can only be
+  # compiled where webkit/gtk exist (the release legs below).
+  core-tests:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tray
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p bili-tray-core --all-targets -- -D warnings
+      - run: cargo test -p bili-tray-core
+
+  # Per-platform installer builds, released together by the publish job.
+  # Tag format: tray-v0.1.0 (tray-v* keeps bili's bare v* tag namespace free).
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/tray-v') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundles: dmg
+            args: "--target universal-apple-darwin"
+            artifact: ""
+          - os: windows-latest
+            bundles: nsis
+            args: ""
+            artifact: ""
+          - os: ubuntu-latest
+            bundles: deb
+            args: ""
+            artifact: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # universal-apple-darwin is a Tauri-CLI magic value, NOT a rustup
+          # target — rust-std has no such component. rustup needs BOTH real
+          # targets installed; tauri lipo's them into the universal binary.
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libssl-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev pkg-config
+      - name: Install Tauri CLI
+        # the install.sh pipe dies on sh-is-dash (Linux) and on Windows/macOS
+        # sh flavors (bash-only syntax) — cargo install is portable everywhere
+        # the rust toolchain step already ran.
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Build installer
+        working-directory: tray/app
+        run: cargo tauri build --bundles ${{ matrix.bundles }} ${{ matrix.args }}
+      - name: Normalize artifact name
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#tray-v}"
+          OUT="$RUNNER_TEMP/assets"
+          mkdir -p "$OUT"
+          case "${{ matrix.bundles }}" in
+            dmg)
+              SRC=$(find target -path '*bundle/dmg/*.dmg' | head -n1)
+              cp "$SRC" "$OUT/BiliTray-$VER-macOS-universal.dmg" ;;
+            nsis)
+              SRC=$(find target -path '*bundle/nsis/*x64-setup.exe' | head -n1)
+              cp "$SRC" "$OUT/BiliTray-$VER-Windows-x64-setup.exe" ;;
+            deb)
+              SRC=$(find target -path '*bundle/deb/*.deb' | head -n1)
+              cp "$SRC" "$OUT/BiliTray-$VER-Linux-amd64.deb" ;;
+          esac
+          ls -la "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tray-assets-${{ matrix.os }}
+          path: ${{ runner.temp }}/assets
+
+  publish:
+    if: ${{ startsWith(github.ref, 'refs/tags/tray-v') }}
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tray-assets-*
+          path: dist
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#tray-v}"
+          ASSETS=$(find dist -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.deb' \))
+          test -n "$ASSETS"
+          NOTES="BiliTray v$VER — standalone system-tray indicator for billion-context (#3217)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $ASSETS --clobber
+          else
+            gh release create "$TAG" --title "BiliTray v$VER" --notes "$NOTES" $ASSETS
+          fi
