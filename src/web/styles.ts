@@ -363,6 +363,8 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .twide table.data { min-width: 940px; table-layout: fixed; }
 .hitc { font-size: 11px; letter-spacing: -0.2px; }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-cell { min-width: 0; }
+.w-client { display: inline-block; max-width: 100%; vertical-align: bottom; }
 .w-title { display: inline-block; max-width: 230px; vertical-align: bottom; }
 .w-up { display: inline-block; max-width: 128px; vertical-align: bottom; }
 .copy-btn.copied, .btn.copied { border-color: var(--green); color: var(--green); background: var(--green-soft); }

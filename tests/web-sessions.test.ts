@@ -602,6 +602,7 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
     const T0 = Date.parse("2026-09-28T09:00:00Z");
     const sw = makeSession("sw-1", { protocol: "openai" }, { requests: 4, inputTokens: 12000, cachedTokens: 2000, contextTokens: 9000 });
     sw.metadata = {
+        clientHint: "Codex Desktop/0.163.0-alpha.10.2 (Windows 10.0.26300; x86_64; unknown (Codex Desktop; 26.1013.31256))",
         lastModel: "model-b",
         cacheLedger: {
             v: 1, lastBlockId: null, consumedFoldSeq: 0, sampleSeq: 2, foldSeqCounter: 0, folds: [],
@@ -688,6 +689,10 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
         for (const r of rows) assert.equal((r.match(/<td/g) ?? []).length, 13, "row has exactly 13 cells");
         const swHtml = rows.find((r) => r.includes("sw-1"));
         assert.ok(swHtml, "switching session row rendered");
+        assert.ok(swHtml!.includes('class="client-cell"'), "客户端单元格保留限宽样式入口");
+        assert.match(swHtml!, /class="mono small clip w-client" title="Codex Desktop\/0\.163\.0-alpha\.10\.2 \(Windows 10\.0\.26300;/, "长客户端名称使用单行省略样式");
+        assert.ok(swHtml!.includes('title="' + sw.metadata.clientHint + '"'), "悬浮提示保留完整客户端名称");
+        assert.match(page, /\.w-client \{[^}]*max-width: 100%/, "客户端名称宽度不超出所在列");
         assert.match(swHtml!, /1 · 8\.0K/, "switch cell shows count · dropped tokens");
         assert.ok(swHtml!.includes('title="Mid-session model switches'), "switch cell carries the attribution tooltip");
         const plainHtml = rows.find((r) => r.includes("plain-1"));
