@@ -13,6 +13,12 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 **env var > config file > built-in default**, resolved in exactly one place
 (`src/knobs.ts`).
 
+> **Lifecycle vs. existence.** This file governs whether a knob MAY be an env var.
+> Whether an existing one is TEMPORARY (a cap / kill-switch / experiment with a
+> release condition) is tracked in [`LIFECYCLE.md`](../LIFECYCLE.md) (#3249) —
+> every `BILI_*` read in `src/` must be registered there; CI enforces it via
+> `scripts/lifecycle-ledger-guard.mjs`.
+
 ## Where a knob lives
 
 | Category | Home | Examples |
