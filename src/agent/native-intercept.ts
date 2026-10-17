@@ -138,7 +138,7 @@ export interface NativeInterceptState {
      *  request tunnels with the x-bili-resign markers and every egress body
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
-    resignCredentialFor?: (url: string, scheme: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    resignCredentialFor?: (url: string, scheme: string, inboundAk?: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
@@ -198,13 +198,9 @@ export function isModelApiUrl(url: string): boolean {
     }
 }
 
-/** Detect a body-covering signature from either init.headers or a
- *  Request-object input — the two forms a dispatch can arrive in — by
- *  normalizing to lowercased header names and delegating to the single
- *  shape-based detector shared with the proxy guard (#1884/#2090). Returns
- *  the scheme token (e.g. "sdk-hmac-sha256") or undefined for unsigned
- *  traffic. */
-export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+/** Normalize either init.headers or a Request-object input — the two forms a
+ *  dispatch can arrive in — into a lowercased-name header record. */
+function headerRecordOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
     let headers: Headers | undefined;
     if (init?.headers !== undefined) headers = new Headers(init.headers);
     else if (input !== null && typeof input === "object" && !(input instanceof URL)) {
@@ -217,7 +213,33 @@ export function bodySignedSchemeOf(input: string | URL | Request, init?: Request
     if (headers === undefined) return undefined;
     const record: Record<string, string> = {};
     for (const [name, value] of headers) record[name] = value;
-    return inboundSignedScheme(record);
+    return record;
+}
+
+/** Detect a body-covering signature from either init.headers or a
+ *  Request-object input — the two forms a dispatch can arrive in — by
+ *  normalizing to lowercased header names and delegating to the single
+ *  shape-based detector shared with the proxy guard (#1884/#2090). Returns
+ *  the scheme token (e.g. "sdk-hmac-sha256") or undefined for unsigned
+ *  traffic. */
+export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+    const record = headerRecordOf(input, init);
+    return record === undefined ? undefined : inboundSignedScheme(record);
+}
+
+/** The SDK-HMAC-SHA256 signing account is named in the inbound Authorization
+ *  (`SDK-HMAC-SHA256 Access=<ak>,…`). bili re-signs every egress body (#1884),
+ *  so it must sign with THE SAME account the request was issued under — not an
+ *  arbitrary pool account — or a multi-account pool collapses to one credential
+ *  and off-account models break upstream (#3106). Returns `<ak>` or undefined
+ *  when the header is absent or carries no `Access=` field. */
+export function inboundApigAccessKey(input: string | URL | Request, init?: RequestInit): string | undefined {
+    const record = headerRecordOf(input, init);
+    if (record === undefined) return undefined;
+    const auth = String(record["authorization"] ?? "").trim();
+    const match = /\bAccess=([^,\s]+)/.exec(auth);
+    const ak = match?.[1];
+    return ak !== undefined && ak.trim() !== "" ? ak.trim() : undefined;
 }
 
 /** True when the URL addresses bili's own control plane (`/__bili/*`,
@@ -835,7 +857,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 let cred: { ak: string; sk: string; token?: string } | undefined;
                 if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
                     try {
-                        cred = await state.resignCredentialFor(url, signedScheme);
+                        cred = await state.resignCredentialFor(url, signedScheme, inboundApigAccessKey(input, init));
                     } catch {
                         cred = undefined;
                     }

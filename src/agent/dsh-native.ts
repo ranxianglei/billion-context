@@ -1023,6 +1023,72 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     }
 }
 
+// #3106: which CodeArts pool credential to re-sign with. Honors the inbound
+// request's own signing account (inboundAk — its access_key_id from the
+// Authorization header) so a multi-account pool never collapses to whichever
+// account sorts first; falls back to first-resolvable-in-pool-order when no
+// account matches. Pure + deterministic (now/ttlMs injectable) for testing.
+const RESIGN_CACHE_MS = 10_000;
+type ApigCredLike = { ak: string; sk: string; token?: string };
+export async function pickCodeartsResignCred(opts: {
+    candidates: readonly { ref: string }[];
+    resolve: (ref: string) => Promise<{ value?: string } | undefined>;
+    inboundAk?: string;
+    cache: Map<string, { cred: ApigCredLike; at: number }>;
+    now?: number;
+    ttlMs?: number;
+}): Promise<ApigCredLike | undefined> {
+    const now = opts.now ?? Date.now();
+    const ttlMs = opts.ttlMs ?? RESIGN_CACHE_MS;
+    const parse = (value: unknown): ApigCredLike | undefined => {
+        if (typeof value !== "string" || value === "") return undefined;
+        const parsed = JSON.parse(value) as Record<string, unknown>;
+        const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
+        const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
+        if (ak === "" || sk === "") return undefined;
+        const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
+        return { ak, sk, token };
+    };
+    const cachedOf = (ak: string): ApigCredLike | undefined => {
+        const entry = opts.cache.get(ak);
+        return entry !== undefined && now - entry.at < ttlMs ? entry.cred : undefined;
+    };
+    // Fast path: the account the request itself was signed with.
+    if (opts.inboundAk !== undefined && opts.inboundAk !== "") {
+        const hit = cachedOf(opts.inboundAk);
+        if (hit !== undefined) return hit;
+        for (const { ref } of opts.candidates) {
+            let cred: ApigCredLike | undefined;
+            try {
+                cred = parse((await opts.resolve(ref))?.value);
+            } catch {
+                cred = undefined;
+            }
+            if (cred !== undefined && cred.ak === opts.inboundAk) {
+                opts.cache.set(cred.ak, { cred, at: now });
+                return cred;
+            }
+        }
+        // No pool account matches the inbound AK (removed mid-flight): fall
+        // through to first-valid below rather than refusing.
+    }
+    // Fallback (pre-#3106 semantics): first resolvable candidate in pool order.
+    for (const { ref } of opts.candidates) {
+        let cred: ApigCredLike | undefined;
+        try {
+            cred = parse((await opts.resolve(ref))?.value);
+        } catch {
+            cred = undefined;
+        }
+        if (cred === undefined) continue;
+        const hit = cachedOf(cred.ak);
+        if (hit !== undefined) return hit;
+        opts.cache.set(cred.ak, { cred, at: now });
+        return cred;
+    }
+    return undefined;
+}
+
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -1291,10 +1357,13 @@ export function apply(ctx: PluginContext): void {
 
     // #1884 re-sign arm: bind the host's credential service (dynamic inject —
     // a host without it keeps the #1886 direct fallback), then expose a
-    // resolver that walks the enabled CodeArts accounts in the host's
-    // account-pool state ($DSH_HOME/jet-hub/state.json) in pool order and
-    // returns the first resolvable credential — same first-usable semantics
-    // as the CodeArts plugin's own account selection. BILI_CODEARTS_REF
+    // resolver over the enabled CodeArts accounts in the host's account-pool
+    // state ($DSH_HOME/jet-hub/state.json). It signs with THE SAME account the
+    // inbound request was issued under (its access_key_id rides in the
+    // Authorization header, passed in as inboundAk); substituting another pool
+    // account would collapse a multi-account pool to one credential and break
+    // off-account models (#3106), so first-resolvable-in-pool-order is only the
+    // fallback when no account matches. BILI_CODEARTS_REF
     // pins a specific credential ref instead. The loopback markers carry
     // ak/sk/token to the proxy, which re-signs every egress body it produces
     // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
@@ -1338,30 +1407,17 @@ export function apply(ctx: PluginContext): void {
             return [];
         }
     };
-    let resignCache: { cred: { ak: string; sk: string; token?: string }; at: number } | undefined;
-    const RESIGN_CACHE_MS = 10_000;
-    state.resignCredentialFor = async () => {
+    // Cache keyed by access_key_id (not a single global slot) so distinct pool
+    // accounts stop clobbering each other within the TTL window (#3106).
+    let resignCache: Map<string, { cred: { ak: string; sk: string; token?: string }; at: number }> | undefined;
+    state.resignCredentialFor = async (_url, _scheme, inboundAk) => {
         if (credentialsService?.resolve === undefined) return undefined;
-        const now = Date.now();
-        if (resignCache !== undefined && now - resignCache.at < RESIGN_CACHE_MS) return resignCache.cred;
-        for (const { ref } of codeartsRefCandidates()) {
-            try {
-                const resolved = await credentialsService.resolve(ref);
-                const value = resolved?.value;
-                if (typeof value !== "string" || value === "") continue;
-                const parsed = JSON.parse(value) as Record<string, unknown>;
-                const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
-                const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
-                if (ak === "" || sk === "") continue;
-                const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
-                const cred = { ak, sk, token };
-                resignCache = { cred, at: now };
-                return cred;
-            } catch {
-                // unresolvable / malformed account: pool order says try the next
-            }
-        }
-        return undefined;
+        return pickCodeartsResignCred({
+            candidates: codeartsRefCandidates(),
+            resolve: credentialsService.resolve.bind(credentialsService),
+            inboundAk,
+            cache: (resignCache ??= new Map()),
+        });
     };
     const signedUrlSeen = new Set<string>();
     state.onSignedModelUrl = (rawUrl, scheme) => {
