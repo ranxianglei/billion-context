@@ -121,6 +121,10 @@ The suites below cover the full context lifecycle plus the hermetic billing/advi
 
 Rules: run the codex suite (at least the 4-phase core) before merging changes to the request pipeline (`src/server.ts`, `src/loop/**`, adapters, preflight/compact paths); run the registry suite before changing `src/update.ts`, `src/advisory.ts`, or `src/plugin-install.ts`. Exact env vars, phases, and the CI trigger file-list: [reference/testing.md](reference/testing.md).
 
+### Gate Test Discipline — Negative Assertions (#3617)
+
+Every gate (suppression / degradation / fallback / exemption) ships with **both directions** asserted: "triggers when it should" AND "does NOT trigger when it should not." A gate that lands with only the positive case is incomplete by definition — #3401 shipped that way and over-suppressed the dsh compress surface for two releases; #3600's PTC `run_code` shape had no row at all in the decision matrix, so the reachability gate closed the whole surface silently while CI stayed green. Row-driven truth tables (`tests/lane-decisions-matrix.test.ts`) take each new tool-shape/profile as a positive+negative row pair; the decision functions in `src/server/lane-decisions.ts` carry doc comments pointing at their matrix file so an added row is discoverable.
+
 ### Configuration Surface Discipline (owner-gated)
 
 The config surface — every field of `~/.config/billion-context/billion-context.json`, every `BILI_*` env var, every CLI flag, mirrored across CONFIGURATION.md en/zh — is **owner-design territory**. Hard rules:

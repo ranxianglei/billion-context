@@ -181,6 +181,10 @@ interface LaneDecisionInput {
 //     old `shouldInject` conjunct lives for every lane; the standalone
 //     copies in openai/google were redundant — compressSurfaceOn already
 //     implies injectTool).
+// Truth-table pinned across all four wires × lanes × tool shapes by
+// tests/lane-decisions-matrix.test.ts: adding or dropping a conjunct must
+// land WITH the matrix rows asserting BOTH directions (fires when it should,
+// stays silent when it should not — #3617 negative-assertion discipline).
 export interface NudgeGateInputs {
     /** opts.compress.injectNudge — the config-level master switch. */
     readonly injectNudge: boolean;
@@ -213,6 +217,9 @@ export function nudgeOn(i: NudgeGateInputs): boolean {
         && i.modelWantsIt;
 }
 
+/** Lane-decision resolver — truth-table pinned across all four wires × lanes
+ * × tool shapes by tests/lane-decisions-matrix.test.ts; a new tool shape or
+ * profile default lands there as a positive+negative row pair (#3617). */
 export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const profile = hostProfileFor(input.pluginAgent);
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
