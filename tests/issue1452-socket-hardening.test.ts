@@ -400,7 +400,20 @@ test("retired stall guard: mid-stream silence survives any short window even wit
             },
         );
         req.end(STREAM_BODY);
-        await new Promise((r) => setTimeout(r, 2000));
+        // Event-driven first-chunk wait (#3449): a loaded runner may deliver
+        // the first byte slowly without any product defect; the old fixed 2s
+        // wall-clock window turned that into a false windows-shard failure.
+        // A real pre-first-byte hang still fails at the deadline.
+        const firstChunkDeadline = Date.now() + 15_000;
+        while (seen.length === 0 && Date.now() < firstChunkDeadline) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        // Then observe >=2s of post-first-chunk silence — far past the
+        // retired 400ms window — before judging that nothing cut the stream.
+        const silenceEnd = Date.now() + 2000;
+        while (Date.now() < silenceEnd) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
         assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);
