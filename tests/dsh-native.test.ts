@@ -97,6 +97,13 @@ afterEach(() => { void _settleNativeForTest(); });
 // override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
+// #1365: a dev shell that runs DSH itself exports a live attach target; every
+// suite below must start from a clean slate or it silently binds to the real
+// proxy instead of the mock it set up. withEnv() only restores the keys it was
+// given, so the host values have to go here.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
+
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
@@ -2102,6 +2109,92 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         _setSpawnForTest(undefined);
         rmrf(home);
         rmrf(stateHome);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 explicit BILLION_CONTEXT_ATTACH remains the tool endpoint when the routed model origin denies the plugin manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365-explicit-attach-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined, BILI_ATTACH_HEALTH_DEADLINE_MS: "40" }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            const ctx = mockCtx();
+            apply(ctx);
+            assert.equal(await _stateRespawnForTest()?.(), attach.origin, "recovery must probe the explicit plugin endpoint, not the model-only origin");
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tool registration");
+            assert.equal(spawnCalls, 0, "a second proxy must not be spawned for an API-only model route");
+            assert.equal(modelManifestRequests, 0, "pre-existing model-route evidence must not override explicit attach");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        _setSpawnForTest(undefined);
+        rmrf(home);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("explicit attach keeps the DSH tool base when a late routed model origin denies the manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-explicit-attach-late-route-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tools before route observation");
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            await waitFor(() => modelManifestRequests === 1, "manifest liveness probe of late routed origin");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit-late" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit-late", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }

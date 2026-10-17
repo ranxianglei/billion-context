@@ -71,3 +71,15 @@ export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
 export function postBindCanLadder(hasLaunchToken: boolean, strictPort: boolean, upgradeReplacement: boolean): boolean {
     return hasLaunchToken && !strictPort && !upgradeReplacement;
 }
+
+/** Windows reports a bind collision with a listener held on ANOTHER address
+ *  family as WSAEACCES, not WSAEADDRINUSE: an IPv6 wildcard listener makes the
+ *  IPv4 bind of the same port fail with EACCES even though the port is well
+ *  above the privileged range. Left untreated, a launcher-spawned child dies
+ *  with the misleading "port N requires privileges. Use a port >= 1024" hint
+ *  instead of laddering off the squatted zone port (#1660). Privileged-port
+ *  EACCES (below 1024) stays a real permission error. */
+export function isPortBusyError(code: string | undefined, port: number, platform: NodeJS.Platform = process.platform): boolean {
+    if (code === "EADDRINUSE") return true;
+    return platform === "win32" && code === "EACCES" && port >= 1024;
+}

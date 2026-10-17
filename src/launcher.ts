@@ -3874,6 +3874,24 @@ export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return cleaned;
 }
 
+/** Launcher-owned spawn channels. Each one is re-derived from THIS launch's
+ *  own options and re-injected conditionally below, so an inherited copy must
+ *  be dropped first: a stale map from an outer process otherwise lands in the
+ *  child's instance record, and every later launch refuses to attach with
+ *  model-windows-mismatch (#2195). */
+const INHERITED_LAUNCHER_CHANNELS = [
+    "BILI_LAUNCHER_LANE",
+    "BILI_LAUNCHER_MODEL_WINDOWS",
+    "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
+    "BILI_STRICT_PORT",
+];
+
+function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INHERITED_LAUNCHER_CHANNELS) delete cleaned[key];
+    return cleaned;
+}
+
 /** #1012: capture the user's proxy vars BEFORE stripping, so the launcher can
  *  forward them to the proxy child under dedicated BILI_INHERITED_* names.
  *  The child itself runs with a clean env (e1c6c92: shell proxies must not
@@ -4207,7 +4225,7 @@ export async function ensureProxyRunning(
                     windowsHide: true,
                     stdio: ["ignore", logFd, logFd],
                     env: {
-                        ...stripInheritedProxy(process.env),
+                        ...stripInheritedLauncherChannels(stripInheritedProxy(process.env)),
                         ...captureInheritedProxyEnv(process.env),
                         // #1429: inside an Electron host the resolved runtime may be this
                         // same binary run as Node — force it so the child runs Node instead

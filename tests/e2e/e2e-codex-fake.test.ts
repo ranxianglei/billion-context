@@ -13,6 +13,10 @@ const MODEL = process.env.E2E_MODEL ?? "qwen3.8-27b";
 const TMO = Number(process.env.E2E_TMO ?? 120_000);
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream.mjs");
 const WORK_ROOT = path.join(process.cwd(), "tmp");
+const EXTERNAL_ATTACH = (process.env.E2E_CODEX_ATTACH_ORIGIN ?? "").trim();
+const UPSTREAM_HOST = (process.env.E2E_UPSTREAM_HOST ?? "127.0.0.1").trim();
+const UPSTREAM_URL_HOST =
+	(process.env.E2E_UPSTREAM_URL_HOST ?? (UPSTREAM_HOST === "0.0.0.0" ? "host.docker.internal" : UPSTREAM_HOST)).trim();
 fs.mkdirSync(WORK_ROOT, { recursive: true });
 // codex discovers AGENTS.md by walking UP from its spawn cwd (#815): keep the
 // cwd outside the repo tree or the whole repo doc leaks into every request.
@@ -70,7 +74,18 @@ function filler(i: number, lines: number): string {
 	return out.join("\n");
 }
 
-type OracleEntry = { t: number; model: string; stream: boolean; isSummary: boolean; inputLen: number; input: unknown[] };
+type OracleEntry = {
+	t: number;
+	model: string;
+	stream: boolean;
+	isSummary: boolean;
+	inputLen: number;
+	plugin: string | null;
+	tools: string[];
+	nativeTool: string | null;
+	functionCallOutputs: Array<{ callId: string; output: unknown }>;
+	input: unknown[];
+};
 
 function flatContent(c: unknown): string {
 	if (typeof c === "string") return c;
@@ -109,11 +124,12 @@ type Ctx = {
 	reqLog: string;
 	fakePid?: number;
 	proxyPid?: number;
+	external: boolean;
 	resumed: boolean;
 	turnCount: number;
 };
 
-async function startCtx(contextWindow: number): Promise<Ctx> {
+async function startCtx(contextWindow: number, fakeEnv: Record<string, string> = {}): Promise<Ctx> {
 	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-fake-"));
 	const ctx: Ctx = {
 		work,
@@ -123,6 +139,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		port: await freePort(),
 		fakePort: await freePort(),
 		reqLog: path.join(work, "fake-requests.jsonl"),
+		external: EXTERNAL_ATTACH.length > 0,
 		resumed: false,
 		turnCount: 0,
 	};
@@ -130,7 +147,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 
 	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
-		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL },
+		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: UPSTREAM_HOST, FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL, ...fakeEnv },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	ctx.fakePid = fake.pid;
@@ -143,28 +160,32 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		"",
 		"[model_providers.e2e]",
 		'name = "OpenAI"',
-		`base_url = "http://127.0.0.1:${ctx.port}/bili/http://127.0.0.1:${ctx.fakePort}/v1"`,
+		ctx.external
+			? `base_url = "${EXTERNAL_ATTACH}/bili/http://${UPSTREAM_URL_HOST}:${ctx.fakePort}/v1"`
+			: `base_url = "http://127.0.0.1:${ctx.port}/bili/http://127.0.0.1:${ctx.fakePort}/v1"`,
 		'wire_api = "responses"',
 		'env_key = "E2E_UPSTREAM_KEY"',
 		"",
 	].join("\n"));
 
-	await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
-	const logPath = path.join(work, "bili.log");
-	const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
-		env: {
-			...process.env,
-			XDG_CONFIG_HOME: ctx.xdg.config,
-			XDG_CACHE_HOME: ctx.xdg.cache,
-			XDG_STATE_HOME: ctx.xdg.state,
-			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
-			...windowEnv(contextWindow),
-		},
-		stdio: ["ignore", "ignore", "pipe"],
-	});
-	ctx.proxyPid = proxy.pid;
-	proxy.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logPath, c); } catch { /* noop */ } });
-	await waitFor(`http://127.0.0.1:${ctx.port}/__bili/health`, 30_000, "bili proxy");
+	if (!ctx.external) {
+		await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
+		const logPath = path.join(work, "bili.log");
+		const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
+			env: {
+				...process.env,
+				XDG_CONFIG_HOME: ctx.xdg.config,
+				XDG_CACHE_HOME: ctx.xdg.cache,
+				XDG_STATE_HOME: ctx.xdg.state,
+				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+				...windowEnv(contextWindow),
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		ctx.proxyPid = proxy.pid;
+		proxy.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logPath, c); } catch { /* noop */ } });
+		await waitFor(`http://127.0.0.1:${ctx.port}/__bili/health`, 30_000, "bili proxy");
+	}
 	return ctx;
 }
 
@@ -279,6 +300,65 @@ test("under-window: no compression occurs (control)", { skip: skipReason }, asyn
 	assert.ok(oracle.length > 0, "fake upstream received no requests");
 	assert.ok(oracle.every((o) => !o.isSummary), "control turn must make no summarization calls");
 });
+
+test("native tools: real codex uses bili-injected ACP tools without MCP", { skip: skipReason, timeout: 300_000 }, async (t) => {
+	const ctx = await startCtx(60_000, { FAKE_NATIVE_TOOL: "acp_status" });
+	t.after(() => teardown(ctx));
+
+	const config = fs.readFileSync(path.join(ctx.codexHome, "config.toml"), "utf8");
+	assert.doesNotMatch(config, /\[mcp_servers\./i, "this lane must not register bili through MCP");
+
+	const r = await turn(ctx, "请执行原生注入验收, 只回复: 收到");
+	assert.equal(r.code, 0, `codex exec should succeed (got ${r.code})\nbili log:\n${logs(ctx)}`);
+
+	const oracle = readOracle(ctx.reqLog);
+	const injected = oracle.find((o) => !o.isSummary && o.nativeTool === "acp_status");
+	assert.ok(injected, `upstream never saw bili's injected ACP tool surface: ${JSON.stringify(oracle)}`);
+	assert.equal(injected.plugin, null, "codex must use proxy-mode wire injection, not a plugin header");
+	assert.ok(injected.tools.includes("compress"), `compress tool missing from injected surface: ${injected.tools.join(",")}`);
+	assert.ok(injected.tools.includes("acp_status"), `acp_status tool missing from injected surface: ${injected.tools.join(",")}`);
+
+	const executed = oracle.find((o) => !o.isSummary && o.functionCallOutputs.some((out) => out.callId.startsWith("call_native_")));
+	assert.ok(executed, `bili never re-requested with function_call_output; log:\n${logs(ctx)}`);
+	const output = String(executed.functionCallOutputs.find((out) => out.callId.startsWith("call_native_"))?.output ?? "");
+	assert.match(output, /context|window|token|session|messages/i, `unexpected acp_status result: ${output}`);
+	assert.match(logs(ctx), /proxy tool executed; re-requesting/, "server-side native tool execution was not logged");
+});
+
+test(
+	"native tools: real codex reaches an external Docker bili without MCP",
+	{
+		skip:
+			skipReason ??
+			(EXTERNAL_ATTACH.length === 0
+				? "set E2E_CODEX_ATTACH_ORIGIN=http://127.0.0.1:8787 to exercise a running Docker proxy"
+				: undefined),
+		timeout: 300_000,
+	},
+	async (t) => {
+		const ctx = await startCtx(60_000, { FAKE_NATIVE_TOOL: "acp_status" });
+		t.after(() => teardown(ctx));
+
+		const config = fs.readFileSync(path.join(ctx.codexHome, "config.toml"), "utf8");
+		assert.match(config, new RegExp(`base_url = "${EXTERNAL_ATTACH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/bili/`));
+		assert.doesNotMatch(config, /\[mcp_servers\./i, "this lane must not register bili through MCP");
+
+		const r = await turn(ctx, "请执行 Docker 原生注入验收, 只回复: 收到");
+		assert.equal(r.code, 0, `codex exec should succeed (got ${r.code})`);
+
+		const oracle = readOracle(ctx.reqLog);
+		const injected = oracle.find((o) => !o.isSummary && o.nativeTool === "acp_status");
+		assert.ok(injected, `Docker bili never injected ACP tools: ${JSON.stringify(oracle)}`);
+		assert.equal(injected.plugin, null, "codex must use proxy-mode wire injection, not a plugin header");
+		assert.ok(injected.tools.includes("compress"), `compress tool missing from injected surface: ${injected.tools.join(",")}`);
+		assert.ok(injected.tools.includes("acp_status"), `acp_status tool missing from injected surface: ${injected.tools.join(",")}`);
+
+		const executed = oracle.find((o) => !o.isSummary && o.functionCallOutputs.some((out) => out.callId.startsWith("call_native_")));
+		assert.ok(executed, "Docker bili never re-requested with function_call_output");
+		const output = String(executed.functionCallOutputs.find((out) => out.callId.startsWith("call_native_"))?.output ?? "");
+		assert.match(output, /context|window|token|session|messages/i, `unexpected acp_status result: ${output}`);
+	},
+);
 
 test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: skipReason, timeout: 300_000 }, async (t) => {
 	// The #1802 blind spot: nothing here runs through startCtx/turn (those

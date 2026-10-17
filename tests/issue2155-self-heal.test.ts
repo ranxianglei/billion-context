@@ -19,6 +19,7 @@ import {
     SELF_HEAL_WINDOW,
     biliToolsDeclaredOnWire,
     countBiliToolUses,
+    declaresMcpBiliToolsOnWire,
     evaluateSelfHealRound,
     nudgeSuppressed,
     pluginLaneDegraded,
@@ -175,6 +176,16 @@ test("unit: biliToolsDeclaredOnWire sees every protocol's tool shape", () => {
         true,
     );
     assert.equal(biliToolsDeclaredOnWire({}, "openai"), false);
+});
+
+test("unit: declaresMcpBiliToolsOnWire requires the strict MCP server prefix", () => {
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ name: "mcp__bili__acp_status" }] }), true);
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ function: { name: "mcp__bili__compress" } }] }), true);
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ type: "namespace", tools: [{ name: "mcp__bili__search_context" }] }] }), true);
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ name: "acp_status" }] }), false);
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ function: { name: "compress" } }] }), false);
+    assert.equal(declaresMcpBiliToolsOnWire({ tools: [{ name: "mcp__other__compress" }] }), false);
+    assert.equal(declaresMcpBiliToolsOnWire({}), false);
 });
 
 // ---- integration: zombie degrade (openai wire) -------------------------------

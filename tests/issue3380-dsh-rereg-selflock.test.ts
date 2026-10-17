@@ -47,6 +47,8 @@ import { rmrf } from "./tmp-rm.ts";
 // standalone file run behaves identically (dsh-native reads it lazily).
 process.env.NODE_TEST_CONTEXT = process.env.NODE_TEST_CONTEXT ?? "1";
 process.env.BILI_PERSIST = "0";
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 afterEach(() => { void _settleNativeForTest(); });
 

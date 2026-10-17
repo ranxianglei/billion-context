@@ -58,7 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
-import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
+import { decideEaddrinuse, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -1243,7 +1243,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     server.on("error", (err: NodeJS.ErrnoException) => {
         let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision" | undefined;
         let twin: RegistryEntry | undefined;
-        if (err.code === "EADDRINUSE") {
+        if (isPortBusyError(err.code, lastTriedPort)) {
             twin = findSameLaneTwin(listInstances(), lastTriedPort, launcherLane, ownFingerprint);
             const action = decideEaddrinuse({
                 upgradeReplacement,
@@ -1263,14 +1263,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
             if (action.kind === "ladder") {
                 listenAttempts += 1;
-                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`);
+                log(
+                    "warn",
+                    `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`,
+                );
                 attemptListen(action.nextPort);
                 return;
             }
             busyReason = action.reason;
         }
         const hint =
-            err.code === "EADDRINUSE"
+            isPortBusyError(err.code, lastTriedPort)
                 ? busyReason === "twin-collision"
                   ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${twin?.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044).`
                   : busyReason === "upgrade-replacement"

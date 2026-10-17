@@ -659,16 +659,20 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
  *  foreign conversation id. */
 const PENDING_REGISTER_TTL_MS = 10 * 60 * 1000;
 
-/** Take (and remove) the oldest pending registration — called by the server
- *  when a model request resolves a NEW session, to bind that session into
- *  plugin mode. Expired (orphaned) registrations are dropped, never bound.
- *  Entries are appended in time order, so pruning from the front suffices. */
-export function takePendingPluginRegister(): PendingPluginRegister | undefined {
+/** Take (and remove) the oldest eligible pending registration — called by the
+ *  server when a model request resolves a NEW session, to bind that session
+ *  into plugin mode. Expired (orphaned) registrations are dropped, never
+ *  bound. Entries are appended in time order, so pruning from the front
+ *  suffices. */
+export function takePendingPluginRegister(
+    eligible: (pending: PendingPluginRegister) => boolean = () => true,
+): PendingPluginRegister | undefined {
     const now = Date.now();
     while (pendingRegisters.length > 0 && now - pendingRegisters[0]!.ts > PENDING_REGISTER_TTL_MS) {
         pendingRegisters.shift();
     }
-    return pendingRegisters.shift();
+    const index = pendingRegisters.findIndex(eligible);
+    return index < 0 ? undefined : pendingRegisters.splice(index, 1)[0];
 }
 const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
 

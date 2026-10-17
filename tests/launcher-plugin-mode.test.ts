@@ -115,13 +115,14 @@ async function startRig(): Promise<Rig> {
     };
 }
 
-function postModel(rig: Rig, sessionHeader?: string): Promise<Response> {
+function postModel(rig: Rig, sessionHeader?: string, mcpTools = false): Promise<Response> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (sessionHeader) headers["x-claude-code-session-id"] = sessionHeader;
+    const tools = mcpTools ? [{ name: "mcp__bili__acp_status", description: "status", input_schema: { type: "object", properties: {} } }] : undefined;
     return fetch(rig.modelUrl(), {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }], ...(tools ? { tools } : {}) }),
     });
 }
 
@@ -168,18 +169,49 @@ test("launcher identity binding: register arriving AFTER the first request still
     }
 });
 
-test("launcher headless pending binding: register BEFORE the first request binds the new session (codex spawn)", async () => {
+test("launcher headless pending binding: an MCP-declaring request binds the new session", async () => {
     const rig = await startRig();
     try {
         await register(rig, "headless-conv-1", { agent: "mcp" });
         // Strong signal that does NOT match the registered id (#286: anonymous
         // requests are 400 now), so the identity lookup misses and the headless
         // pending path has to fire.
-        await postModel(rig, "headless-req-1");
+        await postModel(rig, "headless-req-1", true);
         assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "wire tool injection suppressed from the very first request");
         const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-1"))).json() as { ok: boolean; pluginAgent?: string };
         assert.ok(status.ok, "pending register consumed by the new session");
         assert.equal(status.pluginAgent, "mcp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("launcher headless pending binding: native wire requests do not consume an MCP registration", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "headless-conv-2", { agent: "mcp" });
+        await postModel(rig, "native-wire-1");
+        assert.ok(rig.upstreamBodies[0]!.includes("\"compress\""), "native wire tools remain injected");
+        const before = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-2"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.equal(before.ok, false, "pending registration remains available for the MCP lane");
+        await postModel(rig, "mcp-wire-1", true);
+        const after = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-2"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(after.ok, "the later MCP request consumes the pending registration");
+        assert.equal(after.pluginAgent, "mcp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("launcher headless pending binding: native wire requests keep non-MCP headless binding", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "headless-pi-conv", { agent: "pi" });
+        await postModel(rig, "headless-pi-req");
+        assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "the non-MCP headless registration still binds");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-pi-conv"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(status.ok);
+        assert.equal(status.pluginAgent, "pi");
     } finally {
         await rig.closeAll();
     }
@@ -380,7 +412,7 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
                     // request carries a strong signal that does NOT match the
                     // self-registered conversation id (#286: anonymous requests
                     // are 400 now), so the headless pending path has to fire.
-                    void postModel(rig, "codex-e2e-req-1").then(() => {
+                    void postModel(rig, "codex-e2e-req-1", true).then(() => {
                         send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
                         send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: {} } });
                     });

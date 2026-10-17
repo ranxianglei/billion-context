@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type EaddrinuseContext } from "../src/listen-policy.ts";
+import { decideEaddrinuse, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type EaddrinuseContext } from "../src/listen-policy.ts";
 
 const base: EaddrinuseContext = {
     upgradeReplacement: false,
@@ -87,4 +87,22 @@ test("postBindCanLadder: a marked upgrade replacement never gains post-bind ladd
     // on a contested port instead of hopping — the orphan shape, via the
     // second hop path.
     assert.equal(postBindCanLadder(true, false, true), false);
+});
+
+test("isPortBusyError: Windows cross-family collisions count as busy, real privilege errors do not", () => {
+    // Stock contention on every platform.
+    assert.equal(isPortBusyError("EADDRINUSE", 18787, "linux"), true);
+    assert.equal(isPortBusyError("EADDRINUSE", 18787, "win32"), true);
+    // Windows reports a bind collision with a listener held on ANOTHER address
+    // family (IPv6 wildcard vs IPv4) as EACCES although the port is not
+    // privileged — that must ladder like EADDRINUSE instead of dying with the
+    // misleading "requires privileges" hint.
+    assert.equal(isPortBusyError("EACCES", 18787, "win32"), true);
+    // A genuinely privileged port stays a permission error even on Windows.
+    assert.equal(isPortBusyError("EACCES", 443, "win32"), false);
+    // POSIX EACCES above 1024 is a real permission error (SELinux/caps), not a collision.
+    assert.equal(isPortBusyError("EACCES", 18787, "linux"), false);
+    // Unrelated codes never ladder.
+    assert.equal(isPortBusyError("EAFNOSUPPORT", 18787, "win32"), false);
+    assert.equal(isPortBusyError(undefined, 18787, "win32"), false);
 });

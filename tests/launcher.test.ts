@@ -2329,6 +2329,101 @@ test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not a
     assert.equal(handle.attached, undefined);
 });
 
+// #2195: BILI_LAUNCHER_* / BILI_STRICT_PORT are launcher→child channels, not
+// user configuration. A copy inherited from the launcher's own env (a host
+// that exported one, or a harness that injected it) must never ride into the
+// spawned proxy when THIS launch derives nothing for it: a stale window map
+// otherwise lands in the instance record and every later launch refuses to
+// attach with model-windows-mismatch, while the twin-collision guard then
+// kills the replacement spawn.
+test("ensureProxyRunning: inherited launcher channels never leak into the spawn env (#2195)", async () => {
+    const keys = ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"] as const;
+    const prev = new Map<string, string | undefined>();
+    for (const key of keys) prev.set(key, process.env[key]);
+    process.env.BILI_LAUNCHER_LANE = "stale-lane";
+    process.env.BILI_LAUNCHER_MODEL_WINDOWS = JSON.stringify({ "stale-model": 60000 });
+    process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS = JSON.stringify({ "stale-model": 8192 });
+    process.env.BILI_STRICT_PORT = "1";
+    try {
+        let spawnEnv: NodeJS.ProcessEnv | undefined;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex" },
+            {
+                spawnImpl: (_cmd, _args, options) => {
+                    spawnEnv = options.env ?? {};
+                    return makeFakeChild(42470);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42470 }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.ok(handle.child, "the launch still spawns");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_LANE, "codex", "this launch's own lane still crosses the boundary");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_MODEL_WINDOWS, undefined, "a stale inherited window map must not leak (#2195)");
+        assert.equal(spawnEnv?.BILI_LAUNCHER_MODEL_MAX_OUTPUTS, undefined, "a stale inherited max-output map must not leak (#2195)");
+        assert.equal(spawnEnv?.BILI_STRICT_PORT, undefined, "strictness is re-derived per launch, never inherited");
+    } finally {
+        for (const key of keys) {
+            const value = prev.get(key);
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test("ensureProxyRunning: this launch's own window map still reaches the child (#2195)", async () => {
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
+    await ensureProxyRunning(
+        {
+            host: "127.0.0.1",
+            port: 8787,
+            passthrough: false,
+            debug: false,
+            lane: "codex",
+            modelWindows: { "m1": 60000 },
+            modelMaxOutputs: { "m1": 4096 },
+        },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawnEnv = options.env ?? {};
+                return makeFakeChild(42471);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42471 }),
+            readInstanceFile: () => undefined,
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.deepEqual(JSON.parse(String(spawnEnv?.BILI_LAUNCHER_MODEL_WINDOWS)), { "m1": 60000 });
+    assert.deepEqual(JSON.parse(String(spawnEnv?.BILI_LAUNCHER_MODEL_MAX_OUTPUTS)), { "m1": 4096 });
+});
+
+// #2195: the strip above drops every inherited launcher channel; strictPort is
+// one of them, so its re-injection path needs its own positive proof — without
+// it a future refactor could silently stop forwarding this launch's own pin.
+test("ensureProxyRunning: this launch's own strictPort still reaches the child (#2195)", async () => {
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
+    await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex", strictPort: true },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawnEnv = options.env ?? {};
+                return makeFakeChild(42472);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42472 }),
+            readInstanceFile: () => undefined,
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnEnv?.BILI_STRICT_PORT, "1", "strictness set by THIS launch still crosses the boundary");
+});
+
 test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {

@@ -817,3 +817,13 @@ test("headless launcher registrations expire after the TTL (no stale poisoning)"
         _resetPluginStateForTest();
     }
 });
+
+test("headless launcher registration selection preserves unrelated non-MCP lanes", () => {
+    queuePluginRegister("select-mcp", "mcp", false);
+    queuePluginRegister("select-pi", "pi", false);
+    const mcpFirst = takePendingPluginRegister((candidate) => candidate.agent === "mcp");
+    assert.equal(mcpFirst?.conversationId, "select-mcp");
+    const pi = takePendingPluginRegister((candidate) => candidate.agent !== "mcp");
+    assert.equal(pi?.conversationId, "select-pi");
+    assert.equal(takePendingPluginRegister(), undefined);
+});

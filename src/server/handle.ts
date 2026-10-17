@@ -16,7 +16,7 @@ import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-bod
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
-import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -1436,7 +1436,14 @@ async function handleRequest(
             // binding belongs to the root session, #317). Same for a split
             // Claude Code subagent session (#970): its first request looks
             // brand-new, but the root's register is not its to claim.
-            const pending = takePendingPluginRegister();
+            // An MCP registration is claimable only by a request declaring the
+            // fixed mcp__bili__ server tools. A stale MCP shim must not bind
+            // an unrelated native wire session to plugin mode and suppress
+            // tool injection. Other launcher registrations keep their
+            // headless binding contract.
+            const pending = declaresMcpBiliToolsOnWire(parsed)
+                ? takePendingPluginRegister((candidate) => candidate.agent === "mcp")
+                : takePendingPluginRegister((candidate) => candidate.agent !== "mcp");
             if (pending) {
                 pluginAgent = pending.agent;
                 pluginConversation = pending.conversationId;

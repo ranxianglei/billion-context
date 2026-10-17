@@ -20,6 +20,9 @@ import http from "node:http";
 import { apply, _resetRegisterForTest, _settleNativeForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
+
 afterEach(() => { void _settleNativeForTest(); });
 
 type MockTool = { name: string; description?: string; inputSchema: Record<string, unknown> };
