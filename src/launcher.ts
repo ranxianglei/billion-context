@@ -4067,7 +4067,10 @@ export async function ensureProxyRunning(
     // second session attaches must not beat the registration to the grace
     // window.
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
-        console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
+        // #3404: host-safe channel (#3200) — a raw console.* here lands on the
+        // physical screen bypassing an in-host TUI renderer (host-log.ts),
+        // e.g. into Pi's input draft after herdr session restore.
+        attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerWatcher(inst.origin, watchPid);
         // #1322: a refusal means the shared proxy has NO session-lifecycle
         // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
@@ -4116,7 +4119,9 @@ export async function ensureProxyRunning(
     // a second writer over the same sessions dir. In-process dedup is separate
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
-        console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
+        // #3404: same host-safe channel as attachTo above — normal startup
+        // progress, not user-actionable.
+        attachDiag("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
         const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
         if (waited) {
             return attachTo(waited);
@@ -4392,7 +4397,9 @@ export async function ensureProxyRunning(
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
-                    console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
+                    // #3404: successful-attach announcement on the recovery
+                    // path — same class as attachTo, host-safe channel.
+                    attachDiag(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
                     return attachTo(late);
                 }
             }

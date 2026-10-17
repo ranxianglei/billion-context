@@ -7461,6 +7461,184 @@ test("ensureProxyRunning non-debug: incompatible candidate skipped silently, rea
     }
 });
 
+// #3404: the two remaining startup banners (`attaching to running proxy`,
+// `another bili launch ...`) still went out through raw console.error — in a
+// native host process that lands on the physical screen bypassing the TUI
+// renderer (Pi's input draft after herdr restore, same mechanism as
+// #2827/#2831). They now ride the #3200 host-safe channel: durable log file by
+// default, one controlled stderr copy under explicit debug. The failure-path
+// console.error lines in the same function stay visible — these tests pin the
+// boundary. Shared harness: isolated HOME/XDG tree (logHostEvent target) plus
+// stderr capture proving nothing reaches the terminal.
+function isolatedHomeWithStderrCapture(
+    fn: (home: string, stderrWrites: string[]) => Promise<void>,
+): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3404-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return Promise.resolve()
+        .then(() => fn(home, stderrWrites))
+        .finally(() => {
+            process.stderr.write = origStderrWrite;
+            process.env.HOME = prevHome;
+            if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+            else process.env.USERPROFILE = prevUserProfile;
+            if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+            if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = prevXdgData;
+            if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdgState;
+            rmrf(home);
+        });
+}
+
+function stateLog(home: string): string {
+    return fs.readFileSync(path.join(home, ".local", "state", "billion-context", "bili.log"), "utf8");
+}
+
+test("attach banner stays off the terminal by default; file keeps origin/pid, watcher unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "still attaches to the healthy instance");
+        assert.equal(handle.origin, "http://127.0.0.1:8787");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]], "watcher registration unchanged");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attaching to running proxy at http://127.0.0.1:8787 (pid ${process.pid})`), `log was: ${content}`);
+    });
+});
+
+test("concurrent-startup wait banner goes to the file only; wait-then-attach behavior unchanged (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Active starter marker (our own pid, fresh timestamp, undeclared lane =
+        // wildcard) forces the cross-process startup window instead of a direct
+        // attach; the instance appears only on the FIRST starter poll tick.
+        const markerDir = path.join(home, ".local", "state", "billion-context");
+        fs.mkdirSync(markerDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(markerDir, "proxy-starting"),
+            `${JSON.stringify({ token: "starter-3404", pid: process.pid, host: "127.0.0.1", port: 0, startedAt: Date.now() })}\n`,
+        );
+        let reads = 0;
+        const registrations: Array<[string, number]> = [];
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => (++reads > 1 ? recordedInstance() : undefined),
+                registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true, "waited for the starter, then attached — did not spawn a second writer");
+        assert.equal(reads, 2, "initial snapshot saw nothing; the first starter poll found the instance");
+        assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]]);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = stateLog(home);
+        assert.ok(content.includes("another bili launch is bringing up a proxy"), `log was: ${content}`);
+        assert.ok(content.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), `log was: ${content}`);
+    });
+});
+
+test("explicit debug keeps one controlled stderr copy of the attach banner (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (_home, stderrWrites) => {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: process.pid, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance(),
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+    });
+});
+
+test("user-actionable gate refusal stays on the terminal — not hidden with the banners (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "unverifiable-watchdog lane instance is still refused");
+        assert.ok(stderrWrites.some((m) => m.includes("refusing to attach")), `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stateLog(home).includes("refusing to attach"), "file record kept as well");
+    });
+});
+
+test("recovery-path attach announcement goes through the host-safe channel; child-death notice stays visible (#3404)", async () => {
+    await isolatedHomeWithStderrCapture(async (home, stderrWrites) => {
+        // Same shape as the #1903 late-publisher scenario, but on the DEFAULT
+        // diag sink: the spawned child dies before healthy (failure notice must
+        // stay on the terminal), re-discovery then attaches a late publisher —
+        // that SUCCESS announcement is what moved off the terminal.
+        const PORT = 38993;
+        const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+        let reads = 0;
+        let t = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+                readInstanceFile: () => (++reads > 1 ? late : undefined),
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "ok",
+                scriptPath: FP_SCRIPT,
+                // #2877: lane-less (manual) daemon ridden by a LANEd launch — pin
+                // the legacy policy so this keeps exercising the post-exit
+                // re-discovery mechanism, like the #1903 test it mirrors.
+                resolveAttachPolicy: () => "global-fallback",
+            },
+        );
+        assert.equal(handle.attached, true, "attached to the late publisher via the recovery path");
+        assert.equal(handle.origin, late.origin);
+        assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+        assert.equal(stderrWrites.length, 1, `stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("spawned proxy exited before becoming healthy"), stderrWrites[0]);
+        assert.ok(!stderrWrites.some((m) => m.includes("attached to")), "success announcement must not reach the terminal");
+        const content = stateLog(home);
+        assert.ok(content.includes(`bili: attached to ${late.origin} (pid ${late.pid})`), `log was: ${content}`);
+    });
+});
+
 // #1753: the spawn-wait fallback must verify the healthy responder on the
 // preferred port is the child WE spawned. A foreign proxy squats the preferred
 // port (that is exactly why our child laddered away); trusting "healthy" alone
