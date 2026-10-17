@@ -780,11 +780,23 @@ export async function buildSessionList(): Promise<WebSessionSummary[]> {
     return vis;
 }
 
-interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+type SessionPageState = "live" | "history";
+
+interface SessionPageQuery {
+    q?: string;
+    protocol?: string;
+    client?: string;
+    state?: SessionPageState;
+    page?: number;
+    pageSize: number;
+}
 
 interface SessionPageResult {
     sessions: WebSessionSummary[];
     total: number;
+    unfilteredTotal: number;
+    protocols: string[];
+    clients: string[];
     page: number;
     pageSize: number;
 }
@@ -798,17 +810,36 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
     const all = await mergedSummaries();
     const vis = all.filter((s) => !isEmptyStub(s));
     lastHiddenEmpty = all.length - vis.length;
+    const unfilteredTotal = vis.length;
     const q = (query.q ?? "").trim().toLowerCase();
-    const filtered = q
-        ? vis.filter((s) =>
-            (s.title ?? "").toLowerCase().includes(q) ||
-            (s.label ?? "").toLowerCase().includes(q) ||
-            s.id.toLowerCase().includes(q))
-        : vis;
+    const protocol = (query.protocol ?? "").trim().toLowerCase();
+    const client = (query.client ?? "").trim().toLowerCase();
+    const filtered = vis.filter((s) => {
+        if (q) {
+            const hit =
+                (s.title ?? "").toLowerCase().includes(q) ||
+                (s.label ?? "").toLowerCase().includes(q) ||
+                s.id.toLowerCase().includes(q);
+            if (!hit) return false;
+        }
+        if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
+        if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.state === "live" && (!s.live || s.restored)) return false;
+        if (query.state === "history" && s.live && !s.restored) return false;
+        return true;
+    });
     const total = filtered.length;
     const pageSize = Math.min(Math.max(1, Math.floor(query.pageSize)), 200);
     const page = Math.max(1, Math.floor(query.page ?? 1));
-    return { sessions: filtered.slice((page - 1) * pageSize, page * pageSize), total, page, pageSize };
+    return {
+        sessions: filtered.slice((page - 1) * pageSize, page * pageSize),
+        total,
+        unfilteredTotal,
+        protocols: [...new Set(vis.map((s) => s.protocol ?? "unknown"))].sort((a, b) => a.localeCompare(b)),
+        clients: [...new Set(vis.flatMap((s) => s.clientHint ? [s.clientHint] : []))].sort((a, b) => a.localeCompare(b)),
+        page,
+        pageSize,
+    };
 }
 
 /** Aggregate stats across ALL known sessions (live + disk) — the "how many

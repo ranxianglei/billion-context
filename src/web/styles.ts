@@ -304,6 +304,18 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 [hidden] { display: none !important; }
 .search { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 13px; max-width: 280px; outline: none; }
 .search:focus { border-color: var(--accent); }
+.ses-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.ses-filter { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 8px; padding: 6px 8px; font-size: 12.5px; max-width: 190px; outline: none; }
+.ses-filter:focus { border-color: var(--accent); }
+.ses-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -6px 0 10px; }
+.ses-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 10px; }
+.ses-pager #ses-page-label { min-width: 110px; text-align: center; font-variant-numeric: tabular-nums; }
+.ses-pager button:disabled { opacity: 0.45; cursor: default; }
+@media (max-width: 720px) {
+    .ses-toolbar { justify-content: flex-start; }
+    .ses-toolbar .search { flex: 1 1 220px; max-width: none; }
+    .ses-filter { flex: 1 1 140px; max-width: none; }
+}
 .route-block { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .route-block:last-child { border-bottom: none; padding-bottom: 0; }
 .route-key { font-weight: 600; font-size: 13px; margin-bottom: 6px; word-break: break-all; }
