@@ -69,9 +69,10 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
+import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
 import { normalizeVertexModelId, stripBiliWrappers, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
 
 export {
@@ -3573,6 +3574,20 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
     return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
 }
 
+/** #3436: project a caller's model-map opts onto what a spawned child will
+ *  RECORD for them: CLI lanes inject JSON.stringify(opts) into the named env
+ *  var at spawn time, native lanes inherit the ambient value; the child
+ *  records the parser applied to exactly that string (context-window.ts).
+ *  Running the want-side through the same parse keeps the comparison
+ *  byte-stable regardless of how the map was produced. */
+function recordedModelMap(
+    passed: Record<string, number> | undefined,
+    ambientRaw: string | undefined,
+    parse: (raw: string | undefined) => Record<string, number>,
+): Record<string, number> {
+    return parse(passed && Object.keys(passed).length > 0 ? JSON.stringify(passed) : ambientRaw);
+}
+
 /** #1225: reuse requires identical CODE, not just identical config shape —
  *  same version number with different dist contents (local rebuild, npm link,
  *  unpublished branch) must not be served by the stale instance. codeFingerprint
@@ -3587,16 +3602,22 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
-    const wantDomains = opts.mitmDomains ?? [];
+    // #3436: each cell wants what a spawned child will RECORD, not the raw
+    // caller input — the child records loadOptions' gated mitm tier and the
+    // parse of the BILI_LAUNCHER_MODEL_* env it receives. Native lanes pass no
+    // domains/windows at all, so the bare `?? []` / `?? {}` fallbacks never
+    // matched an instance whose owner configured ANY tier: every attach was a
+    // mismatch and every host process spawned its own proxy (instances only
+    // grew). Projecting onto the recorded values makes same-lane peers converge
+    // while genuine drift (config edited after spawn) still mismatches.
+    const wantDomains = resolveRecordedMitmDomains(opts.mitmDomains);
     if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return "mitm-domains-mismatch";
-    const wantWindows = opts.modelWindows ?? {};
-    const keys = Object.keys(wantWindows);
-    if (Object.keys(inst.modelWindows).length !== keys.length) return "model-windows-mismatch";
-    if (!keys.every((k) => inst.modelWindows[k] === wantWindows[k])) return "model-windows-mismatch";
-    const wantMax = opts.modelMaxOutputs ?? {};
-    const maxKeys = Object.keys(wantMax);
-    if (Object.keys(inst.modelMaxOutputs ?? {}).length !== maxKeys.length) return "model-max-outputs-mismatch";
-    return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
+    const wantWindows = recordedModelMap(opts.modelWindows, process.env.BILI_LAUNCHER_MODEL_WINDOWS, parseLauncherModelWindows);
+    if (Object.keys(inst.modelWindows).length !== Object.keys(wantWindows).length) return "model-windows-mismatch";
+    if (!Object.keys(wantWindows).every((k) => inst.modelWindows[k] === wantWindows[k])) return "model-windows-mismatch";
+    const wantMax = recordedModelMap(opts.modelMaxOutputs, process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS, parseLauncherModelMaxOutputs);
+    if (Object.keys(inst.modelMaxOutputs ?? {}).length !== Object.keys(wantMax).length) return "model-max-outputs-mismatch";
+    return Object.keys(wantMax).every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
 }
 
 /** #1232: every healthy live instance — not just the last writer of the

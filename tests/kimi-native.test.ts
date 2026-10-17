@@ -26,6 +26,7 @@ import {
 import {
     activateKimiPluginMode,
     bootstrapKimiNative,
+    kimiConfigModelWindows,
     planNativeKimi,
     probeProxyHealth,
     unrouteKimi,
@@ -345,6 +346,20 @@ test("scanKimiModelWindows keys windows by model id across all sections (#2954)"
     const two = 'default_model = "a"\n\n[models.a]\nmodel = "alpha"\nmax_context_size = 100000\n\n[models.b]\nmax_context_size = 200000\n';
     assert.deepEqual(scanKimiModelWindows(two), { alpha: 100000, b: 200000 }, "sections without a model field key by name");
     assert.deepEqual(scanKimiModelWindows(SAMPLE_CONFIG), {}, "no windows declared → empty map, nothing to feed");
+});
+
+test("kimiConfigModelWindows hands both kimi proxy paths ONE windows source (#3436/#3557)", () => {
+    const home = path.join(tmpdir(), `bili-kimi-win-${process.pid}-${Date.now()}`);
+    mkdirSync(home, { recursive: true });
+    try {
+        writeFileSync(path.join(home, "config.toml"), THINKING_CONFIG);
+        assert.deepEqual(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: home }), { "deepseek-r1": 65536 });
+        writeFileSync(path.join(home, "config.toml"), SAMPLE_CONFIG);
+        assert.equal(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: home }), undefined, "no windows → undefined, caller omits the field");
+        assert.equal(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: path.join(home, "missing") }), undefined, "no file → undefined, never throws");
+    } finally {
+        rmrf(home);
+    }
 });
 
 interface FakeHome { home: string; cleanup: () => void }

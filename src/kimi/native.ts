@@ -294,6 +294,19 @@ export async function bootstrapKimiNative(opts: BootstrapKimiOptions = {}): Prom
     return { mode: "active", attached, routed };
 }
 
+/** #2954/#3436: every model window the client's own config.toml declares, or
+ *  undefined when none (no file / no windows / unreadable). Both kimi proxy
+ *  paths (plugin bootstrap AND the MCP watchdog respawn, native-mcp.ts) must
+ *  present this SAME map — different sources make their proxies mutually
+ *  unattachable on the model-windows cell and stack instances (#3557). */
+export function kimiConfigModelWindows(env: NodeJS.ProcessEnv = process.env): Record<string, number> | undefined {
+    try {
+        const scanned = scanKimiModelWindows(fs.readFileSync(path.join(resolveKimiHome(env), "config.toml"), "utf8"));
+        if (Object.keys(scanned).length > 0) return scanned;
+    } catch {}
+    return undefined;
+}
+
 async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean }> {
     // The spawned proxy's parent-gone watchdog (#server.ts BILI_PARENT_PID)
     // keys off OUR pid: kimi kills this MCP child when its session ends, so
@@ -302,11 +315,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
     // (not just the active model's one-shot runtime-info report) so per-request
     // window resolution knows the real window of any other model that flows
     // through — mid-session switches used to resolve against a stale guess.
-    let modelWindows: Record<string, number> | undefined;
-    try {
-        const scanned = scanKimiModelWindows(fs.readFileSync(path.join(resolveKimiHome(process.env), "config.toml"), "utf8"));
-        if (Object.keys(scanned).length > 0) modelWindows = scanned;
-    } catch {}
+    const modelWindows = kimiConfigModelWindows();
     const handle = await ensureProxyRunning(
         { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
         { scriptPath: nativeProxyScriptPath() },
