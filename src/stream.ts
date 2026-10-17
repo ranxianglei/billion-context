@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
-import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
+import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
@@ -995,11 +995,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
-        recordCacheFoldsFromBlocks(
-            ctx.session,
-            res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: viewTokens, Vp: postCtx },
-        );
+        const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
+        // #3307: the ledger credits a fold only when firstFoldStartTokens=X < billed
+        // input, but X is a kernel chars/4 estimate vs provider-billed input — in long
+        // sessions X can land >= input and the re-pay drops unattributed. Log X plus the
+        // same-space view tokens (V/Vp) so one capture separates unit-scale from view
+        // identity as the inflation source.
+        if (newFoldBlocks.length > 0) {
+            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${prefixTokensBeforeRef(ctx.session, b.startRef)}` : `${b.blockId}=none`)).join(" ");
+            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vp=${postCtx} (#3307)`);
+        }
+        recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible
