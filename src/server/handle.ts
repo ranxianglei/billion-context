@@ -2310,6 +2310,17 @@ async function handleRequest(
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
                 }
+                // #3450: ONE wall per request — on the refold path the
+                // prepare/nudge stage must judge against the same window the
+                // preflight stage folds on. min(declared, stated): the
+                // operator/host declaration and the upstream's own proof bound
+                // each other; neither may outrank the other within one
+                // request (the two-walls split let "usage=105%" and
+                // "target 1048576" coexist in the same second). Downward only
+                // — a stated ceiling above the declaration never loosens it.
+                if (overflowWindow !== undefined && typeof reqConfig.modelContextLimit === "number" && reqConfig.modelContextLimit > 0 && overflowWindow < reqConfig.modelContextLimit) {
+                    reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
+                }
                 prepared = await runPrepare();
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
@@ -2380,7 +2391,10 @@ async function handleRequest(
                         res,
                         opts,
                         core,
-                        overflowWindow !== undefined ? { ...reqConfig, modelContextLimit: overflowWindow } : reqConfig,
+                        // #3450: no per-stage override anymore — the wall was
+                        // unified above (min of declared and upstream-stated),
+                        // so prepare/nudge and preflight judge on one number.
+                        reqConfig,
                         nativeWindow,
                         requestModel,
                         resolvedNativeWindow,

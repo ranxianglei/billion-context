@@ -74,6 +74,101 @@ test("Anthropic: 'prompt is too long: X tokens > Y maximum' → window is Y", ()
     assert.equal(info.window, 128000); // the maximum, not the 130000 total
 });
 
+// #3450: when the body ALSO states the rejected payload's own counts, they are
+// distinct from the ceiling — arming the shrink at the ceiling instead of the
+// measurement is what turned a real deficit into "deficit 0". Each pattern is
+// provider-specific; a wrong guess is worse than no guess.
+test("DeepSeek/OpenAI: 'requested N tokens (M in the messages, K in the completion)' → all three counts (#3450)", () => {
+    // Verbatim from incident #3450.
+    const body = JSON.stringify({
+        error: {
+            code: "context_length_exceeded",
+            message:
+                "This model's maximum context length is 1048576 tokens. However, you requested 1160518 tokens (904518 in the messages, 256000 in the completion). Please reduce the length of the inputs or output.",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1048576); // the ceiling
+    assert.equal(info.requestedTotal, 1160518);
+    assert.equal(info.requestedMessages, 904518);
+    assert.equal(info.requestedCompletion, 256000);
+});
+
+test("DeepSeek/OpenAI counts survive comma grouping (#3450)", () => {
+    const body = JSON.stringify({
+        error: {
+            code: "context_length_exceeded",
+            message: "you requested 1,160,518 tokens (904,518 in the messages, 256,000 in the completion).",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.requestedTotal, 1160518);
+    assert.equal(info.requestedMessages, 904518);
+    assert.equal(info.requestedCompletion, 256000);
+});
+
+test("Anthropic 'prompt is too long' states the prompt count — no completion split (#3450)", () => {
+    const body = JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "prompt is too long: 130000 tokens > 128000 maximum" },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.window, 128000);
+    assert.equal(info.requestedTotal, 130000);
+    assert.equal(info.requestedMessages, 130000); // input side only
+    assert.equal(info.requestedCompletion, undefined);
+});
+
+test("Gemini 'input token count (N) exceeds' states the input count (#3450)", () => {
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"The input token count (1012345) exceeds the maximum number of tokens allowed (1048576)."}}',
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1048576);
+    assert.equal(info.requestedTotal, 1012345);
+    assert.equal(info.requestedMessages, 1012345);
+    assert.equal(info.requestedCompletion, undefined);
+});
+
+test("overflow body WITHOUT stated counts → no requested* fields (#3450 regression guard)", () => {
+    // The legacy phrasing must keep behaving exactly as before (selfheal T3
+    // relies on it): window only, no invented counts.
+    const body = JSON.stringify({
+        error: {
+            code: "context_length_exceeded",
+            message: "This model's maximum context length is 8192 tokens. However, your messages resulted in 13000 tokens.",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 8192);
+    assert.equal(info.requestedTotal, undefined);
+    assert.equal(info.requestedMessages, undefined);
+    assert.equal(info.requestedCompletion, undefined);
+});
+
+test("legacy OpenAI 'requested N tokens (your request used ...)' does NOT match the counts pattern (#3450)", () => {
+    // The chat-completions phrasing splits inputs/output differently — it must
+    // not be misread as a messages/completion pair.
+    const body = JSON.stringify({
+        error: {
+            message:
+                "This model's maximum context length is 128000 tokens. However, you requested 132096 tokens (your request used 20 inputs and 4096 output tokens). Please reduce the length of the inputs or output.",
+            type: "invalid_request_error",
+            code: "context_length_exceeded",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 128000);
+    assert.equal(info.requestedTotal, undefined);
+    assert.equal(info.requestedMessages, undefined);
+    assert.equal(info.requestedCompletion, undefined);
+});
+
 test("context_length_exceeded code with comma-grouped window", () => {
     const body = JSON.stringify({ error: { code: "context_length_exceeded", message: "exceeds the limit of 1,048,576 tokens" } });
     const info = inspectContextOverflow(400, body);

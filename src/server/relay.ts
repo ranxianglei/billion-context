@@ -828,7 +828,13 @@ export async function forward(
             // accept it as rescue-grade, everything else usage-gated keeps
             // excluding it. A real usage report on the next successful turn
             // overwrites it.
-            s.stats.lastInputTokens = info.window;
+            // #3450: when the body states the REJECTED PAYLOAD'S OWN size
+            // ("N in the messages"), book THAT as the armed baseline — the
+            // window is a ceiling, not a measurement; arming at the ceiling
+            // made preflight see "payload ~window, deficit 0" while the real
+            // payload sat above its local estimate and the re-forward died.
+            const measured = typeof info.requestedMessages === "number" && info.requestedMessages > 0 ? info.requestedMessages : undefined;
+            s.stats.lastInputTokens = measured ?? info.window;
             s.stats.lastInputTokensSource = "overflow-arm";
             // #2313: the rejection came from THIS upstream — stamp the
             // evidence origin so the #1933 F2 route gate (and the #2313
@@ -836,9 +842,23 @@ export async function forward(
             // instead of demoting it against a stale settle origin.
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
             // #1110: record the arm SEPARATELY so the side-request guard
-            // can read it without ever touching the nudge baseline.
+            // can read it without ever touching the nudge baseline. The guard
+            // keeps the CEILING even when the baseline books the measurement
+            // (#3450) — it must never clamp below what the upstream proved.
             s.stats.overflowArmTokens = info.window;
-            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
+            // #3450: the completion share proves this provider bills OUTPUT
+            // against the same wall — remember it so preflight folds against
+            // window − completion (the foldable quantity is MESSAGES).
+            const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
+            if (reserve !== undefined) s.stats.overflowArmCompletionReserve = reserve;
+            // #3450: one-time mismatch warning — the upstream-stated window
+            // differs from the window bili actually judges on.
+            const declaredWindow = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
+            if (declaredWindow > 0 && declaredWindow !== info.window && !s.stats.overflowArmMismatchWarned) {
+                s.stats.overflowArmMismatchWarned = true;
+                log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
+            }
+            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink, declared window unchanged (#987)`);
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is

@@ -335,6 +335,16 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** #3450: completion-channel reservation PROVEN by an upstream-stated
+         *  overflow ("N in the completion" billed against the same wall) —
+         *  preflight folds against window − reserve because the foldable
+         *  quantity is MESSAGES. Set alongside the overflow arm; cleared on
+         *  native-compaction reset like the arm itself. Absent/zero → no
+         *  reservation (legacy behavior). */
+        overflowArmCompletionReserve?: number;
+        /** #3450: one-time mismatch warning already emitted for this session
+         *  (upstream-stated window ≠ window in use). Provenance only. */
+        overflowArmMismatchWarned?: boolean;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -1289,6 +1299,11 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // #3450: same boundary — the proven completion reservation described the
+    // pre-compaction payload lineage, and the rebuilt conversation re-arms the
+    // one-time mismatch warning.
+    delete session.stats.overflowArmCompletionReserve;
+    delete session.stats.overflowArmMismatchWarned;
     // #728: the pre-compaction outbound payload is gone — the old estimate
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.

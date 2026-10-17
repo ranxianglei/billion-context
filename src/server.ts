@@ -2889,7 +2889,12 @@ export async function preflightCompressIfNeeded(
     instanceId: string,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
-    const limit = config.modelContextLimit;
+    // #3450: when an upstream-stated overflow proved this provider bills the
+    // COMPLETION against the same wall ("N in the messages, N in the
+    // completion"), the foldable quantity is MESSAGES — every payload-vs-wall
+    // judgment below runs on window − reservation instead of the raw window.
+    const completionReserve = typeof session.stats.overflowArmCompletionReserve === "number" && session.stats.overflowArmCompletionReserve > 0 ? session.stats.overflowArmCompletionReserve : 0;
+    const limit = Math.max(0, config.modelContextLimit - completionReserve);
     const overflowTarget = prepared.protocol === "responses" && isCodexClient(req.headers) && codexCompactMode() === "intercept"
         ? limit * CODEX_COMPACT_HEALTH_RATIO
         : limit;
@@ -3208,7 +3213,7 @@ export async function preflightCompressIfNeeded(
     // provider-billed baseline and the (calibrated) local estimate — so a
     // false trigger is diagnosable from the log alone instead of requiring a
     // cross-reference between gate and nudge lines.
-    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget}${growthArmed ? " (auto-fold growth floor)" : ""} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget}${growthArmed ? " (auto-fold growth floor)" : ""}${completionReserve > 0 ? ` (window ${config.modelContextLimit} minus proven completion reservation ${completionReserve})` : ""} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);

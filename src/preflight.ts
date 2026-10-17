@@ -2049,6 +2049,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
             const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
             currentTokens = Math.max(0, currentTokens - folded + countText(summary));
+            // The apply path (stream.ts applyRanges) already netted the gross
+            // fold out of lastInputTokens and credited compressCreditTokens;
+            // add the re-entering summary's cost back so the baseline tracks
+            // the post-fold payload size exactly once (#3450 trace: arm 1048576
+            // → −gross +summary = 1047168 after one fold).
             deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;

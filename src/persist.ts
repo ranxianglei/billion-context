@@ -143,6 +143,8 @@ interface PersistedSession {
         lastInputTokensSource?: string;
         lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
+        overflowArmCompletionReserve?: number;
+        overflowArmMismatchWarned?: boolean;
         contextTokens?: number;
         contextTokensSource?: string;
         // #2129: measurement-state fields buildRecord persists via spread —
@@ -2188,6 +2190,9 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
+            // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
+            overflowArmCompletionReserve: typeof stats.overflowArmCompletionReserve === "number" && Number.isFinite(stats.overflowArmCompletionReserve) && stats.overflowArmCompletionReserve > 0 ? stats.overflowArmCompletionReserve : undefined,
+            overflowArmMismatchWarned: stats.overflowArmMismatchWarned === true ? true : undefined,
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),

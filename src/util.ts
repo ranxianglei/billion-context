@@ -231,6 +231,18 @@ export interface ContextOverflowInfo {
      *  number is present. #987: this arms the one-shot emergency shrink — it
      *  is never persisted as a learned window. */
     window?: number;
+    /** #3450: total token count the upstream says it RECEIVED, when the body
+     *  states it ("you requested N tokens") — the rejected payload's own size,
+     *  NOT the window; arming at the ceiling instead of this measurement is
+     *  what turned a real deficit into "deficit 0". */
+    requestedTotal?: number;
+    /** #3450: message-channel share of the requested total ("N in the
+     *  messages") — the foldable quantity an over-window provider bills. */
+    requestedMessages?: number;
+    /** #3450: completion-channel share ("N in the completion") — proves this
+     *  provider bills OUTPUT against the same wall as input, so preflight
+     *  must fold against window − reservation. */
+    requestedCompletion?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -299,6 +311,25 @@ function parseOverflowWindow(text: string): number | undefined {
     return undefined;
 }
 
+/** #3450: best-effort extraction of the REJECTED PAYLOAD'S OWN token counts
+ *  from an overflow body — distinct from parseOverflowWindow (the ceiling). A
+ *  wrong guess is worse than no guess, so each pattern is provider-specific. */
+function parseOverflowCounts(text: string): { total?: number; messages?: number; completion?: number } {
+    // OpenAI/DeepSeek: "...you requested 1160518 tokens (904518 in the
+    // messages, 256000 in the completion)."
+    let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
+    // first number IS the prompt (messages) size; no completion split stated.
+    m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    // Gemini: "The input token count (1012345) exceeds the maximum number of
+    // tokens allowed (1048576)."
+    m = text.match(/input token count\s*\((\d[\d,]*)\)\s*exceeds/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[1]) };
+    return {};
+}
+
 /** Inspect an upstream response for a context-overflow error. `status` is the
  *  HTTP status; `bodyText` is the (usually small) error body. 400/413 and any
  *  5xx are checked against the recognized context-too-long markers; the marker
@@ -312,7 +343,15 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
     if (!isOverflow) return { isOverflow: false, message };
-    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
+    const counts = parseOverflowCounts(bodyText);
+    return {
+        isOverflow: true,
+        window: parseOverflowWindow(bodyText),
+        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        message,
+    };
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
