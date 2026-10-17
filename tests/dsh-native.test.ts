@@ -1799,6 +1799,65 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
     }
 });
 
+test("#3582 apply() pushes live takeover state on gate transitions (host→proxy heartbeat)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3582-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3582-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Intercept ONLY the runtime-info channel and answer it locally; every
+            // other call (manifest/status/register/tool) delegates to the real
+            // mock proxy so bootstrap is untouched. A scoped swap is safe here.
+            const realFetch = globalThis.fetch;
+            const posts: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+            globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+                const u = String(input);
+                if (u.includes("/__bili/plugin/runtime-info")) {
+                    let b: Record<string, unknown> | undefined;
+                    try { b = JSON.parse(String(init?.body)) as Record<string, unknown>; } catch { b = undefined; }
+                    posts.push({ url: u, body: b });
+                    return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+                }
+                return realFetch(input, init);
+            }) as typeof fetch;
+            try {
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+                const gate = _stateTakeoverGateForTest();
+                assert.ok(gate !== undefined, "takeoverGate installed");
+                const tposts = (): string[] => posts
+                    .filter((p) => p.body !== undefined && typeof p.body.takeover === "object" && p.body.takeover !== null)
+                    .map((p) => (p.body!.takeover as { state: string }).state);
+                const base = tposts().length;
+                const url = "https://api.gate-probe.test/v1/chat/completions";
+                assert.equal(gate(url), false, "unattributed → refused");
+                await waitFor(() => tposts().length === base + 1, "takeover report after first refusal");
+                const noneBody = posts.filter((p) => p.body?.takeover).slice(-1)[0]!.body!.takeover as { state: string; refusals: number; byEndpoint: { endpoint: string; count: number }[] };
+                assert.equal(noneBody.state, "none", "first unattributed refusal reports none (numbers only, no banner)");
+                assert.equal(noneBody.refusals, 1);
+                assert.match(noneBody.byEndpoint[0]?.endpoint ?? "", /gate-probe/);
+                const before = tposts().length;
+                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                await new Promise((r) => setTimeout(r, 30));
+                assert.equal(tposts().length, before, "a same-state refusal must not re-report");
+                ctx.setInitiator({ session: { id: "s3582" } });
+                assert.equal(gate(url), true, "attributed traffic claims");
+                await waitFor(() => tposts().length === before + 1, "recovery report after attribution returns");
+                assert.equal(tposts()[tposts().length - 1], "ok", "recovery flips headline back to ok");
+            } finally {
+                globalThis.fetch = realFetch;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts accumulate; transitions re-print (+bili.log)", async () => {
     const proxy = await startMockProxy([]);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-state-"));

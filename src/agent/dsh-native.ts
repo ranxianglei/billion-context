@@ -53,7 +53,8 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, reportTakeoverStatus, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { TAKEOVER_TOP_ENDPOINTS, type TakeoverReport } from "../takeover-status.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
@@ -63,6 +64,13 @@ export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
 
 const RETRY_INTERVAL_MS = 10000;
+// #3582: host process identity for the takeover-health heartbeat. A real host
+// restart reloads this module → new value, so the panel can tell "recovered"
+// apart from "counters reset because the host restarted". The heartbeat cadence
+// is a fixed 60s (no env knob — this is an internal reporting rhythm, not user
+// config); the proxy's staleness window (TAKEOVER_STALE_MS) is sized to it.
+const HOST_STARTED_AT_MS = Date.now();
+const TAKEOVER_HEARTBEAT_MS = 60_000;
 /** #2082: BILI_DSH_RETRY_INTERVAL_MS — test/ops knob to shrink the retry
  *  wall without wall-clock waits (same pattern as BILI_MODEL_INFO_RETRY_MS). */
 function retryIntervalMs(): number {
@@ -959,6 +967,20 @@ function armRecoveryTimer(): void {
     recoveryTimer.unref?.();
 }
 
+// #3582: live takeover-health heartbeat. The proxy is display-only; the HOST
+// owns the fact. The pusher ref is (re)assigned by each apply() activation so
+// the timer always reports the CURRENT activation's gate state; a real host
+// restart reloads the module and re-arms from scratch. The NODE_TEST_CONTEXT
+// guard mirrors armRecoveryTimer — tests drive pushes directly rather than wait.
+let takeoverPushRef: (() => void) | undefined;
+let takeoverHeartbeatTimer: NodeJS.Timeout | undefined;
+function armTakeoverHeartbeat(): void {
+    if (takeoverHeartbeatTimer !== undefined) return;
+    if (process.env.NODE_TEST_CONTEXT !== undefined) return;
+    takeoverHeartbeatTimer = setInterval(() => { takeoverPushRef?.(); }, TAKEOVER_HEARTBEAT_MS);
+    takeoverHeartbeatTimer.unref?.();
+}
+
 function maybeRetry(ctx: PluginContext): void {
     activeCtx = ctx;
     // #3380: the base-less state heals through the RESPAWN branch below even
@@ -1492,6 +1514,43 @@ export function apply(ctx: PluginContext): void {
         attrReportedRefusals = 0;
         reportAttrHealth();
     };
+    // #3582: headline takeover-health pushed to the proxy's /__bili/status. The
+    // HOST owns this fact (the proxy is display-only). Severity-ordered so a
+    // single agentless/sidecar `none` can never mask a healthy main conversation
+    // or a broken one: `ok` always resets to ok (a real claim = compression
+    // works), `threw` sticks until an `ok` clears it (internal error, no
+    // legitimate source), and `none` surfaces only when nothing definite has
+    // happened yet — exactly the designed empty-slot passthrough (numbers only,
+    // no banner).
+    let headlineState: TakeoverReport["state"] | undefined;
+    let takeoverSinceMs = Date.now();
+    const buildTakeoverSnapshot = (): TakeoverReport => {
+        let total = 0;
+        const perEndpoint: TakeoverReport["byEndpoint"] = [];
+        for (const [endpoint, v] of gateRefusals) {
+            total += v.count;
+            perEndpoint.push({ endpoint, count: v.count });
+        }
+        perEndpoint.sort((a, b) => b.count - a.count);
+        return { state: headlineState ?? (total > 0 ? "none" : "ok"), refusals: total, byEndpoint: perEndpoint.slice(0, TAKEOVER_TOP_ENDPOINTS), sinceMs: takeoverSinceMs, hostStartedAtMs: HOST_STARTED_AT_MS };
+    };
+    const pushTakeoverStatus = (): void => {
+        const o = currentOrigin();
+        if (o === undefined || o.length === 0) return;
+        void reportTakeoverStatus(o, "dsh", buildTakeoverSnapshot()).catch(() => {});
+    };
+    const noteGateOutcome = (s: TakeoverReport["state"]): void => {
+        if (s === "ok") {
+            if (headlineState !== "ok") { headlineState = "ok"; takeoverSinceMs = Date.now(); pushTakeoverStatus(); }
+        } else if (s === "threw") {
+            if (headlineState !== "threw") { headlineState = "threw"; takeoverSinceMs = Date.now(); pushTakeoverStatus(); }
+        } else if (headlineState === undefined) {
+            headlineState = "none"; takeoverSinceMs = Date.now(); pushTakeoverStatus();
+        }
+    };
+    takeoverPushRef = pushTakeoverStatus;
+    armTakeoverHeartbeat();
+    pushTakeoverStatus();
     const refuse = (url: string, attr: GateAttribution): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
@@ -1511,6 +1570,7 @@ export function apply(ctx: PluginContext): void {
             persistClientEvent(line);
         }
         if (attr.state !== "ok") noteAttrRefusal(attr.state);
+        noteGateOutcome(attr.state);
         return false;
     };
     // #2924 direction 2: `threw` is an INTERNAL error in the host's
@@ -1537,6 +1597,7 @@ export function apply(ctx: PluginContext): void {
                 if (again.state === "ok") {
                     persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
                     noteAttrRecovery();
+                    noteGateOutcome("ok");
                     return true;
                 }
                 if (again.state === "none") return refuse(url, again);
@@ -1565,6 +1626,7 @@ export function apply(ctx: PluginContext): void {
             threwStreak = 0;
             threwGiveUpNoticed = false;
             noteAttrRecovery();
+            noteGateOutcome("ok");
             return true;
         }
         if (attr.state === "threw") {

@@ -8,6 +8,7 @@
 import { envMillis } from "./native-bootstrap.js";
 import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "../proxy-tool-result.js";
 import type { ToolOutcomeKind } from "../proxy-tool-result.js";
+import type { TakeoverReport } from "../takeover-status.js";
 
 export type ManifestTool = {
     name: string;
@@ -294,6 +295,19 @@ export async function reportRuntimeInfo(proxyBase: string, info: RuntimeInfoRepo
         body: JSON.stringify(info),
     }, STATUS_TIMEOUT_MS);
     if (!ok) throw new Error(`runtime-info report failed (${status})`);
+}
+
+// #3582: push the host's live takeover-health fact over the SAME loopback
+// runtime-info channel (an optional `takeover` field, no model — this is a
+// per-host operational fact, not a model-config report). Fire-and-forget by
+// design: a failed report must never affect model traffic.
+export async function reportTakeoverStatus(proxyBase: string, agent: string, info: TakeoverReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/runtime-info`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent, takeover: info }),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`takeover-status report failed (${status})`);
 }
 
 // Per-(agent, conversation) fingerprint of the last successfully reported

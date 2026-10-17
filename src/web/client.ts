@@ -549,6 +549,35 @@ export const WEB_CLIENT = `(function () {
         }
     }
     function renderBanners(d) {
+        // #3582: takeover-health banner - the single most important cue, kept
+        // ABOVE every other banner. Strong prompt only for the threw state
+        // (internal error, no legitimate source); none is deliberately quiet
+        // here (its numbers stay in /__bili/status for debugging, not a banner:
+        // agentless sidecar traffic is legitimately none, so a banner would
+        // false-alarm). unknown (host stopped heartbeating) must NOT render as
+        // healthy.
+        const tb = $("takeover-banner");
+        if (tb) {
+            const tk = d.takeover;
+            if (tk && typeof tk === "object" && tk.state === "threw") {
+                const eps = Array.isArray(tk.byEndpoint) ? tk.byEndpoint.map((e) => escapeHtml(e.endpoint) + " (" + e.count + ")").join(", ") : "";
+                const epLine = eps ? '<div style="margin-top:4px;font-family:monospace;font-size:12px">' + escapeHtml(t("takeover.refusals_label")) + " " + (tk.refusals || 0) + ": " + eps + "</div>" : "";
+                tb.hidden = false;
+                tb.classList.add("show");
+                tb.innerHTML = "<strong>" + t("takeover.threw_title") + "</strong> " + t("takeover.threw_body")
+                    + '<div style="margin-top:6px">' + t("takeover.threw_action") + "</div>"
+                    + '<div style="margin-top:4px" class="dim">' + t("takeover.threw_confirm") + "</div>"
+                    + epLine;
+            } else if (tk && typeof tk === "object" && tk.state === "unknown") {
+                tb.hidden = false;
+                tb.classList.add("show");
+                tb.innerHTML = "<strong>" + t("takeover.unknown_title") + "</strong> " + t("takeover.unknown");
+            } else {
+                tb.hidden = true;
+                tb.classList.remove("show");
+                tb.innerHTML = "";
+            }
+        }
         // #1870 web surface: critical update notice (#1977 — only critical
         // spans ever reach here; the server sends null otherwise). Kept ABOVE
         // the stale banner: it carries the release context (version + summary),

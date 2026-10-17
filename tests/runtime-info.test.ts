@@ -29,6 +29,7 @@ import {
 } from "../src/plugin.ts";
 import { extractV1Outputs } from "../src/agent/opencode-native.ts";
 import { reportRuntimeInfoOnChange } from "../src/agent/shared.ts";
+import { _resetTakeoverStatusForTest, takeoverStatusWire } from "../src/takeover-status.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function mockRes(): { res: http.ServerResponse; body(): string } {
@@ -151,6 +152,58 @@ describe("runtime-info endpoint handler (#955)", () => {
         assert.equal(runtimeConversationId({ "x-my-sess": "custom" }, {}, "x-my-sess"), "custom");
         // x-bili-plugin-conversation alone (no marker) is not honored — same rule as binding
         assert.equal(runtimeConversationId({ "x-bili-plugin-conversation": "c" }, {}), undefined);
+    });
+});
+
+describe("runtime-info takeover field (#3582)", () => {
+    beforeEach(() => {
+        _resetPluginStateForTest();
+        _resetTakeoverStatusForTest();
+    });
+    afterEach(() => {
+        _resetPluginStateForTest();
+        _resetTakeoverStatusForTest();
+    });
+
+    it("accepts a takeover-only report (no model) and records it", () => {
+        const ok = mockRes();
+        handlePluginRuntimeInfo(
+            JSON.stringify({ agent: "dsh", takeover: { state: "threw", refusals: 4, byEndpoint: [{ endpoint: "https://x/v1", count: 4 }], sinceMs: 1000, hostStartedAtMs: 900 } }),
+            ok.res,
+        );
+        assert.ok(JSON.parse(ok.body()).ok);
+        const w = takeoverStatusWire("dsh");
+        assert.equal(w?.state, "threw");
+        assert.equal(w?.refusals, 4);
+        assert.equal(w?.byEndpoint[0]?.endpoint, "https://x/v1");
+    });
+
+    it("records both the model config and the takeover fact when both are present", () => {
+        const ok = mockRes();
+        handlePluginRuntimeInfo(
+            JSON.stringify({ agent: "dsh", model: "m1", contextWindow: 1000, takeover: { state: "ok", refusals: 0, sinceMs: 1, hostStartedAtMs: 1 } }),
+            ok.res,
+        );
+        assert.ok(JSON.parse(ok.body()).ok);
+        assert.equal(pluginRuntimeInfoFor("dsh", "m1")?.contextWindow, 1000);
+        assert.equal(takeoverStatusWire("dsh")?.state, "ok");
+    });
+
+    it("still rejects a report with neither model nor takeover", () => {
+        const bad = mockRes();
+        handlePluginRuntimeInfo(JSON.stringify({ agent: "dsh" }), bad.res);
+        assert.equal(JSON.parse(bad.body()).ok, false);
+    });
+
+    it("ignores a malformed takeover but still accepts the model part (pre-#3582 fallback)", () => {
+        const ok = mockRes();
+        handlePluginRuntimeInfo(
+            JSON.stringify({ agent: "dsh", model: "m1", contextWindow: 2048, takeover: { state: "bogus" } }),
+            ok.res,
+        );
+        assert.ok(JSON.parse(ok.body()).ok);
+        assert.equal(takeoverStatusWire("dsh"), null);
+        assert.equal(pluginRuntimeInfoFor("dsh", "m1")?.contextWindow, 2048);
     });
 });
 
@@ -538,5 +591,41 @@ describe("runtime-info pre-first-request status (#955)", () => {
         const json = (await resp.json()) as { phase?: string; conversationId: string };
         assert.equal(json.phase, undefined);
         assert.equal(json.conversationId, "conv-pre-1");
+    });
+});
+
+describe("takeover parity on status + overview (#3582, #2152)", () => {
+    let h: Harness | undefined;
+    beforeEach(async () => {
+        _resetTakeoverStatusForTest();
+        h = await startHarness();
+    });
+    afterEach(async () => {
+        await h?.close();
+        h = undefined;
+        _resetTakeoverStatusForTest();
+    });
+
+    it("both /__bili/status and /__bili/overview carry the same takeover object", async () => {
+        const rec = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "dsh", takeover: { state: "threw", refusals: 6, byEndpoint: [{ endpoint: "https://api.deepseek.com/anthropic/v1/messages", count: 6 }], sinceMs: Date.now(), hostStartedAtMs: Date.now() - 60_000 } }),
+        });
+        assert.equal(rec.status, 200);
+
+        const status = (await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/status`)).json()) as { takeover?: unknown };
+        const overview = (await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/overview`)).json()) as { takeover?: unknown };
+        assert.ok(status.takeover);
+        assert.ok(overview.takeover);
+        assert.deepEqual(overview.takeover, status.takeover);
+        const t = status.takeover as { state: string; refusals: number };
+        assert.equal(t.state, "threw");
+        assert.equal(t.refusals, 6);
+    });
+
+    it("omits takeover until any host reports (additive wire field)", async () => {
+        const status = (await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/status`)).json()) as { takeover?: unknown };
+        assert.equal(status.takeover, null);
     });
 });

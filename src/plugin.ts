@@ -68,6 +68,7 @@ import { awaitDrain } from "./server/stream-io.js";
 import { incomingCoreMessages } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
+import { parseTakeoverReport, recordTakeoverStatus } from "./takeover-status.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
 // via tsx and bundled via tsup). Shown in the /acp panel header, aligned with
@@ -581,9 +582,12 @@ export function runtimeConversationId(headers: Record<string, string | string[] 
     return typeof pck === "string" && pck.trim().length > 0 ? pck.trim() : undefined;
 }
 
-/** Accept the bootstrap/model-switch report. Body:
+/** Accept the bootstrap/model-switch report AND the live takeover-health
+ *  heartbeat (#3582). Body:
  *  { agent, model, contextWindow?, maxOutput?, baseURL?, source?,
- *    conversationId? } — agent+model are required; numbers are validated.
+ *    conversationId?, takeover? } — `agent` is always required; at least one
+ *  of `model` (the #955 config report) or a well-formed `takeover` (the host's
+ *  live compression-attribution fact) must be present; numbers are validated.
  *  Loopback-gated like every /__bili/plugin/* endpoint (the route lives
  *  under the same admin gate in server.ts). */
 export function handlePluginRuntimeInfo(payload: string, res: import("node:http").ServerResponse): void {
@@ -595,27 +599,35 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
         return;
     }
-    const body = parsed as { agent?: unknown; model?: unknown; contextWindow?: unknown; maxOutput?: unknown; baseURL?: unknown; conversationId?: unknown; source?: unknown };
+    const body = parsed as { agent?: unknown; model?: unknown; contextWindow?: unknown; maxOutput?: unknown; baseURL?: unknown; conversationId?: unknown; source?: unknown; takeover?: unknown };
     const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
     const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined);
     const agent = str(body.agent, 64);
     const model = str(body.model, 256);
-    if (agent === undefined || model === undefined) {
+    const takeover = parseTakeoverReport(body.takeover);
+    // #3582: a takeover-only heartbeat carries no model — accept it when agent
+    // + a well-formed takeover are present; otherwise fall back to the old
+    // model-required contract. A malformed takeover parses to undefined and so
+    // never satisfies this branch (it degrades to the pre-#3582 behavior).
+    if (agent === undefined || (model === undefined && takeover === undefined)) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "agent and model are required" }));
         return;
     }
-    const conversationId = str(body.conversationId, 256);
-    recordPluginRuntimeInfo({
-        agent,
-        model,
-        contextWindow: num(body.contextWindow),
-        maxOutput: num(body.maxOutput),
-        baseURL: str(body.baseURL, 2048),
-        ...(conversationId !== undefined ? { conversationId } : {}),
-        source: str(body.source, 64) ?? "client-config",
-        ts: Date.now(),
-    });
+    if (takeover !== undefined) recordTakeoverStatus(agent, takeover);
+    if (model !== undefined) {
+        const conversationId = str(body.conversationId, 256);
+        recordPluginRuntimeInfo({
+            agent,
+            model,
+            contextWindow: num(body.contextWindow),
+            maxOutput: num(body.maxOutput),
+            baseURL: str(body.baseURL, 2048),
+            ...(conversationId !== undefined ? { conversationId } : {}),
+            source: str(body.source, 64) ?? "client-config",
+            ts: Date.now(),
+        });
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 }

@@ -320,7 +320,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
 
-**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。
+**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。自动更新只替换磁盘上的包与独立拉起的代理进程，内嵌在长驻宿主里的代码要等宿主**完全重启**后才生效（#3582）；当这样的过期宿主停止接管模型请求时，Web UI 现在会弹出「接管已失效」横幅，而不是静默退化为全价直连。
 
 **自 v0.1.183 起,更新提示默认静默(#1977):**routine/recommended 版本不再在 `/acp` 面板脚注或 `acp_status` 中渲染更新行 —— 只有 `critical` 级别的版本会在那里显示(`CRITICAL UPDATE READY/AVAILABLE`)。检查"已安装未重启"版本的常设途径即上文所列的过期线索:Web UI 横幅、`/acp` 单行警告、以及 `GET /__bili/status`。刻意不设常驻提醒;严重缺陷公告通道(#1481)仍是唯一自动可见的严重路径。
 

@@ -114,6 +114,13 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.storage_degraded": "未来几个版本将默认开启 SQLite 统一存储，但你的系统因 {reason} 暂不支持（已自动回退 JSON 存储，当前不受影响）。请点击下方按钮反馈，帮助我们在默认开启前覆盖你的环境。",
         "sys.report_copy": "复制诊断信息",
         "sys.report_issue": "在 GitHub 反馈",
+        "takeover.threw_title": "接管已失效：",
+        "takeover.threw_body": "压缩已停止，正在按全价直连。原因：接管归因失败。",
+        "takeover.threw_action": "请完全退出 DSH 后重新打开（仅关闭窗口无效）。",
+        "takeover.threw_confirm": "重启后确认面板「当前运行 ≥ 1」即已恢复。",
+        "takeover.refusals_label": "被拒请求",
+        "takeover.unknown_title": "宿主未上报接管状态：",
+        "takeover.unknown": "DSH 可能已退出或失联。若仍在用它，请检查其是否正常运行。",
         "conflict.on": "检测到压缩冲突",
         // #2102: the sentence is composed per kind family present — a ledger full of
         // client-native rewrites must not read as "third-party plugin" evidence.
@@ -594,6 +601,13 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.storage_degraded": "Unified SQLite storage becomes the default in an upcoming release, but this system cannot run it ({reason}). You have been automatically rolled back to JSON storage — nothing is affected today. Please report this so your environment is covered before the flip.",
         "sys.report_copy": "Copy diagnostics",
         "sys.report_issue": "Report on GitHub",
+        "takeover.threw_title": "Takeover failed:",
+        "takeover.threw_body": "Compression has stopped — you are being billed at full price on direct requests. Cause: takeover attribution failed.",
+        "takeover.threw_action": "Fully quit DSH and reopen it (closing the window alone does not work).",
+        "takeover.threw_confirm": "After restarting, confirm the panel shows Live ≥ 1 to verify recovery.",
+        "takeover.refusals_label": "refused requests",
+        "takeover.unknown_title": "Host not reporting takeover status:",
+        "takeover.unknown": "DSH may have exited or lost contact. If you are still using it, check that it is running.",
         "conflict.on": "Compression conflict detected",
         // #2102: composed per kind family present — see the zh entry above.
         "conflict.found": ": traces of ",
