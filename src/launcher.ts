@@ -4372,7 +4372,10 @@ export async function ensureProxyRunning(
                 }
                 if (info?.ok && !squatterAnnounced) {
                     squatterAnnounced = true;
-                    console.error(
+                    // #3575: self-recovering progress diagnostic — host-safe
+                    // channel only; a raw console.* here lands on the TUI
+                    // screen itself in native lanes (see agent/host-log.ts).
+                    attachDiag(
                         `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
                     );
                 }

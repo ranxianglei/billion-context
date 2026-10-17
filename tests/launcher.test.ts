@@ -7552,3 +7552,141 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
         /did not become healthy/,
     );
 });
+
+// #3575: the #1753 squatter wait is a SELF-RECOVERING progress diagnostic —
+// the launch still succeeds once the child's laddered record publishes — so
+// it must ride the host-safe channel (durable log file; stderr only under
+// explicit debug) instead of a raw console.error that lands on the TUI screen
+// itself in native lanes. Scenario builder: foreign pid 875250 squats the
+// preferred port 18787; our child (pid 42451) ladders to 18790 and its
+// launchToken record becomes visible on the SECOND spawn-wait read — the
+// first read sees nothing, so the #1753 squatter branch provably fires before
+// the handshake settles (gating on read count taken AT SPAWN, immune to
+// however many times pre-spawn discovery reads the file).
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
+    let childToken = "";
+    let preSpawnReads = -1;
+    let reads = 0;
+    const deps = {
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async (origin: string) => ({
+            ok: true,
+            pid: origin.endsWith(":18787") ? 875250 : 42451,
+        }),
+        spawnImpl: (_cmd: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+            preSpawnReads = reads;
+            childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+            return makeFakeChild(42451);
+        },
+        sleep: () => Promise.resolve(),
+        listRegistryInstances: () => [],
+        scriptPath: FP_SCRIPT,
+        attachDiag,
+        readInstanceFile: () => {
+            reads += 1;
+            return reads >= preSpawnReads + 2 && childToken !== ""
+                ? recordedInstance({ origin: "http://127.0.0.1:18790", port: 18790, pid: 42451, launchToken: childToken })
+                : undefined;
+        },
+    };
+    return {
+        deps,
+        opts: { host: "127.0.0.1", port: 18787, passthrough: false, debug },
+    };
+}
+function withHomeSandbox(run: () => Promise<void>): Promise<void> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3575-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    return run().finally(() => {
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    });
+}
+function captureStderr(): { writes: string[]; restore: () => void } {
+    const writes: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        writes.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    return { writes, restore: () => { process.stderr.write = origStderrWrite; } };
+}
+function stateLogPath(): string {
+    return path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+}
+
+test("ensureProxyRunning non-debug: squatter wait diagnostic goes to the log file, terminal stays silent (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(false);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790", "client still exported to the child's real (laddered) origin");
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            const content = fs.readFileSync(stateLogPath(), "utf8");
+            const hits = content.split("but is not the proxy this launcher spawned").length - 1;
+            assert.equal(hits, 1, `squatter diagnostic expected exactly once:\n${content}`);
+            assert.ok(content.includes("(pid 875250)"), `foreign pid missing from log:\n${content}`);
+            assert.ok(content.includes("(child pid 42451)"), `child pid missing from log:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning: injected attachDiag receives the squatter diagnostic verbatim, default sink bypassed (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const diag: string[] = [];
+            const scenario = makeSquatterScenario(false, (m) => diag.push(m));
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            assert.deepEqual(diag, [SQUATTER_MSG], `diag calls: ${JSON.stringify(diag)}`);
+            assert.equal(writes.length, 0, `terminal got bytes: ${JSON.stringify(writes)}`);
+            let content = "";
+            try {
+                content = fs.readFileSync(stateLogPath(), "utf8");
+            } catch {}
+            assert.ok(!content.includes("but is not the proxy this launcher spawned"), `default sink must stay untouched when a host injects its own channel:\n${content}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("ensureProxyRunning explicit debug: squatter diagnostic keeps one controlled stderr copy (#3575)", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        try {
+            const scenario = makeSquatterScenario(true);
+            const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
+            assert.equal(handle.origin, "http://127.0.0.1:18790");
+            const expected = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z \\[info\\] \\[v=[^\\]]+\\] ${SQUATTER_MSG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+            const hits = writes.filter((w) => w.includes("but is not the proxy this launcher spawned"));
+            assert.equal(hits.length, 1, `expected exactly one terminal line, got: ${JSON.stringify(writes)}`);
+            assert.ok(expected.test(hits[0].trimEnd()), `stderr line format drifted: ${JSON.stringify(hits[0])}`);
+            assert.equal(writes.length, 1, `unexpected extra terminal output: ${JSON.stringify(writes)}`);
+        } finally {
+            restore();
+        }
+    });
+});
