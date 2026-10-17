@@ -462,29 +462,6 @@ Top-level keys that control how the proxy listens and behaves globally.
   }
   ```
 
-### dsh native compaction and custom agent presets
-
-`#3354` stands dsh native basic compaction down at load time (rows marked `disabled: true`) and gates each preset entry on the `biliBasicCompactionPolicy` service so the overlay cannot lose the import race. The gate list is the built-in roster only:
-
-```ts
-// src/agent/dsh-compaction-disable.ts
-const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
-```
-
-A preset declared by a **third-party bundle** — any entry whose `name` is `'@deepseek-ai/dsh-agent-preset'` in some bundle's own `cordis.patch.yml`, which is how an assistant preset installed as its own bundle is declared — is not in that roster and carries no `inject: [biliBasicCompactionPolicy]`. Its rows can then resolve before bili's overlay is registered, so dsh native compaction stays armed and every compaction call is refused at the wire (`#1729`, `422 dsh_compaction_refused`) with nothing visible in the UI. Add the gate yourself:
-
-```yaml
-# `/.dsh/profiles/<profile>/cordis.patch.yml
-- id: <your preset id>
-  inject: [biliBasicCompactionPolicy]
-```
-
-A full-snapshot override of that preset's `compaction-basic` row (`#2474`) also works; `config` is replaced wholesale there, so restate its defaults. Setting `dsh.allowDshCompaction` to `true` is the other way out, and the irreversible one: the checkpoint shadows the raw history.
-
-Under a **dsh native install** (`bili plugin install dsh`) the launcher's overlay patch is not written at all — `writeDshAcpPatch` is skipped when `dshNativeInstalled()` (`src/launcher.ts`) — so the gate has to live in the profile's own patch layer. The boot warning says that; this section says which layer, and why the roster cannot reach you.
-
-What it costs to leave a custom preset ungated — one Android/proot device, dsh 2.0.0-rc.2 + bili 0.1.197, 98 sessions of which 70 ran a custom preset: 5,090 compaction calls refused (3,254 of them in a single session). That session's inbound averaged **16.67 MiB per step** against 0.36–0.99 MiB for the gated ones — 57.7 GiB over 23 hours. The refused replay also fed the `#2490` planning floor, so the output budget was clamped 113 times (e.g. 10033 -> 4220) and the step count roughly doubled. Gating the preset (or opting in, as that device ultimately did) ended the storm.
-
 ### `compat`
 
 - **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; noCacheControl?: boolean; keepResponseId?: boolean }`
@@ -2269,6 +2246,29 @@ Automatic pressure/overflow compaction is off (and with the strong variant the w
 Because a partial override fails without any diagnostic, always re-dump and compare entry counts after editing.
 - Under the opencode launcher/native mode a present `opencode-acp` is info-only by design (#920 absorbs it for legacy sessions); everywhere else it warns.
 - Disable: `BILI_CONFLICT_SCAN=0`.
+
+### dsh native compaction and custom agent presets
+
+`#3354` stands dsh native basic compaction down at load time (rows marked `disabled: true`) and gates each preset entry on the `biliBasicCompactionPolicy` service so the overlay cannot lose the import race. The gate list is the built-in roster only:
+
+```ts
+// src/agent/dsh-compaction-disable.ts
+const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
+```
+
+A preset declared by a **third-party bundle** — any entry whose `name` is `'@deepseek-ai/dsh-agent-preset'` in some bundle's own `cordis.patch.yml`, which is how an assistant preset installed as its own bundle is declared — is not in that roster and carries no `inject: [biliBasicCompactionPolicy]`. Its rows can then resolve before bili's overlay is registered, so dsh native compaction stays armed and every compaction call is refused at the wire (`#1729`, `422 dsh_compaction_refused`) with nothing visible in the UI. Add the gate yourself:
+
+```yaml
+# $DSH_HOME/profiles/<profile>/cordis.patch.yml
+- id: <your preset id>
+  inject: [biliBasicCompactionPolicy]
+```
+
+A full-snapshot override of that preset's `compaction-basic` row (`#2474`) also works; `config` is replaced wholesale there, so restate its defaults. Setting `dsh.allowDshCompaction` to `true` is the other way out, and the irreversible one: the checkpoint shadows the raw history.
+
+Under a **dsh native install** (`bili plugin install dsh`) the launcher's overlay patch is not written at all — `writeDshAcpPatch` is skipped when `dshNativeInstalled()` (`src/launcher.ts`) — so the gate has to live in the profile's own patch layer. The boot warning says that; this section says which layer, and why the roster cannot reach you.
+
+What it costs to leave a custom preset ungated — one Android/proot device, dsh 2.0.0-rc.2 + bili 0.1.197, 98 sessions of which 70 ran a custom preset: 5,090 compaction calls refused (3,254 of them in a single session). That session's inbound averaged **16.67 MiB per step** against 0.36–0.99 MiB for the gated ones — 57.7 GiB over 23 hours. The refused replay also fed the `#2490` planning floor, so the output budget was clamped 113 times (e.g. 10033 -> 4220) and the step count roughly doubled. Gating the preset (or opting in, as that device ultimately did) ended the storm.
 
 ---
 
