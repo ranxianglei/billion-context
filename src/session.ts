@@ -1,7 +1,7 @@
 import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
-import { getStore, effectiveFileStorageMode } from "./persist.js";
+import { getStore } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile } from "./config.js";
@@ -1052,9 +1052,10 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
         stats: zeroStats(),
-        // #3093: stamp provenance on the LIVE object too — the web detail panel
-        // reads live sessions directly; buildRecord re-stamps the same values on save.
-        metadata: { biliVersion: VERSION, storageMode: effectiveFileStorageMode() },
+        // #3093/#3135③: stamp provenance on the LIVE object too — the web detail
+        // panel reads live sessions directly; buildRecord re-stamps the same
+        // value on save (the store's construction-time mode, not the knob).
+        metadata: { biliVersion: VERSION, storageMode: getStore().stampMode },
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),

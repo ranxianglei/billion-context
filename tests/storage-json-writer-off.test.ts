@@ -134,6 +134,51 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
     }
 });
 
+test("jsonWriter=off (full): the 3-strike disable tick arms a JSON write in the same tick (#3135①)", async () => {
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_STORAGE_JSON_WRITER = "off";
+    try {
+        const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-seed-"));
+        const session = loadCorpusCase(seed, "folded", "corpus-folded", "anthropic");
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-flip-"));
+        try {
+            const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            // Force every unified ingest to fail so the sidecar hits its
+            // 3-consecutive-failure self-disable on the third save.
+            const shadow = (store as unknown as { shadow: { stats: { disabled: boolean }; store: { ingestSession: (...args: unknown[]) => void } } }).shadow;
+            const realIngest = shadow.store.ingestSession.bind(shadow.store);
+            shadow.store.ingestSession = () => { throw new Error("simulated sqlite failure"); };
+            try {
+                assert.equal(store.flushSync(session), true);
+                assert.equal(shadow.stats.disabled, false);
+                assert.equal(envelopeFiles(dir).length, 0, "transient failures must not arm the legacy writer");
+                assert.equal(store.flushSync(session), true);
+                assert.equal(shadow.stats.disabled, false);
+                assert.equal(envelopeFiles(dir).length, 0);
+                // Strike 3 flips the sidecar off — this tick must not be memory-only.
+                assert.equal(store.flushSync(session), true);
+                assert.equal(shadow.stats.disabled, true, "third consecutive failure must disable the sidecar");
+                assert.equal(envelopeFiles(dir).length, 1, "the disabling tick must arm a legacy JSON write in the same tick");
+                // After the flip the normal legacy path writes again.
+                session.stats.requests += 1;
+                assert.equal(store.flushSync(session), true);
+                assert.equal(envelopeFiles(dir).length, 1);
+            } finally {
+                shadow.store.ingestSession = realIngest;
+                store.cancelAll();
+                store.closeQuietly();
+            }
+        } finally {
+            rmBestEffort(dir);
+            rmBestEffort(seed);
+        }
+    } finally {
+        delete process.env.BILI_STORAGE_JSON_WRITER;
+        process.env.BILI_STORAGE_UNIFIED = prevMode;
+    }
+});
+
 test("jsonWriter=off is ignored under shadow (JSON stays the sole source of truth)", async () => {
     const prevMode = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "1"; // shadow

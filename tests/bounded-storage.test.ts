@@ -160,6 +160,48 @@ test("bounded boot preserves unified-first reads when the JSON copy is older", a
     }
 });
 
+test("bounded boot warms index-only sessions through the index union (#3135⑥)", async () => {
+    const previous = process.env.BILI_STORAGE_UNIFIED;
+    const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_STORAGE_JSON_WRITER = "off";
+    try {
+        await fixture(async (dir, store) => {
+            const session = createSession("ses_index_only_bounded", { label: "ses_index_only_bounded" });
+            session.stats.requests = 5;
+            await store.writeNow(session);
+            assert.ok(!existsSync(path.join(dir, relPathFor(session.id))), "jsonWriter=off leaves no envelope behind");
+            const warm = await store.boot({ maxSessions: 2, maxBytes: 40000 });
+            assert.equal(warm.get(session.id)?.stats.requests, 5, "bounded boot must warm index-only sessions via the index union");
+        });
+    } finally {
+        if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = previous;
+        if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER; else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
+    }
+});
+
+test("lazy reload re-imports the envelope when the JSON copy is newer than the index (#3135⑥)", async () => {
+    const previous = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        await fixture(async (dir, store) => {
+            const session = createSession("ses_newer_json", { label: "ses_newer_json" });
+            session.stats.requests = 9;
+            await store.writeNow(session);
+            const file = path.join(dir, relPathFor(session.id));
+            const envelope = JSON.parse(readFileSync(file, "utf8"));
+            envelope.payload.stats.requests = 42;
+            envelope.payload.savedAt = Date.now() + 60_000;
+            writeFileSync(file, JSON.stringify(envelope));
+            await store.boot({ maxSessions: 0, maxBytes: 0 });
+            const resumed = store.loadSync(session.id);
+            assert.equal(resumed?.stats.requests, 42, "a newer JSON copy must win over the stale index row");
+        });
+    } finally {
+        if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = previous;
+    }
+});
+
 test("warm budget counts decoded bytes, not compressed disk size (#2803 zstd)", async () => {
     const previous = process.env.BILI_PERSIST_ZSTD;
     process.env.BILI_PERSIST_ZSTD = "1";

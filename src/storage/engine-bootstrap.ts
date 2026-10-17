@@ -217,14 +217,16 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     }
     const spec = activeSpec();
     const target = platformOverride ?? platformTargetKey();
-    if (cacheUsable(finalDir(spec.version), target)) {
-        if (!tryRegisterFromCache(finalDir(spec.version))) {
-            // Bytes were sha-verified when cached, so an unloadable copy means
-            // an environment change (e.g. major Node upgrade) — keep warning,
-            // never re-loop the download, never brick startup.
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
-        }
-        return { status: "cache-hit", detail: target };
+    const pinnedDir = finalDir(spec.version);
+    if (cacheUsable(pinnedDir, target)) {
+        if (tryRegisterFromCache(pinnedDir)) return { status: "cache-hit", detail: target };
+        // #3135⑤: an unloadable cached copy used to park EVERY boot on
+        // "cache-hit" plus a permanent degraded banner. The sha512 pin makes
+        // re-downloading safe, so remove the dead copy and run the normal
+        // ladder; a fresh download that ALSO fails to load arms the cooldown
+        // below, bounding any retry loop to one attempt per window.
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy at ${pinnedDir} present but unloadable — removing it and re-running the bootstrap`);
+        await fsp.rm(pinnedDir, { recursive: true, force: true }).catch(() => {});
     }
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };
@@ -240,11 +242,16 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     loggerLog("info", `[storage] sqlite engine self-bootstrap: downloading better-sqlite3@${spec.version} (~11 MB) from ${engineMirrors().join(" → ")} ...`);
     try {
         await downloadAndInstall(spec, target, opts.resolveProxy);
-        if (!tryRegisterFromCache(finalDir(spec.version))) {
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
+        if (!tryRegisterFromCache(pinnedDir)) {
+            // #3135⑤: bytes verified but unloadable in THIS environment — arm
+            // the cooldown so the next boot's rm-leg above hits the marker and
+            // returns "cooldown" instead of re-downloading in a loop.
+            await writeCooldown("freshly downloaded copy failed to load");
+            loggerLog("warn", `[storage] sqlite engine self-bootstrap: freshly downloaded copy failed to load — retrying after ${COOLDOWN_MS / 3_600_000}h`);
+            return { status: "downloaded", detail: target };
         }
         await clearCooldown();
-        await pruneSiblingVersions(finalDir(spec.version));
+        await pruneSiblingVersions(pinnedDir);
         loggerLog("info", `[storage] sqlite engine self-bootstrap: ok — engine=better-sqlite3(self-downloaded v${spec.version})`);
         return { status: "downloaded", detail: target };
     } catch (err) {

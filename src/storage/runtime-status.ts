@@ -14,13 +14,17 @@
  *   - cli.ts:        recordEngineBootstrap(ensureSqliteEngine outcome)
  *   - shadow.ts:     recordSidecarOpenFailure / recordSidecarInstance
  *                    (inside UnifiedShadow.maybeOpen)
- *   - persist.ts:    recordRequestedMode(mode, encryptionBlocked) — the
- *                    SessionStore constructor is the single mode-resolution
- *                    seam, so it also owns the requested-mode record.
+ *   - persist.ts:    recordRequestedMode(mode, encryptionBlocked) +
+ *                    recordPersistDisabled(!enabled) — the SessionStore
+ *                    constructor is the single mode-resolution seam, so it
+ *                    also owns the requested-mode and persistence records.
  *
- * The BILI_ENCRYPTION_KEY opt-out is INTENTIONAL legacy-only (index.db would
- * hold cleartext payloads); it is reported as intentionalOptOut and must NOT
- * raise the degraded warning.
+ * Two conditions are INTENTIONAL legacy-only and must NOT raise the degraded
+ * warning (reported as intentionalOptOut): the BILI_ENCRYPTION_KEY block
+ * (index.db would hold cleartext payloads) and persistence disabled
+ * (BILI_PERSIST=0 / persist.enabled=false — #3135②: the sidecar is never
+ * even attempted, so a "degraded" banner with a bogus engine reason was a
+ * false alarm that shipped users misleading diagnostic blobs).
  */
 
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
@@ -33,13 +37,16 @@ interface RuntimeState {
     /** Recorded by the SessionStore constructor; null only before first store build. */
     requested: StorageMode | null;
     encryptionBlocked: boolean;
+    /** Persistence disabled for this process (#3135②): the sidecar is never
+     *  attempted at all — an intentional opt-out, same class as encryption. */
+    persistDisabled: boolean;
     sidecar: UnifiedShadow | null;
     sidecarOpenError: string | null;
     bootstrap: BootstrapOutcome | null;
 }
 
 function freshState(): RuntimeState {
-    return { requested: null, encryptionBlocked: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
+    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
 }
 
 let state: RuntimeState = freshState();
@@ -61,6 +68,10 @@ export function recordSidecarInstance(shadow: UnifiedShadow): void {
 export function recordRequestedMode(mode: StorageMode, encryptionBlocked: boolean): void {
     state.requested = mode;
     state.encryptionBlocked = encryptionBlocked;
+}
+
+export function recordPersistDisabled(disabled: boolean): void {
+    state.persistDisabled = disabled;
 }
 
 export function _resetStorageRuntimeStatusForTest(): void {
@@ -125,11 +136,18 @@ interface StorageRuntimeStatus {
     effective: "legacy" | "shadow" | "full";
     /** Requested a unified mode but the sidecar is not carrying data. */
     degraded: boolean;
-    /** BILI_ENCRYPTION_KEY opt-out — intentional legacy-only, never warns. */
+    /** Intentional legacy-only opt-out (encryption block OR persistence
+     *  disabled) — never warns. */
     intentionalOptOut: boolean;
+    persistenceDisabled: boolean;
     /** Human-readable degrade cause (set iff degraded). */
     reason: string | null;
     engine: { name: string; source: string } | null;
+    /** Ingest verification tallies (#3135④): a non-zero drift count means
+     *  some session's unified replay no longer matches the legacy view —
+     *  surfaced for field diagnosis instead of staying in one-time logs. */
+    verifyOk: number;
+    verifyDrift: number;
     bootstrap: string | null;
     bootstrapFailure: { atMs: number; reason: string } | null;
     cooldownRemainingMs: number | null;
@@ -142,7 +160,7 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
     // Fallback before the first SessionStore build: full knob resolution
     // (a running server always has a store, so this path is defensive).
     const requested = state.requested ?? resolveStorageMode(process.env, fileStorageUnified());
-    const intentionalOptOut = state.encryptionBlocked;
+    const intentionalOptOut = state.encryptionBlocked || state.persistDisabled;
     const sidecar = state.sidecar;
     const disabled = !!sidecar?.stats.disabled;
     // healthy sidecar ⇒ its mode === requested (maybeOpen opens only under
@@ -156,8 +174,11 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         effective,
         degraded,
         intentionalOptOut,
+        persistenceDisabled: state.persistDisabled,
         reason: degraded ? degradeReason() : null,
         engine: sidecar ? { name: sidecar.engine, source: sidecar.engineSource } : null,
+        verifyOk: sidecar?.stats.verifyOk ?? 0,
+        verifyDrift: sidecar?.stats.verifyDrift ?? 0,
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,
@@ -176,6 +197,8 @@ interface StorageStatusWire {
     intentionalOptOut: boolean;
     reason: string | null;
     engine: { name: string; source: string } | null;
+    verifyOk: number;
+    verifyDrift: number;
     bootstrap: string | null;
     bootstrapFailure: { atMs: number; reason: string } | null;
     cooldownRemainingMs: number | null;
@@ -191,6 +214,8 @@ export function storageStatusWire(): StorageStatusWire {
         intentionalOptOut: st.intentionalOptOut,
         reason: st.reason,
         engine: st.engine,
+        verifyOk: st.verifyOk,
+        verifyDrift: st.verifyDrift,
         bootstrap: st.bootstrap,
         bootstrapFailure: st.bootstrapFailure,
         cooldownRemainingMs: st.cooldownRemainingMs,
@@ -212,9 +237,10 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
     const lines: string[] = [
         "--- storage ---",
         `requested mode: ${st.requested}`,
-        `effective mode: ${st.effective}${st.intentionalOptOut ? " (BILI_ENCRYPTION_KEY opt-out — intentional)" : ""}`,
+        `effective mode: ${st.effective}${st.intentionalOptOut ? ` (${st.persistenceDisabled ? "persistence disabled" : "BILI_ENCRYPTION_KEY opt-out"} — intentional)` : ""}`,
         ...(st.degraded && st.reason ? [`degrade reason: ${st.reason}`] : []),
         `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}` : "none"}`,
+        ...(st.engine ? [`digest verify: ok=${st.verifyOk} drift=${st.verifyDrift}`] : []),
         `engine bootstrap: ${st.bootstrap ?? "not run"}`,
         ...(st.bootstrapFailure ? [`bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining)` : ""}`] : []),
         `BILI_STORAGE_UNIFIED: ${env.BILI_STORAGE_UNIFIED ?? "(unset)"}`,

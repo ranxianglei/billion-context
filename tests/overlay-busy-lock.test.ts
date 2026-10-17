@@ -272,6 +272,17 @@ test("six racing processes: exactly one wins the lease (#1952)", { timeout: 60_0
             try { c.kill("SIGTERM"); } catch {}
         }
     }
+    // Reap before cleanup: on Windows a killed child's tsx-cache handles outlive the
+    // SIGTERM and make rmSync throw ENOTEMPTY if any racer is still winding down (#3144 CI).
+    await Promise.all(
+        children.map(
+            (c) =>
+                new Promise<void>((resolve) => {
+                    if (c.exitCode !== null || c.signalCode !== null) resolve();
+                    else c.once("close", () => resolve());
+                }),
+        ),
+    );
     assert.equal(
         results.filter((r) => r === "WIN").length,
         1,

@@ -368,6 +368,89 @@ test("bootstrap: happy path downloads, verifies sha, extracts, registers loader;
     }
 });
 
+test("bootstrap: unloadable complete cache copy is removed and re-downloaded once (#3135⑤)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        // Pre-materialize a COMPLETE cache layout whose loader throws on
+        // require: cacheUsable() passes, registration fails.
+        const target = platformTargetKey();
+        const dir = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+        fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
+        fs.mkdirSync(path.join(dir, "prebuilds"), { recursive: true });
+        fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+        fs.writeFileSync(path.join(dir, "lib", "index.js"), "throw new Error('corrupted cache copy');");
+        fs.writeFileSync(path.join(dir, "prebuilds", `${target}.node`), Buffer.from("FAKE-NODE-BINARY"));
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.deepEqual(out.status, "downloaded", `expected self-healing re-download, got ${JSON.stringify(out)}`);
+            assert.equal(reg!.requests(), 1, "the broken copy must be replaced by one fresh download");
+            // The healed copy now loads through the driver.
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            assert.equal(o.source, "self-downloaded");
+            o.db.close();
+            // Second boot: healthy cache hit, no further traffic.
+            resetEngineBootstrapForTests();
+            setPreferredSqliteEngineForTests(null);
+            const out2 = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out2.status, "cache-hit");
+            assert.equal(reg!.requests(), 1);
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "no cooldown marker after a successful heal");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: freshly downloaded-but-unloadable copy arms the cooldown instead of looping (#3135⑤)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        // The registry serves a package whose loader throws on require; the
+        // spec pins THIS tgz's sha so verification passes and extraction
+        // succeeds — only the final registration fails.
+        const badTgz = buildTgz([
+            { name: "package/package.json", content: JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }) },
+            { name: "package/lib/index.js", content: "throw new Error('broken build');" },
+            ...ALL_TARGETS.map((t) => ({ name: `package/prebuilds/${t}.node`, content: Buffer.from(`FAKE-NODE-BINARY:${t}`) })),
+        ]);
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(badTgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(badTgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.deepEqual(out.status, "downloaded");
+            assert.equal(reg!.requests(), 1);
+            const marker = path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json");
+            assert.ok(fs.existsSync(marker), "registration failure after a verified download must arm the cooldown");
+            const body = JSON.parse(fs.readFileSync(marker, "utf8")) as { reason?: string };
+            assert.match(body.reason ?? "", /failed to load/);
+            // Next boot: the rm leg sees the active cooldown and stops — no
+            // per-boot re-download loop against a genuinely broken build.
+            resetEngineBootstrapForTests();
+            setPreferredSqliteEngineForTests(null);
+            const out2 = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out2.status, "cooldown");
+            assert.equal(reg!.requests(), 1, "cooldown must bound the retry to one download per window");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
 test("bootstrap: sha512 mismatch quarantines the download and arms the cooldown", async () => {
     const cachePrev = isolateCache();
     let reg: MockRegistry | null = null;
