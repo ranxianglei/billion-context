@@ -1888,8 +1888,12 @@ type FileConfig = {
      *  instead of retaining an unbounded raw copy. Default 100 MiB; `0`
      *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
     plugin?: { snapshotCapBytes?: number };
-    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
-    update?: { registry?: string; checkIntervalMs?: number };
+    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS.
+     *  `staggerMinDelayMs`/`staggerMaxDelayMs` override the LOCAL base window of
+     *  the #3619 staggered rollout (remote policy `default`/overrides still stack
+     *  on top); `policyUrl` overrides the remote policy file URL (test seam —
+     *  production stays pinned to the official repo). */
+    update?: { registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number; staggerMaxDelayMs?: number; policyUrl?: string };
     /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
      *  ACP_RAW_DUMP_DIR / BILI_DUMP_4XX* / ACP_RENDER_NONE / ACP_NO_INJECT_TOOL /
      *  ACP_NO_COMPRESS_PROMPT / ACP_COUNT_TOKENS_PASSTHROUGH / ACP_COMPRESS_PROTOCOL. */

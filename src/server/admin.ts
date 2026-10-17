@@ -27,6 +27,7 @@ import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
+import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
@@ -895,6 +896,24 @@ function currentAdvisoryPayload() {
     return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
 }
 
+/** #3619: the `updatePolicy` field exposed by BOTH /__bili/status and
+ *  /__bili/overview (same single-source discipline as the advisory payload):
+ *  whether auto-upgrades are frozen/pinned right now, which policy source is
+ *  in effect, and the staggered upgrade moment when one is pending. */
+function updatePolicyPayload() {
+    const st = getUpdatePolicyState();
+    const planned = getPlannedUpgrade();
+    return {
+        source: st?.source ?? "unknown",
+        fetchedAt: st?.fetchedAt !== undefined ? new Date(st.fetchedAt).toISOString() : null,
+        hold: st?.doc?.hold ?? false,
+        pinned: st?.doc?.pinned ?? null,
+        blocked: st?.doc?.blocked ?? [],
+        error: st?.error ?? null,
+        plannedUpgrade: planned ? { tag: planned.tag, version: planned.version, at: new Date(planned.at).toISOString() } : null,
+    };
+}
+
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
@@ -928,7 +947,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -979,6 +998,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
+        updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
         inFlight: totalInFlight(),

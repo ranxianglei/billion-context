@@ -29,6 +29,12 @@ import { rmrf } from "./tmp-rm.ts";
 
 const root = mkdtempSync(path.join(tmpdir(), "bc-owner-lane-backoff-"));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
+// #3619: the profile/pi lanes now pass through the update-policy gate before
+// the backoff logic — stagger 0/0 + an unroutable policy URL keep this suite
+// hermetic (same discipline as update-dsh-self-refresh.test.ts).
+process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
+process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
+process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
 const {
     refreshDshDesktopCopy,
@@ -50,6 +56,9 @@ const { setLogCapture } = await import("../src/logger.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
+    delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
+    delete process.env.BILI_UPDATE_POLICY_URL;
     rmrf(root);
 });
 

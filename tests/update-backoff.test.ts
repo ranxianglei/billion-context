@@ -15,6 +15,12 @@ import path from "node:path";
 const root = mkdtempSync(path.join(tmpdir(), "bc-backoff-test-"));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
 process.env.BILI_UPDATE_CHECK_INTERVAL_MS = "1";
+// #3619: this suite pins backoff mechanics, not rollout timing — keep legacy
+// immediate upgrades (stagger 0/0) and an unroutable policy URL so no cycle
+// depends on external network state.
+process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
+process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
+process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 const { checkForUpdate, backoffMs, _resetInstallBackoffForTest } = await import("../src/update.ts");
 const { setLogCapture } = await import("../src/logger.ts");
 
@@ -79,6 +85,9 @@ test("checkForUpdate: a persistently failing install backs off instead of retryi
         await _resetInstallBackoffForTest();
         delete process.env.XDG_CACHE_HOME;
         delete process.env.BILI_UPDATE_CHECK_INTERVAL_MS;
+        delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
+        delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
+        delete process.env.BILI_UPDATE_POLICY_URL;
         rmSync(root, { recursive: true, force: true });
     }
 });

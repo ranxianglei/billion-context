@@ -59,6 +59,27 @@ entries:
     group: updates
     desc_en: "Interval between npm registry version checks."
     desc_zh: "npm registry 版本检查间隔。"
+  - key: update.staggerMinDelayMs
+    type: number
+    default: "900000 (built-in 15 min)"
+    env: BILI_UPDATE_STAGGER_MIN_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: lower bound of this machine's base upgrade-delay window in ms; 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口下限（毫秒）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。"
+  - key: update.staggerMaxDelayMs
+    type: number
+    default: "172800000 (built-in 48 h)"
+    env: BILI_UPDATE_STAGGER_MAX_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window in ms; together with min 0 restores legacy immediate upgrades."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限（毫秒）；与 min=0 一起恢复立即升级。"
+  - key: update.policyUrl
+    type: string
+    default: "official repo raw URL"
+    env: BILI_UPDATE_POLICY_URL
+    group: updates
+    desc_en: "Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo)."
+    desc_zh: "远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。"
   - key: advisoryCheck
     type: boolean
     default: "true"

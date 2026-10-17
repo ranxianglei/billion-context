@@ -385,6 +385,32 @@ export function updateCheckIntervalMs(): number {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : 3 * 60 * 1000;
 }
 
+/** BILI_UPDATE_POLICY_URL > update.policyUrl > undefined (caller applies the
+ *  official-repo raw default). The override exists for TESTS — the production
+ *  URL is fixed to the official repo (#3619 security boundary). */
+export function updatePolicyUrl(): string | undefined {
+    const envRaw = process.env.BILI_UPDATE_POLICY_URL;
+    if (envRaw !== undefined && envRaw.trim().length > 0) return envRaw.trim();
+    const f = loadConfigFile().update?.policyUrl;
+    return typeof f === "string" && f.trim().length > 0 ? f.trim() : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MIN_MS > update.staggerMinDelayMs > undefined. The
+ *  undefined result means "not set locally": the caller composes with the
+ *  remote policy's default window and then the built-in 15-min floor (#3619).
+ *  0 is valid: it disables the delay for this machine (legacy immediate). */
+export function updateStaggerMinDelayMs(): number | undefined {
+    const v = tNumLoose("BILI_UPDATE_STAGGER_MIN_MS", loadConfigFile().update?.staggerMinDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
+/** BILI_UPDATE_STAGGER_MAX_MS > update.staggerMaxDelayMs > undefined (built-in 48 h).
+ *  0 is valid: together with min 0 it restores legacy immediate upgrades. */
+export function updateStaggerMaxDelayMs(): number | undefined {
+    const v = tNumLoose("BILI_UPDATE_STAGGER_MAX_MS", loadConfigFile().update?.staggerMaxDelayMs);
+    return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
 // --- CCR / codex / misc host-adjacent knobs ---
 
 /** BILI_PUBLIC_SNAPSHOT_CAP_BYTES > plugin.snapshotCapBytes > 100 MiB (#2017

@@ -37,7 +37,8 @@ import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-chann
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs } from "./knobs.js";
+import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs, updatePolicyUrl as knobUpdatePolicyUrl, updateStaggerMinDelayMs as knobUpdateStaggerMinDelayMs, updateStaggerMaxDelayMs as knobUpdateStaggerMaxDelayMs } from "./knobs.js";
+import { POLICY_URL_DEFAULT, ensureStaggerDraw, loadUpdatePolicy, resolveStaggerWindow, resolveUpgradeCandidate, setPlannedUpgrade, staggerKey } from "./update-policy.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -1129,6 +1130,12 @@ export async function refreshDshProfileCopy(
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    // #3619: the periodic self-check obeys the same policy gate as the global
+    // lane (hold / pin / block / stagger). The post-global-install convergence
+    // paths deliberately bypass it: that version already passed the gate.
+    const gate = await passUpdatePolicyGate({ packageName: opts.packageName, currentVersion, latest, tag: normalizeUpdateTag(opts.updateTag), force: false, resolveProxy: opts.resolveProxy });
+    if ("reason" in gate) return;
+    const target = gate.candidate;
     log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
     const lock = await tryAcquireLock();
     if (!lock) {
@@ -1136,8 +1143,8 @@ export async function refreshDshProfileCopy(
         return;
     }
     try {
-        await runProfileBundlesRefresh(latest, log, env);
-        await refreshDshDesktopCopy(latest, log, env);
+        await runProfileBundlesRefresh(target, log, env);
+        await refreshDshDesktopCopy(target, log, env);
     } finally {
         await lock.release();
     }
@@ -1238,6 +1245,16 @@ export async function refreshPiNpmCopy(
         log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    // #3619: same policy gate as the other lanes. pi's owner channel
+    // (`pi update --extension <spec>`) installs whatever LATEST resolves to —
+    // it cannot express a stepped target, so a pin/block that moves the
+    // candidate below latest is a skip here rather than a wrong install.
+    const gate = await passUpdatePolicyGate({ packageName: opts.packageName, currentVersion, latest, tag: normalizeUpdateTag(opts.updateTag), force: false, resolveProxy: opts.resolveProxy });
+    if ("reason" in gate) return;
+    if (gate.candidate !== latest) {
+        log("info", `[update] policy selected ${gate.candidate} below dist-tag ${latest}; not driving pi update (it would install ${latest}) — manual escape: pi update --extension ${PI_NPM_SPEC}@${gate.candidate}`);
+        return;
+    }
     if (await backoffInCooldown(ownerLaneKey("pi-npm", latest))) return; // #2192: inside the backoff window — no spawn
     log("info", `[update] pi npm copy is stale (${currentVersion} → ${latest}) — refreshing via pi's update channel`);
     const lock = await tryAcquireLock();
@@ -1330,6 +1347,87 @@ export async function convergeDshProfileBundles(
     } finally {
         await lock.release();
     }
+}
+
+/** #3619: the shared policy gate every automatic upgrade path passes through
+ *  after "newer version found": remote policy fetch (fail-open) → hold →
+ *  pinned/blocked candidate resolution → stagger draw. Returns `{candidate}`
+ *  on go or `{reason}` on stop; stop reasons are logged here, deduped per
+ *  process. Manual updates (force=true) skip hold + stagger but still resolve
+ *  pinned/blocked — those are version-level facts, not pacing. Never throws:
+ *  any unexpected failure degrades to the legacy immediate install of the
+ *  dist-tag version. */
+const policyGateLogged = new Set<string>();
+
+function policyGateLogOnce(key: string, message: string): void {
+    if (policyGateLogged.has(key)) return;
+    policyGateLogged.add(key);
+    loggerLog("info", message);
+}
+
+async function passUpdatePolicyGate(args: {
+    packageName: string;
+    currentVersion: string;
+    latest: string;
+    tag: string;
+    force: boolean;
+    resolveProxy?: (url: string) => string | undefined;
+}): Promise<{ candidate: string } | { reason: string }> {
+    const { force } = args;
+    try {
+        const policy = await loadUpdatePolicy({ url: knobUpdatePolicyUrl() ?? POLICY_URL_DEFAULT, resolveProxy: args.resolveProxy });
+        const doc = policy.doc;
+        if (!force && doc?.hold) {
+            setPlannedUpgrade(undefined);
+            policyGateLogOnce("policy:hold", `[update] HOLD active in the remote update policy — ${args.latest} is available but auto-upgrade is frozen fleet-wide until the owner lifts it; manual escape: \`bili update\` (bypasses hold) or npm install -g ${args.packageName}@${args.latest} (#3619)`);
+            return { reason: "hold" };
+        }
+        let candidate = args.latest;
+        if (doc && (doc.pinned !== null || doc.blocked.length > 0)) {
+            const res = await resolveUpgradeCandidate({
+                currentVersion: args.currentVersion,
+                latest: args.latest,
+                doc,
+                packumentUrl: `${REGISTRY_BASE}/${encodeURIComponent(args.packageName)}`,
+                resolveProxy: args.resolveProxy,
+            });
+            if (res.kind === "deferred") {
+                setPlannedUpgrade(undefined);
+                policyGateLogOnce("policy:deferred", `[update] ${res.reason} (#3619)`);
+                return { reason: "deferred" };
+            }
+            if (res.kind === "none") {
+                setPlannedUpgrade(undefined);
+                policyGateLogOnce(`policy:none:${res.reason}`, `[update] ${res.reason} — staying at ${args.currentVersion} (#3619)`);
+                return { reason: "none" };
+            }
+            candidate = res.candidate;
+            if (candidate !== args.latest) {
+                policyGateLogOnce(`policy:stepped:${args.latest}->${candidate}`, `[update] installing ${candidate} instead of dist-tag ${args.latest} per the remote policy (#3619)`);
+            }
+        }
+        if (!force) {
+            const win = resolveStaggerWindow(candidate, doc, knobUpdateStaggerMinDelayMs(), knobUpdateStaggerMaxDelayMs());
+            const now = Date.now();
+            const draw = await ensureStaggerDraw({ key: staggerKey(args.tag, candidate), minDelayMs: win.minMs, maxDelayMs: win.maxMs, now });
+            if (draw.at > now) {
+                setPlannedUpgrade({ tag: args.tag, version: candidate, at: draw.at });
+                const mins = Math.max(1, Math.round((draw.at - now) / 60_000));
+                policyGateLogOnce(`policy:stagger:${args.tag}:${candidate}:${draw.at}`, `[update] staggered rollout (#3619): upgrade to ${candidate} scheduled for ${new Date(draw.at).toISOString()} (~${mins} min from now; window ${(win.minMs / 60_000 | 0)}-${(win.maxMs / 60_000 | 0)} min)`);
+                return { reason: "stagger" };
+            }
+        }
+        setPlannedUpgrade(undefined);
+        return { candidate };
+    } catch (e) {
+        policyGateLogOnce(`policy:gatefail:${String(e)}`, `[update] policy gate failed (${String(e)}) — proceeding with the legacy immediate install (#3619)`);
+        return { candidate: args.latest };
+    }
+}
+
+/** Test seam: clear the gate's per-process log dedupe. */
+export function _resetPolicyGateForTest(): void {
+    policyGateLogged.clear();
 }
 
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
@@ -1452,20 +1550,48 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
-        const tarballUrl = data.dist?.tarball;
-        const integrity = data.dist?.integrity;
-        const shasum = data.dist?.shasum;
+        // #3619: remote update policy + staggered rollout. The gate resolves
+        // the final install candidate (pin ceiling / blocked stepping) and the
+        // per-version upgrade moment; any gate failure degrades to the legacy
+        // immediate install of the dist-tag version (fail-open).
+        const gate = await passUpdatePolicyGate({
+            packageName: opts.packageName,
+            currentVersion,
+            latest,
+            tag,
+            force,
+            resolveProxy: opts.resolveProxy,
+        });
+        if ("reason" in gate) return;
+        const target = gate.candidate;
+
+        let tarballUrl = data.dist?.tarball;
+        let integrity = data.dist?.integrity;
+        let shasum = data.dist?.shasum;
+        if (target !== latest) {
+            // The policy moved the target off the dist-tag version — resolve
+            // THAT version's own registry doc. The policy file can only
+            // subtract from registry truth, never name what gets installed.
+            const steppedDoc = await fetchVersionDoc(opts, opts.packageName, target);
+            if (!steppedDoc?.tarball) {
+                loggerLog("warn", `[update] registry has no tarball for policy-selected ${target}, skipping`);
+                return;
+            }
+            tarballUrl = steppedDoc.tarball;
+            integrity = steppedDoc.integrity;
+            shasum = steppedDoc.shasum;
+        }
         if (!tarballUrl) {
             loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
             return;
         }
 
-        const bkey = backoffKey(installDir, latest);
+        const bkey = backoffKey(installDir, target);
         if (!force && (await backoffInCooldown(bkey))) {
             return;
         }
 
-        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
+        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${target}${target !== latest ? ` (dist-tag says ${latest})` : ""}, downloading\u2026`);
 
         // Acquire lock to prevent concurrent updates across processes.
         const lock = await tryAcquireLock();
@@ -1474,17 +1600,17 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
         try {
-            const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
+            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 await clearInstallBackoff(bkey);
-                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
+                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${target}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
                 // the old version next to the new global one (#953). Best-effort:
                 // never fails the update itself.
-                await runProfileBundlesRefresh(latest, loggerLog);
-                await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
-                notifyStaleInstall(opts, latest);
+                await runProfileBundlesRefresh(target, loggerLog);
+                await refreshDshDesktopCopy(target, loggerLog, process.env, opts.resolveProxy);
+                notifyStaleInstall(opts, target);
             } else {
                 await recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
                 logInstallLocationOnce(installDir, opts.packageName, loggerLog);

@@ -1,0 +1,11 @@
+{
+    "schemaVersion": 1,
+    "default": {
+        "minDelayMs": 900000,
+        "maxDelayMs": 172800000
+    },
+    "overrides": [],
+    "hold": false,
+    "blocked": [],
+    "pinned": null
+}
