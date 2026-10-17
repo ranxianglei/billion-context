@@ -771,6 +771,41 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
         const r = res.result;
+        // #3322: coverage-monotonicity backstop. A committed fold must never
+        // leave a previously-covered message without ANY covering block: on
+        // full-resend hosts the kernel's turn-integrity gate once judged splits
+        // against the fold's own set instead of post-fold coverage, so ids
+        // carried by consumed blocks were withdrawn wholesale — the processed
+        // view doubled (253→519), the local estimate blew past the window and
+        // preflight fail-fasted forever while upstream had headroom. Measure
+        // active-block coverage before vs after on the clone; any loss means
+        // this fold GROWS the live view, refuse it before commit (state and
+        // prefix cache untouched). Healthy folds never lose coverage: fresh
+        // folds add it, refolds preserve it, integrity withdrawals only touch
+        // direct ids of the range being folded.
+        {
+            const coveredAfter = new Set<string>();
+            for (const b of res.state.blocks) {
+                if (!b.active) continue;
+                for (const id of b.effectiveMessageIds) coveredAfter.add(id);
+            }
+            const lostCoverage = new Set<string>();
+            for (const b of ctx.session.state.blocks) {
+                if (!b.active) continue;
+                for (const id of b.effectiveMessageIds) {
+                    if (!coveredAfter.has(id)) lostCoverage.add(id);
+                }
+            }
+            if (lostCoverage.size > 0) {
+                const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+                const sample = [...lostCoverage].slice(0, 5).map((id) => saltedMsgIdForLog(id)).join(", ");
+                const specKey = normalizedSpecKey(ranges);
+                const repeatGuard = recordCompressFailure(ctx.session, specKey);
+                ctx.log(`[acp-proxy: compress REFUSED ${detail} — coverage regression: ${lostCoverage.size} previously-folded message(s) would lose ALL covering block(s) (${sample}); committing it grows the live view and can push the local estimate past the model window (#3322). State left uncommitted, prefix cache untouched.]`);
+                const receipt = `[Compression refused: coverage regression — folding these ranges would leave ${lostCoverage.size} already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+                return compressResult(receipt, "refused", 0, "gate:coverage-regression");
+            }
+        }
         // #2748: host-side image notes append a ref-carrying footer to a new
         // block's summary AFTER the kernel's length validation — count that
         // wrapped mass in the net-benefit decision too. Moved above the commit
