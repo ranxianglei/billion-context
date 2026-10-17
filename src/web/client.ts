@@ -356,7 +356,10 @@ export const WEB_CLIENT = `(function () {
     // #1937: server-side paging state for the session list (50 rows per page).
     const SES_PAGE_SIZE = 50;
     let sesPage = 1;
+    let sesPages = 1;
     let sesTotal = 0;
+    let sesUnfilteredTotal = 0;
+    let sesRequestId = 0;
     // #1937: poll failure accounting — exponential backoff (5s → 10s → … cap 60s),
     // one persistent error strip instead of toast spam, and an in-flight guard so
     // slow responses never stack concurrent admin requests.
@@ -475,7 +478,11 @@ export const WEB_CLIENT = `(function () {
         if (compact) {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            const clientHint = s.clientHint ? String(s.clientHint) : "";
+            const clientCell = clientHint
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
+                : '<span class="dim">' + t("common.none") + "</span>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
         tr.addEventListener("click", (ev) => {
@@ -823,19 +830,28 @@ export const WEB_CLIENT = `(function () {
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
-    // #1937: the list is server-side paged & filtered — page 1 replaces the
-    // cache, load-more appends the next page, search re-queries with ?q=.
-    async function refreshSessions(showToast) {
+    // #1937：服务端筛选后分页；改变筛选返回首页，翻页替换当前页。
+    async function refreshSessions(showToast, page) {
+        const requestId = ++sesRequestId;
         try {
-            const d = await json(sessionListUrl(1));
+            const requested = Math.max(1, Math.floor(Number(page) || 1));
+            const d = await json(sessionListUrl(requested));
+            if (requestId !== sesRequestId) return true;
+            const total = typeof d.total === "number" ? d.total : (d.sessions || []).length;
+            const pages = Math.max(1, Math.ceil(total / SES_PAGE_SIZE));
+            if (requested > pages) return await refreshSessions(showToast, pages);
             sessionsCache = d.sessions || [];
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = 1;
+            sesTotal = total;
+            sesUnfilteredTotal = typeof d.unfilteredTotal === "number" ? d.unfilteredTotal : sesTotal;
+            sesPage = typeof d.page === "number" ? d.page : requested;
+            sesPages = pages;
             hiddenEmptyN = d.hiddenEmpty || 0;
+            updateFacetOptions(d);
             renderSessionTable();
-            updateLoadMoreBtn();
+            updatePager();
             return true;
         } catch (e) {
+            if (requestId !== sesRequestId) return true;
             lastErrMsg = friendlyMsg(e);
             if (showToast) toast(t("toast.failed", { msg: lastErrMsg }), "err");
             return false;
@@ -844,36 +860,91 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        const protocol = filterValue("ses-protocol");
+        const client = filterValue("ses-client");
+        const state = filterValue("ses-state");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
+            (q ? "&q=" + encodeURIComponent(q) : "") +
+            (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
+            (client ? "&client=" + encodeURIComponent(client) : "") +
+            (state ? "&state=" + encodeURIComponent(state) : "");
     }
-    async function loadMoreSessions() {
-        const btn = $("ses-loadmore");
-        if (btn) busy(btn, true);
-        try {
-            const next = sesPage + 1;
-            const d = await json(sessionListUrl(next));
-            sessionsCache = sessionsCache.concat(d.sessions || []);
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = next;
-            renderSessionTable();
-            updateLoadMoreBtn();
-            return true;
-        } catch (e) {
-            lastErrMsg = friendlyMsg(e);
-            toast(t("toast.failed", { msg: lastErrMsg }), "err");
-            return false;
-        } finally {
-            if (btn) busy(btn, false);
+    function filterValue(id) {
+        const el = $(id);
+        return ((el && el.value) || "").trim();
+    }
+    function facetLabel(kind, value) {
+        if (kind === "protocol") return value === "unknown" ? t("ses.filter_unknown") : value;
+        return value;
+    }
+    function fillFacet(id, values, allLabel, kind) {
+        const sel = $(id);
+        if (!sel) return;
+        const active = sel.value || "";
+        const frag = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = allLabel;
+        frag.appendChild(all);
+        values.forEach((value) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = facetLabel(kind, value);
+            frag.appendChild(opt);
+        });
+        sel.textContent = "";
+        sel.appendChild(frag);
+        if (active) sel.value = active;
+        if (active && sel.value !== active) {
+            const stale = document.createElement("option");
+            stale.value = active;
+            stale.textContent = facetLabel(kind, active);
+            sel.appendChild(stale);
+            sel.value = active;
         }
     }
-    function updateLoadMoreBtn() {
-        const btn = $("ses-loadmore");
-        if (!btn) return;
-        btn.hidden = !(sessionsCache.length < sesTotal);
+    function updateFacetOptions(d) {
+        fillFacet("ses-protocol", Array.isArray(d.protocols) ? d.protocols : [], t("ses.filter_all"), "protocol");
+        fillFacet("ses-client", Array.isArray(d.clients) ? d.clients : [], t("ses.filter_all_clients"), "client");
+    }
+    function hasActiveFilters() {
+        const q = (($("ses-search") && $("ses-search").value) || "").trim();
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+    }
+    function updatePager() {
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) prev.disabled = sesPage <= 1;
+        if (next) next.disabled = sesPage >= sesPages;
+        const label = $("ses-page-label");
+        if (label) label.textContent = t("ses.page_label", { page: sesPage, pages: sesPages });
+    }
+    async function goToSessionPage(page) {
+        const target = Math.min(Math.max(1, page), sesPages);
+        if (target === sesPage) return true;
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) busy(prev, true);
+        if (next) busy(next, true);
+        try {
+            return await refreshSessions(true, target);
+        } finally {
+            if (prev) busy(prev, false);
+            if (next) busy(next, false);
+            updatePager();
+        }
+    }
+    function resetSessionFilters() {
+        const search = $("ses-search");
+        if (search) search.value = "";
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        return refreshSessions(false, 1);
     }
     function renderSessionTable() {
         const rows = sessionsCache;
-        $("ses-count").textContent = t("ses.count", { count: sesTotal });
+        $("ses-count").textContent = hasActiveFilters()
+            ? t("ses.filtered_count", { shown: sesTotal, total: sesUnfilteredTotal })
+            : t("ses.count", { count: sesTotal });
         const heEl = $("ses-empty-hint");
         if (heEl) {
             if (hiddenEmptyN > 0) { heEl.hidden = false; heEl.textContent = t("ses.empty_hidden", { n: hiddenEmptyN }); }
@@ -2724,12 +2795,20 @@ export const WEB_CLIENT = `(function () {
         const search = $("ses-search");
         if (search) {
             let sesTimer = null;
-            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false), 300); });
+            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false, 1), 300); });
         }
         const sref = $("ses-refresh");
-        if (sref) sref.addEventListener("click", () => refreshSessions(true));
-        const lm = $("ses-loadmore");
-        if (lm) lm.addEventListener("click", loadMoreSessions);
+        if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+            const el = $(id);
+            if (el) el.addEventListener("change", () => refreshSessions(false, 1));
+        });
+        const reset = $("ses-reset-filters");
+        if (reset) reset.addEventListener("click", resetSessionFilters);
+        const prev = $("ses-prev");
+        if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
+        const next = $("ses-next");
+        if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -2885,7 +2964,7 @@ export const WEB_CLIENT = `(function () {
             // restarting server cannot spam toasts from background views.
             let ok = current === "overview" ? await loadOverview() : await loadOverview(true);
             // A paged-down or searched list must not be clobbered by the background refresh.
-            if (current === "sessions" && $("session-detail-view").hidden && sessionsCache.length <= SES_PAGE_SIZE) ok = (await refreshSessions(false)) && ok;
+            if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {

@@ -966,19 +966,37 @@ function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
     res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
 }
 
-/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
- *  server-side filtered paging. Without params the response shape is unchanged
- *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+/** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
+ *  无参数时保留原响应结构，兼容旧界面；每页最多返回 200 条。 */
 async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
     let body: Record<string, unknown>;
     try {
-        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+        const paged =
+            u.searchParams.has("page") ||
+            u.searchParams.has("pageSize") ||
+            u.searchParams.has("q") ||
+            u.searchParams.has("protocol") ||
+            u.searchParams.has("client") ||
+            u.searchParams.has("state");
+        if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
             const rawPage = Number(u.searchParams.get("page"));
             const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
-            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+            const rawState = u.searchParams.get("state");
+            const state = rawState === "live" || rawState === "history" ? rawState : undefined;
+            body = {
+                ...(await buildSessionPage({
+                    q: u.searchParams.get("q") ?? undefined,
+                    protocol: u.searchParams.get("protocol") ?? undefined,
+                    client: u.searchParams.get("client") ?? undefined,
+                    state,
+                    page,
+                    pageSize,
+                })),
+                hiddenEmpty: hiddenEmptyCount(),
+            };
         } else {
             const sessions = await buildSessionList();
             body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };
