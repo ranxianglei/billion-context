@@ -461,3 +461,42 @@ Panel presentation keeps lost folds out of the headline number: the web
 sessions view shows them as separate labeled segments (row tooltip,
 overview sub-line, detail stat) — frozen pre-loss savings stay visible,
 post-loss growth stops.
+
+## Verified-incremental prefix fast path (#3248 phase 1)
+
+Plugin lanes (`session.metadata.pluginAgent` set — dsh / pi /
+opencode-native; the four general wire adapters stay untouched) can skip
+the full `planReconciliation` scan when the resent history is provably a
+pure tail-append of the previous pass:
+
+- After every main-lane pass (fast or full) the session metadata records
+  `{count, hash, clean}` under `incrementalPrefix`: the derived-id count,
+  a sha256 chain digest over those ids (32 hex), and whether that pass saw
+  any drift (claims/unmatched).
+- The next pass verifies count + digest over its own first `count` ids. A
+  match over a CLEAN predecessor makes the absence set empty (the kernel's
+  id ⇔ bytes invariant means any identity-visible change inside the span
+  flips some id and thus the digest), so the pass substitutes the exact
+  plan `planReconciliation` returns at its missing===0 early exit — all
+  downstream bookkeeping (anchors, order/positions roll, coverage p/r/t/e/z,
+  reap, drift streaks) runs unchanged.
+- Every gate failure — head truncation (`count-shrink`), prefix re-encode or
+  edit (`hash-mismatch`), dirty predecessor (`dirty-predecessor`) — falls
+  back to full reconciliation and counts/logs the reason once per
+  (session, reason). The fingerprint is refreshed from EVERY pass, so a
+  dirty episode self-heals into fast-path eligibility after one clean pass.
+- Side-request-shaped passes (< 10 inbound messages, #2202) never touch it;
+  non-plugin lanes never write it. Per-lane hits + miss reasons surface at
+  `GET /__bili/stats` under `incremental`.
+
+This is phase 1 of #3248 (incremental lane): it removes the O(full)
+reconcile walk for stable prefixes but changes no wire shape and no other
+per-message work in the prepare stack — clients still resend everything.
+The outbound-from-DB rebuild (phase 2) landed separately as #3253
+(`POST /__bili/plugin/turn`); the fast path applies to both traffic shapes
+because both feed reconcile the same derived ids. Core property test:
+`tests/incremental-prefix.test.ts` (lockstep equivalence — a fast-path
+session must stay byte-identical, metadata and blocks, to an identical
+session forced through full reconciliation every pass). Escape hatch
+unchanged: `BILI_FOLD_RECONCILE=off` disables the whole mechanism, fast
+path included.

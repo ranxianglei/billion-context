@@ -90,6 +90,31 @@
 // re-rendered cell. Zero corroboration anywhere stays honest drift — "order
 // is the same" is only a claim when something verified it.
 //
+// #3248 phase 1 — VERIFIED-INCREMENTAL FAST PATH (the first instance of the
+// incremental-lane pattern #2926 settled for threads, generalized to every
+// native lane). Plugin-lane clients (dsh/pi/opencode — self-controlled) resend
+// the FULL history every turn; reconciliation then re-scans the whole prefix
+// every pass to PROVE what the bytes already say. When the resent leading span
+// is byte-stable against the last fingerprint-establishing pass, that proof is
+// free: bili keeps {count, hash, clean} in session.metadata
+// (METADATA_INCREMENTAL_PREFIX) — hash = chain digest over the DERIVED message
+// ids (id ⇔ bytes: the kernel's deriveMessageId hashes the identity fields
+// exactly, so any identity-visible change flips some id and the chain) — and a
+// matching chain means the absence set (covered \ live ids) is invariant
+// across the stable span. If the establishing pass was clean (zero missing),
+// this pass's plan is EXACTLY planReconciliation's missing===0 early return,
+// so the fast path substitutes that shape (cleanIncrementalPlan) and runs
+// EVERY downstream bookkeeping step unchanged — anchor seed/reuse, order and
+// positional-copy roll, coverage records, zombie streaks, reap, drift
+// escalation. Any gate failure (not a plugin lane, no fingerprint yet, count
+// shrink, chain mismatch, dirty predecessor) takes the full plan; the
+// fingerprint re-establishes from THIS pass's bytes on every qualifying pass
+// either way, so a mismatch costs one extra full pass and self-heals.
+// Water-level: per-lane hit/miss counters at GET /__bili/stats plus one
+// deduplicated miss log line — the measurement that picks which lanes adopt
+// true incrementality in phase 2. Escape hatch: reconcile=off stops the
+// mechanism wholesale (early exit above the fingerprint logic).
+//
 // Pass 3 (#2636) — ASSISTANT-TURN key. A host replaying one conversation
 // across models re-serializes every thinking-bearing assistant turn: the
 // same-model replay carries reasoning in a structured field (kernel: adjacent
@@ -209,6 +234,10 @@ const GAP_SIMHASH_MAX_HAMMING = 8;
 /** #2202: per-block coverage evidence, consumed by the cache ledger's
  *  conditional avoided-token accrual (src/cache-ledger.ts). */
 export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
+/** #3248 phase 1: verified-incremental prefix fingerprint (see
+ *  IncrementalPrefixState). Plugin lanes only — third-party proxy clients are
+ *  outside the incremental contract and must not pollute the water-level data. */
+export const METADATA_INCREMENTAL_PREFIX = "incrementalPrefix";
 /** #2202: passes carrying fewer inbound messages than this are auxiliary
  *  side-requests (#1075: title-gen / WebSearch refinement "carry only a
  *  handful of brand-new messages") — no drift evidence is taken from them.
@@ -349,6 +378,9 @@ interface FoldReconcileResult {
      *  a majority-loss zombie streak). */
     reaped: number;
     unmatched: number;
+    /** #3248 phase 1: this pass used the verified-incremental prefix fast
+     *  path (plugin lanes only) instead of full reconciliation. */
+    fastPath?: boolean;
 }
 
 /** #2202: last qualifying pass's per-block coverage evidence — how much of the
@@ -377,6 +409,76 @@ export interface FoldBlockCoverage {
      *  the substrate is taken for destroyed by an unannounced client rewrite
      *  and the block is reaped (reapDestroyedSubstrate, src/session.ts). */
     z?: number;
+}
+
+/** #3248 phase 1: verified-incremental prefix fingerprint — persisted in
+ *  session.metadata (free-form field, rides every save). `count` = derived-id
+ *  count of the last fingerprint-establishing pass; `hash` = chain digest over
+ *  those ids; `clean` = that pass saw zero missing covered ids. */
+export interface IncrementalPrefixState {
+    count: number;
+    hash: string;
+    clean: boolean;
+}
+
+/** #3248 phase 1: chain digest over derived message ids — one sha256 over the
+ *  NUL-joined id list, kept at 32 hex chars (128-bit). Order-sensitive by
+ *  construction; the kernel's id ⇔ bytes invariant means any identity-visible
+ *  change inside the span flips some id and thus the digest. 32 hex rather
+ *  than the 16-hex change-detector style used elsewhere: a false match here
+ *  skips drift repair, so the accidental-collision budget must survive
+ *  fleet-scale pass counts. */
+export function prefixIdChainHash(ids: readonly string[]): string {
+    return createHash("sha256").update(ids.join("\u0000"), "utf8").digest("hex").slice(0, 32);
+}
+
+// #3248 phase 1 water-level (non-persisted, process-local): per-lane hit/miss
+// counts surfaced at GET /__bili/stats (`incremental`) — the measurement that
+// decides which lanes adopt true incrementality in phase 2. Miss reasons:
+// count-shrink (head truncated/deleted), hash-mismatch (prefix re-encoded or
+// edited), dirty-predecessor (the establishing pass had drift — evidence and
+// streaks must keep ticking through full passes). A fresh session's first
+// pass establishes the fingerprint without counting.
+const incrementalLaneStats = new Map<string, { hits: number; misses: Record<string, number> }>();
+function laneStatsOf(lane: string): { hits: number; misses: Record<string, number> } {
+    let s = incrementalLaneStats.get(lane);
+    if (s === undefined) {
+        s = { hits: 0, misses: {} };
+        incrementalLaneStats.set(lane, s);
+    }
+    return s;
+}
+export function getIncrementalStats(): { hits: number; misses: Record<string, number>; lanes: Record<string, { hits: number; misses: Record<string, number> }> } {
+    let hits = 0;
+    const misses: Record<string, number> = {};
+    const lanes: Record<string, { hits: number; misses: Record<string, number> }> = {};
+    for (const [lane, s] of incrementalLaneStats) {
+        hits += s.hits;
+        lanes[lane] = { hits: s.hits, misses: { ...s.misses } };
+        for (const [reason, n] of Object.entries(s.misses)) misses[reason] = (misses[reason] ?? 0) + n;
+    }
+    return { hits, misses, lanes };
+}
+
+// A dirty episode repeats the same miss every pass — dedupe the log line per
+// (session, reason) but keep counting. Bounded by clearing wholesale past
+// 4096 sessions (water-level data, not an alerting path).
+const incrementalMissLogged = new Map<string, Set<string>>();
+function noteIncrementalMiss(lane: string, opts: ReconcileOptions, reason: string): void {
+    const stats = laneStatsOf(lane);
+    stats.misses[reason] = (stats.misses[reason] ?? 0) + 1;
+    if (opts.log === undefined) return;
+    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+    const key = opts.sessionId ?? lane;
+    let seen = incrementalMissLogged.get(key);
+    if (seen === undefined) {
+        if (incrementalMissLogged.size > 4096) incrementalMissLogged.clear();
+        seen = new Set();
+        incrementalMissLogged.set(key, seen);
+    }
+    if (seen.has(reason)) return;
+    seen.add(reason);
+    opts.log("info", `${tag}[incremental] prefix fast path missed (${reason}) — falling back to full reconciliation (#3248)`);
 }
 
 const seenInvalidEnv = new Set<string>();
@@ -645,19 +747,15 @@ function coveredIdsOf(blocks: BlockLike[]): Set<string> {
     return coveredRealHistoryIds(blocks);
 }
 
-/** Pure core: plan the reconciliation between the previous pass order and the
- *  incoming messages. Exposed for unit tests. `positions` (#2480) is the
- *  stored positional fingerprint copy {ids, canon} (#2487's self-contained
- *  storage shape, adopted); Pass 0 claims by position + canonical fingerprint
- *  before the anchor passes run. */
-export function planReconciliation(
-    oldOrder: string[],
-    anchors: Record<string, FoldAnchor>,
+/** #3248 phase 1: the order/canon/byId head-walk shared by planReconciliation
+ *  and the verified-incremental fast path — extracted verbatim (minus one dead
+ *  local) so both paths produce byte-identical newOrder/nextCanon and the
+ *  positional copy self-heals through either. */
+function buildOrderAndCanon(
     msgs: CoreMessage[],
-    covered: Set<string>,
+    oldOrder: string[],
     positions?: { ids: string[]; canon: string[] },
-): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0 };
+): { newOrder: string[]; canon: string[]; byId: Map<string, CoreMessage>; stored: string[] | undefined } {
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -681,12 +779,42 @@ export function planReconciliation(
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) {
         if (m.id === undefined) continue;
-        const i = newOrder.length;
         newOrder.push(m.id);
         byId.set(m.id, m);
         const priorCanon = canonById.get(m.id);
         canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
     }
+    return { newOrder, canon, byId, stored };
+}
+
+/** #3248 phase 1: the EXACT shape planReconciliation returns at its missing===0
+ *  early exit (empty claims/unmatched, full newOrder/nextCanon, churn fields
+ *  undefined) — the verified-incremental fast path substitutes this for the
+ *  full scan because a byte-stable prefix over a clean predecessor provably
+ *  has an empty absence set (module doc). */
+function cleanIncrementalPlan(
+    msgs: CoreMessage[],
+    oldOrder: string[],
+    positions?: { ids: string[]; canon: string[] },
+): ReconciliationPlan {
+    const { newOrder, canon } = buildOrderAndCanon(msgs, oldOrder, positions);
+    return { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, resyncs: 0, newOrder, nextCanon: canon };
+}
+
+/** Pure core: plan the reconciliation between the previous pass order and the
+ *  incoming messages. Exposed for unit tests. `positions` (#2480) is the
+ *  stored positional fingerprint copy {ids, canon} (#2487's self-contained
+ *  storage shape, adopted); Pass 0 claims by position + canonical fingerprint
+ *  before the anchor passes run. */
+export function planReconciliation(
+    oldOrder: string[],
+    anchors: Record<string, FoldAnchor>,
+    msgs: CoreMessage[],
+    covered: Set<string>,
+    positions?: { ids: string[]; canon: string[] },
+): ReconciliationPlan {
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0 };
+    const { newOrder, canon, byId, stored } = buildOrderAndCanon(msgs, oldOrder, positions);
     plan.newOrder = newOrder;
     plan.nextCanon = canon;
     const missing: string[] = [];
@@ -1310,11 +1438,64 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         positions = { ids: storedRaw.ids as string[], canon: storedRaw.canon as string[] };
     }
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    // #3248 phase 1: verified-incremental prefix fast path — plugin lanes only
+    // (their clients are ours: dsh / pi / opencode-native; the four general
+    // wire adapters stay untouched). A fingerprint match proves the prefix is
+    // byte-stable, which over a clean predecessor makes the absence set empty
+    // (module doc), so the full scan is replaced by its exact missing===0
+    // result shape. Every gate failure falls back to full reconciliation and
+    // records a water-level miss reason; the fingerprint itself is refreshed
+    // from every pass's result below, so a dirty episode self-heals into
+    // fast-path eligibility again once the next pass comes back clean.
+    const lane = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
+    let incFastPath = false;
+    if (lane !== undefined) {
+        const storedInc = session.metadata[METADATA_INCREMENTAL_PREFIX] as IncrementalPrefixState | undefined;
+        if (storedInc !== undefined && typeof storedInc === "object"
+            && Number.isInteger(storedInc.count) && storedInc.count > 0
+            && typeof storedInc.hash === "string" && typeof storedInc.clean === "boolean") {
+            const currentIds: string[] = [];
+            for (const m of msgs) if (m.id !== undefined) currentIds.push(m.id);
+            if (currentIds.length < storedInc.count) {
+                noteIncrementalMiss(lane, opts, "count-shrink");
+            } else if (prefixIdChainHash(currentIds.slice(0, storedInc.count)) !== storedInc.hash) {
+                noteIncrementalMiss(lane, opts, "hash-mismatch");
+            } else if (!storedInc.clean) {
+                noteIncrementalMiss(lane, opts, "dirty-predecessor");
+            } else {
+                incFastPath = true;
+                laneStatsOf(lane).hits += 1;
+            }
+        }
+    }
+    let plan: ReconciliationPlan;
+    if (incFastPath) {
+        plan = cleanIncrementalPlan(msgs, oldOrder, positions);
+    } else {
+        plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    }
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
         process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} bySim=${plan.bySim} byOrder=${plan.byOrder} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+    }
+
+    // #3248 phase 1: refresh the prefix fingerprint from EVERY main-lane pass
+    // (fast or full) so the next pass verifies against this one. `clean`
+    // records whether this pass saw any drift: claims are recoveries of
+    // covered ids absent from the wire, unmatched are ids no pass could
+    // explain — either means the absence set is non-empty, so the next pass
+    // must run full until a clean pass re-qualifies it. idRewriteSuspects is
+    // only ever raised inside the claim passes (missing>0), so it cannot be
+    // non-zero when claims+unmatched are both empty. Computed from `plan`
+    // before reap below mutates anything downstream (reap strips the local
+    // nextOrder slice copy, not plan.newOrder).
+    if (lane !== undefined) {
+        session.metadata[METADATA_INCREMENTAL_PREFIX] = {
+            count: plan.newOrder.length,
+            hash: prefixIdChainHash(plan.newOrder),
+            clean: plan.claims.size === 0 && plan.unmatched.length === 0,
+        };
     }
 
     // Seed/refresh anchors for covered ids present in this pass (including
@@ -1616,7 +1797,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0, fastPath: incFastPath };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
@@ -1664,6 +1845,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byImage: plan.byImage,
         reaped: reapedCount,
         unmatched: plan.unmatched.length,
+        fastPath: incFastPath,
     };
 }
 
