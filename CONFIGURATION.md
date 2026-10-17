@@ -1246,7 +1246,26 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Default:** `50000`
 - **Status:** ACTIVE
-- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Keep this proportional to your smallest model window:** the T1 mass trigger needs one full step of compressible content, so a step larger than the window (e.g. `1500000` against a ~1M window) makes the mass trigger unreachable for that entire window — usage-percentage pressure bands and preflight remain as backstops, but incremental folding goes silent and an over-window request (typical after a mid-session fork onto a smaller-window model) falls straight into the multi-round preflight summarization marathon instead of folding early.
+- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Keep this proportional to your smallest model window:** the T1 mass trigger needs one full step of compressible content, so a step larger than the window (e.g. `1500000` against a ~1M window) makes the mass trigger unreachable for that entire window — usage-percentage pressure bands and preflight remain as backstops, but incremental folding goes silent and an over-window request (typical after a mid-session fork onto a smaller-window model) falls straight into the multi-round preflight summarization marathon instead of folding early. **What moves together:** the growth gate is `max(20000, 0.45 × step)` (kernel `minGrowthFloor` / `minGrowthRatio`), the T1 token-mass trigger defaults to one full step, and T2/T3 derive at step × 1.5 unless pinned via [`tierNudgeTokens`](#tiernudgetokens) — so raising the step (e.g. `50000` → `100000`) moves the gate to `45000`, the T1 mass trigger to `100000`, and the derived T2/T3 to `150000` in a single change, and each fold then covers a larger span. To shift only the T1 mass trigger while keeping the cadence, set `tierNudgeTokens.t1` instead. **Per-model override:** when one expensive-summary model (long thinking plus long summaries on every compress call) shares a route with cheaper models, scope the step to that model by its EXACT wire model id (the `model` value in the request body — no substring matching) instead of moving the route-wide value; unmatched models keep the route/global settings untouched:
+
+```jsonc
+{
+  "providers": {
+    "https://<your-gateway>/v1": {
+      "models": {
+        // key = the exact model string the client sends upstream
+        "deepseek-v4.1-flash": {
+          "compress": {
+            "nudgeGrowthTokens": 100000   // candidate value — validate on YOUR workload before adopting
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Confirm the resolved value live: each request's nudge decision log line prints the effective `interval=` (this step) and `reason=`, so you can verify which settings a given request actually ran with.
 
 #### `minPressureBenefitTokens`
 

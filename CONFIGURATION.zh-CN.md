@@ -1249,7 +1249,26 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number`
 - **默认值：** `50000`
 - **状态：** ACTIVE
-- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。**保持该值与最小模型窗口成比例：** T1 质量触发需要整整一个步长的可压缩内容，因此步长大于窗口（例如对 ~1M 窗口设 `1500000`）会让质量触发在整个窗口内都不可达——usage 百分比压力带和 preflight 仍兜底，但增量折叠会静默失效，超窗请求（会话中途 fork 到更小窗口模型的典型场景）不再提前折叠，而是直接坠入多轮 preflight 总结马拉松。
+- **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。**保持该值与最小模型窗口成比例：** T1 质量触发需要整整一个步长的可压缩内容，因此步长大于窗口（例如对 ~1M 窗口设 `1500000`）会让质量触发在整个窗口内都不可达——usage 百分比压力带和 preflight 仍兜底，但增量折叠会静默失效，超窗请求（会话中途 fork 到更小窗口模型的典型场景）不再提前折叠，而是直接坠入多轮 preflight 总结马拉松。**联动效应：** 增长门为 `max(20000, 0.45 × 步长)`（内核 `minGrowthFloor` / `minGrowthRatio`），T1 token 质量触发默认取整整一个步长，T2/T3 按步长 × 1.5 派生（除非用 [`tierNudgeTokens`](#tiernudgetokens) 钉死）——因此把步长调大（例如 `50000` → `100000`）会一次性把门移到 `45000`、T1 质量触发移到 `100000`、派生 T2/T3 移到 `150000`，且每次折叠覆盖的跨度也随之变大。只想移动 T1 质量触发而不动节奏，改用 `tierNudgeTokens.t1`。**按模型覆盖：** 当某个高成本摘要模型（每次压缩调用都带长思考 + 长摘要）与更便宜的模型共用同一条路由时，用**精确的 wire 模型 id**（请求体里的 `model` 值——不做子串匹配）把步长限定到该模型，而不是改整条路由的值；未匹配的模型保持路由/全局设置不变：
+
+```jsonc
+{
+  "providers": {
+    "https://<your-gateway>/v1": {
+      "models": {
+        // key = the exact model string the client sends upstream
+        "deepseek-v4.1-flash": {
+          "compress": {
+            "nudgeGrowthTokens": 100000   // candidate value — validate on YOUR workload before adopting
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+在日志中确认生效值：每个请求的 nudge 决策行会打印实际生效的 `interval=`（即本步长）和 `reason=`，可以核对某个请求到底用了哪套配置。
 
 #### `minPressureBenefitTokens`
 
