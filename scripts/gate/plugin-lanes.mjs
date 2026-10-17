@@ -267,6 +267,21 @@ async function runLane(agent, recipe) {
 
   try {
     await recipe.setup(ctx);
+    // One-time host warmup BEFORE timed turns: opencode v1 runs a one-time
+    // sqlite storage migration on fresh XDG ("Performing one time database
+    // migration, may take a few minutes...") — in hermetic containers that
+    // eats the whole t1 turn budget and wipes the lane (r5: every turn red,
+    // 0 upstream requests). A disposable long-timeout turn absorbs it;
+    // output discarded, failure logged but non-fatal.
+    if (recipe.warmup) {
+      const t0 = Date.now();
+      try {
+        await recipe.warmup(ctx);
+        console.log(`-- lane ${agent}: warmup ok in ${Math.round((Date.now() - t0) / 1000)}s`);
+      } catch (e) {
+        console.log(`-- lane ${agent}: warmup failed (non-fatal): ${String(e).slice(0, 140)}`);
+      }
+    }
     const sid = { v: null };
     const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE line of section S40. Do not run any other tool or command.`, sid, "t1");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t1.txt`), t1.out || "");
@@ -627,6 +642,16 @@ const RECIPES = {
         }, null, 2));
       ocFor(BIG_WINDOW);
       ctx.env = { ...ctx.baseEnv, BILLION_CONTEXT_NODE: process.execPath };
+    },
+    // see runLane: absorbs the v1 CLI's one-time storage migration
+    async warmup(ctx) {
+      const model = MODEL1.model.split(",")[0];
+      const r = sh((process.env.GATE_OC1_BIN || "opencode").trim(),
+        ["run", "-m", `gate/${model}`, "--dangerously-skip-permissions", "Reply with the single word READY."],
+        { cwd: ctx.workDir, env: ctx.env, timeout: 600_000 });
+      // sh() swallows exit codes — throw so runLane logs "warmup failed"
+      // instead of a misleading "warmup ok" when the turn actually died.
+      if (r.status !== 0) throw new Error(`opencode warmup exited ${r.status ?? "timeout"}\n${(r.stderr || "").slice(-300)}`);
     },
     setWindow(ctx, w) {
       const file = path.join(ctx.laneDir, "xdg/config/opencode/opencode.json");
