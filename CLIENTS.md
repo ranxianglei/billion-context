@@ -511,6 +511,16 @@ corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
 Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
 child process item-by-item identical to the caller array.
 
+### Composer predictions (Codex Desktop): custom-provider threads are ineligible (#3408)
+
+Codex Desktop's Composer-prediction feature has a **client-side eligibility gate** that runs before any prediction request could reach billion-context: it checks the resumed source thread's *actual* provider and requires the built-in `openai` provider — any other provider selects `unsupported_provider` and the client returns without generating a prediction (static inspection of Desktop 26.1013.3656.0, #3408). The gate reads the *thread's* provider, not the current global default: the prediction path forks the source thread in a special prediction mode whose call supplies no independent prediction provider, so changing the global default does not re-qualify an existing thread. Consequences:
+
+- **Custom-provider threads never show predictions** — by design of the client, not a bili defect. No prediction request ever reaches the proxy, so there is nothing on the bili side to fix or configure; absence of gateway traffic for a prediction is expected, not evidence of a dropped request.
+- **Provider-preserving transport keeps eligibility intact mechanically.** Cert-MITM routing (the `HTTPS_PROXY` + `SSL_CERT_FILE` the `bili codex` launcher injects) intercepts below the provider layer: codex's own config and provider selection are untouched, so the thread keeps its built-in `openai` provider identity and official ChatGPT auth — exactly what the gate reads. Runtime confirmation on a Desktop build is still pending (no matched A/B yet); if you can confirm or refute predictions under this transport on Desktop, report back in #3408.
+- **No supported configuration restores predictions on custom-provider threads.** Any route through a custom `model_providers` entry — API-key auth, third-party one-click installs included — sits on the ineligible side of the gate by construction (such entries also drop the subscription login, above). Renaming a custom provider to impersonate `openai`, or patching the client's eligibility check, is unsupported and will not be documented as a workaround.
+
+Rule of thumb: need predictions → stay on the built-in OpenAI provider route; need a custom provider → accept that predictions will not appear in those threads.
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
 Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of

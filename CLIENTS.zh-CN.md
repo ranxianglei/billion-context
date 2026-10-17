@@ -140,6 +140,16 @@ Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发�
 
 已在 windows-latest CI 上对真实全局 `@openai/codex` 安装验证(`tests/win-cmd-argv.test.ts`,`ci-windows-codex.yml` 硬门禁):完整语料——空参数、普通空格、嵌入引号、TOML `-c` 值、JSON、Unicode、尾反斜杠、`%COMSPEC%`、`!VAR!`、`&|<>^()`——逐项与调用方数组相等地到达子进程。
 
+### Composer 预测(Codex Desktop):自定义 provider 的线程没有资格(#3408)
+
+Codex Desktop 的 Composer 预测功能有一道**客户端资格门槛**,在任何预测请求能到达 billion-context 之前执行:它检查被恢复源线程的**实际 provider**,要求是内置 `openai` provider —— 其他任何 provider 都会选中 `unsupported_provider`,客户端直接返回、不生成预测(对 Desktop 26.1013.3656.0 的静态检查,#3408)。门槛读的是*线程*的 provider,而不是当前全局默认值:预测路径以特殊预测模式 fork 源线程,该调用不提供独立的预测 provider,所以改全局默认也不会让既有线程重新获得资格。后果:
+
+- **自定义 provider 的线程永远不显示预测** —— 这是客户端的设计,不是 bili 缺陷。预测请求根本到不了代理,bili 侧没有可修可配的东西;看不到预测相关的网关流量是预期现象,不是请求被丢的证据。
+- **保 provider 的传输在机制上保住资格。** 证书 MITM 路由(`bili codex` 启动器注入的 `HTTPS_PROXY` + `SSL_CERT_FILE`)在 provider 层之下拦截:codex 自己的配置与 provider 选择原样不动,线程保留内置 `openai` provider 身份与官方 ChatGPT 认证 —— 正是门槛读取的东西。Desktop 构建上的运行时确认仍待完成(尚无配对 A/B);若你能在该传输下于 Desktop 上证实或证伪预测行为,请到 #3408 回报。
+- **没有任何受支持的配置能为自定义 provider 线程恢复预测。** 任何走自定义 `model_providers` 条目的路由 —— API-key 认证、第三方一键安装在内 —— 按构造都落在门槛的不合格一侧(这类条目同时废掉订阅登录,见上文)。把自定义 provider 改名冒充 `openai`,或打补丁修改客户端资格检查,不受支持,也不会被文档化为绕行方案。
+
+经验法则:要预测 → 留在内置 OpenAI provider 路由上;要自定义 provider → 接受这些线程里不会出现预测。
+
 ## Pi(pi.dev coding agent)
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
