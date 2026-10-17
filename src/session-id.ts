@@ -220,6 +220,21 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
     return identity.clientProvided ? identity.value : undefined;
 }
 
+/** #2218/#2649: destination-shape half of the gate — is this origin a
+ *  deliberate local relay? Shared with the chat egress site so a
+ *  client-supplied prompt_cache_key is kept exactly where relays may read
+ *  it and stripped everywhere else. */
+export function relayAffinityDestined(upstreamOrigin: string): boolean {
+    try {
+        const hostname = new URL(upstreamOrigin).hostname;
+        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
+        // only); a silent miss here would reproduce the zero-signal bug (#2218).
+        return hostname === "localhost" || isLoopbackAddress(hostname);
+    } catch {
+        return false;
+    }
+}
+
 /**
  * #2218: decide whether the proxy stamps `prompt_cache_key` into an outbound
  * OpenAI chat body on behalf of a plugin host (dsh desktop) whose ONLY
@@ -236,28 +251,22 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
  *  - the plugin lane owns the identity (the winning conversation header is
  *    the bili-internal one, not a header the upstream could read itself);
  *  - the client sent no prompt_cache_key of its own (client value wins);
- *  - the destination is admin-configured (provider-rewritten route) or
- *    loopback — deliberate relay/local deployments. Strict direct APIs can
- *    400 unknown body params (#1403), so unrouted non-loopback forwards
- *    stay unstamped.
+ *  - the destination is loopback — deliberate relay/local deployments.
+ *    #2649: a rewritten/embedded route URL is NOT relay evidence (the /bili/
+ *    tunnel lane rewrites the user's own remote destination too, which
+ *    stamped strict remote APIs and 400'd them — the #2645 class), so the
+ *    admin-rewritten leg is gone; loopback is the only destination-shape
+ *    proof of a relay. Strict direct APIs can 400 unknown body params
+ *    (#1403/#2645), so non-loopback forwards stay unstamped.
  */
 export function shouldStampRelayAffinityPck(
     identityHeaderName: string | undefined,
     clientPck: unknown,
-    routeRewrittenUrl: string | undefined,
     upstreamOrigin: string,
 ): boolean {
     if (identityHeaderName !== "x-bili-plugin-conversation") return false;
     if (clientPck !== undefined) return false;
-    if (routeRewrittenUrl !== undefined) return true;
-    try {
-        const hostname = new URL(upstreamOrigin).hostname;
-        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
-        // only); a silent miss here would reproduce the zero-signal bug (#2218).
-        return hostname === "localhost" || isLoopbackAddress(hostname);
-    } catch {
-        return false;
-    }
+    return relayAffinityDestined(upstreamOrigin);
 }
 
 /**

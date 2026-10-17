@@ -5,7 +5,7 @@ import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type 
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
-import { conversationHeaderSource, shouldStampRelayAffinityPck } from "../session-id.js";
+import { conversationHeaderSource, relayAffinityDestined, shouldStampRelayAffinityPck } from "../session-id.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -402,18 +402,25 @@ export async function prepareOpenai(
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
     // OpenAI-compatible upstreams may reject unknown fields, and cache policy
-    // is the upstream's business — strip it. prompt_cache_key itself passes
-    // through: upstreams that ignore it lose nothing, upstreams that use it
-    // get a per-conversation routing hint.
+    // is the upstream's business — strip it. prompt_cache_key is not
+    // schema-defined on the chat wire either: strict upstreams 400 unknown
+    // body params (#2645), so it is kept only where a relay can live and
+    // stripped from all other egress below.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
     // #2218: body-only relay affinity for plugin hosts. dsh desktop's only
     // identity signal is the bili-internal x-bili-plugin-conversation header
     // (already forwarded as x-session-id by buildForwardTarget); body-keyed
     // relays (workbuddy panel) can't read headers, so stamp the conversation
-    // id into prompt_cache_key too. Gated to admin-rewritten or loopback
-    // destinations — strict direct APIs can 400 unknown body params (#1403).
-    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin)) {
+    // id into prompt_cache_key too. Gated to loopback relay destinations
+    // (#2649: a rewritten route is not relay evidence) — strict direct APIs
+    // can 400 unknown body params (#1403/#2645), so a client-supplied
+    // prompt_cache_key survives verbatim ONLY on relay destinations
+    // ("client wins" there, the body-keyed relay family may be keyed by it)
+    // and is stripped on all other egress.
+    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, upstreamOrigin)) {
         rebuilt.prompt_cache_key = session.id;
+    } else if (!relayAffinityDestined(upstreamOrigin)) {
+        delete (rebuilt as Record<string, unknown>).prompt_cache_key;
     }
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without

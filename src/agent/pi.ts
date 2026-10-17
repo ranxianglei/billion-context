@@ -408,7 +408,14 @@ export function ompCoworkTransportBypassesFetch(
     // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
     const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
     const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
-    return !hasProviderProxy && !hasGlobalProxy;
+    if (hasProviderProxy || hasGlobalProxy) return false;
+    // HTTPS_PROXY is deliberately NOT routing evidence here: the Cowork
+    // transport's node:https stack ignores env proxies entirely (proven
+    // live 2026-10-17, Anthropic req_011Cg7cujfgv4xLjuRvLMqvg — a loopback
+    // HTTPS_PROXY was set and the stamped body still reached the upstream
+    // direct, 400). Only PI_PROXY / PI_PROXY_ANTHROPIC push Cowork onto
+    // Bun's fetch, where the patch can see and the proxy can consume it.
+    return true;
 }
 
 // Once per process per model — the bypass is a property of the installed host
@@ -452,6 +459,19 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     // name gate.
     const profile = hostProfileFor(agent);
     if (!profile.stampsBodyPromptCacheKey) return undefined;
+    // #2583 (hoisted): the Cowork withhold must gate EVERY stamp path, not
+    // just the unrouted fallback below. On the launcher cert-MITM lane
+    // (HTTPS_PROXY + BILI_MITM_HOSTS) destinationRoutedThroughProxy() is
+    // true, which skipped this check entirely — yet Cowork traffic never
+    // rides globalThis.fetch on that lane either, so the stamp could fire
+    // on a transport the fetch intercept cannot consume and ride verbatim
+    // into Anthropic's strict schema (#1403's 400 on every delegation).
+    // #3482 site 2: whether that transport is even POSSIBLE is a registry
+    // property; the env observation below is the per-request truth.
+    if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+        noteOmpCoworkBypass(ctx.model?.id ?? (ctx.model?.baseUrl ?? ""));
+        return undefined;
+    }
     if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) {
         // #1579: native omp mode routes at the FETCH layer — the model
         // baseUrl stays the real upstream, so the launcher-shaped checks
@@ -480,21 +500,6 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         const base = ctx.model?.baseUrl ?? "";
         const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
         if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
-        // #2583: the gates above prove the interceptor WOULD rewrite this URL
-        // at the fetch layer — but OMP's Cowork transport never puts default
-        // anthropic/anthropic-messages traffic ON globalThis.fetch in the
-        // first place (node:https direct unless a proxy env is set), so the
-        // rewrite can never fire and the stamped pck would ride verbatim into
-        // Anthropic's strict schema (400 on every delegation). Withhold the
-        // stamp where the transport is proven direct: those requests go
-        // direct anyway (uncompressed, anonymous to the proxy) — soft
-        // identity loss instead of a guaranteed hard failure (#1403).
-        // #3482 site 2: whether that transport is even POSSIBLE is a registry
-        // property; the env-observation below is the per-request truth.
-        if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
-            noteOmpCoworkBypass(ctx.model?.id ?? base);
-            return undefined;
-        }
     }
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
