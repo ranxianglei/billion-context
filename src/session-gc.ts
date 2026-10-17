@@ -263,6 +263,15 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 dropSessionForGc(view.id);
             }
         }
+        // #3463 step 1: unified-store GC parity — this sweep used to delete
+        // ONLY the legacy file; under unified modes the session's index.db rows
+        // (and every CAS refcount behind them) survived forever, so index.db
+        // grew without bound (#3463). Release the rows BEFORE the file goes —
+        // same order as removeLegacyFile: if the rm below fails, the next
+        // sweep retries and self-heals (the row removal is idempotent).
+        if (view.id !== null) {
+            store.removeUnifiedSession(view.id);
+        }
         try {
             await rm(file, { force: true });
         } catch {

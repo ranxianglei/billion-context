@@ -24,7 +24,7 @@
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type StorageGcReport, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
@@ -328,6 +328,14 @@ export class UnifiedShadow {
     deleteCheckpoint(cpId: string): boolean {
         this.assertLive();
         return this.store.deleteCheckpoint(cpId);
+    }
+
+    /** #3463 step 1: manual storage-GC pass (refcount reconcile -> zero-ref
+     *  reclaim -> optional VACUUM). Throws like the other explicit operator
+     *  actions when the sidecar is disabled. */
+    runGc(opts: { fix?: boolean; vacuum?: boolean }): StorageGcReport {
+        this.assertLive();
+        return this.store.runGc(opts);
     }
 
     /** Ingest freshness watermark for load-side import gating (null = never

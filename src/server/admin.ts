@@ -502,6 +502,48 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: deleted, deleted }));
         return;
     }
+    // #3463 step 1: manual storage-GC pass — reconcile content refcounts
+    // against actual references, reclaim zero-refcount CAS rows, optionally
+    // VACUUM so freed pages return to the OS. Loopback-gated like every
+    // /__bili/ route; 501 in legacy mode. Defaults are fix+vacuum ON: each
+    // step is safe by construction (fix only moves booked counts toward
+    // actually-counted refs, reclaim only deletes provably-unreferenced rows,
+    // VACUUM never touches live data), so an unflagged run already delivers
+    // the full benefit pass the issue asks for.
+    if (req.method === "POST" && req.url === "/__bili/storage/gc") {
+        try {
+            const raw = await readBody(req);
+            let parsed: { fix?: unknown; vacuum?: unknown } = {};
+            if (raw.byteLength > 0) {
+                const maybe = JSON.parse(raw.toString("utf8")) as unknown;
+                if (typeof maybe !== "object" || maybe === null || Array.isArray(maybe)) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: "expected {} or { fix?: boolean, vacuum?: boolean }" }));
+                    return;
+                }
+                parsed = maybe as { fix?: unknown; vacuum?: unknown };
+            }
+            if ((parsed.fix !== undefined && typeof parsed.fix !== "boolean") || (parsed.vacuum !== undefined && typeof parsed.vacuum !== "boolean")) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected {} or { fix?: boolean, vacuum?: boolean }" }));
+                return;
+            }
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "storage GC requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            const report = store.storageGc({ fix: parsed.fix ?? true, vacuum: parsed.vacuum ?? true });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, ...report }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : err instanceof SyntaxError ? 400 : 500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
             const body = await readBody(req);

@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
@@ -32,6 +32,47 @@ import type { MessageContentStore } from "acp-kernel";
  *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
+
+/** #3463 step 1: the COMPLETE set of CAS ref-holding columns. The reconcile's
+ *  safety depends on this list being exhaustive — a row it counts keeps its
+ *  bytes alive, a source it misses becomes a data-loss path when reclaim runs.
+ *  Add an entry here whenever a new column starts referencing content(hash). */
+const CAS_REF_SOURCES: { table: string; column: string; nullable: boolean }[] = [
+    { table: "messages", column: "content_hash", nullable: false },
+    { table: "blocks", column: "summary_hash", nullable: false },
+    { table: "blocks", column: "one_hash", nullable: true },
+    { table: "ccr_entries", column: "content_hash", nullable: false },
+    { table: "checkpoints", column: "state_hash", nullable: false },
+];
+
+export interface RefcountAuditReport {
+    /** Total content rows scanned. */
+    checked: number;
+    /** Drifted rows whose actual reference count is zero (booked > 0) — deletable garbage. */
+    orphaned: number;
+    /** Rows booked higher than reality (>0): leaked refs keeping bytes alive. */
+    overBooked: number;
+    /** Rows booked lower than reality: premature-reclaim hazard. */
+    underBooked: number;
+    /** Source-table rows pointing at absent content rows (corruption; FKs should prevent). */
+    missingContentRefs: number;
+    /** Rows corrected (only when fix=true). */
+    fixedRows: number;
+}
+
+export interface StorageGcReport {
+    startedAt: number;
+    durationMs: number;
+    fixApplied: boolean;
+    sessions: number;
+    contentRowsBefore: number;
+    contentBytesBefore: number;
+    audit: RefcountAuditReport;
+    reclaimed: { rows: number; bytes: number };
+    vacuum: { ran: boolean; error: string | null };
+    dbSizeBytesBefore: number;
+    dbSizeBytesAfter: number;
+}
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -232,13 +273,20 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    private readonly filePath: string;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, filePath: string) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
+        this.filePath = filePath;
+    }
+
+    /** Absolute path of the index.db file (size reporting / diagnostics). */
+    get dbPath(): string {
+        return this.filePath;
     }
 
     static open(
@@ -273,7 +321,7 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source);
+        return new UnifiedStore(db, used, source, path);
     }
 
     close(): void {
@@ -1087,6 +1135,119 @@ export class UnifiedStore {
             .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(byte_len),0) AS b, COALESCE(SUM(refcount),0) AS r FROM content")
             .get() as { n: number; b: number; r: number };
         return { rows: row.n, bytesTotal: row.b, refcounted: row.r };
+    }
+
+    /** #3463 step 1 (#2671 §7 item 6): reconcile the booked content refcounts
+     *  against the ACTUAL references counted across every CAS ref-holding
+     *  column (CAS_REF_SOURCES). fix=true resets drifted rows to the actual
+     *  count — over-booked leaks become reclaimable, under-booked hazards are
+     *  raised before they can delete still-referenced bytes. */
+    refcountAudit(fix: boolean): RefcountAuditReport {
+        const parts: string[] = [];
+        for (const src of CAS_REF_SOURCES) {
+            parts.push(`SELECT ${src.column} AS h FROM ${src.table}${src.nullable ? ` WHERE ${src.column} IS NOT NULL` : ""}`);
+        }
+        const drifted = this.db
+            .prepare(
+                `WITH actual AS (${parts.join(" UNION ALL ")})
+                 SELECT c.hash AS hash, c.refcount AS booked, COALESCE(a.n, 0) AS actual_n
+                 FROM content c LEFT JOIN (SELECT h, COUNT(*) AS n FROM actual GROUP BY h) a ON a.h = c.hash
+                 WHERE c.refcount <> COALESCE(a.n, 0)`,
+            )
+            .all() as { hash: string; booked: number; actual_n: number }[];
+        let missingContentRefs = 0;
+        for (const src of CAS_REF_SOURCES) {
+            const row = this.db
+                .prepare(`SELECT COUNT(*) AS n FROM ${src.table} WHERE ${src.column} NOT IN (SELECT hash FROM content)`)
+                .get() as { n: number };
+            missingContentRefs += row.n;
+        }
+        let fixedRows = 0;
+        if (fix && drifted.length > 0) {
+            const setActual = this.db.prepare("UPDATE content SET refcount = ? WHERE hash = ?");
+            this.db.transaction(() => {
+                for (const d of drifted) {
+                    setActual.run(d.actual_n, d.hash);
+                    fixedRows++;
+                }
+            });
+        }
+        let orphaned = 0;
+        let overBooked = 0;
+        let underBooked = 0;
+        for (const d of drifted) {
+            if (d.actual_n === 0) orphaned++;
+            else if (d.booked > d.actual_n) overBooked++;
+            else underBooked++;
+        }
+        const total = this.db.prepare("SELECT COUNT(*) AS n FROM content").get() as { n: number };
+        return { checked: total.n, orphaned, overBooked, underBooked, missingContentRefs, fixedRows };
+    }
+
+    /** #3463 step 1: collect CAS rows at zero refcount — unreferenced garbage.
+     *  Only safe AFTER a reconcile when drift is possible: a leaked
+     *  over-booked count would otherwise keep dead bytes alive forever. */
+    reclaimZeroRefCount(): { rows: number; bytes: number } {
+        const before = this.db
+            .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(byte_len), 0) AS b FROM content WHERE refcount <= 0")
+            .get() as { n: number; b: number };
+        if (before.n === 0) return { rows: 0, bytes: 0 };
+        this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+        return { rows: before.n, bytes: before.b };
+    }
+
+    /** #3463 step 1: full VACUUM — rewrites the db file so freed pages go back
+     *  to the OS (deletes alone only grow the freelist). Takes an exclusive
+     *  lock and needs ~2x transient disk space, so only operator-triggered
+     *  idle-time maintenance calls it; periodic automation belongs to step 2
+     *  (incremental_vacuum + auto_vacuum), not here. */
+    vacuum(): void {
+        this.db.exec("VACUUM");
+    }
+
+    /** #3463 step 1: one manual storage-GC pass — reconcile refcounts
+     *  (optionally fixing drift), reclaim zero-refcount CAS rows, optionally
+     *  VACUUM the file. Every step is safe by construction: fix only moves
+     *  booked counts toward actually-counted refs, reclaim only deletes
+     *  provably-unreferenced rows, VACUUM never touches live data. A vacuum
+     *  failure is reported, not thrown — the reclamation already landed. */
+    runGc(opts: { fix?: boolean; vacuum?: boolean } = {}): StorageGcReport {
+        const startedAt = Date.now();
+        const fix = opts.fix ?? false;
+        const wantVacuum = opts.vacuum ?? false;
+        const sizeOf = (): number => {
+            try { return statSync(this.filePath).size; } catch { return -1; }
+        };
+        const dbSizeBytesBefore = sizeOf();
+        const before = this.contentDedupReport();
+        const audit = this.refcountAudit(fix);
+        const reclaimed = this.reclaimZeroRefCount();
+        let vacuumRan = false;
+        let vacuumError: string | null = null;
+        if (wantVacuum) {
+            try {
+                this.vacuum();
+                vacuumRan = true;
+            } catch (err) {
+                vacuumError = String(err);
+                loggerLog("warn", `[storage] GC VACUUM failed: ${String(err)}`);
+            }
+        }
+        const sessions = this.counts().sessions;
+        loggerLog("info", `[storage] GC: sessions=${sessions}, content rows ${before.rows} -> ${before.rows - reclaimed.rows} (reclaimed ${reclaimed.bytes} B; drift: ${audit.overBooked} over-booked, ${audit.underBooked} under-booked, ${audit.orphaned} orphaned, ${audit.fixedRows} fixed${fix ? "" : ", fix off"}), vacuum=${vacuumRan ? "ok" : vacuumError ? "failed" : "skipped"}, index.db ${dbSizeBytesBefore} B -> ${sizeOf()} B`);
+        return {
+            startedAt,
+            durationMs: Date.now() - startedAt,
+            fixApplied: fix,
+            sessions,
+            contentRowsBefore: before.rows,
+            contentBytesBefore: before.bytesTotal,
+            audit,
+            reclaimed,
+            vacuum: { ran: vacuumRan, error: vacuumError },
+            dbSizeBytesBefore,
+            dbSizeBytesAfter: sizeOf(),
+        };
     }
 
     listSessionIds(): string[] {
