@@ -151,6 +151,32 @@ function ensureManifest(): Promise<void> {
 // partial note for clients that only render content text.
 export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
+// #3472: Claude Code 2.1.300 replaces the WHOLE content array of any SUCCESSFUL
+// MCP tool result that carries a structuredContent record with JSON.stringify of
+// that record (reproduced over stdio: text + structuredContent → the model sees
+// `{"outcome":"success"}`; text only → text; empty structuredContent → `{}`).
+// Error results keep their text. Since #2752 attaches that record, every
+// successful call from such a host reached the model as the bare envelope — 21
+// bytes — while acp_status/acp_cache/search_context/decompress return their
+// entire payload as prose, so the model was told to paste a report it never got.
+// Mirror the text into the structured object (`text`, byte-identical to
+// content[0].text) so a structured-only reader still receives the full receipt.
+// The mirror is unconditional, not success-gated: failure receipts are
+// one-liners (no payload to save) and the error-results exemption above is
+// observed host-version behavior, so the receipts that matter most must not
+// depend on it holding. Hosts that read content keep byte-identical envelopes,
+// and a result with no outcome/blocksCreated still carries no structuredContent
+// at all.
+export function mcpToolResultEnvelope(out: McpForwardedToolResult): Record<string, unknown> {
+    const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
+    if (out.outcome === undefined && out.blocksCreated === undefined) return result;
+    const structured: Record<string, unknown> = { text: out.text };
+    if (out.outcome !== undefined) structured.outcome = out.outcome;
+    if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
+    result.structuredContent = structured;
+    return result;
+}
+
 export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
@@ -351,14 +377,9 @@ async function handleMessage(msg: {
                 // #2752: the business state rides MCP structuredContent (spec
                 // field alongside content; clients predating it ignore it).
                 // isError semantics are unchanged — partial stays non-error.
-                const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
-                if (out.outcome !== undefined || out.blocksCreated !== undefined) {
-                    const structured: Record<string, unknown> = {};
-                    if (out.outcome !== undefined) structured.outcome = out.outcome;
-                    if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
-                    result.structuredContent = structured;
-                }
-                sendResult(id, result);
+                // #3472: the report text rides inside that record too; see
+                // mcpToolResultEnvelope.
+                sendResult(id, mcpToolResultEnvelope(out));
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC
                 // errors, so the host surfaces them to the model.
