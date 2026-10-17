@@ -726,11 +726,13 @@ Verified entry points (community-maintained list — the mechanism is generic):
 | **Void** | custom OpenAI-compatible endpoint setting |
 | **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | custom-model base URL setting |
+| **PI-Desktop** (Electron + embedded pi SDK) | per-model custom entry — **Endpoint** field ("Model Freedom" / connect-your-own-provider) |
 
 Notes:
 
 - **Crush** is a launcher lane now — prefer `bili crush` (config untouched, HTTPS domains MITM'd automatically).
 - **Zed** is a launcher lane too — prefer `bili zed` (Linux; config untouched, model domains MITM'd automatically, loopback providers stay direct). The settings.json `api_url` path above remains the cross-platform alternative.
+- **PI-Desktop** (Electron + embedded pi SDK, 0.18.x): zero-code path = point the per-model **Endpoint** at `http://127.0.0.1:8787/bili/<upstream>`, keep the API key as-is, run `bili start`. First-class support (.piplug embedded proxy + plugins.aiuo.net listing) is tracked in #2677 — session-identity anchoring on this client awaits a real-machine wire capture (#2677 G4), so it is documented here as the supported configuration path, not as a verified 95–97% cache-hit lane. Do not stack the in-process bcp extension route on top of this one (#3238 documents its multi-turn limits on this host); coexistence relies on bcp's proxied-baseURL stand-down (real-machine check pending, #2677 G7).
 - Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
 - Plain **web apps** (browser-only products) have no local traffic to intercept.
 - VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.

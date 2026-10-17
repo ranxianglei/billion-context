@@ -211,11 +211,13 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 | **Void** | 自定义 OpenAI 兼容端点设置 |
 | **Cursor**(单模型通道) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | 自定义模型 base URL 设置 |
+| **PI-Desktop**(Electron + 内嵌 pi SDK) | 每模型自定义条目 —— **Endpoint** 字段("Model Freedom"/接入自有 provider 入口) |
 
 注意:
 
 - **Crush** 已有启动器车道——直接用 `bili crush`(配置零改动,HTTPS 域自动 MITM)。
 - **Zed** 也已有启动器车道——直接用 `bili zed`(Linux;配置零改动,模型域自动 MITM,环回 provider 保持直连)。上面的 settings.json `api_url` 路径仍是跨平台替代。
+- **PI-Desktop**(Electron + 内嵌 pi SDK,0.18.x):零代码路径 = 把每模型 **Endpoint** 指到 `http://127.0.0.1:8787/bili/<上游>`,API key 原样保留,跑 `bili start`。一等支持(.piplug 内嵌代理 + plugins.aiuo.net 上架)在 #2677 跟踪——该客户端上的会话身份锚定尚待实机抓包确认(#2677 G4),故此处按「受支持的配置路径」而非「已验证 95–97% 缓存命中车道」记录。不要在这条路线上叠加进程内 bcp 扩展(#3238 记录了它在该宿主上的多轮局限);共存依赖 bcp 的 proxied-baseURL stand-down(真机核对待做,#2677 G7)。
 - **账号登录**型客户端(OAuth/订阅)通常焊死端点——前缀技巧不适用,改看[下方 MITM 节](#客户端用-httpproxyconnect接入但从不压缩)。
 - 纯 **web 应用**(只在浏览器里的产品)本地没有流量可截。
 - VS Code 扩展的 baseURL 字段在明文设置里,密钥在系统钥匙串——这里只需要改 baseURL。
