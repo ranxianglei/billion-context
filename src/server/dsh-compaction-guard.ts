@@ -265,7 +265,8 @@ export type Refusal = { status: number; body: unknown };
 const REFUSAL_MESSAGE =
     `dsh native compaction call refused by billion-context: bili owns compression on this lane (#1729, cf. #1772/#1206). ` +
     `A landed dsh compaction checkpoint durably shadows the raw conversation history, which destroys the proxy's compression substrate. ` +
-    `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
+    `No action is needed: your conversation is intact and bili compresses automatically as turns grow too large — if the session is currently over its window, it starts folding on the next turn (#3453). ` +
+    `If you still want dsh native compaction on this lane, opt in explicitly: "allowDshCompaction": true in the bili config or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
  * clients render it natively). 422: a policy refusal of this one request — not

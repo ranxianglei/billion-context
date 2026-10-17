@@ -185,6 +185,11 @@ test("refusal bodies carry the marker reason and are non-retryable", () => {
     assert.equal(openai.status, 422);
     assert.equal(openai.body.error.retryable, false);
     assert.match(openai.body.error.message, /#1729/);
+    // #3499: the refusal must tell the user what to do INSTEAD (keep using the
+    // lane; over-window sessions fold on the next turn), not only how to force
+    // the refused behavior — the incident user read the bare opt-in as "the fix".
+    assert.match(openai.body.error.message, /No action is needed/);
+    assert.match(openai.body.error.message, /starts folding on the next turn/);
     const anthropic = dshCompactionRefusal("anthropic") as { status: number; body: { error: { message: string } } };
     assert.equal(anthropic.status, 422);
     assert.match(anthropic.body.error.message, /durably/);
