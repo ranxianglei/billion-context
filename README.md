@@ -151,6 +151,9 @@ This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
 (pass the flag again on any future npm reinstall of `bili`) — that is the
 permanent fix; avoid `sudo`.
 
+Prefer containers? A `Dockerfile` ships at the repository root — see
+[Running in Docker](#running-in-docker) below.
+
 ## Quickstart
 
 Three ways to use it — pick one:
@@ -390,6 +393,31 @@ state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
 #362, opt-in cleanup #1082) — full paths in [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Running the proxy
+
+### Running in Docker
+
+A `Dockerfile` ships at the repository root — it installs the published npm
+package at build time (the tested artifact; nothing is compiled in the image)
+and runs the proxy as a service:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+Then point clients' baseURL at `http://<host>:8787/bili/…` exactly like Option 3
+above.
+
+- **Base:** `node:24-slim` — uses the builtin `node:sqlite` storage engine directly (no native-addon download). Don't switch to Node 20 bases: the self-downloaded SQLite engine requires Node ≥ 22 and crashes under 20 (#3341).
+- **Updates:** in-container self-update is **off by default** (`ACP_AUTO_UPDATE=0`) — the sanctioned update channel for a containerized copy is rebuilding/pulling a newer image; an in-place self-update would be silently reverted to the image version on the next recreate. Opt back in with `-e ACP_AUTO_UPDATE=1`; pin a release at build time with `--build-arg BILI_VERSION=0.1.197` (default `latest`).
+- **Data:** the four mounted dirs hold config, session state, update throttle/lock + cached SQLite engine, and logs respectively. Mount volumes or bind mounts so they survive container replacement; the image also declares them as `VOLUME`s so even a bare `docker run` keeps them out of the container layer.
+- **Security:** the container listens on `0.0.0.0:8787` so clients outside it can connect — there is **no authentication**, so expose the port only on a trusted network (same caveat as `--host 0.0.0.0` below). The web UI and `/__bili/*` JSON endpoints work unchanged through the mapped port.
+- **Healthcheck:** the image ships a `HEALTHCHECK` probing `/__bili/health` on 8787 via node's builtin fetch (no curl needed in the slim base); if you override the listen port, remember the probe stays pinned to 8787.
 
 ### Flags
 

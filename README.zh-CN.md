@@ -145,6 +145,8 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
+想用容器?仓库根目录自带 `Dockerfile`——见下文[在 Docker 中运行](#在-docker-中运行)。
+
 ## 快速上手
 
 3种方式 —— 任选其一:
@@ -279,6 +281,28 @@ curl -s http://localhost:8787/__bili/stats
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
 ## 运行代理
+
+### 在 Docker 中运行
+
+仓库根目录自带 `Dockerfile`——构建期从 npm 装已发布的包(被测试过的产物;镜像里不编译任何东西),把代理作为服务跑起来:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+然后把客户端 baseURL 指到 `http://<host>:8787/bili/…`,和上面方式 3 完全一样。
+
+- **基础镜像:** `node:24-slim` —— 直接用内置 `node:sqlite` 存储引擎(不发生 native addon 下载)。不要换成 Node 20 基础镜像:自举下载的 SQLite 引擎要求 Node ≥ 22,在 20 上会崩(#3341)。
+- **更新:** 容器内自更新**默认关闭**(`ACP_AUTO_UPDATE=0`)——容器化副本的合法升级通道是重建/pull 新镜像;原地自更新会在下次重建时被静默回退到镜像版本。想开回来用 `-e ACP_AUTO_UPDATE=1`;构建期钉版本用 `--build-arg BILI_VERSION=0.1.197`(默认 `latest`)。
+- **数据:** 四个挂载目录分别存放配置、会话状态、更新节流/锁 + 缓存的 SQLite 引擎、日志。挂 volume 或 bind mount 让它们跨容器替换存活;镜像也把这四个目录声明为 `VOLUME`,裸 `docker run` 也不会把它们落进容器层。
+- **安全:** 容器监听 `0.0.0.0:8787` 以便外部客户端接入——**没有认证**,端口只应暴露给可信网络(与下面 `--host 0.0.0.0` 的注意事项相同)。Web UI 和 `/__bili/*` JSON 端点经映射端口照常可用。
+- **健康检查:** 镜像自带 `HEALTHCHECK`,用 node 内置 fetch 探 8787 上的 `/__bili/health`(slim 基础无需 curl);若覆盖监听端口,注意探针仍钉在 8787。
 
 ### 命令行参数
 
