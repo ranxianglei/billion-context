@@ -26,12 +26,23 @@ function isObj(v: unknown): v is Record<string, unknown> {
 interface ImageRef {
     mediaType?: string;
     b64?: string;
+    // #3398: non-pixel opaque payload bili forwards verbatim but cannot spill
+    // to disk (unknown shape — no known field holds the bytes). The placeholder
+    // records type + size so the fold does not lose it silently; there is no
+    // decompress({ imageRef }) restore for these.
+    label?: string;
 }
 
 function refFromDataUrl(url: unknown): ImageRef | undefined {
     if (typeof url !== "string") return undefined;
     const d = parseDataUrl(url);
     return d ? { mediaType: d.mediaType, b64: d.base64 } : undefined;
+}
+
+function opaqueLabel(part: Record<string, unknown>): string {
+    const t = typeof part.type === "string" ? part.type : "media";
+    const kb = Math.max(1, Math.round(JSON.stringify(part).length / 1024));
+    return `${t} ~${kb}KB`;
 }
 
 /** The images this core message carries, in wire order. Empty for plain-text
@@ -51,6 +62,24 @@ export function messageImages(m: CoreMessage): ImageRef[] {
             return [refFromDataUrl(s.url) ?? { mediaType }];
         }
         return [{ mediaType }];
+    }
+    // #3398: tool_result blocks with non-text nested blocks ride the same
+    // sidecar whole; each nested block gets its own placeholder so a folded
+    // range does not lose them silently.
+    if (isObj(ab) && ab.type === "tool_result" && Array.isArray(ab.content)) {
+        const refs: ImageRef[] = [];
+        for (const c of ab.content) {
+            if (!isObj(c) || c.type === "text") continue;
+            const s = c.source;
+            if (isObj(s) && s.type === "base64" && typeof s.data === "string") {
+                refs.push({ mediaType: isObj(s) && typeof s.media_type === "string" ? s.media_type : undefined, b64: s.data });
+            } else if (isObj(s) && s.type === "url") {
+                refs.push(refFromDataUrl(s.url) ?? {});
+            } else {
+                refs.push({ label: opaqueLabel(c) });
+            }
+        }
+        if (refs.length > 0) return refs;
     }
     // Responses: the original item keeps every input_image part (the singular
     // imageBase64 sidecar covers only the first), so walk it when present.
@@ -74,8 +103,15 @@ export function messageImages(m: CoreMessage): ImageRef[] {
     if (Array.isArray(mm.rawOpenaiContentParts)) {
         const refs: ImageRef[] = [];
         for (const p of mm.rawOpenaiContentParts) {
-            if (!isObj(p) || p.type !== "image_url") continue;
-            refs.push(refFromDataUrl(isObj(p.image_url) ? p.image_url.url : undefined) ?? {});
+            if (!isObj(p)) continue;
+            if (p.type === "image_url") {
+                refs.push(refFromDataUrl(isObj(p.image_url) ? p.image_url.url : undefined) ?? {});
+                continue;
+            }
+            // #3398: custom-shape media parts (e.g. {type:"image",attachment:{…}})
+            // ride this sidecar verbatim too — record them as labelled media so
+            // the fold does not lose them silently.
+            refs.push({ label: opaqueLabel(p) });
         }
         if (refs.length > 0) return refs;
     }
@@ -90,6 +126,9 @@ export function messageImages(m: CoreMessage): ImageRef[] {
  *  from decodeImageDims (container-header scan only — no full decode). */
 export function imagePlaceholders(m: CoreMessage): string[] {
     return messageImages(m).map((ref) => {
+        // #3398: opaque payloads have no pixels to describe — a distinct
+        // `[media: …]` marker so readers don't mistake them for restorable images.
+        if (ref.label && !ref.b64) return `[media: ${ref.label}]`;
         let note = "";
         if (ref.mediaType) note += ref.mediaType.includes("/") ? ref.mediaType.split("/").pop()! : ref.mediaType;
         if (ref.b64) {
