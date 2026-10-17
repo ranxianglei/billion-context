@@ -33,7 +33,12 @@ interface AppendInfo {
     //   appended elements) — the healthy shape for array-appending clients.
     // tail-fields: same element stability, but the divergence is trailing
     //   fields after the message array.
-    kind: "strict" | "json-tail" | "tail-fields";
+    // mid-insert: same element COUNT, but one element's INTERIOR grew (a single
+    //   logical unit whose content extended in place, e.g. auto-review's giant
+    //   user message with a growing FILTERED_HISTORY + fixed PENDING_ACTION
+    //   trailer) — byte-wise a mid-body insertion, semantically an append
+    //   (#3476).
+    kind: "strict" | "json-tail" | "tail-fields" | "mid-insert";
     countA: number;
     countB: number;
 }
@@ -177,6 +182,22 @@ function prefixCompare(a: Buffer, b: Buffer): { rel: "append" | "diverge"; offse
     }
     if (b.length >= a.length) return { rel: "append", offset: a.length, extra: b.length - a.length };
     return { rel: "diverge", offset: n, extra: b.length - a.length };
+}
+
+// #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
+// plus some common suffix — i.e. its middle residual is EMPTY — while `cur`
+// carries extra bytes in that middle. That is a SEMANTIC append: no prior byte
+// moved or changed, only new bytes landed between a stable head and a stable
+// trailer (e.g. a single giant message whose interior container grows, with a
+// fixed trailer shifting right). A genuine rewrite leaves a non-empty residual
+// on the shorter side, so it is never matched here — this cannot mask a real
+// mid-history break.
+function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
+    if (cur.length <= prev.length || lcp >= prev.length) return false;
+    const room = prev.length - lcp;
+    let lcs = 0;
+    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
+    return lcp + lcs === prev.length;
 }
 
 const MSG_KEYS = ["messages", "input", "contents"];
@@ -351,6 +372,16 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
                 }
             }
         }
+    }
+    // #3476: same element count but one element's interior grew — a single
+    // logical unit extending in place (auto-review FILTERED_HISTORY + fixed
+    // PENDING_ACTION trailer). Byte-wise a mid-body insertion; semantically an
+    // append. Recognize it instead of flagging a rewrite.
+    if (isMidInsertionAppend(aBody, bBody, O)) {
+        return {
+            rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+            append: { kind: "mid-insert", countA: ia?.items.length ?? 0, countB: ib?.items.length ?? 0 },
+        };
     }
     return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: false };
 }

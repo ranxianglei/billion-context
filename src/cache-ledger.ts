@@ -680,6 +680,20 @@ function byteLcp(a: Buffer, b: Buffer): number {
     return lcp;
 }
 
+// #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
+// plus some common suffix (its middle residual is EMPTY) while `cur` carries
+// extra bytes in that middle — a SEMANTIC append where one logical unit's
+// interior grows in place (auto-review FILTERED_HISTORY + fixed PENDING_ACTION
+// trailer). A genuine rewrite leaves a non-empty residual on the shorter side,
+// so it is never matched here and stays "mid". Mirrors src/acp-cache-diff.ts.
+function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
+    if (cur.length <= prev.length || lcp >= prev.length) return false;
+    const room = prev.length - lcp;
+    let lcs = 0;
+    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
+    return lcp + lcs === prev.length;
+}
+
 // #2982: byte offset of the CLOSING bracket terminating the top-level
 // messages/input/contents array (same key set as seamLcp's msgsOf), or null
 // when the body carries no such array (or is not valid JSON). String-aware
@@ -1513,7 +1527,11 @@ export function settleUsageReport(
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
                         const arrClose = messagesArrayCloseOffset(shorterFull);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : "mid";
+                        // #3476: a growing logical unit (single giant message whose interior
+                        // container extends in place) is byte-wise a mid-body insertion but
+                        // semantically an append — recognize it in the would-be-mid slot.
+                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
+                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
