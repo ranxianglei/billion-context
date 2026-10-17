@@ -27,6 +27,7 @@ import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
+import { nodeSqliteUpgradeHint } from "./engine-bootstrap.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
@@ -41,6 +42,16 @@ export const VERIFY_EVERY_INGESTS = 20;
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
 // discipline, #2030); re-exported here for the storage-layer importers.
 export { resolveStorageMode, type StorageMode } from "../knobs.ts";
+
+/** #3489 item B (follow-up to #3485): the recurring boot-time degrade warn
+ *  carries the same Node-upgrade lever as the diagnostics degrade reason —
+ *  but ONLY when the open failure IS the missing-engine condition (#2823);
+ *  other failures (corrupt index.db, disk errors) keep their byte-stable
+ *  recovery instruction untouched. Pure (errText + nodeVersion in → suffix
+ *  out) so tests pin the gate without depending on the runner's own Node. */
+export function sidecarOpenFailHint(errText: string, nodeVersion: string = process.versions.node): string {
+    return /no SQLite engine available/i.test(errText) ? nodeSqliteUpgradeHint(nodeVersion) : "";
+}
 
 interface ShadowStats {
     ingests: number;
@@ -97,7 +108,7 @@ export class UnifiedShadow {
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
+                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index${sidecarOpenFailHint(String(err))}`,
             );
             recordSidecarOpenFailure(String(err));
             return null;

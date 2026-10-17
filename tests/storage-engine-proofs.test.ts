@@ -26,6 +26,9 @@
  *                      instead of bricking construction (#2771).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
+ *   DEGRADE HINT     — the boot-time warn surfaces the Node-upgrade lever
+ *                      ONLY for the missing-engine failure; corrupt-index
+ *                      keeps its byte-stable recovery line (#3489 item B).
  *
  * The corrupt-index test is the regression for #2771; the rest are contract
  * pins (proof-only, no product change).
@@ -39,8 +42,10 @@ import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
-import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { UnifiedShadow, sidecarOpenFailHint } from "../src/storage/shadow.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
+import { nodeSqliteUpgradeHint } from "../src/storage/engine-bootstrap.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
@@ -498,6 +503,71 @@ test("storage engine: no SQLite engine -> maybeOpen degrades to null (sidecar ab
         assert.equal(shadow, null, "maybeOpen must return null (legacy-only) when no SQLite engine is available");
     } finally {
         setSqliteEnginesUnavailableForTests(false);
+        rmrf(dir);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// DEGRADE HINT SURFACES (#3489 item B, follow-up to #3485): the recurring
+// boot-time warn (maybeOpen's catch) must carry the Node-upgrade lever ONLY
+// for the missing-engine condition; every other open failure keeps its
+// byte-stable recovery instruction.
+// ---------------------------------------------------------------------------
+
+test("storage engine: sidecarOpenFailHint pins the gate x version matrix (#3489)", () => {
+    const oldNode = "20.19.0";
+    const hint = nodeSqliteUpgradeHint(oldNode);
+    assert.ok(hint.length > 0, "sanity: a pinned pre-22.5 Node must lack the builtin");
+    assert.equal(
+        sidecarOpenFailHint("[storage:node:sqlite] no SQLite engine available", oldNode),
+        hint,
+        "missing-engine failure on a pre-22.5 Node must carry the upgrade hint",
+    );
+    assert.equal(
+        sidecarOpenFailHint("SQLITE_NOTADB: file is not a database", oldNode),
+        "",
+        "corrupt-index failures must NOT pick up the upgrade hint",
+    );
+    assert.equal(
+        sidecarOpenFailHint("[storage:node:sqlite] no SQLite engine available", "24.0.0"),
+        "",
+        "Nodes with the builtin have nothing to suggest",
+    );
+});
+
+test("storage engine: no-engine boot warn carries the hint slot; corrupt-index warn stays byte-stable (#3489)", () => {
+    const dir = tmpdir("bili-engproof-hint-warn-");
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => { lines.push(msg); });
+    try {
+        // Missing engine: the warn is the pre-change base PLUS exactly what
+        // the helper says for THIS runner's Node (on a <22.5 runner that IS
+        // the full upgrade hint).
+        setSqliteEnginesUnavailableForTests(true);
+        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(shadow, null, "no-engine maybeOpen must degrade to null");
+        const base = `[storage] unified sidecar failed to open ${dir}/index.db`;
+        const line = lines.find((l) => l.startsWith(base));
+        assert.ok(line, "no-engine open failure must log the degrade warn");
+        const parsed = /\((.*)\) — staying legacy-only; delete the file to reset the index(.*)$/.exec(line);
+        assert.ok(parsed, "warn line shape drifted");
+        const [, errText, suffix] = parsed;
+        assert.match(errText, /no SQLite engine available/i, "captured failure must be the missing-engine condition");
+        assert.equal(suffix, sidecarOpenFailHint(errText), "suffix must be exactly the helper's verdict for the captured error");
+
+        // Corrupt index (engines available): the warn must end byte-identical
+        // to the pre-#3489 line — no hint, no drift of the recovery text.
+        setSqliteEnginesUnavailableForTests(false);
+        fs.writeFileSync(path.join(dir, "index.db"), Buffer.alloc(512, 0x5a));
+        lines.length = 0;
+        const shadow2 = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(shadow2, null, "corrupt-index maybeOpen must degrade to null");
+        const corrupt = lines.find((l) => l.startsWith(base));
+        assert.ok(corrupt, "corrupt-index open failure must log the degrade warn");
+        assert.ok(corrupt.endsWith("delete the file to reset the index"), "corrupt-index warn must stay byte-stable (no hint)");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        setLogCapture(null);
         rmrf(dir);
     }
 });
