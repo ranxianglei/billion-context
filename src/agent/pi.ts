@@ -554,7 +554,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 // #2416: read the LIVE base — a native respawn after a proxy
@@ -574,7 +574,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // rebinding (onRoutedOriginObserved) converges env back to the
                 // observed routed origin.
                 const base = proxyBaseForCtx(ctx) ?? proxyBase;
-                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown", toolCallId);
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
