@@ -11,7 +11,7 @@ on:
   # (the pre-#3295 push trigger was deliberately dropped, not lost).
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     paths:
       - "proof/**"
       - "tests/cache-theorem.test.ts"

@@ -20,7 +20,7 @@ on:
   # covered by the regular test/build workflows.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     paths:
       - "src/server.ts"
       - "src/server/**"

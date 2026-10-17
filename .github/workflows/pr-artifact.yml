@@ -2,7 +2,7 @@ name: PR Build Artifact
 
 on:
     pull_request:
-        branches: [master]
+        branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
 
 # #2637: same-ref supersede-cancel (pattern of merged #2635) — a rapid re-push
 # must not queue a second build+publish behind its own predecessor. The temp

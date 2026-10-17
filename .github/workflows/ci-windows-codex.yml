@@ -8,7 +8,7 @@ on:
   # else, so a plain PR never runs this lane.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
   # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
   schedule:
     - cron: '13/30 * * * *'

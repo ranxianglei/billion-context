@@ -7,7 +7,7 @@ on:
   # runner on doc-only diffs. Manual dispatch covers everything else.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     paths:
       - "src/image-*.ts"
       - "src/preflight.ts"

@@ -11,7 +11,7 @@ on:
     # workflow compensates via workflow_dispatch below.
     branches: [master, "*_release-v*"]
   pull_request:
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
