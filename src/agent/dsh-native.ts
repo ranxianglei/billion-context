@@ -1337,8 +1337,15 @@ export function apply(ctx: PluginContext): void {
     // RETRY_INTERVAL_MS until a proxy lands.
     maybeRetry(ctx);
 
-    // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
-    // endpoint logs once; same-state refusals accumulate silently and re-print
+    // #1158 L2: a refusal leaves the request uncompressed, but does NOT decide
+    // its egress — that is settled downstream in the intercept: direct-to-
+    // upstream for plain traffic on a raw URL, or stamped into the proxy's
+    // unattributed passthrough lane (every overlay-routed URL; a marker-
+    // sniffed compaction POST is diverted there too, where the #2709 guard
+    // runs the decisive check). The log must not claim "sent DIRECT" (#3499:
+    // the claim misread as upstream-direct cost a full diagnostic pass — the
+    // bytes can die inside the proxy instead). First refusal per endpoint
+    // logs once; same-state refusals accumulate silently and re-print
     // only on an attribution STATE change (none↔threw), always carrying the
     // cumulative count — bounded noise (#1117 silence preserved) while a
     // "dozens refused, one passed" distribution becomes visible. The durable
@@ -1368,7 +1375,7 @@ export function apply(ctx: PluginContext): void {
                         ? "initiator present but missing session id"
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
             const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
-            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
+            const line = `bili-native-dsh: model request NOT taken over by bili (uncompressed) — takeover gate refused ${key}: ${reason} — egress: direct upstream or proxy passthrough lane (decided after the gate) — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
         }
         return false;

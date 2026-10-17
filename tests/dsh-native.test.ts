@@ -1768,7 +1768,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 3);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request NOT taken over by bili \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — egress: direct upstream or proxy passthrough lane \(decided after the gate\) — refusals so far: 5 \(state none→threw\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
