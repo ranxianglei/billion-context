@@ -25,6 +25,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "check:test-import-graph": "node scripts/check-test-import-graph.mjs",
+    "check:dist-thin": "node scripts/check-dist-thin-install.mjs",
     "pretest": "node scripts/test-suite-lock.mjs gate && npm --prefix kernel run build && npm --prefix pi-subagents run build",
     "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",

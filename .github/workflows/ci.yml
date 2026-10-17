@@ -238,6 +238,11 @@ jobs:
       # pi-lane component — its own unit suite against its TS source.
       - run: npm --prefix pi-subagents test
       - run: npm run build
+      # #3617-C: thin-install smoke — install ONLY the packed tarball into a
+      # scratch dir (no repo node_modules) and run it: catches ANY undeclared
+      # runtime dependency in the bundles at import time (the #3511 zod class;
+      # generalizes #3519's static-only check).
+      - run: node scripts/check-dist-thin-install.mjs
 
   version-guard:
     runs-on: ubuntu-latest
