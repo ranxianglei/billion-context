@@ -315,7 +315,7 @@ OpenAI/ChatGPT 凭据。
 
 同一接缝还承载 `/acp-cache`(#1146)—— prompt-cache 对账报告的人侧入口(输出与 `acp_cache` 工具一致):pi/omp 原生注册(`/acp-cache [full]` 出逐行清单);opencode V1 渲染为一条被忽略的消息,代理在到达 wire 前从模型上下文剥离;opencode V2 渲染为合成消息(报告最多可见 ~8 KB);dsh(两条泳道)显示默认摘要台账——dsh 的命令 API 不传参数,故无 `full`。旧 opencode-acp 会话(#920)收到显式的不可用提示(其流量绕过本代理的压缩状态)。Claude Code 没有进程内命令 API:`bili plugin install claude` 写一个模型中介的 `commands/acp-cache.md` markdown 命令,其 prompt 驱动 `acp_cache` MCP 工具并把报告逐字贴回。codex/kimi/hermes 没有用户可输入的命令接缝——直接让模型调用它的 `acp_cache` 工具。每次折叠的盈亏判定按可选的 `compress.priceProfile`(以输入 token 单价为基准的归一化倍率)计价;任何层级都未设置时,取请求模型在 models.dev 的价格行按绝对 $/Mtok 计(仅无法解析的模型回退内核比率默认值)——因此 breakeven/PAID BACK 开箱即反映你上游的真实经济账;对带自定义加价的中转站可按 provider 覆盖(CONFIGURATION.zh-CN.md,#1279)。
 
-同一接缝还承载 `/acp-rule`(#1251/#1399)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册,操作集与工具完全一致 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用),`/acp-rule remove <id>` 删除一条,裸 `/acp-rule clear` 清空全部(`clear <文本>` 是记录而非清空——一个手误不该毁掉所有规则)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。
+同一接缝还承载 `/acp-rule`(#1251/#1399)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp/opencode 原生注册,操作集与工具完全一致 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用),`/acp-rule remove <id>` 删除一条,裸 `/acp-rule clear` 清空全部(`clear <文本>` 是记录而非清空——一个手误不该毁掉所有规则)。pi/omp 与 opencode V1 的包裹后 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制);opencode V2 渲染为合成非模型消息 —— 已记录的指令本来就每轮经 system prompt 注入。
 
 ### 旧 opencode-acp 会话(#920)
 

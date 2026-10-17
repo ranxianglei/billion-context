@@ -219,10 +219,10 @@ entries:
     group: compress
     id: ct.rules
     render: compress-row
-    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
-    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
-    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
-    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
+    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp/opencode expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
+    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp/opencode 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
+    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp/opencode expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
+    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp/opencode 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
   - key: compress.injectTool
     type: boolean
     default: "true"

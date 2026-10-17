@@ -926,14 +926,15 @@ relays with custom markup (CONFIGURATION.md, #1279).
 
 The same seam carries `/acp-rule` (#1251/#1399) — the human entry point to
 the persistent-rules feature (identical output to the `acp_rule` tool):
-pi/omp register it natively with the tool's full operation set — bare
-`/acp-rule` lists every recorded rule, `/acp-rule <text>` records one directly
-(as if the model had called it), `/acp-rule remove <id>` deletes one, and bare
-`/acp-rule clear` wipes all recorded rules (`clear <text>` records instead of
-wiping — a typo must not destroy every rule). The wrapped transcript message
-is stripped from model context by content signature like the cache report —
-recorded rules reach the model every turn via the system-prompt injection
-anyway.
+pi/omp/opencode register it natively with the tool's full operation set —
+bare `/acp-rule` lists every recorded rule, `/acp-rule <text>` records one
+directly (as if the model had called it), `/acp-rule remove <id>` deletes one,
+and bare `/acp-rule clear` wipes all recorded rules (`clear <text>` records
+instead of wiping — a typo must not destroy every rule). In pi/omp and
+opencode V1 the wrapped transcript message is stripped from model context by
+content signature like the cache report; opencode V2 renders the report as a
+synthetic non-model message instead — recorded rules reach the model every
+turn via the system-prompt injection anyway.
 
 ### Legacy opencode-acp sessions (#920)
 

@@ -49,7 +49,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStaleNotice, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -571,6 +571,10 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 } catch (err) {
                                     text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                                 }
+                                // #3594 parity with the V1 lane: surface a stale release
+                                // (installed newer than running) in the status panel too.
+                                const staleNotice = await fetchStaleNotice(base).catch(() => undefined);
+                                if (staleNotice !== undefined) text += `\n\n${staleNotice}`;
                             }
                         }
                         try {
@@ -624,6 +628,67 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp-cache render failed: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                    },
+                });
+                // #3594 parity with the pi lane (/acp-rule): same ops as the acp_rule tool.
+                // Renders like the cache report (fitted description); the model-facing body
+                // stays the inert one-liner, so no proxy-side stripping wrap is needed (#1146).
+                editor.add({
+                    name: "acp-rule",
+                    description: "Persistent rules for this session (same ops as the acp_rule tool). Usage: /acp-rule [text to record] | /acp-rule remove <id> | /acp-rule clear",
+                    execute: async (input) => {
+                        const sid = typeof input.sessionID === "string" ? input.sessionID : "";
+                        if (!sid) {
+                            console.warn("[bili-opencode] /acp-rule invoked without a sessionID; cannot run the rule ops");
+                            return;
+                        }
+                        let text: string;
+                        if (pluginDisabled()) {
+                            text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
+                        } else {
+                            const base = state.proxyBase ?? proxyBaseFromEnv();
+                            const raw = (typeof input.arguments === "string" ? input.arguments : "").trim();
+                            let toolArgs: Record<string, unknown> | undefined;
+                            if (raw === "") {
+                                toolArgs = {};
+                            } else if (raw === "clear") {
+                                toolArgs = { clear: true };
+                            } else if (raw === "remove" || raw.startsWith("remove ")) {
+                                const id = raw.slice("remove".length).trim();
+                                if (id !== "") toolArgs = { delete: id };
+                            } else {
+                                toolArgs = { rule: raw };
+                            }
+                            if (!base) {
+                                text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp-rule again)";
+                            } else if (toolArgs === undefined) {
+                                text = "Usage: /acp-rule remove <rule-id> — bare /acp-rule lists the recorded ids";
+                            } else {
+                                try {
+                                    const report = await forwardTool(base, sid, "acp_rule", toolArgs, undefined, true);
+                                    if (report.failed) {
+                                        text = `bili: acp_rule failed: ${report.text}`;
+                                    } else if (report.text.startsWith("acp_rule is not enabled")) {
+                                        // #1192 note channel — surface the enablement hint instead of
+                                        // echoing the model-facing note into the transcript.
+                                        text = "bili: acp_rule is not enabled on this bili proxy — set compress.rules.enabled: true in your bili config";
+                                    } else {
+                                        text = report.text;
+                                    }
+                                } catch (err) {
+                                    const msg = err instanceof Error ? err.message : String(err);
+                                    text = msg.includes("no model request has arrived")
+                                        ? "bili: no ACP session yet for this conversation (send a model request first, then run /acp-rule)"
+                                        : `bili: acp_rule failed (${msg})`;
+                                }
+                            }
+                        }
+                        try {
+                            const description = fitNoticeDescription(text, V2_CACHE_REPORT_VISIBLE_MAX, "report");
+                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
+                        } catch (err) {
+                            console.error(`[bili-opencode] /acp-rule render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
                     },
                 });

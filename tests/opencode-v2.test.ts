@@ -17,7 +17,7 @@ const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_
 const LONG_PANEL = Array.from({ length: 30 }, (_, i) => `panel line ${String(i + 1).padStart(2, "0")}: ${"x".repeat(38)}`).join("\n");
 const LONG_REPORT = Array.from({ length: 200 }, (_, i) => `report line ${String(i + 1).padStart(3, "0")}: ${"y".repeat(38)}`).join("\n");
 
-function startFakeProxyV2(manifestOpenaiTools?: Array<{ name: string; description?: string; parameters?: unknown }>): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
+function startFakeProxyV2(manifestOpenaiTools?: Array<{ name: string; description?: string; parameters?: unknown }>, acpRuleResult?: string, statusBody?: object): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
     const toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }> = [];
     const compacts: string[] = [];
     const server = http.createServer((req, res) => {
@@ -34,6 +34,8 @@ function startFakeProxyV2(manifestOpenaiTools?: Array<{ name: string; descriptio
                 } else if (data.tool === "acp_cache") {
                     const body = data.conversationId === "ses_cache_long" ? LONG_REPORT : "CACHE-REPORT-OK";
                     res.end(JSON.stringify({ ok: true, result: `Web UI: http://127.0.0.1:9/__bili/#/session/${data.conversationId}\n\n${body}` }));
+                } else if (data.tool === "acp_rule" && acpRuleResult !== undefined) {
+                    res.end(JSON.stringify({ ok: true, result: acpRuleResult }));
                 } else {
                     res.end(JSON.stringify({ ok: false, error: `boom-${data.tool}` }));
                 }
@@ -73,6 +75,16 @@ function startFakeProxyV2(manifestOpenaiTools?: Array<{ name: string; descriptio
                 ? { version: "9.9.9-test", tools: { openai: manifestOpenaiTools } }
                 : { version: "9.9.9-test" };
             res.end(JSON.stringify(manifest));
+            return;
+        }
+        if ((req.url ?? "") === "/__bili/status") {
+            if (statusBody === undefined) {
+                res.writeHead(404);
+                res.end("{}");
+                return;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(statusBody));
             return;
         }
         res.writeHead(404);
@@ -1008,4 +1020,171 @@ test("fitNoticeDescription: under-cap verbatim; overflow keeps whole lines, hois
     assert.equal(hoisted.match(/^Web UI: .+$/gm)!.length, 1, "embedded link deduped, single occurrence");
     assert.ok(!hoisted.includes("http://old.example"), "stale embedded link removed");
     assert.ok(hoisted.length <= 500, `hoisted result fits (${hoisted.length})`);
+});
+
+// #3594: /acp-rule gives the opencode V2 lane the same rule ops as the pi lane.
+
+test("v2 setup: /acp-rule registered with the pi-lane description (#3594)", async () => {
+    const fake = makeFakeCtx();
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const rule = fake.addedCommands.find((c) => c.name === "acp-rule");
+            assert.ok(rule, "/acp-rule command registered");
+            assert.equal(
+                rule!.description,
+                "Persistent rules for this session (same ops as the acp_rule tool). Usage: /acp-rule [text to record] | /acp-rule remove <id> | /acp-rule clear",
+            );
+        } finally {
+            cleanup();
+        }
+    });
+});
+
+test("v2 setup: /acp-rule forwards acp_rule and renders the report via inert synthetic (#3594)", async () => {
+    const proxy = await startFakeProxyV2(undefined, "RULE-REPORT-V2");
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const rule = fake.addedCommands.find((c) => c.name === "acp-rule")!;
+                await rule.execute({ sessionID: "ses_rule_1", arguments: "remember X" });
+                await until(() => fake.syntheticCalls.length === 1);
+                // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
+                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_rule_1", tool: "acp_rule", args: { rule: "remember X" }, nativeCaller: true }]);
+                assert.equal(fake.syntheticCalls[0].sessionID, "ses_rule_1");
+                // #1146: the model-facing body stays the inert one-liner; the report lives in the description only.
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.ok(!fake.syntheticCalls[0].text.includes("RULE-REPORT-V2"), "report body does not reach the model");
+                assert.match(fake.syntheticCalls[0].description!, /RULE-REPORT-V2/);
+                assert.equal(fake.syntheticCalls[0].resume, false);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp-rule maps argument forms pi-identically onto acp_rule args (#3594)", async () => {
+    const proxy = await startFakeProxyV2(undefined, "R");
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const rule = fake.addedCommands.find((c) => c.name === "acp-rule")!;
+                const cases: Array<[string, unknown]> = [
+                    ["", {}],
+                    ["clear", { clear: true }],
+                    ["remove 3", { delete: "3" }],
+                    ["always cite sources", { rule: "always cite sources" }],
+                ];
+                for (const [args, expected] of cases) {
+                    const before = proxy.toolCalls.length;
+                    await rule.execute({ sessionID: "s", arguments: args });
+                    await until(() => proxy.toolCalls.length === before + 1);
+                    assert.equal(proxy.toolCalls[before].tool, "acp_rule", `arguments=${JSON.stringify(args)}`);
+                    assert.deepEqual(proxy.toolCalls[before].args, expected, `arguments=${JSON.stringify(args)}`);
+                }
+                const before = proxy.toolCalls.length;
+                await rule.execute({ sessionID: "s", arguments: "remove" });
+                await until(() => fake.syntheticCalls.length >= 1);
+                assert.equal(proxy.toolCalls.length, before, "bare remove must not call the proxy");
+                assert.match(fake.syntheticCalls[fake.syntheticCalls.length - 1].description!, /Usage: \/acp-rule remove <rule-id>/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp-rule surfaces the enablement hint when rules are off (#3594)", async () => {
+    const proxy = await startFakeProxyV2(undefined, "acp_rule is not enabled in this session's effective config");
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const rule = fake.addedCommands.find((c) => c.name === "acp-rule")!;
+                await rule.execute({ sessionID: "s" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, /compress\.rules\.enabled: true/);
+                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp-rule renders diagnostics without a proxy or under the kill switch (#3594)", async () => {
+    for (const [vars, expected] of [
+        [{ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, /no proxy detected/],
+        [{ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: "0" }, /disabled \(BILLION_CONTEXT_PLUGIN=0\)/],
+    ] as Array<[Record<string, string | undefined>, RegExp]>) {
+        const fake = makeFakeCtx();
+        await withEnv(vars, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const rule = fake.addedCommands.find((c) => c.name === "acp-rule")!;
+                await rule.execute({ sessionID: "s_diag" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.match(fake.syntheticCalls[0].description!, expected);
+            } finally {
+                cleanup();
+            }
+        });
+    }
+});
+
+test("v2 setup: /acp appends the staleness notice when the on-disk install is newer (#3594)", async () => {
+    const proxy = await startFakeProxyV2(undefined, undefined, { version: "1.0.0", diskVersion: "2.0.0", stale: true, autoRestartOnUpdate: false });
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_stale" });
+                await until(() => fake.syntheticCalls.length === 1);
+                const desc = fake.syntheticCalls[0].description ?? "";
+                assert.ok(desc.includes("ACP-PANEL-OK"), "panel is preserved");
+                assert.match(desc, /is stale/);
+                assert.match(desc, /v1\.0\.0/);
+                assert.match(desc, /v2\.0\.0/);
+                assert.match(desc, /restart the host/i);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp omits the staleness notice when the running install matches disk (#3594)", async () => {
+    const proxy = await startFakeProxyV2(undefined, undefined, { version: "2.0.0", diskVersion: "2.0.0", stale: false });
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_fresh" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.equal(fake.syntheticCalls[0].description, "ACP-PANEL-OK");
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
 });
