@@ -1,5 +1,6 @@
 import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
+import { coreHostRefs, HOST_ID_BODY_FIELD, HOST_ID_MAX_ENTRIES } from "./host-id-channel.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -351,7 +352,7 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
+export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer, hostIds?: (string | null)[]): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
     // so both the ≤200 heuristic and size-based guards are proxies that a new
@@ -392,6 +393,9 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
         const cap = publicSnapshotCapBytes();
         const dropOverCap = () => {
             session.pluginSnapshot = undefined;
+            // #3464 (R1): the pairing list dies with its snapshot — a stale
+            // pairing would mis-attribute identity on the next ingest.
+            session.pluginSnapshotHostIds = undefined;
             session.metadata.publicSnapshotCapped = true;
             delete session.metadata.publicSnapshotBytes;
         };
@@ -405,6 +409,10 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             if (cap > 0 && bytes > cap) dropOverCap();
             else {
                 session.pluginSnapshot = structuredClone(original);
+                // #3464 (R1): wire-aligned stamp of THIS request — the snapshot
+                // now reflects exactly its wire messages, so the full list is
+                // the correct pairing for every core inside it.
+                session.pluginSnapshotHostIds = hostIds === undefined ? undefined : [...hostIds];
                 session.metadata.publicSnapshotBytes = bytes;
                 delete session.metadata.publicSnapshotCapped;
             }
@@ -438,6 +446,11 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
                 if (cap > 0 && bytes > cap) dropOverCap();
                 else {
                     for (let i = k; i < n; i++) prev.push(structuredClone(original[i]));
+                    // #3464 (R1): extension appends cores whose wire messages
+                    // continue this request's numbering, so the full wire list
+                    // of THIS request pairs every core of the extended
+                    // snapshot (wire indices never restart mid-conversation).
+                    session.pluginSnapshotHostIds = hostIds === undefined ? undefined : [...hostIds];
                     session.metadata.publicSnapshotBytes = bytes;
                     delete session.metadata.publicSnapshotCapped;
                 }
@@ -449,6 +462,9 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
                 if (cap > 0 && bytes > cap) dropOverCap();
                 else {
                     session.pluginSnapshot = structuredClone(original);
+                    // #3464 (R1): same full-list pairing as first write — the
+                    // rebuilt snapshot reflects exactly this request's wire.
+                    session.pluginSnapshotHostIds = hostIds === undefined ? undefined : [...hostIds];
                     session.metadata.publicSnapshotBytes = bytes;
                     delete session.metadata.publicSnapshotCapped;
                 }
@@ -858,7 +874,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         // #2652: maxToolDurationMs = the budget's totalTimeoutMs ceiling, so agent-side
         // bridges size their compress-call HTTP wait to the real server bound instead of a
         // fixed constant. Absent when the chain is off (classic summaries commit locally).
-        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" }, hostMessageIds: { bodyField: HOST_ID_BODY_FIELD, maxEntries: HOST_ID_MAX_ENTRIES } },
     }));
 }
 
@@ -1040,7 +1056,13 @@ function forkSnapshot(session: Session) {
     // the revision is only the cheap early-exit token.
     const activeBlockSet = session.state.blocks.filter((b) => b.active).map((b) => b.blockId).sort();
     const parentRevision = forkHash({ sessionId: session.id, seq: orderedMessages.length, blockSet: activeBlockSet });
-    return { protocolVersion: 2, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+    // #3464 (R1): host-id → bili-ref map for stamped lanes. Deliberately OUTSIDE
+    // orderedMessages: that array feeds orderHash/stableJson branch-point
+    // comparison, so mixing host ids in would break old-client/new-server
+    // pairs. A parallel index-aligned array is additive — old clients ignore
+    // it, and it must never influence any hash.
+    const snapshotHostRefs = coreHostRefs(messages as ReadonlyArray<{ id: string; wireIndex?: number }>, session.pluginSnapshotHostIds);
+    return { protocolVersion: 2, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, hostIds: snapshotHostRefs.map((r) => r?.hostId ?? null), messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
 }
 
 /** #2671 Phase 2b transition digest: fork protocol v1 hashed the ENTIRE
@@ -1247,7 +1269,24 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount));
+            const forkedPrefix = parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount);
+            // #3464 (R1): the pairing list is WIRE-aligned while the fork
+            // boundary is counted in CORES — derive the covered wire span from
+            // the prefix's wireIndex sidecars (non-decreasing down the array,
+            // every wire message yields ≥1 core ⇒ span is exactly 0..max).
+            // No wireIndex anywhere (lane without host ids) → no pairing,
+            // byte-keyed ingest as before.
+            let forkedHostIds: (string | null)[] | undefined;
+            if (parent.pluginSnapshotHostIds !== undefined) {
+                let maxWire = -1;
+                for (const m of forkedPrefix) {
+                    const wi = (m as { wireIndex?: unknown }).wireIndex;
+                    if (typeof wi === "number" && Number.isSafeInteger(wi) && wi > maxWire) maxWire = wi;
+                }
+                if (maxWire >= 0) forkedHostIds = parent.pluginSnapshotHostIds.slice(0, maxWire + 1);
+            }
+            child.pluginSnapshot = structuredClone(forkedPrefix);
+            child.pluginSnapshotHostIds = forkedHostIds;
             const forkView = prune(child.pluginSnapshot, child.state);
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
@@ -1256,6 +1295,9 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                     child.state.blocks.some((b) => b.active && !b.expanded && a.summary.length > 0 && b.summary.includes(a.summary))
                 )) ?? []);
             child.lastMessages = structuredClone(child.pluginSnapshot);
+            // #3464 (R1): lastMessages here IS the raw forked prefix, so it
+            // carries the same wire-aligned pairing as pluginSnapshot.
+            child.lastMessagesHostIds = child.pluginSnapshotHostIds;
             child.lastMessagesFolded = false;
             const parentStore = contentStoreOf(parent);
             for (const { ref, rawId } of prefix) {

@@ -51,7 +51,8 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, hostIdChannelForProxy, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { collectWireHostIds } from "../host-id-channel.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { registerCompactionDisable } from "./dsh-compaction-disable.js";
@@ -1437,6 +1438,9 @@ export function apply(ctx: PluginContext): void {
     state.beforeSend = async (url, init) => {
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        // #3464 (R1): LAST — an incremental takeover already replaced the body
+        // (marker set), and this stamps only full-resend anthropic bodies.
+        await maybeStampHostIds(init);
     };
 
     // #3248 incremental turns (#3370 hardened): reference wiring for the
@@ -1509,6 +1513,39 @@ export function apply(ctx: PluginContext): void {
         headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
         init.headers = headers;
         incPendingAcks.set(turnId, { sid, url, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
+    }
+    // #3464 (R1): passive host-id side channel. Hosts that serialize their
+    // per-message stable id into the outgoing anthropic body (dsh
+    // MessageBase.id) get it echoed back to bili in the reserved top-level
+    // field — identity-by-id instead of byte-hash guessing on the proxy side.
+    // Reads the id off each message of THIS request's own body (no cross-
+    // request state, no races); stamps only when the proxy advertised the
+    // channel (old proxies never see the field) and at least one message
+    // carries an id. Never touches marker'd/delta bodies or non-anthropic
+    // shapes; a malformed id list ships nothing (honest degradation).
+    function maybeStampHostIds(init: RequestInit | undefined): void {
+        if (!register.toolsReady || init === undefined) return;
+        const headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+        if (headers.get(INCREMENTAL_TURN_MARKER_HEADER) === "1") return; // delta lane owns that body
+        const attr = attributionOf(ctx);
+        if (attr.state !== "ok") return;
+        const body = init.body;
+        if (typeof body !== "string" || body.length === 0) return;
+        let parsed: Record<string, unknown>;
+        try {
+            parsed = JSON.parse(body) as Record<string, unknown>;
+        } catch {
+            return;
+        }
+        if (!Array.isArray(parsed.messages) || typeof parsed.model !== "string") return; // anthropic wire only
+        const base = register.base ?? state.origin;
+        if (base === undefined) return;
+        const channel = hostIdChannelForProxy(base);
+        if (channel === undefined) return; // proxy predates the channel — never stamp
+        const ids = collectWireHostIds(parsed.messages, channel.maxEntries);
+        if (ids === null) return;
+        parsed[channel.bodyField] = ids;
+        init.body = JSON.stringify(parsed);
     }
     state.onResponse = (_url, response, headers) => {
         const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];

@@ -175,6 +175,26 @@ function recordManifestToolDuration(proxyBase: string, json: unknown): void {
     if (typeof value === "number" && Number.isFinite(value) && value > 0) manifestToolDurations.set(proxyBase, value);
 }
 
+// #3464 (R1): per-proxy host-message-id side-channel, learned from the manifest
+// at bootstrap. Plugins stamp the body field ONLY when their proxy advertises
+// it — an older build would forward the unknown top-level field upstream, so
+// capability gating is what makes the channel safe to ship unconditionally on
+// the server side.
+const manifestHostIdChannels = new Map<string, { bodyField: string; maxEntries: number }>();
+
+function recordManifestHostIdChannel(proxyBase: string, json: unknown): void {
+    const caps = (json as { capabilities?: { hostMessageIds?: { bodyField?: unknown; maxEntries?: unknown } } })?.capabilities?.hostMessageIds;
+    if (typeof caps?.bodyField !== "string" || caps.bodyField.length === 0) return;
+    const maxEntries = typeof caps.maxEntries === "number" && Number.isSafeInteger(caps.maxEntries) && caps.maxEntries > 0 ? caps.maxEntries : 10000;
+    manifestHostIdChannels.set(proxyBase, { bodyField: caps.bodyField, maxEntries });
+}
+
+/** The body field this proxy accepts for wire-aligned host message ids, or
+ *  undefined when the proxy predates #3464 (do NOT stamp). */
+export function hostIdChannelForProxy(proxyBase: string): { bodyField: string; maxEntries: number } | undefined {
+    return manifestHostIdChannels.get(proxyBase);
+}
+
 /** Effective HTTP wait (ms) for a forwarded tool call. Only compress invokes the
  *  external summary executor (bounded by totalTimeoutMs), so only it grows past the
  *  base floor — and only when the proxy advertised a budget. Everything else, and any
@@ -190,6 +210,7 @@ export async function fetchManifest(proxyBase: string, format: "anthropic" | "op
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
     recordManifestToolDuration(proxyBase, json);
+    recordManifestHostIdChannel(proxyBase, json);
     if (format === "openai") {
         // OpenAI function style: {name, description, parameters} (plain JSON Schema).
         const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };

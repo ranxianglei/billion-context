@@ -752,6 +752,10 @@
       ],
       "endpoint": "/__bili/plugin/fork",
       "snapshotEndpoint": "/__bili/plugin/snapshot"
+    },
+    "hostMessageIds": {
+      "bodyField": "_bili_message_ids",
+      "maxEntries": 10000
     }
   }
 }

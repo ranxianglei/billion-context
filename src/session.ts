@@ -514,6 +514,15 @@ export type Session = {
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3464 (R1) wire-aligned host message ids, one entry per WIRE message of
+     *  the request that produced lastMessages (null entries = padding).
+     *  In-memory only: cleared wherever lastMessages is re-rendered or replaced
+     *  from disk — a stale pairing would mis-attribute identity. */
+     lastMessagesHostIds?: (string | null)[];
+    /** #3464 (R1): wire-aligned host ids for pluginSnapshot (same pairing
+     *  rule as lastMessagesHostIds). Persisted beside pluginSnapshot under the
+     *  same fork-receipt gate — the fork child replays it into ingest. */
+    pluginSnapshotHostIds?: (string | null)[];
     /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
      *  bumped by markDirty after every mutation. Keys the fork-revision cache
      *  below so status polling skips re-hashing the whole history (#2017). */
@@ -1246,10 +1255,14 @@ export function findSessionByCanonicalId(canonicalId: string): Session | undefin
  *  raw request messages (originalMessages from prepare*). One array per
  *  session, replaced every request — bounded, always the newest state. Empty
  *  arrays (parse failures) never clobber a good snapshot. */
-export function snapshotMessages(session: Session, messages: CoreMessage[]): void {
+export function snapshotMessages(session: Session, messages: CoreMessage[], lastMessagesHostIds?: (string | null)[] | null): void {
     if (messages.length > 0) {
         session.lastMessages = messages;
         session.lastMessagesFolded = false;
+        // #3464 (R1): exact replacement, never merge — a shorter/absent stamp
+        // for this request means the lane is unstamped and any leftover pairing
+        // would mis-attribute identity on the next ingest.
+        session.lastMessagesHostIds = lastMessagesHostIds ?? undefined;
     }
 }
 

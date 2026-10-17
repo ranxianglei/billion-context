@@ -48,10 +48,13 @@ Fetch once at plugin startup.
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
   "capabilities": {
-    "fork": { "protocolVersion": 2, "acceptsProtocolVersions": [1, 2], "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
+    "fork": { "protocolVersion": 2, "acceptsProtocolVersions": [1, 2], "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" },
+    "hostMessageIds": { "bodyField": "_bili_message_ids", "maxEntries": 10000 }
   }
 }
 ```
+
+`capabilities.hostMessageIds` (#3464): the proxy accepts a **side-channel top-level body field** carrying your conversation's stable per-message ids. On model requests whose body is the Anthropic chat shape (`messages` + `model`), you may add `"_bili_message_ids": [<id-or-null>, …]`, index-aligned with `messages` (use `null` for messages that have no id). The proxy strips the field before forwarding — it never reaches the upstream provider — and uses it as the PRIMARY message identity for that session: storage rows key on the host id (a resend under drifted bytes refreshes the row instead of minting a twin), fold reconciliation claims by exact host-id equality before any heuristic pass, and the fork snapshot answers with the same array so you can map host ids back to bili refs. Omit the field whenever your host has no message-level id (or its serializer does not put one in the body) — identity then falls back to content bytes exactly as before; a malformed array is stripped and ignored for that request only. Never stamp this field on requests carrying bili-internal marks (passthrough / plugin-bypass / compaction) or on incremental-turn marker'd bodies — those paths own their bytes.
 
 Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
 
@@ -220,6 +223,7 @@ Marker divert (#3248 phase 2 — native extensions): instead of switching the pr
 3. Forward tool executions verbatim; return `result` as the tool result.
 4. Self-disable when not running behind bili (e.g. the agent's baseURL does not point at the proxy) — same convention as billion-context-pi / opencode-acp extensions.
 5. Keep tool-call ids byte-stable within one conversation, including when projecting it onto another provider. Tool-message identity keys on `toolCallId` as the protocol-stable pairing factor; a projection that rewrites those ids (e.g. sanitizing stored composite ids for a foreign Responses provider) silently loses fold coverage — compressed tool outputs re-enter the wire unfolded (#2396). Canonicalize ids at the host boundary before the payload reaches the proxy; the proxy detects the shape and names it in the fold-drift log, but never repairs onto guessed pairings (see MESSAGE-IDENTITY.md).
+6. If your host model carries a stable per-message id AND its request serializer writes it into the outgoing body, stamp `capabilities.hostMessageIds.bodyField` (index-aligned with `messages`, `null` where absent) on every full-resend Anthropic-shaped model request — read passively off the body you already parse; do not mutate host state to force ids into existence. Gate on the manifest capability (older proxies have no such capability entry and must never see the field), skip incremental-turn marker'd bodies, and keep each id stable for the life of the message (the proxy treats one host id as exactly one message forever, mirroring the never-reused ref contract). Hosts without message-level ids (pi, omp today) simply omit the field (#3464).
 
 ## Reference
 

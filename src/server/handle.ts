@@ -37,6 +37,7 @@ import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
+import { HOST_ID_BODY_FIELD, extractHostIds } from "../host-id-channel.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
@@ -471,6 +472,27 @@ async function handleRequest(
             parsed = JSON.parse(bodyText);
         } catch {
             parsed = null;
+        }
+    }
+    // #3464 (R1): host message-id side channel — extracted at the single
+    // parse chokepoint so EVERY downstream path (processed rebuild, chain
+    // skip, verbatim relays) sees the field gone. extractHostIds deletes it
+    // for any presence, well-formed or not; the re-serialization below only
+    // fires when a stamp was actually carried, so unstamped traffic keeps its
+    // exact bytes. Malformed stamps degrade to "channel off for this
+    // request" — never worse than status quo.
+    let stampedWireIds: (string | null)[] | null = null;
+    {
+        const p = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+        if (p && HOST_ID_BODY_FIELD in p) {
+            const wireMessages = Array.isArray(p.messages) ? p.messages : Array.isArray(p.input) ? p.input : Array.isArray(p.contents) ? p.contents : undefined;
+            const ex = extractHostIds(p, wireMessages);
+            stampedWireIds = ex.ids;
+            bodyText = JSON.stringify(p);
+            bodyBuffer = Buffer.from(bodyText, "utf8");
+            log(ex.ids === null ? "debug" : "info", ex.ids === null
+                ? "[hostids] malformed _bili_message_ids field stripped upstream; identity channel ignored for this request (#3464)"
+                : `[hostids] host message-id channel active (${ex.ids.filter((e) => e !== null).length}/${wireMessages?.length ?? "?"} ids) (#3464)`);
         }
     }
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
@@ -2253,7 +2275,11 @@ async function handleRequest(
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        // #3464 (R1): wire-aligned host ids from the parse-
+                        // chokepoint extraction; only the anthropic lane zips
+                        // them onto cores today (the kernel tags wireIndex
+                        // there), other lanes degrade to byte-id behavior.
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide, stampedWireIds)
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide)
                           : responsesCompact
@@ -2543,7 +2569,7 @@ async function handleRequest(
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer, preparedToRemember.hostIds));
                 }
             }
         } finally {

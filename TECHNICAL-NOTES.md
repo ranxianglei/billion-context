@@ -266,6 +266,41 @@ its mode (`pm`) and prepare-responses logs one transition line with the reason
 are recorded — never the prompt body. No wire behavior changed: both projections
 stay exactly as before; the switch is now *recorded* instead of misattributed.
 
+## Host message ids: exact set algebra on stamped lanes (#3464, R1 of #2960)
+
+Message identity was derived from serialized bytes in every layer; any byte
+drift (protocol/model switch, provider rewrite, fork, compaction, marker strip)
+collapsed session/message/fold-anchor identity together — the #2915/#2917/#2838
+family. R1 gives lanes whose host model has a stable per-message id (dsh
+`MessageBase.id`, opencode `msg_…`) an exact identity channel:
+
+- **Transport**: top-level body field `_bili_message_ids` (index-aligned with
+  `messages`, `null` padding), stripped at the single body-parse chokepoint in
+  `src/server/handle.ts` before ANY forward path — reserved namespace never
+  reaches upstream. Plugins read ids passively off the outgoing body (no host
+  API mutation), gate on manifest `capabilities.hostMessageIds`, and stamp only
+  Anthropic-shaped full-resend requests (`src/agent/dsh-native.ts`,
+  `src/agent/opencode-native.ts`). The wire protocols themselves have no id
+  field (MESSAGE-IDENTITY.md lane survey) — this is a side channel, not a
+  protocol change.
+- **Ingress**: `prepareAnthropic` threads the list to reconcile and the
+  snapshot; storage keys rows on `(session_id, host_id, host_slot)` (schema
+  v6, partial unique index). A resend under drifted bytes refreshes the row
+  IN PLACE (documented append-only exception — the DB view must equal the
+  in-memory tail byte-for-byte for #2960⑤ digest parity) and reuses the seq
+  (host-key continuity: drift no longer mints new seqs or churns the ingest
+  watermark). No host id → today's `(msg_id, content_hash)` behavior,
+  bit-identical.
+- **Reconcile**: Pass -1 in `planReconciliation` claims by exact host-id
+  equality (k-th within multi-core groups, role-gated) before every heuristic
+  pass; anchors persist `h` across passes. Fork snapshots answer with the
+  index-aligned `hostIds` array (outside every hash) so host ids map back to
+  bili refs.
+
+Lanes without message-level ids (pi, omp, claude-code, codex, kimi, zcode)
+stay on byte identity unchanged — adoption is per-lane and self-degrading;
+malformed or absent fields never make a request worse than unstamped.
+
 ## Responses native chaining is not supported — history must be replayed (#1954)
 
 The Responses-wire adapter (`prepareResponses` in `src/server.ts`, `buildRequest`

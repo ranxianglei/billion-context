@@ -22,6 +22,7 @@ import { dirname } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
+import { hostKeyOf } from "../host-id-channel.js";
 import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -90,6 +91,14 @@ export interface MessageRow {
      *  lets ingestSession skip re-hashing every message on every save.
      *  Identical value to sha256Hex(content); optional for direct callers. */
     contentHash?: string;
+    /** #3464 (R1): host-stamped id of the WIRE message that produced this row
+     *  (null on lanes without a host id channel). With hostSlot, the partial
+     *  UNIQUE index makes (session_id, host_id, host_slot) the row identity
+     *  under a stamped lane — byte drift refreshes instead of minting twins. */
+    hostId: string | null;
+    /** Ordinal of this core message within its wire message's block group
+     *  (0-based; one wire message can project N core messages). */
+    hostSlot: number | null;
 }
 
 export interface BlockRow {
@@ -383,9 +392,17 @@ export class UnifiedStore {
                 const existingIdentity = this.db.prepare(
                     "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ?",
                 );
+                const existingHostKey = this.db.prepare(
+                    "SELECT 1 FROM messages WHERE session_id = ? AND host_id = ? AND host_slot = ?",
+                );
                 for (const m of input.messages) {
                     if (!m.contentHash) return false;
                     if (existingIdentity.get(s.sessionId, m.msgId, m.contentHash)) return false;
+                    // #3464 (R1): a delta row whose host key already exists is
+                    // a rewound/re-derived tail too — the partial unique index
+                    // would reject it and its tailSeqs slot would point at
+                    // nothing. Same discipline: bail to full ingest.
+                    if (m.hostId !== null && existingHostKey.get(s.sessionId, m.hostId, m.hostSlot)) return false;
                 }
                 // Placeholder→absolute renumber: the plan emitted
                 // watermark+1.. under the aligned assumption; anchoring at
@@ -438,17 +455,44 @@ export class UnifiedStore {
                 // the boot watermark reset still re-establishes delta trust).
                 if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
                     const incomingIds = new Set<string>();
+                    // #3464 (R1): stamped-lane rows are identified by their
+                    // host key, NOT by bytes — a drifted row keeps its host
+                    // key with fresher bytes than the plan's byte identity.
+                    // Sweeping it would delete a live row; the refresh step
+                    // below updates it in place instead.
+                    const incomingHostKeys = new Set<string>();
                     for (const m of messages) {
                         incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
+                        if (m.hostId !== null) incomingHostKeys.add(hostKeyOf({ hostId: m.hostId, slot: m.hostSlot ?? 0 }));
                     }
                     const staleRows = this.db
-                        .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                        .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                        .prepare("SELECT seq, msg_id, content_hash, host_id, host_slot FROM messages WHERE session_id = ?")
+                        .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string; host_id: string | null; host_slot: number | null }[];
                     for (const row of staleRows) {
                         if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
+                        if (row.host_id !== null && incomingHostKeys.has(hostKeyOf({ hostId: row.host_id, slot: row.host_slot ?? 0 }))) continue;
                         this.releaseContent(row.content_hash);
                         this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
                     }
+                }
+                // #3464 (R1): stamped-lane refresh — one documented exception
+                // to the append-only log: a plan row that reuses an existing
+                // seq via its host key may carry FRESHER bytes than the
+                // stored row (marker strip / re-serialization drift). Update
+                // the SAME logical row in place so the raw-tail view stays
+                // digest-equal to the in-memory tail (#2960 ⑤). Identical
+                // bytes no-op; unstamped lanes never have hostId rows.
+                for (const m of messages) {
+                    if (m.hostId === null || !m.contentHash) continue;
+                    const cur = this.db
+                        .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?")
+                        .get(s.sessionId, m.seq) as { msg_id: string; content_hash: string } | undefined;
+                    if (!cur || cur.content_hash === m.contentHash) continue;
+                    this.putContent(m.content, m.contentHash);
+                    this.db.prepare(
+                        "UPDATE messages SET msg_id = ?, ref = ?, ref_num = ?, role = ?, kind = ?, content_hash = ? WHERE session_id = ? AND seq = ?",
+                    ).run(m.msgId, m.ref, m.refNum, m.role, m.kind, m.contentHash, s.sessionId, m.seq);
+                    this.releaseContent(cur.content_hash);
                 }
             }
             this.db
@@ -518,9 +562,9 @@ export class UnifiedStore {
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
-                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, host_id, host_slot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash);
+                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.hostId, m.hostSlot);
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -677,12 +721,17 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+            .prepare("SELECT seq, msg_id, content_hash, host_id, host_slot FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string; host_id: string | null; host_slot: number | null }[];
         const seqByIdentity = new Map<string, number>();
+        // #3464 (R1): on stamped lanes the host key IS the row's identity —
+        // byte drift must not mint a new seq (that would break tailSeqs /
+        // watermark continuity on every marker strip or re-serialization).
+        const seqByHostKey = new Map<string, number>();
         let nextSeq = 0;
         for (const row of existing) {
             seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+            if (row.host_id !== null) seqByHostKey.set(hostKeyOf({ hostId: row.host_id, slot: row.host_slot ?? 0 }), row.seq);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -697,11 +746,20 @@ export class UnifiedStore {
             // callers without a planner pay the sha256 here.
             const hash = m.contentHash ?? sha256Hex(m.content);
             const key = `${m.msgId}\u0000${hash}`;
-            let abs = seqByIdentity.get(key);
+            let abs: number | undefined;
+            // #3464 (R1): host key outranks byte identity — a drifted row
+            // keeps its original seq and the refresh step rewrites bytes.
+            if (m.hostId !== null) {
+                abs = seqByHostKey.get(hostKeyOf({ hostId: m.hostId, slot: m.hostSlot ?? 0 }));
+            }
+            if (abs === undefined) {
+                abs = seqByIdentity.get(key);
+            }
             if (abs === undefined) {
                 abs = nextSeq++;
-                seqByIdentity.set(key, abs);
+                if (m.hostId !== null) seqByHostKey.set(hostKeyOf({ hostId: m.hostId, slot: m.hostSlot ?? 0 }), abs);
             }
+            seqByIdentity.set(key, abs);
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
@@ -1272,7 +1330,7 @@ export class UnifiedStore {
 
     getMessages(sessionId: string): (MessageRow & { contentHash: string })[] {
         const rows = this.db
-            .prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq")
+            .prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, host_id, host_slot FROM messages WHERE session_id = ? ORDER BY seq")
             .all(sessionId) as Record<string, unknown>[];
         return rows.map((r) => ({
             seq: r.seq as number,
@@ -1282,6 +1340,8 @@ export class UnifiedStore {
             role: r.role as string,
             kind: r.kind as string,
             contentHash: r.content_hash as string,
+            hostId: (r.host_id as string | null) ?? null,
+            hostSlot: (r.host_slot as number | null) ?? null,
             content: this.getContent(r.content_hash as string) ?? "",
         }));
     }

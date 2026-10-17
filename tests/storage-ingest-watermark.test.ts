@@ -543,7 +543,11 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         // a mismatch would show up as sampled-verify drift, not a migration
         // problem.
         const { STORAGE_DDL_V1_FOR_TESTS } = await import("../src/storage/schema.ts");
-        const v4Ddl = STORAGE_DDL_V1_FOR_TESTS.replace(/^\s*last_ingested_seq   INTEGER,$/m, "");
+        const v4Ddl = STORAGE_DDL_V1_FOR_TESTS
+            .replace(/^\s*last_ingested_seq   INTEGER,$/m, "")
+            .replace(/^\s*host_id\s+TEXT,$/m, "")
+            .replace(/^\s*host_slot\s+INTEGER,$/m, "")
+            .replace(/^-- #3464 \(R1\)[\s\S]*?CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_host[^\n]*\n/m, "");
         const { DatabaseSync } = await import("node:sqlite");
         const raw = new DatabaseSync(dbPath);
         raw.exec(v4Ddl);
@@ -558,7 +562,7 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "open() migrates v4 → v5");
+            assert.equal(ver.user_version, 6, "open() migrates v4 → v6");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");

@@ -136,7 +136,7 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+     record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean; lastMessagesHostIds?: (string | null)[] }, liveCcr?: MessageContentStore): void {
         if (this.stats.disabled) return;
         try {
             const loaded = this.legacyLoad(record);
@@ -145,7 +145,14 @@ export class UnifiedShadow {
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
                 hasRawTail = true;
-                legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
+                // #3464 (R1): the host-id pairing rides with the raw tail —
+                // absent here means the lane was not stamped for this save.
+                legacy = {
+                    ...legacy,
+                    lastMessages: rawTail.lastMessages,
+                    lastMessagesFolded: rawTail.lastMessagesFolded === true,
+                    ...(rawTail.lastMessagesHostIds ? { lastMessagesHostIds: rawTail.lastMessagesHostIds } : {}),
+                };
             }
             // #2960 ③: the live kernel content store when the caller has one
             // materialized — the envelope only serializes it for fork-receipt

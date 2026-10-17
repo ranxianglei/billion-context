@@ -52,6 +52,10 @@ type SnapshotResponse = {
     parentRevision?: string;
     orderHash?: string;
     orderedMessages?: ForkIdentity[];
+    /** #3464 (R1): index-aligned host message ids for stamped lanes — the
+     *  host-id → bili-ref map. Outside every hash by construction; absent on
+     *  older proxies or unstamped lanes. */
+    hostIds?: (string | null)[];
 };
 
 type ForkAdoptionResult =

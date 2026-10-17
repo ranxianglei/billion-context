@@ -26,8 +26,10 @@ sha256;`assignRefs` 再 first-wins 挂 ref(`if (map.byRaw[message.id]) continue`
 | pi(chat,MITM/plugin) | 是(`convertToLlm()` 每次重建数组;消息模型无 id 字段) | 无通道 |
 | omp | 是(pi 系插件) | 无通道 |
 | hermes 插件 | 是(自有存储 + `pre_api_request` 钩子) | 无通道 |
+| dsh | 是 | **宿主模型 id 走旁路字段**——`MessageBase.id` 跨表示边界稳定;插件从出站 body 读 id,宿主序列化器带上它就盖 `_bili_message_ids`(#3464) |
+| opencode | 是 | **宿主模型 id 走旁路字段**——`msg_…` id,同一机制(#3464) |
 
-覆盖率必须在 **re-join 时点**衡量,而不是 ingress 时点。
+覆盖率必须在 **re-join 时点**衡量,而不是 ingress 时点。上表两条旁路 lane 即 R1 的采用:宿主自己存储里的 id 就是 join key,bili 永不铸造或改写它。
 
 ## Lane 普查:id 能放在哪?
 
@@ -101,8 +103,14 @@ DeepSeek 类网关要求客户端传回网关自己发出的 reasoning("the reas
 | 标记当身份(标签由宿主持久化) | 标签回声事故证明该通道会污染所载内容;现行设计已在两端剥离。 |
 | 隐式别名化宿主改写的工具调用 id | 把一个缺失 covered id 与"同内容、不同 toolCallId"的入站孪生配对需要宿主知识;没有它,claim 就是猜测,decompress 时认错(#2396:Prime 跨 provider 切换改写了复合 id)。只交付检测;修复属于宿主边界(PLUGIN.md 义务 5)。#2480 更新:Pass 0 现在提供了那份宿主知识(位置 + 存储的规范指纹),这一类从"只计数"变为"可认领";能在更早边界规范化的宿主,PLUGIN.md 义务 5 依然成立。 |
 
-## 未来方向
+## 宿主稳定 id:R1 通道(#3464,取代旧的「未来方向」)
 
-若未来宿主或 lane 提供真正稳定的客户端消息 id,只允许作为**附加 join hint** 采纳——永不替代 content-hash 基座。在那之前:字节是锚,hash 是 join,mNNNNN 是账本,标签是视图。
+本文档旧立场——宿主稳定 id 至多算**附加 join hint**、永不替代 content-hash 基座——已被 #2938 的 owner 裁定(hash 降为二等公民;顺序为中心、绝不模糊)与 #3464(#2960 身份管线 R1)取代。宿主模型带稳定消息 id 的 lane(dsh `MessageBase.id`、opencode `msg_…`)现在通过**顶层 body 旁路字段**(`_bili_message_ids`,与 `messages` 下标对齐;wire 协议本身仍无 id 字段——上表普查结论不变)把 id 送进 bili。盖了章的 lane 上,身份从「猜内容像不像」变成精确集合代数:
 
-相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)、#2396(跨 provider 切换时宿主改写的工具调用 id)、#2480(位置折叠覆盖;`tests/identity-proof.test.ts` 是其证明矩阵)、#2636(切模型形状 churn:assistant-turn key + 图片占位变体 pass)。
+- **存储**(`src/storage/schema.ts` v6):`messages.host_id`/`host_slot` + 部分唯一索引 `(session_id, host_id, host_slot)`。行的键是宿主 id,字节 hash 降为内容列。同一条宿主消息以漂移后的字节重发时,**原地刷新该行**(有记录的 append-only 例外,保证 DB 视图与内存尾部逐字节相等——#2960⑤ digest parity),而不是再落一行孪生行。seq 分配优先沿用宿主键连续性,字节漂移不再搅动水位。
+- **对账**(`src/fold-reconcile.ts`):Pass -1,排在一切启发式 pass 之前——锚点带宿主 id 的 covered id 直接认领同宿主 id 的唯一入站 core(多 core 组内 k-th 配对,role 门)。启发式 pass(位置/toolCallId/孪生/simhash/顺序括号)保留给未盖章 lane 与盖章前留下的锚点。未盖章 lane 与此前逐位一致。
+- **fork**(`src/plugin.ts` fork 快照):响应新增加性的 `hostIds` 数组(与 orderedMessages 下标对齐)——宿主 id → bili ref 映射,构造上不进任何 hash,新旧客户端的分支点比较都保持基于字节。
+
+采用按 lane 渐进、自动降级:插件被动读取宿主序列化器实际写进出站 body 的 id(不改宿主 API),仅在 proxy 广播 `capabilities.hostMessageIds` 时盖章,字段缺失或畸形一律退回字节 id 路径。宿主模型没有消息级 id 的 lane(pi、omp——见普查)在其宿主补齐前保持字节身份。字节仍是通用兜底;宿主 id 在有处即为主键。
+
+相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)、#2396(跨 provider 切换时宿主改写的工具调用 id)、#2480(位置折叠覆盖;`tests/identity-proof.test.ts` 是其证明矩阵)、#2636(切模型形状 churn:assistant-turn key + 图片占位变体 pass)、#2938(宿主消息 id 旁路通道提案;owner 裁定:顺序为中心、hash 二等公民)、#3464(R1 宿主 id 通道实现)。

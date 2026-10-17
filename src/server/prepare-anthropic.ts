@@ -50,6 +50,9 @@ export async function prepareAnthropic(
      *  `model`, so the diag line below would otherwise print `undefined`. */
     resolvedModel?: string,
     decide?: DecideConfig,
+    /** #3464 (R1): wire-aligned host message ids extracted at the parse
+     *  chokepoint (null = lane not stamped or stamp malformed). */
+    stampedWireIds?: (string | null)[] | null,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -261,7 +264,9 @@ export async function prepareAnthropic(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts) });
+        // #3464 (R1): wire-aligned host ids → Pass -1 exact claims + anchor.h
+        // stamps; absent on unstamped lanes (byte-based passes unchanged).
+        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), hostIds: stampedWireIds ?? undefined });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -457,7 +462,9 @@ export async function prepareAnthropic(
     // SysPrompt row — the kernel breakdown classifies messages only, and on
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
-    snapshotMessages(session, originalMessages);
+        // #3464 (R1): carry the wire-aligned host ids with the snapshot —
+        // ingest keys stamped-lane rows by (hostId, slot) instead of bytes.
+        snapshotMessages(session, originalMessages, stampedWireIds ?? undefined);
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
@@ -483,7 +490,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId), hostIds: stampedWireIds ?? undefined } as Prepared;
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's

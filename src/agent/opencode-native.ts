@@ -79,7 +79,8 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
+import { asciiHeaderValue, fetchProxyVersion, hostIdChannelForProxy, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
+import { collectWireHostIds } from "../host-id-channel.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -826,7 +827,32 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+// #3464 (R1): the divert runs first; when it took the request, the marker
+// header is set on the replacement and the stamp skips it (delta bodies are
+// not stamped). Otherwise the outgoing anthropic body is stamped with the
+// host message ids it carries — same passive recipe as the dsh lane.
+async function maybeStampHostIdsOpencode(e: V2HttpRequestEvent, s: V2State): Promise<void> {
+    const base = s.proxyBase;
+    if (!base) return;
+    const channel = hostIdChannelForProxy(base);
+    if (channel === undefined) return; // proxy predates the channel — never stamp
+    const req = e.request as Request | undefined;
+    if (req === undefined || typeof req.clone !== "function") return;
+    try {
+        if (req.headers.get(INCREMENTAL_TURN_MARKER_HEADER) === "1") return; // delta lane owns that body
+        const body: unknown = await req.clone().json().catch(() => null);
+        if (body === null || typeof body !== "object") return;
+        const b = body as { messages?: unknown; model?: unknown };
+        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only
+        const ids = collectWireHostIds(b.messages, channel.maxEntries);
+        if (ids === null) return;
+        replaceRequestPayload(e, JSON.stringify({ ...(b as Record<string, unknown>), [channel.bodyField]: ids }));
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: async (e, s) => { await maybeIncrementalOpencode(e, s); await maybeStampHostIdsOpencode(e, s); } }), server };
 
 /** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
  *  http.request hook (routing + header stamping already happened, so the

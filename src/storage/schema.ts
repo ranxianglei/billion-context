@@ -63,7 +63,18 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-const STORAGE_SCHEMA_VERSION = 5;
+//      - v6: host message ids (#3464 R1) — messages gains `host_id` /
+//        `host_slot` (the plugin-stamped host identity of the WIRE message
+//        that produced the row; NULL on lanes without a host id channel)
+//        plus partial UNIQUE index idx_messages_host(session_id, host_id,
+//        host_slot) WHERE host_id IS NOT NULL — under a stamped lane the
+//        host key is the row's identity, so a byte drift (marker strip,
+//        protocol re-serialization) refreshes ONE row instead of minting a
+//        twin. Both directions compatible: an older build opening a v6
+//        file no-ops at the version gate (extra columns/index ignored); a
+//        newer build upgrades a v5 file with two probe-guarded ALTERs and
+//        one CREATE UNIQUE INDEX IF NOT EXISTS.
+export const STORAGE_SCHEMA_VERSION = 6;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -133,6 +144,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role            TEXT NOT NULL,
     kind            TEXT NOT NULL DEFAULT 'message',
     content_hash    TEXT NOT NULL REFERENCES content(hash),
+    host_id         TEXT,
+    host_slot       INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -245,6 +258,10 @@ CREATE TABLE IF NOT EXISTS kv_store (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(session_id, msg_id);
+-- #3464 (R1): on stamped lanes the host key IS the row identity — one wire
+-- message may refresh its bytes across resends (marker strip, re-serialization)
+-- but must never mint a second row. Partial: NULL host_id rows are exempt.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_host ON messages(session_id, host_id, host_slot) WHERE host_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_dead_refs_session ON dead_refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_refs_session ON refs(session_id, ord);
@@ -299,6 +316,22 @@ export function migrateSchema(db: {
             if (!cols.includes("last_ingested_seq")) {
                 db.exec("ALTER TABLE sessions ADD COLUMN last_ingested_seq INTEGER");
             }
+        }
+        if (from < 6) {
+            // v6 host message ids (#3464 R1): two additive NULLable columns
+            // on messages + the partial host-key uniqueness index. Same
+            // probe-guarded ALTER discipline as v2/v5; the index create is
+            // idempotent, so fresh-install DDL that already carries both
+            // re-lands cleanly.
+            const mcols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!mcols.includes("host_id")) {
+                db.exec("ALTER TABLE messages ADD COLUMN host_id TEXT");
+            }
+            if (!mcols.includes("host_slot")) {
+                db.exec("ALTER TABLE messages ADD COLUMN host_slot INTEGER");
+            }
+            db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_host ON messages(session_id, host_id, host_slot) WHERE host_id IS NOT NULL");
         }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     });

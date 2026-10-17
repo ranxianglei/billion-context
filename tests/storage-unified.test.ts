@@ -738,7 +738,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "schema version stamped to 5 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column)");
+            assert.equal(ver.user_version, 6, "schema version stamped to 6 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 host-id columns)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");

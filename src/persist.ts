@@ -200,6 +200,12 @@ interface PersistedSession {
      *  history and must still be pruned at export time. */
     messagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3464 (R1): host message ids aligned with `pluginSnapshot` (one entry
+     *  per wire message the snapshot cores expanded from; null = that wire
+     *  message carried no id). Persisted only when the snapshot itself is
+     *  persisted (fork-receipt gating) — the ingest dedup needs it across a
+     *  restart exactly when the raw snapshot leg re-enters the union. */
+    pluginSnapshotHostIds?: (string | null)[];
     forkContentStore?: MessageContentStore;
 }
 
@@ -1645,7 +1651,14 @@ export class SessionStore {
                 // which the delta path already routes to the full ingest.
                 const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
                 this.shadow?.record(record, tail && tail.length > 0
-                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                    ? {
+                        lastMessages: tail,
+                        lastMessagesFolded: session.lastMessagesFolded,
+                        // #3464 (R1): the host-id list rides with the RAW tail
+                        // only — a folded re-render has no stable per-core
+                        // pairing with its stamped source.
+                        ...(session.lastMessagesHostIds ? { lastMessagesHostIds: session.lastMessagesHostIds } : {}),
+                    }
                     : undefined, session.contentStore ?? undefined);
                 this.noteOwnCommit(session.id, record);
                 return record;
@@ -1710,7 +1723,13 @@ export class SessionStore {
         // never older than what the disk copy carries.
         session.lastMessages = fresh.lastMessages ?? session.lastMessages;
         session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
+        // #3464 (R1): the host-id list is runtime-only (never in the
+        // envelope) — a disk tail that replaced the in-memory one has no
+        // pairing for it, so the channel is inert until the next stamped
+        // request re-stamps (the watermark protects the stored prefix).
+        if (fresh.lastMessages !== undefined) session.lastMessagesHostIds = undefined;
         session.pluginSnapshot = fresh.pluginSnapshot;
+        session.pluginSnapshotHostIds = fresh.pluginSnapshotHostIds;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
         if (!session.meta.upstreamOrigin && fresh.meta.upstreamOrigin) session.meta.upstreamOrigin = fresh.meta.upstreamOrigin;
@@ -1983,6 +2002,9 @@ function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full"
         // sessions pay no disk cost; the in-memory copy self-heals on the next
         // model request because plugin agents resend their full history.
         pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
+        // #3464 (R1): rides the same fork-receipt gate as the snapshot it
+        // aligns with — absent snapshot, absent pairing.
+        pluginSnapshotHostIds: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshotHostIds : undefined,
         forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
@@ -2129,6 +2151,12 @@ function buildSession(parsed: PersistedSession): Session {
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
         pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
+        // #3464 (R1): reject a malformed or misaligned list outright — a
+        // half-valid pairing would dedup the WRONG cores.
+        pluginSnapshotHostIds: Array.isArray(parsed.pluginSnapshot) && isHostIdList(parsed.pluginSnapshotHostIds)
+            && parsed.pluginSnapshotHostIds.length === parsed.pluginSnapshot.length
+            ? parsed.pluginSnapshotHostIds
+            : undefined,
         contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,
@@ -2140,6 +2168,12 @@ export function isValidRecord(parsed: unknown): parsed is PersistedSession {
     if (!parsed || typeof parsed !== "object") return false;
     const r = parsed as Partial<PersistedSession>;
     return typeof r.id === "string" && typeof r.state === "object" && r.state !== null && Array.isArray(r.state.blocks);
+}
+
+/** #3464 (R1): shape check for a persisted host-id list — every entry is a
+ *  non-empty string or an explicit null (the stamper's "no id here"). */
+function isHostIdList(v: unknown): v is (string | null)[] {
+    return Array.isArray(v) && v.every((e) => e === null || (typeof e === "string" && e.length > 0));
 }
 
 /** #408: true when a persisted record (grouped v2+ or flat v1) carries a

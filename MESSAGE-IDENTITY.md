@@ -48,8 +48,12 @@ host:
 | pi (chat, MITM/plugin) | yes (`convertToLlm()` rebuilds arrays; message model has no id field) | no channel |
 | omp | yes (pi-family plugin) | no channel |
 | hermes plugin | yes (own store, `pre_api_request` hook) | no channel |
+| dsh | yes | **host-model id via side-channel** — `MessageBase.id` is stable across representation boundaries; the plugin reads it off the outgoing body and stamps `_bili_message_ids` when the host serializer includes it (#3464) |
+| opencode | yes | **host-model id via side-channel** — `msg_…` ids, same mechanism (#3464) |
 
-Coverage must be measured at the **re-join point**, not at ingress.
+Coverage must be measured at the **re-join point**, not at ingress. The two
+side-channel lanes above are the R1 adoption: the host's own storage id is
+the join key, and bili never mints or rewrites it.
 
 ## Lane survey: where could an id even live?
 
@@ -243,15 +247,49 @@ byte-identical. Identity bookkeeping is never involved.
 | Marker-as-identity (tags persisted by hosts) | The tag-echo incidents show the channel corrupts what it carries; current design already strips it at both ends. |
 | Implicit aliasing of host-rewritten tool-call ids | Pairing a missing covered id with an inbound twin that has identical content under a different toolCallId requires host knowledge; without it the claim is a guess and misattributes on decompress (#2396: Prime rewrote composite ids across a provider switch). Detection-only shipped; the fix belongs at the host boundary (PLUGIN.md obligation 5). #2480 update: Pass 0 now supplies that host knowledge (position + stored canonical fingerprint), so this class is claimed rather than only counted; PLUGIN.md obligation 5 stands for hosts that can canonicalize earlier. |
 
-## Future direction
+## Host-stable ids: the R1 channel (#3464, supersedes the old "future direction")
 
-If a future host or lane offers a genuinely stable client-side message id,
-it may be adopted **only as an additional join hint** — never as a replacement
-for the content-hash base. Until then: bytes are the anchor, hashes are the
-join, mNNNNN is the ledger, tags are the view.
+The old stance here — a host-stable id could at best be an *additional join
+hint*, never a replacement for the content-hash base — is superseded by the
+owner rulings on #2938 (hash demoted to second-class citizen; order-centric,
+never fuzzy) and #3464 (R1 of the #2960 identity pipeline). Lanes whose host
+model carries a stable per-message id (dsh `MessageBase.id`, opencode
+`msg_…`) now ride it into bili through a **side-channel top-level body field**
+(`_bili_message_ids`, index-aligned with `messages`; the wire protocols
+themselves still offer no id field — the survey above stands). On stamped
+lanes identity becomes exact set algebra instead of byte-hash guessing:
+
+- **Storage** (`src/storage/schema.ts` v6): `messages.host_id`/`host_slot` +
+  partial unique index `(session_id, host_id, host_slot)`. A row's key is the
+  host id; the byte hash becomes the *content* column. Resending the same
+  host message under drifted bytes refreshes the row in place (documented
+  append-only exception, required so the DB view equals the in-memory tail
+  byte-for-byte — #2960⑤ digest parity) instead of minting a twin row. Seq
+  assignment prefers host-key continuity, so byte drift no longer churns the
+  watermark.
+- **Reconcile** (`src/fold-reconcile.ts`): Pass -1, before every heuristic
+  pass — a covered id whose stored anchor carries a host id claims the unique
+  inbound core with the same host id (k-th pairing within multi-core groups,
+  role-gated). Heuristic passes (position/tool-call-id/twin/simhash/order
+  bracket) remain the fallback for unstamped lanes and for cells whose anchor
+  predates stamping. Unstamped lanes are bit-identical to before.
+- **Fork** (`src/plugin.ts` fork snapshot): the response gains an additive,
+  index-aligned `hostIds` array — the host-id → bili-ref map — outside every
+  hash by construction, so branch-point comparison stays byte-based for old
+  and new clients alike.
+
+Adoption is per-lane and self-degrading: the plugin reads whatever ids the
+host serializer actually puts in the outgoing body (passive read, no host-API
+mutation), stamps only when the proxy advertises
+`capabilities.hostMessageIds`, and degrades to the byte-id path whenever the
+field is absent or malformed. Lanes whose host model has no message-level id
+(pi, omp — see survey) stay on bytes until their hosts add one. Bytes remain
+the universal fallback; host ids are the primary key where they exist.
 
 Related: #1496 (this document's prompt), `SESSION-IDENTITY.md` (session
 granularity), #1476 + kernel #459/#463 (echo discrimination), #242/#1475
 (Responses id constraints), #206/#673 (tag echo), #1479/#1482 (strict-echo
 repair), #1039 (tool-call byte-exactness invariant), #2396 (host-rewritten tool-call ids across a provider switch), #2480 (positional fold coverage;
-`tests/identity-proof.test.ts` is its proof matrix).
+`tests/identity-proof.test.ts` is its proof matrix), #2938 (host message-id
+side-channel proposal; owner ruling: order-centric, hash second-class),
+#3464 (R1 implementation of the host-id channel).

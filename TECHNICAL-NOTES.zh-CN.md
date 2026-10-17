@@ -118,3 +118,13 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
 
 出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。
+
+## 宿主消息 id:盖章 lane 上的精确集合代数(#3464,#2960 R1)
+
+消息身份原先在每一层都从序列化字节推导;任何字节漂移(换协议/换模型、provider 改写、fork、压缩、marker 剥离)会让会话/消息/折叠锚点三层身份一起塌——#2915/#2917/#2838 那一族。R1 给宿主模型带稳定消息 id 的 lane(dsh `MessageBase.id`、opencode `msg_…`)一条精确身份通道:
+
+- **传输**:顶层 body 字段 `_bili_message_ids`(与 `messages` 下标对齐,`null` 占位),在 `src/server/handle.ts` 唯一的 body 解析咽喉处剥离——保留命名空间永不出站。插件被动读取出站 body 里的 id(不改宿主 API),按 manifest `capabilities.hostMessageIds` 门控,只盖 Anthropic 形状的全量重发请求(`src/agent/dsh-native.ts`、`src/agent/opencode-native.ts`)。wire 协议本身没有 id 字段(MESSAGE-IDENTITY.md 普查)——这是旁路通道,不是协议变更。
+- **入口**:`prepareAnthropic` 把列表传给对账与快照;存储按 `(session_id, host_id, host_slot)` 键控行(schema v6,部分唯一索引)。同一条宿主消息以漂移后的字节重发时**原地刷新该行**(有记录的 append-only 例外——DB 视图必须与内存尾部逐字节相等,#2960⑤ digest parity),并沿用原 seq(宿主键连续性:漂移不再铸造新 seq、不再搅动水位)。无宿主 id → 与今天 `(msg_id, content_hash)` 行为逐位一致。
+- **对账**:`planReconciliation` 的 Pass -1 在一切启发式 pass 之前按宿主 id 精确认领(多 core 组内 k-th,role 门);锚点跨 pass 持久化 `h`。fork 快照响应带同序 `hostIds` 数组(构造上不进任何 hash),宿主 id 可映射回 bili ref。
+
+没有消息级 id 的 lane(pi、omp、claude-code、codex、kimi、zcode)保持字节身份不变——采用按 lane 渐进、自动降级;字段缺失或畸形绝不比未盖章更差。

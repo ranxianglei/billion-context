@@ -1413,6 +1413,10 @@ export type Prepared = {
      *  text (collectBlockContent reads message text by id); processedMessages
      *  has compressed messages replaced with placeholders → empty content. */
     originalMessages: CoreMessage[];
+    /** #3464 (R1): wire-aligned host message ids for this request's inbound
+     *  messages (null entries = padding). Present on stamped plugin lanes
+     *  only; consumers zip per-core via BiliMessage.wireIndex. */
+    hostIds?: (string | null)[];
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;

@@ -11,6 +11,14 @@
  *    content parts → distinct rows. Byte-identical resends are the same row
  *    (kernel identity is id-based; #1476 renumbers new instances, which get
  *    new ids anyway). seq = first-seen arrival order.
+ *  - #3464 (R1): stamped lanes additionally key by the host message id —
+ *    one row per (host_id, host_slot), where slot is the core's ordinal
+ *    inside its wire message (host-id channel). A byte-drifted resend of a
+ *    host-identified message REFRESHES that row's bytes/ref instead of
+ *    minting a twin (the documented append-only exception: the stored view
+ *    must stay equal to the in-memory tail or the verify digest false-
+ *    alarms); the row keeps its first-seen seq position. Lanes without
+ *    host ids keep pure byte-key behavior.
  *  - pluginSnapshot / lastMessages are POINTER SEQUENCES into that log
  *    (tail_json): they are views (subsequences), never re-stored as content.
  *    pluginSnapshot is the frozen raw prefix; lastMessages is the folded
@@ -28,6 +36,7 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
+import { coreHostRefs, hostKeyOf, type CoreHostRef } from "../host-id-channel.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 
 /** Field order of mergeState() output (src/persist.ts) — the loader must
@@ -71,6 +80,10 @@ export interface LegacySessionLike {
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3464 (R1): wire-aligned host message ids, index-for-index with the
+     *  matching leg (null entry = that wire message carries no id). */
+    lastMessagesHostIds?: (string | null)[] | null;
+    pluginSnapshotHostIds?: (string | null)[] | null;
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
@@ -98,6 +111,8 @@ interface LogEntry {
     role: string;
     kind: string;
     ref: string | null;
+    hostId: string | null;
+    hostSlot: number | null;
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -115,6 +130,8 @@ export function toLegacyLike(s: {
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
+    lastMessagesHostIds?: LegacySessionLike["lastMessagesHostIds"];
+    pluginSnapshotHostIds?: LegacySessionLike["pluginSnapshotHostIds"];
     contentStore?: LegacySessionLike["contentStore"];
 }): LegacySessionLike {
     return {
@@ -129,6 +146,8 @@ export function toLegacyLike(s: {
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
         pluginSnapshot: s.pluginSnapshot,
+        lastMessagesHostIds: s.lastMessagesHostIds,
+        pluginSnapshotHostIds: s.pluginSnapshotHostIds,
         contentStore: s.contentStore,
     };
 }
@@ -146,7 +165,14 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     // lives in planIngestDelta + the sessions.last_ingested_seq watermark.
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
-    const intern = (m: CoreMessage): number => {
+    // #3464 (R1): on stamped lanes the host key (host_id + slot inside its
+    // wire message) is the primary identity — byte drift across legs must
+    // land in ONE row. First-seen wins the seq position; the LATER leg's
+    // bytes win the row's unit (the snapshot leg interns first, so the
+    // fresh tail refreshes drifted rows — the stored view must equal the
+    // in-memory tail or the verify digest false-alarms).
+    const seqByHostKey = new Map<string, number>();
+    const intern = (m: CoreMessage, hostRef: CoreHostRef | null | undefined): number => {
         const content = JSON.stringify(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(content) as { role: string; contentType?: string };
@@ -154,13 +180,40 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
+        if (hostRef !== null && hostRef !== undefined) {
+            const hk = hostKeyOf(hostRef);
+            const survivorIdx = seqByHostKey.get(hk);
+            if (survivorIdx !== undefined) {
+                const survivor = log[survivorIdx];
+                if (survivor.msgId !== entry.msgId || survivor.hash !== entry.hash || survivor.role !== entry.role || survivor.kind !== entry.kind) {
+                    for (const [bk, idx] of seqByIdentity) {
+                        if (idx === survivorIdx) seqByIdentity.delete(bk);
+                    }
+                    survivor.msgId = entry.msgId;
+                    survivor.content = entry.content;
+                    survivor.hash = entry.hash;
+                    survivor.role = entry.role;
+                    survivor.kind = entry.kind;
+                    survivor.ref = byRawRef[entry.msgId] ?? null;
+                }
+                seqByIdentity.set(key, survivorIdx);
+                return survivorIdx;
+            }
+            seqByHostKey.set(hk, log.length);
+            const seq = log.length;
+            seqByIdentity.set(key, seq);
+            log.push({ seq, msgId: entry.msgId, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[entry.msgId] ?? null, hostId: hostRef.hostId, hostSlot: hostRef.slot });
+            return seq;
+        }
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, hostId: null, hostSlot: null });
         return seq;
     };
-    const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
-    const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
+    const snapshotRefs = session.pluginSnapshot ? coreHostRefs(session.pluginSnapshot, session.pluginSnapshotHostIds) : null;
+    const tailRefs = session.lastMessages ? coreHostRefs(session.lastMessages, session.lastMessagesHostIds) : null;
+    const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map((m, i) => intern(m, snapshotRefs?.[i] ?? null)) : null;
+    const tailSeqs = session.lastMessages ? session.lastMessages.map((m, i) => intern(m, tailRefs?.[i] ?? null)) : null;
 
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
@@ -225,11 +278,18 @@ export function planIngestDelta(
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];
+    // #3464 (R1): stamped entries carry their host key through to the row.
+    // No dedup against the trusted prefix here — a collision with an
+    // existing (host_id, host_slot) row is an integrity violation the
+    // store's strict-append guard aborts this delta for (full ingest then
+    // reconciles it). Slots are unique within one leg, so no local map.
+    const tailRefs = coreHostRefs(tail, session.lastMessagesHostIds);
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
         const content = JSON.stringify(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const hostRef = tailRefs[i];
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
@@ -243,6 +303,8 @@ export function planIngestDelta(
             role: parsed.role,
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
+            hostId: hostRef?.hostId ?? null,
+            hostSlot: hostRef?.slot ?? null,
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -284,6 +346,8 @@ function finishPlan(
         kind: e.kind,
         content: e.content,
         contentHash: e.hash,
+        hostId: e.hostId,
+        hostSlot: e.hostSlot,
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
