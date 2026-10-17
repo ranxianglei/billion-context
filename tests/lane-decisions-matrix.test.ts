@@ -14,6 +14,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 // #3417 lane-decisions truth table (characterization pass): pin the CURRENT
 // compress-surface behavior (standing prompt + nudge) per lane across all four
@@ -166,12 +167,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        // closeAllConnections destroys keep-alive sockets that close() alone
-        // would wait on forever (server.close only completes once every
-        // connection ends) — belt-and-suspenders against teardown hangs.
-        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
-        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+        await closeServers([proxy, upstream], "lane-decisions harness");
     };
     return { send, forwarded, close };
 }

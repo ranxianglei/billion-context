@@ -12,6 +12,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 interface Harness {
     proxyPort: number;
@@ -69,13 +70,7 @@ mitm: { enabled: false, domains: [] },
         upstreamPort,
         captured,
         close: async () => {
-            proxy.close();
-            proxy.closeIdleConnections?.();
-            proxy.closeAllConnections?.();
-            upstream.close();
-            upstream.closeIdleConnections?.();
-            upstream.closeAllConnections?.();
-            await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            await closeServers([proxy, upstream], "plugin-bypass harness");
         },
     };
 }

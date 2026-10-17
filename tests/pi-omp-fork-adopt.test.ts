@@ -17,6 +17,7 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { incomingCoreMessages } from "../src/fork-adoption.ts";
 import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
 import { FORK_SEED_MIN_REPLAYED_MESSAGES, createBiliPlugin, replayedMessageCount } from "../src/agent/pi.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-piomp-fork-"));
@@ -319,7 +320,7 @@ async function harness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "fork-adopt harness"); } };
 }
 
 async function seedParent(h: Awaited<ReturnType<typeof harness>>, conversationId: string) {
