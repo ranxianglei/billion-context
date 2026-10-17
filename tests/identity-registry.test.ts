@@ -285,3 +285,129 @@ test("R2.1 list fast path: full-mode summaries match the legacy walk (parity)", 
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }
 });
+
+test("full mode: conversations binding is first-claimant-wins and cross-namespace collision-free", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-id-bind-"));
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    let loader: SessionStore | null = null;
+    let db: UnifiedStore | null = null;
+    try {
+        const dir = corpusDir(tmp);
+        const baseSavedAt = readCorpusRecord(dir).savedAt as number;
+
+        // First ingest claims (proxy, conversation id) → its own row key.
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok(loader.loadSync(CORPUS_ID, { protocol: "anthropic", upstreamOrigin: ORIGIN_A }));
+        loader.closeQuietly();
+        loader = null;
+        db = UnifiedStore.open(path.join(dir, "index.db"));
+        let bindings = db.listConversationBindings();
+        assert.equal(bindings.length, 1, "first ingest lands exactly one claim");
+        assert.deepEqual(bindings[0], {
+            namespace: "proxy",
+            conversationId: CORPUS_ID,
+            sessionId: CORPUS_ID,
+            claimedAt: baseSavedAt,
+        }, "v1 mapping: the claim points at its own row, stamped at ingest time");
+        db.close();
+        db = null;
+
+        // Re-ingest under a fresher savedAt: the sessions row follows the
+        // newer record, but the existing claim keeps its claimed_at
+        // (ON CONFLICT DO NOTHING — first claimant wins).
+        let record = readCorpusRecord(dir);
+        record.savedAt = baseSavedAt + 5000;
+        writeRecordFile(dir, ORIGIN_A, record);
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok((await loader.loadAll()).get(CORPUS_ID), "stale-guard re-ingest ran");
+        loader.closeQuietly();
+        loader = null;
+        db = UnifiedStore.open(path.join(dir, "index.db"));
+        assert.equal(db.getSessionRow(CORPUS_ID)?.updatedAt, baseSavedAt + 5000, "sessions row followed the newer record");
+        bindings = db.listConversationBindings();
+        assert.equal(bindings.length, 1, "re-ingest does not mint a second claim");
+        assert.equal(bindings[0]?.claimedAt, baseSavedAt, "first claimant wins — claimed_at frozen");
+        db.close();
+        db = null;
+
+        // Cross-namespace collision: the SAME conversation id adopted into a
+        // plugin lane adds a second claim but must NOT fork the row.
+        record = readCorpusRecord(dir);
+        record.metadata = { ...((record.metadata as Record<string, unknown>) ?? {}), pluginAgent: "dsh" };
+        record.savedAt = baseSavedAt + 10_000;
+        writeRecordFile(dir, ORIGIN_A, record);
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok((await loader.loadAll()).get(CORPUS_ID), "adoption re-ingest ran");
+        loader.closeQuietly();
+        loader = null;
+        db = UnifiedStore.open(path.join(dir, "index.db"));
+        assert.equal(db.listSessionIds().length, 1, "cross-namespace collision never forks the row");
+        assert.equal(db.getSessionRow(CORPUS_ID)?.namespace, "dsh", "row identity follows the latest adopter");
+        bindings = db.listConversationBindings();
+        assert.equal(bindings.length, 2, "each namespace keeps its own historical claim");
+        const proxyClaim = bindings.find((b) => b.namespace === "proxy");
+        const dshClaim = bindings.find((b) => b.namespace === "dsh");
+        assert.equal(proxyClaim?.claimedAt, baseSavedAt, "earlier claim untouched by the adoption");
+        assert.equal(dshClaim?.claimedAt, baseSavedAt + 10_000);
+        for (const b of bindings) assert.equal(b.sessionId, CORPUS_ID, "every claim resolves to the live row");
+        assert.equal(db.lookupConversation("dsh", CORPUS_ID), CORPUS_ID, "adopted namespace resolves");
+        assert.equal(db.lookupConversation("pi", CORPUS_ID), null, "unclaimed pair resolves to null");
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        loader?.closeQuietly();
+        db?.close();
+        try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+});
+
+test("full mode: bounded boot warms index-only rows and still imports organic files", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-id-bboot-"));
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    let loader: SessionStore | null = null;
+    let db: UnifiedStore | null = null;
+    try {
+        const limits = { maxSessions: 8, maxBytes: 1_000_000_000 };
+
+        // Establish the file + index row, then delete the file — the row
+        // becomes index-only (the exact shape the review found invisible to
+        // bootBounded, initSessions' normal path).
+        const dir = corpusDir(tmp);
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        assert.ok(loader.loadSync(CORPUS_ID, { protocol: "anthropic", upstreamOrigin: ORIGIN_A }));
+        loader.closeQuietly();
+        loader = null;
+        fs.rmSync(path.join(dir, relPathFor(CORPUS_ID, "anthropic", ORIGIN_A)), { force: true });
+
+        // Bounded boot must rescue the fileless row into its warm slots.
+        loader = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        const out = await loader.boot(limits);
+        const rescued = out.get(CORPUS_ID);
+        assert.ok(rescued, "fileless index row warmed by the bounded boot union");
+        assert.equal(activeBlocks(rescued), 1, "fold ledger intact through the rescue");
+        loader.closeQuietly();
+        loader = null;
+        db = UnifiedStore.open(path.join(dir, "index.db"));
+        assert.ok(db.getSessionRow(CORPUS_ID), "the row survived the file deletion");
+        db.close();
+        db = null;
+
+        // Control: a fresh tree whose file was NEVER ingested still warms
+        // through the organic path — and lands in the index afterwards.
+        const dir2 = path.join(tmp, "organic");
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), dir2, { recursive: true });
+        const loader3 = new SessionStore({ dir: dir2, debounceMs: 1, enabled: true });
+        const organic = await loader3.boot(limits);
+        // #286 alias adoption: bounded boot keys the map (and the imported
+        // row) by meta.label when it differs from the file id.
+        assert.ok(organic.get("corpus-corpus-folded") ?? organic.get(CORPUS_ID), "un-ingested file still warms organically");
+        loader3.closeQuietly();
+        const db2 = UnifiedStore.open(path.join(dir2, "index.db"));
+        assert.ok(db2.getSessionRow("corpus-corpus-folded") ?? db2.getSessionRow(CORPUS_ID), "organic import landed in the index");
+        db2.close();
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+        loader?.closeQuietly();
+        db?.close();
+        try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+});

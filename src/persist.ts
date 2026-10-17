@@ -650,9 +650,9 @@ export class SessionStore {
         }
         // #2960 R2.1 boot union (full mode) — mirrors loadAll: index rows
         // without a legacy file stay enumerable (the index is
-        // self-sufficient). bootBounded (limits path) intentionally stays
-        // file-based: bounded boot is the cold-start triage path for huge
-        // legacy trees.
+        // self-sufficient). bootBounded applies the same union to its
+        // remaining warm slots (initSessions' normal path — review
+        // follow-up on #2960 R2.1).
         if (this.shadow?.readsUnified) {
             for (const id of this.shadow.listSessionIds()) {
                 if (out.has(id)) continue;
@@ -766,7 +766,23 @@ export class SessionStore {
             const session = this.loadSync(id, item.meta);
             if (session) out.set(id, session);
         }
-        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
+        // #2960 R2.1 review follow-up: bounded boot is initSessions' normal
+        // path, so index rows without a legacy file fill its remaining warm
+        // slots too — they cost no file bytes and the count still caps at
+        // maxSessions (the byte budget governs decoded FILE bytes only).
+        let indexOnly = 0;
+        if (this.shadow?.readsUnified) {
+            for (const id of this.shadow.listSessionIds()) {
+                if (out.size >= limits.maxSessions) break;
+                if (out.has(id)) continue;
+                const session = this.loadSync(id);
+                if (session) {
+                    out.set(id, session);
+                    indexOnly++;
+                }
+            }
+        }
+        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes${indexOnly > 0 ? ` (${indexOnly} index-only)` : ""}; older states load on demand`);
         return out;
     }
 
