@@ -214,6 +214,13 @@ type FakePi = {
     // #2708: real pi exposes the registry contents; the plugin probes it to
     // detect a mid-session drop. Optional so a host without it can be modeled.
     getAllTools?: () => Array<{ name: string }>;
+    // #3542: real pi exposes the ACTIVE loadout (distinct from the registry);
+    // the plugin re-asserts it after a tree navigation. Optional so a host
+    // without it can be modeled.
+    activeTools: string[];
+    setActiveCalls: unknown[][];
+    getActiveTools?: () => string[];
+    setActiveTools?: (toolNames: string[]) => void;
 };
 
 function makeFakePi(): FakePi {
@@ -221,12 +228,18 @@ function makeFakePi(): FakePi {
     const tools: RecordedTool[] = [];
     const commands = new Map<string, RecordedCommand>();
     const providers = new Map<string, string>();
+    // #3542: the active loadout, separate from the registry `tools` — a test
+    // can reset it (as pi's /tree does) while the registrations survive.
+    const activeTools: string[] = [];
+    const setActiveCalls: unknown[][] = [];
     let registerCallCount = 0;
     return {
         events,
         tools,
         commands,
         providers,
+        activeTools,
+        setActiveCalls,
         get registerCalls() { return registerCallCount; },
         on: (event, handler) => {
             // Real pi dispatches each event to ALL registered handlers in
@@ -253,6 +266,13 @@ function makeFakePi(): FakePi {
         // registry contents by name. The test drops tools from `tools` directly
         // to simulate pi rebuilding its registry with an empty instance map.
         getAllTools: () => tools.map((t) => ({ name: t.name })),
+        // #3542: mirrors real pi's ExtensionAPI.getActiveTools()/setActiveTools().
+        // setActiveTools dedupes like pi (_setActiveTools via [...new Set(...)]).
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (toolNames) => {
+            setActiveCalls.push([...toolNames]);
+            activeTools.splice(0, activeTools.length, ...new Set(toolNames));
+        },
     };
 }
 
@@ -975,6 +995,108 @@ test("#2708: a same-id session_start after a drop re-asserts during registration
         // so poll rather than asserting synchronously.
         await waitForTools(pi, 2);
         assert.ok(pi.tools.some((t) => t.name === "compress"), "tools re-asserted on same-id session_start");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a /tree rewind that resets the active loadout self-heals on session_tree", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        const before = pi.registerCalls;
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            // pi's navigateTree() rewinds past the entry that declared our tools
+            // and _restoreToolsFromTranscript() resets the loadout to what
+            // survives — the definitions stay in the registry, only the loadout
+            // loses them (the exact shape #2708's probe cannot see).
+            pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+            assert.deepEqual([...pi.getAllTools!().map((t) => t.name)].sort(), ["acp_status", "compress"], "precondition: definitions still registered");
+            await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        });
+
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "the dropped tools are back in the active loadout");
+        assert.equal(pi.registerCalls, before, "no re-registration needed — the definitions never left the registry");
+        const dropLogPath = path.join(stateHome, "billion-context", "bili.log");
+        const dropLines = (fs.existsSync(dropLogPath) ? fs.readFileSync(dropLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("dropped from the active loadout"));
+        assert.ok(dropLines.length >= 1, `the silent loadout reset is logged in bili.log, got: ${JSON.stringify(dropLines)}`);
+        assert.ok(dropLines.some((l) => l.includes("compress")), "the dropped tool name is named in the log");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#3542: the re-assert is additive-only — names the host holds are never removed", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // Host keeps its own tools plus one of ours active; the rewind drops
+        // only acp_status from the loadout.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+        assert.deepEqual(pi.setActiveCalls[0], ["bash", "read", "compress", "acp_status"], "previously-active names kept, missing ones appended");
+        assert.deepEqual(pi.activeTools, ["bash", "read", "compress", "acp_status"]);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: the fast path leaves the loadout untouched when nothing was dropped", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        const before = pi.registerCalls;
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "no setter call when the loadout is intact");
+        assert.equal(pi.registerCalls, before, "no re-registration either");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a host without a loadout query/setter keeps working", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        delete pi.getActiveTools;
+        delete pi.setActiveTools; // older pi / omp: no loadout surface
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "no blind set without a loadout surface");
+        assert.deepEqual(pi.activeTools, ["bash", "read"], "loadout untouched");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a throwing loadout query degrades to a no-op", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.getActiveTools = () => { throw new Error("ctx is stale"); };
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "never sets blindly after a failed query");
     } finally {
         await proxy.close();
     }

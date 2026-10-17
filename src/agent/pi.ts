@@ -98,6 +98,12 @@ type ExtensionAPI = {
     // #2322: current session name (pi /name); optional because older hosts
     // lack it (the session_info_changed event is the primary channel).
     getSessionName?: () => string | undefined;
+    // #3542: the ACTIVE tool loadout — the set pi declares to the model and
+    // its dispatcher checks, distinct from the registry (getAllTools). pi's
+    // /tree rewind resets it from the transcript, so a registered tool can be
+    // missing from it; optional because older hosts lack it.
+    getActiveTools?: () => string[];
+    setActiveTools?: (toolNames: string[]) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -651,6 +657,42 @@ function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: str
     if (missing.length === 0) return;
     logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
     for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+}
+
+// #3542: a pi /tree rewind (navigateTree) resets the ACTIVE tool loadout to what
+// the surviving transcript system entries declare (_restoreToolsFromTranscript),
+// discarding the entry that declared our tools whenever it sits after the rewind
+// target — the normal case, since the manifest handshake is async and lands after
+// the first turn's declaration. The definitions stay in the registry, so #2708's
+// probe sees nothing missing, but pi dispatches on the loadout: every later call
+// fails with "Tool X not found" until restart. session_tree fires right after the
+// reset and before the next _startRun, so re-assert there. Additive-only (names
+// the host currently holds are never removed), mirroring pi's own reload()
+// precedent of re-activating all extension tools. No loadout query/setter (older
+// pi / omp) or a throwing query → no-op, never a blind set.
+function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const getActive = pi.getActiveTools;
+    const setActive = pi.setActiveTools;
+    if (typeof getActive !== "function" || typeof setActive !== "function") return;
+    let active: string[];
+    try {
+        const names = getActive.call(pi);
+        if (!Array.isArray(names)) return;
+        active = names.filter((n): n is string => typeof n === "string");
+    } catch {
+        return; // stale ctx — same guard as reassertDroppedTools
+    }
+    const present = new Set(active);
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    try {
+        setActive.call(pi, [...active, ...missing]);
+    } catch {
+        return; // setter rejected — never break the navigation
+    }
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542)`);
 }
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
@@ -1425,6 +1467,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         pi.on("session_shutdown", () => {
             disposeSubagentSelfReg(subagentReg);
         });
+        // #3542: a /tree rewind resets the active loadout from the transcript —
+        // re-assert ours right after the reset (see reassertLoadoutAfterTree).
+        pi.on("session_tree", () => reassertLoadoutAfterTree(pi, state, agent));
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
         // the now-unreachable blocks (#395). Fire-and-forget: a failed
