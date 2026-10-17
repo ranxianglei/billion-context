@@ -726,6 +726,7 @@ Verified entry points (community-maintained list — the mechanism is generic):
 | **Void** | custom OpenAI-compatible endpoint setting |
 | **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | custom-model base URL setting |
+| **Bionic** (open-source Rust agentic harness, [bionic-gpt](https://github.com/bionic-gpt/bionic-gpt)) | model endpoint setting (OpenAI-compatible base URL); verified end-to-end incl. a local inference server as upstream (#3086) |
 
 Notes:
 
@@ -734,6 +735,7 @@ Notes:
 - Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
 - Plain **web apps** (browser-only products) have no local traffic to intercept.
 - VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.
+- **Local model servers as upstream** (LM Studio, Ollama, …): any OpenAI-compatible server on loopback works behind the `/bili/` prefix for local clients (#409 admits loopback destinations) — verified with LM Studio / a local inference server in #3086. Declare the model's real context window per provider (`providers["http://127.0.0.1:<port>"].models.<name>.context`) since no registry knows local models.
 
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 
