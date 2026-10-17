@@ -77,7 +77,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -213,6 +213,9 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
 }
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+// #3304: the opencode swap stamps the turn id atomically with the body, so the
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+state.prepareDirectSend = createPrepareDirectSend();
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -858,7 +861,21 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
         const url = req.url;
         sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
-        const body: unknown = await req.clone().json().catch(() => null);
+        // #3304: keep the ORIGINAL body string — stashed under the turn id
+        // below so the direct-send guard can restore it when the proxy dies
+        // before the swapped payload lands.
+        let origText: string;
+        try {
+            origText = await req.clone().text();
+        } catch {
+            return;
+        }
+        let body: unknown;
+        try {
+            body = JSON.parse(origText);
+        } catch {
+            return;
+        }
         if (body === null || typeof body !== "object") return;
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
@@ -877,6 +894,11 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         }
         if (inflight) return;
         const turnId = newIncrementalTurnId();
+        // #3304: stash before the swap — the opencode replacement happens in
+        // this hook, BEFORE the fetch intercept ever sees the request, so
+        // every direct-send fall-back (not just the give-up paths) relies on
+        // these bytes.
+        rememberOriginalBody(turnId, origText);
         replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1", [INCREMENTAL_TURN_ID_HEADER]: turnId });
         incPendingOpencode.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
     } catch {

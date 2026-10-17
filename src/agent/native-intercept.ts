@@ -22,6 +22,13 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
  *  context window. */
 export type GateVerdict = boolean | "refuse-oversized";
 
+/** #3304: prepareDirectSend's verdict for one fall-back send to the real
+ *  upstream (see the state field). */
+export type DirectSendPrep =
+    | { outcome: "as-is" }
+    | { outcome: "restored"; body: string }
+    | { outcome: "unrestorable" };
+
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
@@ -62,7 +69,22 @@ export interface NativeInterceptState {
      *  the request init (body) and may spend async time; wire-mode requests
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
-    beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+    /** #3304: consulted immediately before ANY fall-back send to the REAL
+     *  upstream (proxy-death give-up, bootstrap-fail, unattributed direct,
+     *  signed passthrough). Lanes that mutate the outgoing payload (the
+     *  incremental-turn adapters) arm it; every other lane leaves it
+     *  undefined and each fall-back behaves byte-identically to pre-#3304.
+     *  The hook sees the SAME (input, init) pair the fall-back would send
+     *  (headers/body already mutated by the lane's own swap) and answers:
+     *  - "as-is"        — the payload is a standalone request → send it;
+     *  - "restored"     — send `body` INSTEAD (the pre-mutation original);
+     *  - "unrestorable" — the payload was mutated and cannot be undone →
+     *                     the direct send is refused locally (TypeError) so
+     *                     a lane-only body never reaches a provider that
+     *                     cannot parse it; the host's retry re-runs the full
+     *                     decision (re-probe, re-plan) from scratch. */
+    prepareDirectSend?: (url: string, input: string | URL | Request, init: RequestInit | undefined) => DirectSendPrep | Promise<DirectSendPrep>;
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
@@ -642,6 +664,26 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
+/** #3304: rebuild a fall-back dispatch carrying `body` INSTEAD of whatever
+ *  `init`/the Request carried. The restored body rides INIT so fetch-spec
+ *  precedence (init over Request fields) stays exactly what the original
+ *  dispatch had; a string body needs no duplex. */
+export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
+    if (input instanceof Request) {
+        try {
+            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            return { input: plain, init: { ...(init ?? {}), body } };
+        } catch {
+            const headers: Record<string, string> = {};
+            try {
+                for (const [k, v] of input.headers) headers[k] = v;
+            } catch {}
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+        }
+    }
+    return { input, init: { ...(init ?? {}), body } };
+}
+
 /** Install the global fetch patch. The first call wraps globalThis.fetch and
  *  returns true; later calls return false (a process installs one chain) BUT
  *  always rebind the live-state slot, so a host hot-reimport that re-applies
@@ -721,6 +763,47 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             return again;
         };
 
+        // #3304: ask the lane whether this fall-back payload may go to the
+        // real upstream AS-IS. Fail-safe direction: an armed hook that
+        // throws is treated as "unrestorable" — never risk sending bytes the
+        // lane may have mutated.
+        const prepareForDirectSend = async (url: string, input: string | URL | Request, init: RequestInit | undefined): Promise<DirectSendPrep> => {
+            const hook = state.prepareDirectSend;
+            if (hook === undefined) return { outcome: "as-is" };
+            try {
+                return await hook(url, input, init);
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-native: prepareDirectSend hook failed (${err instanceof Error ? err.message : String(err)}) — refusing the direct send (#3304)`);
+                return { outcome: "unrestorable" };
+            }
+        };
+
+        // #3304: the guarded fall-back send. `defaultInput` is what the site
+        // would send without the guard (usually `input`; makeTarget(routedTarget)
+        // on the routed give-up). Restored bodies ride INIT so fetch-spec
+        // precedence (init over Request) stays exactly what the original
+        // dispatch had.
+        const directSendOrRefuse = async (dispatchUrl: string, defaultInput: string | URL | Request, init: RequestInit | undefined): Promise<Response> => {
+            const prep = await prepareForDirectSend(dispatchUrl, defaultInput, init);
+            if (prep.outcome === "as-is") {
+                state.onDispatch?.(dispatchUrl, "direct");
+                return send(defaultInput, init);
+            }
+            if (prep.outcome === "unrestorable") {
+                // A lane-only payload (e.g. an incremental delta) cannot be
+                // forwarded to a provider that cannot parse it — refusing
+                // locally keeps the host's retry loop driving the decision
+                // again (re-probe / re-plan) instead of burning the turn on
+                // an upstream 400.
+                state.onDispatch?.(dispatchUrl, "refused");
+                logHostEvent("error", "[native-client]", `bili-native: no usable proxy and the request carries a lane-only payload — failing locally instead of sending it to the provider; retry the turn (#3304): ${dispatchUrl}`);
+                throw new TypeError("billion-context: proxy unavailable — the request payload is lane-specific (incremental turn) and cannot be forwarded to the provider directly; retry the turn (#3304)");
+            }
+            const restored = withRestoredBody(defaultInput, init, prep.body);
+            state.onDispatch?.(dispatchUrl, "direct");
+            return send(restored.input, restored.init);
+        };
+
         // Already-routed `/bili/` model requests (launcher settings overlay):
         // routing is done, but plugin headers still decide wire vs plugin
         // mode — stamp and pass through untouched otherwise.
@@ -746,8 +829,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 }
                 if (verdict !== true) {
                     const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
-                    state.onDispatch?.(url, "direct");
-                    return send(stamped.input, stamped.init);
+                    return directSendOrRefuse(url, stamped.input, stamped.init);
                 }
             }
             // #1365: attributed routed traffic pins this process's model channel
@@ -830,8 +912,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
-                state.onDispatch?.(routedTarget, "direct");
-                return send(makeTarget(routedTarget), init);
+                return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init);
             }
         }
         if (!isModelApiUrl(url)) {
@@ -888,8 +969,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     }
                     clearSignedRefusal(signedScheme);
                     noteSignedDirect(url, signedScheme, "built-in passthrough opt-in (#1884) — byte-untouched, no compression");
-                    state.onDispatch?.(url, "direct");
-                    return send(input, init);
+                    return directSendOrRefuse(url, input, init);
                 }
                 resignExtra = {
                     [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
@@ -935,8 +1015,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     state.onDispatch?.(url, "refused");
                     return oversizeRefusal(url);
                 }
-                state.onDispatch?.(url, "direct");
-                return send(input, init);
+                return directSendOrRefuse(url, input, init);
             }
         }
 
@@ -948,8 +1027,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 warned = true;
                 logHostEvent("error", "[native-client]", `bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
-            state.onDispatch?.(url, "direct");
-            return send(input, init);
+            return directSendOrRefuse(url, input, init);
         }
         // Attach mode rewrites exactly like spawn mode (#809 semantics —
         // opencode's attach probe+rewrite; the V1 fetch patch relies on it to
@@ -1012,8 +1090,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
-                state.onDispatch?.(url, "direct");
-                return send(input, init);
+                return directSendOrRefuse(url, input, init);
             }
             throw err;
         }

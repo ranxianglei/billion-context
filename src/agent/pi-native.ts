@@ -29,7 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
-import { createBiliPlugin } from "./pi.js";
+import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
@@ -118,6 +118,10 @@ function errMessage(err: unknown): string {
 }
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+// #3304: the pi extension swaps payloads inside its runner — the guard
+// sniffs the outgoing envelope and restores the stashed original before any
+// direct-send fall-back reaches the real upstream.
+state.prepareDirectSend = createPiDirectSendGuard();
 
 async function bootstrap(): Promise<string | undefined> {
     try {

@@ -25,7 +25,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -140,12 +140,16 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) { return; }
+        const turnId = newIncrementalTurnId();
+        // #3304: stash the pre-swap body under this turn's id — if the proxy
+        // dies before the send lands, the direct-send guard restores these
+        // bytes instead of forwarding the lane-only payload upstream.
+        rememberOriginalBody(turnId, init.body);
         init.body = plan.body;
         const headers = new Headers(init.headers);
         headers.set("x-bili-plugin", "omp");
         headers.set("x-bili-plugin-conversation", sid);
         headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
-        const turnId = newIncrementalTurnId();
         headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
         init.headers = headers;
         incPendingOmp.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
@@ -155,6 +159,9 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
 }
 
 state.beforeSend = ompIncrementalBeforeSend;
+// #3304: the omp swap stamps the turn id atomically with the body, so the
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+state.prepareDirectSend = createPrepareDirectSend();
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];

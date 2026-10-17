@@ -14,7 +14,8 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -746,6 +747,69 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
+// #3304: pi's payload swap happens INSIDE the runner (before_provider_request
+// returns the replacement), so the fetch layer cannot correlate a request by
+// object identity. Instead it sniffs the outgoing body for the incremental
+// envelope — the same shape test the lane's divert runs server-side — and
+// restores the original stashed under the envelope's conversationId. Pi sends
+// model requests strictly sequentially per session (the same invariant
+// pendingIncrementalAcks relies on), so one entry per conversation is exact.
+const PI_ORIGINAL_TTL_MS = 5 * 60_000;
+const piIncrementalOriginals = new Map<string, { body: string; at: number }>();
+
+function stashPiIncrementalOriginal(conversationId: string, payload: unknown): void {
+    const now = Date.now();
+    sweepStale(piIncrementalOriginals, PI_ORIGINAL_TTL_MS);
+    piIncrementalOriginals.set(conversationId, { body: JSON.stringify(payload), at: now });
+}
+
+function takePiIncrementalOriginal(conversationId: string): string | null {
+    const entry = piIncrementalOriginals.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= PI_ORIGINAL_TTL_MS) return null;
+    return entry.body;
+}
+
+export function __resetPiIncrementalOriginalsForTests(): void {
+    piIncrementalOriginals.clear();
+}
+
+/** Test-only: seed the stash directly (driving the full extension event
+ *  chain just for this is not worth it). */
+export function __stashPiIncrementalOriginalForTests(conversationId: string, payload: unknown): void {
+    stashPiIncrementalOriginal(conversationId, payload);
+}
+
+/** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
+ *  it on its NativeInterceptState). A body that IS an incremental envelope
+ *  was swapped by maybeIncrementalTurn → restore the stashed original
+ *  (or refuse when the stash aged out); any other body is a standalone
+ *  full-resend request → as-is. */
+export function createPiDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    return async (_url, input, init) => {
+        let text: string | undefined;
+        try {
+            if (typeof init?.body === "string") {
+                text = init.body;
+            } else if (input instanceof Request) {
+                text = await input.clone().text();
+            }
+        } catch {
+            text = undefined; // unreadable body — treat as standalone
+        }
+        if (text === undefined || text.length === 0) return { outcome: "as-is" };
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            return { outcome: "as-is" };
+        }
+        const sid = incrementalEnvelopeConversationId(parsed);
+        if (sid === undefined) return { outcome: "as-is" };
+        const body = takePiIncrementalOriginal(sid);
+        return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
+    };
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -1238,6 +1302,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 request: payload as Record<string, unknown>,
             });
             if (plan.mode === "skip") return undefined;
+            // #3304: stash the ORIGINAL payload under this conversation — the
+            // direct-send guard restores it if the proxy dies before the
+            // swapped envelope lands on the wire.
+            stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
             return JSON.parse((plan as { body: string }).body) as unknown;
         }
@@ -1349,6 +1417,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     return;
                 }
                 pendingIncrementalAcks.delete(sid);
+                piIncrementalOriginals.delete(sid); // #3304: turn settled — original no longer needed
                 if (status === 200) {
                     noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;
