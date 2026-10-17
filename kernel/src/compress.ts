@@ -164,7 +164,10 @@ function refGateDiagnostics(
 ): string {
   const highest = highestUsedIndex(state.messageRefs);
   const highestRef = highest > 0 ? indexToRef(highest) : "none";
-  return `[diagnostics: session highest ref=${highestRef}, unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
+  // #3302: the bare "highest ref" read as "valid numbers live below here" and
+  // sent models probing downward/upward one number at a time (each probe a
+  // full round). State the sparse-space fact instead.
+  return `[diagnostics: session highest allocated ref=${highestRef} (the ref space is sparse — numbers at or below it are NOT necessarily allocated, so probing numbers will not find a valid one; use only refs acp_status lists), unknown ranges in request=${unknownCount}/${requestedRanges}, session history=${state.stats.compressionCount} compression(s), ${state.blocks.length} block(s)]`;
 }
 
 function danglingMessageRefs(
@@ -180,7 +183,18 @@ function danglingMessageRefs(
     const rawId =
       state.messageRefs.byRef[parsed.raw] ??
       state.messageRefs.byRef[indexToRef(parsed.numericId)];
-    if (!rawId || visible.has(rawId)) continue;
+    if (!rawId) {
+      // #3302: a host-pruned byRef entry leaves no rawId to inspect, but a
+      // dead-ref tombstone proves the number WAS allocated here and its
+      // message was later pruned — the same "no longer backs any message"
+      // fact, so it counts as dangling (DEAD) instead of vanishing.
+      const padded = indexToRef(parsed.numericId);
+      if (state.deadRefs?.includes(parsed.raw) || state.deadRefs?.includes(padded)) {
+        dangling.push(padded);
+      }
+      continue;
+    }
+    if (visible.has(rawId)) continue;
     const covered = state.blocks.some(
       (block) => block.active && block.effectiveMessageIds.includes(rawId),
     );
@@ -522,11 +536,22 @@ export function createCore(ports: Ports = {}): CompressionCore {
         const danglingRefs = consumedRanges.flatMap(
           (spec) => danglingBySpec.get(spec) ?? [],
         );
+        // #3302: name the failing endpoints — "unknown ranges in request=1/1"
+        // said nothing about WHICH side failed, so the model kept re-probing
+        // the same doomed endId against fresh startIds.
+        const unknownEndpoints = new Set<string>();
+        for (const [spec, resolution] of classifications) {
+          if (resolution.status !== "unknown") continue;
+          const endpoint = resolution.error.endpoint;
+          unknownEndpoints.add(
+            `${endpoint}Id=${endpoint === "start" ? spec.startRef : spec.endRef}`,
+          );
+        }
         let gateMessage =
           resolvableCount === 0 &&
           consumedRanges.length === 0 &&
           unknownCount > 0
-            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them, so unknown refs cannot come from an earlier compress in this session. They come from a different generation: a previous session instance (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001), the generation before a native-compaction rebase (which also resets refs to m00001), or a typo. ${diagnostics} Run acp_status, then call the compress tool again using only the refs it reports.`
+            ? `None of the ${input.ranges.length} requested range(s) resolved — every ref is unknown to this session${unknownEndpoints.size > 0 ? `, failing endpoints: ${[...unknownEndpoints].join(", ")}` : ""}. Refs are per-session snapshots, assigned once when a message is first rendered; no compress reassigns them. An unknown ref is usually a stale artifact from an earlier generation (switching model or upstream mid-conversation starts a fresh session whose refs restart at m00001, and a native-compaction rebase resets them the same way) or a typo — but a number at or below the highest allocated ref may also simply be an unallocated gap: the ref space is sparse. ${diagnostics} Do not probe for valid numbers. Run acp_status, then call the compress tool again using only the refs it reports.`
             : consumedRanges.length > 0
               ? danglingRefs.length > 0
                 ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`

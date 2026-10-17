@@ -72,6 +72,25 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
     return `\n${icon} [ACP] ${inner}\n`;
 }
 
+// #3302 (Ask 6): accumulate endpoint values from failed compress receipts and
+// report the first endpoint that saw ≥2 distinct values — the probe-family
+// signature. Pure so it is unit-testable without driving a full loop.
+export function recordProbeFailures(
+    probes: Map<string, Set<string>>,
+    results: ReadonlyArray<{ name: string; result: string }>,
+): { label: string; values: string[] } | null {
+    for (const pr of results) {
+        if (pr.name !== "compress") continue;
+        for (const m of pr.result.matchAll(/(startId|endId)="(m\d+)"/g)) {
+            const values = probes.get(m[1]) ?? new Set<string>();
+            values.add(m[2]);
+            probes.set(m[1], values);
+        }
+    }
+    const probing = [...probes.entries()].find(([, values]) => values.size >= 2);
+    return probing ? { label: probing[0], values: [...probing[1]] } : null;
+}
+
 // #413 follow-up: when the stream dies AFTER visible text has already been
 // forwarded (final-report shape — heavy reasoning, then the answer starts,
 // then the relay cuts), a blind re-fetch would make the client watch the
@@ -519,6 +538,14 @@ export async function* runCompressLoop(
     // deterministic (identical args → identical failure), so a byte-identical
     // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
     const failedSignatures = new Set<string>();
+
+    // #3302 (Ask 6): probe-family observability — a model failing compress with
+    // one endpoint fixed and the other varying is enumerating a sparse ref
+    // space; the identical-args breaker above never fires on that pattern.
+    // Log it once as an operator signal; the failure receipts carry the live
+    // range table, so the loop keeps running for the model to find it.
+    const probeFailures = new Map<string, Set<string>>();
+    let probeWarned = false;
 
     // #762,#1479: strict-echo origin for re-request normalization (the learned
     // flag rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
@@ -1399,6 +1426,15 @@ export async function* runCompressLoop(
                 }
             }
             for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
+
+            if (!probeWarned) {
+                const probing = recordProbeFailures(probeFailures, failedMutating);
+                if (probing) {
+                    probeWarned = true;
+                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); not breaking early, the receipts carry the live range table`);
+                    loggerLog("warn", `[acp-loop] compress probe family at round ${round}: ${probing.values.length} distinct ${probing.label} values failed (${probing.values.join(", ")}) (#3302)`);
+                }
+            }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 

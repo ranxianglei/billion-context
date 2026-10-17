@@ -635,7 +635,7 @@ test("consumed plus fresh-but-small range is not misreported as too small", () =
   );
   assert.match(
     retry.result.errors[0]!,
-    /\[diagnostics: session highest ref=m00005, unknown ranges in request=0\/2, session history=1 compression\(s\), 1 block\(s\)\]/,
+    /\[diagnostics: session highest allocated ref=m00005 \(the ref space is sparse.*?\), unknown ranges in request=0\/2, session history=1 compression\(s\), 1 block\(s\)\]/,
   );
   assert.doesNotMatch(retry.result.errors[0]!, /renumber/i);
   assert.match(retry.result.errors[0]!, /[Rr]un acp_status/);
@@ -680,19 +680,38 @@ test("all-unknown batch reports stale refs instead of too-small (billion-context
     /None of the 2 requested range\(s\) resolved/,
   );
   assert.match(result.result.errors[0]!, /no compress reassigns them/);
+  // #3302: the old text asserted unknown refs "cannot come from an earlier
+  // compress" — false for sparse spaces where pruned numbers sit below the
+  // highest. The new text names the failing endpoints and drops the claim.
   assert.match(
+    result.result.errors[0]!,
+    /failing endpoints: startId=m00050, startId=m00070/,
+  );
+  assert.doesNotMatch(
     result.result.errors[0]!,
     /cannot come from an earlier compress in this session/,
   );
   assert.match(
     result.result.errors[0]!,
-    /\[diagnostics: session highest ref=m00005, unknown ranges in request=2\/2, session history=0 compression\(s\), 0 block\(s\)\]/,
+    /stale artifact from an earlier generation/,
+  );
+  assert.match(result.result.errors[0]!, /the ref space is sparse/);
+  assert.match(result.result.errors[0]!, /Do not probe for valid numbers/);
+  assert.match(
+    result.result.errors[0]!,
+    /\[diagnostics: session highest allocated ref=m00005 \(the ref space is sparse.*?\), unknown ranges in request=2\/2, session history=0 compression\(s\), 0 block\(s\)\]/,
   );
   assert.doesNotMatch(result.result.errors[0]!, /renumber/i);
   assert.match(result.result.errors[0]!, /Run acp_status/);
   assert.doesNotMatch(result.result.errors[0]!, /too small/);
-  assert.match(result.result.errors[1]!, /does not exist in this session/);
-  assert.match(result.result.errors[2]!, /does not exist in this session/);
+  assert.match(
+    result.result.errors[1]!,
+    /startId="m00050" is above this session's highest allocated ref \(m00005\)/,
+  );
+  assert.match(
+    result.result.errors[2]!,
+    /startId="m00070" is above this session's highest allocated ref \(m00005\)/,
+  );
 });
 
 test("consumed plus unknown ranges keep the already-compressed message", () => {
@@ -742,7 +761,7 @@ test("consumed plus unknown ranges keep the already-compressed message", () => {
   );
   assert.match(
     retry.result.errors.find((e) => e.startsWith("range m00050..m00060")) ?? "",
-    /does not exist in this session/,
+    /startId="m00050" is above this session's highest allocated ref/,
   );
 });
 
@@ -774,7 +793,8 @@ test("first compress of a fresh session with foreign refs reports a new generati
     result.result.errors[0]!,
     /None of the 1 requested range\(s\) resolved/,
   );
-  assert.match(
+  assert.match(result.result.errors[0]!, /failing endpoints: startId=m00050/);
+  assert.doesNotMatch(
     result.result.errors[0]!,
     /cannot come from an earlier compress in this session/,
   );
@@ -782,10 +802,13 @@ test("first compress of a fresh session with foreign refs reports a new generati
   assert.match(result.result.errors[0]!, /native-compaction rebase/);
   assert.match(
     result.result.errors[0]!,
-    /\[diagnostics: session highest ref=m00003, unknown ranges in request=1\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
+    /\[diagnostics: session highest allocated ref=m00003 \(the ref space is sparse.*?\), unknown ranges in request=1\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
   );
   assert.doesNotMatch(result.result.errors[0]!, /renumber/i);
-  assert.match(result.result.errors[1]!, /does not exist in this session/);
+  assert.match(
+    result.result.errors[1]!,
+    /startId="m00050" is above this session's highest allocated ref \(m00003\)/,
+  );
 });
 
 test("refs from before a native-compaction rebase report a new generation with zeroed history (billion-context#387)", () => {
@@ -845,7 +868,7 @@ test("refs from before a native-compaction rebase report a new generation with z
   assert.match(result.result.errors[0]!, /refs restart at m00001/);
   assert.match(
     result.result.errors[0]!,
-    /\[diagnostics: session highest ref=m00002, unknown ranges in request=1\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
+    /\[diagnostics: session highest allocated ref=m00002 \(the ref space is sparse.*?\), unknown ranges in request=1\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
   );
   assert.doesNotMatch(result.result.errors[0]!, /renumber/i);
 });
@@ -898,7 +921,7 @@ test("drifted message content dangles the old ref — reported as unanchorable, 
   assert.deepEqual(result.state.deadRefs, ["m00005"]);
   assert.match(
     result.result.errors[0]!,
-    /\[diagnostics: session highest ref=m00006, unknown ranges in request=0\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
+    /\[diagnostics: session highest allocated ref=m00006 \(the ref space is sparse.*?\), unknown ranges in request=0\/1, session history=0 compression\(s\), 0 block\(s\)\]/,
   );
   assert.doesNotMatch(result.result.errors[0]!, /already compressed/);
   assert.doesNotMatch(result.result.errors[0]!, /renumber/i);
@@ -1054,7 +1077,10 @@ test("unknown ref (valid format, never allocated) names the ref and suggests acp
 
   assert.equal(result.result.blocksCreated, 0);
   assert.equal(result.result.errors.length, 1);
-  assert.match(result.result.errors[0]!, /does not exist in this session/);
+  assert.match(
+    result.result.errors[0]!,
+    /startId="m00099" is above this session's highest allocated ref \(m00001\)/,
+  );
   assert.match(result.result.errors[0]!, /run acp_status/);
 });
 

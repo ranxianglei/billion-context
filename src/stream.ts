@@ -108,6 +108,24 @@ function compressionRecovery(ctx: RewriteCtx): { hint: string; canRetry: boolean
             }
             return { hint: " No eligible message ranges are available now; continue the task without compressing. Recheck acp_status after the context changes.", canRetry: false };
         }
+        // #3302: the live check only yields a verdict when this pass produced a
+        // nudge decision. When it didn't, the previous prepare's offer
+        // (ctx.lastNudge) still lists kernel-validated ranges — stale by at
+        // most one turn, and self-correcting if one was folded meanwhile (the
+        // kernel rejects it as already compressed). Sending the model to
+        // acp_status for another full round-trip after EVERY failed compress
+        // is exactly the cost this issue reports.
+        const last = ctx.lastNudge;
+        if (last?.shouldInject && last.compressibleRanges && last.compressibleRanges.length > 0) {
+            const minChars = ctx.config.compress.minCompressRange;
+            const submitGate = (r: CompressibleRangeItem): boolean =>
+                minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars;
+            const ranges = excludeDeadRefRanges(viableRanges(last.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
+            if (ranges.length > 0) {
+                const formatted = formatRanges(ranges, []).replace(/\s*\n\s*/g, " ");
+                return { hint: ` Current compressible ranges from the last compression check (use these refs exactly as listed; recheck acp_status if one is rejected): ${formatted} Do not repeat the rejected call unchanged.`, canRetry: true };
+            }
+        }
     } catch {
         // Never replace a failed live check with a guessed ref span.
     }
@@ -338,17 +356,20 @@ function compressFailureCause(errs: string, session: Session): string {
             ? "substrate-destruction — host-native compaction or bulk client-side history rewrite landed outside bili's knowledge (#1729/#2193); structural, report it"
             : "content-changed — the messages behind those refs changed and carry new refs now";
     }
-    if (errs.includes("every ref is unknown to this session")) return "stale-ref — the refs belong to another session generation (or are typos)";
+    // #3302: "unknown" now covers three sub-cases (earlier generation, typo,
+    // sparse-space gap) — name the class honestly; the prefix stays stable for
+    // downstream startsWith matching (acp_status verdict sections).
+    if (errs.includes("every ref is unknown to this session")) return "stale-ref — the refs do not exist in this session's ref space (another generation, a typo, or pruned gaps)";
     if (errs.includes("covered by active block")) return "covered-by-block — nothing new to fold in that window";
     return "";
 }
 
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
- *  pre-allocated), so the kernel's generic "typo or wrong session" wording
- *  misleads models into hunting for the typo and re-anchoring on other stale
- *  artifacts. The deterministic cause is stale-generation refs baked into the
- *  client's persisted history — name it instead. */
+ *  pre-allocated); the kernel now classifies that case as above-frontier
+ *  (#3302) and this note reinforces it with the model-visible consequence —
+ *  NO superset of such refs can ever compress — so the model stops re-anchoring
+ *  on other stale artifacts instead. */
 export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
     let highest = 0;
     for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {

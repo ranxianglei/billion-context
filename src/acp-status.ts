@@ -290,7 +290,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (staleRef || (substrateDestroyed && breaker === undefined)) {
         extra.push("");
         if (staleRef) {
-            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed belong to another session generation; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
+            // #3302: "stale-ref" covers earlier-generation refs, typos AND
+            // sparse-space gaps — the per-failure cause above names the sub-case;
+            // don't over-assert generation here.
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed do not exist in this session's current ref space; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
         } else {
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }

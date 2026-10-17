@@ -1,7 +1,7 @@
 import { activeBlocks, blockById } from "./state.js";
 import { isRenderedSummaryMessage, summaryMessageId } from "./prune.js";
 import { isRetrievedMessage } from "./ccr.js";
-import { BLOCKED_REF, refToIndex } from "./refs.js";
+import { BLOCKED_REF, highestUsedIndex, refToIndex } from "./refs.js";
 import type {
   CompressionBlock,
   CompressionState,
@@ -178,14 +178,54 @@ function resolveAnchorIndex(
 ): AnchorResolution {
   const label = endpoint === "start" ? "startId" : "endId";
   if (boundary.kind === "message") {
+    const paddedRef = formatPaddedRef(boundary.numericId);
     const rawId =
       state.messageRefs.byRef[boundary.raw] ??
-      state.messageRefs.byRef[formatPaddedRef(boundary.numericId)];
+      state.messageRefs.byRef[paddedRef];
     if (!rawId) {
+      // #3302: a dead-ref tombstone means this number WAS allocated here and its
+      // message was later pruned or removed (host-side tombstones, e.g. the
+      // native-compaction archive prune) — anchor to the nearest visible
+      // neighbor instead of mislabeling the gap "typo or wrong session" and
+      // sending the model probing upward for a valid number. Kernel-minted dead
+      // refs (#2362) keep their byRef entry and resolve through the branches
+      // below, so only host-pruned refs reach this path.
+      if (state.deadRefs?.includes(paddedRef)) {
+        const neighbor = snapToNeighborVisible(
+          state,
+          indexByMessageId,
+          boundary.numericId,
+          endpoint,
+        );
+        if (neighbor !== null) {
+          return {
+            index: neighbor,
+            snapped: `${label}="${boundary.raw}" no longer backs any visible message (its content was pruned or removed by the client) — anchored to the nearest visible message instead, so the range folds slightly less than requested.`,
+          };
+        }
+        throw new BoundaryNotFoundError(
+          "consumed",
+          endpoint,
+          `${label}="${boundary.raw}" is a dead ref (its message was pruned or removed by the client) and no adjacent visible message exists to anchor to — nothing left to fold here. run acp_status for live refs.`,
+        );
+      }
+      // #3302: split the unknown case into two honest ones. Refs are minted in
+      // order and never pre-allocated, so a number strictly ABOVE the session's
+      // highest allocated ref cannot exist here (stale artifact from an earlier
+      // generation or a typo); a gap at or below the highest is a sparse-space
+      // hole (pruned or skipped) and must not be read as cross-session.
+      const highest = highestUsedIndex(state.messageRefs);
+      if (boundary.numericId > highest) {
+        throw new BoundaryNotFoundError(
+          "unknown",
+          endpoint,
+          `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — refs are minted in order and never pre-allocated, so it cannot exist in this session (stale artifact from an earlier generation, or a typo). run acp_status for current refs.`,
+        );
+      }
       throw new BoundaryNotFoundError(
         "unknown",
         endpoint,
-        `${label}="${boundary.raw}" does not exist in this session (typo or wrong session) — run acp_status for current refs.`,
+        `${label}="${boundary.raw}" was never allocated in this session or was pruned after allocation — the ref space is sparse, so a number at or below the highest is not necessarily present; this is not a cross-session ref. run acp_status for current refs.`,
       );
     }
     const index = indexByMessageId.get(rawId);
@@ -199,7 +239,6 @@ function resolveAnchorIndex(
         snapped: `${label}="${boundary.raw}" refers to a message already compressed into an active block — anchored to the active block covering it instead.`,
       };
     }
-    const paddedRef = formatPaddedRef(boundary.numericId);
     if (state.hiddenOrphanRefs?.includes(paddedRef)) {
       const neighbor = snapToNeighborVisible(
         state,

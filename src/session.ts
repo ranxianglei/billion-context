@@ -1457,11 +1457,25 @@ function pruneRefsToLiveIds(
     }
     if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
     const prunedByRef: Record<string, string> = {};
+    const droppedRefs: string[] = [];
     for (const [ref, rawId] of Object.entries(byRef)) {
         if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+        else droppedRefs.push(ref);
     }
     session.state.messageRefs.byRaw = prunedByRaw;
     session.state.messageRefs.byRef = prunedByRef;
+    if (droppedRefs.length > 0) {
+        // #3302: tombstone the freed numbers so the kernel classifies a later
+        // citation as dead (snap-to-neighbor / honest "content gone") instead
+        // of unknown ("typo or wrong session") — the mislabel that sent models
+        // probing upward for a valid number after every native-compaction
+        // prune. I6 invariant: deadRefs stays unique and numerically sorted
+        // ascending; empty ⇒ undefined.
+        const merged = new Set(session.state.deadRefs ?? []);
+        for (const ref of droppedRefs) merged.add(ref);
+        const sorted = [...merged].sort((a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")));
+        session.state.deadRefs = sorted.length > 0 ? sorted : undefined;
+    }
 }
 
 /** #2695: remove fold blocks whose covered substrate the client demonstrably
