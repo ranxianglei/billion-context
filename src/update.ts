@@ -778,7 +778,10 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
 export async function readDiskVersion(installDir: string): Promise<string | undefined> {
     try {
         const pkg = JSON.parse(await readFile(path.join(installDir, "package.json"), "utf-8"));
-        return pkg.version;
+        const v = pkg.version;
+        // A tampered package.json may carry a non-string version (#3160 threat
+        // model); treat it as unreadable so the out-of-band path handles it.
+        return typeof v === "string" ? v : undefined;
     } catch {
         return undefined;
     }
@@ -1067,6 +1070,34 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
     return data.version;
 }
 
+/** #3160 owner-feedback: fetch the full set of versions published for a package
+ *  (the npm packument) so an ahead-of-registry copy can be told apart from a
+ *  merely-untracked-but-genuinely-published build. Auto-converging back is only
+ *  safe for a version that PROVABLY does not exist on the registry — a real
+ *  newer build must never be silently downgraded. Fail-open: any error or an
+ *  unexpected response shape yields undefined, which callers treat as "cannot
+ *  prove it is fake" → defer rather than downgrade. */
+export async function fetchPublishedVersions(
+    resolveProxy: ((url: string) => string | undefined) | undefined,
+    packageName: string,
+): Promise<Set<string> | undefined> {
+    const url = `${REGISTRY_BASE}/${packageName}`;
+    const dispatcher = egressDispatcher({ resolveProxy }, url);
+    try {
+        const res = await fetchWithEgress(url, {
+            signal: AbortSignal.timeout(5000),
+            headers: { Accept: "application/json" },
+            ...(dispatcher ? { dispatcher } : {}),
+        });
+        if (!res.ok) return undefined;
+        const data = (await res.json()) as { versions?: Record<string, unknown> };
+        if (!data.versions || typeof data.versions !== "object") return undefined;
+        return new Set(Object.keys(data.versions));
+    } catch {
+        return undefined;
+    }
+}
+
 /** #1196: when the running process itself lives inside a dsh profile bundle
  *  (dsh plugin-market install), there is no global bili to drive the lockstep
  *  refresh — the profile copy would stay frozen at its install version
@@ -1124,11 +1155,37 @@ export async function refreshDshProfileCopy(
     }
     const diskVersion = await readDiskVersion(installDir);
     const currentVersion = diskVersion ?? opts.currentVersion;
-    if (!isVersionNewer(latest, currentVersion)) {
+    // #3160: only an exactly-in-step copy is silent. A copy AHEAD of the registry
+    // latest used to read as "up to date" and freeze the lane forever (hand-placed
+    // version). Owner follow-up: being absent from the public packument is NOT safe
+    // proof of tampering — a user's own maintained build is also absent — so an ahead
+    // registry-form copy is NEVER auto-downgraded here; we surface it loudly and leave
+    // it untouched, and auto-quarantine of provably-unexplained copies lands in #3224.
+    // Local pins (link:/file:) are respected: they fall through so their siblings still
+    // refresh via refreshDshProfileBundles (which skips the pinned profile itself).
+    const runningSpec = dshProfileDepSpec(path.resolve(installDir, "..", ".."));
+    if (diskVersion !== undefined && diskVersion === latest) {
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
-    log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
+    if (diskVersion !== undefined && !isVersionNewer(latest, diskVersion)) {
+        if (runningSpec !== undefined && !isRegistryDepSpec(runningSpec)) {
+            log("info", `[update] dsh profile bundle reports v${currentVersion}, ahead of registry ${latest}, but is locally pinned (${runningSpec}) \u2014 intentional dev pin, refreshing other registry-pinned profiles only`);
+        } else {
+            // Diagnostic only (drives the wording below): name which situation this
+            // is so the operator can act — never gates a downgrade.
+            const published = await fetchPublishedVersions(opts.resolveProxy, opts.packageName);
+            const why = published === undefined
+                ? "could not be verified against the registry"
+                : published.has(diskVersion)
+                    ? "is a published version (likely tracked under a different tag)"
+                    : "does not exist on the public registry (possibly a hand-placed/out-of-band build)";
+            log("warn", `[update] dsh profile bundle reports v${currentVersion}, ahead of registry ${latest} \u2014 ${why}; bili will NOT auto-downgrade it (#3160). If this is an intentional local build, pin it (profile dep \u2192 link:/file:, or point at your private registry) and bili stops touching it; otherwise remove it`);
+            return;
+        }
+    } else {
+        log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
+    }
     const lock = await tryAcquireLock();
     if (!lock) {
         log("info", `[update] another process is updating, will check next cycle`);
@@ -1149,8 +1206,11 @@ export async function refreshDshProfileCopy(
  *  junction-safe installer (whose hostManagedInstall exemption recognizes this
  *  exact layout), keyed off the running user's DSH_HOME. Called alongside
  *  refreshDshProfileBundles at every driver site; all sites hold the shared
- *  update lock. Silent while the copy is missing, in step, or ahead; failures
- *  log and back off through the owner-lane InstallBackoff (#2192 — this lane
+  *  update lock. Silent while the copy is missing or in step; an ahead/out-of-band
+  *  copy (#3160) is loudly warned and left untouched — never auto-downgraded, since a
+  *  higher version may be a deliberate local build (auto-quarantine lands in #3224);
+  *  failures log and back off through the owner-lane InstallBackoff
+ *  (#2192 — this lane
  *  re-downloads the tarball per attempt, so an unbacked retry loop burned
  *  bandwidth every check cycle); never throws. */
 export async function refreshDshDesktopCopy(
@@ -1169,7 +1229,21 @@ export async function refreshDshDesktopCopy(
             return; // no desktop profile on this machine — nothing to keep in step
         }
         diskVersion = await readDiskVersion(flat);
-        if (!isVersionNewer(targetVersion, diskVersion ?? "0.0.0")) return; // in step or ahead — never downgrade
+        if (diskVersion === targetVersion) return;
+        if (diskVersion !== undefined && !isVersionNewer(targetVersion, diskVersion)) {
+            // #3160 owner follow-up: an ahead desktop copy is NEVER auto-downgraded —
+            // a higher version may be a deliberate local build, and packument-absence
+            // alone can't tell that from a tampered copy. Surface it loudly, leave it;
+            // auto-quarantine of provably-unexplained copies lands in #3224.
+            const published = await fetchPublishedVersions(resolveProxy, DSH_PACKAGE);
+            const why = published === undefined
+                ? "could not be verified against the registry"
+                : published.has(diskVersion)
+                    ? "is a published version (likely tracked under a different tag)"
+                    : "does not exist on the public registry (possibly a hand-placed/out-of-band build)";
+            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} copy reports v${diskVersion}, ahead of the target v${targetVersion} \u2014 ${why}; bili will NOT auto-downgrade it (#3160). If this is an intentional local build, pin it (profile dep \u2192 link:/file:, or point at your private registry) and bili stops touching it; otherwise remove it`);
+            return;
+        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);

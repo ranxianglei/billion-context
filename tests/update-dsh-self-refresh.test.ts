@@ -108,14 +108,30 @@ function makeFixture(version: string): Fixture {
     };
 }
 
-async function withRegistry<T>(version: string | undefined, fn: (fetches: { count: number }) => Promise<T>): Promise<T> {
+/** Stub the registry: `/billion-context/<tag>` → single-version doc; the bare
+ *  `/billion-context` packument → `{versions}` keyed by every published version.
+ *  `published` defaults to just the resolved `version` (so an inflated copy reads
+ *  as unpublished, matching the #3160 incident). */
+async function withRegistry<T>(
+    version: string | undefined,
+    fn: (fetches: { count: number; packument: number }) => Promise<T>,
+    published?: string[],
+): Promise<T> {
     const original = globalThis.fetch;
-    const fetches = { count: 0 };
-    globalThis.fetch = (() => {
+    const fetches = { count: 0, packument: 0 };
+    const pubList = published ?? (version ? [version] : []);
+    globalThis.fetch = ((url: unknown) => {
         fetches.count += 1;
-        return version === undefined
-            ? Promise.resolve(new Response("nope", { status: 500 }))
-            : Promise.resolve(new Response(JSON.stringify({ version })));
+        if (version === undefined) return Promise.resolve(new Response("nope", { status: 500 }));
+        const u = String(url);
+        if (/\/billion-context$/.test(u)) {
+            fetches.packument += 1;
+            return Promise.resolve(new Response(JSON.stringify({ name: "billion-context", versions: Object.fromEntries(pubList.map((v) => [v, {}])) })));
+        }
+        if (/\/billion-context\/[^/]+$/.test(u)) {
+            return Promise.resolve(new Response(JSON.stringify({ version })));
+        }
+        return Promise.reject(new Error(`unexpected fetch in test: ${u}`));
     }) as unknown as typeof fetch;
     try {
         return await fn(fetches);
@@ -176,6 +192,71 @@ test("refreshDshProfileCopy: up-to-date copy never spawns dsh", async () => {
     } finally {
         _setDshRunnersForTest(undefined);
         fx.cleanup();
+    }
+});
+
+test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) is left untouched + warned, never auto-downgraded (#3160)", async () => {
+    const fx = makeFixture("1.2.9"); // profile a declares ^1.2.9 and reports 1.2.9 on disk
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.197", async () => {
+            await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
+        });
+        assert.deepEqual(calls, [], "an ahead copy must NOT be auto-downgraded (may be a deliberate local build)");
+        assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${entries.join(" | ")}`);
+        assert.ok(!entries.some((l) => l.includes("up to date")), "an ahead copy must not be reported as up to date");
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
+
+test("refreshDshProfileCopy: a PUBLISHED-but-ahead copy is NOT auto-downgraded — deferred with a hint (#3160 owner-feedback)", async () => {
+    const fx = makeFixture("0.1.198"); // profile a declares ^0.1.198 and reports 0.1.198 on disk
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        // registry's tracked latest is 0.1.197, but 0.1.198 IS published (e.g. on `next`)
+        await withRegistry("0.1.197", async () => {
+            await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
+        }, ["0.1.197", "0.1.198"]);
+        assert.deepEqual(calls, [], "a genuinely-published ahead copy must not be downgraded");
+        assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${entries.join(" | ")}`);
+    } finally {
+        _setDshRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
+
+test("refreshDshProfileCopy: an ahead copy under a local pin stays put (info) while sibling registry-pinned profiles still refresh (#3160)", async () => {
+    const base = fs.mkdtempSync(path.join(root, "fx-"));
+    const dshHome = path.join(base, "dsh");
+    const aDir = path.join(dshHome, "profiles", "a");
+    const installDir = path.join(aDir, "node_modules", "billion-context");
+    const bDir = path.join(dshHome, "profiles", "b");
+    fs.mkdirSync(installDir, { recursive: true });
+    fs.mkdirSync(bDir, { recursive: true });
+    // profile a: link:-pinned (deliberate dev pin) but its on-disk copy reports 1.2.9;
+    // profile b: registry-pinned ^0.1.196 with no copy yet — must still be refreshed.
+    fs.writeFileSync(path.join(aDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": `link:${path.join(base, "dev-bc")}` } }));
+    fs.writeFileSync(path.join(bDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^0.1.196" } }));
+    fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "1.2.9" }));
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.197", async () => {
+            await refreshDshProfileCopy(installDir, OPTS, { ...process.env, DSH_HOME: dshHome }, log);
+        });
+        assert.deepEqual(calls, ["plugin --profile b add billion-context@0.1.197"], "pinned profile untouched, sibling still refreshed");
+        assert.ok(entries.some((l) => l.startsWith("info") && l.includes("intentional dev pin")), `expected the dev-pin info log, got: ${entries.join(" | ")}`);
+        assert.ok(!entries.some((l) => l.startsWith("warn") && l.includes("#3160")), "a deliberate pin must not raise the out-of-band warning");
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(base);
     }
 });
 

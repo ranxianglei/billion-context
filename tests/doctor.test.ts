@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
+import { dshBundleShadowWarning, dshOutOfBandCopyWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
 import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -70,6 +70,48 @@ test("#2891: dshBundleShadowWarning fires only when a machine-global copy coexis
     const w = dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.135", profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" });
     assert.ok(typeof w === "string" && w.includes("v0.1.135") && w.includes("v0.1.194") && w.includes("installation-anchor-first") && w.includes("dsh --profile web --dump-config"), `expected divergent-version shadow warning, got: ${w}`);
     assert.ok(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: undefined, profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }) !== undefined);
+});
+
+test("#3160: dshOutOfBandCopyWarning fires only for a registry-form copy AHEAD of the registry latest", () => {
+    // inflated out-of-band copy → warn, naming both versions and the issue
+    const w = dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "desktop", pinned: false, copyVersion: "1.2.9", registryVersion: "0.1.197" });
+    assert.ok(typeof w === "string" && w.includes("#3160") && w.includes("v1.2.9") && w.includes("v0.1.197"), `expected out-of-band warning, got: ${w}`);
+    // in step → silent
+    assert.equal(dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "web", pinned: false, copyVersion: "0.1.197", registryVersion: "0.1.197" }), undefined);
+    // behind (normal stale — already covered by the verdict) → not out-of-band
+    assert.equal(dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "web", pinned: false, copyVersion: "0.1.190", registryVersion: "0.1.197" }), undefined);
+    // deliberate local pin → never out-of-band
+    assert.equal(dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "dev", pinned: true, copyVersion: "1.2.9", registryVersion: "0.1.197" }), undefined);
+    // missing either version → no false positive
+    assert.equal(dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "web", pinned: false, copyVersion: undefined, registryVersion: "0.1.197" }), undefined);
+    assert.equal(dshOutOfBandCopyWarning({ packageName: "billion-context", profileName: "web", pinned: false, copyVersion: "1.2.9", registryVersion: undefined }), undefined);
+});
+
+test("#3160: runDoctor surfaces the out-of-band warning on a dsh profile whose copy outruns the registry, without changing its verdict", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-oob-run-"));
+    const runWithFetch = mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "0.1.197" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    try {
+        await runWithFetch(async () => {
+            const home = path.join(base, "oob");
+            const profileDir = path.join(home, "dsh", "profiles", "desktop");
+            const copyDir = path.join(profileDir, "node_modules", "billion-context");
+            mkdirSync(copyDir, { recursive: true });
+            writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.196" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+            // inflated out-of-band copy: reports 1.2.9 while the registry latest is 0.1.197
+            writeFileSync(path.join(copyDir, "package.json"), JSON.stringify({ name: "billion-context", version: "1.2.9" }));
+            await withEnv({ ...doctorSandboxEnv(home), DSH_HOME: path.join(home, "dsh") }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.196" });
+                const lane = report.lanes.find((l) => l.agent === "dsh:desktop");
+                assert.ok(lane !== undefined, "dsh:desktop lane present");
+                // the verdict stays "ok" (nothing newer than it exists) — the finding rides a warning
+                assert.equal(lane?.verdict, "ok");
+                assert.ok(lane?.warnings?.some((w) => w.startsWith("out-of-band copy:") && w.includes("v1.2.9") && w.includes("v0.1.197")), `expected an out-of-band warning, got: ${JSON.stringify(lane?.warnings)}`);
+                assert.match(renderDoctorReport(report), /⚠️ out-of-band copy/);
+            });
+        });
+    } finally {
+        rmrf(base);
+    }
 });
 
 test("#2891: a dsh lane carrying the shadow warning renders under its row without touching the verdict", () => {
