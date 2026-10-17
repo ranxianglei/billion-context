@@ -138,7 +138,12 @@ export async function handle(
                 res.end(JSON.stringify({ error: denial }));
                 return;
             }
-            handleIncrementalProbe(res);
+            // #3352: `?conversation=<sid>` upgrades the probe to a pull
+            // receipt (appliedSeq + boundary) for hosts with no response
+            // seam — see handleIncrementalProbe.
+            const query = new URL(req.url ?? "/", "http://localhost").searchParams;
+            const conversation = query.get("conversation") ?? undefined;
+            handleIncrementalProbe(res, conversation !== "" ? conversation : undefined);
             return;
         }
         // #3248 marker divert: a native extension may stamp

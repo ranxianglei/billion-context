@@ -508,3 +508,73 @@ test("incrementalTurnBodyShape accepts the incremental payload and rejects anthr
     const badSeq = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: "3", messages: [] }));
     assert.equal(incrementalTurnBodyShape(badSeq), false, "sinceSeq must be an integer");
 });
+
+test("incremental lane: #3352 pull receipt — ?conversation= answers appliedSeq + boundary in the shared wire formula", async () => {
+    const h = await harness("full");
+    try {
+        const msgs = [userTurn(1), assistantTurn(1), { id: "u2", role: "user", contentType: "text", content: "tail message" }];
+        const seed = await h.turn({ sinceSeq: 0, messages: msgs });
+        assert.equal(seed.status, 200);
+
+        const response = await fetch(`${h.proxyUrl}/__bili/plugin/turn?conversation=conv-inc-1`, { method: "GET", headers: { "x-bili-plugin": "dsh" } });
+        assert.equal(response.status, 200);
+        const body = await response.json() as { ok: boolean; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        assert.equal(body.ok, true);
+        assert.ok(body.conversation, "?conversation= adds the receipt object");
+        assert.equal(body.conversation.appliedSeq, 3, "appliedSeq is the warm canonical length");
+
+        // boundary uses the CLIENT formula (incremental-client.ts wireHash):
+        // sha256(role \0 JSON.stringify(content)) first 16 hex — byte-parity
+        // is the whole adoption contract, pin it cross-module.
+        const { incrementalWireHash } = await import("../src/agent/incremental-client.ts");
+        const tail = { role: "user", content: "tail message" }; // userTurn(2, "tail message") on the wire
+        assert.equal(body.conversation.boundary, incrementalWireHash(tail), "boundary = wire hash of the canonical tail (client formula)");
+    } finally {
+        await h.close();
+    }
+});
+
+test("incremental lane: #3352 pull receipt — cold rebuild answers boundary null (adopting is the client's call, never ours)", async () => {
+    const h = await harness("full");
+    try {
+        const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1), assistantTurn(1)] });
+        assert.equal(seed.status, 200);
+        // restart: warm cache gone — the canonical rebuilds from the store,
+        // and the boundary is deliberately NOT recomputed (a stale or
+        // table-derived hash could match a foreign tail; null forces the
+        // client to resync).
+        _resetSessionsForTest();
+        __resetIncrementalLaneForTests();
+        const response = await fetch(`${h.proxyUrl}/__bili/plugin/turn?conversation=conv-inc-1`, { method: "GET", headers: { "x-bili-plugin": "dsh" } });
+        assert.equal(response.status, 200);
+        const body = await response.json() as { ok: boolean; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        assert.ok(body.conversation, "receipt object present");
+        assert.equal(body.conversation.appliedSeq, 2, "cold rebuild still reports the table truth");
+        assert.equal(body.conversation.boundary, null, "cold boundary is null by design");
+
+        // a system-only turn does not move the boundary (empty delta keeps the tail)
+        const sysTurn = await h.turn({ sinceSeq: 2, system: "new system", messages: [] });
+        assert.equal(sysTurn.status, 200);
+        const warm = await fetch(`${h.proxyUrl}/__bili/plugin/turn?conversation=conv-inc-1`, { method: "GET", headers: { "x-bili-plugin": "dsh" } });
+        const warmBody = await warm.json() as { conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        assert.ok(warmBody.conversation, "receipt object present");
+        assert.equal(warmBody.conversation.appliedSeq, 2, "system-only turn keeps the length");
+        // …but a canonical that was rebuilt from the store NEVER claims a
+        // boundary: the stored rows are core-form, and the client formula
+        // hashes wire bytes — parity is unprovable, so null stays until a
+        // wire delta (a resync or an append) lands and re-arms it.
+        assert.equal(warmBody.conversation.boundary, null, "cold-rebuilt canonical stays boundary-null through a system-only turn");
+
+        // a real wire delta re-arms the boundary from its own tail
+        const delta = await h.turn({ sinceSeq: 2, messages: [{ id: "u3", role: "user", contentType: "text", content: "wire tail" }] });
+        assert.equal(delta.status, 200);
+        const rearmed = await fetch(`${h.proxyUrl}/__bili/plugin/turn?conversation=conv-inc-1`, { method: "GET", headers: { "x-bili-plugin": "dsh" } });
+        const rearmedBody = await rearmed.json() as { conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        assert.ok(rearmedBody.conversation, "receipt object present");
+        const { incrementalWireHash } = await import("../src/agent/incremental-client.ts");
+        assert.equal(rearmedBody.conversation.appliedSeq, 3, "the delta extended the canonical");
+        assert.equal(rearmedBody.conversation.boundary, incrementalWireHash({ role: "user", content: "wire tail" }), "a wire delta re-arms the boundary (client formula)");
+    } finally {
+        await h.close();
+    }
+});

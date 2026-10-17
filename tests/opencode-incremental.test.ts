@@ -20,9 +20,24 @@ import type { V2HttpRequestEvent, V2State } from "../src/agent/opencode-v2.ts";
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
-async function fakeLane(enabled: boolean): Promise<{ base: string; close: () => Promise<void> }> {
+async function fakeLane(enabled: boolean): Promise<{ base: string; close: () => Promise<void>; receipts: Map<string, { appliedSeq: number; boundary: string | null }>; pullCount: { pulls: number } }> {
+    // #3352: the lane also serves the pull receipt — GET ?conversation=<sid>
+    // answers { conversation: { appliedSeq, boundary } }. Tests drive the
+    // receipt table directly (the canonical lives in the real lane; here we
+    // pin the CLIENT half of the contract: when to adopt, when to decline).
+    const receipts = new Map<string, { appliedSeq: number; boundary: string | null }>();
+    const counters = { pulls: 0 };
     const srv = createServer((req, res) => {
-        if (req.method === "GET" && req.url === "/__bili/plugin/turn") {
+        const u = new URL(req.url ?? "/", "http://localhost");
+        if (req.method === "GET" && u.pathname === "/__bili/plugin/turn") {
+            const conversation = u.searchParams.get("conversation");
+            if (conversation !== null) {
+                counters.pulls += 1;
+                const r = receipts.get(conversation) ?? { appliedSeq: 0, boundary: null };
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only", conversation: { appliedSeq: r.appliedSeq, boundary: r.boundary } }));
+                return;
+            }
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only" }));
             return;
@@ -31,7 +46,7 @@ async function fakeLane(enabled: boolean): Promise<{ base: string; close: () => 
     });
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
     const { port } = srv.address() as AddressInfo;
-    return { base: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => srv.close(() => r())) };
+    return { base: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => srv.close(() => r())), receipts, pullCount: counters };
 }
 
 function fakeEvent(body: unknown, sid: string): { e: V2HttpRequestEvent; url: string } {
@@ -273,4 +288,169 @@ test("opencode incremental: late response crossing the TTL attributes by turn id
     } finally {
         Date.now = realNow;
     }
+});
+
+test("opencode incremental: #3352 pull reconcile — a V2 host with no response seam settles its last turn by boundary", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const s = state(lane.base);
+    const { incrementalWireHash } = await import("../src/agent/incremental-client.ts");
+
+    // V2 host: the http.request hook never observes responses — the seed's
+    // pending entry is the only record of what was sent, and NOTHING acks it.
+    const msgs1 = [{ role: "user", content: "hello pull" }];
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs1 }, "oc-pull-1");
+    await maybeIncrementalOpencode(t1.e, s);
+    assert.notEqual(headersOf(t1.e.request as Request)["x-bili-turn-id"], undefined, "seed dispatched with a turn id");
+    // (no opencodeIncrementalOnResponse call — that seam does not exist here)
+
+    // the lane's receipt: appliedSeq = seed length, boundary = wire hash of
+    // the LAST message the host sent — the formula is shared by both sides.
+    lane.receipts.set("oc-pull-1", { appliedSeq: msgs1.length, boundary: incrementalWireHash(msgs1[msgs1.length - 1]) });
+
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const t2 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }, "oc-pull-1");
+    await maybeIncrementalOpencode(t2.e, s);
+    const body2 = JSON.parse(await (t2.e.request as Request).clone().json().then((j) => JSON.stringify(j))) as Record<string, unknown>;
+    assert.equal(body2.sinceSeq, 1, "pull receipt ADOPTED — the watermark advanced via the boundary match");
+    assert.equal((body2.messages as unknown[]).length, 2, "delta rides on the pulled watermark");
+    assert.equal(lane.pullCount.pulls, 1, "exactly one pull per reconcile");
+});
+
+test("opencode incremental: #3352 pull reconcile — a cold (null) or mismatched boundary is declined and re-seeds", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const s = state(lane.base);
+    const { incrementalWireHash } = await import("../src/agent/incremental-client.ts");
+
+    const msgs1 = [{ role: "user", content: "hello cold" }];
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs1 }, "oc-pull-2");
+    await maybeIncrementalOpencode(t1.e, s);
+    assert.equal(lane.pullCount.pulls, 0, "no stash → the seed turn itself never pulls");
+
+    // cold lane: the canonical was rebuilt from the store — boundary is null
+    // by design and MUST be declined (adopting would credit foreign rows).
+    lane.receipts.set("oc-pull-2", { appliedSeq: 9, boundary: null });
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const t2 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }, "oc-pull-2");
+    await maybeIncrementalOpencode(t2.e, s);
+    const body2 = JSON.parse(await (t2.e.request as Request).clone().json().then((j) => JSON.stringify(j))) as Record<string, unknown>;
+    assert.equal(body2.sinceSeq, 0, "cold boundary declined — this turn plans against stale state");
+    assert.equal(body2.resync, true, "one decline re-seeds (self-heal, #3369 circuit not tripped)");
+
+    // an interleaved full-resend advanced the canonical: the boundary now
+    // hashes a FOREIGN tail — mismatch must also be declined.
+    lane.receipts.set("oc-pull-2", { appliedSeq: 4, boundary: incrementalWireHash({ role: "user", content: "foreign tail from a wire full-resend" }) });
+    const msgs3 = [...msgs2, { role: "assistant", content: "again" }, { role: "user", content: "third" }];
+    const t3 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs3 }, "oc-pull-2");
+    await maybeIncrementalOpencode(t3.e, s);
+    const body3 = JSON.parse(await (t3.e.request as Request).clone().json().then((j) => JSON.stringify(j))) as Record<string, unknown>;
+    assert.equal(body3.resync, true, "foreign boundary declined — resync replaces the canonical wholesale");
+    assert.equal(body3.sinceSeq, 0, "watermark never advanced on a declined receipt");
+
+    // the resync landed; a matching receipt then carries the chain forward
+    // (the stash from the resync turn is settled by the NEXT pull).
+    lane.receipts.set("oc-pull-2", { appliedSeq: msgs3.length, boundary: incrementalWireHash(msgs3[msgs3.length - 1]) });
+    const msgs4 = [...msgs3, { role: "user", content: "fourth" }];
+    const t4 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs4 }, "oc-pull-2");
+    await maybeIncrementalOpencode(t4.e, s);
+    const body4 = JSON.parse(await (t4.e.request as Request).clone().json().then((j) => JSON.stringify(j))) as Record<string, unknown>;
+    assert.equal(body4.sinceSeq, msgs3.length, "after the resync settled, the pull adopts and deltas ride");
+    assert.equal((body4.messages as unknown[]).length, 1, "only the new message rides");
+});
+
+test("opencode incremental: #3352 pull reconcile — an unreachable lane skips incremental this turn and keeps the stash", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const s = state(lane.base);
+
+    const msgs1 = [{ role: "user", content: "hello unreachable" }];
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs1 }, "oc-pull-3");
+    await maybeIncrementalOpencode(t1.e, s);
+
+    // pull breaks (connection refused): the adapter must NOT convert this
+    // turn on stale state — but it also keeps the stash so a later pull can
+    // still settle the seed.
+    const deadBase = "http://127.0.0.1:1"; // nothing listens on port 1
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const t2 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }, "oc-pull-3");
+    await maybeIncrementalOpencode(t2.e, { proxyBase: deadBase } as unknown as V2State);
+    const body2 = await (t2.e.request as Request).clone().json();
+    assert.equal((body2 as Record<string, unknown>).conversationId, undefined, "no incremental payload when the pull cannot be verified");
+    assert.deepEqual(body2, { model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }, "full resend rides the host path byte-identically");
+});
+
+test("opencode incremental: #3352 V1 seam — beforeSend converts, stamps marker+turn-id, acks on the response seam", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const { maybeIncrementalOpencodeV1ForTest, __setOpencodeOriginForTests } = await import("../src/agent/opencode-native.ts");
+    __setOpencodeOriginForTests(lane.base);
+    const { incrementalWireHash } = await import("../src/agent/incremental-client.ts");
+
+    // the V1 shape: an ordinary anthropic body on a model URL, the plugin
+    // stamp (chat.headers) already on the init — the only conversation
+    // identity the seam can bookkeep under.
+    const msgs1 = [{ role: "user", content: "hello v1" }];
+    const init: RequestInit = {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "oc-v1-1" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs1 }),
+    };
+    await maybeIncrementalOpencodeV1ForTest("https://api.anthropic.com/v1/messages", init);
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    assert.equal(body.conversationId, "oc-v1-1", "seed payload swapped in place");
+    assert.equal(body.sinceSeq, 0);
+    const headers = new Headers(init.headers);
+    assert.equal(headers.get("x-bili-plugin-turn"), "1", "marker stamped on the same init (atomic, #3370)");
+    const turnId = headers.get("x-bili-turn-id");
+    assert.ok(turnId, "turn id stamped for response-seam attribution (#3329)");
+
+    // V1 hosts DO have the response seam: the ack lands per turn id.
+    opencodeIncrementalOnResponse("https://api.anthropic.com/v1/messages", new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "1" } }), Object.fromEntries(headers));
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const init2: RequestInit = {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "oc-v1-1" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }),
+    };
+    await maybeIncrementalOpencodeV1ForTest("https://api.anthropic.com/v1/messages", init2);
+    const body2 = JSON.parse(String(init2.body)) as Record<string, unknown>;
+    assert.equal(body2.sinceSeq, 1, "V1 rides the response-seam ack");
+    assert.equal((body2.messages as unknown[]).length, 2, "delta only");
+
+    // a MISSED seam heals via the pull: stash turn 2, do not ack it, then
+    // hand the lane a receipt matching turn 2's wire tail.
+    lane.receipts.set("oc-v1-1", { appliedSeq: msgs2.length, boundary: incrementalWireHash(msgs2[msgs2.length - 1]) });
+    const msgs3 = [...msgs2, { role: "user", content: "third" }];
+    const init3: RequestInit = {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "oc-v1-1" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs3 }),
+    };
+    await maybeIncrementalOpencodeV1ForTest("https://api.anthropic.com/v1/messages", init3);
+    const body3 = JSON.parse(String(init3.body)) as Record<string, unknown>;
+    assert.equal(body3.sinceSeq, msgs2.length, "pull receipt settled the missed seam — delta rides");
+    assert.equal((body3.messages as unknown[]).length, 1, "only the new message");
+});
+
+test("opencode incremental: #3352 V1 seam — no plugin stamp (proxy mode) stays full resend", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const { maybeIncrementalOpencodeV1ForTest, __setOpencodeOriginForTests } = await import("../src/agent/opencode-native.ts");
+    __setOpencodeOriginForTests(lane.base);
+    const original = { model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "no stamp" }] };
+    const init: RequestInit = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(original) };
+    await maybeIncrementalOpencodeV1ForTest("https://api.anthropic.com/v1/messages", init);
+    assert.deepEqual(JSON.parse(String(init.body)), original, "no x-bili-plugin-conversation → no conversation identity → untouched");
+    assert.equal(new Headers(init.headers).get("x-bili-plugin-turn"), null);
 });

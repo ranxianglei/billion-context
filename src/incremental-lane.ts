@@ -58,6 +58,7 @@
  * (R1 message ids), durable acks.
  */
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
@@ -154,9 +155,30 @@ interface Canonical {
     marks: Map<string, unknown>;
     system: unknown;
     systemSet: boolean;
+    /** #3352: wire hash (sha256(role\u0000JSON.stringify(content))[:16]) of
+     *  the last wire message this lane applied — the pull receipt boundary.
+     *  Warm-cache only: it describes the tail of THIS entry's msgs, which
+     *  only applyTurn mutates. Cold rebuilds report null (see
+     *  handleIncrementalProbe) — a persisted boundary would go stale when
+     *  rawTail rows append after the last incremental turn, and a stale
+     *  match would let a client adopt a watermark that counts foreign rows
+     *  (duplicate-serving); null forces the honest resync instead. */
+    boundary: string | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
+
+/** #3352: the exact wire-hash formula incremental-client.ts applies to its
+ *  outgoing messages (role + \u0000 + JSON.stringify(content), first 16 hex
+ *  chars of sha256). The pull receipt's boundary must be comparable to the
+ *  hash the CLIENT computed over its own bytes, so the lane replicates the
+ *  formula on the wire messages it applies — never on converted core form
+ *  (JSON key order could differ after anthropicToCore→coreToAnthropic and
+ *  a false mismatch would resync-loop the conversation). */
+function hashWireMessage(msg: { role: string; content: unknown } | undefined): string | null {
+    if (msg === undefined || typeof msg.role !== "string") return null;
+    return createHash("sha256").update(`${msg.role}\u0000${JSON.stringify(msg.content)}`).digest("hex").slice(0, 16);
+}
 
 function touchCache(conversationId: string, entry: Canonical): void {
     canonicalCache.delete(conversationId);
@@ -304,6 +326,12 @@ function applyTurn(
     const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...flat.msgs];
+    // #3352 pull receipt: the boundary follows the wire tail THIS turn
+    // applied — every non-empty apply moves it; a system-only append keeps
+    // the tail (and the boundary) unchanged; a system-only resync empties
+    // the canonical, so the boundary goes null with it.
+    if (deltaWire.length > 0) entry.boundary = hashWireMessage(deltaWire[deltaWire.length - 1]);
+    else if (resync) entry.boundary = null;
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
     return { ok: true, appliedSeq: entry.msgs.length, marks: flat.cacheControls };
 }
@@ -341,8 +369,21 @@ export function incrementalTurnsEnabled(): boolean {
 
 /** GET probe on the turn path: capabilities for native extensions. A 404 on
  *  older servers means "no incremental support" — clients fall back to full
- *  resend, which is the default everywhere. */
-export function handleIncrementalProbe(res: http.ServerResponse): void {
+ *  resend, which is the default everywhere.
+ *
+ *  #3352: with `?conversation=<sid>` the probe also returns a RECEIPT for
+ *  hosts with no response seam (opencode V2 observes neither the response
+ *  headers nor a fetch-patch onResponse — without a receipt their every
+ *  turn re-seeds). The receipt carries the warm canonical's length plus its
+ *  boundary (wire hash of the last applied wire message). The client adopts
+ *  the watermark only when the boundary equals the hash of the last message
+ *  it sent — a mismatch (foreign rawTail rows, rewound store, lost branch)
+ *  means the tail is NOT the client's, and adopting would double-count: the
+ *  receipt is declined instead and the client re-syncs. Boundary is
+ *  warm-only by construction (cold rebuilds return null) because the table
+ *  can hold rows the lane never applied; appliedSeq of a null-boundary
+ *  receipt is still reported for observability but never adoptable. */
+export function handleIncrementalProbe(res: http.ServerResponse, conversationId?: string): void {
     const sidecar = (() => {
         try {
             return getStore().replicasAvailable();
@@ -350,12 +391,30 @@ export function handleIncrementalProbe(res: http.ServerResponse): void {
             return false;
         }
     })();
+    let conversation: { appliedSeq: number; boundary: string | null } | undefined;
+    if (conversationId !== undefined && conversationId.length > 0) {
+        let entry = canonicalCache.get(conversationId);
+        if (entry === undefined) {
+            const rebuilt = readCanonicalFromStore(laneSessionId(conversationId));
+            if (rebuilt.kind === "ok") {
+                entry = { sessionId: laneSessionId(conversationId), msgs: rebuilt.msgs, marks: new Map(), system: undefined, systemSet: false, boundary: null };
+            }
+        }
+        // Deliberately NOT cached: this partial entry (marks/system skipped)
+        // exists only to answer the receipt; caching it would poison a later
+        // turn into skipping loadMarks/loadSystem.
+        conversation = {
+            appliedSeq: entry === undefined ? 0 : entry.msgs.length,
+            boundary: entry === undefined || entry.sessionId !== laneSessionId(conversationId) ? null : entry.boundary,
+        };
+    }
     jsonReply(res, 200, {
         ok: true,
         protocol: 1,
         feature: "pluginIncrementalTurns",
         enabled: featureEnabled("pluginIncrementalTurns") && sidecar,
         storage: sidecar ? "unified" : "legacy-only",
+        ...(conversation !== undefined ? { conversation } : {}),
     });
 }
 
@@ -424,7 +483,7 @@ export async function handleIncrementalTurn(
                 log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — requesting client resync`);
                 return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
             }
-            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
+            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null };
         }
         const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload);
         if (!applied.ok) {

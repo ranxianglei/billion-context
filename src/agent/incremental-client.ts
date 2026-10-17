@@ -155,6 +155,53 @@ function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+/** #3352: the same wire-hash formula, exported for adapters that must
+ *  compare a pull receipt's boundary against the tail message they sent —
+ *  incremental-lane.ts replicates it server-side (hashWireMessage); the two
+ *  must never diverge. */
+export function incrementalWireHash(m: IncrementalWireMessage): string {
+    return wireHash(m);
+}
+
+/** #3352 pull receipt: authoritative canonical state for ONE conversation,
+ *  fetched fresh every call (the 30s probeCache gates feature availability;
+ *  per-turn canonical state must never ride a cached view). `boundary` is
+ *  the wire hash of the last message the lane applied from THIS client's
+ *  turns — null when the lane only has a cold/table view (restart, LRU
+ *  eviction, foreign rawTail rows): a null or mismatched boundary is NEVER
+ *  adoptable; the caller must decline and re-sync. */
+interface IncrementalReceipt {
+    appliedSeq: number;
+    boundary: string | null;
+}
+
+/** Fetch the receipt from `GET /__bili/plugin/turn?conversation=<sid>`.
+ *  Any failure (network, non-200, malformed body, missing conversation
+ *  section) → null: callers treat null as "lane unreachable" and skip
+ *  incremental this turn rather than plan against stale beliefs. */
+export async function pullIncrementalReceipt(
+    proxyBase: string,
+    conversationId: string,
+    fetchImpl: typeof fetch = fetch,
+): Promise<IncrementalReceipt | null> {
+    try {
+        const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn?conversation=${encodeURIComponent(conversationId)}`, {
+            method: "GET",
+            headers: { "x-bili-plugin": "opencode" },
+            signal: AbortSignal.timeout(3000),
+        });
+        if (!res.ok) return null;
+        const body = await res.json() as { ok?: unknown; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        if (body.ok !== true || body.conversation === null || typeof body.conversation !== "object") return null;
+        const { appliedSeq, boundary } = body.conversation;
+        if (typeof appliedSeq !== "number" || !Number.isSafeInteger(appliedSeq) || appliedSeq < 0) return null;
+        if (boundary !== null && typeof boundary !== "string") return null;
+        return { appliedSeq, boundary };
+    } catch {
+        return null;
+    }
+}
+
 type IncrementalPlan =
     | { mode: "seed"; body: string }            // full history, sinceSeq 0 (server may 409 → resync)
     | { mode: "delta"; body: string }           // suffix only, acked sinceSeq

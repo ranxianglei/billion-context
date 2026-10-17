@@ -77,7 +77,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, incrementalWireHash, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -780,6 +780,77 @@ async function resolveV1Origin(): Promise<string | undefined> {
     }
 }
 
+/** #3352 V1 incremental wiring: opencode's legacy plugin lane has NO
+ *  request-level hook — model traffic egresses through the global fetch
+ *  patch (native-intercept), whose awaited beforeSend slot is the only place
+ *  the outgoing body can still be swapped. Mirrors the dsh reference
+ *  (dsh-native maybeIncrementalNative): parse the anthropic body, plan
+ *  (probe-gated), replace init.body with the delta payload and stamp marker
+ *  + turn-id on the SAME init (atomic, #3370) — attribution then rides the
+ *  existing response seam: on V1 hosts the fetch patch IS installed, so
+ *  opencodeIncrementalOnResponse observes x-bili-applied-seq per turn id
+ *  (#3329). The conversation id comes from the chat.headers stamp
+ *  (x-bili-plugin-conversation): without plugin stamping (z absent, no
+ *  legacy acp) there is no stable conversation identity to bookkeep under —
+ *  those installs stay full-resend. */
+async function maybeIncrementalOpencodeV1(url: string, init: RequestInit | undefined): Promise<void> { // exported for the incremental suite below
+    try {
+        if (init === undefined) return;
+        const body = init.body;
+        if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride full resend
+        let parsed: { messages?: unknown; system?: unknown; model?: unknown };
+        try {
+            parsed = JSON.parse(body) as typeof parsed;
+        } catch {
+            return;
+        }
+        if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only
+        const base = state.origin;
+        if (base === undefined) return;
+        const sid = new Headers(init.headers).get("x-bili-plugin-conversation");
+        if (sid === null || sid.length === 0) return; // no plugin stamping → no conversation identity
+        if (!(await probeIncrementalTurns(base))) return;
+        // #3352 pull reconcile runs here too: a V1 host whose response seam
+        // missed an ack (host restarted mid-turn, response consumed by a
+        // non-marker'd retry) settles via the receipt exactly like V2.
+        const last = latestUnackedFor(sid);
+        if (last !== undefined) {
+            const receipt = await pullIncrementalReceipt(base, sid);
+            if (receipt === null) return; // lane unreachable — full resend this turn, stash kept
+            incPendingOpencode.delete(last.turnId);
+            const expected = last.pending.messages.length > 0 ? incrementalWireHash(last.pending.messages[last.pending.messages.length - 1]) : null;
+            if (receipt.boundary !== null && receipt.boundary === expected) {
+                noteIncrementalAck(sid, receipt.appliedSeq, last.pending.messages, last.pending.system);
+            } else {
+                noteIncrementalRejection(sid);
+            }
+        }
+        const plan = planIncrementalTurn({
+            conversationId: sid,
+            path: "/v1/messages", // placeholder — the marker divert uses the ORIGINAL routed URL
+            messages: parsed.messages as IncrementalWireMessage[],
+            system: "system" in parsed ? parsed.system : undefined,
+            request: parsed as Record<string, unknown>,
+        });
+        if (plan.mode === "skip") return;
+        // #3378 single-flight per URL (omp/dsh pattern): while a marker'd
+        // request for this URL awaits its ack, later requests ride full resend.
+        sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
+        for (const pending of incPendingOpencode.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) return;
+        }
+        init.body = (plan as { body: string }).body;
+        const turnId = newIncrementalTurnId();
+        const headers = new Headers(init.headers);
+        headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
+        headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
+        init.headers = headers;
+        incPendingOpencode.set(turnId, { sid, url, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
 const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     if (plan.mode === "off") return {};
     const origin = await resolveV1Origin();
@@ -800,6 +871,10 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     if (installNativeFetchIntercept(state)) {
         console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
+    // #3352: the same patch is now also the V1 incremental seam — beforeSend
+    // converts anthropic bodies before they leave the process; the response
+    // side (state.onResponse, wired at module level) acks per turn id.
+    state.beforeSend = maybeIncrementalOpencodeV1;
     if (origin === undefined) {
         console.error("[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
         return {};
@@ -857,20 +932,50 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const req = e.request as Request | undefined;
         if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
         const url = req.url;
-        sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
         const body: unknown = await req.clone().json().catch(() => null);
         if (body === null || typeof body !== "object") return;
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
+        // #3352 pull reconcile: V2 hosts observe no response seam (the
+        // http.request hook exposes the request, not the response), so acks
+        // never arrive and every turn would re-seed. The lane is the only
+        // authority: before planning, pull the receipt and settle the LAST
+        // unacked turn of this conversation by its boundary — the wire hash
+        // of the canonical tail. Match → the watermark advances (note the
+        // ack with the stash's full wire list, same shape the response-seam
+        // path records). Mismatch/null → decline: noteIncrementalRejection
+        // (one decline re-seeds next turn, only a streak kills — #3369) and
+        // keep planning — the resync replaces the canonical wholesale.
+        // Adopting a receipt whose boundary is NOT our tail would credit
+        // foreign rows (rawTail full-resends, a provider switch) to our
+        // watermark and double-serve them upstream; the boundary check is
+        // what makes the pull safe.
+        const last = latestUnackedFor(sid);
+        if (last !== undefined) {
+            const receipt = await pullIncrementalReceipt(base, sid);
+            if (receipt === null) return; // lane unreachable — ride the normal pipeline this turn, stash kept
+            incPendingOpencode.delete(last.turnId);
+            const expected = last.pending.messages.length > 0 ? incrementalWireHash(last.pending.messages[last.pending.messages.length - 1]) : null;
+            if (receipt.boundary !== null && receipt.boundary === expected) {
+                noteIncrementalAck(sid, receipt.appliedSeq, last.pending.messages, last.pending.system);
+            } else {
+                const verdict = noteIncrementalRejection(sid);
+                logHostEvent("warn", "[native-client]", `[opencode] incremental pull receipt declined for ${sid} (boundary ${receipt.boundary === null ? "cold" : "mismatch"}) — conversation ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3352)`);
+            }
+        }
         const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
         if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
         // its ack, later requests ride the normal pipeline. Pending entries
         // are keyed by turn id (#3329), so the guard scans for a live entry
-        // stashed on THIS url (sweepStale above already aged out the stale
-        // ones — an aged entry must not block a fresh conversion).
+        // stashed on THIS url. The sweep runs HERE (after the pull reconcile)
+        // deliberately: aging is memory hygiene for this scan, and an entry
+        // older than the TTL is still the reconcile's only record of what the
+        // last turn sent — sweeping it first would force an unnecessary
+        // resync after any idle gap (#3352).
+        sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
         let inflight = false;
         for (const pending of incPendingOpencode.values()) {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
@@ -907,10 +1012,35 @@ const INC_PENDING_TTL_MS = 30_000;
  *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
 
+/** #3352: the newest still-unacked pending entry for a conversation — what
+ *  the pull reconcile settles. V1 hosts ack via the response seam (entries
+ *  are consumed by opencodeIncrementalOnResponse); V2 hosts never do, so
+ *  exactly one entry per conversation accumulates between turns and is
+ *  settled (ack or decline) by the next turn's pull. */
+function latestUnackedFor(sid: string): { turnId: string; pending: IncrementalPendingTurn } | undefined {
+    let best: { turnId: string; pending: IncrementalPendingTurn } | undefined;
+    for (const [turnId, pending] of incPendingOpencode) {
+        if (pending.sid !== sid) continue;
+        if (best === undefined || pending.at > best.pending.at) best = { turnId, pending };
+    }
+    return best;
+}
+
 /** Test hook: drop all planned turns (the map is module state across suites). */
 export function __resetOpencodeIncrementalForTests(): void {
     incPendingOpencode.clear();
+    state.origin = undefined; // V1 seam tests set this — never leak it into other suites
 }
+
+/** Test hook: point the module's intercept state at a lane origin, exactly
+ *  like the runtime origin resolver does — drives maybeIncrementalOpencodeV1. */
+export function __setOpencodeOriginForTests(origin: string | undefined): void {
+    state.origin = origin;
+}
+
+/** Exported for the incremental suite: the V1 seam itself (same exposure
+ *  pattern as the V2 maybeIncrementalOpencode). */
+export const maybeIncrementalOpencodeV1ForTest = maybeIncrementalOpencodeV1;
 
 /** Ack collector registered on the module's NativeInterceptState: the
  *  model-API and routed branches both fire onResponse(url, resp, headers)
