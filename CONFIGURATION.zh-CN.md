@@ -232,7 +232,7 @@
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。 |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | 强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。 |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
-| `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
+| `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | 输出预留占窗口的最大比例（按模型稳定的声明/配置输出上限计算，不再取逐请求的 max_tokens —— #3017）。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
 | `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
@@ -1040,7 +1040,7 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 - **类型：** `Record<string, { context?: number; output?: number; compress?: CompressSettings; benefit?: boolean }>`
 - **默认值：** *（无）*
 - **状态：** ACTIVE
-- **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小，在请求完全不携带输出预算字段时作为 output headroom 预留的回退值（见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）。它同时是 #546 输出预算恢复的下限：当客户端自己的 `max_tokens` 在携带工具的 main 请求上萎缩到 ≤ 200 时，代理会把它恢复到该会话最近的健康预算，且恢复目标以模型已知的最大输出为下限 —— 客户端上报的 runtime-info > launcher 通道 > 此处声明值 > models.dev registry 条目（#1665/#1840）。若所有来源都不知道该模型的输出上限，代理会按模型打一条一次性警告：此时恢复只以客户端自己最后的非饥饿值为依据，长会话仍可能在 max-tokens 处被截断。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)），以及 #1884 重签臂的模型级开关：`benefit: true | false` —— 这个模型是否走 CodeArts 免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头；环境变量 `BILI_RESIGN_BENEFIT` 优先于整棵树，未设置落到内置 `glm-5.3-flash, deepseek-v4.1-flash` 集）。
+- **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小，是 output headroom 预留的来源之一 —— 客户端上报的 runtime-info > launcher 通道 > 此处声明值 > models.dev registry 条目（#3017），受 [`outputHeadroomMaxPct`](#outputheadroommaxpct) 封顶。它同时是 #546 输出预算恢复的下限：当客户端自己的 `max_tokens` 在携带工具的 main 请求上萎缩到 ≤ 200 时，代理会把它恢复到该会话最近的健康预算，且恢复目标以模型已知的最大输出为下限 —— 客户端上报的 runtime-info > launcher 通道 > 此处声明值 > models.dev registry 条目（#1665/#1840）。若所有来源都不知道该模型的输出上限，代理会按模型打一条一次性警告：此时恢复只以客户端自己最后的非饥饿值为依据，长会话仍可能在 max-tokens 处被截断。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)），以及 #1884 重签臂的模型级开关：`benefit: true | false` —— 这个模型是否走 CodeArts 免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头；环境变量 `BILI_RESIGN_BENEFIT` 优先于整棵树，未设置落到内置 `glm-5.3-flash, deepseek-v4.1-flash` 集）。
 
   内置上下文表是随每个版本发布的静态数据，可能过期 —— 例如 DeepSeek 的规范请求 id `deepseek-flash` 在 models.dev 上没有以该名列出（其窗口列在 `deepseek-v4-flash` 名下），因此只有兜底表能回答它（#852）。日志会为每个模型记录一次胜出来源（`[window] ... fallback=true` 表示值来自内置表）。若解析出的窗口不对，按上文声明 `models.<name>.context`（它优先于注册表和内置表），或固定 `compress.modelContextLimit`；注意 provider 键必须带流量的 scheme（MITM 登录态客户端流量用 `mitm://<host>`，`/bili/` 流量用 `https://<host>`）。
 
@@ -1228,7 +1228,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number | string`
 - **默认值：** `0.25`
 - **状态：** ACTIVE
-- **说明：** 输出预留（output headroom）的上限，以上下文窗口的比例为单位：预留量 = `min(max_tokens, pct × window)`。**预算来源：** 当请求完全不带输出预算字段（`max_tokens` / `max_completion_tokens` / `max_output_tokens`）时 —— 例如 Codex native Responses 路径不发送 `max_output_tokens`（#924）—— 代理回退到模型声明的最大输出：先取 per-route 配置 `providers[url].models[model].output`，再取 models.dev registry 的 output ceiling（bundled snapshot 离线兜底）；都拿不到则不预留。同样的 cap 也作用于回退值。该预留让引擎的 nudge/truncate 档位位于 `window − 预留量` 之下，防止长回复把「输入+输出」推进窗口之外 —— 适用于把输出计入窗口的 API（Anthropic Messages 豁免：其 input limit 独立于 `max_tokens` 执行，故排除在外）。不设上限时，注册最大输出占窗口比例大的模型（如 262144 窗口上 maxTokens 131072）会失去大半输入预算，75% 强制压缩阈值会在约三分之一的完整窗口处就触发。默认 0.25 在控制损失的同时保证只要单轮回复不超过窗口的 25%，就不会在 95% 紧急阈值下溢出；更长的回复会溢出一次，由下一轮的 overflow self-heal 恢复。注意该上限只放宽过大的预留：当 `max_tokens` 本身 ≤ `pct × window` 时，预留仍是完整的 `max_tokens`（与旧行为逐字节一致）。接受比例（`0.25`）或百分比字符串（`"25%"`）；设 `0` 完全禁用预留；`>= 1` 恢复旧的完整预留行为（input + 用满预算的响应总能放进窗口 —— SGLang/vLLM 等严格后端的要求）。负数或无法解析的值会拒绝整个 `compress` 块。示例：窗口 262144 token、`max_tokens = 131072` → 默认 `0.25` 预留 65536 → 有效窗口 196608（旧完整预留：131072）；`max_tokens = 65536` → 预留 65536 → 196608 不变（65536 ≤ 窗口的 25%）。与 billion-context-pi（`#207`）对齐，见 #896。
+- **说明：** 输出预留（output headroom）的上限，以上下文窗口的比例为单位：预留量 = `min(ceiling, pct × window)`，其中 ceiling 是该模型**稳定的**已知输出预算，按会话/模型解析为：客户端上报的 runtime-info（#955）> launcher 通道（#971）> per-route 配置 `providers[url].models[model].output` > models.dev registry 的 output ceiling（bundled snapshot 离线兜底）；所有来源都不知道该上限时不预留（完整窗口）。自 #3017 起，逐请求的 wire `max_tokens` **不再**驱动这个预留 —— 它每轮都在变，会让 nudge/preflight 判定的墙在请求之间漂移；它仍然喂 outgoing max_tokens clamp，clamp 独立地对完整 native window 封顶。该预留让引擎的 nudge/truncate 档位位于 `window − 预留量` 之下，防止长回复把「输入+输出」推进窗口之外 —— 适用于把输出计入窗口的 API（Anthropic Messages 豁免：其 input limit 独立于 `max_tokens` 执行，故排除在外）。不设上限时，注册最大输出占窗口比例大的模型（如 262144 窗口上 maxTokens 131072）会失去大半输入预算，75% 强制压缩阈值会在约三分之一的完整窗口处就触发。默认 0.25 在控制损失的同时保证只要单轮回复不超过窗口的 25%，就不会在 95% 紧急阈值下溢出；更长的回复会溢出一次，由下一轮的 overflow self-heal 恢复。注意该上限只放宽过大的预留：当 ceiling 本身 ≤ `pct × window` 时，预留就是完整的 ceiling。接受比例（`0.25`）或百分比字符串（`"25%"`）；设 `0` 完全禁用预留；`>= 1` 恢复旧的完整预留行为（input + 用满预算的响应总能放进窗口 —— SGLang/vLLM 等严格后端的要求）。负数或无法解析的值会拒绝整个 `compress` 块。示例：窗口 262144 token、声明输出上限 131072 → 默认 `0.25` 预留 65536 → 有效窗口 196608（不设上限则为 131072）；ceiling 为 65536 → 预留 65536 → 196608 不变（65536 ≤ 窗口的 25%）。与 billion-context-pi（`#207`）对齐，见 #896。
 
 #### `maxContextLimit`
 
@@ -1523,11 +1523,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   **~200k** 才发生第一次压缩。
 
 强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兑底，且作用在
-「有效窗口」上 —— 输出预留 `min(max_tokens, outputHeadroomMaxPct × 窗口)`
+「有效窗口」上 —— 输出预留 `min(声明输出上限, outputHeadroomMaxPct × 窗口)`
 （cap 默认 0.25，见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）先被
-扣除。预留通常很小，只有请求携带很大的 `max_tokens` 时才会被 25% 封顶拉满：
-262,144 窗口 + `max_tokens = 131072` → 有效窗口 196,608 → 强制线 ≈147k；
-262,144 窗口 + 预留 8k → 强制线 ≈190k。
+扣除。预留对每个会话/模型恒定（取的是稳定上限，不是逐请求的 `max_tokens` ——
+#3017），只有模型声明输出非常大时才会被 25% 封顶拉满：
+262,144 窗口 + 上限 131072 → 有效窗口 196,608 → 强制线 ≈147k；
+262,144 窗口 + 上限 8k → 强制线 ≈190k。
 
 之后仍是增长制节奏：每 +50k 可压缩增长一次增量压缩。本地模型每次压缩都是
 整窗重新 prefill —— 重型启动 + 大窗口的长任务会经历多次，任务时长可能被拖长

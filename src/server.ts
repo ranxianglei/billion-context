@@ -1607,12 +1607,10 @@ export function imageReserveFor(
     return learnedImageReserve(session, upstreamHost(upstreamUrl), nImages, `${billing}:${cap}`, cap) ?? prior;
 }
 
-// #924: one-time-per-model log for the output-budget fallback (request carries
-// no budget → configured/registry max output) — same pattern as windowSourceLogged.
-export const headroomFallbackLogged = new Set<string>();
-
-// #2096: dedupe the post-reservation effective-window line per model|value —
-// the reserved window varies per request (max_tokens), so key on both.
+// #2096/#3017: dedupe the post-reservation effective-window line per model|value.
+// Since #3017 the reservation is driven by the STABLE configured/declared output
+// ceiling (not the per-request wire max_tokens), so the value is constant per
+// session/model — the Set simply logs each distinct wall once.
 export const headroomEffectiveLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through

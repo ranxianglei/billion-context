@@ -230,7 +230,9 @@ async function startProxyUpstream(window: number, sessionId: string, respond: (r
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upPort}`]: { models: { m: { context: window } } } },
+        // output 20_000 pins the judge denominator to the pre-#3017 arithmetic
+        // (reserved window = window - 20k) that both integration tests rely on.
+        routes: { [`http://127.0.0.1:${upPort}`]: { models: { m: { context: window, output: 20_000 } } } },
         modelContextLimit: window, kernelConfig: defaultConfig(window),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",

@@ -8,9 +8,9 @@ import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
-import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
+import { contextFromRegistry, peekRegistryContext, peekRegistryPriceProfile } from "../registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -40,7 +40,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -50,7 +50,7 @@ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encodin
 import { autoModeForgeEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
@@ -66,7 +66,7 @@ import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js"
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
@@ -2007,10 +2007,11 @@ async function handleRequest(
         // exempt: its input limit is enforced independently of max_tokens
         // (separate output budget), so reserving would shift every band down by
         // maxOutput on every session for no safety gain — see
-        // shouldReserveOutputHeadroom. The request's own budget field is the exact
-        // output budget requested for THIS turn, so it is precise and per-request;
-        // when the harness omits every budget field (#924 fallback below) the
-        // model's declared max output stands in for it.
+        // shouldReserveOutputHeadroom. The reservation is sized from the
+        // client-configured / model-declared output scale (resolveKnownOutputCeiling
+        // below), NOT the per-request wire max_tokens — a per-turn sample would move
+        // the wall between requests (#3017). When no source knows the model's output
+        // the reservation drops to 0 (full window), as before.
         // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
         // with billion-context-pi #207) caps the reservation at headroomCap × window
         // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
@@ -2022,81 +2023,25 @@ async function handleRequest(
         const nativeWindow = reqConfig.modelContextLimit;
         if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
-            const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
-            let maxOutput = typeof rawMax === "number" ? rawMax : 0;
-            // #924: harnesses that omit every output-budget field (Codex native
-            // Responses sends no max_output_tokens — openai/codex#36180) still get
-            // the upstream's own default output cap applied, so reserving nothing
-            // leaves the nudge/truncate bands able to overflow with one long
-            // reply. Fall back to the model's declared max output — per-route
-            // config first (operator-declared, outranks auto-fetched data, same
-            // order as the window resolution #344), then the models.dev registry
-            // ceiling (cache-only + bundled-snapshot floor, never fetches — the
-            // source preflight's summary cap uses, #853) — through the SAME capped
-            // reservation below. Unknown model → 0 → today's behavior.
-            if (!(maxOutput > 0)) {
-                // Runtime-info protocol (#955): the plugin reported the client's
-                // CONFIGURED max output (or the model's declared default, e.g.
-                // dsh's defaultMaxTokens) for exactly this model — outranks
-                // configured/registry because it is what the client will
-                // actually ask the upstream for. Still only a fallback: a
-                // max_tokens on the wire beat it above.
-                const fbModel0 = (parsed as { model?: string }).model;
-                // #1531: same dual lookup as the window chain above — header
-                // agent wins exclusively, header-less agents resolve by
-                // conversation signal.
-                const fbAgent = pluginAgentHeader(req.headers);
-                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
-                    ?? (fbAgent !== undefined
-                        ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
-                        : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
-                if (typeof runtimeMax === "number" && runtimeMax > 0) {
-                    maxOutput = runtimeMax;
-                    if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
-                        headroomFallbackLogged.add(`${fbModel0 ?? "?"}|runtime-info`);
-                        log("info", `[headroom] model=${fbModel0 ?? "?"}: request carries no output budget; reserving against runtime-info max output ${runtimeMax} (#955)`);
-                    }
-                }
-            }
-            if (!(maxOutput > 0)) {
-                // Launcher env channel (#971): the client's OWN config declares
-                // this model's output ceiling (codex model_max_output_tokens,
-                // pi/omp maxTokens, opencode limit.output, codebuddy
-                // maxOutputTokens) — handed over at launch time. Below
-                // runtime-info (per-request plugin truth) but above the
-                // generic configured/registry sources, same rank order as the
-                // window chain's launcher tier (1b).
-                const fbLauncher = (parsed as { model?: string }).model;
-                const launcherMax = fbLauncher !== undefined ? launcherMaxOutput(fbLauncher) : undefined;
-                if (typeof launcherMax === "number" && launcherMax > 0) {
-                    maxOutput = launcherMax;
-                    if (!headroomFallbackLogged.has(`${fbLauncher}|launcher`)) {
-                        headroomFallbackLogged.add(`${fbLauncher}|launcher`);
-                        log("info", `[headroom] model=${fbLauncher}: request carries no output budget; reserving against launcher max output ${launcherMax} (#971)`);
-                    }
-                }
-            }
-            if (!(maxOutput > 0)) {
-                const fbModel = (parsed as { model?: string }).model;
-                if (fbModel) {
-                    let host: string | undefined;
-                    try { host = route?.rewrittenUrl ? new URL(route.rewrittenUrl).host : undefined; } catch { host = undefined; }
-                    const cfgOut = resolveConfiguredOutputLimit(opts.routes, route?.rewrittenUrl, fbModel);
-                    const regOut = peekRegistryOutputLimit(fbModel, host);
-                    const budget = cfgOut !== undefined ? cfgOut : regOut;
-                    if (typeof budget === "number" && budget > 0) {
-                        maxOutput = budget;
-                        const source = cfgOut !== undefined ? "configured" : "registry";
-                        if (!headroomFallbackLogged.has(`${fbModel}|${source}`)) {
-                            headroomFallbackLogged.add(`${fbModel}|${source}`);
-                            log("info", `[headroom] model=${fbModel}: request carries no output budget; reserving against ${source} max output ${budget} (#924)`);
-                        }
-                    }
-                }
-            }
+            // #3017: the wall nudge/preflight judge against must be STABLE within a
+            // session. Seeding the reservation from the PER-REQUEST wire max_tokens
+            // moved it turn to turn (a coding agent asks a different amount each call),
+            // so usage% against the 80%/92% bands drifted between requests — even within
+            // one second the #3004 incident logged two walls (1036971 vs 984464). Pin it
+            // to the client-configured / model-declared output scale via the SAME single
+            // resolution restoreOutputBudget uses above (#1840 resolveKnownOutputCeiling:
+            // runtime-info #955 > launcher #971 > configured > registry #853, NO wire
+            // value) so the two never disagree and the denominator is constant per
+            // session/model. Unknown model → undefined → 0 → full window (today's
+            // no-reservation behavior for that case). The outgoing max_tokens CLAMP is
+            // UNAFFECTED: it reads the wire field from the body and caps against the FULL
+            // nativeWindow independently (budget.ts) — overflow safety never depended on
+            // this denominator.
+            const stableCeiling = resolveKnownOutputCeiling(req.headers, p, opts.routes, route?.rewrittenUrl, opts.sessionHeader);
+            const maxOutput = typeof stableCeiling === "number" && stableCeiling > 0 ? stableCeiling : 0;
             // #2283 sub-defect 1: emit [window-change] when the per-session resolution
             // triple (model/source/base) moves mid-session. Placed pre output-headroom so
-            // #2096's per-request max_tokens reservation can't read as a base change.
+            // the output-headroom reservation can't read as a base change.
             {
                 const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
                 const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
@@ -2125,7 +2070,7 @@ async function handleRequest(
                 const headroomModel = String(requestModel ?? "?");
                 if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
                     headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
-                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap}) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096)`);
+                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for declared output ceiling ${maxOutput}, cap ${headroomCap}) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096/#3017)`);
                 }
             }
         }

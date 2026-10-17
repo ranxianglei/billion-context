@@ -181,6 +181,8 @@ interface DriveOpts {
     turn1PromptTokens: number;
     turn2Body: Record<string, unknown>;
     extraHeaders?: Record<string, string>;
+    /** declared stable output ceiling for model m — pins the judge denominator (#3017 removed the wire-max_tokens source) */
+    output?: number;
 }
 
 async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>; turn2MessageCount: number }> {
@@ -202,7 +204,7 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upPort}`]: { models: { m: { context: o.window } } } },
+        routes: { [`http://127.0.0.1:${upPort}`]: { models: { m: { context: o.window, ...(o.output !== undefined ? { output: o.output } : {}) } } } },
         modelContextLimit: o.window, kernelConfig: defaultConfig(o.window),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
@@ -293,11 +295,12 @@ test("#453 clamp: oversized max_tokens is reduced when input+system nearly fills
 });
 
 test("#453 escalation: nudge injected at the escalation line though the kernel cadence-stays silent", async () => {
-    // window 100k, max_tokens 20k -> reserved 80k. Usage = lastInputTokens/80k.
+    // window 100k, declared output 20k -> reserved 80k (#3017: denominator from
+    // the stable ceiling, not the wire max_tokens). Usage = lastInputTokens/80k.
     // 57.6k -> 72% (>= 0.70 escalation line, < 0.75 over-limit) vs 48k -> 60%.
     // Fresh session: growth not ready, so the kernel arms nothing at either
     // point; only the host-side escalation adds the trailing nudge at 72%.
-    const escalated = await drive({ sessionId: "esc-on", window: 100_000, turn1PromptTokens: 57_600, turn2Body: { model: "m", max_tokens: 20_000, messages: turn2Compressible() } });
+    const escalated = await drive({ sessionId: "esc-on", window: 100_000, output: 20_000, turn1PromptTokens: 57_600, turn2Body: { model: "m", max_tokens: 20_000, messages: turn2Compressible() } });
     const quiet = await drive({ sessionId: "esc-off", window: 100_000, turn1PromptTokens: 48_000, turn2Body: { model: "m", max_tokens: 20_000, messages: turn2Compressible() } });
     assert.equal(escalated.turn2MessageCount, quiet.turn2MessageCount + 1, "escalation adds exactly the trailing nudge message");
 });

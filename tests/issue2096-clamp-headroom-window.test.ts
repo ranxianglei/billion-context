@@ -91,7 +91,7 @@ async function startHarness(): Promise<{ proxy: http.Server; upstream: http.Serv
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW, output: 30_000 } } } },
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW),
         compress: { injectTool: true, injectNudge: true },
@@ -122,8 +122,9 @@ test("#2096 e2e: [window] reports the base, [headroom] reports the enforced effe
     setLogCapture((level, msg) => { logs.push(`${level} ${msg}`); });
     const h = await startHarness();
     try {
-        // max_tokens 30000 > 25% of 100000 -> reserved = min(30000, 25000) = 25000
-        // -> effective 75000.
+        // gpt-basil declares a STABLE output ceiling of 30000 (routes config), so
+        // the reservation is min(30000, 0.25×100000=25000) = 25000 -> effective
+        // 75000 — independent of the per-request wire max_tokens (#3017).
         await drive(h.proxyPort, h.upstreamPort, "s2096-e2e", 30_000);
         const windowLines = logs.filter((l) => l.includes("[window] model=gpt-basil"));
         assert.equal(windowLines.length, 1, `exactly one [window] line per model, got: ${JSON.stringify(windowLines)}`);
@@ -132,18 +133,20 @@ test("#2096 e2e: [window] reports the base, [headroom] reports the enforced effe
         let headroomLines = logs.filter((l) => l.includes("[headroom] model=gpt-basil: effective window"));
         assert.equal(headroomLines.length, 1, `one [headroom] effective-window line after first reservation, got: ${JSON.stringify(headroomLines)}`);
         assert.ok(headroomLines[0].includes(`effective window ${WINDOW} -> ${WINDOW - 25_000}`), `reserved value must appear, got: ${headroomLines[0]}`);
-        assert.ok(headroomLines[0].includes(`reserved ${25_000} for max output 30000`), `reservation math must be stated, got: ${headroomLines[0]}`);
+        assert.ok(headroomLines[0].includes(`reserved ${25_000} for declared output ceiling 30000`), `reservation math must be stated, got: ${headroomLines[0]}`);
 
         // Same model|value -> deduped (no second line).
         await drive(h.proxyPort, h.upstreamPort, "s2096-e2e", 30_000);
         headroomLines = logs.filter((l) => l.includes("[headroom] model=gpt-basil: effective window"));
         assert.equal(headroomLines.length, 1, `identical model|value must not re-log, got: ${JSON.stringify(headroomLines)}`);
 
-        // Different max_tokens -> different reserved value -> new line.
+        // #3017: a DIFFERENT per-request wire max_tokens must NOT move the wall —
+        // the denominator is pinned to the stable declared ceiling, so no new line
+        // and the same effective window as before.
         await drive(h.proxyPort, h.upstreamPort, "s2096-e2e", 10_000);
         headroomLines = logs.filter((l) => l.includes("[headroom] model=gpt-basil: effective window"));
-        assert.equal(headroomLines.length, 2, `new model|value pair must log once, got: ${JSON.stringify(headroomLines)}`);
-        assert.ok(headroomLines[1].includes(`effective window ${WINDOW} -> ${WINDOW - 10_000}`), `second reservation must surface, got: ${headroomLines[1]}`);
+        assert.equal(headroomLines.length, 1, `wire max_tokens must not move the stable denominator (#3017), got: ${JSON.stringify(headroomLines)}`);
+        assert.ok(headroomLines[0].includes(`effective window ${WINDOW} -> ${WINDOW - 25_000}`), `wall must stay put, got: ${headroomLines[0]}`);
     } finally {
         setLogCapture(null);
         h.proxy.close();

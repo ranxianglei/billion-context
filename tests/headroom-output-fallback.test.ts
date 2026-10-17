@@ -173,16 +173,19 @@ test("e2e #924: unknown model keeps today's no-reservation behavior", async () =
     }), 30);
 });
 
-test("e2e #924: an explicit request budget outranks the configured output", async () => {
-    // max_tokens=10k beats the configured 80k: reserved min(10k, 50k)=10k →
-    // effective 190k → 63% < 75% → no nudge (would be 80%/nudge if the
-    // fallback clobbered the explicit field).
+test("e2e #3017: the per-request wire max_tokens no longer moves the stable denominator", async () => {
+    // #3017: the denominator is pinned to the configured/declared output scale
+    // (80k here), NOT the per-request wire max_tokens. A small wire budget (10k)
+    // must NOT shrink the reservation the way the old code did — the wall stays
+    // 200k − min(80k, 0.25×200k=50k) = 150k → 120k/150k = 80% ≥ 75% → nudge (31).
+    // Before the fix the 10k wire value won: reserved min(10k,50k)=10k → 190k →
+    // 63% < 75% → no nudge (30).
     assert.equal(await turn2MessageCount({
         session: "hf-explicit",
         model: "headroom-model-a",
         models: { "headroom-model-a": { context: 200_000, output: 80_000 } },
         maxTokens: 10_000,
-    }), 30);
+    }), 31);
 });
 
 test("e2e #971: launcher-env max output stands in with nothing configured", async () => {

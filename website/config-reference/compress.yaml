@@ -38,10 +38,10 @@ entries:
     group: compress
     id: cw.ohmp
     render: compress-row
-    desc_en: "Cap on the share of the window reserved for output via max_tokens."
-    desc_zh: "max_tokens 输出预留占窗口的最大比例。"
-    site_en: "Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens."
-    site_zh: "max_tokens 输出预留占窗口的最大比例（0–1，默认 0.25）。"
+    desc_en: "Cap on the share of the window reserved for output (sized from the model's stable declared/configured output ceiling, not the per-request max_tokens — #3017)."
+    desc_zh: "输出预留占窗口的最大比例（按模型稳定的声明/配置输出上限计算，不再取逐请求的 max_tokens —— #3017）。"
+    site_en: "Cap (0–1, default 0.25) on the share of the window reserved for output — sized from the model's stable declared/configured output ceiling (#3017), not the per-request max_tokens."
+    site_zh: "输出预留占窗口的最大比例（0–1，默认 0.25）—— 按模型稳定的声明/配置输出上限计算（#3017），不再取逐请求的 max_tokens。"
   - key: compress.nudgeGrowthTokens
     type: number
     default: "50000 (kernel flat cadence)"

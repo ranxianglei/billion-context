@@ -88,7 +88,7 @@ function makeUpstreamOk(calls?: Call[]): http.Server {
     });
 }
 
-function startProxy(upstreamPort: number, models: Record<string, { context: number }>, kernelOverrides?: Partial<Config>, compressOverrides?: Partial<CompressSettings>): Promise<http.Server> {
+function startProxy(upstreamPort: number, models: Record<string, { context: number; output?: number }>, kernelOverrides?: Partial<Config>, compressOverrides?: Partial<CompressSettings>): Promise<http.Server> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     return startServer({
@@ -464,11 +464,13 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    // Model declares a 10k window (registry table), NO operator override. The
-    // OpenAI-chat endpoint reserves output headroom: max_tokens 4000 shrinks the
-    // effective window 10000 -> 6000. A ~12k incompressible (hard-protected bash)
-    // tool result overflows 6000 → fail-fast.
-    const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, { protectedTools: ["bash"] });
+    // Model declares a 10k window AND a stable output ceiling of 4000 (routes
+    // config), NO operator compress.modelContextLimit override. The OpenAI-chat
+    // endpoint reserves output headroom from that ceiling: min(4000,
+    // 0.25×10000=2500)=2500 shrinks the effective window 10000 -> 7500 (#3017: the
+    // per-request wire max_tokens no longer drives this). A ~12k incompressible
+    // (hard-protected bash) tool result overflows 7500 → fail-fast.
+    const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000, output: 4_000 } }, { protectedTools: ["bash"] });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
 
