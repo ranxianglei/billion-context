@@ -1,4 +1,5 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
+import { parse as parseJsonc, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
@@ -2039,6 +2040,38 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
 // fields.
 let configFileCache: { raw: string; value: FileConfig } | null = null;
 
+// #3572: bili's own config file is documented as JSONC — CONFIGURATION*.md show
+// ```jsonc blocks whose first line is a // comment — but this reader used bare
+// JSON.parse, so a file copied straight from the docs failed on the first // and
+// EVERY key was silently dropped (one error line, no other signal; e.g. an
+// update.registry mirror override never applied). Parse strict JSON first so a
+// valid file takes the exact same path as before (zero behavior change), then
+// fall back to jsonc-parser (comments + trailing commas) — the same way the repo
+// already reads opencode's own JSONC configs (parseConfigText, src/client-config.ts).
+// A genuinely malformed file still fails LOUDLY: jsonc-parser reports the first
+// error and we rethrow it as a SyntaxError, so the caller's catch logs + caches {}
+// exactly as it did for JSON.parse failures.
+export function parseBiliConfig(raw: string): unknown {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        const errors: ParseError[] = [];
+        const value = parseJsonc(raw, errors, { allowTrailingComma: true });
+        if (errors.length === 0) return value;
+        const first = errors[0];
+        throw new SyntaxError(`invalid JSON/JSONC at ${lineColumnOf(raw, first.offset)}: ${printParseErrorCode(first.error)}`);
+    }
+}
+
+function lineColumnOf(text: string, offset: number): string {
+    let line = 1;
+    let column = 1;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        if (text.charAt(i) === "\n") { line++; column = 1; } else column++;
+    }
+    return `line ${line} column ${column}`;
+}
+
 export function loadConfigFile(): FileConfig {
     const path = configFile();
     let raw: string | undefined;
@@ -2047,7 +2080,7 @@ export function loadConfigFile(): FileConfig {
         raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
         const cached = configFileCache;
         if (cached && cached.raw === raw) return cached.value;
-        const parsed: unknown = JSON.parse(raw);
+        const parsed: unknown = parseBiliConfig(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);

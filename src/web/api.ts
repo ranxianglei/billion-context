@@ -8,13 +8,13 @@ import {
     collectNamedProviders,
     loadNamedProviders,
     normalizeLegacyAllowDshCompaction,
+    parseBiliConfig,
     parseCompressSettings,
     parseNamedProviderRecipe,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
     rejectLegacyRoute,
-    safeReadJson,
     type DshFileSettings,
     type UpstreamProxyMode,
 } from "../config.js";
@@ -30,20 +30,33 @@ type ConfigShape = Record<string, unknown> & {
     upstreamProxyMode?: string;
 };
 
-function readConfig(): ConfigShape {
-    const parsed = safeReadJson(configFile());
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ConfigShape : {};
+// #3572: parse bili's own config file through the SAME tolerant parser the runtime
+// loader uses (loadConfigFile → parseBiliConfig), else a JSONC config that works at
+// runtime would show "not valid JSON" here and block every PUT. A genuinely malformed
+// file still throws — that is what keeps the PUT-block guard in configParseError honest.
+function readConfigRaw(): { value: unknown; error: string | null } {
+    if (!existsSync(configFile())) return { value: undefined, error: null };
+    let raw: string;
+    try { raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, ""); }
+    catch { return { value: undefined, error: null }; }
+    try { return { value: parseBiliConfig(raw), error: null }; }
+    catch (e) { return { value: undefined, error: String(e) }; }
 }
 
-/** The config file exists on disk but does not parse as JSON (hand-edited
- *  comment, trailing comma, …). Distinct from "missing": a broken file must
- *  never be silently rebuilt from {} by a PUT — that would wipe every field
- *  the loader could not read. */
+function readConfig(): ConfigShape {
+    const { value } = readConfigRaw();
+    return value && typeof value === "object" && !Array.isArray(value) ? value as ConfigShape : {};
+}
+
+/** The config file exists on disk but does not parse as JSON/JSONC (genuinely broken
+ *  syntax, not just comments/trailing commas which are valid JSONC per #3572). Distinct
+ *  from "missing": a broken file must never be silently rebuilt from {} by a PUT — that
+ *  would wipe every field the loader could not read. Only real syntax errors block it. */
 function configParseError(): string | null {
     if (!existsSync(configFile())) return null;
-    const parsed = safeReadJson(configFile());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
-    return `config file is not valid JSON: ${configFile()}`;
+    const { value, error } = readConfigRaw();
+    if (value && typeof value === "object" && !Array.isArray(value)) return null;
+    return `config file is not valid JSON: ${configFile()}${error ? ` (${error})` : ""}`;
 }
 
 /** Raw inline `providers` block exactly as written in the config file. The
@@ -182,7 +195,7 @@ export async function handleConfigPut(
         if (typeof body.file !== "string") return sendError(res, 400, "file must be a string (raw config JSON text)");
         let next: ConfigShape;
         try {
-            const p = JSON.parse(body.file);
+            const p = parseBiliConfig(body.file);
             if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
             const rec = p as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(rec);
