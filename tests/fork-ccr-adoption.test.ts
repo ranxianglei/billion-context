@@ -303,11 +303,17 @@ test("child persists its own companion and survives a proxy restart (#1341)", ()
         const child = forkChild(armed, forkBody);
         assert.equal(contentStoreOf(child).byRef["m00003"] ? true : false, true);
 
+        // #3586: a fold commit now persists the FOLDED session's own artifacts
+        // (setPostRebuildAnchor -> markDirty -> synchronous content-store write
+        // inside scheduleSave), so the armed parent legitimately leaves its
+        // own companion behind before we get here. Companion files are named
+        // after the (hashed) envelope path, not the session id — so pin the
+        // FLUSH DELTA instead of the absolute count: exactly one NEW companion
+        // appears for the child.
+        const before = listFiles(dir).filter((f) => f.endsWith(".content-store.json")).length;
         assert.ok(getStore().flushSync(child), "flush wrote the child's records");
-        // Companion files are named after the (hashed) envelope path, not the
-        // session id; only the child was flushed with a dirty store here.
         const envelopes = listFiles(dir).filter((f) => f.endsWith(".content-store.json"));
-        assert.equal(envelopes.length, 1, "exactly one companion envelope for the child");
+        assert.equal(envelopes.length - before, 1, "the child's flush adds exactly one companion envelope");
 
         assert.equal(dropSessionForGc(child.id), true, "evict from memory (restart)");
         const reloaded = getSession(child.id, META);

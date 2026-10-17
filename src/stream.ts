@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, setPostRebuildAnchor, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -983,6 +983,25 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
         const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
+        // #3573: a fold that out-sizes the session meter (stale baseline after
+        // an upgrade cutover, a never-reporting upstream, or simply the first
+        // fold of a raw-replayed giant history) drives the #695 net below zero
+        // and clamps it to 0 — the meter baseline is annihilated and the next
+        // prepare falls through the effectiveTokenCount ladder to the
+        // resent-history char-count bound, which over-counts 2-4x and fires a
+        // phantom EMERGENCY nudge / preflight marathon into an ALREADY-folded
+        // context (observed: usage=289% right after a successful 1.9M-token
+        // fold, 564% on the field report). Anchor the meter to this fold's
+        // post-fold view size (same kernel-count space the shrink line
+        // reports) — the #1820 post-rebuild semantics extended from preflight
+        // rebuilds to plain folds: a real usage report supersedes it
+        // immediately and the bounded prepare budget falls back to legacy
+        // sizing for never-reporting upstreams.
+        // Degenerate full-coverage folds (marathon strategy, #1911) can leave
+        // postCtx === 0; the setter no-ops on <=0 and the ghost decision would
+        // survive one more prepare. Anchor to 1 instead — the preflight fit
+        // gate stays the hard backstop either way.
+        setPostRebuildAnchor(ctx.session, Math.max(1, postCtx));
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
         ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —
