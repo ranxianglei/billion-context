@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -45,23 +46,6 @@ function fakeFetch(sink: string[]) {
     }) as typeof fetch;
 }
 
-interface RecordedCall {
-    url: string;
-    headers: Record<string, string>;
-    at: number;
-}
-
-function fakeFetchRecordingHeaders(sink: RecordedCall[]) {
-    return (async (input: string | URL | Request, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
-        const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
-        const headers: Record<string, string> = {};
-        if (src !== undefined) for (const [k, v] of new Headers(src).entries()) headers[k] = v;
-        sink.push({ url, headers, at: Date.now() });
-        return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-}
-
 async function withPatchRecording<T>(
     state: NativeInterceptState,
     fn: (fetch: typeof globalThis.fetch) => Promise<T>,
@@ -69,7 +53,7 @@ async function withPatchRecording<T>(
     const saved = globalThis.fetch;
     _resetForTest();
     const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    globalThis.fetch = makeRecordingFetch(sink);
     try {
         assert.equal(installNativeFetchIntercept(state), true);
         const result = await fn(globalThis.fetch);
@@ -464,36 +448,20 @@ test("install: a hot-reimport rebinds routing to the new instance's state (#3394
     // Two distinct module instances: A booted first, B is the FRESH state a
     // host hot-reimport (DSH profile recomposition) re-applies in the SAME
     // process with no reset in between.
-    const stateA: NativeInterceptState = {
-        origin: "http://127.0.0.1:40901",
-        ready: Promise.resolve("http://127.0.0.1:40901"),
-        headersFor: () => ({ "x-bili-test": "A" }),
-    };
-    const stateB: NativeInterceptState = {
-        origin: "http://127.0.0.1:40902",
-        ready: Promise.resolve("http://127.0.0.1:40902"),
-        headersFor: () => ({ "x-bili-test": "B" }),
-    };
-    const saved = globalThis.fetch;
-    _resetForTest();
-    const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
-    try {
-        assert.equal(installNativeFetchIntercept(stateA), true);
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40901", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
         // The hot-reimport path: install again with B's state. One chain per
         // process (returns false) but the live slot must rebind to B.
-        assert.equal(installNativeFetchIntercept(stateB), false);
-        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
-        assert.equal(res.status, 200);
-    } finally {
-        globalThis.fetch = saved;
-        _resetForTest();
-    }
+        const b = api.world("http://127.0.0.1:40902", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
     // Routing must follow B — the newest applied instance: B's origin rewrite
     // AND B's header stamp. Pre-#3394 the chain closed over A → 40901 + "A".
-    assert.equal(sink.length, 1);
-    assert.equal(sink[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
-    assert.equal(sink[0].headers["x-bili-test"], "B");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "B");
 });
 
 test("install: a same-instance re-activation outranks an older activation's late dispose (#3394)", async () => {
@@ -503,54 +471,51 @@ test("install: a same-instance re-activation outranks an older activation's late
     // object identity cannot tell the activations apart; only the install
     // generation can. A wrong clear here silently drops routing to direct
     // until restart: the exact bug class #3394 fixes.
-    const state: NativeInterceptState = {
-        origin: "http://127.0.0.1:40903",
-        ready: Promise.resolve("http://127.0.0.1:40903"),
-        headersFor: () => ({ "x-bili-test": "same" }),
-    };
-    const saved = globalThis.fetch;
-    _resetForTest();
-    const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
-    try {
-        assert.equal(installNativeFetchIntercept(state), true);
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40903", () => ({ "x-bili-test": "same" }));
+        assert.equal(w.install(), true);
         // Activation 1's effect runs post-commit: capture its disposer.
-        const disposeActivation1 = liveStateSlotEffect(state)();
+        const disposeActivation1 = w.captureDispose();
         // Re-activation: same state object, fresh context, no reset in between.
-        assert.equal(installNativeFetchIntercept(state), false);
+        assert.equal(w.install(), false);
         disposeActivation1();
-        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
-        assert.equal(res.status, 200);
-    } finally {
-        globalThis.fetch = saved;
-        _resetForTest();
-    }
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
     // The late dispose must be a no-op: routing still rides the rebound slot.
-    assert.equal(sink.length, 1);
-    assert.equal(sink[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
-    assert.equal(sink[0].headers["x-bili-test"], "same");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "same");
 });
 
 test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
-    const state: NativeInterceptState = {
-        origin: "http://127.0.0.1:40904",
-        ready: Promise.resolve("http://127.0.0.1:40904"),
-    };
-    const saved = globalThis.fetch;
-    _resetForTest();
-    const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
-    try {
-        assert.equal(installNativeFetchIntercept(state), true);
-        liveStateSlotEffect(state)()();
-        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
-        assert.equal(res.status, 200);
-    } finally {
-        globalThis.fetch = saved;
-        _resetForTest();
-    }
-    assert.equal(sink.length, 1);
-    assert.equal(sink[0].url, "http://127.0.0.1:8199/v1/messages", "empty slot passes through direct, unrewritten");
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40904");
+        assert.equal(w.install(), true);
+        w.captureDispose()();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:8199/v1/messages", "empty slot passes through direct, unrewritten");
+});
+
+test("install: successive hot-reimports keep routing on the newest world, stale disposers stay no-ops (#3617-E①)", async () => {
+    // The shared driver's generalization case beyond the original #3394 trio:
+    // three applied instances (A superseded by B superseded by C) plus A's
+    // LATE dispose landing after C took over — routing must ride C end to end.
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40911", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
+        const disposeA = a.captureDispose();
+        const b = api.world("http://127.0.0.1:40912", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        const c = api.world("http://127.0.0.1:40913", () => ({ "x-bili-test": "C" }));
+        assert.equal(c.install(), false);
+        disposeA();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40913/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "C");
 });
 
 test("install: Request-object input is re-dispatched with the rewritten URL", async () => {

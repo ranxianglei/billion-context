@@ -683,8 +683,10 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  discovery may find another healthy one first). Resolves to the origin the
  *  plugin should use — the (recovered) attach origin, the fallback origin,
  *  or undefined when nothing came up (register left base-less; maybeRetry
- *  keeps re-probing through the respawn hook). */
-async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
+ *  keeps re-probing through the respawn hook). Exported for tests, like the
+ *  omp/pi/opencode lanes' twins: the pinned-attach version decision (#3544) is
+ *  driven hermetically against a version-controllable resident. */
+export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     const seqAtEntry = register.giveUpSeq;
     // #3616: capture this flight's world — an apply() re-arm (or a test reset)
     // while any await below is pending supersedes the flight; its landings must

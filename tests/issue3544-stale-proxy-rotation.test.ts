@@ -28,7 +28,7 @@ import {
 import { watcherIsDead } from "../src/server.ts";
 import { handleAdminRoute } from "../src/server/admin.ts";
 import { BILI_TUNNEL_HEADER } from "../src/tunnel-guard.ts";
-import { rotatePinnedStaleProxy } from "../src/agent/dsh-native.ts";
+import { rotatePinnedStaleProxy, verifyAttachAndRecover, _registerStateForTest, _resetRegisterForTest, _resetRoutedForTest, _setSpawnForTest } from "../src/agent/dsh-native.ts";
 
 const ORIGIN = "http://127.0.0.1:18787";
 const CHILD_PID = 42_471;
@@ -328,3 +328,125 @@ test("#3544 watcherIsDead: heartbeat-opted pids age out past the grace window", 
     assert.equal(watcherIsDead(true, now - 16_000, now, 15_000), true, "missed beats beyond grace mark the slot dead");
     assert.equal(watcherIsDead(false, now - 1_000, now, 15_000), true, "a truly dead pid never needs the heartbeat");
 });
+
+// #3617-E② / #3544: the PINNED-ATTACH decision gate itself (verifyAttachAndRecover).
+// The suite above pins the discovery-path rotation and rotatePinnedStaleProxy's
+// mechanics, but nothing drove the version comparison at the attach decision
+// point: a preset BILLION_CONTEXT_PROXY resolving to a STRICTLY OLDER resident
+// must be rotated out and replaced before use (first case), while equal, newer
+// and unparseable residents attach untouched (negative guards, #3617-A).
+interface Resident {
+    origin: string;
+    readonly shutdowns: number;
+    close: () => Promise<void>;
+}
+
+function startResident(version: string, exitOnShutdown: boolean): Promise<Resident> {
+    let shutdowns = 0;
+    let down = false;
+    const server = http.createServer((req, res) => {
+        if (req.method === "POST" && req.url === "/__bili/shutdown") {
+            shutdowns += 1;
+            down = true;
+            res.writeHead(202, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+        }
+        if (req.url === "/__bili/plugin/manifest") {
+            if (down && exitOnShutdown) { res.writeHead(503); res.end(); return; }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ version }));
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+            const addr = server.address() as { port: number };
+            resolve({
+                origin: `http://127.0.0.1:${addr.port}`,
+                get shutdowns() { return shutdowns; },
+                close: () => new Promise<void>((r, j) => server.close((e) => (e ? j(e) : r()))),
+            });
+        });
+    });
+}
+
+const PINNED_ENV_KEYS = ["BILLION_CONTEXT_PROXY", "BILLION_CONTEXT_NATIVE", "DSH_HOME", "XDG_STATE_HOME"] as const;
+
+async function withPinnedEnv<T>(set: Partial<Record<(typeof PINNED_ENV_KEYS)[number], string>>, fn: () => Promise<T>): Promise<T> {
+    const saved: Partial<Record<(typeof PINNED_ENV_KEYS)[number], string | undefined>> = {};
+    for (const k of PINNED_ENV_KEYS) saved[k] = process.env[k];
+    Object.assign(process.env, set);
+    try {
+        return await fn();
+    } finally {
+        for (const k of PINNED_ENV_KEYS) {
+            if (saved[k] === undefined) delete process.env[k];
+            else process.env[k] = saved[k]!;
+        }
+    }
+}
+
+test("#3544/#3617-E② pinned attach: a strictly older resident is rotated out and replaced by the current build", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3544pin-home-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3544pin-state-"));
+    const resident = await startResident("0.0.1", true);
+    let spawnCalls = 0;
+    try {
+        _resetRoutedForTest();
+        _resetRegisterForTest(resident.origin);
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+            const landed = await verifyAttachAndRecover(resident.origin);
+            assert.equal(landed, "http://127.0.0.1:2", "rotated out: the spawned origin wins");
+            assert.equal(spawnCalls, 1, "spawn fallback ran exactly once");
+            assert.equal(resident.shutdowns, 1, "graceful shutdown requested exactly once");
+            assert.equal(_registerStateForTest().base, "http://127.0.0.1:2", "register re-based onto the fresh spawn");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "preset unfrozen");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        await resident.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+for (const [label, version] of [["equal", VERSION], ["newer", "999.0.0"], ["unparseable", "not-a-version"]] as const) {
+    test(`#3544/#3617-E② pinned attach: a ${label}-version resident attaches untouched (no rotation)`, async () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), `bili-3544pin-${label}-home-`));
+        const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), `bili-3544pin-${label}-state-`));
+        const resident = await startResident(version, false);
+        let spawnCalls = 0;
+        try {
+            _resetRoutedForTest();
+            _resetRegisterForTest(resident.origin);
+            _setSpawnForTest(async () => {
+                spawnCalls += 1;
+                return "http://127.0.0.1:2";
+            });
+            await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+                const landed = await verifyAttachAndRecover(resident.origin);
+                assert.equal(landed, resident.origin, "attaches as-is");
+                assert.equal(spawnCalls, 0, "no spawn for an up-to-date or incomparable resident");
+                assert.equal(resident.shutdowns, 0, "no shutdown requested");
+                assert.equal(_registerStateForTest().base, resident.origin, "register bound to the resident");
+                assert.equal(process.env.BILLION_CONTEXT_PROXY, resident.origin, "preset stays frozen");
+            });
+        } finally {
+            _setSpawnForTest(undefined);
+            await resident.close();
+            fs.rmSync(home, { recursive: true, force: true });
+            fs.rmSync(stateHome, { recursive: true, force: true });
+            _resetRoutedForTest();
+            _resetRegisterForTest(undefined);
+        }
+    });
+}

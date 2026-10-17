@@ -8,6 +8,9 @@ import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
+import { once } from "node:events";
+import { startServer } from "../src/server.ts";
+import { defaultConfig } from "acp-kernel";
 
 // #3370: the incremental-turn conversion must stamp the marker header on the
 // SAME init as the body swap (atomic, omp pattern) — the old arms-a-flag /
@@ -2085,6 +2088,98 @@ test("#3581 recovery clears the episode, re-arms settle-retry, and reports ok", 
         rmrf(home);
         _resetRegisterForTest(undefined);
         _resetAttributionHealthForTest();
+    }
+});
+
+// #3578/#3581 combined contract (#3617-E③): the transition-window shape — old
+// injected code whose agent scope is disposed (a version swap left the LIVE
+// proxy behind) must fail VISIBLE: the gate refuses to claim model traffic AND
+// the plugin's own report bytes must pass the REAL endpoint validation into
+// /__bili/status. Side A (gate internals against a mock endpoint, above) and
+// side B (endpoint + status wire against hand-crafted POSTs,
+// issue3581-attribution-health.test.ts) were covered separately; this pins the
+// seam with the real plugin→real proxy chain.
+test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bili/status attribution surface", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-base-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-3578-home-"));
+    const upstream = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    let srv: http.Server | undefined;
+    try {
+        await withEnv({
+            BILI_SESSIONS_DIR: path.join(base, "sessions"),
+            BILI_CONFIG_FILE: path.join(base, "absent-config.json"),
+            XDG_CACHE_HOME: path.join(base, "cache"),
+            XDG_STATE_HOME: stateHome,
+            BILI_PERSIST_ZSTD: "0",
+        }, async () => {
+            srv = await startServer({
+                port: 0,
+                host: "127.0.0.1",
+                upstream: `http://127.0.0.1:${upstreamPort}`,
+                routes: {},
+                modelContextLimit: 400_000,
+                kernelConfig: defaultConfig(400_000),
+                compress: { injectTool: false, injectNudge: false },
+                promptCache: { routing: "auto" },
+                sessionHeader: "x-acp-session",
+                log: false,
+                debug: false,
+                passthrough: false,
+                autoUpdate: false,
+                compat: { roles: {} },
+                streamErrorShape: "protocol",
+                passthroughSource: null,
+                autoRestartOnUpdate: false,
+                updateTag: "latest",
+                advisoryCheck: false,
+                releaseNotesCheck: false,
+                mitm: { enabled: false, domains: [] },
+            });
+            await once(srv, "listening");
+            const port = (srv.address() as { port: number }).port;
+            const origin = `http://127.0.0.1:${port}`;
+            await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, XDG_STATE_HOME: stateHome }, async () => {
+                _resetRoutedForTest();
+                _resetRegisterForTest(origin);
+                _resetAttributionHealthForTest();
+                _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+                const ctx = mockCtx();
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length >= 1, "real-manifest tool registration");
+                const gate = _stateTakeoverGateForTest();
+                assert.ok(gate !== undefined, "takeoverGate installed");
+                const statusOf = async (): Promise<Record<string, { state: string; refusals: number; since: number }>> =>
+                    ((await (await fetch(`${origin}/__bili/status`)).json()) as { attribution?: Record<string, { state: string; refusals: number; since: number }> }).attribution ?? {};
+                assert.deepEqual(await statusOf(), {}, "no report yet: empty surface");
+                // #3578 shape: the ALS boundary throws for the host's whole lifetime.
+                ctx.agents.currentInitiator = () => { throw new Error("agent initiator scope is disposed"); };
+                assert.equal(await gate(`${origin}/v1/messages`), false, "disposed scope cannot attribute — request goes direct");
+                // The fire-and-forget report must survive the real endpoint's
+                // validation and land on the status wire.
+                const deadline = Date.now() + 5_000;
+                let ep: { state: string; refusals: number; since: number } | undefined;
+                for (;;) {
+                    ep = (await statusOf())["bili-native"];
+                    if (ep !== undefined && ep.state === "threw" && ep.refusals >= 1 && ep.since > 0) break;
+                    if (Date.now() > deadline) throw new Error(`real status surface never showed the episode (last: ${JSON.stringify(await statusOf())})`);
+                    await new Promise((r) => setTimeout(r, 25));
+                }
+                assert.ok(ep.since > 0, "episode start timestamp recorded");
+            });
+        });
+    } finally {
+        _setThrewRetryForTest();
+        _resetAttributionHealthForTest();
+        _resetRegisterForTest(undefined);
+        const server = srv;
+        if (server) await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
+        await new Promise<void>((resolve, reject) => upstream.close((e) => (e ? reject(e) : resolve())));
+        rmrf(base);
+        rmrf(stateHome);
+        rmrf(home);
     }
 });
 
