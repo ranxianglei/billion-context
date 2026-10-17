@@ -11,6 +11,8 @@ import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresenc
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
+import { resolveDshHome } from "./client-config.js";
+import { dshProfileCopyFindings } from "./provenance.js";
 
 type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
 
@@ -205,6 +207,7 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
         channel: UPDATE_CHANNEL[agent],
     };
     if (agent === "dsh" && presence.profiles !== undefined) {
+        const profilesRoot = path.join(resolveDshHome(process.env), "profiles");
         return presence.profiles.map((p) => {
             const missing = p.bundleInstalled && p.copyVersion === undefined;
             const row: DoctorLane = {
@@ -219,6 +222,11 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
             else if (row.verdict === "broken") row.reason = "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
             const shadow = dshBundleShadowWarning({ packageName: ctx.packageName, globalInstallDir: ctx.global.installDir, globalDiskVersion: ctx.global.diskVersion, profileName: p.name, bundleInstalled: p.bundleInstalled, profileCopyVersion: p.copyVersion });
             if (shadow !== undefined) row.warnings = [...(row.warnings ?? []), shadow];
+            // #3224: manifest / lockfile / copy three-way disagreement rides the
+            // same advisory channel — detection only, never touches the verdict.
+            for (const f of dshProfileCopyFindings(path.join(profilesRoot, p.name))) {
+                row.warnings = [...(row.warnings ?? []), f.detail];
+            }
             return row;
         });
     }

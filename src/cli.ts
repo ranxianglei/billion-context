@@ -28,6 +28,7 @@ import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { auditDshProfileCopyProvenance } from "./provenance.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
@@ -603,6 +604,17 @@ export async function main(): Promise<void> {
     });
     recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
+
+    // #3224: loud provenance detection for dsh profile copies — manifest /
+    // lockfile / on-disk-copy three-way disagreement otherwise surfaces nowhere
+    // when the copy is not above the registry target (#3160 residual). Runs for
+    // every proxy start, independent of autoUpdate; purely local file reads, so
+    // it costs nothing when no wedged profile exists and fails open.
+    try {
+        auditDshProfileCopyProvenance({ log: loggerLog });
+    } catch {
+        // detection is advisory — never affect startup
+    }
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
