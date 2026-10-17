@@ -276,7 +276,9 @@ export const WEB_CLIENT = `(function () {
             const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
             let body = null;
             try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            // #3488: server errors may be objects ({type, message}); String() on
+            // them rendered "[object Object]" in the toast.
+            if (!res.ok) throw new Error(body && body.error ? (typeof body.error === "object" ? String(body.error.message || body.error.type || JSON.stringify(body.error)) : String(body.error)) : "HTTP " + res.status);
             return body;
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -2473,6 +2475,8 @@ export const WEB_CLIENT = `(function () {
         const box = $("summary-fields"), fe = $("cfg-file-edit");
         if (!box || !fe) return;
         const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        // #3488: five-state view; falls back to the legacy boolean on old servers.
+        const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
             const draft = JSON.parse(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
@@ -2578,7 +2582,14 @@ export const WEB_CLIENT = `(function () {
                     const row = document.createElement("div"); row.className = "summary-actions";
                     const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
                     const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
-                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    // #3488: distinguish "not set" from "set but unusable" and
+                    // "store broken" — all of them used to render as 未配置.
+                    const state = ref ? detail[ref] : undefined;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
+                    badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
+                    row.appendChild(badge);
                     if (ref && ref.indexOf("secret:") === 0) {
                         const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
                         key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
@@ -2586,7 +2597,7 @@ export const WEB_CLIENT = `(function () {
                             busy(btn, true);
                             try {
                                 const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
-                                key.value = ""; status[ref] = result.configured;
+                                key.value = ""; status[ref] = result.configured; detail[ref] = result.configured ? "configured" : "missing";
                                 render();
                                 toast(t("summary.key_saved"), "ok");
                             } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }

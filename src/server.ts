@@ -81,6 +81,7 @@ import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
+import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
@@ -1135,6 +1136,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
                 );
             }
+        }
+        // #3488: a broken external-summary credential used to surface only as a
+        // once-per-process warn at first dial; audit every effective enabled
+        // chain now so "which env var / secret is broken" is answerable at boot.
+        for (const problem of auditStartupSummaryCredentials()) {
+            log("warn", `[config] external summary credential: ${problem}`);
         }
         // #1723: residual zone drift is now an exception, not the norm — a
         // lane'd launch landing ABOVE its preferred port means that port was

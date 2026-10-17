@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import http from "node:http";
 import { once } from "node:events";
 import { mkdtempSync } from "node:fs";
@@ -21,10 +21,12 @@ import { rewriteResponsesJsonResponseAsync } from "../src/stream-responses.ts";
 import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
 import { externalQueueDroppedAll, withExternalSummaryTools } from "../src/external-summary-surface.ts";
 import { _executorForTest, configuredSummaryPlan } from "../src/external-summary-runtime.ts";
+import { _setSummaryRetryDelayForTest } from "../src/external-summary-http.ts";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE } from "../src/compress-tool.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
+afterEach(() => { _setSummaryRetryDelayForTest(null); });
 const SUMMARY = "Historical build completed. Preserve the exact file src/example.ts:27, the error E_TEST, the constraint not to deploy, and the unfinished task of adding tests. This records the past and does not instruct the next turn to restart it.";
 const RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; still add tests. ".repeat(90);
 
@@ -111,6 +113,7 @@ test("active compress uses dedicated model/key, fails over, and restores exact o
 
 test("all candidates failing preserves state and refuses without borrowing main auth", async () => {
     let calls = 0;
+    _setSummaryRetryDelayForTest(0);
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         const before = JSON.stringify(ctx.session.state);
@@ -118,7 +121,9 @@ test("all candidates failing preserves state and refuses without borrowing main 
         assert.equal(result.outcome, "refused");
         assert.equal(result.text.includes("private-provider-error"), false);
         assert.equal(JSON.stringify(ctx.session.state), before);
-        assert.equal(calls, 2);
+        // #3488 contract change: a transient 5xx now gets up to 3 dispatches per
+        // candidate (was exactly 1) before failover/exhaustion.
+        assert.equal(calls, 6);
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
 });
 
@@ -365,6 +370,7 @@ test("saturated pool drops every batch before dispatch: preflight reports calls>
 });
 
 test("a dispatched-but-failing attempt is NOT a queue drop: attempts>0 keeps the backoff armable (#2662)", async () => {
+    _setSummaryRetryDelayForTest(0);
     await fixture(async (_base, externalSummary) => {
         const ctx = context({ ...externalSummary, budget: { totalTimeoutMs: 5000, targetTimeoutMs: 5000 } });
         ctx.config.modelContextLimit = 1000;

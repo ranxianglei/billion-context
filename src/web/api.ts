@@ -20,7 +20,7 @@ import {
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
-import { SummaryCredentialStore } from "../external-summary-credentials.js";
+import { SummaryCredentialStore, type SummaryCredentialState } from "../external-summary-credentials.js";
 import { parseExternalSummaryChain, expandExternalSummaryChain } from "../external-summary-settings.js";
 import { agentProviderRecipes, agentRegistryStatus } from "../agent-providers.js";
 
@@ -91,6 +91,9 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const config = readConfig();
     const rawCompress = config.compress && typeof config.compress === "object" ? config.compress as Record<string, unknown> : undefined;
     const credentialStatus: Record<string, boolean> = {};
+    // #3488: additive five-state view (missing vs invalid value vs unreadable
+    // store) alongside the legacy boolean record scripts already consume.
+    const credentialDetail: Record<string, SummaryCredentialState> = {};
     let hideInvalidSummary = false;
     // Disabled chains skip strict target validation (an inert chain must not
     // brick the config view), so surface credential status from the raw
@@ -112,7 +115,11 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
                 ? Object.values(loadNamedProviders()).flatMap((recipe) => recipe.credentialRef !== undefined ? [`secret:${recipe.credentialRef}`] : recipe.apiKeyEnv !== undefined ? [`env:${recipe.apiKeyEnv}`] : [])
                 : rawCredentialRefs(rawCompress.externalSummary);
             const store = new SummaryCredentialStore();
-            for (const ref of refs) credentialStatus[ref] = store.configured(ref);
+            for (const ref of refs) {
+                const state = store.status(ref);
+                credentialStatus[ref] = state === "configured";
+                credentialDetail[ref] = state;
+            }
         } catch {
             // A manually edited invalid block can contain inline credentials.
             // Never echo that block through either structured or raw config GET.
@@ -130,6 +137,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         externalSummaryCredentials: credentialStatus,
+        externalSummaryCredentialStatus: credentialDetail,
         agentProviders: agentRegistryStatus(),
         passthrough: passthroughState(process.env),
         allowDshCompaction: allowDshCompactionState(process.env),
