@@ -402,6 +402,16 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
     if (Array.isArray(content))
       return content.some((p) => !isObjWith(p, "type", "text"));
   }
+  // #3410: unknown top-level block types (in the wild: document/PDF) ride the
+  // sidecar with their full payload — media like image, not text.
+  const abType = asObj(ab)?.type;
+  if (
+    typeof abType === "string" &&
+    abType !== "image" &&
+    abType !== "tool_result" &&
+    abType !== "redacted_thinking"
+  )
+    return true;
   const item = m.rawResponsesItem;
   if (isObjWith(item, "type", "input_image")) return true;
   if (item && typeof item === "object") {
@@ -462,7 +472,16 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
         }
       }
     }
-    // redacted_thinking etc. share this field — ignored, parity with hasMediaPayload
+    // #3410: unknown top-level block types (document/PDF ...) — the host
+    // archives no such payload to disk, so folding destroys it permanently.
+    if (
+      typeof ab.type === "string" &&
+      ab.type !== "image" &&
+      ab.type !== "tool_result" &&
+      ab.type !== "redacted_thinking"
+    )
+      return true;
+    // redacted_thinking shares this field — ignored, parity with hasMediaPayload
   }
 
   const item = asObj(m.rawResponsesItem);

@@ -269,10 +269,15 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                 }
                 continue;
             } else {
-                if (part.type !== "image") continue;
+                // #3410: document blocks (PDF) ride the sidecar verbatim since
+                // kernel 0.0.131 — size them like the openai file precedent
+                // above: inline base64 by payload, url refs by URL, bare block
+                // flat (billing must see them or the fold gate undercounts).
+                if (part.type !== "image" && part.type !== "document") continue;
                 const src = part.source;
                 if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
                 else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                else if (part.type === "document") total += applyCap(REMOTE_IMAGE_TOKENS, configuredCap);
             }
         }
     }
@@ -286,7 +291,7 @@ function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "go
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
         : protocol === "responses" ? s.includes("input_image")
         : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"')
-        : s.includes('"type":"image"') || s.includes('"type": "image"');
+        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"document"') || s.includes('"type": "document"');
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
@@ -359,10 +364,13 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
                 if (part.type === "file") n += 1;
                 continue;
             } else {
-                if (part.type !== "image") continue;
+                // #3410: lockstep with the cost walker above — every document
+                // shape that bills here must count here too.
+                if (part.type !== "image" && part.type !== "document") continue;
                 const src = part.source;
                 if (isObj(src) && src.type === "base64" && typeof src.data === "string") n += 1;
                 else if (isObj(src) && src.type === "url" && typeof src.url === "string") n += 1;
+                else if (part.type === "document") n += 1;
             }
         }
     }

@@ -154,7 +154,7 @@ import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } 
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
-import { droppedOpenaiParts } from "./wire-drop-warn.js";
+import { droppedOpenaiParts, unknownAnthropicBlocks } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
@@ -185,6 +185,22 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
         warnedWireDropKeys.delete(warnedWireDropKeys.values().next().value as string);
     }
     log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188), but parts riding system/assistant/tool messages still reduce to text-only`);
+}
+
+// #3410: unknown anthropic top-level block types (document/PDF in the wild)
+// are preserved verbatim since kernel 0.0.131 — nothing is dropped anymore,
+// so this is a NOTICE, not a drop warning: one per session per type-set,
+// same bounded FIFO as warnedWireDropKeys above.
+export function warnUnknownAnthropicBlocks(parsed: unknown, sessionId: string, log: (level: string, msg: string) => void): void {
+    const report = unknownAnthropicBlocks(parsed);
+    if (!report) return;
+    const key = `${sessionId}:anthropic:${report.types.join(",")}`;
+    if (warnedWireDropKeys.has(key)) return;
+    warnedWireDropKeys.add(key);
+    if (warnedWireDropKeys.size > WARNED_WIREDROP_KEY_CAP) {
+        warnedWireDropKeys.delete(warnedWireDropKeys.values().next().value as string);
+    }
+    log("warn", `[${sessionId}] wire codec preserves ${report.count} anthropic block(s) with unrecognized type(s) [${report.types.join(", ")}] verbatim (first at message #${report.firstIndex}, #3410) — they ride the sidecar untouched but are excluded from context folding because bili cannot archive their payload`);
 }
 
 // #1284: upstream targets already warned about a "not a model conversation →

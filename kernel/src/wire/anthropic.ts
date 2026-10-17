@@ -200,6 +200,25 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           });
           break;
         }
+        default: {
+          // #3410: unknown top-level block types (in the wild today:
+          // document/PDF) used to fall out of this switch silently — user
+          // content lost on every rebuild, no warning. Ride the sidecar like
+          // image/redacted_thinking (#366): coreToAnthropic re-emits
+          // rawAnthropicBlock verbatim, cache_control included.
+          const unknownType = (b as { type?: unknown }).type;
+          const label =
+            typeof unknownType === "string" ? `[${unknownType}]` : "[unknown]";
+          const base = deriveMessageId(m.role, "text", label);
+          msgs.push({
+            id: clusters.next(base),
+            role: m.role,
+            contentType: "text",
+            text: label,
+            rawAnthropicBlock: b,
+          });
+          break;
+        }
       }
     }
     for (let k = before; k < msgs.length; k++) {

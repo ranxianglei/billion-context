@@ -244,6 +244,19 @@ test("hasMediaPayload detects each sidecar carrier and ignores plain/tool-result
     ),
     false,
   );
+  // #3410: unknown top-level block types (document/PDF) ride the sidecar with
+  // their full payload — media like image.
+  assert.equal(
+    hasMediaPayload(
+      mediaUserMsg("u", "x", {
+        rawAnthropicBlock: {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: "QQ==" },
+        },
+      }),
+    ),
+    true,
+  );
   assert.equal(
     hasMediaPayload(
       mediaUserMsg("g", "x", {
@@ -379,6 +392,32 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
     ),
     false,
     "thinking-family carriers are not media",
+  );
+  // #3410: unknown top-level block types (document/PDF) — the host archives no
+  // such payload to disk, so folding destroys it permanently.
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("u", "x", {
+        rawAnthropicBlock: {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: "QQ==" },
+        },
+      }),
+    ),
+    true,
+    "unknown top-level block types are not archivable — pinned",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("u2", "x", {
+        rawAnthropicBlock: {
+          type: "document",
+          source: { type: "url", url: "https://example.com/d.pdf" },
+        },
+      }),
+    ),
+    true,
+    "url-source document likewise pins",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(

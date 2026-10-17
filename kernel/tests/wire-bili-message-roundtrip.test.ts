@@ -167,6 +167,77 @@ test("anthropic: multiple redacted_thinking blocks get distinct stable ids", () 
   );
 });
 
+// 2d. Unknown top-level block types (in the wild today: document/PDF)
+// round-trip verbatim (#3410 — they fell out of anthropicToCore's switch
+// silently before the default case landed, losing user content on every
+// rebuild with no warning).
+test("anthropic: unknown top-level block types are restored verbatim", () => {
+  const doc = {
+    type: "document",
+    source: {
+      type: "base64",
+      media_type: "application/pdf",
+      data: "JVBERi0xLjQ=",
+    },
+    cache_control: { type: "ephemeral" },
+  };
+  const body = {
+    model: "claude",
+    max_tokens: 100,
+    messages: [{ role: "user", content: [doc] }],
+  } as unknown as AnthropicRequestBody;
+  const { msgs } = anthropicToCore(body);
+  assert.equal(msgs.length, 1, "unknown block tracked as a core message");
+  assert.equal(msgs[0]?.contentType, "text");
+  assert.equal(msgs[0]?.text, "[document]");
+  assert.ok(msgs[0]?.rawAnthropicBlock, "sidecar rawAnthropicBlock stored");
+  const rebuilt = coreToAnthropic(msgs);
+  assert.equal(rebuilt.length, 1);
+  assert.deepEqual(
+    rebuilt[0]!.content,
+    body.messages[0]!.content,
+    "document block re-emitted verbatim (source + cache_control)",
+  );
+});
+
+test("anthropic: multiple unknown blocks of one type get distinct stable ids", () => {
+  const mk = () =>
+    ({
+      model: "claude",
+      max_tokens: 100,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: "A" },
+            },
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: "B" },
+            },
+            { type: "text", text: "hi" },
+          ],
+        },
+      ],
+    }) as unknown as AnthropicRequestBody;
+  const a = anthropicToCore(mk()).msgs;
+  const b = anthropicToCore(mk()).msgs;
+  assert.deepEqual(
+    a.map((m) => m.id),
+    b.map((m) => m.id),
+    "ids stable across turns",
+  );
+  assert.equal(new Set(a.map((m) => m.id)).size, 3, "distinct ids");
+  const rebuilt = coreToAnthropic(a);
+  assert.deepEqual(
+    rebuilt[0]!.content,
+    mk().messages[0]!.content,
+    "both document blocks re-emitted verbatim in order",
+  );
+});
+
 // 3. Anthropic tool_result.is_error round-trips (was previously dropped).
 test("anthropic: tool_result.is_error is restored", () => {
   const body: AnthropicRequestBody = {
