@@ -59,6 +59,7 @@ import { closeLogger, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
 import { flushPrefixAffinity } from "./affinity-persist.js";
+import { flushOrderSkeletons } from "./order-persist.js";
 import { findInstallDir, isVersionNewer, verifyInstallLoadable } from "./update.js";
 import { isPidAlive, listInstances } from "./instance.js";
 import { UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
@@ -449,16 +450,18 @@ function resumeListening(server: http.Server, host: string, port: number, log: L
 
 /** #1724: durable-state set captured before the replacement boots — mirrors
  *  what the normal shutdown path persists (conversations + sessions +
- *  prefix-affinity). */
+ *  prefix-affinity + session-order skeletons #3397). */
 async function defaultPreSpawnFlush(): Promise<void> {
     flushConversations();
     await flushAllSessions();
     flushPrefixAffinity();
+    flushOrderSkeletons();
 }
 
 function defaultFinish(): void {
     flushConversations();
     flushPrefixAffinity();
+    flushOrderSkeletons();
     void flushAllSessions().finally(() => {
         closeLogger();
         process.exit(0);

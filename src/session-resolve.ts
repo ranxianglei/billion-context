@@ -81,6 +81,10 @@ import { createHash } from "node:crypto";
 // never lets a shallow side request clobber a deeper persisted entry.
 import { prefixAffinity } from "./prefix-affinity.js";
 import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+// #3397: skeleton persistence hook (deferred-use ESM cycle with
+// src/order-persist.ts — each side calls the other only inside function
+// bodies, never at module evaluation; see the note on its import).
+import { scheduleOrderPersist } from "./order-persist.js";
 
 const TAIL_WINDOW = 8;
 
@@ -130,14 +134,33 @@ export type SessionOrderResolution = {
     reason?: string;
 };
 
-type Recorded = { kinds: string[]; frags: string[]; tag: string; model?: string };
+type Recorded = { kinds: string[]; frags: string[]; tagHash: string; model?: string; lastSeen: number };
 
-/** In-memory order skeletons, same lifetime as the old anchors map
- *  (process memory; not persisted — a restart re-claims on first sight). */
+/** #3397: persona-tag identity is carried by its sha256 (the raw text can be
+ *  tens of KB of host system prompt; the persisted snapshot must not carry it
+ *  and the resolver only ever compares tags for equality). "" = non-anchoring. */
+const tagHashOf = (tag: string): string =>
+    tag === "" ? "" : createHash("sha256").update(tag, "utf8").digest("hex");
+
+/** Order skeletons. #3397: no longer process-memory-only — every mutation is
+ *  debounced-persisted (src/order-persist.ts) and hydrated on boot, so a
+ *  restart can no longer re-run the cold-start claim race that flipped the
+ *  main conversation's key across boots and orphaned its compression state. */
 const skeletons = new Map<string, Recorded>();
 
-function record(rawId: string, turns: NeutralTurn[], tag: string, model?: string): void {
-    skeletons.set(rawId, { kinds: turns.map((t) => t.kind), frags: fragsOf(turns), tag, model });
+/** Persisted form of a recorded skeleton (src/order-persist.ts wire shape). */
+export interface OrderSkeletonEntry {
+    id: string;
+    kinds: string[];
+    frags: string[];
+    tagHash: string;
+    model?: string;
+    lastSeen: number;
+}
+
+function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: string): void {
+    skeletons.set(rawId, { kinds: turns.map((t) => t.kind), frags: fragsOf(turns), tagHash, model, lastSeen: Date.now() });
+    scheduleOrderPersist();
 }
 
 /** #2944 order-primary resolution. `rawId` MUST be a client-minted,
@@ -158,6 +181,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     const kinds = turns.map((t) => t.kind);
     const incomingFrags = fragsOf(turns);
     const tag = personaTag !== undefined && personaTag.trim().length > 0 ? personaTag : "";
+    const tagHash = tagHashOf(tag);
     const model = declaredModel !== undefined && declaredModel.trim().length > 0 ? declaredModel.trim() : undefined;
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
@@ -173,7 +197,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         if (!mainShaped(kinds) && tag === "") {
             return { key: `${rawId}|sub:aux`, action: "derived-aux", reason: "shallow history with no assistant turns" };
         }
-        record(rawId, turns, tag, model);
+        record(rawId, turns, tagHash, model);
         return { key: rawId, action: "claim" };
     }
     const fragTailEquals = (n: number): boolean => {
@@ -182,11 +206,11 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         const b = recorded.frags.slice(-w);
         return a.length === b.length && a.every((f, i) => f === b[i]);
     };
-    const tagChanged = tag !== "" && tag !== recorded.tag;
+    const tagChanged = tagHash !== "" && tagHash !== recorded.tagHash;
     // An EMPTY incoming tag (system-less / instructions-less request) is
     // the old ladder's non-anchoring path: it rides whatever the id holds
     // and never counts as a persona change.
-    const effectiveTag = tag === "" ? recorded.tag : tag;
+    const effectiveTagHash = tagHash === "" ? recorded.tagHash : tagHash;
     const effectiveModel = model ?? recorded.model;
     if (tagChanged) {
         // Persona guard (owner rule 3). Same id, different persona text:
@@ -201,7 +225,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         const headAligns = headN > 0 && recorded.kinds.every((k, i) => kinds[i] === k);
         const headFragsEqual = headN > 0 && incomingFrags.slice(0, headN).every((f, i) => f === recorded.frags[i]);
         if (mainShaped(kinds) && headAligns && headFragsEqual) {
-            record(rawId, turns, tag, effectiveModel);
+            record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed on continuing history — anchor migrated (#2241/#2250)" };
         }
         if (
@@ -214,7 +238,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // across a compacted/rewritten history whose fragments cannot
             // prove continuation. Without the header change this exact shape
             // still forks (the control case).
-            record(rawId, turns, tag, effectiveModel);
+            record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "header-corroborated model switch — anchor migrated (#2601/#2817)" };
         }
         if (Array.isArray(history) && prefixAffinity.chainContinues(history, rawId)) {
@@ -232,11 +256,11 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // whose neutral progressive hash at the stored depth equals the
             // stored tail hash is cryptographically the same conversation
             // continuing — migrate, exactly like the old #2241 ladder did.
-            record(rawId, turns, tag, effectiveModel);
+            record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed on a history that continues the raw key’s persisted chain — anchor migrated (post-restart persona race #2241/#2250)" };
         }
         const laneKey = `${rawId}|sub:${fp16(tag)}`;
-        record(laneKey, turns, tag, model);
+        record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
     if (!mainShaped(kinds)) {
@@ -248,12 +272,12 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // aux personas (dsh review, title) carry a DIFFERENT tag and fork
         // onto their own lane before reaching here; the strict |sub:aux
         // branch protects only VIRGIN ids (nothing to steal once claimed).
-        record(rawId, turns, effectiveTag, effectiveModel);
+        record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "continue" };
     }
     if (kinds.length >= recorded.kinds.length) {
         if (recorded.kinds.every((k, i) => kinds[i] === k)) {
-            record(rawId, turns, effectiveTag, effectiveModel);
+            record(rawId, turns, effectiveTagHash, effectiveModel);
             return { key: rawId, action: "continue" };
         }
         if (tailAligns(kinds, recorded.kinds) && fragTailEquals(Math.min(kinds.length, recorded.kinds.length))) {
@@ -261,7 +285,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // fragments match: the host rewrote the head (native compaction
             // summary / re-anchored event log) while keeping the living
             // tail verbatim. Trust the id, re-anchor the skeleton.
-            record(rawId, turns, effectiveTag, effectiveModel);
+            record(rawId, turns, effectiveTagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "order tail aligned and tail fragments match, head rewritten" };
         }
         if (tag !== "") {
@@ -270,7 +294,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // end. The strict task-lane guard below is for tag-less and
             // cross-persona callers, where id trust has no persona
             // corroboration (#150 subagent replay).
-            record(rawId, turns, effectiveTag, effectiveModel);
+            record(rawId, turns, effectiveTagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "same persona id, diverged order — skeleton follows the living end" };
         }
         // Deep main-shaped history sharing nothing with the recorded
@@ -286,14 +310,14 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     // replay (#150 codex subagent: self-contained, tail aligns by
     // alternation) whose tail content is DIFFERENT → derived-task.
     if (tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
-        record(rawId, turns, effectiveTag, effectiveModel);
+        record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "truncated head, tail aligned and fragment-verified" };
     }
     if (tag !== "") {
         // Same persona, shorter, not a verbatim suffix: persona owns the
         // id (old ladder's fp-equal rescue shape — a shrunken replay under
         // the anchor system keeps the raw key).
-        record(rawId, turns, effectiveTag, effectiveModel);
+        record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "same persona id, shorter replay — skeleton follows the living end" };
     }
     return {
@@ -310,6 +334,24 @@ export function sessionOrderSkeletonOf(rawId: string): string[] | undefined {
 
 export function resetSessionOrderForTest(): void {
     skeletons.clear();
+}
+
+/** #3397: persisted-snapshot surface (src/order-persist.ts wire shape). */
+export function orderSnapshot(): OrderSkeletonEntry[] {
+    return [...skeletons.entries()].map(([id, r]) => ({ id, kinds: r.kinds, frags: r.frags, tagHash: r.tagHash, model: r.model, lastSeen: r.lastSeen }));
+}
+
+/** Merge a hydrated snapshot: per-id newer lastSeen wins. Returns imported count. */
+export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
+    let imported = 0;
+    for (const e of entries) {
+        const cur = skeletons.get(e.id);
+        if (!cur || e.lastSeen > cur.lastSeen) {
+            skeletons.set(e.id, { kinds: e.kinds, frags: e.frags, tagHash: e.tagHash, model: e.model, lastSeen: e.lastSeen });
+            imported++;
+        }
+    }
+    return imported;
 }
 
 /** handle.ts wiring adapter (replaces personaNamespace at the dsh /
