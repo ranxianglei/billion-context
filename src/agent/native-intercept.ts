@@ -22,6 +22,14 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
  *  context window. */
 export type GateVerdict = boolean | "refuse-oversized";
 
+/** #3304: a (input, init) pair ready for a direct send — either the host's
+ *  original pair or a lane-restored one carrying the ORIGINAL payload. */
+type DirectSendPair = { input: string | URL | Request; init?: RequestInit };
+
+/** #3304: directGuard verdicts — replace the outgoing pair, refuse locally,
+ *  or leave it untouched (nothing was swapped). */
+type DirectGuardVerdict = DirectSendPair | "refuse" | undefined;
+
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
@@ -63,6 +71,16 @@ export interface NativeInterceptState {
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+    /** #3304: consulted at EVERY exit that sends a model request DIRECT —
+     *  proxy death (give-up), bootstrap failure, unattributed passthrough.
+     *  Lane adapters arm it to restore the ORIGINAL payload when they
+     *  swapped the outgoing body (incremental turns): a rewritten envelope
+     *  must never leave the process toward a bare upstream. Return a
+     *  replacement (input, init) pair, `"refuse"` for a local protocol-
+     *  shaped refusal, or undefined when nothing was swapped. A throwing
+     *  guard fails closed (local refusal) — it must never degrade to
+     *  sending the possibly-rewritten body. */
+    directGuard?: (url: string, input: string | URL | Request, init?: RequestInit) => DirectGuardVerdict | Promise<DirectGuardVerdict>;
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
@@ -276,8 +294,9 @@ function fetchUrlOf(input: string | URL | Request): string | undefined {
 
 /** HTTP method of a fetch call, uppercased: init.method wins (spec: init
  *  overrides a Request-object input), then the Request object's own method,
- *  then the fetch default GET. */
-function fetchMethodOf(input: string | URL | Request, init?: RequestInit): string {
+ *  then the fetch default GET. Exported for #3304 directGuard restorers,
+ *  which must rebuild the outgoing pair with the SAME effective method. */
+export function fetchMethodOf(input: string | URL | Request, init?: RequestInit): string {
     const m = init?.method;
     if (typeof m === "string") return m.toUpperCase();
     try {
@@ -407,6 +426,58 @@ function oversizeRefusal(url: string): Response {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
     }
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal", message, retryable: false } }), { status: 422, headers });
+}
+
+/** #3304: protocol-shaped local refusal for the give-up fallback when the
+ *  outstanding request carries a lane payload that cannot be restored. 503
+ *  retryable (transient infrastructure failure — the next turn re-plans
+ *  against the respawned proxy), NOT 4xx (the request itself is fine; a 4xx
+ *  would teach hosts the payload was wrong). */
+function giveUpRestoreRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: the bili proxy died mid-session and this request carries an incremental payload that cannot be safely sent uncompressed — failing closed instead of shipping a rewritten body the upstream cannot parse (#3304). Retry the turn.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "giveup-restore-refusal", "retry-after": "1" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), { status: 503, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_giveup_restore_refusal", message, retryable: true } }), { status: 503, headers });
+}
+
+/** #3304: the single choke point every exit that sends a model request
+ *  DIRECT (proxy death, bootstrap failure, unattributed passthrough) must
+ *  consult before sending. When a lane swapped the outgoing body
+ *  (incremental turns), the ORIGINAL payload must travel instead of the
+ *  rewritten envelope — or the request fails locally. Returns:
+ *   - a Response: a local refusal (ship NOTHING);
+ *   - a DirectSendPair: the caller must send exactly this pair;
+ *   - undefined: nothing was swapped — the caller keeps its OWN default
+ *     pair construction (each exit builds its target differently, e.g.
+ *     makeTarget vs verbatim input), which stays byte-identical to the
+ *     pre-fix behavior.
+ * A guard error fails closed too: an unknown state must never be resolved
+ * by shipping a possibly-rewritten body. */
+/** "refuse" never leaves this helper — it becomes the local refusal
+ *  Response — so callers only ever see pair / refusal / undefined. */
+async function directGuardVerdict(
+    state: NativeInterceptState,
+    url: string,
+    input: string | URL | Request,
+    init?: RequestInit,
+): Promise<Response | DirectSendPair | undefined> {
+    const guard = state.directGuard;
+    if (guard === undefined) return undefined;
+    let verdict: DirectGuardVerdict;
+    try {
+        verdict = await guard(url, input, init);
+    } catch (err) {
+        logHostEvent("error", "[native-client]", `bili-native: directGuard failed (${err instanceof Error ? err.message : String(err)}) — refusing instead of shipping a possibly-rewritten body (#3304)`);
+        verdict = "refuse";
+    }
+    if (verdict === "refuse") {
+        state.onDispatch?.(url, "refused");
+        return giveUpRestoreRefusal(url);
+    }
+    return verdict;
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
@@ -745,7 +816,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     return oversizeRefusal(url);
                 }
                 if (verdict !== true) {
-                    const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
+                    const gv = await directGuardVerdict(state, url, input, init);
+                    if (gv instanceof Response) return gv;
+                    const pair = gv ?? { input, init };
+                    const stamped = withHeaders(pair.input, pair.init, { [BILI_PASSTHROUGH_HEADER]: "1" });
                     state.onDispatch?.(url, "direct");
                     return send(stamped.input, stamped.init);
                 }
@@ -830,7 +904,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
+                const gv = await directGuardVerdict(state, routedTarget, input, init);
+                if (gv instanceof Response) return gv;
                 state.onDispatch?.(routedTarget, "direct");
+                if (gv !== undefined) return send(gv.input, gv.init);
                 return send(makeTarget(routedTarget), init);
             }
         }
@@ -887,8 +964,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                         return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
                     }
                     clearSignedRefusal(signedScheme);
+                    const gv = await directGuardVerdict(state, url, input, init);
+                    if (gv instanceof Response) return gv;
                     noteSignedDirect(url, signedScheme, "built-in passthrough opt-in (#1884) — byte-untouched, no compression");
                     state.onDispatch?.(url, "direct");
+                    if (gv !== undefined) return send(gv.input, gv.init);
                     return send(input, init);
                 }
                 resignExtra = {
@@ -935,7 +1015,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     state.onDispatch?.(url, "refused");
                     return oversizeRefusal(url);
                 }
+                const gv = await directGuardVerdict(state, url, input, init);
+                if (gv instanceof Response) return gv;
                 state.onDispatch?.(url, "direct");
+                if (gv !== undefined) return send(gv.input, gv.init);
                 return send(input, init);
             }
         }
@@ -948,7 +1031,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 warned = true;
                 logHostEvent("error", "[native-client]", `bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
+            const gv = await directGuardVerdict(state, url, input, init);
+            if (gv instanceof Response) return gv;
             state.onDispatch?.(url, "direct");
+            if (gv !== undefined) return send(gv.input, gv.init);
             return send(input, init);
         }
         // Attach mode rewrites exactly like spawn mode (#809 semantics —
@@ -1012,7 +1098,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
+                const gv = await directGuardVerdict(state, url, input, init);
+                if (gv instanceof Response) return gv;
                 state.onDispatch?.(url, "direct");
+                if (gv !== undefined) return send(gv.input, gv.init);
                 return send(input, init);
             }
             throw err;

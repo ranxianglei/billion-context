@@ -50,7 +50,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { fetchMethodOf, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1628,6 +1628,9 @@ export function apply(ctx: PluginContext): void {
     // pipeline — dropping it is a separate follow-up, not this PR.
     const INC_PENDING_TTL_MS = 30_000; // matches omp-native / opencode-native
     const incPendingAcks = new Map<string, { sid: string; url: string; messages: IncrementalWireMessage[]; system: unknown; base: string; at: number }>();
+    // #3304: original (body, headers) per swapped init — the give-up restore
+    // guard looks the init object back up by identity when the proxy dies.
+    const incOriginals = new WeakMap<object, { body: string; headers: Headers }>();
     async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
         if (!register.toolsReady || init === undefined) return;
         const attr = attributionOf(ctx);
@@ -1664,6 +1667,7 @@ export function apply(ctx: PluginContext): void {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        incOriginals.set(init, { body, headers: new Headers(init.headers) });
         init.body = (plan as { body: string }).body;
         const turnId = newIncrementalTurnId();
         const headers = new Headers(init.headers);
@@ -1672,6 +1676,16 @@ export function apply(ctx: PluginContext): void {
         init.headers = headers;
         incPendingAcks.set(turnId, { sid, url, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
     }
+    // #3304: when the proxy dies and this request falls back to a direct
+    // send, restore the ORIGINAL payload instead of shipping the lane
+    // envelope a bare upstream cannot parse.
+    state.directGuard = (url, input, guardInit) => {
+        if (guardInit === undefined) return undefined;
+        const orig = incOriginals.get(guardInit);
+        if (orig === undefined) return undefined;
+        incOriginals.delete(guardInit);
+        return { input: url, init: { ...guardInit, method: fetchMethodOf(input, guardInit), body: orig.body, headers: orig.headers } };
+    };
     state.onResponse = (_url, response, headers) => {
         const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
         if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)

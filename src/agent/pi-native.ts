@@ -33,7 +33,8 @@ import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { consumePiIncrementalOriginal, INCREMENTAL_TURN_MARKER_HEADER } from "./incremental-client.js";
+import { fetchMethodOf, installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { installInlineTransport } from "./pi-inline.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
@@ -214,6 +215,28 @@ const plan = planNativePi(process.env, loadConfigFile().pi?.inline === true);
 export function armNativePi(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "pi");
+    // #3304: when the proxy dies and this request falls back to a direct
+    // send, put the ORIGINAL payload back on the wire instead of shipping
+    // the lane envelope a bare upstream cannot parse. The extension's swap
+    // (pi.ts, same bundle) notes the original per conversation id; the sid
+    // here is read off the outgoing x-bili-plugin-conversation header.
+    state.directGuard = (url, input, guardInit) => {
+        const src = guardInit?.headers !== undefined ? guardInit.headers : input instanceof Request ? input.headers : undefined;
+        if (src === undefined) return undefined;
+        let sid: string | null;
+        try {
+            sid = new Headers(src).get("x-bili-plugin-conversation");
+        } catch {
+            return undefined;
+        }
+        if (sid === null || sid.length === 0) return undefined;
+        const payload = consumePiIncrementalOriginal(sid);
+        if (payload === undefined) return undefined;
+        const outHeaders = new Headers(src);
+        outHeaders.delete(INCREMENTAL_TURN_MARKER_HEADER);
+        const init: RequestInit = { ...guardInit, method: fetchMethodOf(input, guardInit), body: JSON.stringify(payload), headers: outHeaders };
+        return { input: url, init };
+    };
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;
@@ -305,6 +328,11 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#3304): expose the armed give-up restore guard. */
+export function _directGuardForTest(): NativeInterceptState["directGuard"] {
+    return state.directGuard;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

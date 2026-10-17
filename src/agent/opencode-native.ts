@@ -876,8 +876,10 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        const oldReq = req;
         const turnId = newIncrementalTurnId();
         replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1", [INCREMENTAL_TURN_ID_HEADER]: turnId });
+        if (e.request !== oldReq) incOriginalRequestsOpencode.set(e.request as Request, oldReq);
         incPendingOpencode.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
     } catch {
         // never break the host's request on adapter failure
@@ -906,6 +908,12 @@ const INC_PENDING_TTL_MS = 30_000;
  *  was planned on so the #3378 single-flight guard can scan for live
  *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
+
+// #3304: the ORIGINAL Request per swapped Request (replaceRequestPayload
+// mints a fresh object; the original's body stream stays untouched because
+// planning reads a clone). The give-up restore guard looks it back up by
+// identity when the proxy dies.
+const incOriginalRequestsOpencode = new WeakMap<Request, Request>();
 
 /** Test hook: drop all planned turns (the map is module state across suites). */
 export function __resetOpencodeIncrementalForTests(): void {
@@ -959,3 +967,30 @@ export function opencodeIncrementalOnResponse(_url: string, response: Response, 
 }
 
 state.onResponse = opencodeIncrementalOnResponse;
+
+/** Test hook (#3304): expose the armed give-up restore guard (mirrors omp/pi). */
+export function _directGuardForTest(): NativeInterceptState["directGuard"] {
+    return state.directGuard;
+}
+
+// #3304: when the proxy dies and this request falls back to a direct send,
+// restore the ORIGINAL request instead of shipping the lane envelope a bare
+// upstream cannot parse. The original's body stream was never consumed
+// (planning reads a clone), so it can travel verbatim.
+state.directGuard = (url, input) => {
+    if (!(input instanceof Request)) return undefined;
+    const orig = incOriginalRequestsOpencode.get(input);
+    if (orig === undefined) return undefined;
+    incOriginalRequestsOpencode.delete(input);
+    if (orig.bodyUsed) return "refuse";
+    try {
+        const init: RequestInit & { duplex?: "half" } = { method: orig.method, headers: new Headers(orig.headers) };
+        if (orig.body !== null) {
+            init.body = orig.body;
+            init.duplex = "half";
+        }
+        return { input: url, init };
+    } catch {
+        return "refuse";
+    }
+};

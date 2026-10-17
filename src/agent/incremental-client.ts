@@ -291,10 +291,45 @@ export function clearIncrementalProbe(proxyBase: string): void {
     probeCache.delete(proxyBase);
 }
 
+// #3304: pi-lane original-payload ledger backing the give-up restore guard.
+// The swap happens in the extension's before_provider_request handler while
+// the guard runs in the bootstrap's fetch intercept — same bundle (the
+// package.json "pi" manifest loads dist/agent/pi-native.js, which inlines
+// pi.ts), so this module-level state is shared between them. Keyed per
+// conversation id: pi sends strictly sequentially per session, and the
+// writer clears the entry whenever a turn leaves WITHOUT a swap (or its
+// response lands), so at fetch time an entry exists iff THE CURRENT request
+// was swapped. TTL bounds memory for sessions whose response never comes.
+const PI_ORIGINAL_TTL_MS = 30_000;
+const piOriginals = new Map<string, { payload: unknown; at: number }>();
+
+export function notePiIncrementalOriginal(conversationId: string, payload: unknown): void {
+    sweepStale(piOriginals, PI_ORIGINAL_TTL_MS);
+    piOriginals.set(conversationId, { payload, at: Date.now() });
+}
+
+export function clearPiIncrementalOriginal(conversationId: string): void {
+    piOriginals.delete(conversationId);
+}
+
+/** Consume (and forget) the original payload of the current swapped turn.
+ *  Absent when nothing is pending or the entry expired. */
+export function consumePiIncrementalOriginal(conversationId: string): unknown {
+    const entry = piOriginals.get(conversationId);
+    if (entry === undefined) return undefined;
+    if (Date.now() - entry.at >= PI_ORIGINAL_TTL_MS) {
+        piOriginals.delete(conversationId);
+        return undefined;
+    }
+    piOriginals.delete(conversationId);
+    return entry.payload;
+}
+
 export function __resetIncrementalClientForTests(): void {
     convs.clear();
     probeCache.clear();
     rejectionCircuit.clear();
     droppedParamWarned.clear();
     droppedParamWarnPairs = 0;
+    piOriginals.clear();
 }

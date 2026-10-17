@@ -24,7 +24,7 @@
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { fetchMethodOf, installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
@@ -104,6 +104,10 @@ const incPendingOmp = new Map<string, IncrementalPendingTurn>();
  *  (#3329): attribution is exact per turn id. Mirrors opencode. */
 const INC_PENDING_TTL_MS = 30_000;
 
+// #3304: original (body, headers) per swapped init — the give-up restore
+// guard looks the init object back up by identity when the proxy dies.
+const incOriginalsOmp = new WeakMap<object, { body: string; headers: Headers }>();
+
 /** Test hook: drop all planned turns (module state across suites). */
 export function __resetOmpIncrementalForTests(): void {
     incPendingOmp.clear();
@@ -140,6 +144,7 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) { return; }
+        incOriginalsOmp.set(init, { body: init.body, headers: new Headers(init.headers) });
         init.body = plan.body;
         const headers = new Headers(init.headers);
         headers.set("x-bili-plugin", "omp");
@@ -155,6 +160,17 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
 }
 
 state.beforeSend = ompIncrementalBeforeSend;
+
+// #3304: when the proxy dies and this request falls back to a direct
+// send, restore the ORIGINAL payload instead of shipping the lane
+// envelope a bare upstream cannot parse.
+state.directGuard = (url, input, guardInit) => {
+    if (guardInit === undefined) return undefined;
+    const orig = incOriginalsOmp.get(guardInit);
+    if (orig === undefined) return undefined;
+    incOriginalsOmp.delete(guardInit);
+    return { input: url, init: { ...guardInit, method: fetchMethodOf(input, guardInit), body: orig.body, headers: orig.headers } };
+};
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
@@ -380,6 +396,11 @@ export function _setOmpOriginForTest(origin: string | undefined): void {
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#3304): expose the armed give-up restore guard. */
+export function _directGuardForTest(): NativeInterceptState["directGuard"] {
+    return state.directGuard;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

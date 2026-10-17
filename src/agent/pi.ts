@@ -14,7 +14,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, clearPiIncrementalOriginal, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, notePiIncrementalOriginal, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -1239,6 +1239,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             });
             if (plan.mode === "skip") return undefined;
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
+            // #3304: remember the ORIGINAL payload so the give-up restore
+            // guard (bootstrap bundle, same module state) can put it back on
+            // the wire if the proxy dies before this request lands.
+            notePiIncrementalOriginal(sid, event.payload);
             return JSON.parse((plan as { body: string }).body) as unknown;
         }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
@@ -1319,6 +1323,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 } catch (err) {
                     logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental turn skipped (${err instanceof Error ? err.message : String(err)}) — full resend this turn`);
                 }
+                // #3304: this request leaves UN-swapped (full resend) — drop any
+                // stale original so the give-up guard cannot restore a PREVIOUS
+                // turn's payload onto this one.
+                const noSwapSid = sessionIdOf(ctx);
+                if (noSwapSid !== undefined && noSwapSid.length > 0) clearPiIncrementalOriginal(noSwapSid);
             }
             return stampPromptCacheKey(event, ctx, agent);
         });
@@ -1349,6 +1358,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     return;
                 }
                 pendingIncrementalAcks.delete(sid);
+                // #3304: the swapped turn completed — its original is spent.
+                clearPiIncrementalOriginal(sid);
                 if (status === 200) {
                     noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;
