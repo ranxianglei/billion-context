@@ -165,6 +165,10 @@ export async function fetchWithTimeout(
     opts: FetchOptions,
     timeoutMs?: number,
     externalSignal?: AbortSignal,
+    // #3342: true = skip the ALS transport lookup. A plain-HTTP egress issued
+    // from INSIDE an active transport (Responses-WS falling back after a refused
+    // upgrade) must not recurse back into the intercepted WebSocket transport.
+    forceDirect?: boolean,
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
     checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
@@ -235,7 +239,7 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const transport = currentFetchTransport();
+        const transport = forceDirect ? undefined : currentFetchTransport();
         const raw = transport
             ? await transport(url, finalOpts)
             : await fetch(url, finalOpts as RequestInit) as Response;

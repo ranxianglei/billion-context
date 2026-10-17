@@ -611,7 +611,7 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     assert.match(biliLog(ctx), /forward WS/);
 });
 
-test("C: auto — upstream WS refusal surfaces cleanly; explicit sse unaffected", { skip: skipReason, timeout: 900_000 }, async (t) => {
+test("C: auto — upstream WS refusal falls back to HTTP egress; explicit sse unaffected", { skip: skipReason, timeout: 900_000 }, async (t) => {
     let ctx: Ctx | undefined;
     let ctxSse: Ctx | undefined;
     const mock = await startMock({ failUpgrade: true, getRowsPath: () => (ctx ? path.join(ctx.work, "rows.json") : undefined) });
@@ -626,15 +626,19 @@ test("C: auto — upstream WS refusal surfaces cleanly; explicit sse unaffected"
     });
     ctx = await startCtx("auto", mock.port);
 
-    // Topology change disclosed with #2111: interception moves the client
-    // handshake onto bili (local — always succeeds), so an upstream refusal now
-    // lands on bili's UPSTREAM leg. pi classifies that as a mid-stream failure
-    // (websocketStarted=true → throw, no same-turn SSE fallback; pre-intercept
-    // only a client-side handshake failure triggered recordWebSocketSseFallback).
+    // #3342: interception moves the client handshake onto bili (local — always
+    // succeeds), so an upstream WS refusal lands on bili's UPSTREAM leg — where
+    // bili now falls back to the supplier's plain HTTP/SSE leg instead of failing
+    // the turn. This mock refuses the upgrade (503) yet still serves POST/SSE on
+    // the same port, so the ping completes transparently over HTTP and pi sees a
+    // normal success. pi does no same-turn SSE fallback of its own (#2111: a
+    // mid-stream WS failure just throws), so success here can only mean bili's
+    // internal HTTP fallback carried the turn end-to-end.
     const r = await piRun(ctx, "ping fallback");
-    assert.notEqual(r.code, 0, `mid-stream WS failure surfaces as an error (exit ${r.code})`);
-    assert.match(r.stderr, /Responses WebSocket handshake failed|provider_transport_failure/, "pi reported the transport failure");
-    assert.ok(mock.stats.wsConnections >= 1, "bili attempted the upstream WS connection");
+    assert.equal(r.code, 0, `WS refusal falls back to HTTP egress (exit ${r.code})\n${r.stderr.slice(-2000)}`);
+    assert.ok(r.stdout.includes("WS_E2E_OK"), "the turn's response returned through the HTTP fallback");
+    assert.ok(mock.stats.wsConnections >= 1, "bili attempted the upstream WS connection before falling back");
+    assert.ok(mock.rows.some((x) => x.transport === "http"), "bili served the turn over the upstream's HTTP/SSE leg");
     assert.match(biliLog(ctx), /codex-responses-ws/, "client leg reached bili's WS bridge lane");
 
     // Explicit sse stays usable against the same WS-refusing upstream.

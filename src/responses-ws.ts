@@ -1,7 +1,7 @@
 import http from "node:http";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
-import { MAX_REQUEST_BYTES, type FetchOptions } from "./fetch-util.js";
+import { MAX_REQUEST_BYTES, fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
@@ -14,6 +14,40 @@ type DiagnosticLog = (level: "debug" | "warn", message: string) => void;
 
 function closeCode(event: Event): number | "none" {
     return "code" in event && typeof event.code === "number" ? event.code : "none";
+}
+
+// #3342: the ONLY failure that may trigger the HTTP/SSE egress fallback is a
+// genuine WS-upgrade refusal in the handshake phase (before any generation
+// request is sent). An abort (client cancelled) or any other error propagates
+// instead — a generation that already started must never be replayed over HTTP.
+function isHandshakeRefusal(error: unknown): boolean {
+    return error instanceof Error && error.message === "Responses WebSocket handshake failed";
+}
+
+// egressHttp arms fetchWithTimeout's idle watchdog — a ref'd timer defaulting to a
+// 10-minute pin when no explicit timeout is passed — but returns the response for the
+// caller to stream later, so it cannot clear it itself. Wrap the body to release it
+// exactly once on settle (close/error/cancel); every other fetchWithTimeout caller does
+// this, and leaking it pins the event loop for the whole watchdog window per fallback
+// turn (#552-class hang). The underlying body is already armIdleBody-wrapped, so this
+// composes cleanly and re-arms on each chunk until settle.
+function releaseUpstreamWatchdog(response: Response, release: () => void): Response {
+    const inner = response.body;
+    if (!inner) { release(); return response; }
+    const reader = inner.getReader();
+    let released = false;
+    const finish = (): void => { if (!released) { released = true; release(); } };
+    const wrapped = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const chunk = await reader.read();
+                if (chunk.done) { controller.close(); finish(); return; }
+                controller.enqueue(chunk.value);
+            } catch (err) { controller.error(err); finish(); }
+        },
+        async cancel(reason) { try { await reader.cancel(reason); } catch { /* upstream already gone */ } finish(); },
+    });
+    return new Response(wrapped, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
 function object(value: unknown): value is JsonObject {
@@ -254,6 +288,34 @@ export class ResponsesWsUpstream {
         return socket;
     }
 
+    // #3342: plain-HTTP /responses+SSE egress for a supplier that refused the WS
+    // upgrade. Sends the FULL expanded effective input (minus previous_response_id
+    // and the WS-only `type` field — a fresh connection shares no checkpoint, so a
+    // delta would dangle), transport fields under the same codec gate as the WS
+    // egress. Returns the supplier's response UNCHANGED so the relay forwards it
+    // exactly like the non-WS codex lane (2xx→drainSse→WS frames, non-2xx verbatim);
+    // cancellation rides the same abort signal the WS leg honors.
+    private async egressHttp(url: string, options: FetchOptions, body: JsonObject, egressTransportFields: JsonObject): Promise<Response> {
+        const stamped = Object.fromEntries(new Headers(options.headers).entries());
+        if (this.hopStamp !== undefined && !Object.keys(stamped).includes(BILI_HOP_HEADER)) stamped[BILI_HOP_HEADER] = this.hopStamp;
+        stamped[BILI_TUNNEL_HEADER] = "1";
+        const headers = finalizeResponsesWsUpstreamHeaders(url, stamped);
+        headers["content-type"] = "application/json";
+        // The WS lane streams because the connection is inherently streaming;
+        // plain HTTP has no such default, so force stream:true or the supplier
+        // answers a single JSON body that the SSE-only sink would mislabel as an
+        // error frame. (body carries no `stream` — it was stripped above.)
+        const httpBody: JsonObject = { ...body, ...egressTransportFields, stream: true };
+        const { response, clearTimer } = await fetchWithTimeout(
+            url,
+            { method: "POST", headers, body: JSON.stringify(httpBody), dispatcher: options.dispatcher },
+            undefined,
+            options.signal ?? undefined,
+            true,
+        );
+        return releaseUpstreamWatchdog(response, clearTimer);
+    }
+
     async fetch(url: string, options: FetchOptions, rotateRetry = true): Promise<Response> {
         const bodyText = bodyToText(options.body);
         if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || bodyText === undefined) throw new Error("Unsupported request in Responses WebSocket transport");
@@ -273,7 +335,18 @@ export class ResponsesWsUpstream {
             if (stream !== undefined) egressTransportFields.stream = stream;
             if (streamOptions !== undefined) egressTransportFields.stream_options = streamOptions;
         }
-        const socket = await this.connect(url, options);
+        let socket: InstanceType<typeof UpstreamWebSocket>;
+        try {
+            socket = await this.connect(url, options);
+        } catch (error) {
+            // #3342: supplier refused the WS upgrade before any generation request
+            // was sent → egress over plain HTTP /responses+SSE instead. Any other
+            // failure (abort, non-handshake error) propagates unchanged.
+            if (!isHandshakeRefusal(error)) throw error;
+            this.close("ws-refused-http-fallback");
+            this.log("debug", "upstream egress mode=http reason=ws-handshake-refused");
+            return this.egressHttp(url, options, body, egressTransportFields);
+        }
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
         this.log("debug", `upstream request mode=${request.previous_response_id === undefined ? "full" : "delta"}`);
@@ -552,10 +625,18 @@ class ResponsesWsSession implements WsBridgeSession {
         // byte inflation. Forward verbatim on the upstream transport.
         if (Array.isArray(body.input) && body.input.length === 0 && body.generate === false) {
             void (async () => {
+                const sendFrame = (payload: string): void => { if (peer.readyState === WebSocket.OPEN) peer.send(payload); };
+                let sawTerminal = false;
                 try {
                     const response = await this.transport.fetch(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body) });
                     if (response.body === null) {
-                        peer.send(await response.text());
+                        const text = await response.text();
+                        if (!response.ok) {
+                            this.history.clear();
+                            sendFrame(text || errorFrame("probe_failed", "Warmup failed", response.status >= 400 ? response.status : 502));
+                            return;
+                        }
+                        sendFrame(text);
                         return;
                     }
                     const reader = response.body.getReader();
@@ -565,17 +646,39 @@ class ResponsesWsSession implements WsBridgeSession {
                         const { done, value } = await reader.read();
                         if (done) break;
                         buffer += decoder.decode(value, { stream: true });
+                        if (buffer.length > MAX_REQUEST_BYTES) throw new Error("Warmup output buffer limit exceeded");
                         for (;;) {
                             const index = buffer.indexOf("\n\n");
                             if (index < 0) break;
                             const block = buffer.slice(0, index);
                             buffer = buffer.slice(index + 2);
-                            for (const line of block.split("\n")) if (line.startsWith("data: ")) peer.send(line.slice(6));
+                            for (const line of block.split("\n")) {
+                                if (!line.startsWith("data: ")) continue;
+                                const payload = line.slice(6);
+                                sendFrame(payload);
+                                let frame: unknown;
+                                try { frame = JSON.parse(payload); } catch { continue; }
+                                if (!object(frame)) continue;
+                                if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) {
+                                    sawTerminal = true;
+                                    // #3342: even a no-generation warmup must establish a usable
+                                    // client checkpoint, so a later previous_response_id
+                                    // continuation resolves instead of throwing not_found.
+                                    if (frame.type === "response.completed" && object(frame.response)) this.history.commit(body, frame.response);
+                                }
+                            }
                         }
                     }
+                    if (!sawTerminal) {
+                        this.history.clear();
+                        sendFrame(response.ok
+                            ? errorFrame("incomplete_response", "Warmup ended without a terminal event", 502)
+                            : errorFrame("probe_failed", "Warmup failed", response.status >= 400 ? response.status : 502));
+                    }
                 } catch {
+                    this.history.clear();
                     this.context.log("warn", "probe relay failed");
-                    peer.send(errorFrame("invalid_request", "Probe relay failed", 502));
+                    sendFrame(errorFrame("invalid_request", "Probe relay failed", 502));
                 } finally {
                     this.active = undefined;
                     this.busy = false;

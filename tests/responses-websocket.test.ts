@@ -690,9 +690,16 @@ test(`Responses WS faults: repeated ${code} stops after one transport recovery`,
 });
 }
 
-test("Responses WS faults: refused handshake then a new upstream reconnects without leaking diagnostics", { timeout: 30000 }, async () => {
+test("Responses WS faults: refused handshake falls back to HTTP egress without leaking diagnostics", { timeout: 30000 }, async () => {
     const f = await fixture();
-    const rejected = http.createServer();
+    // #3342: a supplier that refuses the WS upgrade but still serves plain HTTP
+    // /responses — the exact shape the fallback targets. It answers with a JSON
+    // completion so the direct transport.fetch resolves through the HTTP leg.
+    const rejected = http.createServer((req, res) => {
+        let b = "";
+        req.on("data", c => { b += c; });
+        req.on("end", () => { res.setHeader("connection", "close"); res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "completed" })); });
+    });
     rejected.on("upgrade", (_req, socket) => socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"));
     rejected.listen(0, "127.0.0.1");
     await once(rejected, "listening");
@@ -701,13 +708,17 @@ test("Responses WS faults: refused handshake then a new upstream reconnects with
     const body = JSON.stringify({ model: "gpt-5.2", stream: false, input: [user("private-handshake-payload")] });
     try {
         const port = (rejected.address() as { port: number }).port;
-        await assert.rejects(transport.fetch(`http://127.0.0.1:${port}/responses?private-query=secret`, { method: "POST", headers: { authorization: "Bearer private-handshake-credential" }, body, signal: AbortSignal.timeout(10000) }), /handshake failed/);
+        // A pre-generation WS refusal now falls back to HTTP egress on the same
+        // URL instead of failing the turn (#3342) — the fetch RESOLVES via HTTP.
+        const fallback = await transport.fetch(`http://127.0.0.1:${port}/responses?private-query=secret`, { method: "POST", headers: { authorization: "Bearer private-handshake-credential" }, body, signal: AbortSignal.timeout(10000) });
+        assert.equal((await fallback.json() as Item).status, "completed", "refused WS handshake falls back to HTTP egress");
         const response = await transport.fetch(`${f.upstreamOrigin}/v1/responses`, { method: "POST", body });
         assert.equal((await response.json() as Item).status, "completed");
         assert.equal(f.rows.length, 1);
         assert.equal(f.rows[0].request.previous_response_id, undefined);
         assert.match(log.join("\n"), /failed phase=handshake event=error close_code=none/);
-        assert.match(log.join("\n"), /checkpoint reset reason=connection-key-changed/);
+        assert.match(log.join("\n"), /egress mode=http reason=ws-handshake-refused/);
+        assert.match(log.join("\n"), /checkpoint reset reason=ws-refused-http-fallback/);
         assert.doesNotMatch(log.join("\n"), /private-|secret|Bearer/);
     } finally {
         transport.close();
