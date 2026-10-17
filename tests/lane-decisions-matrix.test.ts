@@ -25,6 +25,15 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 //   - dsh plugin, only acp_status on the wire: dropped (named-tool precision
 //     target — today trivially dropped, post-fix still dropped for the right
 //     reason: the nudge names compress, which is NOT on the wire)
+//   - #3617-D completion: every profile's host-scoped default exercised via
+//     the real prepare chain (pi/opencode not scoped → kept; omp single
+//     regular tool ignored → kept), plus the proxy-mode structural-on control,
+//     plus the EMERGENCY override pair (#3461 guardrail): taught usage 45k/64k
+//     = 70% sits between the host escalation line (0.7) and the kernel
+//     over-limit line (0.75), so the kernel declines on cadence (fresh
+//     session, growth 0 < floor) while ≥5K of executable mass stays above
+//     minPressureBenefit — the override must inject where the surface is
+//     reachable and must NOT punch through an unreachable dsh tool table.
 //
 // The nudge arms deterministically: usage reports 50k against a 64k
 // operator-declared window (78%) with a compressible history outside the
@@ -37,7 +46,8 @@ test.after(() => rmSync(root, { recursive: true, force: true }));
 for (const key of ["HOME", "APPHOME", "HERMES_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
 
 type Wire = "anthropic" | "openai" | "responses" | "google";
-type Lane = "omp" | "dsh";
+// "proxy" = no x-bili-plugin header at all (plain client; bili injects its own tools).
+type Lane = "omp" | "dsh" | "pi" | "opencode" | "proxy";
 
 interface RowOutcome {
     nudge: boolean;
@@ -68,7 +78,10 @@ function historyTexts(): string[] {
     return out;
 }
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true) {
+// teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
+// The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
+// this is how each row dials context usage against the 64k declared window.
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
     // occasionally lands in an OS-reserved/excluded port range and emits
     // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
@@ -103,10 +116,10 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             res.writeHead(200, { "content-type": "application/json" });
             const bodies = {
-                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 50_000, completion_tokens: 10 } },
-                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: 50_000, output_tokens: 10 } },
-                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 50_000, candidatesTokenCount: 10 } },
+                anthropic: { id: "msg_fixture", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                openai: { id: "chat_fixture", choices: [{ message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: teachTokens, completion_tokens: 10 } },
+                responses: { id: "resp_fixture", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: teachTokens, output_tokens: 10 } },
+                google: { candidates: [{ content: { role: "model", parts: [{ text: "answer" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: teachTokens, candidatesTokenCount: 10 } },
             };
             res.end(JSON.stringify(bodies[wire]));
         });
@@ -158,7 +171,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     const send = async (texts: string[]) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, "x-bili-plugin": lane },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -218,7 +231,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -241,12 +254,30 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; e
     // injectTool off the nudge must stay off on ALL wires (master allowed it
     // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
     { name: "injectTool-off drops the surface everywhere (anthropic nudge convergence)", lane: "omp", tools: [], injectTool: false, expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #3617-D: every profile's host-scoped default through the real chain.
+    // pi/opencode are NOT host-scoped (registry default false) → the tool
+    // table is irrelevant and the surface stays on.
+    { name: "pi no-tools keeps the surface (registry default: not host-scoped)", lane: "pi", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "opencode no-tools keeps the surface (registry default: not host-scoped)", lane: "opencode", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Contrast twin of the dsh precision rows: a non-host-scoped lane ignores
+    // the declared tool table entirely.
+    { name: "omp single regular tool keeps the surface (non-host-scoped ignores tool table)", lane: "omp", tools: ["get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Proxy mode: bili injects its own tools into the outbound body, so the
+    // surface is structurally on regardless of what the client declares.
+    { name: "proxy control keeps the surface (structural on: bili owns the tool table)", lane: "proxy", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3617-D EMERGENCY pair (#3461 guardrail), taught usage 45k/64k = 70%:
+    // between the host escalation line (0.7) and the kernel over-limit line
+    // (0.75) — the kernel declines on cadence while executable mass clears
+    // minPressureBenefit, so ONLY the host override can arm the nudge.
+    { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
         test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
-            const h = await harness(wire, row.lane, row.tools, row.injectTool);
+            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
                 await h.send(historyTexts());            // arm the nudge
