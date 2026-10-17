@@ -14,8 +14,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { rmrf } from "./tmp-rm.ts";
+import { supportsFileSymlink } from "./platform-capabilities.ts";
 
 const root = path.resolve(import.meta.dirname, "..");
 
@@ -71,6 +73,29 @@ test("package root export points at the dsh host half and stays inert (#1590)", 
         assert.equal(r.code, 0, `stderr: ${r.stderr}`);
         assert.match(r.stdout, /^name:string apply:function$/m);
         assert.doesNotMatch(r.stdout + r.stderr, /bili:|unknown command|EADDRINUSE/);
+    } finally {
+        rmrf(box);
+    }
+});
+
+test("package.json is an exported subpath so CJS hosts can locate the package (#3077)", (t) => {
+    if (!supportsFileSymlink()) {
+        t.skip("the node_modules fixture requires file symlinks");
+        return;
+    }
+    // DSH's client scanner locates a plugin via createRequire('<pkg>/package.json')
+    // when the host lacks --expose-internals (DSH Desktop): without the exports
+    // entry Node throws ERR_PACKAGE_PATH_NOT_EXPORTED and the plugin is skipped
+    // silently — no settings row, no log line.
+    const box = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pkgjson-export-"));
+    try {
+        // A differently-named package.json above the probe anchor stops Node's
+        // self-name resolution from finding billion-context in this checkout.
+        fs.writeFileSync(path.join(box, "package.json"), JSON.stringify({ name: "bili-pkgjson-fixture", version: "0.0.0" }));
+        fs.mkdirSync(path.join(box, "node_modules"));
+        fs.symlinkSync(root, path.join(box, "node_modules", "billion-context"));
+        const probe = createRequire(path.join(box, "probe.cjs"));
+        assert.equal(fs.realpathSync(probe.resolve("billion-context/package.json")), fs.realpathSync(path.join(root, "package.json")));
     } finally {
         rmrf(box);
     }
