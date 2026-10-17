@@ -40,6 +40,7 @@ import {
     opencodeMajorVersion,
     parseOpencodeMajor,
     stripInheritedProxy,
+    stripInternalLauncherChannels,
     resolvePiHome,
     resolveOmpHome,
     extractDomains,
@@ -3282,6 +3283,115 @@ test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest
     assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
     assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
     assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
+});
+
+// #3521: the verbatim-passthrough client lanes (no routable providers, direct-URL
+// mode) must keep the user's OWN proxy vars while losing every internal channel.
+test("stripInternalLauncherChannels: #3521 removes only the internal channels, keeps user proxy vars", () => {
+    const cleaned = stripInternalLauncherChannels({
+        BILI_LAUNCHER_LANE: "pi",
+        BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify({ "stale-model": 12345 }),
+        BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify({ "stale-model": 999 }),
+        BILI_STRICT_PORT: "1",
+        http_proxy: "http://corp:20172",
+        HTTPS_PROXY: "http://corp:20172",
+        PATH: "/usr/bin",
+    });
+    for (const k of ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"]) {
+        assert.equal(cleaned[k], undefined, `${k} should be stripped`);
+    }
+    assert.equal(cleaned.http_proxy, "http://corp:20172", "user's own lowercase proxy var survives");
+    assert.equal(cleaned.HTTPS_PROXY, "http://corp:20172", "user's own uppercase proxy var survives");
+    assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
+});
+
+// #3521: internal launcher channels are not user configuration — a value left
+// behind by an earlier spawn must not survive sanitization, while user-facing
+// env (BILI_MITM_DOMAINS is the config twin of mitm.domains) must.
+test("stripInheritedProxy: #3521 strips inherited internal launcher channels, keeps user-facing vars", () => {
+    const cleaned = stripInheritedProxy({
+        BILI_LAUNCHER_LANE: "pi",
+        BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify({ "stale-model": 12345 }),
+        BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify({ "stale-model": 999 }),
+        BILI_STRICT_PORT: "1",
+        BILI_MITM_DOMAINS: "api.example.com",
+        PATH: "/usr/bin",
+    });
+    for (const k of ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"]) {
+        assert.equal(cleaned[k], undefined, `${k} should be stripped`);
+    }
+    assert.equal(cleaned.BILI_MITM_DOMAINS, "api.example.com", "user-facing mitm domains kept");
+    assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
+});
+
+// #3521: an earlier spawn left its options in THIS process's env (long-lived
+// desktop host, test harness). They must not ride into the next proxy child:
+// the child records them in its instance file, later launches with different
+// options fail attach (model-windows-mismatch) and die on the twin-collision
+// path. Current options are still injected fresh on top of the clean env.
+test("ensureProxyRunning: #3521 inherited launcher channels never reach the spawned proxy", async () => {
+    const channelKeys = ["BILI_LAUNCHER_LANE", "BILI_LAUNCHER_MODEL_WINDOWS", "BILI_LAUNCHER_MODEL_MAX_OUTPUTS", "BILI_STRICT_PORT"] as const;
+    const saved: Record<string, string | undefined> = {};
+    for (const k of channelKeys) saved[k] = process.env[k];
+    let liveInst: InstanceFile | undefined;
+    const spawns: Array<NodeJS.ProcessEnv> = [];
+    const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+        const env = options.env ?? {};
+        spawns.push(env);
+        const pid = 42900 + spawns.length;
+        // The child records whatever lane/windows it was handed — here the
+        // poisoned values, so launch two below cannot attach (lane-mismatch)
+        // and must spawn, exactly like the real repro.
+        liveInst = recordedInstance({ pid, lane: env.BILI_LAUNCHER_LANE ?? "stale-lane", modelWindows: { "stale-model": 12345 }, launchToken: env.BILI_LAUNCH_TOKEN });
+        return makeFakeChild(pid);
+    };
+    const deps = {
+        spawnImpl,
+        fetchImpl: async () => ({ ok: true }),
+        fetchHealthInfo: async () => ({ ok: true, instanceId: liveInst?.instanceId ?? "inst-1", pid: liveInst?.pid, watchdog: { armed: true } }),
+        readInstanceFile: () => liveInst,
+        sleep: () => Promise.resolve(),
+        scriptPath: FP_SCRIPT,
+    };
+    try {
+        process.env.BILI_LAUNCHER_LANE = "stale-lane";
+        process.env.BILI_LAUNCHER_MODEL_WINDOWS = JSON.stringify({ "stale-model": 12345 });
+        process.env.BILI_LAUNCHER_MODEL_MAX_OUTPUTS = JSON.stringify({ "stale-model": 999 });
+        process.env.BILI_STRICT_PORT = "1";
+
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            deps,
+        );
+        assert.equal(spawns.length, 1, "first launch spawns");
+        for (const k of channelKeys) {
+            assert.equal(spawns[0][k], undefined, `${k} must not ride along from the parent env`);
+        }
+
+        await ensureProxyRunning(
+            {
+                host: "127.0.0.1",
+                port: 8787,
+                passthrough: false,
+                debug: false,
+                lane: "pi",
+                modelWindows: { "current-model": 200000 },
+                modelMaxOutputs: { "current-model": 64000 },
+                strictPort: true,
+            },
+            deps,
+        );
+        assert.equal(spawns.length, 2, "lane-mismatch against the recorded stale lane forces a fresh spawn");
+        assert.equal(spawns[1].BILI_LAUNCHER_LANE, "pi", "current lane is injected fresh");
+        assert.equal(spawns[1].BILI_LAUNCHER_MODEL_WINDOWS, JSON.stringify({ "current-model": 200000 }), "current windows replace, not merge with, stale ones");
+        assert.equal(spawns[1].BILI_LAUNCHER_MODEL_MAX_OUTPUTS, JSON.stringify({ "current-model": 64000 }), "current max outputs replace, not merge with, stale ones");
+        assert.equal(spawns[1].BILI_STRICT_PORT, "1", "explicit strict port still crosses the boundary");
+    } finally {
+        for (const k of channelKeys) {
+            if (saved[k] === undefined) delete process.env[k];
+            else process.env[k] = saved[k];
+        }
+    }
 });
 
 test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => {

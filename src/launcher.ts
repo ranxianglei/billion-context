@@ -3868,10 +3868,38 @@ const INHERITED_PROXY_VARS = [
     "NO_PROXY",
 ];
 
+/** #3521: internal launcher→child channels carrying THIS launch's options into
+ *  the spawned proxy child. They are not user configuration (CONFIGURATION.md:
+ *  "Only the launcher sets it — no user configuration") and only the proxy
+ *  child reads them (server.ts / context-window.ts). A value left in the parent
+ *  env by an earlier spawn (long-lived desktop hosts, test harnesses, nested
+ *  launches) must not ride along: the child would record it in its instance
+ *  file, later launches with different options fail attach
+ *  (model-windows-mismatch / lane-mismatch), and the replacement dies on the
+ *  twin-collision path. Stripped from every child env here; the spawn site
+ *  re-injects exactly what the current options supply. */
+const INTERNAL_LAUNCHER_CHANNEL_VARS = [
+    "BILI_LAUNCHER_LANE",
+    "BILI_LAUNCHER_MODEL_WINDOWS",
+    "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
+    "BILI_STRICT_PORT",
+];
+
+/** #3521: remove ONLY the internal launcher channels, keeping everything else
+ *  (including the user's own proxy vars) intact. For the client lanes whose
+ *  base env is passed through verbatim because bili does not route them via
+ *  proxy envs (dsh/kimi/mcode/aider with no routable providers, codex and
+ *  claude direct-URL mode) — the channels must still never cross the boundary. */
+export function stripInternalLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INTERNAL_LAUNCHER_CHANNEL_VARS) delete cleaned[key];
+    return cleaned;
+}
+
 export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const cleaned: NodeJS.ProcessEnv = { ...env };
     for (const key of INHERITED_PROXY_VARS) delete cleaned[key];
-    return cleaned;
+    return stripInternalLauncherChannels(cleaned);
 }
 
 /** #1012: capture the user's proxy vars BEFORE stripping, so the launcher can
@@ -5101,7 +5129,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // through them, so a launch with no non-loopback custom providers behaves
         // exactly as before.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         env.BILLION_CONTEXT_PROXY = origin;
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
         if (usesProxyEnv) {
@@ -5191,7 +5219,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // W − reserved_context_size (~95% of window), which ACP compression
         // (~55% once windows align via BILI_LAUNCHER_MODEL_WINDOWS) precedes.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         if (usesProxyEnv) {
             const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
@@ -5220,7 +5248,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // auto-compaction fires on input-token footprint, which ACP compression
         // precedes once windows align via BILI_LAUNCHER_MODEL_WINDOWS.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : stripInternalLauncherChannels(process.env);
         if (usesProxyEnv) {
             const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
@@ -5320,7 +5348,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
         env = usesProxyEnv
             ? buildAiderEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env), routes.httpEnvRoutes.length > 0)
-            : { ...process.env };
+            : stripInternalLauncherChannels(process.env);
         if (routes.httpRewrites.length > 0) {
             console.error(
                 `bili: ${routes.httpRewrites.length} loopback endpoint(s) declared for aider bypass NO_PROXY and will NOT go through the proxy — point their base URL at ${origin}/bili/<url> manually (e.g. via --openai-api-base) to compress them.`,
@@ -5387,7 +5415,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         const codexCaPath = resolveCombinedCaPath(process.env);
         if (directUrl) {
-            env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+            env = { ...stripInternalLauncherChannels(process.env), BILLION_CONTEXT_PROXY: origin };
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
@@ -5464,8 +5492,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // table in buildClientEnv, per-key).
         const claudeVertex = claudeVertexUpstream(config.claude);
         env = directUrl
-            ? buildClaudePluginEnv(origin, true, process.env, claudeVertex)
-            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+            ? buildClaudePluginEnv(origin, true, stripInternalLauncherChannels(process.env), claudeVertex)
+            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInternalLauncherChannels(process.env));
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
         // An unroutable Vertex lane is a warning, not a silent downgrade: the
         // client would call Google directly and bili would see nothing at all.
