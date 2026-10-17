@@ -7,6 +7,7 @@ import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
+import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import { parseCompatDropFields } from "./compat-drop.js";
@@ -943,6 +944,81 @@ function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null
     );
 }
 
+export function _resetNamedProviderWarningsForTest(): void {
+    seenNamedProviderWarnings.clear();
+}
+
+/** #3632: does a resolved route carry any routing field the request path
+ *  consumes? Bare marker entries (`{}` values) earn no inert-lane warnings —
+ *  there is nothing for them to apply. */
+function routeCarriesFields(route: ProviderRoute | undefined): boolean {
+    if (!route) return false;
+    return Object.values(route).some((v) => v !== undefined);
+}
+
+/** #3632: does an already-configured `mitm://` key cover the same traffic as
+ *  the https:// URL `target`? A pathless mitm://<host> lane covers every path
+ *  on that host; a path-scoped one covers only its own prefix — mirroring
+ *  findRouteKey's exact-or-`startsWith(key + "/")` matching. */
+function mitmTwinCovers(routes: ProviderRoutes, target: URL): boolean {
+    for (const key of Object.keys(routes)) {
+        if (!key.startsWith("mitm://")) continue;
+        let twin: URL;
+        try {
+            twin = new URL(key);
+        } catch {
+            continue;
+        }
+        if (twin.host !== target.host) continue;
+        const tp = twin.pathname;
+        if (tp === "" || tp === "/") return true;
+        const pp = target.pathname;
+        if (pp === tp || pp.startsWith(tp + "/")) return true;
+    }
+    return false;
+}
+
+/** #3632: on the CONNECT/MITM lane every lookup runs against a rewritten
+ *  `mitm://<host>` URL (src/server.ts resolveUpstream), so a plain `https://`
+ *  providers key can NEVER match MITM-lane traffic to its host. The scheme
+ *  split is intentional (CONFIGURATION.md: one host can serve a login client
+ *  over CONNECT and an API-key client over /bili/ with different settings),
+ *  but a lone https:// entry on a MITM-whitelisted host sat silently inert
+ *  until a per-request [window] fallback line much later — a 1M window
+ *  degrading to the 2e5 default, emergency folds, ECONNRESET. Warn once per
+ *  key at config load, same family as warnInertRoutingFields.
+ *
+ *  Whitelist scope: DEFAULT_MITM_DOMAINS ∪ explicit mitm.domains /
+ *  BILI_MITM_DOMAINS. Auto-discovered hosts (discoverMitmDomains) are
+ *  deliberately NOT checked here — keeping config load free of client-config
+ *  file IO — and stay covered by the runtime [route] miss warning (#2317),
+ *  which carries the same scheme-mismatch hint. */
+function warnInertMitmLaneKeys(routes: ProviderRoutes, env: NodeJS.ProcessEnv): void {
+    const fileConfig = loadConfigFile();
+    const mitmEnabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    if (!mitmEnabled) return;
+    const whitelist = [...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(env)];
+    for (const key of Object.keys(routes)) {
+        let u: URL;
+        try {
+            u = new URL(key);
+        } catch {
+            continue;
+        }
+        // http:// keys are never warned: MITM terminates TLS only, so a plain
+        // HTTP upstream has no MITM-lane traffic at all.
+        if (u.protocol !== "https:") continue;
+        if (!matchesAnyMitmDomain(u.hostname, whitelist)) continue;
+        if (!routeCarriesFields(routes[key])) continue;
+        if (mitmTwinCovers(routes, u)) continue;
+        const twin = "mitm://" + key.slice("https://".length);
+        warnNamedProviderOnce(
+            `mitm-inert:${key}`,
+            `providers."${key}" is inert for MITM-lane traffic to ${u.host} — CONNECT traffic looks up "${twin}", which has no entry, so these settings never apply to proxy-routed clients. Add a "${twin}" entry to cover them (the https:// entry still serves /bili/-embedded requests).`,
+        );
+    }
+}
+
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
@@ -1156,6 +1232,7 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
     for (const { target, route } of aliases) {
         routes[target] = fillRouteGaps(routes[target], route) as ProviderRoute;
     }
+    warnInertMitmLaneKeys(routes, env);
     return routes;
 }
 

@@ -7,18 +7,12 @@ import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
 import { maskHostForLog, maskHostInText, maskHostPortForLog } from "./log-mask.js";
 import { mitmHandshakeTimeoutMs as knobMitmHandshakeTimeoutMs } from "./knobs.js";
+import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
-// Domains we transparently MITM. These are ONLY the model-inference endpoints
-// hardcoded in client BINARIES with no config file to discover from
-// (Claude=api.anthropic.com, codex-login=api.openai.com/chatgpt.com).
-// Everything else is auto-discovered at runtime from each client's config
-// (see discoverMitmDomains). Expanding this list expands the set of hosts
-// whose TLS we terminate — the security boundary.
-export const DEFAULT_MITM_DOMAINS = [
-    "api.anthropic.com",
-    "api.openai.com",
-    "chatgpt.com",
-];
+// Re-exported so existing importers (launcher.ts) keep their path; the const
+// itself lives in the leaf module so config.ts can use it without importing
+// this one (#3632 import-cycle constraint).
+export { DEFAULT_MITM_DOMAINS };
 
 /** Socket marker: when we MITM a CONNECT tunnel, we stash the original
  *  host the CONNECT tunnel targeted. */
@@ -107,9 +101,7 @@ function mitmHandshakeTimeoutMs(): number {
  *  binary-hardcoded DEFAULT_MITM_DOMAINS + caller-supplied extras + domains
  *  auto-discovered from client config files (see discoverMitmDomains). */
 export function isMitmHost(host: string, extraDomains: string[] = []): boolean {
-    const h = host.toLowerCase();
-    const all = [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()].map((d) => d.toLowerCase());
-    return all.some((d) => h === d || h.endsWith("." + d));
+    return matchesAnyMitmDomain(host, [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()]);
 }
 
 type Logger = (msg: string) => void;

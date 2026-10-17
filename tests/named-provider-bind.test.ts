@@ -21,9 +21,16 @@ function withConfigFile(t: test.TestContext, providers: unknown): string {
     writeFileSync(p, JSON.stringify({ providers }, null, 2), "utf8");
     const prev = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = p;
+    // MITM off: this suite exercises bind/routing semantics; its
+    // api.anthropic.com lanes would otherwise earn the #3632 inert-lane
+    // warning and muddy the warning-count assertions below.
+    const prevMitm = process.env.BILI_MITM;
+    process.env.BILI_MITM = "0";
     t.after(() => {
         if (prev === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prev;
+        if (prevMitm === undefined) delete process.env.BILI_MITM;
+        else process.env.BILI_MITM = prevMitm;
         rmrf(dir);
     });
     return p;

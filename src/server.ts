@@ -2903,7 +2903,33 @@ export function warnRouteMissIfNew(
     if (routeMissWarned.has(key)) return false;
     routeMissWarned.add(key);
     const hosts = knownKeys.map((k) => hostIdForLog(k));
-    log("warn", `[route] no provider route matched ${hostIdForLog(origin)} (model=${model}) — its per-provider settings (context/compress/…) are IGNORED; known providers keys: ${hosts.join(", ")}. Add a matching key to the providers block in ~/.config/billion-context/billion-context.json.`);
+    let msg = `[route] no provider route matched ${hostIdForLog(origin)} (model=${model}) — its per-provider settings (context/compress/…) are IGNORED; known providers keys: ${hosts.join(", ")}. Add a matching key to the providers block in ~/.config/billion-context/billion-context.json.`;
+    // #3632: the #1 silent-miss shape on the MITM lane is a settings entry
+    // under the WRONG SCHEME for the same host (https:// where the lane
+    // looks up mitm://). Name it instead of leaving "add a matching key"
+    // to guesswork.
+    if (origin.startsWith("mitm://")) {
+        const host = origin.slice("mitm://".length);
+        const siblings: string[] = [];
+        let hasMitmTwin = false;
+        for (const k of knownKeys) {
+            let u: URL;
+            try {
+                u = new URL(k);
+            } catch {
+                continue;
+            }
+            if (u.protocol === "https:" && u.host === host) siblings.push(k);
+            else if (u.protocol === "mitm:" && u.host === host) hasMitmTwin = true;
+        }
+        if (siblings.length > 0 && !hasMitmTwin) {
+            // hostIdForLog yields the (possibly masked) HOST only — re-prefix
+            // the scheme, which is the whole point of the hint.
+            const twin = `mitm://${hostIdForLog(`https://${host}`)}`;
+            msg += ` Scheme mismatch: your settings sit under ${siblings.map((s) => hostIdForLog(s)).join(", ")} but MITM-lane lookups use "${twin}" — add that key (the https:// entries keep serving /bili/-embedded requests).`;
+        }
+    }
+    log("warn", msg);
     return true;
 }
 
