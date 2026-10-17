@@ -7,3 +7,4 @@ dist/
 tmp/
 tests/.pp-stamp-state-*/
 .tmp/
+plugin-lanes/

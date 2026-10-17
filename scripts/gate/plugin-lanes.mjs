@@ -29,9 +29,26 @@
 //   t3 @ small window  : "DONE" — preflight fold path must fire
 //   t4                  : recall S07 again — must survive the fold
 //
+// dsh protocol matrix (#3475): the dsh recipe is parameterized over the four
+// provider api types pi-ai supports — openai-completions (the original lane),
+// openai-responses, anthropic-messages, google-generative-ai. Same headless
+// driver, only the cordis provider `api` + baseURL suffix change. Each variant
+// carries a WIRE_EXPECT entry: the recorder must see POSTs whose path AND body
+// top-level shape match that wire (hard wire assertion, not log). When the
+// upstream lacks the door (404/405/mapping-400 with no completed turn) the
+// lane degrades to env-blocked (traffic + wire shape + plugin claim stay
+// hard) instead of failing the gate — same rule as opencode2/#3461.
+//
 // Env: TGZ, REPO, MODEL1_BASE_URL, MODEL1_MODEL, MODEL1_API_KEY,
-//      GATE_AGENTS (default "dsh,pi,codex,opencode,claude"), GATE_SKIP=p,
-//      GATE_TURN_TIMEOUT_MS (default 300000), PLUGIN_LANES_WORK
+//      GATE_AGENTS (default "dsh,pi,codex,opencode,claude"; matrix + proxy
+//      lanes opt in: dsh-responses,dsh-anthropic,dsh-google,dsh-proxy),
+//      GATE_SKIP=p, GATE_TURN_TIMEOUT_MS (default 300000), PLUGIN_LANES_WORK,
+//      GATE_DSH_VERSION (dsh lanes install @deepseek-ai/dsh@<v> per lane,
+//      default "latest"), GATE_OUTPUT_TOKENS (output budget: bili.json
+//      reservation + dsh cordis maxTokens, default 4096 — thinking models
+//      need more or they degenerate to zero-visible-text turns),
+//      GATE_DSH_SMALL_WINDOW (fixed override for the dsh lanes' phase-3
+//      window; by default it derives from the live t2-end payload)
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -58,11 +75,24 @@ const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 if (AGENTS.includes("opencode2"))
   console.log("[opencode2] NOTE env-blocked on some upstreams: transport websocket passes Responses-WS straight through (HTTP-only upstreams fail the WS handshake); transport http needs a real /v1/responses endpoint (some self-hosted servers have a Responses->chat mapping bug or 404). Lane asserts tools/claim/traffic; turn completion may fail against such upstreams — see #3461.");
+if (AGENTS.includes("dsh-responses"))
+  console.log("[dsh-responses] NOTE env-blocked when the upstream has no healthy /v1/responses door (self-hosted servers: 404, or a broken Responses->chat mapping answering 400 — same failure class as opencode2/#3461). bili forwards the responses wire as responses; the door must be real. Wire shape + traffic stay hard-asserted; turn/nudge/fold degrade to env-blocked.");
+if (AGENTS.includes("dsh-anthropic"))
+  console.log("[dsh-anthropic] NOTE env-blocked when the upstream has no /v1/messages door. Cross-validates the claude lane's front door from the dsh side (pi-ai Anthropic SDK).");
+if (AGENTS.includes("dsh-google"))
+  console.log("[dsh-google] NOTE bili does NOT translate google->chat on egress — the recorder sees the google wire (:streamGenerateContent + contents/parts) exactly as dsh sent it. The lane is env-blocked unless the upstream exposes a /v1beta/models/<id>:generateContent door; the observed egress shape is recorded as the round-trip evidence (#3475 acceptance 2).");
+if (AGENTS.includes("dsh-proxy"))
+  console.log("[dsh-proxy] NOTE proxy-mode contrast lane (#3475): same dsh host WITHOUT the billion-context bundle, driving the /bili/ prefix door (proxy mode, acp_summary carrier) — contrasts the native plugin lane in one script.");
 const TMO = Number(process.env.GATE_TURN_TIMEOUT_MS || 300_000);
+const DSH_VERSION = process.env.GATE_DSH_VERSION || "latest";
 const BIG_WINDOW = Number(process.env.GATE_BIG_WINDOW || 262144);
 const MID_WINDOW = Number(process.env.GATE_MID_WINDOW || 58368);
 const SMALL_WINDOW = Number(process.env.GATE_SMALL_WINDOW || 24576);
 const CORPUS_TOKENS = Number(process.env.GATE_CORPUS_TOKENS || 25000);
+// #3475: output budget (bili.json `output` reservation + dsh cordis maxTokens).
+// Thinking models can spend the whole budget on reasoning and end the turn with
+// zero visible text — raise it per environment when the gate model thinks hard.
+const OUTPUT_TOKENS = Number(process.env.GATE_OUTPUT_TOKENS || 4096);
 
 if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
   console.error("plugin-lanes: TGZ, REPO, MODEL1_BASE_URL, MODEL1_MODEL are required");
@@ -70,6 +100,9 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
+// #3475: lanes whose upstream lacks the protocol door — degraded verdict,
+// excluded from the failure tally (see runLane's env-blocked rule).
+const BLOCKED = new Map(); // lane -> { kind: "env" | "client", reason }
 function record(lane, name, ok, note) {
   results.push({ lane, name, ok, note });
   console.log(`${ok ? "PASS" : "FAIL"} [${lane}] ${name}${note ? ` — ${note}` : ""}`);
@@ -143,6 +176,36 @@ const NUDGE_WIRE_RE = /efficiency nudge to compress early|Context limit reached 
 // must not pass — hence full codeword + TITLE anchor.
 const MARK_RE = (i) => new RegExp(`TITLE:\\s*GATE-MARK-${S(i)}-${CODEWORDS[i]}\\b`);
 
+// #3475 protocol matrix: what each pi-ai api type MUST look like at the
+// bili→upstream hop (the recorder's view). pathRe selects the door requests
+// (POST model calls only — GET /models discovery is ignored); bodyCheck pins
+// the wire's top-level shape so a silent wire swap (e.g. google arriving as
+// chat) fails loudly instead of reading green.
+const WIRE_EXPECT = {
+  "openai-completions": {
+    door: "/v1/chat/completions",
+    // SDKs append query params (?beta=true on Anthropic's messages door,
+    // ?alt=sse on google) — match the path prefix, not a bare $ anchor.
+    pathRe: /\/chat\/completions(\?[^#]*)?$/,
+    bodyCheck: (b) => Array.isArray(b.messages),
+  },
+  "openai-responses": {
+    door: "/v1/responses",
+    pathRe: /\/responses(\?[^#]*)?$/,
+    bodyCheck: (b) => b.input !== undefined,
+  },
+  "anthropic-messages": {
+    door: "/v1/messages",
+    pathRe: /\/messages(\?[^#]*)?$/,
+    bodyCheck: (b) => Array.isArray(b.messages) && b.model !== undefined,
+  },
+  "google-generative-ai": {
+    door: "/v1beta/models/<id>:streamGenerateContent",
+    pathRe: /\/models\/[^/:?]+:(?:streamGenerateContent|generateContent)/,
+    bodyCheck: (b) => Array.isArray(b.contents),
+  },
+};
+
 function hashStr(s) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
@@ -203,7 +266,7 @@ async function runLane(agent, recipe) {
       providers: {
         [recUrl]: {
           models: Object.fromEntries(
-            [MODEL1.model, ...extraModels].map((m) => [m, { context: w, output: 4096 }]),
+            [MODEL1.model, ...extraModels].map((m) => [m, { context: w, output: OUTPUT_TOKENS }]),
           ),
         },
       },
@@ -268,10 +331,15 @@ async function runLane(agent, recipe) {
   try {
     await recipe.setup(ctx);
     const sid = { v: null };
-    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE line of section S40. Do not run any other tool or command.`, sid, "t1");
+    // Dual marker: the t2/t4 S07-recall assertions presume t1 actually READ
+    // the corpus middle — models sometimes elide it despite the chunk-read
+    // instruction (observed in proxy mode). Verify the precondition at t1
+    // instead of letting downstream recalls fail for fixture reasons.
+    const t1 = await recipe.turn(ctx, `Read corpus.md in your cwd fully (~1300 lines). Your read tool may truncate or ELIDE the middle of a long file (e.g. claude-code's Read shows head+tail with "... N lines elided ...") — read in sequential chunks (offset 1, 201, 401, …, ~200 lines each, or equivalent line-range calls) until you have seen EVERY line including the middle; do not stop at a truncation or elision. Then reply with ONLY the TITLE lines of sections S40 and S07 (one per line). Do not run any other tool or command.`, sid, "t1");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t1.txt`), t1.out || "");
     record(agent, "t1 read @ big window completes", t1.ok, t1.why.slice(0, 160));
     record(agent, "S40 marker answered (t1)", MARK_RE(39).test(t1.out), `"${t1.out.trim().slice(0, 80)}"`);
+    record(agent, "S07 marker answered (t1)", MARK_RE(6).test(t1.out), `"${t1.out.trim().slice(0, 80)}"`);
 
     // ---- phase 2: MID window — high-usage band, nudge must ride the wire --
     // At ~77% usage with ≥5k pending, the over-limit nudge tier injects and
@@ -283,10 +351,13 @@ async function runLane(agent, recipe) {
     // include. Attempt 1 seeds mid from p1×1.6 (surface guess); after the t2
     // request the log carries the REAL payload P ("usage=X% (P/eff)"), so
     // attempt 2 recomputes mid = P/0.77 + 4096 exactly. Bounded at 2 tries.
+    // p1 = largest session payload seen during the BIG phase (= t1-end state).
+    // Do NOT slice at the first [window-change]: source flips (configured→
+    // runtime-info, #2283) land mid-t1 and truncate the phase before the
+    // payload-bearing idle lines, zeroing p1 and mis-seeding mid.
     const log1 = ctx.readLog();
-    const bigPhase = log1.slice(0, log1.indexOf("[window-change]"));
-    const usageMatches = [...bigPhase.matchAll(/nudge idle: usage=\d+% \((\d+)\//g)];
-    const p1idle = usageMatches.length ? Number(usageMatches[usageMatches.length - 1][1]) : 0;
+    const usageMatches = [...log1.matchAll(/nudge idle: usage=\d+% \((\d+)\//g)];
+    const p1idle = usageMatches.length ? Math.max(...usageMatches.map((m) => Number(m[1]))) : 0;
     // wire seed: the biggest t1 request body ≈ the real live payload
     // (scaffolding included). Idle log lines lag the final corpus read —
     // a container run seeded mid from a stale idle line (9.3k) while the
@@ -298,6 +369,13 @@ async function runLane(agent, recipe) {
     let mid = process.env.GATE_MID_WINDOW
       ? MID_WINDOW
       : (p1 > 0 ? Math.ceil((p1 * 1.6 / 0.77 + 4096) / 1024) * 1024 : MID_WINDOW);
+    // A recipe whose small window can grow past the seeded mid (dsh adaptive,
+    // #3475) would shrink UP in phase 3 — no fold would ever fire. Keep the
+    // mid strictly above the small-window estimate.
+    if (recipe.smallWindow && !process.env.GATE_MID_WINDOW) {
+      const swEst = recipe.smallWindow(ctx, p1);
+      if (mid <= swEst) mid = Math.ceil((swEst * 1.2) / 1024) * 1024;
+    }
 
     let t2 = { ok: false, why: "never ran", out: "" };
     let attempts = 0;
@@ -306,10 +384,7 @@ async function runLane(agent, recipe) {
       ctx.harvestWireModels();
       writeWindow(mid);
       if (recipe.setWindow) await recipe.setWindow(ctx, mid);
-      if (recipe.type === "prefix") {
-        if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} ctx.proxy = null; }
-        await startManualProxy(ctx, ctx.proxyArgs ? ctx.proxyArgs() : { port: ctx.proxyPort });
-      }
+      await restartLaneProxy(ctx, recipe);
       await new Promise((r) => setTimeout(r, 1000));
       const mark = ctx.readLog().length;
       // dsh: a leading cheap tool call guarantees ≥2 LLM requests — the
@@ -351,10 +426,7 @@ async function runLane(agent, recipe) {
     const smallWin = recipe.smallWindow ? recipe.smallWindow(ctx, lastP) : SMALL_WINDOW;
     writeWindow(smallWin);
     if (recipe.setWindow) await recipe.setWindow(ctx, smallWin);
-    if (recipe.type === "prefix") {
-      if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} ctx.proxy = null; }
-      await startManualProxy(ctx, ctx.proxyArgs ? ctx.proxyArgs() : { port: ctx.proxyPort });
-    }
+    await restartLaneProxy(ctx, recipe);
     await new Promise((r) => setTimeout(r, 1000));
 
     if (recipe.turnTimeoutMs) ctx.TMO = recipe.turnTimeoutMs(ctx, "t3");
@@ -364,6 +436,36 @@ async function runLane(agent, recipe) {
       t3 = await recipe.turn(ctx, warm3 + `Reply with the single word DONE.`, sid, "t3");
     fs.writeFileSync(path.join(ctx.laneDir, `turn-t3.txt`), t3.out || "");
     record(agent, "t3 @ small window completes (preflight fold path)", t3.ok, t3.why.slice(0, 160));
+
+    // phase 3b (#3475): hosts with a large fixed scaffolding (dsh 0.2.x ~18k)
+    // leave a post-fold FLOOR that can sit AT the small-window preflight
+    // target — t4 then dead-ends ("0 compressible ranges" fail-fast 502, the
+    // #2847 shape) although the fold itself fired correctly in t3. Measure the
+    // floor (raw wire estimate from the last preflight line) and widen just
+    // enough for t4 to land with margin. Adaptive-smallWindow recipes only —
+    // fixed-SMALL_WINDOW lanes keep byte-identical behavior.
+    if (recipe.smallWindow && t3.ok) {
+      // Direct evidence = the last preflight trigger line's raw wire estimate.
+      // Without one (clean t3, no over-window request ran yet) assume the
+      // WORST CASE: the fold removed nothing net, floor ≈ the t2-end payload.
+      const floorM = [...ctx.readLog().matchAll(/local-est=[\d.]+ raw=(\d+)/g)].pop();
+      const floor = floorM ? Number(floorM[1]) : lastP;
+      const headroom = (w) => Math.min(OUTPUT_TOKENS, Math.floor(w / 4));
+      if (floor > 0 && floor >= smallWin - headroom(smallWin)) {
+        const want = Math.ceil((floor * 1.1) / 1024) * 1024;
+        let w2 = smallWin;
+        while (w2 - headroom(w2) < want && w2 < BIG_WINDOW) w2 += 1024;
+        if (w2 !== smallWin && w2 <= mid) {
+          console.log(`[${agent}] post-fold floor ${floor} tok at the target edge — widening small window ${smallWin} -> ${w2} so t4 lands with margin`);
+          writeWindow(w2);
+          if (recipe.setWindow) await recipe.setWindow(ctx, w2);
+          await restartLaneProxy(ctx, recipe);
+          await new Promise((r) => setTimeout(r, 1000));
+        } else if (w2 > mid) {
+          console.log(`[${agent}] post-fold floor ${floor} tok needs more than mid ${mid} — leaving ${smallWin}, t4 will report honestly`);
+        }
+      }
+    }
 
     let t4 = { ok: false, why: "never ran", out: "" };
     const warm4 = recipe.warmupPrefix || "";
@@ -376,9 +478,73 @@ async function runLane(agent, recipe) {
   }
 
   // ---- wire + proxy truth assertions ------------------------------------
-  const reqs = readJsonl(recOut).filter((r) => r.tag === "req");
+  const allLines = readJsonl(recOut);
+  const reqs = allLines.filter((r) => r.tag === "req");
+  const respBySeq = new Map(allLines.filter((r) => r.tag === "resp").map((r) => [r.seq, r]));
+  const errSeqs = new Set(allLines.filter((r) => r.tag === "error").map((r) => r.seq));
   const log = ctx.readLog();
   record(agent, "upstream saw traffic", reqs.length > 0, `${reqs.length} requests`);
+
+  // #3475 protocol matrix: hard wire-shape assertion — every door POST at the
+  // bili→upstream hop must carry this api type's path AND top-level body
+  // shape. A silent wire swap (google arriving as chat, responses as chat…)
+  // must fail here, not read green on a generic "turn completed".
+  if (recipe.wireApi && WIRE_EXPECT[recipe.wireApi]) {
+    const expect = WIRE_EXPECT[recipe.wireApi];
+    const doorReqs = reqs.filter((r) => r.method === "POST" && expect.pathRe.test(r.path));
+    const badBody = doorReqs.filter((r) => !expect.bodyCheck(r.body || {}));
+    record(agent, `wire shape ${recipe.wireApi} at bili->upstream hop`, doorReqs.length > 0 && badBody.length === 0,
+      doorReqs.length === 0
+        ? `no POST matched ${expect.door}; paths seen: ${[...new Set(reqs.map((r) => `${r.method} ${r.path}`))].slice(0, 6).join(" | ") || "(none)"}`
+        : badBody.length > 0
+          ? `${badBody.length}/${doorReqs.length} off-shape body(s); first off-shape keys: [${Object.keys(badBody[0].body || {}).join(",")}]`
+          : `${doorReqs.length} request(s), all on-shape (path ~${expect.door})`);
+    // round-trip evidence (#3475 acceptance 2): what the model hop actually
+    // received — first door request, persisted for the report.
+    if (doorReqs[0]) {
+      const b = doorReqs[0].body || {};
+      console.log(`[${agent}] egress sample: ${doorReqs[0].path} top-level=[${Object.keys(b).join(",")}]`);
+      fs.writeFileSync(path.join(ctx.laneDir, "egress-sample.json"), JSON.stringify({
+        path: doorReqs[0].path, headers: doorReqs[0].headers, topLevelKeys: Object.keys(b), bodyHead: JSON.stringify(b).slice(0, 2000),
+      }, null, 2));
+    }
+    // Blocked-lane rules — two kinds, both excluded from the gate tally:
+    // (env)    the UPSTREAM door is unhealthy, so bili never ran against a
+    //          live model: either EVERY door request was rejected (4xx/5xx or
+    //          connection error) and no turn completed (opencode2/#3461 rule),
+    //          or the door DEGRADED MID-FLOW — some requests succeeded, later
+    //          ones were rejected, and the flow never finished. A self-hosted
+    //          door mapping bug (responses→chat validation, #3461 sibling),
+    //          not a bili wire defect. Traffic + wire-shape + tools stay the
+    //          hard verdict; turn-dependent records drop out of the tally.
+    // (client) the CLIENT cannot drive this protocol at its installed version:
+    //          zero upstream traffic and every turn died on a config-validation
+    //          error (dsh ≤0.2.1-rc.1's cordis schema lists no
+    //          google-generative-ai among provider apis). Nothing ran, so the
+    //          whole lane drops out of the tally; it auto-promotes when the
+    //          client ships the protocol — no script change needed.
+    const turnRecs = results.filter((r) => r.lane === agent && /completes/.test(r.name));
+    const flowComplete = turnRecs.length >= 4 && turnRecs.every((r) => r.ok);
+    const anyTurnOk = turnRecs.some((r) => r.ok);
+    const doorStatusOf = (r) => errSeqs.has(r.seq) ? "conn-error" : (respBySeq.get(r.seq) ? `HTTP ${respBySeq.get(r.seq).status}` : "no-response");
+    const rejected = doorReqs.filter((r) => errSeqs.has(r.seq) || !respBySeq.get(r.seq) || respBySeq.get(r.seq).status >= 400);
+    const statuses = [...new Set(rejected.map(doorStatusOf))].join(", ");
+    const turnStderr = fs.existsSync(path.join(ctx.laneDir, "turn-stderr.log")) ? fs.readFileSync(path.join(ctx.laneDir, "turn-stderr.log"), "utf8") : "";
+    let blocked = null;
+    if (rejected.length === doorReqs.length && doorReqs.length > 0 && !anyTurnOk) {
+      blocked = { kind: "env", reason: `upstream ${expect.door} unhealthy (${statuses})` };
+    } else if (rejected.length > 0 && doorReqs.length - rejected.length > 0 && !flowComplete) {
+      blocked = { kind: "env", reason: `upstream ${expect.door} degraded mid-flow (${statuses}) after ${doorReqs.length - rejected.length} OK request(s)` };
+    } else if (doorReqs.length === 0 && !anyTurnOk && /ValidationError/.test(turnStderr) && /api expected/.test(turnStderr)) {
+      const m = /\$\.providers\.\w+\.api expected [^\n]+/.exec(turnStderr);
+      blocked = { kind: "client", reason: `client config surface rejects api ${recipe.wireApi} (${m ? m[0] : "ValidationError"}) — zero upstream traffic` };
+    }
+    if (blocked) {
+      BLOCKED.set(agent, blocked);
+      record(agent, "BLOCKED degraded verdict", true,
+        `${blocked.kind}-blocked: ${blocked.reason} — ${blocked.kind === "env" ? "turn-dependent records below are excluded from the gate tally (opencode2/#3461 rule); rerun against an endpoint exposing a real " + expect.door + " door for the full verdict" : "nothing ran (client cannot express this api yet); the whole lane is excluded from the tally and auto-promotes when the client ships the protocol"}`);
+    }
+  }
   const fold = /acp-compress-obs\] shrink (\d+)%/.exec(log);
   record(agent, "fold fired (preflight or model-side)", !!fold, fold ? `shrink ${fold[1]}%` : "no acp-compress-obs line");
   const t4txt = fs.existsSync(path.join(ctx.laneDir, "turn-t4.txt")) ? fs.readFileSync(path.join(ctx.laneDir, "turn-t4.txt"), "utf8") : "";
@@ -387,7 +553,11 @@ async function runLane(agent, recipe) {
   const toolsNames = (r) => {
     const b = r.body || {};
     const flat = (arr) => Array.isArray(arr) ? arr.map((t) => t?.function?.name ?? t?.name).filter(Boolean) : [];
-    return [...flat(b.tools), ...flat(b.input_tools)];
+    // google wire declares tools as tools[].functionDeclarations[].name (#3475).
+    const gdecls = (arr) => Array.isArray(arr)
+      ? arr.flatMap((t) => (Array.isArray(t?.functionDeclarations) ? t.functionDeclarations.map((d) => d?.name) : [])).filter(Boolean)
+      : [];
+    return [...flat(b.tools), ...gdecls(b.tools), ...flat(b.input_tools)];
   };
   const allTools = [...new Set(reqs.flatMap(toolsNames))];
   record(agent, "ACP tools declared on wire", allTools.some((n) => n === "compress" || n === "acp_status"),
@@ -446,6 +616,14 @@ async function startManualProxy(ctx, args) {
   throw new Error(`manual proxy :${args.port} did not become healthy (see ${ctx.laneDir}/proxy.log)`);
 }
 
+// Prefix lanes re-read bili.json through a fresh proxy per phase (native lanes'
+// self-spawned zone proxy picks the new window up per request instead).
+async function restartLaneProxy(ctx, recipe) {
+  if (recipe.type !== "prefix") return;
+  if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} ctx.proxy = null; }
+  await startManualProxy(ctx, ctx.proxyArgs ? ctx.proxyArgs() : { port: ctx.proxyPort });
+}
+
 // ---------------------------------------------------------------------------
 // host recipes
 // ---------------------------------------------------------------------------
@@ -464,68 +642,160 @@ function parseEvents(stdout) {
   return { sid, final: final.trim() };
 }
 
-const RECIPES = {
-  // ---- dsh: native plugin lane (THE #3401 lane) -------------------------
-  dsh: {
-    type: "native", pluginAgent: "dsh",
+// ---- dsh family: native plugin lanes (THE #3401 lane) + protocol matrix
+// (#3475) + proxy-mode contrast lane (owner add-on) -----------------------
+// One headless driver parameterized over the four pi-ai provider api types.
+// Only the cordis provider `api` and the baseURL change per variant; profile
+// layout, window rewrite and turn shape are shared. The openai-completions
+// NATIVE variant emits a cordis.patch.yml byte-identical to the pre-#3475 dsh
+// lane (zero behavior change for the existing lane).
+// BaseURL suffixes follow each SDK's URL assembly:
+//   openai-completions / openai-responses — OpenAI SDK appends /chat/completions | /responses
+//   anthropic-messages                      — Anthropic SDK appends /v1/messages
+//   google-generative-ai                    — genai SDK appends /models/<id>:streamGenerateContent?alt=sse
+//                                             (pi-ai sets apiVersion="" so NO version segment is added):
+//                                             the suffix must carry /v1beta itself.
+const DSH_WARMUP_PREFIX = "First run the bash tool with command `echo warmup`. Then ";
+
+async function dshProfileSetup(ctx, { api, baseURL, withBili }) {
+  // Lane-local dsh install: the system dsh may be too old for the
+  // headless --json shape, and resolveBundleDir() tries the dsh install
+  // anchor BEFORE the profile dir — a stale global billion-context on the
+  // machine would shadow the candidate bundle ("declares no dsh.bundle").
+  // A per-lane prefix keeps the lane hermetic on any machine.
+  const dshPrefix = path.join(ctx.laneDir, "dsh-prefix");
+  console.log(`-- lane ${ctx.agent}: installing @deepseek-ai/dsh@${DSH_VERSION}`);
+  must("npm", ["install", "-g", "--prefix", dshPrefix, "--no-audit", "--no-fund", `@deepseek-ai/dsh@${DSH_VERSION}`], { timeout: 300_000 });
+  const dshHome = path.join(ctx.laneDir, "dsh-home");
+  const profile = path.join(dshHome, "profiles", "headless");
+  fs.mkdirSync(path.join(profile, "node_modules"), { recursive: true });
+  fs.mkdirSync(path.join(ctx.laneDir, "tmp"), { recursive: true });
+  const bundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"];
+  const deps = {};
+  if (withBili) {
+    // candidate as a REAL copy in the profile (e2e-native-dsh.test.ts shape;
+    // bundles @deepseek-ai/dsh-base/-headless resolve from the dsh install)
+    fs.cpSync(ctx.cand, path.join(profile, "node_modules", "billion-context"), { recursive: true });
+    deps["billion-context"] = ctx.candV;
+    bundles.push("billion-context");
+  }
+  const pkg = {
+    name: withBili ? "dsh-profile-plugin-gate" : "dsh-profile-proxy-gate", private: true,
+    dependencies: deps,
+    dsh: { profile: { bundles, patchReload: "startup" } },
+  };
+  fs.writeFileSync(path.join(profile, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
+  fs.writeFileSync(path.join(profile, "cordis.yml"), "[]\n");
+  const cordisFor = (window) =>
+    fs.writeFileSync(path.join(profile, "cordis.patch.yml"), [
+      "- id: llm-pi-ai",
+      "  config:",
+      "    providers:",
+      "      gate:",
+      "        displayName: Gate Upstream",
+      `        apiKeyEnv: GATE_UPSTREAM_KEY`,
+      `        api: ${api}`,
+      `        baseURL: ${baseURL}`,
+      "        models:",
+      ...MODEL_IDS.map((id) => [
+        `          - id: "${id}"`,
+        `            contextWindow: ${window}`,
+        `            maxTokens: ${OUTPUT_TOKENS}`,
+      ].join("\n")),
+      "- id: agent-default-model",
+      "  config:",
+      "    provider: gate",
+      `    model: "${MODEL_MAIN}"`,
+    ].join("\n") + "\n");
+  cordisFor(BIG_WINDOW);
+  fs.writeFileSync(path.join(profile, "pnpm-workspace.yaml"), "packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\n");
+  ctx.dshEnv = {
+    ...ctx.baseEnv,
+    DSH_HOME: dshHome,
+    DSH_TELEMETRY_MODE: "DISABLED",
+    // spill-local mkdtemps into the lane (host /tmp may be read-only)
+    TMPDIR: path.join(ctx.laneDir, "tmp"),
+    PATH: [path.join(dshPrefix, "bin"), process.env.PATH].filter(Boolean).join(path.delimiter),
+  };
+}
+
+const dshSetWindow = (ctx, w) => {
+  // window truth on plugin lanes = the host's own model config (rides
+  // the x-bili-plugin-context-window header); bili.json is ignored there.
+  // On the proxy-mode lane the same rewrite keeps the host view consistent
+  // with the bili.json window that writeWindow() writes.
+  const profile = path.join(ctx.laneDir, "dsh-home", "profiles", "headless");
+  const txt = fs.readFileSync(path.join(profile, "cordis.patch.yml"), "utf8");
+  // /g: MODEL_IDS may name several models — every entry carries its own
+  // contextWindow and all must move together (multi-model cordis).
+  fs.writeFileSync(path.join(profile, "cordis.patch.yml"), txt.replace(/contextWindow: \d+/g, `contextWindow: ${w}`));
+};
+
+const dshTurn = async (ctx, prompt, sid, tag) => {
+  const args = ["--profile", "headless", "headless"];
+  if (sid.v) args.push("--session-id", sid.v);
+  args.push("--json", prompt);
+  const r = sh("dsh", args, { cwd: ctx.workDir, env: ctx.dshEnv, timeout: ctx.TMO });
+  fs.appendFileSync(path.join(ctx.laneDir, "turn-stderr.log"), `\n=== ${tag} exit=${r.status} ===\n${r.stderr}\n`);
+  const { sid: s, final } = parseEvents(r.stdout);
+  if (s) sid.v = s;
+  return { ok: r.status === 0 && !!final, why: r.stderr.slice(-300) || `exit ${r.status}`, out: final };
+};
+
+const dshSmallWindow = (ctx, lastP) => {
+  // dsh's fixed scaffolding (system prompt + tool defs, ~18k tok on 0.2.x)
+  // exceeds the static SMALL_WINDOW minus the output reservation — preflight
+  // fail-fasts forever at 24576. Derive from the LIVE t2-end payload instead:
+  // deep enough to force a fold, wide enough that the folded session fits.
+  const base = Number(process.env.GATE_DSH_SMALL_WINDOW || 0);
+  if (base > 0) return base;
+  const p = lastP > 0 ? lastP : 30000;
+  return Math.min(BIG_WINDOW >> 1, Math.max(SMALL_WINDOW, Math.ceil((p * 0.85 + OUTPUT_TOKENS) / 1024) * 1024));
+};
+
+function dshRecipe(api) {
+  const baseSuffix = api === "anthropic-messages" ? "" : api === "google-generative-ai" ? "/v1beta" : "/v1";
+  return {
+    type: "native", pluginAgent: "dsh", wireApi: api,
     // guarantee ≥2 LLM requests per turn so the model-info retry (see
     // BILI_MODEL_INFO_RETRY_MS) gets a second request to stamp the window on
-    warmupPrefix: "First run the bash tool with command `echo warmup`. Then ",
+    warmupPrefix: DSH_WARMUP_PREFIX,
     async setup(ctx) {
-      const dshHome = path.join(ctx.laneDir, "dsh-home");
-      const profile = path.join(dshHome, "profiles", "headless");
-      fs.mkdirSync(path.join(profile, "node_modules"), { recursive: true });
-      // candidate as a REAL copy in the profile (e2e-native-dsh.test.ts shape;
-      // bundles @deepseek-ai/dsh-base/-headless resolve from the dsh install)
-      fs.cpSync(ctx.cand, path.join(profile, "node_modules", "billion-context"), { recursive: true });
-      const pkg = {
-        name: "dsh-profile-plugin-gate", private: true,
-        dependencies: { "billion-context": ctx.candV },
-        dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"], patchReload: "startup" } },
-      };
-      fs.writeFileSync(path.join(profile, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
-      fs.writeFileSync(path.join(profile, "cordis.yml"), "[]\n");
-      const cordisFor = (window) =>
-        fs.writeFileSync(path.join(profile, "cordis.patch.yml"), [
-          "- id: llm-pi-ai",
-          "  config:",
-          "    providers:",
-          "      gate:",
-          "        displayName: Gate Upstream",
-          `        apiKeyEnv: GATE_UPSTREAM_KEY`,
-          "        api: openai-completions",
-          `        baseURL: ${ctx.recUrl}/v1`,
-          "        models:",
-          ...MODEL_IDS.map((id) => [
-            `          - id: "${id}"`,
-            `            contextWindow: ${window}`,
-            "            maxTokens: 4096",
-          ].join("\n")),
-          "- id: agent-default-model",
-          "  config:",
-          "    provider: gate",
-          `    model: "${MODEL_MAIN}"`,
-        ].join("\n") + "\n");
-      cordisFor(BIG_WINDOW);
-      fs.writeFileSync(path.join(profile, "pnpm-workspace.yaml"), "packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\n");
-      ctx.env = { ...ctx.baseEnv, DSH_HOME: dshHome, DSH_TELEMETRY_MODE: "DISABLED" };
+      await dshProfileSetup(ctx, { api, baseURL: `${ctx.recUrl}${baseSuffix}`, withBili: true });
     },
-    setWindow(ctx, w) {
-      // window truth on plugin lanes = the host's own model config (rides
-      // the x-bili-plugin-context-window header); bili.json is ignored here
-      const profile = path.join(ctx.laneDir, "dsh-home", "profiles", "headless");
-      const txt = fs.readFileSync(path.join(profile, "cordis.patch.yml"), "utf8");
-      fs.writeFileSync(path.join(profile, "cordis.patch.yml"), txt.replace(/contextWindow: \d+/g, `contextWindow: ${w}`));
+    setWindow: dshSetWindow,
+    turn: dshTurn,
+    smallWindow: dshSmallWindow,
+  };
+}
+
+const RECIPES = {
+  dsh: dshRecipe("openai-completions"),
+  "dsh-responses": dshRecipe("openai-responses"),
+  "dsh-anthropic": dshRecipe("anthropic-messages"),
+  "dsh-google": dshRecipe("google-generative-ai"),
+
+  // ---- dsh-proxy: PROXY-mode contrast lane (#3475 owner add-on) ----------
+  // Same host, OTHER activation path: the profile does NOT load the
+  // billion-context bundle (its fetch intercept would stamp x-bili-plugin and
+  // flip the lane back into plugin mode) — dsh drives the chat wire straight
+  // into a manually started proxy via the /bili/ URL, codex/claude style.
+  // Contrasts the native dsh lane within ONE script: #3177/#3401-style
+  // suppression only exists on the plugin path; here nudge/fold must ride the
+  // wire in plain proxy mode (acp_summary carrier). Window truth = bili.json
+  // (writeWindow), like every other prefix lane.
+  "dsh-proxy": {
+    type: "prefix", pluginAgent: "dsh", wireApi: "openai-completions",
+    warmupPrefix: DSH_WARMUP_PREFIX,
+    async setup(ctx) {
+      const port = await freePort();
+      await dshProfileSetup(ctx, { api: "openai-completions", baseURL: `http://127.0.0.1:${port}/bili/${ctx.recUrl}/v1`, withBili: false });
+      ctx.proxyArgs = () => ({ port });
+      await startManualProxy(ctx, { port });
     },
-    async turn(ctx, prompt, sid, tag) {
-      const args = ["--profile", "headless", "headless"];
-      if (sid.v) args.push("--session-id", sid.v);
-      args.push("--json", prompt);
-      const r = sh("dsh", args, { cwd: ctx.workDir, env: ctx.env, timeout: ctx.TMO });
-      const { sid: s, final } = parseEvents(r.stdout);
-      if (s) sid.v = s;
-      return { ok: r.status === 0 && !!final, why: r.stderr.slice(-300) || `exit ${r.status}`, out: final };
-    },
+    setWindow: dshSetWindow,
+    turn: dshTurn,
+    smallWindow: dshSmallWindow,
   },
 
   // ---- pi: native lane, three wires possible — drive openai-chat ---------
@@ -766,8 +1036,21 @@ async function main() {
     console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
     try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); }
   }
-  const failed = results.filter((r) => !r.ok);
-  console.log(`\nplugin-lanes: ${results.length - failed.length}/${results.length} passed`);
+  // #3475: env-blocked lanes (upstream lacks the protocol door) keep their
+  // degraded verdict — FAIL records from turn-dependent assertions are honest
+  // output but excluded from the gate tally, mirroring the opencode2/#3461 rule.
+  // Blocked lanes drop turn-dependent records from the tally: env-blocked
+  // lanes keep their observable hard assertions (traffic, wire shape, tools,
+  // claim), client-blocked lanes ran nothing so the whole lane drops out.
+  const isTurnDependent = (name) => /completes|marker answered|self-calibrated|recalled|nudge reached|fold fired|model invoked/.test(name);
+  const counted = results.filter((r) => {
+    const b = BLOCKED.get(r.lane);
+    if (!b) return true;
+    return b.kind === "env" ? !isTurnDependent(r.name) : false;
+  });
+  const failed = counted.filter((r) => !r.ok);
+  for (const [lane, b] of BLOCKED) console.log(`${b.kind.toUpperCase()}-BLOCKED [${lane}] ${b.reason}`);
+  console.log(`\nplugin-lanes: ${counted.length - failed.length}/${counted.length} passed${BLOCKED.size ? ` (${[...BLOCKED.keys()].map((l) => `${l}:${BLOCKED.get(l).kind}`).join(", ")})` : ""}`);
   process.exit(failed.length ? 1 : 0);
 }
 main();

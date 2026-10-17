@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       agents:
-        description: "comma-separated lanes: dsh,pi,codex,opencode,claude"
+        description: "comma-separated lanes: dsh,pi,codex,opencode,claude (+ dsh matrix/proxy #3475: dsh-responses,dsh-anthropic,dsh-google,dsh-proxy)"
         required: false
         default: "dsh,pi,codex,opencode,claude"
 
