@@ -31,6 +31,7 @@ import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLo
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
+import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
@@ -1078,6 +1079,10 @@ export async function forward(
         // request, so an identical span in the response is an echo, not a
         // model-invented emission.
         const wireBodyText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+        // #3456: prime the phantom-attachment ledger with every attachment
+        // identifier this request ships — the response-side scan treats
+        // anything seen in requests as known (see src/phantom-attachment.ts).
+        noteKnownAttachmentIds(prepared.session?.id, wireBodyText);
         // #411: clear the idle timer on every path — resolveFakeCompletion and
         // other failures still escape these pipes; without a finally each one
         // leaked a live idle timer. (#721/#2563: the SSE pipes themselves no
