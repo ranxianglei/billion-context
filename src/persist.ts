@@ -358,6 +358,9 @@ export class SessionStore {
     /** #3199: post-boot background alias scan (unified modes only) — null in
      *  legacy mode and until bootBounded defers work. */
     private remainderScan: Promise<void> | null = null;
+    /** #3406 item 3: boot start instant — sessions born AFTER this are the
+     *  signature of a label resume that raced the background scan. */
+    private bootStartedAtMs = 0;
     /** #2674: monotonic per-process counter for unique content-store temp
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
@@ -669,6 +672,7 @@ export class SessionStore {
         if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
             throw new Error("Invalid session boot limits");
         }
+        this.bootStartedAtMs = Date.now();
         this.boundedReads = true;
         mkdirSync(this.sessionsDir, { recursive: true });
         this.diskFiles = [];
@@ -844,6 +848,7 @@ export class SessionStore {
     private async scanRemainderInBackground(parsedFiles: Set<string>, canonical: Set<string>): Promise<void> {
         let scanned = 0;
         let aliased = 0;
+        const seenLabels: Array<{ label: string; id: string; file: string }> = [];
         for (const file of this.diskFiles) {
             if (parsedFiles.has(file)) continue;
             scanned++;
@@ -853,13 +858,41 @@ export class SessionStore {
                 if (rec && fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) {
                     const savedAt = rec.payload.savedAt ?? 0;
                     if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
-                    else if (rec.meta.label) aliased += this.upsertLegacyAlias(rec.meta.label, { file, id: rec.payload.id, savedAt }, canonical) ? 1 : 0;
+                    else if (rec.meta.label) {
+                        seenLabels.push({ label: rec.meta.label, id: rec.payload.id, file });
+                        aliased += this.upsertLegacyAlias(rec.meta.label, { file, id: rec.payload.id, savedAt }, canonical) ? 1 : 0;
+                    }
                 }
             }
             await new Promise<void>((resolve) => setImmediate(resolve));
         }
+        this.detectLabelResumeRaces(seenLabels);
         if (scanned > 0) {
             this.log("info", `[persist] background index scan finished after boot: ${scanned} file(s) scanned, ${aliased} alias(es) recorded`);
+        }
+    }
+
+    /** #3406 item 3 (#3199 race, detection half): a label-based resume that
+     *  lands while this scan is still running finds no alias yet and mints an
+     *  EMPTY session under the label; once the scan reaches the older file the
+     *  direct-id file wins every later lookup, so the prior conversation stays
+     *  unreachable under the label. Pure detection — zero state mutation. At
+     *  completion, every scanned label that ALSO resolves to its own direct-id
+     *  file whose payload was born AFTER boot started (the racy session's
+     *  signature; a healthy alias-resume re-key keeps its original createdAt
+     *  and stays quiet) gets one loud warn naming both states. */
+    private detectLabelResumeRaces(seenLabels: Array<{ label: string; id: string; file: string }>): void {
+        const flagged = new Set<string>();
+        for (const entry of seenLabels) {
+            if (flagged.has(entry.label)) continue;
+            const expected = path.basename(relPathFor(entry.label));
+            const direct = this.diskFiles.find((f) => f !== entry.file
+                && (fileNameMatchesId(path.basename(f), entry.label) || path.basename(f).endsWith(`_${expected}`)));
+            if (!direct) continue;
+            const env = this.readEnvelopeFile(direct, entry.label);
+            if (!env || typeof env.payload.createdAt !== "number" || env.payload.createdAt <= this.bootStartedAtMs) continue;
+            flagged.add(entry.label);
+            this.log("warn", `[persist] label resume raced the post-boot background scan: "${entry.label}" was resumed before the scan recorded its alias, so a fresh empty session was minted under the label; the prior conversation survives at ${entry.file} (id ${entry.id}). Resume by id ${entry.id}, or delete the empty ${entry.label} state file if the new conversation supersedes it (#3406/#3199).`);
         }
     }
 
