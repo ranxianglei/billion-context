@@ -175,7 +175,10 @@ for (const pluginMode of [false, true]) {
 test("cancelled growth auto-fold stops before fail-open forwarding and backoff", async () => {
     await withUpstream(async (url, mainCalls) => {
         const f = fixture(url, 50_000);
-        f.session.stats.lastInputTokens = 10_000;
+        // usage baseline must clear the #3444 expected-benefit bar: 8192 is
+        // AUTO_FOLD_TARGET_MIN, so 20_000 − 8192 ≥ 4_096 — below that the
+        // growth fold never arms and this lane exercises nothing.
+        f.session.stats.lastInputTokens = 20_000;
         f.session.stats.lastInputTokensSource = "usage";
         Object.assign(f.config, { externalSummary: parseExternalSummarySettings({
             enabled: true, autoFold: true, autoFoldTargetTokens: 8192,

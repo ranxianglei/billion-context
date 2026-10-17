@@ -78,8 +78,8 @@ import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetr
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
-import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
+import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
@@ -2909,10 +2909,20 @@ export async function preflightCompressIfNeeded(
     // floor under the documented minimum. Clamping to the minimum disarms
     // auto-fold on sub-8K windows outright (target >= overflow ⇒ growthArmed
     // false), which matches the documented feature scope.
+    // [#3444] A configured target below what this session can physically reach
+    // (system prompt + tool schemas + live tail) is UNREACHABLE: every fold
+    // lands above it and the trigger re-fires on every request (fold storm).
+    // An exhausted growth pass measures the irreducible floor into session
+    // metadata — raise the effective target to it so the trigger arms on real
+    // GROWTH past the floor instead of the permanent gap. Latest measurement
+    // wins (tracks baseline drift); a floor at/above the window collapses the
+    // arming entirely (growthArmed false ⇒ classic mode, nudge suppression
+    // releases via growthFoldingArmed's measuredFloor arg).
+    const measuredFloor = autoFoldOn ? autoFoldFloor(session) : undefined;
     const autoFoldTarget = autoFoldOn
-        ? Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget))
+        ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
         : undefined;
-    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget) — keep in sync (PR #2581 review)
+    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
@@ -2992,7 +3002,18 @@ export async function preflightCompressIfNeeded(
         : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
-    const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    // [#3444] expected-benefit gate for growth folds: once the payload sits at
+    // the (possibly floor-raised) target, every further request re-crosses it
+    // with only marginal new content — folding that burns a full external-
+    // summary round trip to save less than its fixed cost. Require the text
+    // channel to exceed the budget by at least AUTO_FOLD_MIN_BENEFIT_TOKENS
+    // before arming; below that the payload fits the window by definition and
+    // forwards as-is until enough material accrues. Classic overflow preflight
+    // is untouched (its bar is the window itself — there, firing is mandatory).
+    // Image-dominant payloads keep the original unconditional arm: images are
+    // not foldable, so their overage is not "expected benefit" at all.
+    const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
+    const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
@@ -3334,6 +3355,16 @@ export async function preflightCompressIfNeeded(
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
         setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
+        // [#3444] exhausted honest pass: the chain folded everything it could
+        // (no failure) yet the rebuilt payload still sits at/above the growth
+        // target — the target is physically unreachable for this session.
+        // Record the measured floor so the next trigger arms on real growth
+        // past it instead of re-firing every request; latest measurement wins.
+        if (growthArmed && result.failure === undefined && rebuiltTextSize + imageTokens >= compressionTarget) {
+            session.metadata.autoFoldFloorTokens = rebuiltTextSize + imageTokens;
+            markDirty(session);
+            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
+        }
     } else {
         fits = unknownBaseline
             ? result.fitsWindow
@@ -3373,6 +3404,16 @@ export async function preflightCompressIfNeeded(
             } else {
                 log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
             }
+        } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
+            // [#3444] sub-benefit fold: a full external-summary round trip saved
+            // less than its fixed cost — same economics as a zero-progress pass,
+            // so arm the same cooldown instead of paying per-request for
+            // marginal folds. Estimation error is the usual cause (the trigger
+            // believed more was over budget than the fold could actually save);
+            // #2662's congestion exemption applies unchanged.
+            log("warn", `[${session.id}] auto-fold saved only ~${result.savedTokens} tokens (< ${AUTO_FOLD_MIN_BENEFIT_TOKENS} worth) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume (#3444)`);
+            armAutoFoldBackoff(session);
+            markDirty(session);
         }
         return outbound;
     }
