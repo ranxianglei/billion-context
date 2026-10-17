@@ -4,6 +4,7 @@ import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHando
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { UnifiedStore } from "./storage/store.js";
+import type { StorageBackend } from "./storage/backend.js";
 
 interface ExportOptions {
     dir?: string;
@@ -202,7 +203,7 @@ function safeJson(raw: string | null | undefined): unknown {
  * placeholders dereferenced to their stored originals when `full`), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
  * state; a generated artifact, never a source of truth. */
-export function renderSessionJsonlFromTables(store: UnifiedStore, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): string {
+export function renderSessionJsonlFromTables(store: StorageBackend, sessionId: string, full: boolean, extraCcr?: ReadonlyMap<string, string>): string {
     const row = store.getSessionRow(sessionId);
     if (!row) throw new Error(`session ${sessionId} is not in the unified index`);
     const lines: string[] = [];

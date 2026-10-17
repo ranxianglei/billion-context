@@ -142,6 +142,16 @@ billion-context/
 │   │   ├── adapter-google.ts     #   Google wire adapter
 │   │   ├── cache-control.ts      #   Explicit Anthropic cache_control breakpoints (#1637)
 │   │   └── tag-echo-filter.ts    #   Streaming-safe stripper for model-echoed render tags (#206); tool args byte-exact
+│   ├── storage/                  # Unified SQLite storage layer (#2671): content-addressed CAS + compression ledger
+│   │   ├── backend.ts            #   StorageBackend operation contract — pluggable backend seam; UnifiedStore implements it (#3388 A)
+│   │   ├── store.ts              #   UnifiedStore — SQLite impl of StorageBackend: raw SQL over the unified index (CAS refcount, checkpoints, ext, kv, atomic ingestSession)
+│   │   ├── schema.ts             #   Schema v1 DDL + pragmas + migrateSchema (PRAGMA user_version); append-only fact + verified-projection columns
+│   │   ├── driver.ts             #   SqliteDatabase seam + engine resolution: builtin node:sqlite → host better-sqlite3 → self-downloaded → none (sync, #2833)
+│   │   ├── engine-bootstrap.ts   #   Self-download/cache of the pinned better-sqlite3 N-API prebuilt (no host build-script approval, #2833)
+│   │   ├── shadow.ts             #   UnifiedShadow sidecar — primary consumer; shadow (double-write dry-run) vs full (unified-first load, #2671)
+│   │   ├── ingest.ts             #   Legacy→unified mapping: ingestSession() to rows, loadLegacyView() rebuilds the legacy view (digest parity)
+│   │   ├── canonical.ts          #   Shared digest canonicalization (TS/UUID/VER scrubbing) — corpus manifests & shadow checks byte-exact
+│   │   └── runtime-status.ts     #   Runtime degradation-status registry (#3040) → /__bili/status + overview + diagnostics blob
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
@@ -205,7 +215,7 @@ When navigating this codebase, these are the load-bearing entry points:
 - **Knobs** — every behavior knob resolves through `src/knobs.ts` (env > config file > default, #2030). Never add a new `process.env` read in a leaf module — see AGENTS.md "Environment Variable Discipline".
 - **Update path** — `src/update.ts` is deliberately self-contained and conservative; it installs via tarball extraction (not `npm install`) to avoid lifecycle-script surprises on user machines. It is load-bearing infrastructure: changes require a no-op validation release first (§5).
 - **Agent plugins** — `src/agent/*.ts` are thin host-specific adapters; shared logic lives in `src/agent/shared.ts`. Each host has a `-native.ts` bootstrap gate variant.
-- **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`.
+- **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/storage/` is the unified SQLite storage layer (#2671) behind the `StorageBackend` contract (`src/storage/backend.ts`), consumed via `src/storage/shadow.ts` at `shadow`/`full` opt-in levels; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`.
 - **会话派生缓存** — `Session.transient` 持有插件工具视图与诊断请求副本；随会话淘汰释放，也纳入会话对象图的字节计量。它不写入持久化记录或上游协议；诊断截段独立复制 UTF-16 内容，避免保留完整请求底层字符串（#2920）。
 - **Wire fidelity** — `src/stream-*.ts` files handle per-protocol streaming transformation. The invariant: never alter upstream protocol shape beyond intended injection (§7.3).
 - **E2E regression** — `tests/e2e/` contains real-client suites (codex, opencode, pi, dsh) plus hermetic lanes (registry, advisory-rollback, release-canary, opencode WS, image billing); each carries its own skip gate — read the test header for the exact env var.
