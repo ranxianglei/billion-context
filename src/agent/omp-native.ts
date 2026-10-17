@@ -237,8 +237,12 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  fallback origin, or undefined when nothing came up. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // Restore the readyOrigin short-circuit — a runtime recovery clears
@@ -247,7 +251,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         publishOrigin(home);
         return home;
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
@@ -255,7 +259,13 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             logHostEvent("info", "[native-client]", `bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        logHostEvent("error", "[native-client]", `bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent(
+            "error",
+            "[native-client]",
+            explicitAttachOrigin !== undefined
+                ? `bili-native(omp): explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
+                : `bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
+        );
         state.origin = undefined;
         return undefined;
     }
