@@ -477,7 +477,7 @@ const LANES: Lane[] = [
 
 // #1399: acp_rule is part of the default injected surface on every wire, so
 // it joins the base expectation here (opt-in lanes below no longer add it).
-// #3400: read_original_image likewise — the egress rescale pass defaults ON,
+// #3400: acp_read_original_image likewise — the egress rescale pass defaults ON,
 // so proxy-injection lanes forward it on every wire (tool-rejecting lanes
 // like codex degrade to size-only notes and never run these rigs).
 const BASE_EXPECTED: Record<Wire, string[]> = {

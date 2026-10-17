@@ -823,7 +823,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const ccrOn = config.ccr?.enabled === true;
     const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
-    // #3400: read_original_image restores the full-resolution original of a
+    // #3400: acp_read_original_image restores the full-resolution original of a
     // downscaled image from local session storage. Same conservative #1192
     // rule as acp_retrieve: advertised only while the base knob enables the
     // rescale pass (disabled ⇒ no [bili] note ever names it, so a registered

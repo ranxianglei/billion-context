@@ -1015,7 +1015,7 @@ function runProof(wire: Wire, bodies: string[], urls: string[], ev: ProofEvents)
 }
 
 
-// #3400: pin legacy wire economics - the default-on read_original_image tool
+// #3400: pin legacy wire economics - the default-on acp_read_original_image tool
 // adds ~200 tokens per request, shifting this scenario's nudge timing so the
 // fold/rearm arithmetic moves by design. Fidelity here is compaction behavior,
 // not egress policy (tests/issue3400-image-rescale.test.ts covers that).

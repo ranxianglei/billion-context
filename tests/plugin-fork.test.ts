@@ -163,7 +163,7 @@ test("HTTP explicit main with only public ACP tools captures initial history, us
     const h = await harness(false, false);
     try {
         const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
-        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache", "read_original_image"]);
+        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_read_original_image"]);
         await sendIntentModel(h, "parent", h.messages, tools, "main");
         assert.deepEqual(h.forwarded.at(-1)!.tools, tools, "main tools survive unchanged");
         assert.equal(h.forwarded.at(-1)!.max_tokens, 256);

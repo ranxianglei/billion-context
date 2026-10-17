@@ -13,7 +13,7 @@
     "absorb",
     "acp_rule",
     "acp_retrieve",
-    "read_original_image"
+    "acp_read_original_image"
   ],
   "tools": {
     "anthropic": [
@@ -275,7 +275,7 @@
         }
       },
       {
-        "name": "read_original_image",
+        "name": "acp_read_original_image",
         "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
         "input_schema": {
           "type": "object",
@@ -576,7 +576,7 @@
       {
         "type": "function",
         "function": {
-          "name": "read_original_image",
+          "name": "acp_read_original_image",
           "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
           "parameters": {
             "type": "object",
@@ -836,7 +836,7 @@
       },
       {
         "type": "function",
-        "name": "read_original_image",
+        "name": "acp_read_original_image",
         "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
         "parameters": {
           "type": "object",

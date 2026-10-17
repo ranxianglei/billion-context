@@ -11,7 +11,7 @@ import type { ProxyOptions } from "../src/config.js";
 // #3400: egress image rescale (simplified re-do of #3295's removal). Contract:
 // big images (>1600 longest edge or >100KB) are downscaled on the OUTBOUND
 // copy only; originals stay in session storage; the model is told both sizes
-// beside the image; read_original_image returns the exact stored bytes and
+// beside the image; acp_read_original_image returns the exact stored bytes and
 // its results are structurally exempt from re-shrinking (the #3266 loop guard).
 process.env.BILI_CONFIG_FILE = "/nonexistent/bili-issue3400-config.json";
 
@@ -84,7 +84,7 @@ test("big image shrunk: anthropic standalone gets copied block + adjacent note m
     assert.notEqual(out[0], input[0], "input object not mutated in place");
     assert.equal(out[1].id, "acp_imgnote_msg_img_1");
     assert.equal(out[1].role, "user");
-    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB\(约 [\d.]+ 倍\)。需要原分辨率细节\(小字、颜色、对齐\)时,调用 read_original_image\("m12345"\) 读取原图。原图较大,按需读取。$/);
+    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB\(约 [\d.]+ 倍\)。需要原分辨率细节\(小字、颜色、对齐\)时,调用 acp_read_original_image\("m12345"\) 读取原图。原图较大,按需读取。$/);
     // original sidecar untouched in the input array
     assert.equal((input[0].rawAnthropicBlock as { source: { data: string } }).source.data, BIG.b64);
 });
@@ -154,7 +154,7 @@ test("openai singular image_url converts to plural parts with inline note", asyn
     assert.match(url, /^data:image\/png;base64,/);
     assert.notEqual(url, `data:image/png;base64,${BIG.b64}`);
     assert.equal(parts[1].type, "text");
-    assert.match(String(parts[1].text), /read_original_image\("m20001"\)/);
+    assert.match(String(parts[1].text), /acp_read_original_image\("m20001"\)/);
 });
 
 test("google inlineData shrunk, note appended to core text (never a raw text part)", async () => {
@@ -169,7 +169,7 @@ test("google inlineData shrunk, note appended to core text (never a raw text par
     const parts = out[0].rawGoogleParts as Array<{ inlineData?: { data?: string } }>;
     assert.equal(parts.length, 1);
     assert.notEqual(parts[0].inlineData?.data, BIG.b64);
-    assert.match(String(out[0].text), /^hello\n\n\[bili\] 本图已降采样:.*read_original_image\("m30001"\)/);
+    assert.match(String(out[0].text), /^hello\n\n\[bili\] 本图已降采样:.*acp_read_original_image\("m30001"\)/);
 });
 
 test("responses item: image url replaced, NO text part inside item, note rides separate message", async () => {
@@ -189,7 +189,7 @@ test("responses item: image url replaced, NO text part inside item, note rides s
     assert.match(String(content[1].image_url), /^data:image\/png;base64,/);
     assert.notEqual(content[1].image_url, `data:image/png;base64,${BIG.b64}`);
     assert.equal(out[1].id, "acp_imgnote_msg_r");
-    assert.match(String(out[1].text), /read_original_image\("m40001"\)/);
+    assert.match(String(out[1].text), /acp_read_original_image\("m40001"\)/);
 });
 
 test("items walker (responses steady path): shrinks + inserts input_text note after the image", async () => {
@@ -204,10 +204,10 @@ test("items walker (responses steady path): shrinks + inserts input_text note af
     assert.match(String(out[0].content[2].text), /^\[bili\] 本图已降采样:/);
 });
 
-test("items walker exemption: output answering read_original_image passes verbatim", async () => {
+test("items walker exemption: output answering acp_read_original_image passes verbatim", async () => {
     const { session, ctx } = ctxFor("s-items-exempt");
     const items = [
-        { type: "function_call", call_id: "call_1", name: "read_original_image", arguments: '{"ref":"m12345"}' },
+        { type: "function_call", call_id: "call_1", name: "acp_read_original_image", arguments: '{"ref":"m12345"}' },
         { type: "function_call_output", call_id: "call_1", output: [{ type: "input_image", image_url: `data:image/png;base64,${BIG.b64}` }] },
     ];
     const out = (await applyImageRescaleItems(items, ctx)) as unknown[];
@@ -215,12 +215,12 @@ test("items walker exemption: output answering read_original_image passes verbat
     assert.equal(out[1], items[1], "exempt tool output must be the SAME object (untouched)");
 });
 
-test("structural loop guard: carrier message with toolName read_original_image is never re-shrunk", async () => {
+test("structural loop guard: carrier message with toolName acp_read_original_image is never re-shrunk", async () => {
     const { session, ctx } = ctxFor("s-guard");
     const input: BiliMessage[] = [{
         id: "acp_loop_r2_img_call_1", role: "user", contentType: "text",
         text: "[bili] 原图已读取,完整分辨率的原始图片如下。",
-        toolName: "read_original_image", imageBase64: BIG.b64, imageMediaType: "image/png",
+        toolName: "acp_read_original_image", imageBase64: BIG.b64, imageMediaType: "image/png",
     }];
     const out = await applyImageRescalePass(input, ctx);
     assert.equal(out.length, 1);
@@ -246,12 +246,12 @@ test("size-only note when the tool lane is not armed (codex/plugin lanes)", asyn
     const out = await applyImageRescalePass(input, ctx);
     assert.equal(out.length, 2);
     assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB。$/);
-    assert.doesNotMatch(String(out[1].text), /read_original_image/);
+    assert.doesNotMatch(String(out[1].text), /acp_read_original_image/);
 });
 
 test("buildRescaleNote: deterministic templates (full + size-only)", () => {
     const full = buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
-    assert.equal(full, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB(约 4.3 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 read_original_image(\"m12345\") 读取原图。原图较大,按需读取。");
+    assert.equal(full, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB(约 4.3 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image(\"m12345\") 读取原图。原图较大,按需读取。");
     assert.equal(full, buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 }));
     const sizeOnly = buildRescaleNote({ ref: "m12345", toolArmed: false, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
     assert.equal(sizeOnly, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB。");

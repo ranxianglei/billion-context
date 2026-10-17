@@ -1723,7 +1723,7 @@ async function handleRequest(
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
         storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
-        // #3400: read_original_image arms where the model can actually reach
+        // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
         // base-config gated like every other opt-in tool, #1192). Never on the

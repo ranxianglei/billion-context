@@ -58,13 +58,13 @@ export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }
 
-// #3400: per-request stamp of the read_original_image TOOL registration gate.
+// #3400: per-request stamp of the acp_read_original_image TOOL registration gate.
 // The rescale PASS itself runs on every lane (governed by the BILI_IMAGE_RESCALE
 // knob); only the manifest registration and the annotation's invocation entry
 // follow this stamp — codex/plugin lanes get size-only notes.
 const EFFECTIVE_IMAGE_RESCALE_KEY = "effectiveImageRescale";
 
-/** Stamp whether read_original_image may be registered for this session's
+/** Stamp whether acp_read_original_image may be registered for this session's
  *  lane (per-request; mirrors the storeEffectiveCcr site). */
 export function storeEffectiveImageRescale(session: Session, armed: boolean | undefined): void {
     // Absent == not armed (imageRescaleToolArmed reads === true). Writing only the

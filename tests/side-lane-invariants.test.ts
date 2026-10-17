@@ -355,11 +355,11 @@ test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
     assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
 });
 
-// (#3400): read_original_image is bili's own context-management tool. A
+// (#3400): acp_read_original_image is bili's own context-management tool. A
 // session-sidecar request that leaks the armed tool set must still be demoted
 // by #1897, so the name joins the bili-owned set in side-request.ts — and per
 // #2170 the lane-logic move lands with its dedicated suite pinning the
 // membership (same discipline as (I) above for the absorb removal).
-test("(J) post-#3400: read_original_image is bili-owned for #1897 demotion", () => {
-    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "read_original_image is in the bili-owned set");
+test("(J) post-#3400: acp_read_original_image is bili-owned for #1897 demotion", () => {
+    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "acp_read_original_image is in the bili-owned set");
 });

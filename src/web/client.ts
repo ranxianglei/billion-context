@@ -2177,6 +2177,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -2256,6 +2259,33 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);

@@ -42,7 +42,7 @@ export interface ProxyToolResult {
     // `parse:missing-content`, `gate:cannot-anchor`) — outcome=refused alone
     // never says WHY in the [plugin] execution line.
     reason?: string;
-    // #3400: original image bytes restored by read_original_image — the loop
+    // #3400: original image bytes restored by acp_read_original_image — the loop
     // rides them as an ephemeral carrier message; plugin-lane hosts open the
     // local path named in the receipt text instead (string protocol).
     image?: { base64: string; mediaType: string };
