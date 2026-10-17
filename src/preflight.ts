@@ -1946,6 +1946,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let lastRoundMs = 0;
     let lastRoundStart = 0;
     let wallBudgetHit = false;
+    let wallStopAfterRounds = 0;
     // #2657×#2678 fusion: set when a round's whole external-summary batch died
     // in the shared pool's queue (deadline, zero dispatched attempts). Later
     // rounds would queue behind the same holders with fresh budgets each,
@@ -2231,6 +2232,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const estNextMs = lastRoundMs > 0 ? lastRoundMs * 2 : 0;
             if (elapsedMs + estNextMs > (preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS)) {
                 wallBudgetHit = true;
+                wallStopAfterRounds = round + 1;
                 deps.log("warn", `[preflight] stopping after round ${round}: ${elapsedMs}ms elapsed + ~${estNextMs}ms for the next round exceeds the wall budget (${preflightWallBudgetOverrideMs ?? PREFLIGHT_WALL_BUDGET_MS}ms) — ${result.compressedRanges} fold(s) from this attempt are persisted; the client retry resumes from the smaller view (#3573)`);
                 break;
             }
@@ -3295,7 +3297,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // minCompressRange" for a range that died before any summary call).
             const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
             const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
-            if (budgetHit) {
+            if (wallBudgetHit) {
+                // #3573: the marathon stopped on the client-patience wall clock, not on a
+                // round or summary budget — say so. The payload may still overflow the
+                // window, but it CAN fit after more folding: every landed fold is persisted,
+                // so the client retry resumes from a smaller view. Never fall through to the
+                // "budget exhausted" wording below — and never into the relaxed deterministic
+                // branch (a 413 terminal verdict would kill exactly this stop's
+                // retry-convergence story); this stop is retryable by design.
+                failure = { kind: "exhausted", retryable: true, detail: `stopped at the client-patience wall budget after ${wallStopAfterRounds} round(s): ${result.compressedRanges} fold(s) from this attempt are persisted — the next request resumes from the smaller view and keeps folding (#3573)` };
+            } else if (budgetHit) {
                 failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
             } else if (relaxed && result.compressedRanges > 0) {
                 // #3461: "folded everything compressible" is only a structural

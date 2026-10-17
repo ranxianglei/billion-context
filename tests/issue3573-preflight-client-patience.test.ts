@@ -164,6 +164,7 @@ test("#3573 slow summary rounds: each attempt stops at the wall budget with prog
                 assert.equal(status, 502, `attempt ${attempts}: an unfinished marathon fails fast with 502 (got ${status})`);
                 assert.ok(body.includes(NOT_FORWARDED_MARK), `attempt ${attempts}: the fail-fast explains the over-window payload (body: ${body.slice(0, 200)})`);
                 assert.ok(!body.includes(COOLDOWN_MARK), `attempt ${attempts}: a budget stop must NOT arm the dead-end cooldown (progress persists — retry is the cure)`);
+                assert.ok(body.includes("client-patience wall budget"), `attempt ${attempts}: the fail-fast names the wall-budget stop honestly, not a phantom round/summary-budget exhaustion (body: ${body.slice(0, 200)})`);
                 assert.ok(blocksNow > blocksBefore, `attempt ${attempts}: the stopped attempt still persisted its fold(s) (blocks ${blocksBefore} -> ${blocksNow})`);
                 assert.ok(sum.calls() > before, `attempt ${attempts}: the attempt did run its summary round(s)`);
                 blocksBefore = blocksNow;
