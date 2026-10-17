@@ -2218,6 +2218,29 @@ dsh --profile <name> --dump-config > /tmp/profile.yml
 - opencode launcher/native 模式下已存在的 `opencode-acp` 按设计只记 info（#920 有意吸收它处理 legacy 会话）；其他场景一律告警。
 - 关闭方式：`BILI_CONFLICT_SCAN=0`。
 
+### dsh 原生压缩与自定义 agent preset
+
+`#3354` 在加载期把 dsh 的 native basic compaction 停掉（行标记 `disabled: true`），并给每个 preset 条目挂 `biliBasicCompactionPolicy` 服务作为闸门，保证 overlay 不输在导入顺序上。闸门名单只有内置的这几个：
+
+```ts
+// src/agent/dsh-compaction-disable.ts
+const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"] as const;
+```
+
+由**第三方 bundle** 声明的 preset —— 某个 bundle 的 `cordis.patch.yml` 里 `name` 为 `'@deepseek-ai/dsh-agent-preset'` 的条目（把助手预设做成独立 bundle 安装就是这样）—— 不在这份名单里，也不会带 `inject: [biliBasicCompactionPolicy]`。于是它的行可能在 bili 的 overlay 注册之前就解析完成，dsh 原生压缩保持 armed，之后每次压缩都在线上被拒（`#1729`，`422 dsh_compaction_refused`），而 UI 上什么都看不到。自己补一行闸门：
+
+```yaml
+# $DSH_HOME/profiles/<profile>/cordis.patch.yml
+- id: <你的 preset id>
+  inject: [biliBasicCompactionPolicy]
+```
+
+按 `#2474` 全量快照覆盖该 preset 的 `compaction-basic` 行同样可行；那里 `config` 是整体替换，默认项要一起写。把 `dsh.allowDshCompaction` 设为 `true` 是另一条出路，也是不可逆的那条：checkpoint 会盖掉原始历史。
+
+**dsh native 安装**（`bili plugin install dsh`）下 launcher 的 overlay patch 根本不会写 —— `dshNativeInstalled()` 为真时 `writeDshAcpPatch` 整段跳过（`src/launcher.ts`）—— 所以闸门必须落在 profile 自己的 patch 层。启动 warning 说了这件事；这一节说清楚是哪一层，以及为什么名单覆盖不到你。
+
+不给自定义 preset 加闸门的代价 —— 一台 Android/proot 设备，dsh 2.0.0-rc.2 + bili 0.1.197，98 个会话里 70 个跑自定义 preset：5,090 次压缩请求全部被拒（单会话占 3,254 次）。该会话入站均值 **16.67 MiB/步**，有闸门的会话是 0.36–0.99 MiB —— 23 小时共 57.7 GiB。被拒的 replay 又喂进 `#2490` 的 planning floor，输出预算被 clamp 113 次（如 10033 → 4220），步数大约翻倍。给 preset 补闸门（或像那台设备一样直接 opt-in）之后风暴就停了。
+
 ---
 
 ## 会话与迁移
