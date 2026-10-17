@@ -219,6 +219,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
+    // #3536: browsers probing the proxy origin for a favicon (the dsh desktop
+    // settings panel frames /__bili/ and the frame fires GET /favicon.ico at
+    // the ORIGIN ROOT) must be answered locally with 204 — falling through to
+    // the relay would rewrite the host onto the configured upstream, burning a
+    // request there and logging a 403 for a static asset no model client ever
+    // asks for. The panel page itself also declares an empty icon (page.ts) so
+    // well-behaved browsers never send the probe at all; this is the backstop
+    // for browsers/timings that still do (probe before redirect, direct visits).
+    if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
     if (req.method === "GET" && req.url === "/__bili/health") {
         // #2941: 503 while registration is still pending — every consumer
         // (launcher spawn-wait, attach discovery, host-native respawn) keys on
