@@ -122,6 +122,9 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 | `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
 | 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
 
+**并发会话(#3203)。** 同一项目目录、同一 `CODEX_HOME` 下可以同时跑多个 `bili codex`:每次启动各取一个独立的每会话 overlay 槽位(`<CODEX_HOME>-bili-s<N>`,池上限 16)和各自的 lane 代理,路由、MCP 会话绑定、压缩状态互不串线。共享状态默认(codex ≥ 0.147.0)下,两个会话的历史都落在真实 home 的同一个活库上,退出顺序不影响保留 —— 见 CONFIGURATION.md 的 `BILI_CODEX_STATE_MODE`。旧版二进制或 `BILI_CODEX_STATE_MODE=legacy` 保持每 home 一个独占 overlay:第二个并发启动会被 `BILI_OVERLAY_BUSY` 拒绝。
+
+
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
 **Responses 原生链式(一个坑)。** bili 靠重放完整 `input` 来压缩,因此无法跟随 OpenAI 原生的 `previous_response_id` 链式续传:只带增量的续传请求会在上游丢失之前的轮次,却仍返回 200。对 codex 而言今天这不是问题 —— 观察到的构建都发 `store:false` 且从不设置 `previous_response_id`(是观察不是证明;E2E 未覆盖该形态)。若你把走原生链式的 Responses 客户端指向 bili,要么重发完整 input/output 历史,要么设 `ACP_KEEP_RESPONSE_ID=1`;bili 剥掉非空 `previous_response_id` 时现在会记一条 `warn`(#1954)。完整链式支持跟踪在 #1973。见[官方迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)。

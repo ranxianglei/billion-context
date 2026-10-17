@@ -337,6 +337,7 @@
 | `BILI_ZCODE_PORT` | number | unset | — | zcode 车道的端口钉死。 |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 凭据车道的固定签名模式。 |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
+| `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
@@ -1855,6 +1856,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
 | `BILI_CLAUDE_NATIVE_PORT` | 为 claude 原生通道 hook 拉起的代理钉死**确切端口**（#964/#1660）：严格端口语义——口上的占用者被大声拒绝而不是跳口——烘进受管 `ANTHROPIC_BASE_URL`。不设则 hook 骑自管区（`BILI_ZONE_PORT` 基准 + 每 lane 粘性），且每次会话把受管 URL 重钉到存活 origin，端口漂移自愈（#1660）。 |
 | `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）——用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
+ | `BILI_CODEX_STATE_MODE` | codex 状态处理（#2222、#3203）。默认 `auto`：当 codex 二进制支持 `CODEX_SQLITE_HOME`（codex-cli ≥ 0.147.0，经缓存的 `--version` 探测判定）时，bili 将其指向**真实** `$CODEX_HOME` —— codex 的 WAL 模式状态库留在真实 home 内的单一物理路径上，bili 与原生运行共享同一个活库。每次启动从有界池（`<CODEX_HOME>-bili-s1..s16`）取一个独立的每会话 overlay 槽位：生成文件（.env、config.toml）与代理绑定都按槽位隔离，因此同一个 `$CODEX_HOME` 下最多可有 16 个独立会话并发运行，各自走自己的代理（代理各跑在独立 lane `codex-s<N>` 上 —— 同构建的两次启动若共享一个 lane，会在端口层互相拒绝，#3044）。槽位持久保留并复用 —— 绝不自动删除，因为冷启动的线程记录要经由槽位解析（#43bf59fc9）—— 崩溃会话的槽位会被下一次启动直接回收。没有逐次启动的数据库拷贝，就没有退出时的合并回写、也没有 `.bili-conflict` 隔离代（#381/#1917/#1918/#1919/#1951/#1965/#2195 补丁族在此模式下退役）。#3203 之前的固定名 `<CODEX_HOME>-bili` overlay 在首次 shared 模式启动时按同一套溯源仲裁一次性迁回真实 home；若仍有存活的旧版 launch 持有它，本次启动会被拒绝。`shared` 强制此模式（二进制过旧时大声降级为 legacy）；`legacy` 强制旧的逐次拷贝 / 合并回写机制及其单一独占 overlay（一次只能一个会话）。仅环境变量的逃生舱 —— **没有**文件等效项。用户自设的 `CODEX_SQLITE_HOME` 原样尊重（原生与 bili 运行必须共享同一逻辑库）；managed requirements.toml 的 `sqlite_home` 压过两者。 |
 
 ---
 

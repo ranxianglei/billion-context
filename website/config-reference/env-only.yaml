@@ -106,6 +106,14 @@ entries:
     group: envonly
     desc_en: "Upstream pin for the claude lane."
     desc_zh: "claude 车道的上游钉死。"
+  - key: BILI_CODEX_STATE_MODE
+    type: string
+    default: "auto"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time."
+    desc_zh: "codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。"
   - key: BILI_ATTACH_HEALTH_DEADLINE_MS
     type: number
     default: "(built-in)"

@@ -427,6 +427,8 @@ so the plugin can never route codex's own traffic. Three postures:
 | `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
 | `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
 
+**Concurrent sessions (#3203).** Several `bili codex` launches may run at once in the same project directory with the same `CODEX_HOME`: each launch takes its own per-session overlay slot (`<CODEX_HOME>-bili-s<N>`, pool of 16) and its own lane proxy, so routing, MCP conversation binding, and compression state never cross between sessions. With the shared-state default (codex ≥ 0.147.0) both sessions' history lands in the ONE live state db in the real home and survives any exit order — see `BILI_CODEX_STATE_MODE` in CONFIGURATION.md. Older binaries, or `BILI_CODEX_STATE_MODE=legacy`, keep one exclusive overlay per home: the second concurrent launch is refused with `BILI_OVERLAY_BUSY`.
+
 The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
 (command = node, args = dist/mcp.js). #1660 removed the install-time origin bake
 (#403: a baked URL went stale after drift/reboot and left the tools pointing at

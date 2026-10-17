@@ -1528,13 +1528,21 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
  *  degrades to nothing (wire mode still compresses server-side) with a
  *  warning. OverlayBusyError (#1952: another live launch owns the overlay) is
  *  PROPAGATED, not degraded — runLaunch aborts the launch, because degrading
- *  to the real home would silently drop the MCP tools and the .env protection. */
+ *  to the real home would silently drop the MCP tools and the .env protection.
+ *  #2222 shared state: with sharedSqlite the overlay additionally carries NO
+ *  SQLite sets at all — CODEX_SQLITE_HOME (sqliteHome) keeps every state db in
+ *  the real home where native and bili runs share one live WAL database, so
+ *  there is nothing to copy in or merge back (the legacy copy/adjudication
+ *  path stays available as the version-gated fallback). */
 export function prepareCodexMcpInjection(opts: {
     codexHome: string;
     origin: string;
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
+    sqliteHome?: string;
+    sessionSlot?: string;
 }): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
     const overlay = prepareCodexHome({
         codexHome: opts.codexHome,
@@ -1542,6 +1550,8 @@ export function prepareCodexMcpInjection(opts: {
         caPath: opts.caPath,
         conversationId: opts.conversationId,
         manageRouting: opts.manageRouting,
+        sharedSqlite: opts.sharedSqlite,
+        sessionSlot: opts.sessionSlot,
     });
     if (!overlay) {
         const losses = [
@@ -1551,10 +1561,12 @@ export function prepareCodexMcpInjection(opts: {
         return {
             clientArgs: [],
             envPatch: {},
-            warning: `could not prepare the codex overlay (<CODEX_HOME>-bili) — ${losses.join("; ")}; wire-injected compression is still active.`,
+            warning: `could not prepare the codex overlay for this launch — ${losses.join("; ")}; wire-injected compression is still active.`,
         };
     }
-    return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
+    const envPatch: Record<string, string> = { CODEX_HOME: overlay };
+    if (opts.sharedSqlite && opts.sqliteHome !== undefined) envPatch.CODEX_SQLITE_HOME = opts.sqliteHome;
+    return { clientArgs: [], envPatch };
 }
 
 /**
@@ -1627,11 +1639,11 @@ function livePidHoldsOverlay(overlay: string): number | undefined {
  *  any stuck state): delete `<overlay>/.bili-launch.lock/`. */
 export class OverlayBusyError extends Error {
     readonly code = "BILI_OVERLAY_BUSY";
-    constructor(readonly overlay: string, readonly holderPid?: number) {
+    constructor(readonly overlay: string, readonly holderPid?: number, detail?: string) {
         super(
             (holderPid !== undefined
                 ? `another bili launch (pid ${holderPid}) is using the shared overlay ${overlay} — only one bili launch per home runs at a time; wait for it to exit`
-                : `the shared overlay ${overlay} is held by a launch whose owner record is incomplete or unverifiable — if no bili launch of this home is running, remove ${overlayLeaseDir(overlay)} to unlock`)
+                : detail ?? `the shared overlay ${overlay} is held by a launch whose owner record is incomplete or unverifiable — if no bili launch of this home is running, remove ${overlayLeaseDir(overlay)} to unlock`)
                 + " (this launch made no changes)",
         );
         this.name = "OverlayBusyError";
@@ -2175,7 +2187,21 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
     }
 }
 
-export function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
+/** #2222 shared-state mode: when sharedSqlite is set, codex keeps its state
+ *  dbs in the real home (CODEX_SQLITE_HOME), so the overlay never copies them
+ *  in and never links them — a linked/copy'd main would re-open the two-paths-
+ *  over-one-inode WAL hazard (#381/#1917) the moment this flag flips back.
+ *  Sets LEFT in the overlay from legacy launches are still merged back here
+ *  (the same mergeSqliteSet provenance adjudication) so the upgrade folds
+ *  itself exactly once; afterwards the overlay holds no sqlite files and this
+ *  path is a no-op for them. */
+export function refreshOverlayHome(
+    realHome: string,
+    overlay: string,
+    generatedFile: string | string[],
+    opts?: { sharedSqlite?: boolean },
+): boolean {
+    const sharedSqlite = opts?.sharedSqlite === true;
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -2289,6 +2315,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         // (#1917, see copySqliteSet). Their sidecars travel with the base: an
         // individually linked/copied sidecar would share state across the two
         // paths again, so sidecars are skipped here entirely.
+        // #2222 shared mode: nothing is copied or linked — the dbs stay in the
+        // real home (CODEX_SQLITE_HOME), and linking them into the overlay
+        // would re-open the two-paths-over-one-inode hazard. They are excluded
+        // from the HOLLOW accounting too, since "not in the overlay" is the
+        // CORRECT steady state here, not a link failure.
         // Regular files only: a DIRECTORY named like a db must be mirrored by
         // the ordinary link path below, not routed into copySqliteSet where it
         // would fail and land in linkFailures.
@@ -2306,22 +2337,29 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         }
         // Merged-in bases are sqlite mains by construction (dbSets came from
         // isSqliteMain) and a successful merge guarantees their main now sits
-        // in the real home — they join the copy inventory even though they were
-        // absent from the pre-merge realEntries snapshot (#1951).
-        for (const base of mergedBases) realDbBases.add(base);
+        // in the real home — legacy mode re-imports them into the overlay even
+        // though they were absent from the pre-merge realEntries snapshot
+        // (#1951); shared mode must NOT (they belong to the real home now).
+        if (!sharedSqlite) {
+            for (const base of mergedBases) realDbBases.add(base);
+        }
+        const exclusionBases = sharedSqlite ? new Set([...realDbBases, ...mergedBases]) : realDbBases;
         const realDbMembers = new Set<string>();
-        for (const base of realDbBases) {
+        for (const base of exclusionBases) {
             for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
         }
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
         const copyPhaseEntries = [...realEntries];
-        for (const base of mergedBases) {
-            if (!realEntries.has(base)) copyPhaseEntries.push(base);
+        if (!sharedSqlite) {
+            for (const base of mergedBases) {
+                if (!realEntries.has(base)) copyPhaseEntries.push(base);
+            }
         }
         for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
+            if (sharedSqlite && realDbMembers.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -2366,7 +2404,39 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
     return true;
 }
 
-function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet<string>): boolean {
+/** True when both paths are regular files holding identical bytes (chunked
+ *  compare, nothing buffered whole). Any stat/read failure counts as
+ *  "different" — conservative, keeps the legacy quarantine path intact. */
+function sameRegularFileBytes(a: string, b: string): boolean {
+    let sa: fs.Stats;
+    let sb: fs.Stats;
+    try {
+        sa = fs.statSync(a);
+        sb = fs.statSync(b);
+    } catch {
+        return false;
+    }
+    if (!sa.isFile() || !sb.isFile() || sa.size !== sb.size) return false;
+    const fa = fs.openSync(a, "r");
+    const fb = fs.openSync(b, "r");
+    try {
+        const bufA = Buffer.allocUnsafe(Math.min(65536, sa.size));
+        const bufB = Buffer.allocUnsafe(Math.min(65536, sa.size));
+        let off = 0;
+        while (off < sa.size) {
+            const n = Math.min(bufA.length, sa.size - off);
+            if (fs.readSync(fa, bufA, 0, n, off) !== n || fs.readSync(fb, bufB, 0, n, off) !== n) return false;
+            if (!bufA.subarray(0, n).equals(bufB.subarray(0, n))) return false;
+            off += n;
+        }
+        return true;
+    } finally {
+        try { fs.closeSync(fa); } catch { /* already closed */ }
+        try { fs.closeSync(fb); } catch { /* already closed */ }
+    }
+}
+
+export function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet<string>): boolean {
     let st: fs.Stats;
     try {
         st = fs.lstatSync(src);
@@ -2429,7 +2499,20 @@ function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet
         }
         return true;
     }
+    // #3203: concurrent sessions each grow identical per-home markers in their
+    // own slots (codex's .sandbox_migration "v1"); a byte-identical loser
+    // carries no data, so drop it silently — the same rule mergeSqliteSet
+    // already applies to snapshots — instead of littering .bili-conflict.
+    const identicalFiles = dstStat !== undefined && sameRegularFileBytes(src, dst);
     if (dstStat && dstStat.mtimeMs >= st.mtimeMs) {
+        if (identicalFiles) {
+            try {
+                fs.unlinkSync(src);
+                return true;
+            } catch {
+                return false;
+            }
+        }
         try {
             fs.renameSync(src, freeConflictName(dst));
             return true;
@@ -2438,6 +2521,14 @@ function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet
         }
     }
     if (dstStat) {
+        if (identicalFiles) {
+            try {
+                fs.unlinkSync(src);
+                return true;
+            } catch {
+                return false;
+            }
+        }
         try {
             fs.renameSync(dst, freeConflictName(dst));
         } catch {
@@ -2956,6 +3047,112 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
     return ok;
 }
 
+/** #3203: bounded pool of per-session codex overlays in shared mode
+ *  (`<CODEX_HOME>-bili-s<N>`). Slots are persistent and reused across
+ *  sessions — never deleted: thread records written during a session keep
+ *  absolute rollout paths that resolve through the slot's sessions symlink
+ *  into the real home (#43bf59fc9 relink discipline), so removing a slot
+ *  would dangle them. Bounding the pool keeps the home from accumulating a
+ *  directory per session. */
+const CODEX_SESSION_SLOT_MAX = 16;
+
+/** #3203: claim a free per-session slot for this launch. Each slot is an
+ *  ordinary overlay with its own lease — concurrent claims serialize on the
+ *  atomic lock mkdir, so two launches never share a slot; a slot held by a
+ *  live foreign launch is skipped, not clobbered (#1952 discipline), and a
+ *  stale one is reclaimed by acquireOverlayLease. Exhaustion refuses loudly. */
+function allocateCodexSessionOverlay(codexHome: string): string {
+    for (let n = 1; n <= CODEX_SESSION_SLOT_MAX; n += 1) {
+        const slot = `${codexHome}-bili-s${n}`;
+        try {
+            fs.mkdirSync(slot, { recursive: true });
+        } catch {}
+        try {
+            acquireOverlayLease(slot);
+            return slot;
+        } catch (err) {
+            if (!(err instanceof OverlayBusyError)) throw err;
+        }
+    }
+    throw new OverlayBusyError(
+        `${codexHome}-bili`,
+        undefined,
+        `all ${CODEX_SESSION_SLOT_MAX} per-session codex slots are held by live bili launches — wait for one to exit`,
+    );
+}
+
+/** #3203: one-time fold of the pre-#3203 fixed-name overlay into the real
+ *  home. Shared-mode launches never refresh `<CODEX_HOME>-bili` again (they
+ *  use per-session slots), so anything still private in it — crashed-legacy
+ *  residue: SQLite sets, copy-fallback files — would stay stranded while the
+ *  live db moves to the real home. finalizeCodexHome merges exactly that back
+ *  (provenance adjudication; symlinks and generated files untouched) and is
+ *  a no-op once folded. Serialized through the legacy overlay's own lease: a
+ *  LIVE foreign holder means a legacy-era launch is still writing the logical
+ *  db through its own overlay copy — proceeding would dual-write it, so the
+ *  launch is refused loudly instead (#1952 discipline). Must run before any
+ *  other lease acquisition in this process (single global activeOverlayLease). */
+function migrateLegacyCodexOverlay(codexHome: string): void {
+    const legacy = `${codexHome}-bili`;
+    let st: fs.Stats;
+    try {
+        st = fs.lstatSync(legacy);
+    } catch {
+        return;
+    }
+    if (!st.isDirectory()) return;
+    acquireOverlayLease(legacy);
+    try {
+        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"]);
+    } finally {
+        releaseOverlayLease();
+    }
+}
+
+/** #3203: phase 1 of a shared-mode codex launch — claim THIS launch's
+ *  per-session slot BEFORE the proxy starts, because the proxy's lane
+ *  identity (codexSlotLane) derives from the slot name and concurrent
+ *  sessions must not be #3044 twins of each other. The claimed lease stays
+ *  held for the whole launch (runLaunch releases it in its finally, after
+ *  the exit merge-back — same ordering as the single-phase path). The
+ *  caller passes the returned dir back as prepareCodexHome's sessionSlot so
+ *  phase 2 (refresh + generated files, which need the proxy origin) does not
+ *  re-run migration/allocation: re-acquiring the legacy overlay's lease here
+ *  would clobber activeOverlayLease and strand this slot's lease until the
+ *  stale-reclaim on next launch. */
+function prepareCodexSessionSlot(codexHome: string): string {
+    migrateLegacyCodexOverlay(codexHome);
+    const overlay = allocateCodexSessionOverlay(codexHome);
+    // #3203: codex creates installation_id under CODEX_HOME (= the slot)
+    // on first use; with concurrent sessions each slot would grow its own
+    // UUID and the exit-time merge-back would quarantine one as
+    // .bili-conflict. Seed the real home atomically so every slot links
+    // ONE canonical identity file.
+    try {
+        const fd = fs.openSync(path.join(codexHome, "installation_id"), fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        try {
+            fs.writeSync(fd, randomUUID());
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    return overlay;
+}
+
+/** #3203: the per-session proxy lane for a slot-backed launch (`codex-s<N>`),
+ *  or undefined for non-slot overlays. A distinct lane per slot keeps
+ *  concurrent sessions' proxies from matching #3044's twin rule (same lane +
+ *  same port + same build ⇒ "the duplicate loses"): different sessions never
+ *  match, while a relaunch onto a still-draining slot's port waits on the
+ *  predecessor like any same-lane upgrade. The bounded slot pool bounds the
+ *  sticky zone-port records these lanes accumulate to CODEX_SESSION_SLOT_MAX. */
+function codexSlotLane(overlay: string): string | undefined {
+    const m = /-bili-s(\d+)$/.exec(path.basename(overlay));
+    return m === null ? undefined : `codex-s${m[1]}`;
+}
+
 /** #681/#1802: persistent <CODEX_HOME>-bili overlay. Carries (a) the bili MCP
  *  server in a merged config.toml when a per-spawn conversationId is given
  *  (inline `-c` args cannot survive cmd.exe on Windows), and (b) whenever the
@@ -2974,6 +3171,16 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  symmetric to .env, #1965). On normal exit the run's data is written back
  *  into the real home by finalizeCodexHome (#1965); generated files stay
  *  overlay-local throughout.
+ *  #2222: with sharedSqlite the overlay additionally holds no SQLite sets —
+ *  codex keeps its state dbs in the real home via CODEX_SQLITE_HOME (set by
+ *  the caller in the spawn env), so refresh neither copies them in nor links
+ *  them, and any leftover legacy sets are merged back as a one-time migration.
+ *  #3203: with sharedSqlite the overlay is a PER-SESSION slot from a bounded
+ *  pool (<CODEX_HOME>-bili-s<N>, CODEX_SESSION_SLOT_MAX) so concurrent
+ *  launches each own their generated files and proxy binding; the pre-#3203
+ *  fixed-name overlay is folded into the real home once (the launch is
+ *  refused while a live legacy-era launch still holds it). Slots persist and
+ *  are reused, never deleted (#43bf59fc9 path discipline).
  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
  *  be built (caller degrades: wire-injected compression still works, native
  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
@@ -2984,6 +3191,11 @@ export function prepareCodexHome(opts: {
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
+    /** #3203: slot already claimed by prepareCodexSessionSlot before the proxy
+     *  started (its lease is active in this process). Skips migration +
+     *  allocation; see that function for why the phases must not overlap. */
+    sessionSlot?: string;
 }): string | undefined {
     const { codexHome, origin, caPath, conversationId, manageRouting } = opts;
     let userEnvText: string | undefined;
@@ -3007,8 +3219,20 @@ export function prepareCodexHome(opts: {
     // would merge it back into the real home (#1802 review; config.toml
     // symmetric to .env, #1965).
     const generatedFiles: string[] = [".env", "config.toml"];
-    const overlay = `${codexHome}-bili`;
-    if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
+    let overlay: string;
+    if (opts.sharedSqlite) {
+        // #3203: shared mode runs a PER-SESSION slot from a bounded pool so
+        // concurrent launches each own their generated .env/config.toml and
+        // their proxy binding; the pre-#3203 fixed-name overlay is folded into
+        // the real home once (the launch is refused while a live legacy-era
+        // launch still holds it). Legacy mode below keeps the fixed name + its
+        // exclusive lease: its DB copy/merge-back arbitration is not safe
+        // across concurrent sessions.
+        overlay = opts.sessionSlot ?? prepareCodexSessionSlot(codexHome);
+    } else {
+        overlay = `${codexHome}-bili`;
+    }
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite })) return undefined;
     if (manageDotEnv) {
         try {
             const st = fs.lstatSync(path.join(overlay, ".env"));
@@ -3257,6 +3481,82 @@ export function codexSupportsNoDaemon(
     } catch {}
     codexNoDaemonCache.set(key, supported);
     return supported;
+}
+
+/** #2222: `codex --version` prints "codex-cli X.Y.Z" — parse it. */
+export function parseCodexVersion(output: string): [number, number, number] | undefined {
+    const m = /codex-cli[ \t]+(\d+)\.(\d+)\.(\d+)/i.exec(output);
+    if (m === null) return undefined;
+    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+
+const codexVersionCache = new Map<string, [number, number, number] | undefined>();
+
+/** #2222: version of a Codex CLI binary via `--version` (cached per resolved
+ *  command). Mirrors codexSupportsNoDaemon: spawned exactly like runClient
+ *  will spawn it (planClientSpawn + windowsVerbatimArguments), short timeout,
+ *  any failure → undefined so callers fall back conservatively. */
+function codexBinaryVersion(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): [number, number, number] | undefined {
+    const key = JSON.stringify([command, ...prefixArgs]);
+    const hit = codexVersionCache.get(key);
+    if (hit !== undefined) return hit;
+    let parsed: [number, number, number] | undefined;
+    try {
+        const plan = planClientSpawn(command, [...prefixArgs, "--version"], process.env, platform);
+        const res = spawnSync(plan.command, plan.args, {
+            timeout: 5000,
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsVerbatimArguments: plan.windowsVerbatimArguments,
+            windowsHide: true,
+        });
+        if (res.status === 0 && !res.error) parsed = parseCodexVersion(res.stdout.toString("utf8"));
+    } catch {}
+    codexVersionCache.set(key, parsed);
+    return parsed;
+}
+
+// #2222: oldest codex verified (source + real-binary probe) to honor
+// CODEX_SQLITE_HOME — introduced between 0.100.0 (absent) and 0.120.0 (present),
+// empirically confirmed on the CI-pinned 0.147.0. Gating at the oldest
+// e2e-tested release keeps every older install on the proven legacy path.
+const CODEX_SQLITE_HOME_MIN_VERSION: readonly [number, number, number] = [0, 147, 0];
+
+export function codexSupportsSqliteHome(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): boolean {
+    const v = codexBinaryVersion(command, prefixArgs, platform);
+    if (v === undefined) return false;
+    for (let i = 0; i < 3; i += 1) {
+        if (v[i] !== CODEX_SQLITE_HOME_MIN_VERSION[i]) return v[i] > CODEX_SQLITE_HOME_MIN_VERSION[i];
+    }
+    return true;
+}
+
+type CodexStateMode = "shared" | "legacy";
+
+/** #2222: BILI_CODEX_STATE_MODE escape hatch for the codex state-db strategy.
+ *  auto (default) — shared when the binary honors CODEX_SQLITE_HOME, else
+ *  legacy copy/adjudication; legacy — always the old path; shared — shared,
+ *  degrading to legacy with a warning when the binary is too old to honor
+ *  CODEX_SQLITE_HOME (silently ignoring an explicit request would hide the
+ *  mismatch). Unrecognized values warn and behave as auto. */
+export function resolveCodexStateMode(requested: string | undefined, supported: boolean): CodexStateMode {
+    const r = requested?.trim().toLowerCase();
+    if (r === "legacy") return "legacy";
+    if (r !== undefined && r !== "" && r !== "auto" && r !== "shared") {
+        console.error(`bili: unrecognized BILI_CODEX_STATE_MODE "${requested}" — using auto.`);
+    }
+    if (r === "shared" && !supported) {
+        console.error("bili: codex is too old to honor CODEX_SQLITE_HOME — BILI_CODEX_STATE_MODE=shared degrades to legacy state handling.");
+        return "legacy";
+    }
+    return supported ? "shared" : "legacy";
 }
 
 /**
@@ -4887,6 +5187,39 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
         config.codex = eff.config;
     }
+    // #3203: concurrent `bili codex` sessions each run their own session-scoped
+    // proxy, so they must not read as #3044 twins of each other (same build +
+    // same lane + same preferred port ⇒ the second child exits as a
+    // "duplicate"). Shared-mode overlay-backed launches therefore claim their
+    // per-session slot HERE, before the proxy starts, and run it under the
+    // slot-derived lane (codexSlotLane); legacy mode keeps the single fixed
+    // overlay (exclusive lease ⇒ no concurrency possible) and the plain
+    // "codex" lane. Refusal here happens pre-proxy: nothing was started yet,
+    // so exit 1 leaks no detached child (the post-proxy abort path stays for
+    // legacy mode only).
+    let codexSlot: string | undefined;
+    let codexLane: string | undefined;
+    // Resolved once here (not again in the codex env branch below) so the
+    // #2222 mode-decision warnings fire exactly once per launch.
+    let codexStateMode: CodexStateMode | undefined;
+    let codexSharedSqlite = false;
+    if (base === "codex") {
+        const { command: codexBinPre, prefixArgs: codexPrefixPre } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+        codexStateMode = resolveCodexStateMode(process.env.BILI_CODEX_STATE_MODE, codexSupportsSqliteHome(codexBinPre, codexPrefixPre, deps.platform ?? process.platform));
+        codexSharedSqlite = codexStateMode === "shared";
+        const needsOverlay = !launcherDirectUrl(process.env) || launcherInjectMcp(process.env, base, codexUpstreamUrl(config.codex));
+        if (codexSharedSqlite && needsOverlay) {
+            try {
+                codexSlot = prepareCodexSessionSlot(resolveCodexHome(process.env));
+            } catch (err) {
+                if (!(err instanceof OverlayBusyError)) throw err;
+                console.error(`bili: ${err.message}`);
+                process.exit(1);
+            }
+            codexLane = codexSlotLane(codexSlot);
+            console.error(`bili: codex session slot ${path.basename(codexSlot)} claimed — this launch's proxy runs on lane ${codexLane} (concurrent sessions stay isolated, #3203).`);
+        }
+    }
     let routes = discoverRoutes(base, config);
     if (base === "aider") {
         // #1048: the CLI channel (--openai-api-base / --set-env) outranks env
@@ -4949,7 +5282,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
         : [];
     const extNonHttpProviders = base === "pi" || base === "omp" ? resolveNonHttpProviders(process.env) : [];
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: codexLane ?? base, strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -5386,13 +5719,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // self-registration (codex provides no session id of its own).
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         const codexCaPath = resolveCombinedCaPath(process.env);
+        const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+        // #2222: state-db strategy (resolved pre-proxy above — see codexSlot
+        // claim block). On binaries that honor CODEX_SQLITE_HOME the live state
+        // dbs stay in the REAL home — one physical path per db, so native and
+        // bili runs coordinate through SQLite's own WAL locking instead of bili
+        // copying/adjudicating generations (#381/#1917/#2195 family).
+        // BILI_CODEX_STATE_MODE=legacy keeps the old overlay-copy path.
+        const codexSharedSqlite = (codexStateMode ?? "legacy") === "shared";
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             if (!codexRunModePinned(params.clientArgs)) {
-                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
                 if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
                     clientArgs = ["--no-daemon", ...clientArgs];
                     console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
@@ -5416,6 +5756,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // direct-URL launches only need it to carry the MCP server block.
         if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
             const codexRealHome = resolveCodexHome(process.env);
+            // A user-set CODEX_SQLITE_HOME wins over our default (the real home):
+            // native codex already reads state from there, so bili must share
+            // the SAME location to keep one logical database across both.
+            const userSqliteHome = process.env.CODEX_SQLITE_HOME?.trim() || undefined;
             let inj: ReturnType<typeof prepareCodexMcpInjection>;
             try {
                 inj = prepareCodexMcpInjection({
@@ -5424,6 +5768,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     caPath: codexCaPath,
                     conversationId: codexConversationId,
                     manageRouting: !directUrl,
+                    sharedSqlite: codexSharedSqlite,
+                    sqliteHome: codexSharedSqlite ? userSqliteHome ?? codexRealHome : undefined,
+                    // #3203: the slot was claimed pre-proxy (its lease is
+                    // active in this process) — phase 2 must not re-run
+                    // migration/allocation (see prepareCodexSessionSlot).
+                    sessionSlot: codexSharedSqlite ? codexSlot : undefined,
                 });
             } catch (err) {
                 if (!(err instanceof OverlayBusyError)) throw err;
@@ -5433,6 +5783,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
+            if (inj.envPatch.CODEX_SQLITE_HOME !== undefined) {
+                console.error(
+                    `bili: codex state shared — CODEX_SQLITE_HOME=${inj.envPatch.CODEX_SQLITE_HOME}; ` +
+                        "the SQLite state lives in the real home (one live db across native/bili runs), no overlay copies.",
+                );
+            }
             // #1965: remember the exact home pair this launch used so a clean
             // exit can write the run's data back into the REAL home. Only set
             // when the overlay actually became CODEX_HOME — a failed prepare

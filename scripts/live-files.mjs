@@ -13,6 +13,7 @@ export const LIVE_FILES = [
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",
     "tests/claude-native.test.ts",
+    "tests/codex-concurrent-launch.test.ts",
     "tests/e2e-plugin-tool-routing.test.ts",
     "tests/graceful-close.test.ts",
     "tests/hermes-native.test.ts",
