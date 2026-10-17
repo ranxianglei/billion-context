@@ -180,10 +180,15 @@ interface StorageStatusWire {
     bootstrapFailure: { atMs: number; reason: string } | null;
     cooldownRemainingMs: number | null;
     sidecarDisabled: boolean;
+    /** #3437: sidecar ingest counters — deltaIngests/ingests shows whether
+     *  steady-state saves ride the O(new-tail) fast path (#3133); null when
+     *  no sidecar instance is live. */
+    ingestStats: { ingests: number; deltaIngests: number; verifyDrift: number } | null;
 }
 
 export function storageStatusWire(): StorageStatusWire {
     const st = getStorageRuntimeStatus();
+    const stats = state.sidecar?.stats;
     return {
         requested: st.requested,
         effective: st.effective,
@@ -195,6 +200,7 @@ export function storageStatusWire(): StorageStatusWire {
         bootstrapFailure: st.bootstrapFailure,
         cooldownRemainingMs: st.cooldownRemainingMs,
         sidecarDisabled: st.sidecarDisabled,
+        ingestStats: stats ? { ingests: stats.ingests, deltaIngests: stats.deltaIngests, verifyDrift: stats.verifyDrift } : null,
     };
 }
 
