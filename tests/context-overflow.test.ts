@@ -151,6 +151,43 @@ test("a bare 5xx without an overflow marker is NOT an overflow", () => {
     assert.equal(inspectContextOverflow(503, '{"error":"upstream unavailable"}').isOverflow, false);
 });
 
+test("Chinese relays: localized overflow wording → overflow (#3240)", () => {
+    // Domestic relay/gateway (中转站) bodies localize the provider's rejection;
+    // phrasings quoted in billion-context-pi#639 plus common gateway variants.
+    // None carries a parseable window number → arm at payload size, never learn
+    // a wrong window.
+    const zhBodies = [
+        JSON.stringify({ error: { message: "上下文长度超出限制" } }),
+        JSON.stringify({ message: "输入长度超过模型支持的最大上下文长度" }),
+        JSON.stringify({ error: { message: "请求的输入 token 数超出限制" } }),
+        JSON.stringify({ error: { message: "输入 tokens 超过模型最大上下文长度" } }),
+        JSON.stringify({ error: { message: "超出模型的上下文窗口限制" } }),
+        JSON.stringify({ error: { message: "prompt 过长，请缩短输入后重试" } }),
+    ];
+    for (const body of zhBodies) {
+        const info = inspectContextOverflow(400, body);
+        assert.equal(info.isOverflow, true, `should match: ${body}`);
+        assert.equal(info.window, undefined, `no number to learn from: ${body}`);
+    }
+});
+
+test("a 5xx carrying a Chinese overflow marker IS an overflow (#2484 + #3240)", () => {
+    assert.equal(
+        inspectContextOverflow(502, '{"error":{"message":"上下文长度超出限制","type":"upstream_error"}}').isOverflow,
+        true,
+    );
+});
+
+test("Chinese errors that merely mention 上下文/token are NOT overflows (#3240)", () => {
+    // Directional-verb gate: auth expiry, rate limit and format errors must not
+    // arm the emergency shrink.
+    assert.equal(inspectContextOverflow(400, '{"message":"无效的 API key"}').isOverflow, false);
+    assert.equal(inspectContextOverflow(400, '{"message":"请求过于频繁，请稍后再试"}').isOverflow, false);
+    assert.equal(inspectContextOverflow(400, '{"message":"token 已过期，请重新登录"}').isOverflow, false);
+    assert.equal(inspectContextOverflow(400, '{"message":"输入格式错误：content 不能为空"}').isOverflow, false);
+    assert.equal(inspectContextOverflow(400, '{"message":"当前上下文窗口配置不正确"}').isOverflow, false);
+});
+
 test("empty body is NOT an overflow", () => {
     assert.equal(inspectContextOverflow(400, "").isOverflow, false);
 });

@@ -261,6 +261,18 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
     // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
     /exceeds the maximum number of tokens/i,
+    // #3240: domestic relay/gateway overflow wording — 中转站 localize provider
+    // rejections ("上下文长度超出限制", "输入长度超过模型支持的最大上下文长度",
+    // "请求的输入 token 数超出限制", …) and every pattern above is English, so a
+    // Chinese body never arms the overflow self-heal and a wrong declared window
+    // locks the session on repeated identical 400s. A directional verb
+    // (超出/超过/超限/过长/超长) is required: an unrelated 400 that merely mentions
+    // 上下文/token (auth expiry, rate limit, format error) must not match.
+    /上下文.{0,10}(?:超出|超过|超限|过长|超长)/,
+    /(?:超出|超过|超限).{0,10}上下文/,
+    /输入.{0,12}(?:超出|超过|超限|过长|超长)/,
+    /token\s*数.{0,10}(?:超出|超过|超限)/i,
+    /prompt.{0,6}(?:过长|太长|超长)/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
