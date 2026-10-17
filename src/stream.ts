@@ -897,6 +897,32 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
                 : "";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}${revs.length > 0 ? " [reversed refs]" : ""}]`);
+            // #3596: a sub-agent lane that replays its whole parent history as ONE
+            // opaque message ends its own state with ZERO mapped refs (the single
+            // blob never gains per-message granularity), yet the model cites the
+            // PARENT session's mNNNNN refs — rendered into the blob by the host.
+            // Every such ref is necessarily unknown here and NONE can ever resolve:
+            // this is not stale-generation or a typo, so the generic per-ref
+            // "unknown … run acp_status and retry" dump (#2146/#1112 family) loops
+            // forever on a structurally incompressible lane. Return a clean
+            // conclusive verdict instead of the per-ref list; the operator log
+            // above keeps the full kernel text. Complements #3126 (empty in-memory
+            // view): here the view is non-empty but carries no addressable refs.
+            const mappedRefCount = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
+            if (mappedRefCount === 0) {
+                const msgCount = ctx.messages.length;
+                const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+                const shapeNote = msgCount === 1 && totalChars > 0
+                    ? " Its single message is an opaque blob — the host serialized the whole parent history into one unstructured message (#3596) — which has no per-message boundaries for bili to fold."
+                    : "";
+                const specKey = normalizedSpecKey(ranges);
+                const repeatGuard = recordCompressFailure(ctx.session, specKey);
+                const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
+                const guard = loopGuard === "" ? repeatGuard : loopGuard;
+                return compressResult(
+                    `[Compression FAILED: this conversation has ${msgCount} message(s) but ZERO addressable per-message refs, so NO ref can resolve here${shapeNote}. The mNNNNN refs you cited belong to a different namespace and cannot resolve in this session. Compression is structurally impossible on this lane — do NOT retry compress or call acp_status about it; continue the task.${guard}]`,
+                    "refused", 0, "gate:non-addressable");
+            }
             // #1036 span hint names boundary+1..highest ("still raw") — it
             // duplicates the snapshot's lo–hi exactly when no fold covers
             // anything, so only append it when active blocks exist.
