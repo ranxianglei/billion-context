@@ -17,8 +17,9 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
  * outlive deleteSession (GC protection) — that is the whole point of the
  * feature: a replica taken before an experiment survives the experiment.
  *
- * Semantics are asserted at the SessionStore API level; the /__bili/replicas
- * HTTP routes in server/admin.ts are a thin mapping over these calls.
+ * Semantics are asserted at the SessionStore API level; the /__bili/checkpoints
+ * HTTP routes (deprecated alias: /__bili/replicas, #3633) in server/admin.ts
+ * are a thin mapping over these calls.
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -84,8 +85,8 @@ test("replicas: create → list → detail round-trip (shadow mode, real persist
             await store.writeNow(session);
             store.cancelAll();
 
-            assert.ok(store.replicasAvailable(), "shadow mode must expose replicas");
-            const row = store.createReplica(session.id, { label: "before-experiment" });
+            assert.ok(store.checkpointsAvailable(), "shadow mode must expose replicas");
+            const row = store.createCheckpoint(session.id, { label: "before-experiment" });
             assert.match(row.cp_id, /^cp-/);
             assert.equal(row.session_id, session.id);
             assert.ok(row.seq_at > 0, `seq_at must be the absolute tip, got ${row.seq_at}`);
@@ -94,10 +95,10 @@ test("replicas: create → list → detail round-trip (shadow mode, real persist
             assert.equal(row.label, "before-experiment");
             assert.ok(row.block_set_hash.length >= 16, "block set hash is a sha256 prefix at least");
 
-            const listed = store.listReplicas(session.id);
+            const listed = store.listCheckpoints(session.id);
             assert.equal(listed.length, 1);
             assert.equal(listed[0]!.cp_id, row.cp_id);
-            assert.ok(store.replicaByteLen(row.cp_id) > 0, "frozen record blob must have size");
+            assert.ok(store.checkpointByteLen(row.cp_id) > 0, "frozen record blob must have size");
             store.closeQuietly();
         } finally {
             try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
@@ -114,7 +115,7 @@ test("replicas: restore materializes a NEW session with identical content, even 
             await store.writeNow(session);
             store.cancelAll();
 
-            const pinned = store.createReplica(session.id, { pinned: true, label: "safe copy" });
+            const pinned = store.createCheckpoint(session.id, { pinned: true, label: "safe copy" });
             const before = (() => {
                 const unified = UnifiedStore.open(path.join(dir, "index.db"));
                 try {
@@ -137,7 +138,7 @@ test("replicas: restore materializes a NEW session with identical content, even 
             gc.deleteSession(session.id);
             gc.close();
 
-            const restored = await store.restoreReplica(pinned.cp_id);
+            const restored = await store.restoreCheckpoint(pinned.cp_id);
             assert.notEqual(restored.sessionId, session.id);
             assert.equal(restored.restoredFrom, session.id);
 
@@ -200,8 +201,8 @@ test("replicas: pinned survives deleteSession GC, unpinned is swept with it", as
             const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
             await store.writeNow(session);
             store.cancelAll();
-            const pinned = store.createReplica(session.id, { pinned: true, label: "keep" });
-            const loose = store.createReplica(session.id, {});
+            const pinned = store.createCheckpoint(session.id, { pinned: true, label: "keep" });
+            const loose = store.createCheckpoint(session.id, {});
 
             const unified = UnifiedStore.open(path.join(dir, "index.db"));
             try {
@@ -231,9 +232,9 @@ test("replicas: legacy mode fails fast (501-class), explicit delete overrides pi
         const legacyStore = new SessionStore({ dir, debounceMs: 1, enabled: true });
         await legacyStore.writeNow(session);
         legacyStore.cancelAll();
-        assert.equal(legacyStore.replicasAvailable(), false);
-        assert.throws(() => legacyStore.createReplica(session.id), /legacy-only/);
-        assert.throws(() => legacyStore.listReplicas(), /legacy-only/);
+        assert.equal(legacyStore.checkpointsAvailable(), false);
+        assert.throws(() => legacyStore.createCheckpoint(session.id), /legacy-only/);
+        assert.throws(() => legacyStore.listCheckpoints(), /legacy-only/);
 
         // Now flip the same directory into shadow mode: organic import on
         // first write brings the session into the index, and the full API
@@ -245,10 +246,10 @@ test("replicas: legacy mode fails fast (501-class), explicit delete overrides pi
             assert.ok(s2);
             await store.writeNow(s2);
             store.cancelAll();
-            const pinned = store.createReplica(session.id, { pinned: true });
-            assert.equal(store.deleteReplica(pinned.cp_id), true);
-            assert.equal(store.listReplicas().length, 0);
-            assert.equal(store.deleteReplica(pinned.cp_id), false, "second delete: gone is gone");
+            const pinned = store.createCheckpoint(session.id, { pinned: true });
+            assert.equal(store.deleteCheckpoint(pinned.cp_id), true);
+            assert.equal(store.listCheckpoints().length, 0);
+            assert.equal(store.deleteCheckpoint(pinned.cp_id), false, "second delete: gone is gone");
         });
         legacyStore.closeQuietly();
     } finally {

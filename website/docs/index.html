@@ -266,6 +266,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li class="tg" data-i18n-html="tg.beh"><strong>Behavior toggles</strong></li>
           <li data-i18n-html="tt.rollout"><code>rollout</code> — canary gating: features enable for a percent of installs, bucketed on a stable per-machine UUID; nested <span class='mech'>base</span> rolls B out only inside A's cohort.</li>
           <li data-i18n-html="tt.mask"><code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked).</li>
+          <li data-i18n-html="tt.srr"><code>strictSessionRouting</code> — reject mis-pinned sessions with 409 instead of starting them cold on the wrong instance (off by default; BILI_STRICT_SESSION_ROUTING wins).</li>
           <li data-i18n-html="tt.adminrelay"><code>security.adminRelay</code> — relay the /__bili/ admin surface through the embedding host's web entry (off by default; fail-closed).</li>
           <li data-i18n-html="tt.subagent"><code>subagentSplit</code> — Claude subagents get their own session namespace (on by default).</li>
           <li data-i18n-html="tt.fork"><code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default).</li>

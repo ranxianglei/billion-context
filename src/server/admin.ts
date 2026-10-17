@@ -205,7 +205,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/session-report")) return sendSessionReport(res, req.url);
-    if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts, instanceId);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
@@ -450,12 +450,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true }));
         return;
     }
-    // #2671 Phase 2: replica/checkpoint management over the unified store.
+    // #2671 Phase 2: session-checkpoint management over the unified store.
     // Loopback-gated like every /__bili/ route; 501 in legacy mode so the
     // operator knows the knob, not the URL, is what is missing.
-    if (req.method === "GET" && (req.url === "/__bili/replicas" || req.url?.startsWith("/__bili/replicas?"))) return await sendReplicasList(res, req.url);
+    // #3633: the canonical prefix is /__bili/checkpoints; /__bili/replicas
+    // stays routable as a deprecated alias ("replica" always meant a frozen
+    // session copy, never a pod peer). Response keys follow the prefix used,
+    // so pre-existing scripts keep parsing byte-for-byte.
+    const cpRoute = matchCheckpointBase(req.url);
+    if (req.method === "GET" && cpRoute !== null && (cpRoute.url === cpRoute.base || cpRoute.url.startsWith(cpRoute.base + "?"))) return await sendCheckpointsList(res, cpRoute.url, cpRoute.base);
     if (req.method === "GET" && req.url === "/__bili/memory") return await sendMemoryReport(res);
-    if (req.method === "POST" && req.url === "/__bili/replicas") {
+    if (req.method === "POST" && cpRoute !== null && cpRoute.url === cpRoute.base) {
         try {
             const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; label?: unknown; pinned?: unknown };
             if (typeof parsed.sessionId !== "string" || !parsed.sessionId) {
@@ -464,9 +469,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 return;
             }
             const store = getStore();
-            if (!store.replicasAvailable()) {
+            if (!store.checkpointsAvailable()) {
                 res.writeHead(501, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                res.end(JSON.stringify({ ok: false, error: "checkpoints require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
                 return;
             }
             // Freshest snapshot first: a resident session is force-flushed so
@@ -475,12 +480,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             const resident = peekSession(parsed.sessionId);
             if (resident) await store.writeNow(resident);
             try {
-                const row = store.createReplica(parsed.sessionId, {
+                const row = store.createCheckpoint(parsed.sessionId, {
                     label: typeof parsed.label === "string" ? parsed.label : undefined,
                     pinned: parsed.pinned === true,
                 });
                 res.writeHead(201, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: true, replica: serializeReplica(row) }));
+                res.end(JSON.stringify({ ok: true, [checkpointKey(cpRoute.base)]: serializeCheckpoint(row) }));
             } catch (err) {
                 const msg = String(err);
                 res.writeHead(msg.includes("not in the unified index") ? 404 : 500, { "content-type": "application/json" });
@@ -493,19 +498,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
-    if (req.method === "GET" && req.url?.startsWith("/__bili/replicas/") && !req.url.endsWith("/restore")) return await sendReplicaDetail(res, req.url);
-    if (req.method === "POST" && req.url?.startsWith("/__bili/replicas/") && req.url.endsWith("/restore")) {
+    if (req.method === "GET" && cpRoute !== null && cpRoute.url.startsWith(cpRoute.base + "/") && !cpRoute.url.endsWith("/restore")) return await sendCheckpointDetail(res, cpRoute.url, cpRoute.base);
+    if (req.method === "POST" && cpRoute !== null && cpRoute.url.startsWith(cpRoute.base + "/") && cpRoute.url.endsWith("/restore")) {
         try {
-            const cpId = replicaIdFromUrl(req.url, "/restore");
+            const cpId = checkpointIdFromUrl(cpRoute.url, cpRoute.base, "/restore");
             if (!cpId) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>/restore" }));
+                res.end(JSON.stringify({ ok: false, error: `expected ${cpRoute.base}/<cpId>/restore` }));
                 return;
             }
             const store = getStore();
-            if (!store.replicasAvailable()) {
+            if (!store.checkpointsAvailable()) {
                 res.writeHead(501, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+                res.end(JSON.stringify({ ok: false, error: "checkpoints require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
                 return;
             }
             let newSessionId: string | undefined;
@@ -520,7 +525,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 newSessionId = parsed.sessionId as string | undefined;
             }
             try {
-                const out = await store.restoreReplica(cpId, { sessionId: newSessionId });
+                const out = await store.restoreCheckpoint(cpId, { sessionId: newSessionId });
                 res.writeHead(201, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, ...out }));
             } catch (err) {
@@ -536,20 +541,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
-    if (req.method === "DELETE" && req.url?.startsWith("/__bili/replicas/")) {
-        const cpId = replicaIdFromUrl(req.url);
+    if (req.method === "DELETE" && cpRoute !== null && cpRoute.url.startsWith(cpRoute.base + "/")) {
+        const cpId = checkpointIdFromUrl(cpRoute.url, cpRoute.base);
         if (!cpId) {
             res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+            res.end(JSON.stringify({ ok: false, error: `expected ${cpRoute.base}/<cpId>` }));
             return;
         }
         const store = getStore();
-        if (!store.replicasAvailable()) {
+        if (!store.checkpointsAvailable()) {
             res.writeHead(501, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+            res.end(JSON.stringify({ ok: false, error: "checkpoints require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
             return;
         }
-        const deleted = store.deleteReplica(cpId);
+        const deleted = store.deleteCheckpoint(cpId);
         res.writeHead(deleted ? 200 : 404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: deleted, deleted }));
         return;
@@ -755,10 +760,10 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
 
-// ---- #2671 Phase 2: replica (checkpoint) helpers --------------------------
+// ---- #2671 Phase 2: session-checkpoint helpers (#3633 renamed) ------------------
 
 /** checkpoints row (snake_case) → HTTP payload (camelCase). */
-function serializeReplica(row: {
+function serializeCheckpoint(row: {
     cp_id: string;
     session_id: string;
     seq_at: number;
@@ -771,8 +776,25 @@ function serializeReplica(row: {
     return { cpId: row.cp_id, sessionId: row.session_id, seqAt: row.seq_at, blockSetHash: row.block_set_hash, kind: row.kind, createdAt: row.created_at, pinned: row.pinned === 1, label: row.label };
 }
 
-function replicaIdFromUrl(url: string, suffix = ""): string | null {
-    const id = url.slice("/__bili/replicas/".length, url.length - suffix.length);
+/** #3633: which checkpoint API prefix this URL uses — the canonical
+ *  /__bili/checkpoints or the deprecated /__bili/replicas alias. Returns the
+ *  matched base WITH the narrowed url string so callers never re-read
+ *  req.url (string | undefined) past the null check. */
+function matchCheckpointBase(url: string | undefined): { base: "/__bili/checkpoints" | "/__bili/replicas"; url: string } | null {
+    if (typeof url !== "string") return null;
+    if (url.startsWith("/__bili/checkpoints")) return { base: "/__bili/checkpoints", url };
+    if (url.startsWith("/__bili/replicas")) return { base: "/__bili/replicas", url };
+    return null;
+}
+
+/** Response object key for the prefix used — "checkpoint" on the canonical
+ *  path, "replica" on the alias, so pre-existing scripts keep parsing. */
+function checkpointKey(base: string): string {
+    return base === "/__bili/checkpoints" ? "checkpoint" : "replica";
+}
+
+function checkpointIdFromUrl(url: string, base: string, suffix = ""): string | null {
+    const id = url.slice(base.length + 1, url.length - suffix.length);
     return id && !id.includes("/") ? decodeURIComponent(id) : null;
 }
 
@@ -801,42 +823,42 @@ async function sendMemoryReport(res: http.ServerResponse): Promise<void> {
     }, null, 2));
 }
 
-async function sendReplicasList(res: http.ServerResponse, url: string): Promise<void> {
+async function sendCheckpointsList(res: http.ServerResponse, url: string, base: string): Promise<void> {
     const store = getStore();
-    if (!store.replicasAvailable()) {
+    if (!store.checkpointsAvailable()) {
         res.writeHead(501, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        res.end(JSON.stringify({ ok: false, error: "checkpoints require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
         return;
     }
     const q = new URL(url, "http://localhost").searchParams.get("sessionId");
-    const rows = store.listReplicas(q ?? undefined);
+    const rows = store.listCheckpoints(q ?? undefined);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, replicas: rows.map(serializeReplica) }, null, 2));
+    res.end(JSON.stringify({ ok: true, [checkpointKey(base) + "s"]: rows.map(serializeCheckpoint) }, null, 2));
 }
 
-async function sendReplicaDetail(res: http.ServerResponse, url: string): Promise<void> {
+async function sendCheckpointDetail(res: http.ServerResponse, url: string, base: string): Promise<void> {
     const store = getStore();
-    if (!store.replicasAvailable()) {
+    if (!store.checkpointsAvailable()) {
         res.writeHead(501, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "replicas require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
+        res.end(JSON.stringify({ ok: false, error: "checkpoints require the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full" }));
         return;
     }
-    const cpId = replicaIdFromUrl(url);
+    const cpId = checkpointIdFromUrl(url, base);
     if (!cpId) {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "expected /__bili/replicas/<cpId>" }));
+        res.end(JSON.stringify({ ok: false, error: `expected ${base}/<cpId>` }));
         return;
     }
     try {
-        const row = store.listReplicas().find((r) => r.cp_id === cpId);
+        const row = store.listCheckpoints().find((r) => r.cp_id === cpId);
         if (!row) {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: `checkpoint not found: ${cpId}` }));
             return;
         }
-        const byteLen = store.replicaByteLen(cpId);
+        const byteLen = store.checkpointByteLen(cpId);
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, replica: { ...serializeReplica(row), byteLen } }, null, 2));
+        res.end(JSON.stringify({ ok: true, [checkpointKey(base)]: { ...serializeCheckpoint(row), byteLen } }, null, 2));
     } catch (err) {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: String(err) }));
@@ -912,7 +934,7 @@ function updateReadyPayload(): { kind: "available" | "ready"; version: string; s
     return updateBannerPayload(getUpdateVisibility(VERSION));
 }
 
-async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
+async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, instanceId: string): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
     try {
@@ -921,14 +943,26 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const splitWarnings = splitSessionWarnings(listSessions());
+    const residentSessions = listSessions();
+    const splitWarnings = splitSessionWarnings(residentSessions);
     for (const w of splitWarnings) {
         if (!splitWarnedBases.has(w.base)) {
             splitWarnedBases.add(w.base);
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    // #3633: instance identity + how many persisted session records THIS
+    // instance holds (the same set the web session list shows). Together they
+    // let a load-balancer script detect "session moved": a client pinned to
+    // instance A that lands on B sees a different instanceId and its session
+    // missing from B. null when the disk walk fails (status never 500s).
+    let sessionsOnDisk: number | null = null;
+    try {
+        sessionsOnDisk = (await buildSessionList()).length;
+    } catch {
+        sessionsOnDisk = null;
+    }
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(residentSessions), instanceId, sessionsOnDisk, storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:

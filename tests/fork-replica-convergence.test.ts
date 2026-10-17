@@ -118,7 +118,7 @@ test("fork receipts cut pinned fork_base checkpoints that survive session deleti
         //    via the replicas API — a fresh session id serving the identical
         //    ordered snapshot (Phase 3 envelope-drop substrate).
         assert.ok(parentBase, "parent fork_base missing");
-        const reborn = await h.store.restoreReplica(parentBase!.cpId, { sessionId: parentSessionId + "-reborn" });
+        const reborn = await h.store.restoreCheckpoint(parentBase!.cpId, { sessionId: parentSessionId + "-reborn" });
         assert.equal(reborn.restoredFrom, parentSessionId);
         const rebornSnapshot = await h.request(`/__bili/plugin/snapshot?conversationId=${reborn.sessionId}`);
         assert.equal(rebornSnapshot.status, 200, JSON.stringify(rebornSnapshot.body));

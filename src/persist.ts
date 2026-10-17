@@ -534,7 +534,7 @@ export class SessionStore {
     }
 
     /** Writes a content-store envelope by id+meta with the same atomic
-     *  tmp+rename discipline as saveContentStore — used by restoreReplica,
+     *  tmp+rename discipline as saveContentStore — used by restoreCheckpoint,
      *  which has no live Session to mark dirty (#2671 review 6). */
     private writeContentStoreSidecar(id: string, meta: { protocol?: string; upstreamOrigin?: string } | undefined, store: MessageContentStore): void {
         const rel = contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin);
@@ -692,10 +692,10 @@ export class SessionStore {
         // mtime only orders the parse window, never the survivor choice).
         // Seed label aliases from the index rows first (no decode); the rest
         // of the bookkeeping finishes in the background. Gate is
-        // replicasAvailable() — a live non-degraded sidecar EXISTS (shadow OR
+        // checkpointsAvailable() — a live non-degraded sidecar EXISTS (shadow OR
         // full) — NOT readsUnified, which is the full-mode-only "rows are
         // authoritative" predicate.
-        if (this.replicasAvailable()) {
+        if (this.checkpointsAvailable()) {
             this.seedIndexedAliases(canonical);
             const hot = (filesByRoot.get(this.sessionsDir) ?? [])
                 .map((file) => {
@@ -939,7 +939,7 @@ export class SessionStore {
             // face of #2401. Import only when the index has never seen the id
             // (organic first open) or the payload is strictly newer than the
             // row (a JSON write that bypassed the ingest: #408 clamp rewrite,
-            // #286 rekey, restoreReplica's direct writeNow — all stamp a fresh
+             // #286 rekey, restoreCheckpoint's direct writeNow — all stamp a fresh
             // savedAt at build time).
             const dbAt = this.shadow.sessionUpdatedAt(id);
             if (dbAt === null || payload.savedAt > dbAt) {
@@ -1261,7 +1261,11 @@ export class SessionStore {
         }
     }
 
-    replicasAvailable(): boolean {
+    /** #3633: renamed from replicasAvailable() — these are session
+     *  CHECKPOINTS (frozen copies restorable into new sessions), not peer
+     *  replicas of this proxy; the word "replica" collided with pod-replica
+     *  for operators running StatefulSets. */
+    checkpointsAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
@@ -1327,7 +1331,7 @@ export class SessionStore {
     /** #2960 R2.1: durable identity lookup — (namespace, conversation id) →
      *  sessions row key. Null when unavailable or unclaimed. */
     lookupConversation(namespace: string, conversationId: string): string | null {
-        if (!this.replicasAvailable()) return null;
+        if (!this.checkpointsAvailable()) return null;
         try {
             return (this.shadow as UnifiedShadow).lookupConversation(namespace, conversationId);
         } catch {
@@ -1338,7 +1342,7 @@ export class SessionStore {
     // ------------------------------------------------------------------
     // Extension namespaces (#3069 v4). Available in shadow AND full (like
     // checkpoints); legacy-only instances fail fast with the same 501-able
-    // message the replica routes use. These are HOST/PLUGIN/UI state — the
+    // message the checkpoint routes use. These are HOST/PLUGIN/UI state — the
     // kernel session state stays in kstate_json and never flows here.
     // ------------------------------------------------------------------
 
@@ -1374,7 +1378,7 @@ export class SessionStore {
         return this.liveShadow().deleteKv(namespace, key);
     }
     private liveShadow(): UnifiedShadow {
-        if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
+        if (!this.checkpointsAvailable()) throw new Error("[storage] checkpoints require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
     }
 
@@ -1388,7 +1392,7 @@ export class SessionStore {
      *  envelope persists (pluginSnapshot + forkContentStore included). The
      *  pinned row survives session deletion (deleteSession sweeps only
      *  unpinned checkpoints), so the fork substrate can be resurrected via
-     *  restoreReplica even after the session row and envelope are gone —
+     *  restoreCheckpoint even after the session row and envelope are gone —
      *  the substrate Phase 3 needs to stop writing the envelope blobs. */
     private maybeCutForkBase(session: Session): void {
         if (!this.shadow || this.shadow.stats.disabled) return;
@@ -1423,12 +1427,12 @@ export class SessionStore {
         }
     }
 
-    createReplica(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
+    createCheckpoint(sessionId: string, opts: { label?: string; pinned?: boolean; kind?: "auto" | "manual" | "replica" | "fork_base" } = {}): CheckpointRow {
         const shadow = this.liveShadow();
         const view = shadow.viewFor(sessionId);
         if (!view) throw new Error(`[storage] session ${sessionId} is not in the unified index (unknown, or never persisted under this mode)`);
         const record = viewToRecord(view);
-        // CCR originals must survive the rollback the replica exists for:
+        // CCR originals must survive the rollback the checkpoint exists for:
         // the live content-store sidecar (not just what the unified index
         // captured) is the authoritative envelope — stamp it into the frozen
         // record (#2690 review blocking 6: "restore without the content-store
@@ -1456,12 +1460,12 @@ export class SessionStore {
         return row;
     }
 
-    listReplicas(sessionId?: string): CheckpointRow[] {
+    listCheckpoints(sessionId?: string): CheckpointRow[] {
         return this.liveShadow().listCheckpoints(sessionId);
     }
 
     /** Blob size of one checkpoint's frozen record (for detail views). */
-    replicaByteLen(cpId: string): number {
+    checkpointByteLen(cpId: string): number {
         return this.liveShadow().checkpointState(cpId).byteLen;
     }
 
@@ -1469,7 +1473,7 @@ export class SessionStore {
      *  touched). The frozen record is written through the normal dual path —
      *  legacy JSON file + unified ingest — so the restored session is a
      *  first-class citizen from the first read. */
-    async restoreReplica(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; seqAt: number }> {
+    async restoreCheckpoint(cpId: string, opts: { sessionId?: string } = {}): Promise<{ sessionId: string; restoredFrom: string; seqAt: number }> {
         const shadow = this.liveShadow();
         const cp = shadow.getCheckpoint(cpId);
         if (!cp) throw new Error(`[storage] checkpoint not found: ${cpId}`);
@@ -1486,7 +1490,7 @@ export class SessionStore {
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
         shadow.record(record);
-        // #3049: the replica record was ingested from the checkpoint payload
+        // #3049: the checkpoint record was ingested from the frozen payload
         // — the ownership token must mirror exactly those counters.
         this.ownCommit.set(newId, {
             requests: record.stats?.requests ?? record.requests ?? 0,
@@ -1505,7 +1509,7 @@ export class SessionStore {
 
     /** Drops a checkpoint. Explicit operator action overrides `pinned` —
      *  pinning protects against GC, not against deletion. */
-    deleteReplica(cpId: string): boolean {
+    deleteCheckpoint(cpId: string): boolean {
         return this.liveShadow().deleteCheckpoint(cpId);
     }
 

@@ -446,6 +446,47 @@ The same bounded retry now covers the **owner-managed lanes** the global self-up
 
 Independent of auto-update (#1481): even with `autoUpdate` off, the proxy polls a small companion npm package (`billion-context-advisories`, published by CI from this repo's [`advisories/`](advisories/) directory) on the same 3-minute cadence. Each advisory names a semver range of broken versions (`affected`), the exact version to install (`target` — which may be *older* than the current one, i.e. a rollback), and a user-facing `reason`. When the local version falls inside `affected`, bili force-installs `target` through the self-updater's full safety chain (cross-process lock, backup + verify + rollback; source checkouts and host-managed installs are refused with manual instructions instead) and warns prominently: a one-time `[advisory] ⚠️ …` log line per process per advisory id, a banner on the web UI showing the reason and the exact manual upgrade command, and the active entry under `advisory` in `/__bili/status`. The check is fail-open by design: an unreachable or malformed advisory source only produces a warning — model traffic is never blocked by it. Disable via config (`"advisoryCheck": false`) or env (`BILI_ADVISORY_CHECK=0`); point at a custom document with `"advisoryUrl"` / `BILI_ADVISORY_URL`.
 
+### Running multiple instances (#3633)
+
+All state is **strictly local to each instance**: session files under the sessions dir (default `~/.local/share/billion-context/sessions`, relocate with `BILI_SESSIONS_DIR`), the unified SQLite index (`index.db`, WAL mode — see [CONFIGURATION.md](CONFIGURATION.md#environment-variables) for `BILI_STORAGE_UNIFIED`), and the prefix-affinity chains (`prefix-affinity.json` in the XDG state dir). There is **no replication, shared storage, or leader election** — multi-instance deployments work, but they put the pinning responsibility on your load balancer. The rules that make that safe:
+
+- **One volume per instance, never a shared filesystem.** In Kubernetes terms: a StatefulSet with ReadWriteOnce PVCs, one per ordinal. Do NOT mount the sessions dir on a network filesystem (ReadWriteOnceMany/NFS/CIFS): WAL mode needs a coherent `-shm` sidecar file plus byte-range locking that NFS-class filesystems do not provide, and the store's `busy_timeout=5000` turns the resulting hard failure into *silent* corruption instead of a clean error. The same applies to two processes writing one local directory — that single-host co-resident scenario and its security boundary are documented in [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#shared-state-dir-and-multi-instance-security-boundary-394--1724).
+- **Pin each client to one instance for the life of its sessions.** A session arriving at an instance that never saw it is *cold* there — no index row, no session file, no prefix-affinity chain — so compression history and prefix-cache affinity are invisible to that instance (not lost: they remain on the owning instance). ClientIP-based stickiness breaks for NATed or roaming clients whose source address changes; stickiness keyed by session id (or a stable client token) is the robust form.
+- **There is no failover.** Scaling down strands live sessions on the removed instance until traffic returns; scaling up recovers them because StatefulSets rebind the same ordinal's volume (PVC retention `Retain`) and prefix-affinity chains hydrate from disk at boot. This is "pin and don't lose", not "any replica serves any session" — plan capacity accordingly.
+
+**Why horizontal scale-out stops here, and how to pin at layer 7.** Serving a session is a function of *local* state only — there is deliberately nothing shared to query — so the pinning above is a hard requirement, not a performance hint, and no stock Kubernetes primitive provides it: `sessionAffinity` supports `ClientIP` only, and attaching ClientIP stickiness means losing every session the moment a client's source address changes (NAT rebalance, laptop roaming, pod-network shift) — the first rollout of such a setup strands the whole fleet of conversations cold. The pinning belongs to your L7 layer: put a real proxy in front of the StatefulSet and hash consistently on the session header your clients send. The proxy keys each conversation on the first non-empty value of its header precedence list (`x-bili-plugin-conversation`, `x-claude-code-session-id`, `x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`, `x-opencode-session-id`, `x-session-affinity`, `x-acp-session`, `x-session-id`, …); for OpenCode clients that is `x-opencode-session-id`. nginx (consistent hashing keeps a conversation on one instance across reloads — plain `hash` re-scatters everything on config change):
+
+```nginx
+upstream bili {
+    server bili-0.bili-headless:8787;
+    server bili-1.bili-headless:8787;
+}
+location / {
+    proxy_pass http://bili;
+    proxy_set_header Host $host;
+    # hash on the header your clients actually send; for anything else swap
+    # the variable ($http_x_session_affinity, $http_x_acp_session, …)
+    hash $http_x_opencode_session_id consistent;
+}
+```
+
+Envoy equivalent — a route-level `hash_policy` (header hash policies are consistent by default):
+
+```yaml
+routes:
+  - match: { prefix: "/" }
+    route:
+      cluster: bili
+      hash_policy:
+        - header: { header_name: x-opencode-session-id }
+```
+
+Requests carrying no session header at all have no cross-instance identity to pin on — route them by ClientIP or arbitrarily; they resolve internally by content prefix, so a miss costs a cold start, not correctness.
+
+**Making a pinning violation visible: `strictSessionRouting`.** By default a mis-pinned request silently starts a cold session on the wrong instance — it works, but the owning instance's compression state sits unused and the symptom is invisible. Opt in to making it loud: set `"strictSessionRouting": true` (or `BILI_STRICT_SESSION_ROUTING=1`) and any request whose session id this instance has never seen locally (memory *or* disk) and whose resent history already carries prior turns is rejected with `409` plus an actionable message naming this instance's `instanceId`, instead of starting cold. Genuinely fresh conversations always pass (the check demands prior-turn evidence in the resent history), anonymous header-less clients are unaffected, and single-instance deployments never trip it. It is a tripwire for your load balancer, not a replacement for correct pinning — fix the routing, then keep it armed.
+
+Naming note: the management endpoints `GET/POST /__bili/checkpoints[/<cpId>]` (and their deprecated alias `/__bili/replicas/…`) are about **session checkpoints** — freezing one session's persisted state and restoring it as a new session — not about pod replicas or peer instances. Likewise `BILI_STORAGE_UNIFIED=shadow|full` enables a *local* dual-write into the same machine's `index.db` and unlocks the checkpoint API; it does not replicate state anywhere. `GET /__bili/status` reports `instanceId` (per-process identity) and `sessionsOnDisk` (how many sessions this instance can serve) so a load balancer or operator can tell "session moved to another instance" from "session evicted".
+
 ## Configuration
 
 The full configuration reference — config file location, top-level keys,
@@ -462,7 +503,7 @@ What's inside (details in CONFIGURATION.md):
 
 - `providers` — per-provider routing table: upstream override, model context windows, per-provider/model compress tuning, wire-protocol declaration, compaction opt-in.
 - `compress` — three-level compression tuning (global → provider → model): thresholds, nudge cadence, preservation rules, prompts, tiers.
-- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
+- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` / `strictSessionRouting` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
 
 Minimal example:
 

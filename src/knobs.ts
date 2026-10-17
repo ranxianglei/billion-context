@@ -162,6 +162,15 @@ export function allowPrivateHttpProviders(): boolean {
     return fileNetwork().allowPrivateHttpProviders === true;
 }
 
+/** BILI_STRICT_SESSION_ROUTING > strictSessionRouting > false (#3633
+ *  multi-instance routing guard; positive judgment mirrors
+ *  allowPrivateHttpProviders — only "1"/"true" enable). */
+export function strictSessionRouting(): boolean {
+    const envRaw = process.env.BILI_STRICT_SESSION_ROUTING;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return loadConfigFile().strictSessionRouting === true;
+}
+
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */

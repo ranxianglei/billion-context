@@ -197,7 +197,7 @@ test("legacy-only instances fail fast with the 501-able message", async () => {
         withMode("legacy", () => {
             const store = new SessionStore({ dir: tmp + "/sessions", enabled: true, debounceMs: 60000 });
             try {
-                assert.equal(store.replicasAvailable(), false);
+                assert.equal(store.checkpointsAvailable(), false);
                 assert.throws(() => store.setSessionExt("s", "k", 1), /legacy-only/);
                 assert.throws(() => store.setKv("ns", "k", 1), /legacy-only/);
             } finally {

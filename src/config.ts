@@ -1595,6 +1595,12 @@ type FileConfig = {
     proxy?: string;
     modelContextLimit?: number;
     sessionHeader?: string;
+    /** Multi-instance routing guard (#3633): when true, a request carrying a
+     *  client-provided conversation id that this instance has no local record
+     *  of (memory or disk) and whose resent history shows prior turns is
+     *  rejected with 409 instead of silently starting a cold session. Default
+     *  false; env BILI_STRICT_SESSION_ROUTING wins. */
+    strictSessionRouting?: boolean;
     log?: boolean;
     debug?: boolean;
     dumpSse?: string;
@@ -1987,7 +1993,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
-    "autoModeForge", "imageRescale", "guardrails",
+    "autoModeForge", "imageRescale", "guardrails", "strictSessionRouting",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

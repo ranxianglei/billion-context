@@ -156,7 +156,7 @@ function fileById(root: string, id: string): string | null {
 
 withShadowMode("#3199 T1: shadow list adopts fresh rows without decoding; stale/unrecorded files win; ghosts drop", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
-    assert.ok(store.replicasAvailable(), "sidecar must be live for this leg (engine available)");
+    assert.ok(store.checkpointsAvailable(), "sidecar must be live for this leg (engine available)");
 
     const sFresh = makeSession("s3199-fresh", { protocol: "openai", title: "Fresh", label: "s3199-fresh" }, { requests: 3, inputTokens: 800, cachedTokens: 200, outputTokens: 40, contextTokens: 400 });
     sFresh.state.blocks.push(mkBlock("bf1", 1500, true, "Fresh topic"));
@@ -252,7 +252,7 @@ withShadowMode("#3199 T1: shadow list adopts fresh rows without decoding; stale/
 withShadowMode("#3199 T2: unified boot parses only the warm window; aliases SQL-seeded; rest fills in background", async (dir) => {
     const N = 12;
     const seeder = new SessionStore({ dir, debounceMs: 0, enabled: true });
-    assert.ok(seeder.replicasAvailable(), "sidecar must be live for this leg (engine available)");
+    assert.ok(seeder.checkpointsAvailable(), "sidecar must be live for this leg (engine available)");
     for (let i = 0; i < N; i++) {
         const id = `s3199-boot-${i}`;
         // Older half carries a distinct label (alias candidate); the newest

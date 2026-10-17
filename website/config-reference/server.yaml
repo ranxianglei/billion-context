@@ -201,6 +201,17 @@ entries:
     desc_zh: "日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。"
     site_en: "<code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked)."
     site_zh: "<code>maskHosts</code> —— 日志中把非公开主机名遮成 &lt;private-host&gt;（默认开；凭据总是遮盖）。"
+  - key: strictSessionRouting
+    type: boolean
+    default: "false"
+    env: BILI_STRICT_SESSION_ROUTING
+    group: behavior
+    id: tt.srr
+    site_group: beh
+    desc_en: "Multi-instance routing guard (#3633): when enabled, a request whose session id this instance has never seen locally (memory or disk) and whose resent history already carries prior turns is rejected with 409 instead of silently starting a cold session on the wrong instance. Genuinely fresh conversations always pass; single-instance deployments never trip it."
+    desc_zh: "多实例路由守卫(#3633):开启后,凡是本实例从未见过(内存与磁盘均无记录)、且重放历史中已含先前轮次的请求,将以 409 拒绝,而不是在错误实例上静默冷启动。真正的新会话始终放行;单实例部署永远不会触发。"
+    site_en: "<code>strictSessionRouting</code> — reject mis-pinned sessions with 409 instead of starting them cold on the wrong instance (off by default; BILI_STRICT_SESSION_ROUTING wins)."
+    site_zh: "<code>strictSessionRouting</code> —— 把被错误粘滞的会话以 409 拒绝,而不是在错误实例上冷启动(默认关;BILI_STRICT_SESSION_ROUTING 优先)。"
   - key: security.adminRelay
     type: boolean
     default: "false"

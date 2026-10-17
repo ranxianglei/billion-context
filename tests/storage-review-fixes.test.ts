@@ -21,8 +21,8 @@ import { UnifiedStore } from "../src/storage/store.ts";
  *      the same state must not resurrect it (upsert-only zombies, #2695).
  *   3. a corrupt index.db must degrade to legacy-only (warn + shadow null),
  *      never brick the proxy on construction or on save/load.
- *   4. restoreReplica refuses to overwrite a live session id (409 upstream).
- *   5. restoreReplica materializes the content-store sidecar for the restored
+ *   4. restoreCheckpoint refuses to overwrite a live session id (409 upstream).
+ *   5. restoreCheckpoint materializes the content-store sidecar for the restored
  *      id so CCR originals survive the next live save + restart cycle
  *      (buildRecord drops forkContentStore without a fork receipt).
  */
@@ -152,7 +152,7 @@ test("review 3: corrupt index.db degrades to legacy-only instead of bricking the
             await store.writeNow(session);
             const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
             assert.ok(reloaded, "legacy fallback load must succeed");
-            assert.equal(store.replicasAvailable(), false, "shadow is unavailable while degraded");
+            assert.equal(store.checkpointsAvailable(), false, "shadow is unavailable while degraded");
             await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
         } finally {
             store!.closeQuietly();
@@ -178,7 +178,7 @@ test("reviews 4+5: restore refuses live-id overwrite and materializes the CCR si
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-restore-"));
         try {
             const session = loadCorpusCase(dir, "ccr", "corpus-ccr", "responses");
-            // Graft a content store so the replica freezes real CCR payloads
+            // Graft a content store so the checkpoint freezes real CCR payloads
             // (same graft as tests/export-jsonl.test.ts).
             session.contentStore = {
                 version: 1,
@@ -190,16 +190,16 @@ test("reviews 4+5: restore refuses live-id overwrite and materializes the CCR si
             await store.writeNow(session);
             store.cancelAll();
 
-            const replica = store.createReplica(session.id, { pinned: true, label: "safe copy" });
+            const checkpoint = store.createCheckpoint(session.id, { pinned: true, label: "safe copy" });
 
             // Review 6 (HTTP half): caller-chosen id that already exists must
             // throw (admin maps to 409), never silently clobber a live session.
             await assert.rejects(
-                store.restoreReplica(replica.cp_id, { sessionId: session.id }),
+                store.restoreCheckpoint(checkpoint.cp_id, { sessionId: session.id }),
                 /already exists/,
             );
 
-            const out = await store.restoreReplica(replica.cp_id);
+            const out = await store.restoreCheckpoint(checkpoint.cp_id);
             assert.ok(out.sessionId.startsWith("restore-"), "default restore target is a fresh id");
             store.closeQuietly();
 

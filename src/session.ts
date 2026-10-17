@@ -1189,6 +1189,16 @@ function processedEvidence(s: Session): boolean {
     return s.stats.requests > 0 || s.state.nextBlockId > 1 || s.blockContents.size > 0;
 }
 
+// #3633: does THIS instance hold ANY local record for the given conversation
+// id — weaker than hasProcessedState (no processing-evidence requirement), so
+// it also covers records created before a turn finished. Memory first, then
+// the store; read-only like hasProcessedState (never mutates the map).
+export function hasLocalSessionRecord(id: string): boolean {
+    if (sessions.has(id)) return true;
+    const store = getStore();
+    return store.enabled && store.loadSync(id) !== null;
+}
+
 /** #1082 GC: remove a session from the in-memory map so its debounced writer
  *  cannot resurrect the file GC just deleted. Caller must have verified the
  *  session is idle (no in-flight requests, no pending save, lastSeen not newer

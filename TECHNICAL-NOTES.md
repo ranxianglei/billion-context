@@ -69,6 +69,14 @@ fix named in #1724
 (#1724 direction #4) reduces cross-instance browsing but does not change this
 boundary.
 
+**Scope note (#3633):** all of the above is the *single-host* story — several
+processes sharing one directory on one machine. A *distributed* deployment
+(one instance per machine, each with its own local volume) has no shared state
+at all and follows different rules: ReadWriteOnce, one volume per instance,
+never a network filesystem (WAL needs a coherent `-shm` plus byte-range locks);
+each client pinned to one instance for the life of its sessions; no failover.
+See [README.md — Running multiple instances](README.md#running-multiple-instances-3633).
+
 ## Runtime-info protocol (#955)
 
 A native plugin lives inside the client process, so it can read the model

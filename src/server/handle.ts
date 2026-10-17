@@ -17,7 +17,7 @@ import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSession, hasLocalSessionRecord, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
@@ -47,7 +47,7 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { autoModeForgeEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir, strictSessionRouting } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
@@ -221,6 +221,26 @@ export async function handle(
         res.removeListener("close", close);
         admission.release();
     }
+}
+
+// #3633: prior-turn evidence for the strict-routing gate — any model/tool
+// turn in the resent history means this is not the conversation's first
+// request. Wire shapes: openai/anthropic messages[] carry role
+// (user/system/assistant/tool/developer); responses input[] carries typed
+// items (function_call/function_call_output/reason); google contents[] uses
+// role user/model. Unknown shapes pass through untouched (no reject) —
+// availability over strictness (#3128): a mis-reject strands a conversation,
+// a missed reject only degrades to today's cold-start behavior.
+export function historyHasPriorTurns(items: unknown[]): boolean {
+    for (const item of items) {
+        if (typeof item !== "object" || item === null) continue;
+        const o = item as Record<string, unknown>;
+        const role = typeof o.role === "string" ? o.role : undefined;
+        if (role !== undefined && role !== "user" && role !== "system") return true;
+        const type = typeof o.type === "string" ? o.type : undefined;
+        if (type === "function_call" || type === "function_call_output" || type === "reason") return true;
+    }
+    return false;
 }
 
 async function handleRequest(
@@ -1250,6 +1270,33 @@ async function handleRequest(
         // embed the id manually. One statement, runs in this request's own
         // async context, so concurrent requests never cross-contaminate.
         enterSessionContext(sessionId);
+        // #3633: strict session routing (opt-in, multi-instance deployments).
+        // A request whose FINAL session key equals the RAW client-provided
+        // value (no subagent/persona/codex-turn namespacing happened to it)
+        // and for which THIS instance has no local record is a pinning
+        // violation: the conversation belongs to another instance. Reject it
+        // instead of silently starting cold — a cold start looks healthy on
+        // its face while the owning instance's state sits unused. Genuinely
+        // fresh conversations always pass: the check below demands prior-turn
+        // evidence in the resent history, so a first request establishes its
+        // session here regardless of the flag. Anonymous (prefix-affinity)
+        // requests carry no cross-instance identity to pin on (#309) and are
+        // out of scope by construction (clientProvided is false for them).
+        if (clientProvided && strictSessionRouting()) {
+            const strictIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
+            const rawClientValue = strictIdentity?.clientProvided ? strictIdentity.value : clientConv;
+            if (rawClientValue !== undefined && sessionId === rawClientValue && !hasLocalSessionRecord(sessionId)
+                && historyHasPriorTurns(affinityMessageList())) {
+                const message = `[strictSessionRouting] session "${sessionId}" was not found on this instance (${instanceId}) and its history carries prior turns — it belongs to another instance. Pin this conversation to its owning instance (README: Running multiple instances) or set strictSessionRouting=false to accept it cold here.`;
+                log("warn", `409: strict session routing rejected ${protocol} request for unknown session ${sessionId} on ${maskUrlsInText(upstreamOrigin)} (#3633)`);
+                loggerLog("warn", `[strict-routing] rejected ${protocol} request: session ${sessionId} unknown on instance ${instanceId}; resent history has prior turns — likely a load-balancer pinning violation`);
+                res.writeHead(409, { "content-type": "application/json" });
+                res.end(JSON.stringify(protocol === "anthropic"
+                    ? { type: "error", error: { type: "request_conflict", message } }
+                    : { ok: false, code: "STRICT_SESSION_ROUTING_REJECTED", error: message }));
+                return;
+            }
+        }
         // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
         // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the

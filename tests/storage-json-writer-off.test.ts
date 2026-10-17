@@ -115,8 +115,8 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
                 // Rollback story: replicas keep materializing JSON envelopes
                 // (restore writes through the kernel store directly) — a
                 // portable export even while the writer is off.
-                const cp = reopen.createReplica(session.id, { label: "json-writer-off-rollback" });
-                const restored = await reopen.restoreReplica(cp.cp_id, { sessionId: session.id + "-rb" });
+const cp = reopen.createCheckpoint(session.id, { label: "json-writer-off-rollback" });
+            const restored = await reopen.restoreCheckpoint(cp.cp_id, { sessionId: session.id + "-rb" });
                 assert.equal(restored.restoredFrom, session.id);
                 const rb = envelopeFiles(dir).map((f) => path.basename(f));
                 assert.ok(rb.some((n) => n.includes("-rb") || n.endsWith(".json")), "restore must write a JSON envelope for portability");

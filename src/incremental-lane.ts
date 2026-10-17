@@ -333,7 +333,7 @@ export const INCREMENTAL_TURN_MARKER_HEADER = "x-bili-plugin-turn";
 export function incrementalTurnsEnabled(): boolean {
     if (!featureEnabled("pluginIncrementalTurns")) return false;
     try {
-        return getStore().replicasAvailable();
+        return getStore().checkpointsAvailable();
     } catch {
         return false;
     }
@@ -345,7 +345,7 @@ export function incrementalTurnsEnabled(): boolean {
 export function handleIncrementalProbe(res: http.ServerResponse): void {
     const sidecar = (() => {
         try {
-            return getStore().replicasAvailable();
+            return getStore().checkpointsAvailable();
         } catch {
             return false;
         }

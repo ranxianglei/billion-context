@@ -338,6 +338,46 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。
 
+### 运行多个实例(#3633)
+
+所有状态都**严格本地于每个实例**:会话文件在会话目录下(默认 `~/.local/share/billion-context/sessions`,可用 `BILI_SESSIONS_DIR` 迁移)、统一 SQLite 索引(`index.db`,WAL 模式 —— `BILI_STORAGE_UNIFIED` 见 [CONFIGURATION.md](CONFIGURATION.zh-CN.md#环境变量))、以及前缀亲和链(XDG state 目录下的 `prefix-affinity.json`)。**没有复制、没有共享存储、没有主从选举** —— 多实例部署可以工作,但把粘滞(pinning)的责任交给了你的负载均衡器。让它安全运行的规则:
+
+- **每实例一个卷,绝不共享文件系统。** Kubernetes 语境下:StatefulSet + ReadWriteOnce PVC,每个 ordinal 一个。不要把会话目录挂到网络文件系统上(ReadWriteOnceMany/NFS/CIFS):WAL 模式需要一致的 `-shm` 伴随文件加字节级锁,NFS 类文件系统不提供;而 store 的 `busy_timeout=5000` 会把由此产生的硬失败变成**静默损坏**,而不是干净报错。两个进程写同一个本地目录同理 —— 该单机共存场景及其安全边界见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#shared-state-dir-and-multi-instance-security-boundary-394--1724)。
+- **每个客户端在其会话生命周期内固定到一个实例。** 落在从未见过它的实例上的会话是**冷**的 —— 没有索引行、没有会话文件、没有前缀亲和链 —— 压缩历史与前缀缓存亲和对该实例不可见(并未丢失:它们仍留在持有它的实例上)。基于 ClientIP 的粘滞对 NAT 后或地址会漂移的客户端会失效;按 session id(或稳定的客户端令牌)做粘滞才是稳健形态。
+- **没有故障转移。** 缩容会让活跃会话滞留在被移除的实例上,直到流量回来;扩容能恢复它们,因为 StatefulSet 会把同一 ordinal 的卷重新绑定(PVC retention `Retain`),前缀亲和链会在启动时从磁盘水合。这是「钉住且不丢」,不是「任意副本可服务任意会话」——容量规划请据此进行。
+
+**为什么横向扩容到此为止,以及如何在第 7 层做粘滞。** 服务一个会话完全是**本地状态**的函数 —— 刻意没有任何可供查询的共享存储 —— 所以上述 pinning 是硬性要求而非性能优化,而且 Kubernetes 没有任何现成原语能做到:`sessionAffinity` 只支持 `ClientIP`,一旦采用 ClientIP 粘滞,客户端源地址一变(NAT 重平衡、笔记本漫游、pod 网络漂移)所有会话立刻全部失联 —— 这种配置的第一次滚动发布就会让整个会话车队集体冷启动。pinning 属于你的第 7 层:在 StatefulSet 前面放一个真正的代理,按客户端实际发送的 session 头做一致性哈希。代理按头部优先级列表(`x-bili-plugin-conversation`、`x-claude-code-session-id`、`x-grok-session-id`/`x-grok-conv-id`、`x-mavis-session-id`、`x-opencode-session-id`、`x-session-affinity`、`x-acp-session`、`x-session-id`……)中第一个非空值作为会话键;OpenCode 客户端即 `x-opencode-session-id`。nginx(一致性哈希保证 reload 后会话仍落在同一实例 —— 普通 `hash` 会在配置变更时重新打散):
+
+```nginx
+upstream bili {
+    server bili-0.bili-headless:8787;
+    server bili-1.bili-headless:8787;
+}
+location / {
+    proxy_pass http://bili;
+    proxy_set_header Host $host;
+    # 哈希变量换成你的客户端实际发送的头($http_x_session_affinity、$http_x_acp_session……)
+    hash $http_x_opencode_session_id consistent;
+}
+```
+
+Envoy 等价写法 —— 路由级 `hash_policy`(header 型哈希策略默认即一致性哈希):
+
+```yaml
+routes:
+  - match: { prefix: "/" }
+    route:
+      cluster: bili
+      hash_policy:
+        - header: { header_name: x-opencode-session-id }
+```
+
+完全不带 session 头的请求没有可跨实例固定的身份 —— 按 ClientIP 或任意方式路由即可;它们在内部按内容前缀解析,失配只付出一次冷启动的代价,不影响正确性。
+
+**让粘滞违规可见:`strictSessionRouting`。** 默认情况下,被错误路由的请求会在错误的实例上静默冷启动 —— 能用,但持有该会话的实例的压缩状态闲置,且症状不可见。想让它大声报警:设置 `"strictSessionRouting": true`(或 `BILI_STRICT_SESSION_ROUTING=1`)后,凡是本实例从未见过(内存*和*磁盘均无记录)、且重放历史里已含先前轮次的请求,将以 `409` 拒绝并附带指明本实例 `instanceId` 的可操作提示,而不是冷启动。真正的新会话始终放行(检查要求重放历史中存在先前轮次证据),无头的匿名客户端不受影响,单实例部署永远不会触发。它是你负载均衡器的绊线,不是正确 pinning 的替代品 —— 修好路由之后保持它常开。
+
+命名说明:管理端点 `GET/POST /__bili/checkpoints[/<cpId>]`(及其弃用别名 `/__bili/replicas/…`)指的是**会话检查点** —— 把一个会话的持久化状态冻结下来、再物化为一个新会话 —— 与 pod 副本或对等实例无关。同理,`BILI_STORAGE_UNIFIED=shadow|full` 启用的是**本机**双写(同一台机器的 `index.db`)并解锁检查点 API,它不向任何地方复制状态。`GET /__bili/status` 报告 `instanceId`(每进程身份)与 `sessionsOnDisk`(本实例可服务的会话数),便于负载均衡器或运维区分「会话去了别的实例」与「会话被逐出」。
+
 ## 配置
 
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
