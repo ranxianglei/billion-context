@@ -938,17 +938,24 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     }, null, 2));
 }
 
-/** #3040: generic diagnostics report — copyable blob + prefilled GitHub issue
- *  link. Loopback-gated like every other /__bili/* route; never throws. */
+/** #3040 (+#3299): generic diagnostics report — copyable blob + prefilled
+ *  GitHub issue link. Loopback-gated like every other /__bili/* route; never
+ *  throws. #3299 adds ?desc=<user description> and ?errors=0 (opt out of the
+ *  [error] log tail on topic=general). */
 function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
     let topic: string | undefined;
+    let desc: string | undefined;
+    let includeErrors = true;
     try {
-        topic = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams.get("topic") ?? undefined;
+        const p = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams;
+        topic = p.get("topic") ?? undefined;
+        desc = p.get("desc") ?? undefined;
+        if (p.get("errors") === "0") includeErrors = false;
     } catch {
         topic = undefined;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
+    res.end(JSON.stringify(buildDiagnostics(topic, { desc, includeErrors }), null, 2));
 }
 
 /** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to

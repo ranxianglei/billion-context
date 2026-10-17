@@ -113,6 +113,15 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.storage_degraded": "未来几个版本将默认开启 SQLite 统一存储，但你的系统因 {reason} 暂不支持（已自动回退 JSON 存储，当前不受影响）。请点击下方按钮反馈，帮助我们在默认开启前覆盖你的环境。",
         "sys.report_copy": "复制诊断信息",
         "sys.report_issue": "在 GitHub 反馈",
+        // #3299: permanent feedback entry (topbar button → modal).
+        "nav.report": "反馈",
+        "rpt.title": "反馈问题",
+        "rpt.note": "描述你遇到的问题。诊断信息（版本、环境、最近的错误日志）会预填进 GitHub issue；API key 与会话内容不会包含在内，但日志行可能包含本地文件路径——提交前请检查。",
+        "rpt.desc_ph": "问题现象、操作步骤、期望行为（可选，但越具体越好）",
+        "rpt.incl_errors": "附带最近的错误日志",
+        "rpt.cancel": "取消",
+        "rpt.session_prefill": "会话 …{id}（{protocol}，upstream {host}，请求 {reqs} 次，缓存命中 {hit}）：",
+        "det.report_issue_session": "报告此会话",
         "conflict.on": "检测到压缩冲突",
         // #2102: the sentence is composed per kind family present — a ledger full of
         // client-native rewrites must not read as "third-party plugin" evidence.
@@ -592,6 +601,15 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.storage_degraded": "Unified SQLite storage becomes the default in an upcoming release, but this system cannot run it ({reason}). You have been automatically rolled back to JSON storage — nothing is affected today. Please report this so your environment is covered before the flip.",
         "sys.report_copy": "Copy diagnostics",
         "sys.report_issue": "Report on GitHub",
+        // #3299: permanent feedback entry (topbar button → modal).
+        "nav.report": "Report an issue",
+        "rpt.title": "Report an issue",
+        "rpt.note": "Describe the problem you ran into. Diagnostics (version, environment, recent error log lines) are prefilled into the GitHub issue; API keys and conversation content are never included, but log lines may contain local file paths — review before submitting.",
+        "rpt.desc_ph": "Symptoms, steps to reproduce, expected behavior (optional, but more detail helps)",
+        "rpt.incl_errors": "Include recent error log lines",
+        "rpt.cancel": "Cancel",
+        "rpt.session_prefill": "Session …{id} ({protocol}, upstream {host}, {reqs} requests, {hit} cache hit): ",
+        "det.report_issue_session": "Report this session",
         "conflict.on": "Compression conflict detected",
         // #2102: composed per kind family present — see the zh entry above.
         "conflict.found": ": traces of ",

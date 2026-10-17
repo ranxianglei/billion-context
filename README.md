@@ -358,8 +358,10 @@ report above.
 
 **Can I query sessions and config over the web?** Yes — open
 [http://localhost:8787](http://localhost:8787): an overview dashboard, session
-list with per-session detail, live logs, a config editor, and an upstream
-connectivity test. Everything is also plain JSON for scripting
+list with per-session detail, live logs, a config editor, an upstream
+connectivity test, and a feedback button that opens a prefilled GitHub issue
+(environment diagnostics plus your own problem description). Everything is
+also plain JSON for scripting
 (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context

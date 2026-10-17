@@ -1,8 +1,11 @@
 import { MESSAGES } from "./i18n.js";
+import { safeSuffix } from "../text-safe.js";
 
 export const WEB_CLIENT = `(function () {
     "use strict";
     const MESSAGES=${JSON.stringify(MESSAGES)};
+    // #816 family: id tails must not cut surrogate pairs — inline the shared clamp (IIFE has no module access).
+    const safeSuffix=${safeSuffix.toString()};
     let locale = "zh-CN";
     try {
         // #2321: an embedding host may pin the locale explicitly (?lang=zh|en) —
@@ -1392,7 +1395,7 @@ export const WEB_CLIENT = `(function () {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
-        parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
+        parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button><button id="sessrpt-issue" class="btn sm">' + t("det.report_issue_session") + "</button></div>");
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -1814,6 +1817,67 @@ export const WEB_CLIENT = `(function () {
             busy(copyBtn, false);
         }
     }
+
+    // #3299: global feedback modal — the report channel for problems that never
+    // raised a warning banner. Unlike the banner wiring there is NO cache here:
+    // every action re-fetches because the description is live user input.
+    async function fetchReportDiagnostics() {
+        const ta = $("report-desc");
+        const cb = $("report-incl-errors");
+        const p = new URLSearchParams();
+        p.set("topic", "general");
+        if (ta && ta.value.trim()) p.set("desc", ta.value.trim());
+        if (cb && !cb.checked) p.set("errors", "0");
+        const d = await json("/__bili/diagnostics?" + p.toString());
+        if (!d || typeof d.blob !== "string" || typeof d.url !== "string") throw new Error("bad diagnostics payload");
+        return d;
+    }
+    function openReportModal(prefill) {
+        const m = $("report-modal");
+        if (!m) return;
+        const ta = $("report-desc");
+        if (ta && prefill) ta.value = prefill;
+        m.hidden = false;
+        const gh = $("report-github");
+        if (gh) gh.removeAttribute("href");
+        if (ta) ta.focus();
+    }
+    function closeReportModal() {
+        const m = $("report-modal");
+        if (!m) return;
+        m.hidden = true;
+        const ta = $("report-desc");
+        if (ta) ta.value = "";
+    }
+    function bindReportModalActions() {
+        const m = $("report-modal");
+        if (!m) return;
+        const close = () => closeReportModal();
+        for (const id of ["report-close", "report-cancel"]) {
+            const b = $(id);
+            if (b) b.addEventListener("click", close);
+        }
+        m.addEventListener("click", (ev) => { if (ev.target === m) close(); });
+        document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !m.hidden) close(); });
+        const copyBtn = $("report-copy");
+        if (copyBtn) copyBtn.addEventListener("click", async () => {
+            busy(copyBtn, true);
+            try { copyText((await fetchReportDiagnostics()).blob, copyBtn); }
+            catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); }
+            finally { busy(copyBtn, false); }
+        });
+        const gh = $("report-github");
+        if (gh) gh.addEventListener("click", async (ev) => {
+            ev.preventDefault();
+            if (gh.classList.contains("busy")) return;
+            busy(gh, true);
+            try {
+                const url = (await fetchReportDiagnostics()).url;
+                window.open(url, "_blank", "noopener,noreferrer");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); }
+            finally { busy(gh, false); }
+        });
+    }
     function refRangeOf(b) {
         return b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
     }
@@ -1888,6 +1952,22 @@ export const WEB_CLIENT = `(function () {
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
                 downloadUrl(URL.createObjectURL(blob), base + ".png");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(pngBtn, false); }
+        });
+        // #3299: session-scoped reports reuse the same modal, prefilled with a
+        // compact fingerprint — the full MD report stays a download (too big for
+        // a GitHub issues/new URL).
+        var issueBtn = $("sessrpt-issue");
+        if (issueBtn) issueBtn.addEventListener("click", function () {
+            var host = "";
+            try { host = d.upstreamOrigin ? new URL(d.upstreamOrigin).host : ""; } catch (e) { host = String(d.upstreamOrigin || ""); }
+            const hit = d.inputTokens ? Math.round((d.cachedTokens || 0) * 100 / d.inputTokens) + "%" : "?";
+            openReportModal(t("rpt.session_prefill", {
+                id: safeSuffix(String(d.id), 12),
+                protocol: d.protocol || "?",
+                host: host || "?",
+                reqs: d.requests != null ? String(d.requests) : "?",
+                hit: hit,
+            }));
         });
     }
     function bindBlocksActions(d) {
@@ -2720,6 +2800,9 @@ export const WEB_CLIENT = `(function () {
                 location.reload();
             }
         });
+        const reportOpen = $("report-open");
+        if (reportOpen) reportOpen.addEventListener("click", () => openReportModal());
+        bindReportModalActions();
         // #1937: search is server-side (?q=) — debounced re-query, not a local filter.
         const search = $("ses-search");
         if (search) {

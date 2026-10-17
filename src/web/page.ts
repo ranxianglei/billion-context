@@ -19,7 +19,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><button id="report-open" class="btn sm" data-i18n="nav.report">${zh("nav.report")}</button><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
@@ -193,6 +193,16 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </div></div>
 </section>
 </main>
+<!-- #3299: permanent feedback entry — the report channel for problems that never
+     raised a warning banner. Static on every page; client.ts wires it. -->
+<div id="report-modal" class="modal-backdrop" hidden>
+<div class="card modal-card"><div class="card-h"><span data-i18n="rpt.title">${zh("rpt.title")}</span><button id="report-close" class="btn sm" aria-label="close">×</button></div>
+<div class="card-b">
+<p class="small dim" data-i18n="rpt.note">${zh("rpt.note")}</p>
+<textarea id="report-desc" class="editor mono" rows="5" data-i18n-ph="rpt.desc_ph" placeholder="${escapeHtml(zh("rpt.desc_ph"))}"></textarea>
+<label class="small"><input type="checkbox" id="report-incl-errors" checked> <span data-i18n="rpt.incl_errors">${zh("rpt.incl_errors")}</span></label>
+<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><button id="report-copy" class="btn sm" data-i18n="sys.report_copy">${zh("sys.report_copy")}</button><a id="report-github" class="btn sm" target="_blank" rel="noopener noreferrer" data-i18n="sys.report_issue">${zh("sys.report_issue")}</a><button id="report-cancel" class="btn sm" data-i18n="rpt.cancel">${zh("rpt.cancel")}</button></div>
+</div></div></div>
 <div id="toast-host" class="toast-host"></div>
 <script>${WEB_CLIENT}</script>
 </body></html>`;

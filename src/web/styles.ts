@@ -425,4 +425,10 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
    embed face a little breathing room instead of zero gutter. */
 .embed main { max-width: none; padding: 8px 10px 16px; }
 .embed .banner { margin: 8px 0 0; }
+/* #3299: global feedback modal — above the page content and qtips (z 60),
+   below the toast host (z 100) so action feedback stays visible on top. */
+.modal-backdrop { position: fixed; inset: 0; z-index: 90; background: rgba(31, 35, 40, 0.45); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.modal-backdrop[hidden] { display: none; }
+.modal-card { width: min(680px, 100%); max-height: calc(100vh - 48px); overflow: auto; }
+#report-desc { width: 100%; box-sizing: border-box; margin-top: 10px; resize: vertical; min-height: 90px; }
 `;
