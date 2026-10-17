@@ -28,7 +28,7 @@ import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alert
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -285,6 +285,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             Object.assign(opts.namedProviders, loadNamedProviders());
         }, opts.port);
     }
+    // #3443: Web UI Save Key — this route was dropped when the admin surface moved here (#1440 P2 cut 1).
+    if (req.method === "PUT" && req.url === "/__bili/external-summary/credential") return handleSummaryCredentialPut(req, res);
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
     // #2102: wipe the diagnostic conflict ledgers (global, or one session via
     // ?session=<id>). Loopback + trusted-origin gated like every /__bili/ path.

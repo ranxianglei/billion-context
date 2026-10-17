@@ -160,6 +160,73 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
     }
 });
 
+test("PUT /__bili/external-summary/credential routes to the private store (#3443)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-summary-cred-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, JSON.stringify({ providers: { deepseek: { baseUrl: "https://api.deepseek.com", api: "openai", credentialRef: "primary", models: { "deepseek-chat": {} } } }, compress: { externalSummary: { enabled: true, targets: ["deepseek/deepseek-chat"] } } }), "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const put = (body: unknown) => fetch(`${base}/__bili/external-summary/credential`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const malformed = await put({ name: "primary" });
+        assert.equal(malformed.status, 400);
+        assert.match(await malformed.text(), /expected name and key/);
+        const key = "test-route-never-echoed-key";
+        const savedRaw = await (await put({ name: "primary", key })).text();
+        assert.equal(savedRaw.includes(key), false);
+        assert.deepEqual(JSON.parse(savedRaw), { ok: true, configured: true });
+        const storePath = `${biliConfig}.summary-credentials.json`;
+        assert.ok(readFileSync(storePath, "utf8").includes(key), "routed handler wrote the private store file");
+        const view = await (await fetch(`${base}/__bili/config`)).json() as { externalSummaryCredentials: Record<string, boolean> };
+        assert.equal(view.externalSummaryCredentials["secret:primary"], true);
+        const deletedRaw = await (await put({ name: "primary", key: null })).text();
+        assert.deepEqual(JSON.parse(deletedRaw), { ok: true, configured: false });
+        const afterDelete = await (await fetch(`${base}/__bili/config`)).json() as { externalSummaryCredentials: Record<string, boolean> };
+        assert.equal(afterDelete.externalSummaryCredentials["secret:primary"], false);
+    } finally {
+        await close(proxy);
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmrf(root);
+    }
+});
+
 test("parseCompressSettings round-trips prompts overrides (#155 + #157 interplay)", () => {
     const withPrompts = {
         nudgeGrowthTokens: 4000,
