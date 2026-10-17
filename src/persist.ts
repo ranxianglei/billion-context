@@ -2082,6 +2082,14 @@ function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full"
             }),
         ])];
     }
+    // #3110: pin the provenance stamps to the TAIL of the persisted metadata,
+    // where every pre-#3093 record had them. #3093 also stamps the LIVE object
+    // at createSession (the web panel reads it in memory); a plain spread would
+    // hoist both keys to the front, moving the persisted bytes' key order —
+    // digest-sensitive, exactly what turned the storage-render goldens red on
+    // master. Capture AFTER the publicSnapshotStoredRefs mutation above; do not
+    // move up or simplify back to a single spread.
+    const { biliVersion: _liveBiliVersion, storageMode: _liveStorageMode, ...restMetadata } = session.metadata;
     return {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
@@ -2106,7 +2114,7 @@ function buildRecord(session: Session, storageMode: "legacy" | "shadow" | "full"
         // (index.db) copy of this session exists. Digest-neutral: canonical.ts
         // drops the key entirely (unlike biliVersion's "__VER__" value-mask) —
         // its PRESENCE is new, so value-masking can't keep old corpus pins green.
-        metadata: { ...session.metadata, biliVersion: VERSION, storageMode },
+        metadata: { ...restMetadata, biliVersion: VERSION, storageMode },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,
