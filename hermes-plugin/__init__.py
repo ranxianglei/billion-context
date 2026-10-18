@@ -672,7 +672,8 @@ def _request_base_url(request: Dict[str, Any], context: Dict[str, Any]) -> Optio
 
 def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
     """#3261: the host's own known context window for a model, read from
-    HERMES_HOME/context_length_cache.yaml (flat mapping "<model>@<base_url>" -> tokens).
+    HERMES_HOME/context_length_cache.yaml (context_lengths mapping
+    "<model>@<base_url>" -> tokens; legacy flat mappings are also accepted).
     Fail-open to None on any miss/error so the proxy falls back to its normal window chain.
     A stage matching several DIFFERENT windows yields nothing rather than a guess: an
     overestimate risks preflight overflow, an underestimate over-compresses — both worse
@@ -687,6 +688,8 @@ def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
         return None
     if not isinstance(data, dict):
         return None
+    if isinstance(data.get("context_lengths"), dict):
+        data = data["context_lengths"]
     pairs: List[Tuple[str, int]] = []
     for key, value in data.items():
         k = str(key)

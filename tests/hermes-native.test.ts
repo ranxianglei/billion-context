@@ -453,10 +453,13 @@ elif SCENARIO.startswith("attach-window"):
     except Exception:
         out["yaml_ok"] = False
     home = os.environ["HERMES_HOME"]
-    if SCENARIO == "attach-window":
+    if SCENARIO in ("attach-window", "attach-window-flat"):
+        cache = {"group/sol@http://127.0.0.1:3425/v1": 500000,
+                 "unrelated@https://other.example/v1": 123456}
+        if SCENARIO == "attach-window":
+            cache = {"context_lengths": cache}
         with open(os.path.join(home, "context_length_cache.yaml"), "w") as f:
-            f.write("group/sol@http://127.0.0.1:3425/v1: 500000\n"
-                    "unrelated@https://other.example/v1: 123456\n")
+            json.dump(cache, f)
         with open(os.path.join(home, "config.yaml"), "w") as f:
             f.write("providers:\n  solprov:\n    base_url: http://127.0.0.1:3425\n")
         win_model, win_provider = "group/sol", "solprov"
@@ -686,28 +689,30 @@ describe("python plugin runtime (subprocess)", () => {
     // (origin-granularity match: cache keeps /v1, config omits it); the hook leg runs WITHOUT
     // a provider kwarg — the known minimum hook surface — so it must work off the unambiguous
     // single-entry fallback.
-    test("attach-window: host context_length_cache.yaml window rides header + runtime-info (#3261)", () => {
-        if (!PY) {
-            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
-            return;
-        }
-        const { out, err } = runDriver("attach-window");
-        assert.ok(out, err);
-        assert.equal(out!.env_https_proxy, out!.origin, "attached");
-        if (!out!.yaml_ok) {
-            console.warn("skip positive leg: no YAML backend on this host — the cache is unreadable and the feature fails open");
-            return;
-        }
-        const h = out!.win_headers!;
-        assert.equal(h["x-bili-plugin"], "hermes");
-        assert.equal(h["x-bili-plugin-conversation"], "sess-w");
-        assert.equal(h["x-bili-plugin-model"], "group/sol");
-        assert.equal(h["x-bili-plugin-context-window"], "500000", "header channel: the host's own window value");
-        assert.equal(out!.req_unmutated, true);
-        assert.deepEqual(out!.runtime_info, [
-            { agent: "hermes", model: "group/sol", maxOutput: 4096, contextWindow: 500000, source: "hermes-native" },
-        ]);
-    });
+    for (const scenario of ["attach-window", "attach-window-flat"]) {
+        test(`${scenario}: host context_length_cache.yaml window rides header + runtime-info (#3261)`, () => {
+            if (!PY) {
+                console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+                return;
+            }
+            const { out, err } = runDriver(scenario);
+            assert.ok(out, err);
+            assert.equal(out!.env_https_proxy, out!.origin, "attached");
+            if (!out!.yaml_ok) {
+                console.warn("skip positive leg: no YAML backend on this host — the cache is unreadable and the feature fails open");
+                return;
+            }
+            const h = out!.win_headers!;
+            assert.equal(h["x-bili-plugin"], "hermes");
+            assert.equal(h["x-bili-plugin-conversation"], "sess-w");
+            assert.equal(h["x-bili-plugin-model"], "group/sol");
+            assert.equal(h["x-bili-plugin-context-window"], "500000", "header channel: the host's own window value");
+            assert.equal(out!.req_unmutated, true);
+            assert.deepEqual(out!.runtime_info, [
+                { agent: "hermes", model: "group/sol", maxOutput: 4096, contextWindow: 500000, source: "hermes-native" },
+            ]);
+        });
+    }
 
     test("attach-window-ambiguous: conflicting per-upstream windows are not guessed (#3261)", () => {
         if (!PY) {
