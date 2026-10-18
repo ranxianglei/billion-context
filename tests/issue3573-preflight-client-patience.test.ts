@@ -58,13 +58,26 @@ function conversation(n: number, tag: string): Array<{ role: string; content: st
     return msgs;
 }
 
-function startMainUpstream(): Promise<{ server: http.Server; url: string }> {
+function startMainUpstream(): Promise<{ server: http.Server; url: string; acceptedTokens: () => number[] }> {
+    const acceptedTokens: number[] = [];
     return new Promise((resolve) => {
-        const server = http.createServer((_req, res) => {
-            res.writeHead(200, { "content-type": "text/event-stream" });
-            res.end(okSse());
+        const server = http.createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on("data", (c: Buffer) => chunks.push(c));
+            req.on("end", () => {
+                const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { messages: unknown[] };
+                const tokens = Math.ceil(JSON.stringify(payload.messages).length / 4);
+                if (tokens > 12_000) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "invalid_request_error", message: `prompt is too long: ${tokens} tokens > 12000 maximum` } }));
+                    return;
+                }
+                acceptedTokens.push(tokens);
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse());
+            });
         });
-        server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` }));
+        server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, acceptedTokens: () => acceptedTokens }));
     });
 }
 
@@ -138,7 +151,7 @@ function stopLines(logs: string[]): string[] {
 test("#3573 slow summary rounds: each attempt stops at the wall budget with progress persisted, and retries converge to a forward", async () => {
     const logs: string[] = [];
     setLogCapture((level, msg) => { logs.push(`${level} ${msg}`); });
-    _setPreflightWallBudgetForTest(400);
+    _setPreflightWallBudgetForTest(600);
     const main = await startMainUpstream();
     const sum = await startSummaryUpstream(250);
     // ~48k calibrated tokens vs a 12k window: comfortably over, far below
@@ -152,19 +165,31 @@ test("#3573 slow summary rounds: each attempt stops at the wall budget with prog
         let body = "";
         let blocksBefore = 0;
         let attempts = 0;
+        let stoppedAttempts = 0;
+        let summariesAtFirstStop = 0;
         const maxAttempts = 24;
         while (attempts < maxAttempts) {
             attempts += 1;
             const before = sum.calls();
+            const stopsBefore = stopLines(logs).length;
             const r = await postTurn(proxy, main.url, "patience-slow-sess", msgs);
             status = r.status;
             body = r.text;
             const blocksNow = activeBlocks("patience-slow-sess");
+            if (status === 400) {
+                assert.ok(body.includes("prompt is too long:"), `attempt ${attempts}: only a context-overflow evidence probe may reach the main upstream before the payload fits`);
+                continue;
+            }
             if (status !== 200) {
+                stoppedAttempts += 1;
+                if (stoppedAttempts === 1) summariesAtFirstStop = sum.calls();
                 assert.equal(status, 502, `attempt ${attempts}: an unfinished marathon fails fast with 502 (got ${status})`);
                 assert.ok(body.includes(NOT_FORWARDED_MARK), `attempt ${attempts}: the fail-fast explains the over-window payload (body: ${body.slice(0, 200)})`);
                 assert.ok(!body.includes(COOLDOWN_MARK), `attempt ${attempts}: a budget stop must NOT arm the dead-end cooldown (progress persists — retry is the cure)`);
                 assert.ok(body.includes("client-patience wall budget"), `attempt ${attempts}: the fail-fast names the wall-budget stop honestly, not a phantom round/summary-budget exhaustion (body: ${body.slice(0, 200)})`);
+                assert.match(stopLines(logs)[stopsBefore] ?? "", /stopping after round 1:/, `attempt ${attempts}: the first slow round must prevent admission of a second round`);
+                assert.match(stopLines(logs)[stopsBefore] ?? "", /elapsed \+ ~[1-9]\d*ms for the next round/, `attempt ${attempts}: admission uses the duration of the round that just completed`);
+                assert.ok(body.includes("after 1 round(s)"), `attempt ${attempts}: the receipt counts the completed round, not the rejected next round (body: ${body.slice(0, 200)})`);
                 assert.ok(blocksNow > blocksBefore, `attempt ${attempts}: the stopped attempt still persisted its fold(s) (blocks ${blocksBefore} -> ${blocksNow})`);
                 assert.ok(sum.calls() > before, `attempt ${attempts}: the attempt did run its summary round(s)`);
                 blocksBefore = blocksNow;
@@ -173,9 +198,11 @@ test("#3573 slow summary rounds: each attempt stops at the wall budget with prog
             }
         }
         assert.equal(status, 200, `the retry loop must converge to a forward within ${maxAttempts} attempts`);
-        assert.ok(attempts >= 2, "with a 400ms budget and 250ms rounds a single attempt cannot converge — convergence must come from retries");
-        assert.ok(stopLines(logs).length >= attempts - 1, `every stopped attempt logged the resume hint (got ${stopLines(logs).length} stop line(s))`);
-        assert.ok(sum.calls() >= attempts, "each attempt admitted at least its first summary round");
+        assert.ok(attempts >= 2, "with a 600ms budget and 250ms rounds a single attempt cannot converge — convergence must come from retries");
+        assert.ok(stopLines(logs).length >= stoppedAttempts, `every stopped attempt logged the resume hint (got ${stopLines(logs).length} stop line(s))`);
+        assert.ok(sum.calls() > summariesAtFirstStop, "retries perform more summary work after the first stopped attempt");
+        assert.equal(main.acceptedTokens().length, 1, "exactly one fitting payload reaches the accepting main upstream");
+        assert.ok(main.acceptedTokens()[0] <= 12_000, "success requires serialized messages to fit the fixture's chars/4 window");
     } finally {
         _setPreflightWallBudgetForTest(null);
         setLogCapture(null);
