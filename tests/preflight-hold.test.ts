@@ -50,11 +50,14 @@ function bigConversation(): Array<{ role: string; content: string }> {
     // #3298: repeat(250) sat ~16 est-tokens under the 10k window after the
     // preflight fold on old system-prompt sizes — any growth of the injected
     // prompt (e.g. the project-attribution line) flipped the #330 soft-zone
-    // relaxation gate and ate the protected tail. repeat(235) restores ~700
+    // relaxation gate and ate the protected tail. repeat(235) restored ~700
     // tokens of margin so the guard pins behavior, not a knife-edge.
+    // #3726: that margin was only ~80 est-tok in practice, so the approved
+    // summary-rule growth (+~300 est-tok per request) flipped the same gate;
+    // repeat(208) restores ~600 tok of headroom, pre-fold still ~15.7k > 10k.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        const filler = `MARKER_${i}_content_`.repeat(235);
+        const filler = `MARKER_${i}_content_`.repeat(208);
         msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;

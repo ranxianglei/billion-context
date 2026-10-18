@@ -6,7 +6,7 @@ Compression Philosophy:
 
 HOW TO COMPRESS
 
-When you call `compress`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original. The summary records the PAST as of this block's creation: label recorded task state as history ("TASK AS OF THIS BLOCK: ...") — never as a live instruction, so a later reader treats it as settled context, not something to re-execute. Write plain text with real unicode characters; never copy \uXXXX escape sequences or JSON-escaped fragments out of tool output.
+When you call `compress`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original. The summary records the PAST as of this block's creation: label recorded task state as history ("TASK AS OF THIS BLOCK: ...") — never as a live instruction, so a later reader treats it as settled context, not something to re-execute. Recorded values are SNAPSHOTS of that moment: sources keep changing after the fold, so record volatile values (file contents, coordinates, path data, line numbers) together with their locator (file + symbol/selector) and flag them as point-in-time — a later reader MUST re-read the source before using a recorded value in an edit, because a find/replace against a stale value fails silently. Write plain text with real unicode characters; never copy \uXXXX escape sequences or JSON-escaped fragments out of tool output.
 
 KEEP VERBATIM — never paraphrase or abbreviate these:
 - Full file paths with line numbers, directory prefix on every mention (`lib/hooks.ts:347`, `src/index.ts:12-18`, `gatenet_v3/model.py:45`). Never abbreviate to a bare filename (`hooks.ts`, `model.py`) — they are ambiguous and cannot be grepped or decompressed-to later.
@@ -22,12 +22,13 @@ KEEP VERBATIM — never paraphrase or abbreviate these:
 - Purpose behind each significant action — preserve not just what was done but why: the hypothesis behind each experiment, the question behind each exploration, the task goal behind each work action. Without purpose, the summary reads as disconnected technical steps with no through-line.
 - Open questions and unresolved TODOs — losing these changes what work appears to remain.
 - Message refs of key anchors (`m00420`, `m00510–m00520`) — they let you or a later reader jump back via decompress to the exact original.
+- Image-bearing ranges — carry every image placeholder ref (`[image: … · mNNNNN]`) into the summary verbatim: it is the ONLY handle for restoring the pixels later (`decompress({ imageRef })` or the host's original-image tool). A prose description of a shape ("tail looks like a paddle") never substitutes for the ref. For iterative visual/design work, end the summary with a one-line baseline anchor: `BASELINE AS OF THIS BLOCK: <iteration/version> — <one-line description of what the current version looks like> + the parameters that define it`, so the next fold knows which version was current and what defined it.
 
 DROP — extract the signal, discard the vessel:
 - Verbose logs (build/test/`npm` output) once you have captured the error line or the result.
 - Duplicate file reads once the needed content is recorded.
 - Consumed exploration — search hits, agent return values, successful tool outputs — once you have extracted the facts you need (same rule as dead-ends, but nothing went wrong; the content is simply spent).
-- Dead-end exploration — but PRESERVE the lesson in one line: "tried X, failed because Y".
+- Dead-end exploration — but PRESERVE the lesson in one line: "tried X, failed because Y". Abandoned tuning iterations count as dead ends too: keep what was changed and what was observed, not just the verdict — a verdict without its failure reason invites repeating the attempt.
 - Back-and-forth discussion and self-corrections once the final position is captured (keep the outcome, drop the journey to it).
 - Repeated status checks (`git status`, `ls`) once state is known.
 

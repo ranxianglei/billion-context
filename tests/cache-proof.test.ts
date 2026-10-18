@@ -1182,10 +1182,20 @@ async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
             if (reply) pushAssistant(t, reply);
             state.suppressTrigger = false;
         };
-        // 1) seed: 12 fat turns — at least one proxy-side fold lands
+        // 1) seed: 12 fat turns — at least one proxy-side fold lands.
+        // #3726 retune (FILLER 6 → 5.6 KB/turn): the approved summary-rule
+        // growth added ~1.2KB (~300 est-tok) to every outbound system prompt,
+        // and this scenario's second 64KB trigger crossing sat inside that
+        // delta (body#11 measured 65125B vs the 65536 gate before the change,
+        // 66325B after): the crossing moved one turn early, desynchronizing
+        // the rearm fold's ref→element mapping so its round-2 no longer
+        // shrank the core element count. ~0.4KB less seed mass per turn
+        // restores the documented alignment with ≥3KB headroom on both sides
+        // of the gate (same class as the #3400 BILI_IMAGE_RESCALE pin and the
+        // #3298 repeat(235) retunes in the sibling preflight fixtures).
         if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
         for (let t = 0; t < 12; t++) {
-            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 5.6));
             await send(t, false);
         }
         assert.ok(trigger.calls() >= 1, `${wire}: seed must land >=1 fold (got ${trigger.calls()})`);

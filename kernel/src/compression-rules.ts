@@ -13,6 +13,13 @@
  * Sidecar showed a multi-block merge (b22 ⊇ b13) dropping a still-open user pivot that
  * b13 had recorded, and the trust-guardrail wording deprioritized objectives living only
  * in summaries. Quotes stay historical; open-objective STATUS is current.
+ *
+ * 2026-10-18 amendment (#3726, owner-approved as enhancement): snapshot-staleness
+ * clause for recorded values; image-ref carry-forward + BASELINE anchor for iterative
+ * visual work; folded-images footer survival across T2/T3 distillation; dead-end rule
+ * extended to abandoned tuning iterations. Motivated by a ~30-round headless-Chrome SVG
+ * iteration where stale summary values silently invalidated edits and folded screenshots
+ * were never restored for comparison (~10–20% of rounds wasted on re-screenshot/re-trial).
  */
 
 /** Opt-in language-preservation rule (#493): summaries must be written in the
@@ -32,7 +39,7 @@ export const COMPRESS_PHILOSOPHY = `Compression Philosophy:
 
 export const HOW_TO_COMPRESS_RULES = `HOW TO COMPRESS
 
-When you call \`compress\`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original. The summary records the PAST as of this block's creation: label recorded task state as history ("TASK AS OF THIS BLOCK: ...") — never as a live instruction, so a later reader treats it as settled context, not something to re-execute. Write plain text with real unicode characters; never copy \\uXXXX escape sequences or JSON-escaped fragments out of tool output.
+When you call \`compress\`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original. The summary records the PAST as of this block's creation: label recorded task state as history ("TASK AS OF THIS BLOCK: ...") — never as a live instruction, so a later reader treats it as settled context, not something to re-execute. Recorded values are SNAPSHOTS of that moment: sources keep changing after the fold, so record volatile values (file contents, coordinates, path data, line numbers) together with their locator (file + symbol/selector) and flag them as point-in-time — a later reader MUST re-read the source before using a recorded value in an edit, because a find/replace against a stale value fails silently. Write plain text with real unicode characters; never copy \\uXXXX escape sequences or JSON-escaped fragments out of tool output.
 
 KEEP VERBATIM — never paraphrase or abbreviate these:
 - Full file paths with line numbers, directory prefix on every mention (\`lib/hooks.ts:347\`, \`src/index.ts:12-18\`, \`gatenet_v3/model.py:45\`). Never abbreviate to a bare filename (\`hooks.ts\`, \`model.py\`) — they are ambiguous and cannot be grepped or decompressed-to later.
@@ -48,12 +55,13 @@ KEEP VERBATIM — never paraphrase or abbreviate these:
 - Purpose behind each significant action — preserve not just what was done but why: the hypothesis behind each experiment, the question behind each exploration, the task goal behind each work action. Without purpose, the summary reads as disconnected technical steps with no through-line.
 - Open questions and unresolved TODOs — losing these changes what work appears to remain.
 - Message refs of key anchors (\`m00420\`, \`m00510–m00520\`) — they let you or a later reader jump back via decompress to the exact original.
+- Image-bearing ranges — carry every image placeholder ref (\`[image: … · mNNNNN]\`) into the summary verbatim: it is the ONLY handle for restoring the pixels later (\`decompress({ imageRef })\` or the host's original-image tool). A prose description of a shape ("tail looks like a paddle") never substitutes for the ref. For iterative visual/design work, end the summary with a one-line baseline anchor: \`BASELINE AS OF THIS BLOCK: <iteration/version> — <one-line description of what the current version looks like> + the parameters that define it\`, so the next fold knows which version was current and what defined it.
 
 DROP — extract the signal, discard the vessel:
 - Verbose logs (build/test/\`npm\` output) once you have captured the error line or the result.
 - Duplicate file reads once the needed content is recorded.
 - Consumed exploration — search hits, agent return values, successful tool outputs — once you have extracted the facts you need (same rule as dead-ends, but nothing went wrong; the content is simply spent).
-- Dead-end exploration — but PRESERVE the lesson in one line: "tried X, failed because Y".
+- Dead-end exploration — but PRESERVE the lesson in one line: "tried X, failed because Y". Abandoned tuning iterations count as dead ends too: keep what was changed and what was observed, not just the verdict — a verdict without its failure reason invites repeating the attempt.
 - Back-and-forth discussion and self-corrections once the final position is captured (keep the outcome, drop the journey to it).
 - Repeated status checks (\`git status\`, \`ls\`) once state is known.
 
@@ -80,6 +88,7 @@ KEEP — these are the only things that survive distillation:
 - Design decisions with architectural impact ("chose compress-as-anchor over synthetic messages because prefix cache").
 - User quotes and task state only as attributed history: keep the source ref with any user quote; never carry an UNVERIFIED tier-1 "CURRENT TASK" claim forward as a live directive — relabel it "TASK AS OF THIS BLOCK". A ref-backed objective that no later source marks completed or superseded is not unverified: it carries in the \`Open objectives:\` entry (next bullet), not as a directive.
 - Open objectives — if ANY source block's summary names a user-requested objective that no later source block marks completed or superseded, the distilled summary MUST keep a one-line \`Open objectives:\` entry re-carrying each still-open objective verbatim with its original ref. They are the last thing to drop and the first thing to restore.
+- Folded-image restore refs — re-carry any \`[folded images: …\` footer lines from source blocks verbatim: their mNNNNN refs are the only keys to archived pixels, and distillation cannot re-derive them from the wire once the originals are pruned.
 - Whether content is OBSOLETE or SUPERSEDED — mark with one line: "[SUPERSEDED by PR #NNN]" or "[OBSOLETE: deleted in vX.Y.Z]". Do NOT keep the obsolete content's details — just the marker and reason.
 - Function/class/type names and module paths that are the SUBJECT of the work — e.g., "fixed filterCompressedRanges in prune.ts", "added SessionStateRegistry in state.ts". Not exact line numbers or full signatures — just enough to LOCATE the code without searching.
 - Exploration findings: if a block was exploratory with no decision, keep the CONCLUSION in one line ("explored X, not viable because Y"). Do not keep the exploration process.
@@ -111,6 +120,7 @@ PRIORITY — when a source block has more facts than the size target allows, kee
 3. Key decisions with architectural impact ("chose X over Y because Z").
 4. Critical constraints ("must support Node 22").
 Drop everything else. Tier 3 is a lookup index, not a knowledge base.
+Folded-image restore refs (\`[folded images: …\`) survive condensation verbatim — archived pixels are unreachable without them.
 
 FORMAT:
 - Start with a source header line:

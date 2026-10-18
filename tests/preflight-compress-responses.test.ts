@@ -42,10 +42,13 @@ function fcEvents(callId: string, args: string): string {
 function longInput() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        // #3298: repeat(235) keeps ~700 est-tokens of margin under the 10k window
+        // #3298: repeat(235) kept ~700 est-tokens of margin under the 10k window
         // after the preflight fold — repeat(250) was knife-edge against the
         // injected system-prompt size and flipped the #330 soft-zone relaxation.
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
+        // #3726: that margin was only ~80 est-tok in practice, so the approved
+        // summary-rule growth (+~300 est-tok per request) flipped the same gate;
+        // repeat(208) restores ~600 tok of headroom, pre-fold still ~15.7k > 10k.
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(208) });
     }
     return input;
 }

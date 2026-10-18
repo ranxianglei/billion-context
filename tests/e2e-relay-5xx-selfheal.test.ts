@@ -37,7 +37,14 @@ import { listSessions, type Session } from "../src/session.ts";
 
 const WINDOW = 32_000;
 const RELAY_WINDOW = 29_500; // the relay's hidden tolerance (tokens, chars/4)
-const BIG = 12_000; // chars per tool_result (well over minOutputTokens 1000)
+// #3726: BIG was 12_000, which put request 1's local estimate at 31851 — under
+// the 32k window by only ~150. The approved summary-rule growth adds ~1.2KB
+// (~300 est-tok) to every outbound system prompt, moving that estimate to
+// 32150 and tripping preflight on request 1 — which this scenario forbids (the
+// relay 5xx must arm the emergency shrink itself, without preflight). 11_500
+// restores ≥1k of headroom while the full body stays above the relay's hidden
+// tolerance (125485B/4 = 31371 > 29500).
+const BIG = 11_500; // chars per tool_result (well over minOutputTokens 1000)
 const STEPS = 9; // big tool steps (outside the protected recent zone)
 
 const RELAY_ERROR_BODY = JSON.stringify({

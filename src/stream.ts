@@ -387,6 +387,52 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
 }
 
+// #3726: the canonical folded-images footer span the host appends to block
+// summaries; the mNNNNN refs inside are the ONLY keys to archived pixels.
+const FOLD_FOOTER_OPEN = "[folded images: ";
+const FOLD_FOOTER_CLOSE = " — decompress({ imageRef }) restores pixels]";
+
+/** #3726: the placeholder tokens inside a summary's folded-images footer spans
+ *  ("[image: png 1024x768 · m00042]", "[media: image ~12KB]" — placeholders
+ *  contain inner spaces, so tokenizing is bracket-based, not whitespace-based). */
+function foldFooterNotes(summary: string): string[] {
+    const notes: string[] = [];
+    let i = 0;
+    while ((i = summary.indexOf(FOLD_FOOTER_OPEN, i)) !== -1) {
+        const close = summary.indexOf(FOLD_FOOTER_CLOSE, i + FOLD_FOOTER_OPEN.length);
+        if (close === -1) break;
+        const body = summary.slice(i + FOLD_FOOTER_OPEN.length, close);
+        let j = 0;
+        while (j < body.length) {
+            while (j < body.length && body[j] !== "[") j += 1;
+            if (j >= body.length) break;
+            const end = body.indexOf("]", j + 1);
+            if (end === -1) break;
+            notes.push(body.slice(j, end + 1));
+            j = end + 1;
+        }
+        i = close + FOLD_FOOTER_CLOSE.length;
+    }
+    return notes;
+}
+
+/** #3726: remove every canonical folded-images footer span from a summary so
+ *  re-appending yields exactly one canonical copy (the model may already have
+ *  carried one into its new text per the carry-forward rule). */
+function stripFoldFooters(summary: string): string {
+    let out = "";
+    let rest = summary;
+    for (;;) {
+        const open = rest.indexOf(FOLD_FOOTER_OPEN);
+        if (open === -1) break;
+        const close = rest.indexOf(FOLD_FOOTER_CLOSE, open + FOLD_FOOTER_OPEN.length);
+        if (close === -1) break;
+        out += rest.slice(0, open);
+        rest = rest.slice(close + FOLD_FOOTER_CLOSE.length);
+    }
+    return (out + rest).replace(/\n{3,}/g, "\n\n").replace(/\n+$/, "");
+}
+
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
  *  the ref numbering restarted, so pre-rebase refs the model still cites can
  *  never resolve again. Name the rebase as the deterministic cause so the
@@ -800,16 +846,50 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         {
             const view = ctx.compressMessages ?? ctx.messages;
             const byRaw = res.state.messageRefs?.byRaw;
+            // #3726: the live-wire derivation only sees messages still on the wire.
+            // Once T1 has pruned the original image-bearing messages, T2/T3 distills
+            // and refolds cannot re-derive the mNNNNN keys — recover them from the
+            // consumed source blocks' footers (distillation) and from a refolded
+            // block's own previous summary instead of letting them die across tiers.
+            // Consumed blocks are NOT removed from state — they stay as
+            // active:false entries (compress.ts), so "consumed" means
+            // "not active in the post-state", never "absent".
+            const afterActive = new Map(res.state.blocks.map((x) => [x.blockId, x.active] as const));
+            const prevBlocks = ctx.session.state.blocks;
             for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
-                const notes: string[] = [];
+                const prevSum = beforeSummaries.get(b.blockId);
+                if (beforeIds.has(b.blockId) && prevSum === b.summary) continue;
+                const live: string[] = [];
                 for (const id of b.directMessageIds) {
                     const m = view.find((msg) => msg.id === id);
                     if (!m) continue;
-                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
+                    live.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
                 }
-                if (notes.length > 0) {
-                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                const carried: string[] = [...foldFooterNotes(prevSum ?? "")];
+                if (!beforeIds.has(b.blockId)) {
+                    // Attribution runs over effectiveMessageIds, not directMessageIds:
+                    // a merge/distillation's own direct ids are the NOT-yet-covered
+                    // stragglers only — the consumed blocks' originals sit in its
+                    // effectiveMessageIds (unit-projection unions them in), which is
+                    // exactly the set a consumed source block's ids must intersect.
+                    const mine = new Set(b.effectiveMessageIds);
+                    for (const c of prevBlocks) {
+                        if (afterActive.get(c.blockId)) continue;
+                        if (!c.directMessageIds.some((id) => mine.has(id))) continue;
+                        const sum = beforeSummaries.get(c.blockId);
+                        if (sum) carried.push(...foldFooterNotes(sum));
+                    }
+                }
+                const seen = new Set<string>();
+                const notes: string[] = [];
+                for (const n of [...live, ...carried]) {
+                    if (!seen.has(n)) { seen.add(n); notes.push(n); }
+                }
+                if (notes.length === 0) continue;
+                const base = stripFoldFooters(b.summary);
+                b.summary = `${base ? `${base}\n\n` : ""}[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                if (carried.length > 0) {
+                    ctx.log(`[acp-proxy: recarried ${carried.length} folded-image ref(s) into block ${b.blockId} across fold (#3726)]`);
                 }
             }
         }

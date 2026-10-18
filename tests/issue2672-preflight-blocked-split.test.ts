@@ -35,9 +35,9 @@ import { listSessions } from "../src/session.ts";
 // the protected pair internally (exactly the production shape).
 //   idx 0      user opener (short)
 //   idx 1..2   assistant foldable 2697 chars   \
-//   idx 3..4   assistant PROTECTED 2562 chars  | c1 = [0..7] by token packing
+//   idx 3..4   assistant PROTECTED ~1700 chars | c1 = [0..7] by token packing
 //   idx 5..7   assistant foldable 2697 chars   /   (8 + 6x675 = 4733 <= 4800),
-//   idx 8      assistant PROTECTED 2562 chars    mid = 3 -> BOTH raw halves
+//   idx 8      assistant PROTECTED ~1700 chars   mid = 3 -> BOTH raw halves
 //   idx 9      assistant foldable 2697 chars     [4..7]/[0..3] touch the pair
 //   idx 10..14 assistant tail 358 chars          -> recent zone (M=1000 grows
 //   idx 15     latest user msg                    backward; endpoint drifts +-1)
@@ -151,8 +151,14 @@ function foldText(i: number): string {
     return `Assistant analysis part ${i}. ` + `FOLD_${i}_payload_`.repeat(178);
 }
 
+// #3726: repeat was 167 (~2562 chars). The approved prompt growth added
+// ~300 est-tok to every outbound system prompt, which pushed the post-half-
+// fold payload from ~7800 over the 8000 window (preflight exhausted -> 413).
+// 106 (~1700 chars) restores ~600 tok of headroom without moving any range
+// boundary: protected mass is hard-excluded from packing, so c1=[0..7], the
+// midpoint, and both snapped halves are unaffected.
 function protectText(i: number): string {
-    return `Protected segment ${i} ${PROTECT_MARKER} stays visible. ` + `PROT_${i}_payload_`.repeat(167);
+    return `Protected segment ${i} ${PROTECT_MARKER} stays visible. ` + `PROT_${i}_payload_`.repeat(106);
 }
 
 function tailText(i: number): string {

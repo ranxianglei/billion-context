@@ -517,11 +517,14 @@ function longAnthropicMessages() {
     // #3298: repeat(250) was knife-edge against the injected system-prompt size —
     // growth of it (the project-attribution line) flipped the #330 soft-zone
     // relaxation, leaving a single anchor message in the forward that this mock
-    // misclassifies as a summary call. repeat(235) restores ~700 est-tokens of
+    // misclassifies as a summary call. repeat(235) restored ~700 est-tokens of
     // margin so the guard pins behavior, not a knife-edge.
+    // #3726: that margin was only ~80 est-tok in practice, so the approved
+    // summary-rule growth (+~300 est-tok per request) flipped the same gate;
+    // repeat(208) restores ~600 tok of headroom, pre-fold still ~15.7k > 10k.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
+        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(208) });
     }
     return msgs;
 }
