@@ -255,26 +255,82 @@ function tierActionHint(config: Config, state: CompressionState): string {
 /** In-place refold (#398): same block id/coverage/tier, new summary (+topic),
  * fresh runId, restoredInline flag cleared. Summary passes the same length
  * checks as a fresh compression. */
+// #3538: open-objective carry-forward backstop. The rules make the model
+// re-carry still-open objectives (with their mNNNNN refs) into every replacing
+// summary, but an early-closing model drops or rewords them and nothing
+// verifies the result before it becomes the only record. Deterministic subset
+// only: every ref named on a source block's `Open objectives:` line must
+// survive into the replacing summary; a missing ref carries its original line
+// back verbatim. A PRESENT ref passes untouched — presence is not semantic
+// proof of closure (the prompt-side evidence gate owns status wording). The
+// whole original line is appended even when only some of its refs are missing:
+// splitting it would fabricate text, and a duplicated entry stays parseable by
+// future distillations.
+const OPEN_OBJECTIVE_LINE_RE = /^\s*(?:[-*+]\s*)?Open objectives\s*:/i;
+
+function openObjectiveCarryLines(summary: string): Map<string, string> {
+  const byRef = new Map<string, string>();
+  for (const line of summary.split("\n")) {
+    if (!OPEN_OBJECTIVE_LINE_RE.test(line)) continue;
+    for (const match of line.matchAll(/\bm(\d+)\b/g)) {
+      if (!byRef.has(match[0])) byRef.set(match[0], line.trim());
+    }
+  }
+  return byRef;
+}
+
+/** Append the open-objective lines whose refs the replacing summary dropped. */
+function carryForwardOpenObjectives(
+  newSummary: string,
+  sourceSummaries: readonly string[],
+): { summary: string; carriedRefs: string[] } {
+  const missing = new Map<string, string>();
+  for (const source of sourceSummaries) {
+    for (const [ref, line] of openObjectiveCarryLines(source)) {
+      if (!missing.has(ref) && !new RegExp(`\\b${ref}\\b`).test(newSummary)) {
+        missing.set(ref, line);
+      }
+    }
+  }
+  if (missing.size === 0) return { summary: newSummary, carriedRefs: [] };
+  const lines = [...new Set(missing.values())];
+  const carriedRefs = [...missing.keys()].sort(
+    (a, b) => Number(a.slice(1)) - Number(b.slice(1)),
+  );
+  return { summary: `${newSummary}\n${lines.join("\n")}`, carriedRefs };
+}
+
+function openObjectiveCarryWarning(refs: string[]): string {
+  return `Open objective(s) ${refs.join(", ")} were missing from this fold's summary — the original Open objectives entry was carried back into the stored summary verbatim. Those objectives remain open: do not treat this fold as completing them.`;
+}
+
 function applyRefolds(input: {
   spec: ApplyCompressionInput["ranges"][number];
   state: CompressionState;
   runId: string;
   config: Config;
   blockIds: string[];
-}): void {
+}): { carriedRefs: string[] } {
   validateSummaryLength(input.spec, input.config.compress);
   const targets = new Set(input.blockIds);
+  // #3538: capture the replaced blocks' summaries BEFORE the rewrite so the
+  // carry-forward backstop can diff their open-objective refs.
+  const sources = input.state.blocks
+    .filter((block) => targets.has(block.blockId))
+    .map((block) => block.summary);
+  const repaired = carryForwardOpenObjectives(input.spec.summary, sources);
   input.state.blocks = input.state.blocks.map((block) =>
     targets.has(block.blockId)
       ? {
           ...block,
-          summary: input.spec.summary,
+          summary: repaired.summary,
           topic: input.spec.topic ?? block.topic,
           runId: input.runId,
           restoredInline: false,
         }
       : block,
   );
+  return { carriedRefs: repaired.carriedRefs };
 }
 
 export function createCore(ports: Ports = {}): CompressionCore {
@@ -606,15 +662,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
       if (resolution === undefined) continue;
       if (resolution.status === "consumed") {
         const decision = refoldDecisions.get(spec);
-        if (decision?.kind === "refold") {
+          if (decision?.kind === "refold") {
           try {
-            applyRefolds({
+            const refolded = applyRefolds({
               spec,
               state,
               runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
             });
+            if (refolded.carriedRefs.length > 0) {
+              warnings.push(openObjectiveCarryWarning(refolded.carriedRefs));
+            }
             blocksCreated += decision.blocks.length;
           } catch (error) {
             errors.push(
@@ -1262,13 +1321,16 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // blocks in place; everything else keeps the legacy rejection verbatim.
     const decision = evaluateRefold(input.state, input.spec);
     if (decision.kind === "refold") {
-      applyRefolds({
+      const refolded = applyRefolds({
         spec: input.spec,
         state: input.state,
         runId: input.runId,
         config: input.config,
         blockIds: decision.blocks.map((block) => block.blockId),
       });
+      if (refolded.carriedRefs.length > 0) {
+        warnings.push(openObjectiveCarryWarning(refolded.carriedRefs));
+      }
       return {
         tokens: 0,
         warnings,
@@ -1300,13 +1362,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // #3538: a distillation/merge consumes existing blocks — their open-objective
+  // refs must survive into the new summary (same backstop as the refold paths).
+  const sourceSummaries = consumedBlockIds
+    .map((id) => blockById(input.state, id)?.summary)
+    .filter((summary): summary is string => typeof summary === "string" && summary.length > 0);
+  const repaired =
+    sourceSummaries.length > 0
+      ? carryForwardOpenObjectives(input.spec.summary, sourceSummaries)
+      : { summary: input.spec.summary, carriedRefs: [] as string[] };
+  if (repaired.carriedRefs.length > 0) {
+    warnings.push(openObjectiveCarryWarning(repaired.carriedRefs));
+  }
+
   const blockId = allocateBlockId(input.state);
   const block: CompressionBlock = {
     blockId,
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: input.spec.summary,
+    summary: repaired.summary,
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],

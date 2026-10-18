@@ -1080,6 +1080,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (changedBlocks.length > 0) {
             msg += "\nFingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
         }
+        // #3538: early-closeout drift — after a fold that reworded open
+        // objectives as delivered, the model closed out on the rewritten state.
+        // One static line at the moment of highest temptation; model-facing
+        // receipt only (the log copy stays excerpt-free per #1718). Byte-stable:
+        // folds already rewrite the history downstream of this message, so the
+        // note rides an existing cache invalidation at zero extra cost.
+        msg += "\nCompression only folds history — it completes no task. Before declaring done, re-check every still-unmet acceptance criterion in your `Open objectives:` entries.";
         // #189 staged compression (gated): a rewrite above the configured max
         // shrink is the shape that trips provider risk-control; steer the model
         // toward smaller, tail-biased ranges so the prefix (m00001..foldPoint)

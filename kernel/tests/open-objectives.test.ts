@@ -2,9 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
-import { collectBlockContent } from "../src/decompress.js";
+import { collectBlockContent, markBlockRestoredInline } from "../src/decompress.js";
 import { renderNudgeText } from "../src/nudge-text.js";
-import type { Config, CoreMessage } from "../src/types.js";
+import { indexToRef } from "../src/refs.js";
+import type { Config, CompressionState, CoreMessage } from "../src/types.js";
 
 // #442 verification shape (request at m00010, fold m00001-m00100, distill).
 // Summary CONTENT is model-produced, so do NOT assert on it — assert the two
@@ -179,5 +180,145 @@ test("gentle T1 nudge carries the open-objectives rule too (#442)", () => {
   assert.ok(
     rendered.text.toLowerCase().includes("open-objective status is current"),
     "softened clause present: quotes historical, status current",
+  );
+  // #3538: the evidence gate lands in the same rule block the model reads at
+  // fold time — an assistant "unreachable" analysis is not closing evidence.
+  assert.ok(
+    rendered.text.includes("NOT closing evidence"),
+    "status changes require in-range user/verification evidence",
+  );
+});
+
+// #3538: deterministic carry-forward backstop — prompt rules cannot be assumed
+// obeyed, so the kernel verifies the ref-presence subset itself on every hop
+// that replaces a block's summary (distillation merge and in-place refold).
+
+const T1_SUMMARY_WITH_OBJECTIVE =
+  "T1 fold.\nOpen objectives: refactor research runner into eight arms (m00010).";
+
+function foldToB1(): { core: ReturnType<typeof createCore>; config: Config; messages: CoreMessage[]; state: CompressionState } {
+  const core = createCore();
+  const config = buildConfig();
+  const messages = makeSession();
+  let state = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config,
+    tokenCount: 50_000,
+  }).state;
+  state = core.applyCompression({
+    ranges: [{ startRef: "m00001", endRef: "m00100", summary: T1_SUMMARY_WITH_OBJECTIVE }],
+    messages,
+    state,
+    config,
+  }).state;
+  return { core, config, messages, state };
+}
+
+test("distillation dropping the open-objective ref carries the entry back verbatim (#3538)", () => {
+  const { core, config, messages, state } = foldToB1();
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "b1",
+        endRef: "b1",
+        summary:
+          "Source: b1 (fold m00001-m00100).\nAll work delivered and committed; objective unreachable per current analysis.",
+      },
+    ],
+    messages,
+    state,
+    config,
+  });
+
+  const b2 = result.state.blocks[1]!;
+  assert.equal(b2.blockId, "b2");
+  assert.ok(
+    b2.summary.includes("Open objectives: refactor research runner into eight arms (m00010)"),
+    `dropped entry carried back into the stored summary, got: ${b2.summary}`,
+  );
+  assert.ok(
+    result.result.warnings.some((w) => w.includes("m00010") && w.includes("remain open")),
+    `receipt warning names the carried ref, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("distillation keeping the ref passes untouched (#3538)", () => {
+  const { core, config, messages, state } = foldToB1();
+  const submitted =
+    "Source: b1 (fold m00001-m00100).\nObjective still open (m00010): refactor runner into eight arms.";
+
+  const result = core.applyCompression({
+    ranges: [{ startRef: "b1", endRef: "b1", summary: submitted }],
+    messages,
+    state,
+    config,
+  });
+
+  const b2 = result.state.blocks[1]!;
+  assert.equal(b2.summary, submitted, "no repair when the ref survives");
+  assert.deepEqual(result.result.warnings.filter((w) => w.includes("m00010")), []);
+});
+
+test("in-place refold dropping the open-objective ref carries it back (#3538)", () => {
+  const core = createCore();
+  const config = buildConfig();
+  const messages: CoreMessage[] = Array.from({ length: 10 }, (_, i) => ({
+    id: `msg-${i + 1}`,
+    role: "assistant",
+    contentType: "text",
+    text: `content ${i + 1} ${"x".repeat(20)}`,
+  }));
+  const ids = messages.map((m) => m.id);
+  const state = createInitialState();
+  state.blocks.push({
+    blockId: "b1",
+    runId: "r1",
+    tier: 1,
+    summary: T1_SUMMARY_WITH_OBJECTIVE,
+    directMessageIds: ids,
+    effectiveMessageIds: ids,
+    directBlockIds: [],
+    compressedTokens: 100,
+    createdAt: 1758800000000,
+    survivedCount: 0,
+    generation: "young",
+    active: true,
+    startRef: "m00001",
+    endRef: "m00010",
+  });
+  messages.forEach((message, i) => {
+    const ref = indexToRef(i + 1);
+    state.messageRefs.byRaw[message.id] = ref;
+    state.messageRefs.byRef[ref] = message.id;
+  });
+  state.nextBlockId = 2;
+  const marked = markBlockRestoredInline(state, "b1").state!;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00010",
+        summary: "Re-folded: work committed; objective deemed unreachable per analysis.",
+      },
+    ],
+    messages: [], // block content hidden from the visible view (post-prune)
+    state: marked,
+    config,
+  });
+
+  assert.deepEqual(result.result.errors, [], JSON.stringify(result.result.errors));
+  assert.equal(result.state.blocks.length, 1, "refold stays in place");
+  const block = result.state.blocks[0]!;
+  assert.equal(block.blockId, "b1");
+  assert.ok(
+    block.summary.includes("Open objectives: refactor research runner into eight arms (m00010)"),
+    `entry carried back onto the refolded summary, got: ${block.summary}`,
+  );
+  assert.ok(
+    result.result.warnings.some((w) => w.includes("m00010")),
+    `warning names the carried ref, got: ${JSON.stringify(result.result.warnings)}`,
   );
 });

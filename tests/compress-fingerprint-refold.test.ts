@@ -101,8 +101,8 @@ test("#1294 P1: long two-section summary yields an exact fingerprint line", () =
     // clean success carries exactly the stop signal.
     assert.deepEqual(
         out.split("\n").slice(2),
-        [STEERING_2544, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
-        "header + fingerprint + #2544 steering + #1387 stop tail only",
+        [STEERING_2544, RECEIPT_TASK_NOTE_3538, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
+        "header + fingerprint + #2544 steering + #3538 task note + #1387 stop tail only",
     );
 });
 
@@ -307,6 +307,8 @@ test("#1615: lone surrogates already present in the input summary are scrubbed t
 });
 
 const STEERING_2544 = "Fingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
+// #3538: static task-state reminder appended to every successful receipt.
+const RECEIPT_TASK_NOTE_3538 = "Compression only folds history — it completes no task. Before declaring done, re-check every still-unmet acceptance criterion in your `Open objectives:` entries.";
 
 test("#2544: receipt states summaries are stored in full and steers to search_context before decompress", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
