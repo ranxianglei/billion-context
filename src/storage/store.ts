@@ -428,14 +428,8 @@ export class UnifiedStore {
                 // forever (permanent DIGEST DRIFT even after the #3166
                 // watermark-clear heal). Release their CAS refs and drop them.
                 //
-                // LANE EXCLUSION (#3248): the incremental lane consumes this
-                // table POSITIONALLY — its baseSeq epoch is an absolute row
-                // count recorded at resync, and rejected-branch rows must stay
-                // in the table as an audit floor the served history slices
-                // past. Sweeping them would invalidate the epoch (cold rebuild
-                // serves an empty canonical → 409 loop). Lane-owned sessions
-                // therefore opt out; they keep #3166-class orphans (bounded —
-                // the boot watermark reset still re-establishes delta trust).
+                // Lane sessions retain rejected branches for legacy epoch
+                // readers; canonical replay follows the raw pointer list.
                 if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
@@ -526,6 +520,11 @@ export class UnifiedStore {
                     // by the existing message row — undo our refcount bump.
                     this.releaseContent(hash);
                 }
+            }
+
+            if (opts?.completeLog === true) {
+                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
+                if (Array.isArray(tail.tailSeqs)) this.setSessionExt(s.sessionId, "history:raw-tail-seqs", tail.tailSeqs);
             }
 
             // blocks: the incoming set is AUTHORITATIVE. Upsert alone leaves
@@ -784,7 +783,7 @@ export class UnifiedStore {
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
      *  key the incremental lane persists is "inc:"-prefixed, so any such key
-     *  marks a session whose messages table the lane consumes positionally. */
+     *  marks a session whose audit rows must survive canonical resyncs. */
     private hasLaneExt(sessionId: string): boolean {
         return this.db.prepare("SELECT 1 FROM session_ext WHERE session_id = ? AND key LIKE 'inc:%' LIMIT 1").get(sessionId) !== undefined;
     }

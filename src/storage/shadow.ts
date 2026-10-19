@@ -241,7 +241,7 @@ export class UnifiedShadow {
                 boundaryMsgId: boundary.msgId,
                 boundaryHash: boundary.contentHash,
                 trustedTailSeqs: mark.tailSeqs,
-            });
+            }, { completeLog: hasRawTail });
             if (applied) this.stats.deltaIngests++;
             return applied;
         } catch {

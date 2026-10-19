@@ -193,10 +193,29 @@ function readCanonicalFromStore(sessionId: string): { kind: "ok"; msgs: BiliMess
         return { kind: "unavailable" };
     }
     if (rows === null) return { kind: "unavailable" };
-    // Divergent-resync epoch: rows below baseSeq belong to a branch the
-    // client already replaced — serve from the current branch only.
-    const baseSeq = readBaseSeq(sessionId);
-    if (baseSeq > 0) rows = rows.slice(baseSeq);
+    let seqs: unknown;
+    try {
+        seqs = getStore().getSessionExt(sessionId, "history:raw-tail-seqs");
+        if (seqs === undefined) seqs = getStore().unifiedTailSeqs(sessionId);
+    } catch {
+        return { kind: "bad", err: "canonical pointers unavailable" };
+    }
+    if (seqs !== null && seqs !== undefined) {
+        if (!Array.isArray(seqs) || !seqs.every((seq): seq is number => Number.isSafeInteger(seq) && seq >= 0)) {
+            return { kind: "bad", err: "malformed canonical pointers" };
+        }
+        const bySeq = new Map(rows.map((row) => [row.seq, row]));
+        const ordered: typeof rows = [];
+        for (const seq of seqs) {
+            const row = bySeq.get(seq);
+            if (!row) return { kind: "bad", err: "canonical pointer references a missing row" };
+            ordered.push(row);
+        }
+        rows = ordered;
+    } else {
+        const baseSeq = readBaseSeq(sessionId);
+        if (baseSeq > 0) rows = rows.slice(baseSeq);
+    }
     const msgs = parseCanonicalRows(rows);
     return msgs === null ? { kind: "bad", err: "malformed canonical rows" } : { kind: "ok", msgs };
 }
@@ -230,34 +249,13 @@ function loadMarks(sessionId: string): Map<string, unknown> {
     return new Map();
 }
 
-/** Divergent-resync epoch (#3248 review finding): a resync REPLACES the
- *  canonical, but the unified messages table is append-only — the rejected
- *  branch's rows stay. Recording the row count at resync time gives cold
- *  rebuilds the absolute index the CURRENT branch starts at, so the table
- *  keeps its audit copy without polluting the served canonical. Degrades
- *  to the full-union read whenever the ext surface is unavailable (legacy). */
+/** Compatibility for legacy sessions without persisted view pointers. */
 function readBaseSeq(sessionId: string): number {
     try {
         const v = getStore().getSessionExt(sessionId, EXT_KEY_BASE_SEQ);
         return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : 0;
     } catch {
         return 0;
-    }
-}
-
-async function recordResyncBaseSeq(sessionId: string, log: (l: string, m: string) => void): Promise<void> {
-    try {
-        const store = getStore();
-        // Settle any debounced save of the outgoing branch FIRST, so the
-        // count cannot miss its rows (a straggler row landing above the
-        // marker would pollute the next branch's slice).
-        const warm = peekSession(sessionId);
-        if (warm) await store.writeNow(warm);
-        const rows = store.unifiedRawMessages(sessionId);
-        const count = rows ? rows.length : 0;
-        if (count > 0) store.setSessionExt(sessionId, EXT_KEY_BASE_SEQ, count);
-    } catch (err) {
-        log("warn", `[incremental] resync epoch not recorded for ${sessionId}: ${String(err)} — cold rebuilds will serve the full row union until the next resync`);
     }
 }
 
@@ -421,10 +419,10 @@ export async function handleIncrementalTurn(
                 return jsonReply(res, 503, { error: "incremental lane requires storage.unified (shadow or full); this lane runs legacy-only" });
             }
             if (rebuilt.kind === "bad") {
-                log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — requesting client resync`);
-                return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
+                log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — ${resync ? "replacing from client resync" : "requesting client resync"}`);
+                if (!resync) return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
             }
-            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
+            entry = { sessionId, msgs: rebuilt.kind === "ok" ? rebuilt.msgs : [], marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
         }
         const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload);
         if (!applied.ok) {
@@ -436,8 +434,14 @@ export async function handleIncrementalTurn(
             entry.systemSet = true;
         }
         touchCache(conversationId, entry);
-        // Record the epoch BEFORE the forward lands the new branch's rows.
-        if (resync) await recordResyncBaseSeq(sessionId, log);
+        if (resync) {
+            try {
+                const session = peekSession(sessionId);
+                if (session) await getStore().writeNow(session);
+            } catch (err) {
+                log("warn", `[incremental] pending branch save failed for ${sessionId}: ${String(err)}`);
+            }
+        }
         persistLaneState(sessionId, entry.system, entry.systemSet, entry.marks, log);
 
         const body: Record<string, unknown> = { ...forwarded, messages: coreToAnthropic(entry.msgs, entry.marks) as never };

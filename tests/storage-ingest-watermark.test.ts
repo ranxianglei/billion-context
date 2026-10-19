@@ -653,6 +653,62 @@ test("watermark: restart handoff — the previous writer's rows and watermark do
     }
 });
 
+test("watermark: raw canonical pointers preserve reused rows, order and duplicate slots", () => {
+    const dir = tmpdir("bili-wm-raw-view-");
+    try {
+        const { shadow, store } = openShadow(dir);
+        try {
+            const id = "raw-view";
+            store.setSessionExt(id, "inc:cache-marks", []);
+            const original = [msg(0), msg(1), msg(2)];
+            shadow.record(mkLegacy(id, original), { lastMessages: original });
+            assert.deepEqual(store.getSessionExt(id, "history:raw-tail-seqs"), [0, 1, 2]);
+            const branch = [msg(2), msg(0), msg(0)];
+            shadow.record(mkLegacy(id, branch), { lastMessages: branch });
+            assert.deepEqual(store.getSessionExt(id, "history:raw-tail-seqs"), [2, 0, 0]);
+            assert.equal(store.getMessages(id).length, 3, "shared identities reuse audit rows");
+            const folded = { ...mkLegacy(id, [msg(9)]), lastMessagesFolded: true };
+            shadow.record(folded);
+            assert.deepEqual(store.tailSeqs(id), [3]);
+            assert.deepEqual(store.getSessionExt(id, "history:raw-tail-seqs"), [2, 0, 0], "folded-only saves preserve the raw view");
+            const withSnapshot = [msg(2), msg(0), msg(4)];
+            shadow.record(mkLegacy(id, withSnapshot, original), { lastMessages: withSnapshot });
+            assert.deepEqual(store.getSessionExt(id, "history:raw-tail-seqs"), store.tailSeqs(id), "plugin snapshot rows do not extend the raw tail");
+        } finally {
+            shadow.close();
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("watermark: raw canonical pointers advance on delta ingest and survive reopening", () => {
+    const dir = tmpdir("bili-wm-raw-delta-");
+    try {
+        const { shadow, store } = openShadow(dir);
+        try {
+            const first = [msg(0)];
+            shadow.record(mkLegacy("raw-delta", first), { lastMessages: first });
+            const next = [...first, msg(1), msg(2)];
+            shadow.record(mkLegacy("raw-delta", next), { lastMessages: next });
+            assert.equal(stats(shadow).deltaIngests, 1);
+            assert.deepEqual(store.getSessionExt("raw-delta", "history:raw-tail-seqs"), [0, 1, 2]);
+        } finally {
+            shadow.close();
+            store.close();
+        }
+        const reopened = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            assert.deepEqual(reopened.getSessionExt("raw-delta", "history:raw-tail-seqs"), [0, 1, 2]);
+        } finally {
+            reopened.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
 test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () => {
     const dir = tmpdir("bili-wm-lane-skip-");
     try {

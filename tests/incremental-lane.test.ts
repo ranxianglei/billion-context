@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -39,10 +39,10 @@ interface Harness {
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "shadow" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
-    process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";
+    process.env.BILI_STORAGE_UNIFIED = storageMode;
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -197,7 +197,7 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         assert.equal(resync.headers.get("x-bili-applied-seq"), "1");
         // Cold restart: the canonical must rebuild from the CURRENT branch
         // only — the rejected branch's rows stay in the table (append-only)
-        // but the served history slices past them (baseSeq epoch).
+        // but the served history follows the current branch's raw pointers.
         _resetSessionsForTest();
         __resetIncrementalLaneForTests();
         const delta = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2, "new branch tail")] });
@@ -208,6 +208,58 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         const first = JSON.stringify(upstream.messages[0].content);
         assert.ok(first.includes("edited branch"), `first message is the resynced one: ${first.slice(0, 80)}`);
         assert.ok(!JSON.stringify(upstream.messages).includes("old branch"), "old branch rows do not leak into the canonical");
+    } finally {
+        await h.close();
+    }
+});
+
+for (const mode of ["full", "shadow"] as const) {
+    for (const editTail of [false, true]) {
+        test(`incremental lane: ${mode} cold resync preserves a shared prefix (edit tail: ${editTail})`, async () => {
+            const h = await harness(mode);
+            try {
+                const original = [userTurn(1, "shared prefix"), assistantTurn(1), userTurn(2, "original tail")];
+                const branch = editTail ? [...original.slice(0, -1), userTurn(2, "edited tail")] : original;
+                const seed = await h.turn({ sinceSeq: 0, messages: original });
+                assert.equal(seed.status, 200);
+                const resync = await h.turn({ sinceSeq: 0, resync: true, messages: branch });
+                assert.equal(resync.status, 200);
+                assert.equal(resync.headers.get("x-bili-applied-seq"), "3");
+                const expected = (h.forwarded.at(-1) as { messages: unknown[] }).messages;
+                const session = peekSession("conv-inc-1");
+                assert.ok(session);
+                await getStore().writeNow(session);
+                _resetSessionsForTest();
+                __resetIncrementalLaneForTests();
+                const delta = await h.turn({ sinceSeq: 3, messages: [assistantTurn(2), userTurn(3, "after cold resync")] });
+                assert.equal(delta.status, 200, JSON.stringify(delta.body));
+                assert.equal(delta.headers.get("x-bili-applied-seq"), "5");
+                const actual = (h.forwarded.at(-1) as { messages: unknown[] }).messages;
+                assert.equal(actual.length, 5);
+                assert.deepEqual(actual.slice(0, 3), expected);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+}
+
+test("incremental lane: malformed canonical pointers require a resync and can be replaced", async () => {
+    const h = await harness("full");
+    try {
+        const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1)] });
+        assert.equal(seed.status, 200);
+        const session = peekSession("conv-inc-1");
+        assert.ok(session);
+        await getStore().writeNow(session);
+        getStore().setSessionExt("conv-inc-1", "history:raw-tail-seqs", [999999]);
+        _resetSessionsForTest();
+        __resetIncrementalLaneForTests();
+        const rejected = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2)] });
+        assert.equal(rejected.status, 409);
+        const recovered = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1, "recovered history")] });
+        assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
+        assert.equal(recovered.headers.get("x-bili-applied-seq"), "1");
     } finally {
         await h.close();
     }
