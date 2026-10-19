@@ -227,7 +227,14 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
         // the fold rides the newest generation's ids — coverage survived three model switches
         const covered = (session.state.blocks as { effectiveMessageIds: string[] }[])[0].effectiveMessageIds;
         for (let i = 1; i < 12; i++) assert.ok(covered.includes(`g3_${i}`), `g3_${i} covered`);
-        assert.ok(covered.includes("pre"), "the honestly-lost preamble id stays listed (warn, not destroy)");
+        // #3849: "warn, not destroy" meant no escalation/latch/reap (asserted
+        // above) — the leftover id also gains a bounded lifetime: permanent on
+        // three evidence-less passes, it retires instead of wedging the
+        // denominator and the warn loop forever.
+        assert.ok(!covered.includes("pre"), "permanently-unmatched preamble id retires on its third evidence-less pass (#3849)");
+        const retiredLines = logs.filter((l) => l.msg.includes("retired from fold coverage"));
+        assert.equal(retiredLines.length, 1, "one-time retirement notice");
+        assert.match(retiredLines[0].msg, /1 covered id\(s\)/);
     });
 
     test("pre-latched escalation (old-build session crossing the upgrade) un-latches on the first recovered pass", () => {
