@@ -19,7 +19,10 @@
 // backstop against compression starvation — over-limit tier-1 arms DO route
 // through the decision, by design).
 
-import type { CompressibleRange } from "acp-kernel";
+import type { CompressibleRange, NudgeDecision, NudgePromptSections, Prompts, RenderedNudge } from "acp-kernel";
+import { renderNudgeText } from "acp-kernel";
+import { externalFailureClasses, externalFailureLatchActive, externalFailureStreak, externalSummaryFingerprint, renderExternalFailureNotice } from "./external-summary-failures.js";
+import { externalSummaryEnabled } from "./external-summary-surface.js";
 
 /** Output budget for the decision call. Matches the SIDE_REQUEST_MAX_TOKENS=200
  *  system (title-gen side requests use the same ceiling class). */
@@ -266,4 +269,32 @@ export function extractDecisionText(
         }
     }
     return parts.join("");
+}
+
+/** #3638: lane-level nudge render with the external-summary failure latch.
+ *  While the session's configured independent summarizer chain has failed its
+ *  last consecutive batches (latch armed), the tier>=2 distillation/condensation
+ *  nudge is replaced by the concise standing notice INSTEAD of re-injecting the
+ *  full block catalog every turn — the catalog instructs the model to distill,
+ *  which cannot succeed while the only authorized path is dead, and each
+ *  injection itself adds context (#3638 self-amplification). Tier-1 nudges are
+ *  untouched; every non-external-mode session renders byte-identically to
+ *  before (the latch is only consulted when the mode is enabled). */
+export function renderLaneNudgeText(
+    decision: NudgeDecision,
+    prompts: Prompts,
+    sections: NudgePromptSections | undefined,
+    metadata: Record<string, unknown> | undefined,
+    config: unknown,
+): RenderedNudge {
+    const tier = decision.tier;
+    // `config` is the full request Config; the latch records fingerprints of
+    // its externalSummary rail chain (same source as the plan/catch paths),
+    // so compare against THAT, not the whole config (#3638 review).
+    const chain = (config as { externalSummary?: unknown } | undefined)?.externalSummary;
+    if (tier !== null && tier >= 2 && externalSummaryEnabled(config)
+        && externalFailureLatchActive(metadata, externalSummaryFingerprint(chain))) {
+        return { voice: "gentle", text: renderExternalFailureNotice(tier, externalFailureClasses(metadata), externalFailureStreak(metadata)) };
+    }
+    return renderNudgeText(decision, prompts, sections);
 }

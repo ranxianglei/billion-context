@@ -5,7 +5,7 @@ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMess
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, renderLaneNudgeText, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -315,7 +315,7 @@ export async function prepareGoogle(
                 }
             } else {
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const rendered = renderLaneNudgeText(turn.nudge, prompts, surface?.nudgeSections, session.metadata, config);
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
                         rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));

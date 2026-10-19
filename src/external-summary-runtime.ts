@@ -1,5 +1,6 @@
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
+import { ExternalSummaryError, externalSummaryFingerprint, type ExternalBatchOutcome, type ExternalSummaryFailureClass } from "./external-summary-failures.js";
 import { parseExternalSummarySettings, SUMMARY_CONCURRENCY_DEFAULT, type ExternalSummarySettings } from "./external-summary-settings.js";
 import { ExternalSummaryExecutor, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
 import { log as loggerLog } from "./logger.js";
@@ -24,17 +25,29 @@ export class ConfiguredSummaryPlan {
      *  (shared-pool congestion, or the plan's budget already exhausted before
      *  reaching the pool — congestion, not a chain failure). */
     readonly stats = { calls: 0, attempts: 0 };
+    /** #3638: stable chain identity for the per-session failure latch. */
+    readonly fingerprint: string;
+    /** #3638: caller-visible labels for diagnostics (config values, not secrets). */
+    readonly targetLabels: readonly { readonly name: string; readonly protocol: string; readonly model: string }[];
+    private readonly onBatch: ((outcome: ExternalBatchOutcome) => void) | undefined;
     private readonly sessionId: string | undefined;
 
     // `raw` may be an already-parsed chain off the request rail or raw JSON
     // from a hand-edited file — re-parse here so invalid settings fail
     // loudly at plan build, never silently use main-model summaries.
-    constructor(raw: unknown, store = new SummaryCredentialStore(), env: NodeJS.ProcessEnv = process.env, sessionId?: string) {
+    constructor(raw: unknown, store = new SummaryCredentialStore(), env: NodeJS.ProcessEnv = process.env, sessionId?: string, options?: { onBatch?: (outcome: ExternalBatchOutcome) => void }) {
         // inlineKeys: the rail may carry agent-registry recipes whose keys
         // were resolved in the agent's memory (#2336) — literal apiKey bytes
         // instead of a credentialRef.
         this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         this.sessionId = sessionId;
+        // Fingerprint the RAW chain, not the parsed settings: the latch
+        // consumers (catch paths, lane nudge render) see the unresolved rail
+        // chain, and parseExternalSummarySettings fills defaults / normalizes
+        // URLs, which would make the two fingerprints disagree (#3638 review).
+        this.fingerprint = externalSummaryFingerprint(raw);
+        this.targetLabels = this.settings.targets.map((target) => ({ name: target.name, protocol: target.protocol, model: target.model }));
+        this.onBatch = options?.onBatch;
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
         this.candidates = this.settings.targets.map((target) => {
             try {
@@ -55,7 +68,9 @@ export class ConfiguredSummaryPlan {
                     seenCandidateWarnings.add(signature);
                     loggerLog("warn", `[external-summary] candidate ${target.name} unavailable: ${reason} — it will be skipped until fixed`);
                 }
-                return { async summarize(): Promise<string> { throw new Error("External summary candidate unavailable"); } };
+                // #3638: typed so the caller-visible diagnostic names the class
+                // (candidate_unavailable) without leaking the private reason.
+                return { async summarize(): Promise<string> { throw new ExternalSummaryError({ cls: "candidate_unavailable" }); } };
             }
         });
     }
@@ -66,9 +81,24 @@ export class ConfiguredSummaryPlan {
         // a construction-time clock point went stale mid-round and starved every
         // later range (#2639). The model-tool path packs all ranges into one call,
         // where executeBatch's shared deadline still bounds the whole batch.
+        const attemptsBefore = this.stats.attempts;
         const batch = await executor.executeBatch(work, this.candidates, { ...this.settings.budget }, signal, { concurrency: this.settings.concurrency });
         this.stats.calls += 1;
         for (const item of batch.results) this.stats.attempts += item.attempts.length;
+        // #3638: report the batch to the session-scoped latch consumer.
+        // dispatched=false (pool dropped everything, #2662) means congestion —
+        // the latch consumer ignores it rather than counting a chain failure.
+        if (this.onBatch) {
+            const classes = new Set<ExternalSummaryFailureClass>();
+            for (const item of batch.results) for (const attempt of item.attempts) if (attempt.failure?.cls) classes.add(attempt.failure.cls);
+            this.onBatch({
+                successes: batch.results.filter((item) => item.status === "success").length,
+                total: batch.results.length,
+                classes: [...classes],
+                fingerprint: this.fingerprint,
+                dispatched: this.stats.attempts > attemptsBefore,
+            });
+        }
         return batch;
     }
 }
@@ -78,8 +108,8 @@ export class ConfiguredSummaryPlan {
  *  `mergeCompress` with whole-chain-replace semantics). undefined/disabled →
  *  undefined (legacy in-model summaries). Invalid settings throw — they must
  *  fail loudly, never silently fall back to main-model summaries. */
-export function configuredSummaryPlan(settings: unknown, sessionId?: string): ConfiguredSummaryPlan | undefined {
+export function configuredSummaryPlan(settings: unknown, sessionId?: string, options?: { onBatch?: (outcome: ExternalBatchOutcome) => void }): ConfiguredSummaryPlan | undefined {
     if (!settings || typeof settings !== "object") return undefined;
     if ((settings as { enabled?: unknown }).enabled !== true) return undefined;
-    return new ConfiguredSummaryPlan(settings, new SummaryCredentialStore(), process.env, sessionId);
+    return new ConfiguredSummaryPlan(settings, new SummaryCredentialStore(), process.env, sessionId, options);
 }

@@ -201,7 +201,9 @@ test("external summary HTTP: an exhausted transient chain logs every attempt and
     await upstream((_req, res) => { res.writeHead(503); res.end("upstream unavailable"); }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
         assert.equal(result.status, "failed");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+        // #3638: retry exhaustion on a non-transient-final verdict now carries the
+        // classified failure (status surfaced, body never is).
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", failure: { cls: "provider_rejected", detail: "HTTP 503" } }]);
     });
     assert.equal(lines.filter((line) => line.includes("rejected: HTTP 503")).length, 3);
 });
@@ -216,7 +218,7 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
         await upstream((_req, res) => res.end(JSON.stringify(body)), async (url) => {
             const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url, protocol), 4096)], budget);
             assert.equal(result.status, "failed");
-            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", failure: { cls: "invalid_output", detail: "response did not complete or contains no summary" } }]);
         });
     });
 }
@@ -250,7 +252,7 @@ test("external summary HTTP: a stalled response is cancelled before the backup a
     }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(`${url}/primary`), 4096), createSummaryHttpCandidate(target(`${url}/backup`), 4096)], { ...budget, targetTimeoutMs: 150 });
         assert.equal(result.status, "success");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "timeout" }, { targetIndex: 1, outcome: "success" }]);
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "timeout", failure: { cls: "timeout" } }, { targetIndex: 1, outcome: "success" }]);
     });
     assert.deepEqual(paths, ["/primary", "/backup"]);
 });

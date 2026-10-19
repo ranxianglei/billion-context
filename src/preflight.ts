@@ -22,6 +22,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { externalSummaryFingerprint, recordExternalBatchOutcome } from "./external-summary-failures.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { isCodexClient } from "./codex-compact.js";
 import type { ExternalSummaryBatchResult } from "./external-summary.js";
@@ -1110,7 +1111,7 @@ export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult
     if (!result) return `batch=${batch.status} (no result)`;
     const parts = [`batch=${batch.status}`, `result=${result.status}`];
     if (result.status === "failed") parts.push(`reason=${result.reason}`);
-    parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}`).join(",")}]`);
+    parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}${a.failure ? `(${a.failure.cls})` : ""}`).join(",")}]`);
     return parts.join(" ");
 }
 
@@ -1503,9 +1504,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // The plan rides the request Config rail: deps.config is this
             // request's resolved Config (three-level cascade), so the plan
             // always matches the settings the wire path itself resolved.
-            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary, deps.session.id) };
+            // #3638: preflight folds feed the same per-session failure latch as
+            // the model-tool path, so a persistently dead chain is visible from
+            // whichever side keeps trying it.
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary, deps.session.id, {
+                onBatch: (outcome) => recordExternalBatchOutcome(deps.session.metadata, outcome),
+            }) };
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
+            // #3638: an unbuildable chain is a persistent failure too — count it
+            // (same class the model-tool path records for the same condition).
+            recordExternalBatchOutcome(deps.session.metadata, { successes: 0, total: 1, classes: ["candidate_unavailable"], fingerprint: externalSummaryFingerprint((deps.config as ResolvedKernelConfig).externalSummary), dispatched: false });
             deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
         }
     }

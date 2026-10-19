@@ -44,7 +44,7 @@ test("external summary: failed targets run once in order, without leaking provid
 
 test("external summary: exhaustion never invents a summary or main-model fallback", async () => {
     const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("failed"); } }], budget);
-    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error" }] });
+    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", failure: { cls: "unknown_error" } }] });
     assert.equal("summary" in result, false);
 });
 
@@ -186,7 +186,7 @@ test("external summary: late rejections are observed and release capacity", asyn
     const executor = new ExternalSummaryExecutor(1);
     const leave = deferred<string>();
     const result = await executor.execute(work, [{ summarize: async () => leave.promise }], { ...budget, targetTimeoutMs: 10 });
-    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "timeout" }] });
+    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "timeout", failure: { cls: "timeout" } }] });
     leave.reject(new Error("late private provider error"));
     await leave.promise.catch(() => undefined);
     assert.equal((await executor.execute(work, [successful()], budget)).status, "success");

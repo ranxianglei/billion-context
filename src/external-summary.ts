@@ -1,7 +1,21 @@
+/** Structured read-only reference (#3638): each candidate fits THESE into its
+ *  own real window before sending (drop-oldest shrinkage); the legacy opaque
+ *  `reference` string is sent as-is when no parts exist. */
+export interface SummaryReferenceParts {
+    readonly submittedSummaryHint?: string;
+    /** Uncovered context messages, oldest first. */
+    readonly currentContext?: ReadonlyArray<{ role: string; text: string }>;
+    /** Other active block summaries, oldest first. */
+    readonly otherSummaries?: ReadonlyArray<{ topic?: string; summary: string }>;
+}
+
+import { classifyError, type ExternalSummaryFailure } from "./external-summary-failures.js";
+
 export interface SummaryWork {
     readonly content: string;
     readonly instructions: string;
     readonly reference?: string;
+    readonly referenceParts?: SummaryReferenceParts;
     readonly minSummaryChars?: number;
     readonly maxSummaryChars?: number;
 }
@@ -27,6 +41,8 @@ interface SummaryPoolOptions {
 interface SummaryAttempt {
     readonly targetIndex: number;
     readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled";
+    /** #3638: classified reason for non-success outcomes (bounded, secret-free). */
+    readonly failure?: ExternalSummaryFailure;
 }
 
 type ExternalSummaryResult =
@@ -38,7 +54,7 @@ export type ExternalSummaryBatchResult =
     | { status: "finished" | "cancelled" | "deadline"; results: ExternalSummaryResult[] }
     | { status: "failed"; reason: "invalid_plan"; results: [] };
 
-type AttemptResult = { kind: "value"; value: string } | { kind: "error" } | { kind: "aborted" };
+type AttemptResult = { kind: "value"; value: string } | { kind: "error"; error?: unknown } | { kind: "aborted" };
 type Release = () => void;
 interface Waiter {
     signal: AbortSignal;
@@ -190,7 +206,7 @@ export class ExternalSummaryExecutor {
                     if (performance.now() >= targetDeadline) abort();
                     if (attempt.signal.aborted) throw new Error("Summary attempt cancelled before dispatch");
                     return target.summarize(request, attempt.signal);
-                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), () => ({ kind: "error" })).finally(release);
+                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), (error) => ({ kind: "error", error })).finally(release);
                 let result: AttemptResult;
                 try {
                     result = await awaitAttempt(operation, attempt.signal);
@@ -200,19 +216,21 @@ export class ExternalSummaryExecutor {
                 }
                 if (performance.now() >= deadline) cancel();
                 if (overall.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: signal?.aborted ? "cancelled" : "timeout" });
+                    attempts.push({ targetIndex, outcome: signal?.aborted ? "cancelled" : "timeout", ...(signal?.aborted ? {} : { failure: { cls: "timeout" as const } }) });
                     return stopped();
                 }
                 if (performance.now() >= targetDeadline) abort();
                 if (result.kind === "aborted" || attempt.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: "timeout" });
+                    attempts.push({ targetIndex, outcome: "timeout", failure: { cls: "timeout" } });
                 } else if (result.kind === "error") {
-                    attempts.push({ targetIndex, outcome: "error" });
-                } else if (typeof result.value !== "string" || !result.value.trim()
-                    || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
-                    || result.value.trim().length < (request.minSummaryChars ?? 1)
+                    attempts.push({ targetIndex, outcome: "error", failure: classifyError(result.error) });
+                } else if (typeof result.value !== "string" || !result.value.trim()) {
+                    attempts.push({ targetIndex, outcome: "invalid_summary", failure: { cls: "invalid_output", detail: "response carries no summary text" } });
+                } else if (Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes) {
+                    attempts.push({ targetIndex, outcome: "invalid_summary", failure: { cls: "output_budget_overflow", detail: `summary exceeds the ${limits.maxSummaryBytes} byte budget` } });
+                } else if (result.value.trim().length < (request.minSummaryChars ?? 1)
                     || ((request.maxSummaryChars ?? 0) > 0 && result.value.trim().length > request.maxSummaryChars!)) {
-                    attempts.push({ targetIndex, outcome: "invalid_summary" });
+                    attempts.push({ targetIndex, outcome: "invalid_summary", failure: { cls: "invalid_output", detail: "summary outside its character limits" } });
                 } else {
                     attempts.push({ targetIndex, outcome: "success" });
                     return { status: "success", summary: result.value, targetIndex, attempts };
