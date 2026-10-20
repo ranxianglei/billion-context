@@ -87,7 +87,8 @@
     "typescript": "^5.5.0",
     "undici": "^7.29.0",
     "verdaccio": "^6.10.4",
-    "ws": "8.22.0"
+    "ws": "8.22.0",
+    "z3-solver": "^5.3.1"
   },
   "engines": {
     "node": ">=20"

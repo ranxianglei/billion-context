@@ -14,5 +14,5 @@
     "lib": ["ES2024"],
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "verif/**/*.ts", "tests/**/*.ts"]
 }
