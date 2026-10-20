@@ -39,6 +39,7 @@ import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools, responsesSysDevItemText } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { captureSystemSurface } from "../system-surface.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -642,6 +643,10 @@ export async function prepareResponses(
     const loadedToolTokens = countLoadedToolTokens(rebuilt);
     if (transformOk) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens + inplaceSysDevTokens;
+        // #3201: persist the system+tools surface text (web trajectory view);
+        // inside transformOk like the measurement — a failed kernel transform
+        // forwards unchanged and must not record a stale surface.
+        captureSystemSurface(session, responsesDevContent ?? "", toolsOut);
         const catalogTokens = defaultCountTokens(JSON.stringify(toolsOut ?? []));
         const visibleTokens = defaultCountTokens(JSON.stringify(modelVisibleTools(toolsOut)));
         if (catalogTokens >= 50_000 || catalogTokens !== visibleTokens || loadedToolTokens > 0) {

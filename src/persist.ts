@@ -36,6 +36,7 @@ import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
+import { isValidSystemSurface, SYSTEM_SURFACE_SUFFIX, type SystemSurfaceRecord } from "./system-surface.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -324,6 +325,13 @@ export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOr
     return base.slice(0, -".json".length) + ".content-store.json";
 }
 
+/** #3201: system-surface sidecar path — same sibling discipline as the
+ *  content store above. */
+function systemSurfaceRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+    const base = relPathFor(id, protocol, upstreamOrigin);
+    return base.slice(0, -".json".length) + SYSTEM_SURFACE_SUFFIX;
+}
+
 /** #1937: true when a walked FILENAME is the canonical (or legacy flat /
  *  .fb fallback) name for record `id` — mirrors the kernel StateStore.loadAll
  *  owner check so independent directory walkers agree with loadSync about
@@ -553,12 +561,16 @@ export class SessionStore {
             legacy: (parsed) => (isValidRecord(parsed) ? { id: parsed.id, payload: parsed, version: parsed.version, savedAt: parsed.savedAt } : null),
             validate: (envelope) => isValidRecord(envelope.payload),
             // #2298: CCR content-store envelopes (#1097) co-reside in the SAME
-            // namespace by design (<proto>/<host>_<hash>.content-store.json) but
+            // namespace by design (<proto>/<host>_<hash>.content-store.json), as
+            // do #3201 system-surface sidecars (.system-surface.json), but
             // are not session records — declaring them foreign keeps the boot
             // scan from parsing each one and warning "skipping invalid record"
             // per file (hundreds of warns per start at multi-relay scale). Same
             // suffix predicate the GC (#1180) and web walkers already use.
-            foreignFile: (file) => path.basename(file).endsWith(".content-store.json"),
+            foreignFile: (file) => {
+                const base = path.basename(file);
+                return base.endsWith(".content-store.json") || base.endsWith(SYSTEM_SURFACE_SUFFIX);
+            },
         });
     }
 
@@ -571,6 +583,45 @@ export class SessionStore {
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(session.id),
         ]);
+    }
+
+    /** #3201: load the session's system-surface sidecar (same probe order as
+     *  loadContentStore). It is a DERIVED artifact, unlike the content store:
+     *  a corrupt/unreadable file degrades to "not captured" (warned) and must
+     *  never refuse boot or block a save. */
+    loadSystemSurface(session: Session): SystemSurfaceRecord | null {
+        return this.readSystemSurfaceRels(session.id, [
+            systemSurfaceRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
+            systemSurfaceRelPathFor(session.id),
+        ]);
+    }
+
+    private readSystemSurfaceRels(id: string, rels: string[]): SystemSurfaceRecord | null {
+        if (!this.enabled) return null;
+        const source = this.sourceFiles.get(id);
+        const paths = [...rels.map(rel => path.join(this.sessionsDir, rel)),
+            ...(source ? [source.replace(/\.json$/, SYSTEM_SURFACE_SUFFIX)] : []),
+            ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
+                .map(file => file.replace(/\.json$/, SYSTEM_SURFACE_SUFFIX))];
+        for (const file of new Set(paths)) {
+            let buf: Buffer;
+            try {
+                buf = readFileSync(file);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+                this.log("warn", `[persist] system surface for ${id} unreadable, ignoring: ${String(err)}`);
+                return null;
+            }
+            try {
+                const parsed: unknown = JSON.parse(this.readCodec.decode(buf));
+                if (isValidSystemSurface(parsed)) return parsed;
+                throw new Error(`system surface for ${id} is malformed`);
+            } catch (err) {
+                this.log("warn", `[persist] system surface for ${id} unreadable, ignoring: ${err instanceof Error ? err.message : String(err)}`);
+                return null;
+            }
+        }
+        return null;
     }
 
     /** Id+meta variant for replica freeze/restore (#2671 review 6): the
@@ -689,6 +740,34 @@ export class SessionStore {
         }
     }
 
+    /** #3201: persist the system-surface sidecar when dirty; an absent
+     *  surface deletes the file. Same atomic tmp+rename discipline as
+     *  saveContentStore. Unlike that one, a failure here only re-arms dirty —
+     *  it never blocks the session state write (derived artifact, see
+     *  readSystemSurfaceRels). */
+    private saveSystemSurface(session: Session): void {
+        if (!this.enabled || !session.systemSurfaceDirty) return;
+        const rel = systemSurfaceRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
+        const abs = path.join(this.sessionsDir, rel);
+        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
+        try {
+            if (!session.systemSurface) {
+                rmSync(abs, { force: true });
+                session.systemSurfaceDirty = false;
+                return;
+            }
+            mkdirSync(path.dirname(abs), { recursive: true });
+            const text = JSON.stringify(session.systemSurface);
+            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text, { mode: 0o600 });
+            renameSync(tmp, abs);
+            session.systemSurfaceDirty = false;
+        } catch (err) {
+            try { rmSync(tmp, { force: true }); } catch { /* best-effort: a stuck temp is swept at next boot */ }
+            session.systemSurfaceDirty = true;
+            this.log("warn", `[persist] system-surface write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
     /** Bulk-load every persisted session from disk into a map keyed by the
      *  REAL session id (read from the file body, not the filename). Called once
      *  at startup before the server accepts traffic. Corrupt individual files
@@ -790,7 +869,8 @@ export class SessionStore {
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             const files = existsSync(root) ? await walkJsonFiles(root) : [];
             for (const file of files) {
-                if (path.basename(file).endsWith(".content-store.json")) continue;
+                const base = path.basename(file);
+                if (base.endsWith(".content-store.json") || base.endsWith(SYSTEM_SURFACE_SUFFIX)) continue;
                 this.diskFiles.push(file);
                 filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
             }
@@ -2289,6 +2369,7 @@ export class SessionStore {
      *  internal debounce could not do: every per-turn save then proved its
      *  bytes on disk and the ownership fast path stayed live. */
     scheduleSave(session: Session): void {
+        this.saveSystemSurface(session);
         if (!this.saveContentStore(session)) return;
         if (this.writerOffActive()) {
             // Phase 3 (#2960): index-only persistence — the builder closure
@@ -2383,6 +2464,7 @@ export class SessionStore {
      *  check and the build), so concurrent callers there cannot interleave
      *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
+        this.saveSystemSurface(session);
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive()) {
             // #3133: drop the armed microtask (token mismatch below) — this
@@ -2463,6 +2545,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
+        this.saveSystemSurface(session);
         if (!this.saveContentStore(session)) return false;
         if (this.writerOffActive()) {
             // #3133: same subsume rule as writeNow.
@@ -2512,7 +2595,10 @@ export class SessionStore {
         // a stray microtask would build against a closed store and burn a
         // 3-strike disable for no reason.
         this.drainWriterOffPending();
-        for (const session of sessions) this.saveContentStore(session);
+        for (const session of sessions) {
+            this.saveSystemSurface(session);
+            this.saveContentStore(session);
+        }
         await this.flushScheduledSaves();
         await this.store.flushAll();
         this.shadow?.close();

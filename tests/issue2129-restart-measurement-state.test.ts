@@ -45,7 +45,7 @@ function makeSession(id: string): Session {
 type StatsBlob = Record<string, unknown>;
 
 function findRecordFile(dir: string): string {
-    const files = readdirSync(dir, { recursive: true }).map(String).filter((f) => f.endsWith(".json"));
+    const files = readdirSync(dir, { recursive: true }).map(String).filter((f) => f.endsWith(".json") && !f.endsWith(".content-store.json") && !f.endsWith(".system-surface.json"));
     assert.equal(files.length, 1, `expected exactly one session record, found ${files.length}`);
     return join(dir, files[0] as string);
 }

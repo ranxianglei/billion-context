@@ -78,6 +78,11 @@ function contentStoreFile(dir: string, rel: string, chars: number, ageDays: numb
     return writeFile(dir, rel, JSON.stringify(store), ageDays);
 }
 
+function systemSurfaceFile(dir: string, rel: string, ageDays: number): string {
+    const rec = { v: 1, hash: "ab".repeat(32), systemText: "sys", systemTruncated: false, toolsJson: "[]", toolsTruncated: false, toolNames: [], updatedAt: Date.now() };
+    return writeFile(dir, rel, JSON.stringify(rec), ageDays);
+}
+
 function writeFile(dir: string, rel: string, content: string | Buffer, ageDays: number): string {
     const full = path.join(dir, rel);
     mkdirSync(path.dirname(full), { recursive: true });
@@ -473,6 +478,77 @@ test("gcSessionFiles: orphaned content stores are swept once old, fresh ones kep
         const store = new SessionStore({ dir, debounceMs: 500 });
         const fOld = contentStoreFile(dir, "anthropic/host_orph_old.content-store.json", 8000, 10);
         const fFresh = contentStoreFile(dir, "anthropic/host_orph_fresh.content-store.json", 8000, 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, "no session files were removed");
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fOld), "aged orphan swept");
+        assert.ok(existsSync(fFresh), "fresh orphan kept (still inside any resume window)");
+    });
+});
+
+test("gcSessionFiles: stale session co-deletes its system-surface companion (#3201)", async () => {
+    const dir = tmpDir("bili-gc-surf-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fSess = writeFile(dir, "anthropic/host_surf.json", JSON.stringify(envelope("gc-surf", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fSurf = systemSurfaceFile(dir, "anthropic/host_surf.system-surface.json", 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fSess));
+        assert.ok(!existsSync(fSurf), "surface co-deleted — no orphan left behind");
+    });
+});
+
+test("gcSessionFiles: stale duplicate keeps its surface while a namespaced twin still relies on it (#3201)", async () => {
+    const dir = tmpDir("bili-gc-surftwin-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // Same meta fill-once migration story as the content-store twin tests:
+        // the _unknown/ sibling is still the LIVE surface — loadSystemSurface
+        // falls back to it when the namespaced one is absent.
+        const stem = "surfbeefcafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-surftwin-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-surftwin-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fSurf = systemSurfaceFile(dir, `_unknown/${stem}.system-surface.json`, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fDup), "stale duplicate deleted");
+        assert.ok(existsSync(fTwin), "live twin untouched");
+        assert.ok(existsSync(fSurf), "live fallback surface of the surviving twin is never co-deleted");
+    });
+});
+
+test("gcSessionFiles: stale duplicate's surface IS co-deleted once the twin owns its own (#3201)", async () => {
+    const dir = tmpDir("bili-gc-surftwinown-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // The session was re-saved after the namespace move: the namespaced
+        // surface shadows the flat one, so the flat sibling is dead bytes and
+        // co-deletion is safe.
+        const stem = "surftwincafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-surftwown-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-surftwown-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fDead = systemSurfaceFile(dir, `_unknown/${stem}.system-surface.json`, 10);
+        const fLive = systemSurfaceFile(dir, `anthropic/api.example.com_${stem}.system-surface.json`, 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fDup));
+        assert.ok(existsSync(fTwin));
+        assert.ok(!existsSync(fDead), "shadowed dead surface co-deleted with its duplicate");
+        assert.ok(existsSync(fLive), "the live namespaced surface stays referenced");
+    });
+});
+
+test("gcSessionFiles: orphaned system surfaces are swept once old, fresh ones kept (#3201)", async () => {
+    const dir = tmpDir("bili-gc-surforph-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const fOld = systemSurfaceFile(dir, "anthropic/host_sorph_old.system-surface.json", 10);
+        const fFresh = systemSurfaceFile(dir, "anthropic/host_sorph_fresh.system-surface.json", 1);
         const res = await gcSessionFiles({ dir, store, now: Date.now() });
         assert.equal(res.removed, 0, "no session files were removed");
         assert.equal(res.companionsRemoved, 1, JSON.stringify(res));

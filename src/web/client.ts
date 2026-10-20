@@ -1790,6 +1790,12 @@ export const WEB_CLIENT = `(function () {
         return html.join("");
     }
     window.bili_renderHandoffMd = renderHandoffMd;
+    const KIND_LABEL = { user: t("kind.user"), assistant: t("kind.assistant"), system: t("kind.system"), tool: t("kind.tool"), "tool-call": t("kind.tool-call"), "tool-result": t("kind.tool-result"), reasoning: t("kind.reasoning"), compacted: t("kind.compacted") };
+    function trajPreview(text) {
+        const s = String(text || "");
+        const nl = s.indexOf("\\n");
+        return nl >= 0 ? s.slice(0, nl) : s.slice(0, 160);
+    }
     function buildDetailHtml(d) {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
@@ -2125,13 +2131,44 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div style="margin-top:10px"><button id="session-conflicts-clear" class="btn sm">' + t("det.conflicts_clear") + "</button></div>");
             parts.push("</div></div>");
         }
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
-        // #1426: copy / download actions over the rendered handoff document
-        parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
+        // #3201: trajectory view replaces the default-rendered handoff document — the same
+        // last-outbound snapshot as a per-record ledger; handoff md stays available via buttons.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.traj_title") + '</span><span class="hint">' + t("det.traj_hint") + '</span></div><div class="card-b">');
+        parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="traj-copy-json" class="btn sm">' + t("det.traj_copy_json") + '</button><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
         if (d.handoffTruncated) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.handoff_truncated") + "</div>");
-        if (d.handoffMd) parts.push('<div class="handoff">' + renderHandoffMd(d.handoffMd) + "</div>");
-        else if (d.handoffHtml) parts.push('<div class="handoff">' + d.handoffHtml + "</div>");
-        else parts.push('<div class="dim small">' + t("common.empty") + "</div>");
+        const traj = d.trajectory;
+        if (!traj || !traj.records.length) {
+            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.traj_empty") + "</div>");
+        } else {
+            if (traj.folded) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.traj_folded") + "</div>");
+            if (traj.truncatedTotal) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.traj_trunc_total") + "</div>");
+            if (traj.recordsCapped) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.traj_records_capped", { n: 5000 }) + "</div>");
+            if (Array.isArray(traj.unanchoredBlocks) && traj.unanchoredBlocks.length > 0) parts.push('<div class="dim small mono" style="margin-bottom:8px">' + escapeHtml(t("det.traj_unanchored", { ids: traj.unanchoredBlocks.join(", ") })) + "</div>");
+            if (traj.system) {
+                const sys = traj.system;
+                parts.push('<details class="traj-sys"><summary><span class="topic">' + t("det.traj_system") + (typeof sys.tokens === "number" ? ' · ~' + fmtW(sys.tokens) + " tok" : "") + '</span><span class="meta">' + timeAgo(sys.updatedAt) + "</span></summary>");
+                parts.push('<div class="body md">' + renderHandoffMd(sys.text || "") + (sys.truncated ? '<div class="dim small" style="margin-top:6px">' + t("det.traj_sys_truncated") + "</div>" : "") + "</div>");
+                parts.push('<details class="traj-tools"><summary>' + t("det.traj_tools", { n: (sys.toolNames || []).length }) + "</summary><div class=\\"tool-chips\\">");
+                for (const name of sys.toolNames || []) parts.push('<span class="chip">' + escapeHtml(name) + "</span>");
+                parts.push("</div><pre class=\\"traj-json\\">" + escapeHtml(sys.toolsJson || "") + (sys.toolsTruncated ? "\\n…(truncated)" : "") + "</pre></details>");
+                parts.push("</details>");
+            }
+            for (const r of traj.records) {
+                const metaBits = [];
+                if (r.ref) metaBits.push(escapeHtml(r.ref));
+                metaBits.push(escapeHtml(t("det.traj_turn", { n: r.turn })));
+                if (typeof r.tokens === "number") metaBits.push("~" + fmtW(r.tokens));
+                if (r.thinkingTokens) metaBits.push(escapeHtml(t("det.thinking")) + " ~" + fmtW(r.thinkingTokens));
+                if (r.toolName) metaBits.push("<b>" + escapeHtml(r.toolName) + "</b>");
+                let extra = "";
+                if (r.kind === "compacted") {
+                    extra = " · T" + String(typeof r.tier === "number" ? r.tier : "?");
+                    if (r.compressedTokens) extra += " · ~" + fmtW(r.compressedTokens);
+                    if (r.blockId) metaBits.push(escapeHtml(r.blockId));
+                }
+                parts.push('<details class="traj-row' + (r.kind === "compacted" ? " traj-fold" : "") + '"><summary><span class="traj-n">' + String(r.n) + '</span><span class="badge k-' + r.kind + '">' + escapeHtml(KIND_LABEL[r.kind] || r.kind) + '</span><span class="meta">' + metaBits.join(" · ") + extra + '</span><span class="traj-preview">' + escapeHtml(trajPreview(r.text)) + (r.truncated ? "…" : "") + "</span></summary><pre class=\\"traj-text\\">" + escapeHtml(r.text) + (r.truncated ? "\\n\\n…(truncated)" : "") + "</pre></details>");
+            }
+        }
         parts.push("</div></div>");
         return parts.join("");
     }
@@ -2150,6 +2187,7 @@ export const WEB_CLIENT = `(function () {
         try {
             host.innerHTML = buildDetailHtml(d);
             bindHandoffActions(d);
+            bindTrajectoryActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
             bindSessionReportActions(d);
@@ -2370,6 +2408,11 @@ export const WEB_CLIENT = `(function () {
                 setTimeout(() => URL.revokeObjectURL(a.href), 4000);
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(dlB, false); }
         });
+    }
+    function bindTrajectoryActions(d) {
+        const btn = $("traj-copy-json");
+        if (!btn || !d.trajectory || !d.trajectory.records.length) { if (btn) btn.hidden = true; return; }
+        btn.addEventListener("click", () => copyText(JSON.stringify(d.trajectory, null, 2), btn));
     }
     function bindHandoffActions(d) {
         const copyBtn = $("handoff-copy-md");

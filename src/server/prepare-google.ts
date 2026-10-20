@@ -27,6 +27,7 @@ import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { captureSystemSurface } from "../system-surface.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
@@ -356,6 +357,10 @@ export async function prepareGoogle(
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
+        // #3201: persist the system+tools surface text (web trajectory view);
+        // same skip guard as the measurement above — title-gen side requests
+        // carry their own tiny system and must not clobber it.
+        captureSystemSurface(session, googleOutboundSystem, toolsOut);
     }
     // #1933 F1 + #2407: billed-caliber denominator of the k̂ learning pair.
     // The Google lane was the only one of the four never recording it, so

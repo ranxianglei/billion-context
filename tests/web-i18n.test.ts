@@ -43,11 +43,11 @@ function collectRefs(): Set<string> {
     const clientSrc = readFileSync(join(here, "..", "src", "web", "client.ts"), "utf8");
     const reportSrc = readFileSync(join(here, "..", "src", "web", "report.ts"), "utf8"); // #3099 server-side report renderer
     const refs = new Set<string>();
-    for (const m of pageSrc.matchAll(/data-i18n(?:-ph|-title)?="([\w.]+)"/g)) refs.add(m[1]);
-    for (const m of pageSrc.matchAll(/zh\("([\w.]+)"\)/g)) refs.add(m[1]);
-    for (const m of clientSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
-    for (const m of reportSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
-    for (const m of reportSrc.matchAll(/\btr\(\s*\w+,\s*"([\w.]+)"/g)) refs.add(m[1]);
+    for (const m of pageSrc.matchAll(/data-i18n(?:-ph|-title)?="([\w.-]+)"/g)) refs.add(m[1]);
+    for (const m of pageSrc.matchAll(/zh\("([\w.-]+)"\)/g)) refs.add(m[1]);
+    for (const m of clientSrc.matchAll(/\bt\("([\w.-]+)"/g)) refs.add(m[1]);
+    for (const m of reportSrc.matchAll(/\bt\("([\w.-]+)"/g)) refs.add(m[1]);
+    for (const m of reportSrc.matchAll(/\btr\(\s*\w+,\s*"([\w.-]+)"/g)) refs.add(m[1]);
     return refs;
 }
 
