@@ -323,6 +323,12 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
     // the tmp dir: link the repo's node_modules beside it; `--import tsx`
     // resolves against cwd, so spawn from the repo root.
     symlinkSync(path.join(repoRoot, "node_modules"), path.join(dir, "node_modules"), process.platform === "win32" ? "junction" : "dir");
+    // Explicit ESM marker beside the child script: on CI the tmp dir sits OUTSIDE
+    // the repo tree, so no package.json is found walking up and Node defaults the
+    // .ts child to CJS — its bare `import "acp-kernel"` then resolves under the
+    // `require` condition, which acp-kernel's exports map lacks → instant death
+    // with ERR_PACKAGE_PATH_NOT_EXPORTED (observed on all three CI legs #3978).
+    writeFileSync(path.join(dir, "package.json"), JSON.stringify({ type: "module" }) + "\n");
     // .ts (not .mjs): tsx transforms .ts but loads .mjs as plain JS.
     const childScript = path.join(dir, "child-proxy.ts");
     // Trailing slash: pathToFileURL omits it for directories, and the child's
