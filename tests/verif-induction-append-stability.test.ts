@@ -42,7 +42,10 @@ import type { SymVal } from "../verif/symbolic.ts";
 
 const REFS_FILE = "kernel/src/refs.ts";
 
-test("induction step: appending a distinct-id message cannot touch any observed binding (arbitrary n)", { timeout: 240_000 }, () => {
+test("induction step: appending a distinct-id message cannot touch any observed binding (arbitrary n)", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
+
   const ctx = newCtx();
   // Abstract prefix state: one observed binding under a FREE key/value.
   const idP = ctx.String.const("id_p");

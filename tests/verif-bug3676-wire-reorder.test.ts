@@ -101,7 +101,9 @@ function partType(content: SymArr, i: number): Seq<"main"> {
   return t.t;
 }
 
-test("bug3676: solver finds the [file,text]→[text,file] part-order reversal on the real wire codec", { timeout: 240_000 }, async () => {
+test("bug3676: solver finds the [file,text]→[text,file] part-order reversal on the real wire codec", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
   const ctx = newCtx();
   const ports = { ...makeCounterPorts(ctx), deriveCanonicalMessageId: makeIdPort(ctx) };
 

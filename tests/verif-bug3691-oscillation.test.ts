@@ -32,6 +32,8 @@ const mkMsgs = (T: string): { id: string; role: "tool" | "user"; contentType: "t
 ];
 
 test("bug3691: solver finds a clip-triggering witness on the real truncation code", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
   const ctx = newCtx();
   const T = ctx.String.const("T");
   const tok1 = ctx.Real.const("tok1");
