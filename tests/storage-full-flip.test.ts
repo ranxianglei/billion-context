@@ -44,8 +44,16 @@ delete process.env.BILI_STORAGE_JSON_WRITER;
 const PREV_UNIFIED = process.env.BILI_STORAGE_UNIFIED;
 const PREV_JSON_WRITER = process.env.BILI_STORAGE_JSON_WRITER;
 
+// Windows can still hold an ephemeral handle on index.db/-wal right after a
+// store closes (Defender scan, delayed close), so a bare rmSync throws EPERM
+// and fails an otherwise green run. Retry, then give up quietly: the dir lives
+// under HERMETIC, which the after hook clears anyway.
 function rmrf(p: string): void {
-    fs.rmSync(p, { recursive: true, force: true });
+    try {
+        fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* Windows stray handle */
+    }
 }
 
 function tmpDir(tag: string): string {
