@@ -1,6 +1,7 @@
 import { clampPrefix } from "./truncate.js";
 import { BLOCKED_REF } from "./refs.js";
 import { COMPRESS_TOOL_NAME } from "./compress-tools.js";
+import { parseLineContent, type CompressLineContentEntry } from "./parse-compress-input.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
 // Orphaned compress calls (no matching block — failed attempts, or historical
@@ -104,6 +105,9 @@ interface ParsedCallText {
   obj: Record<string, unknown>;
   content: unknown[];
   contentWasString: boolean;
+  /** Non-null iff `content` was a plain-text LINE-FORM string (#3975); the
+   *  object pipeline (`content`) is empty then. */
+  lineEntries: CompressLineContentEntry[] | null;
 }
 
 // Adapters (pi) persist the rendered ref tag in front of the tool-call text,
@@ -122,6 +126,7 @@ function parseCallText(text: string | undefined): ParsedCallText | null {
   if (!parsed || typeof parsed !== "object") return null;
   const obj = parsed as Record<string, unknown>;
   let content: unknown[] | null = null;
+  let lineEntries: CompressLineContentEntry[] | null = null;
   let contentWasString = false;
   if (Array.isArray(obj.content)) {
     content = obj.content;
@@ -129,17 +134,26 @@ function parseCallText(text: string | undefined): ParsedCallText | null {
     // Non-strict-tool providers (qwen etc.) sometimes stringify the content
     // array inside the JSON args; the compress tool accepts it, so the
     // rewrite must too. Measured: ALL 52 calls in the billion-context-pi
-    // #336 storm session used this form (#230).
+    // #336 storm session used this form (#230). When the inner value is NOT a
+    // JSON array, the kernel's own parser falls through to the plain-text
+    // LINE FORM (first line "m00100–m00120 topic", remaining lines the
+    // summary) — the cleanup must resolve ranges from that shape too, or such
+    // calls mis-resolve as orphans and keep their full summary text forever
+    // (#3975). parseLineContent mirrors the tool's acceptance ladder exactly.
     contentWasString = true;
     try {
       const inner: unknown = JSON.parse(obj.content);
-      if (Array.isArray(inner)) content = inner;
+      if (Array.isArray(inner)) {
+        content = inner;
+      } else {
+        lineEntries = parseLineContent(obj.content);
+      }
     } catch {
-      content = null;
+      lineEntries = parseLineContent(obj.content);
     }
   }
-  if (!content || content.length === 0) return null;
-  return { prefix: raw.slice(0, start), obj, content, contentWasString };
+  if ((!content || content.length === 0) && !lineEntries) return null;
+  return { prefix: raw.slice(0, start), obj, content: content ?? [], contentWasString, lineEntries };
 }
 
 // Range keys a compress call's args quote, using the same startId/endId
@@ -149,6 +163,12 @@ function quotedRangeKeys(text: string | undefined): Set<string> {
   const parsed = parseCallText(text);
   if (!parsed) return new Set<string>();
   const out = new Set<string>();
+  if (parsed.lineEntries !== null) {
+    for (const entry of parsed.lineEntries) {
+      if (entry.startRef && entry.endRef) out.add(rangeKey(entry.startRef, entry.endRef));
+    }
+    return out;
+  }
   for (const entry of parsed.content) {
     if (!entry || typeof entry !== "object") continue;
     const e = entry as Record<string, unknown>;
@@ -175,6 +195,20 @@ function rewriteCompressText(
 ): string | null {
   const parsed = parseCallText(text);
   if (!parsed) return null;
+  if (parsed.lineEntries !== null) {
+    const kept = parsed.lineEntries.filter(
+      (entry) =>
+        entry.startRef !== undefined &&
+        entry.endRef !== undefined &&
+        liveKeys.has(rangeKey(entry.startRef, entry.endRef)),
+    );
+    if (kept.length === 0) return null;
+    const { text: rebuilt } = serializeLineCompacted(kept);
+    // Re-emit the FULL args object with the line-form string in the content
+    // slot — the string shape is preserved (#230 convention for stringified
+    // content).
+    return parsed.prefix + JSON.stringify({ ...parsed.obj, content: rebuilt });
+  }
   const { prefix, obj, content, contentWasString } = parsed;
 
   const kept = content.filter((entry): entry is Record<string, unknown> => {
@@ -206,6 +240,10 @@ function rewriteCompressText(
 // leading stub for recall; the block remains the durable record.
 const SUMMARY_STUB_CHARS = 200;
 
+function stubSummary(summary: string): string {
+  return `${clampPrefix(summary, SUMMARY_STUB_CHARS - 1)}…`;
+}
+
 function compactEntry(entry: unknown): unknown {
   if (!entry || typeof entry !== "object") return entry;
   const e = entry as Record<string, unknown>;
@@ -213,8 +251,23 @@ function compactEntry(entry: unknown): unknown {
     return entry;
   return {
     ...e,
-    summary: `${clampPrefix(e.summary, SUMMARY_STUB_CHARS - 1)}…`,
+    summary: stubSummary(e.summary),
   };
+}
+
+// Line-form compaction (#3975): rebuild each kept entry as "<header>\n<stubbed
+// summary>" — headers stay verbatim, short or unparsable entries byte-identical.
+function serializeLineCompacted(
+  entries: CompressLineContentEntry[],
+): { text: string; changed: boolean } {
+  let changed = false;
+  const out = entries.map((entry) => {
+    if (entry.startRef === undefined || entry.summary.length <= SUMMARY_STUB_CHARS)
+      return entry.source;
+    changed = true;
+    return `${entry.header}\n${stubSummary(entry.summary)}`;
+  });
+  return { text: out.join("\n"), changed };
 }
 
 function serializeCompacted(
@@ -237,6 +290,12 @@ function serializeCompacted(
 function compactCompressText(text: string | undefined): string | null {
   const parsed = parseCallText(text);
   if (!parsed) return null;
+  if (parsed.lineEntries !== null) {
+    const { text: rebuilt, changed } = serializeLineCompacted(parsed.lineEntries);
+    return changed
+      ? parsed.prefix + JSON.stringify({ ...parsed.obj, content: rebuilt })
+      : null;
+  }
   const { prefix, obj, content, contentWasString } = parsed;
   const { text: out, changed } = serializeCompacted(
     obj,
