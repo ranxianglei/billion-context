@@ -423,6 +423,21 @@ jobs:
           node-version: 22
       - run: node scripts/config-surface-guard.mjs
 
+  # release-notes guard: the Publish Release Notes validator (400-char summary
+  # cap et al.) only runs AFTER merge — push to master + paths filter — so it
+  # can never hold a PR; over-cap entries failed one step too late (runs
+  # 38040163381, 38152721758; fixed in #2818). Same rules, same messages,
+  # extracted to a zero-dep script; this job holds PRs to the payload
+  # contract BEFORE merge. Unit teeth: tests/release-notes-guard.test.ts.
+  release-notes-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/release-notes-guard.mjs
+
   # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
   # side-request.ts + the lane region of src/server/handle.ts, extracted from
   # src/server.ts by #1440) is regression-critical
