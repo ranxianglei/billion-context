@@ -17,6 +17,10 @@
  *                      ABI does not match the running Node is refused before
  *                      any download; a pinned prebuild-less artifact keeps the
  *                      single-tarball lane and never touches the binary mirror.
+ *                      A Node that passes the major floor but predates the
+ *                      artifact's N-API version falls through to the next
+ *                      band; ABI-keyed artifacts cache per ABI so a second
+ *                      runtime never inherits the wrong binding.
  *   EXTRACTOR        — include filtering, required-file validation, path
  *                      traversal rejection, symlink rejection, non-gzip input.
  *   KNOB             — BILI_SQLITE_AUTO_DOWNLOAD > storage.sqliteAutoDownload
@@ -52,6 +56,7 @@ import {
     extractPrebuildTgz,
     extractTgzToDir,
     nodeMajorSatisfiesFloor,
+    pinnedEngineVersionFor,
     nodeSqliteUpgradeHint,
     platformTargetKey,
     resetEngineBootstrapForTests,
@@ -1132,7 +1137,7 @@ test("bootstrap: a JS-only artifact downloads its ABI prebuild and binds it via 
             version: "12.9.0",
             sha512Base64: sha512B64(npmTgz),
             minNodeMajor: 20,
-            prebuild: { nodeAbi: abi, sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+            prebuild: { sha512Base64ByAbi: { [abi]: { [target]: sha512B64(preTgz) } } },
         });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
@@ -1143,7 +1148,7 @@ test("bootstrap: a JS-only artifact downloads its ABI prebuild and binds it via 
             assert.equal(out.status, "downloaded", `the JS-only lane must install, got ${JSON.stringify(out)}`);
             assert.equal(npmReg!.requests(), 1, "the npm tarball was fetched");
             assert.equal(binReg!.requests(), 1, "the ABI prebuild was fetched from the binary mirror");
-            const cached = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-12.9.0");
+            const cached = path.join(cachePrev, "billion-context", "sqlite", `better-sqlite3-12.9.0-abi${abi}`);
             assert.ok(fs.existsSync(path.join(cached, "prebuilds", `${target}.node`)), "the binding is cached next to the JS package");
             const o = openSqliteDatabase(":memory:");
             assert.equal(o.engine, "better-sqlite3");
@@ -1172,7 +1177,7 @@ test("bootstrap: a prebuild whose ABI is not this Node is refused before any dow
             version: "12.9.0",
             sha512Base64: sha512B64(npmTgz),
             minNodeMajor: 20,
-            prebuild: { nodeAbi: "999", sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+            prebuild: { sha512Base64ByAbi: { "999": { [target]: sha512B64(preTgz) } } },
         });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
@@ -1184,7 +1189,7 @@ test("bootstrap: a prebuild whose ABI is not this Node is refused before any dow
             assert.match(out.detail ?? "", /no binding for Node ABI \d+/, "the detail names the ABI gap");
             assert.equal(npmReg!.requests(), 0, "neither artifact may be downloaded");
             assert.equal(binReg!.requests(), 0);
-            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-12.9.0")), "nothing materialized into the cache");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", `better-sqlite3-12.9.0-abi${process.versions.modules}`)), "nothing materialized into the cache");
             assert.throws(() => openSqliteDatabase(":memory:"), /no SQLite engine available/i, "no loader was registered");
         });
     } finally {
@@ -1223,6 +1228,98 @@ test("bootstrap: a self-contained artifact never touches the binary mirror (#389
     }
 });
 
+
+// ---------------------------------------------------------------------------
+// N-API floor (#3894 follow-up): a binding compiled against N-API 10 cannot be
+// dlopen'd by a runtime that only ships N-API 9 - the load faults uncatchably,
+// so the band table must fall through to an artifact that DOES match instead
+// of trusting the package's `engines.node` major alone. Node 22.0-22.12 is
+// exactly that trap: `>= 22` is satisfied, N-API is still 9.
+// ---------------------------------------------------------------------------
+
+test("pinnedEngineVersionFor: every Node band picks a loadable artifact (#3894)", () => {
+    assert.equal(pinnedEngineVersionFor("20.19.5", "115", "9"), "12.9.0", "Node 20 -> the ABI 115 JS-only lane");
+    assert.equal(pinnedEngineVersionFor("22.0.0", "127", "9"), "12.9.0", "Node 22.0-22.12 passes v13's major floor but predates N-API 10 -> must fall back, not dlopen");
+    assert.equal(pinnedEngineVersionFor("22.13.0", "127", "9"), "12.9.0", "the whole pre-N-API-10 22.x band falls back");
+    assert.equal(pinnedEngineVersionFor("22.14.0", "127", "10"), "13.0.3", "N-API 10 arrives -> the single-tarball v13 lane");
+    assert.equal(pinnedEngineVersionFor("23.11.1", "131", "10"), "13.0.3", "Node 23 is above the floor with N-API 10");
+    assert.equal(pinnedEngineVersionFor("24.11.0", "137", "10"), "13.0.3", "Node 24 is above the floor with N-API 10");
+    assert.equal(pinnedEngineVersionFor("25.2.1", "141", "10"), "13.0.3", "Node 25 is above the floor with N-API 10");
+    assert.equal(pinnedEngineVersionFor("21.7.3", "120", "9"), null, "Node 21 has no pinned band -> honest unsupported-node");
+    assert.equal(pinnedEngineVersionFor("19.9.0", "111", "8"), null, "Node 19 is below the engines floor");
+    assert.equal(pinnedEngineVersionFor("18.20.8", "108", "8"), null, "Node 18 is below the engines floor");
+});
+
+test("bootstrap: an artifact whose N-API floor is above this runtime is refused before any download (#3894)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20, minNapiVersion: 99 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        npmReg = await startMockRegistry(tgz);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node", `an N-API gap must be refused, got ${JSON.stringify(out)}`);
+            assert.match(out.detail ?? "", /built against N-API 99/, "the detail names the N-API gap");
+            assert.equal(npmReg!.requests(), 0, "the tarball must not be downloaded");
+            assert.throws(() => openSqliteDatabase(":memory:"), /no SQLite engine available/i, "no loader was registered");
+        });
+    } finally {
+        await npmReg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: an ABI-keyed artifact keeps one cache dir per ABI so a second runtime fetches its own binding (#3894)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    let binReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const target = platformTargetKey();
+        const abi = process.versions.modules;
+        const npmTgz = fakeJsOnlyPackageTgz();
+        const preTgz = fakePrebuildTgz();
+        // A cache dir from the SAME version but a DIFFERENT ABI: reusing it would
+        // hand this runtime the wrong binding, so the bootstrap must not treat it
+        // as a cache hit.
+        const wrongAbiDir = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-12.9.0-abi999");
+        fs.mkdirSync(path.join(wrongAbiDir, "lib"), { recursive: true });
+        fs.mkdirSync(path.join(wrongAbiDir, "prebuilds"), { recursive: true });
+        fs.writeFileSync(path.join(wrongAbiDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "12.9.0" }));
+        fs.writeFileSync(path.join(wrongAbiDir, "lib", "index.js"), FAKE_V12_LIB_INDEX);
+        fs.writeFileSync(path.join(wrongAbiDir, "prebuilds", `${target}.node`), Buffer.from("WRONG-ABI"));
+        setEngineBootstrapSpecForTests({
+            version: "12.9.0",
+            sha512Base64: sha512B64(npmTgz),
+            minNodeMajor: 20,
+            prebuild: { sha512Base64ByAbi: { [abi]: { [target]: sha512B64(preTgz) } } },
+        });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
+        binReg = await startMockBinaryMirror(preTgz, "12.9.0", abi, target);
+        setPrebuildMirrorsForTests([binReg.base]);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `a foreign-ABI cache dir must not be reused, got ${JSON.stringify(out)}`);
+            assert.equal(npmReg!.requests(), 1, "the JS tarball was fetched into this ABI's own dir");
+            const ownDir = path.join(cachePrev, "billion-context", "sqlite", `better-sqlite3-12.9.0-abi${abi}`);
+            assert.ok(fs.existsSync(path.join(ownDir, "prebuilds", `${target}.node`)), "this runtime's own binding was published");
+            assert.ok(fs.existsSync(wrongAbiDir), "the other ABI's cache dir survives the prune");
+        });
+    } finally {
+        await npmReg?.close();
+        await binReg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
 test("bootstrap: pinned sibling cache dirs survive the prune; unpinned ones are still removed (#3894)", async () => {
     const cachePrev = isolateCache();
     let npmReg: MockRegistry | null = null;
@@ -1237,7 +1334,7 @@ test("bootstrap: pinned sibling cache dirs survive the prune; unpinned ones are 
             version: "12.9.0",
             sha512Base64: sha512B64(npmTgz),
             minNodeMajor: 20,
-            prebuild: { nodeAbi: abi, sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+            prebuild: { sha512Base64ByAbi: { [abi]: { [target]: sha512B64(preTgz) } } },
         });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         // Pre-existing siblings before this download publishes: the OTHER pinned
