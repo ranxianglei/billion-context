@@ -111,3 +111,34 @@ test("#3385: healthy storage stays quiet — no degrade line", () => {
         rmrf(base);
     }
 });
+
+test("#3894: below the artifact Node floor the degrade reason names the Node upgrade, not generic no-engine", () => {
+    // Unsupported-node refuses the engine BEFORE any load, so the sidecar open
+    // ALSO records a "no SQLite engine available" open-error. The floor reason
+    // must outrank that generic one — otherwise the user sees "better-sqlite3
+    // not installed" when the real cause is a too-old Node (#3894 dead-code fix).
+    const base = mkdtempSync(path.join(tmpdir(), "acp-status-3894-"));
+    const snap = isolate(base);
+    let store: SessionStore | null = null;
+    try {
+        setSqliteEnginesUnavailableForTests(true);
+        _resetStorageRuntimeStatusForTest();
+        recordEngineBootstrap({ status: "unsupported-node", detail: "better-sqlite3@13.0.3 needs Node.js >= 22, this is 20.19.5" });
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
+
+        const out = handleAcpStatus({}, makeCtx());
+        const text = out.text ?? "";
+        assert.ok(text.includes("STORAGE —"), "the storage line is present");
+        assert.ok(text.includes("⚠ degraded —"), `the degrade warning line is present (got: ${text.slice(-400)})`);
+        assert.ok(text.includes("requires a newer Node.js"), `the specific floor reason surfaces (got: ${text.slice(-400)})`);
+        assert.ok(/Node\.js >= 22/.test(text), "the reason carries the artifact's own Node floor");
+    } finally {
+        store?.closeQuietly();
+        _setStoreForTest(null as unknown as SessionStore);
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        restore(snap);
+        rmrf(base);
+    }
+});

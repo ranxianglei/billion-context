@@ -83,6 +83,12 @@ function degradeReason(): string {
         const last = sidecar.stats.lastError ? shortenError(sidecar.stats.lastError) : "unknown";
         return `unified store auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures (last: ${last})`;
     }
+    // A too-old Node is refused BEFORE any engine load, so the sidecar open ALSO
+    // fails with the generic no-engine error — surface the real floor reason first,
+    // or the sidecar-open-error branch below would shadow it (#3894).
+    if (state.bootstrap?.status === "unsupported-node") {
+        return `self-downloaded SQLite engine requires a newer Node.js (${state.bootstrap.detail ?? "unknown"})`;
+    }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
         // The driver's no-engine error surfaces through the same open path —
@@ -99,8 +105,6 @@ function degradeReason(): string {
                 return `SQLite self-download blocked (${b.detail ?? "unknown"}), retrying after cooldown`;
             case "unsupported-platform":
                 return `unsupported platform for SQLite self-download (${b.detail ?? "?"})`;
-            case "unsupported-node":
-                return `self-downloaded SQLite engine requires a newer Node.js (${b.detail ?? "unknown"})`;
             case "disabled":
                 return "SQLite self-download disabled by configuration";
             case "failed":
