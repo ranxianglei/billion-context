@@ -342,6 +342,19 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                     }
                     continue;
                 }
+                // #3410: unknown top-level block types (document/PDF in the
+                // wild) ride the rawAnthropicBlock sidecar verbatim since this
+                // change — size inline base64 by payload, url refs by URL, and
+                // anything else at the flat remote floor (billing must see the
+                // preserved bytes or the fold gate undercounts). Known blocks
+                // (tool_use / string-content tool_result) carry no media bytes
+                // and fall through untouched, same as before.
+                if (part.type !== "text" && part.type !== "thinking" && part.type !== "tool_use" && part.type !== "tool_result") {
+                    const src = part.source;
+                    if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
+                    else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                    else total += applyCap(REMOTE_IMAGE_TOKENS, configuredCap);
+                }
             }
         }
     }
@@ -360,7 +373,7 @@ function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "go
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
         : protocol === "responses" ? s.includes("input_image") || s.includes('"content":[') || s.includes('"content": [')
         : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"') || s.includes('"content":[') || s.includes('"content": [')
-        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"');
+        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"') || s.includes('"type": "document"');
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
@@ -459,6 +472,10 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
                     }
                     continue;
                 }
+                // #3410: lockstep with the cost walker above — every sidecar-
+                // riding unknown block that bills there must count here too;
+                // known non-media blocks stay uncounted, same as before.
+                if (part.type !== "text" && part.type !== "thinking" && part.type !== "tool_use" && part.type !== "tool_result") n += 1;
             }
         }
     }

@@ -15,7 +15,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
 }
 
-interface DroppedOpenaiPartsReport {
+interface WireDropReport {
     count: number;
     types: string[];
     firstIndex: number;
@@ -25,7 +25,7 @@ interface DroppedOpenaiPartsReport {
 // (stringContent), so only text survives there.
 const DEFAULT_PRESERVED = new Set(["text"]);
 
-export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | null {
+export function droppedOpenaiParts(body: unknown): WireDropReport | null {
     if (!isObj(body)) return null;
     const messages = body.messages;
     if (!Array.isArray(messages)) return null;
@@ -40,6 +40,43 @@ export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | nu
             if (!isObj(p) || DEFAULT_PRESERVED.has(typeof p.type === "string" ? p.type : "<no-type>")) continue;
             count++;
             types.add(typeof p.type === "string" ? p.type : "<no-type>");
+            if (firstIndex < 0) firstIndex = i;
+        }
+    }
+    return count > 0 ? { count, types: [...types].sort(), firstIndex } : null;
+}
+
+// #3410: the anthropic codec used to drop every top-level block type outside
+// the known six — in the wild today that means document/PDF blocks vanished
+// on each rebuild with no trace. The kernel now rides unknown blocks on the
+// rawAnthropicBlock sidecar and re-emits them verbatim, so nothing is dropped
+// anymore; this detector scans the RAW body for those types so the proxy can
+// log a one-time notice (the user may not know their client sent a PDF, and
+// such blocks are excluded from folding since bili cannot archive them).
+const ANTHROPIC_KNOWN_BLOCKS = new Set([
+    "text",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "image",
+    "redacted_thinking",
+]);
+
+export function unknownAnthropicBlocks(body: unknown): WireDropReport | null {
+    if (!isObj(body)) return null;
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return null;
+    let count = 0;
+    const types = new Set<string>();
+    let firstIndex = -1;
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (!isObj(m) || !Array.isArray(m.content)) continue;
+        for (const b of m.content) {
+            if (!isObj(b) || typeof b.type !== "string") continue;
+            if (ANTHROPIC_KNOWN_BLOCKS.has(b.type)) continue;
+            count++;
+            types.add(b.type);
             if (firstIndex < 0) firstIndex = i;
         }
     }
