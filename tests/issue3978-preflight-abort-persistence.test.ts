@@ -331,8 +331,13 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
     const child = spawn(process.execPath, ["--import", "tsx", childScript], {
         cwd: repoRoot,
         env: { ...process.env, E2E_ISSUE3978_SUM_KEY: "k" },
-        stdio: ["ignore", "pipe", "inherit"],
+        // stderr captured in-memory, not inherited: CI shard logs interleave
+        // concurrent test files, so an unattributable child crash would be
+        // undiagnosable; its tail is surfaced in the failure message below.
+        stdio: ["ignore", "pipe", "pipe"],
     });
+    let errTail = "";
+    child.stderr?.on("data", (d: Buffer) => { errTail = (errTail + d.toString()).slice(-8192); });
     const msgs = conversation(40, "t3978p");
     let blocksSeen = 0;
     let readyRes: ((v: { port: number; mainUrl: string }) => void) | null = null;
@@ -354,8 +359,12 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
     let main2: Awaited<ReturnType<typeof startMainUpstream>> | null = null;
     let sum2: Awaited<ReturnType<typeof startSummaryUpstream>> | null = null;
     try {
-        const ready = await Promise.race([readyP, sleep(60_000).then(() => null)]);
-        assert.ok(ready, "the child proxy must become ready");
+        // 180s, not 60s: the child cold-transforms the whole src tree via tsx,
+        // which exceeds 60s under parallel-shard load (observed ubu22-1/win22-1
+        // at head 9be2ec603); diedP fails fast if the child crashes before READY.
+        const diedP = new Promise<null>((r) => { child.on("exit", () => r(null)); });
+        const ready = await Promise.race([readyP, diedP, sleep(180_000).then(() => null)]);
+        assert.ok(ready, `the child proxy must become ready (child stderr tail:\n${errTail.trim() || "(empty)"})`);
         fireAndForget(postTurn(ready.port, ready.mainUrl, "t3978-p", msgs));
         await waitFor(() => blocksSeen >= 1, 60_000, "the child's first committed fold");
         // Settle the per-fold debounce writes (debounceMs=50) before the death.
