@@ -838,6 +838,25 @@ let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
 
+// #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
+// The live weight (transient message caches included) is only measurable while
+// the object is resident — a disk reload carries persisted state alone and
+// under-measures by exactly the mass that made the eviction necessary. The map
+// is advisory (it only shapes refusal wording), never load-bearing; bounded so
+// a long-lived process cannot accumulate unbounded entries.
+const evictedWeights = new Map<string, number>();
+const EVICTED_WEIGHT_CAP = 256;
+
+function stampEvictedWeight(id: string, bytes: number): void {
+    if (evictedWeights.has(id)) evictedWeights.delete(id);
+    evictedWeights.set(id, bytes);
+    while (evictedWeights.size > EVICTED_WEIGHT_CAP) {
+        const oldest = evictedWeights.keys().next().value;
+        if (oldest === undefined) break;
+        evictedWeights.delete(oldest);
+    }
+}
+
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
 function deepSizeOf(value: unknown): number {
@@ -938,6 +957,42 @@ function residentBytes(): number {
     let bytes = 0;
     for (const session of sessions.values()) bytes += sessionWeight(session);
     return bytes;
+}
+
+/** #3918: can this session's message view survive BETWEEN model requests? The
+ * empty-view compress refusal (#3126) self-heals on the next model request ONLY
+ * when the reloaded session stays resident afterwards. When the session's
+ * last-known live weight plus the other residents exceeds the byte budget,
+ * every request cycle ends with it evicted again (releaseInFlight discharge)
+ * and the refusal repeats identically forever — the incident's 444 MiB image
+ * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
+ * Returns the measured pressure so the refusal receipt says so plainly instead
+ * of promising a heal that will not come. */
+interface ResidentPressure {
+    /** True when retrying cannot restore a usable view under the CURRENT pool state. */
+    permanent: boolean;
+    /** Last-known LIVE weight of this session (eviction-time measurement; falls
+     * back to its resident weight when it is resident now). Undefined = unknown. */
+    weightBytes?: number;
+    /** Resident bytes held by all OTHER sessions (this one excluded). */
+    otherBytes: number;
+    residentBytes: number;
+    budgetBytes: number;
+}
+
+export function residentPressure(id: string): ResidentPressure {
+    const resident = sessions.get(id);
+    const self = resident ? sessionWeight(resident) : 0;
+    const total = residentBytes();
+    const known = evictedWeights.get(id);
+    const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    return {
+        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        weightBytes,
+        otherBytes: total - self,
+        residentBytes: total,
+        budgetBytes: MAX_RESIDENT_BYTES,
+    };
 }
 
 function makeResidentRoom(incoming = 0): void {
@@ -1644,6 +1699,7 @@ function evictOldest(): boolean {
         return false;
     }
     sessions.delete(oldestId);
+    stampEvictedWeight(oldestId, sessionWeight(s));
     // #3126: eviction is the trigger for the empty-view compress window (the
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
@@ -1667,6 +1723,7 @@ export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
         if (s.inFlight > 0) s.inFlight = 0;
     }
     sessions.clear();
+    evictedWeights.clear();
 }
 
 export function _sessionsSizeForTest(): number {

@@ -5,8 +5,8 @@
 //   2. every Node-consumed dist/agent/*.js entry IMPORTS in its own process
 //      without throwing — an undeclared runtime dependency fails here at
 //      import time, exactly where it would fail in a real consumer's process
-//      (static analysis like check-dist-external-zod can only see one known
-//      offender; this catches any future one).
+//      (the static gate scripts/check-dist-external.mjs pins the allowlist;
+//      this smoke proves the installed artifact actually RUNS end to end).
 // Run after `npm run build` in CI (static-gates). Deliberately NOT part of
 // the local build chain or the prepare gate: it needs registry access for
 // the package's declared deps and must never slow a consumer install.

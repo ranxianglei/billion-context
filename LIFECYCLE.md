@@ -44,6 +44,9 @@
 | `BILI_STABLE_SYSTEM_ANCHOR` | stable-system-anchor 实验 | 每会话 system 锚点实验（默认 OFF） | 稳定性评估后转正或删 | opt-in（默认 OFF） |
 | `BILI_FORK_ADOPTION` | fork-adoption 特性 | fork 继承实验（opt-in；禁用时提示从零开始，fork-adoption.ts:300） | 稳定后转正或退役 | opt-in（默认 off） |
 | `BILI_ALLOW_DSH_COMPACTION` | dsh compaction | dsh compaction opt-in（env 语义同 BILI_PERSIST 家族） | 转正后移 §2 | opt-in（`=1`） |
+| `BILI_SNAPSHOT_SHADOW` | #3756 | snapshot-render 影子观测：每个 armed turn 计算快照视图但**不使用**（出站仍走 legacy 路径），与实际发送对比记 per-session 计数（面板 + `snapshot-shadow` 诊断话题）——render 引擎在 rollout 翻转前用真实流量证明健康（dry-run-then-flip，同存储 #2815 shadow→#3818 full 纪律） | render 车道转正（rollout 100% 且影子计数归稳）后退役 | 默认 on（render lane 本身 rollout 0%，纯观测） |
+| `BILI_DSH_AUTHORED_COMPACTION` | #3733 | dsh 原生 compaction summarize 调用由 #1729 guard 拒绝改为**本地应答折叠快照**（零出账；dsh 记 checkpoint、会话文件收缩） | adoption 后按 #2028 模式转 file/web 开关，env 退役（file 键 `dsh.authoredCompaction` 已镜像） | 0.1.203 dogfood 站稳后默认 on；`=0` 回 #1729 拒绝路径 |
+| `BILI_PI_INLINE` | #3278 | pi inline 模式（默认 off）：不起 proxy 进程，fetch 链在 intercept 之下的一个环节把伪 origin 流量路由进进程内引擎（inline-engine.ts，跑同 startServer 的每请求管线）；file 家 `"pi": {"inline": true}`，`=0` 显式关 | inline 车道 GA（转 §2 常设）或实验放弃后收束 | opt-in（默认 off） |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
@@ -92,6 +95,10 @@
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | 100 MiB（#2017；0 完全禁用留存） |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | 10000 |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` / `BILI_CHAIN_RECENT_WINDOW_MS` | chain-checkpoint 内部默认值 |
+| `BILI_CA_FILE` | network.caFile，默认无——附加 PEM 根证书与内置根 **MERGE**（企业 MITM/DLP 重签上游证书被拒 SELF_SIGNED_CERT_IN_CHAIN 时，#3776；不替换内置根） |
+| `BILI_RECEIVE_BODY_BYTES` / `BILI_DECODED_BODY_BYTES` | network.receive/decodedBodyBytes，5 GiB / 10 GiB——单请求入站/解码后内存上限（#3128：曾硬编码 100 MiB，多 GB 单请求被 reset） |
+| `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
+| `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
 
 ### 2.4 会话池 / GC / 持久化
 
@@ -108,6 +115,9 @@
 | `BILI_PERSIST_TAIL_TOKENS` | persist.tailTokens，16384（0 禁用消息持久化，#401） |
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |
 | `BILI_SESSIONS_DIR` | 状态目录重定位 |
+| `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | storage.archiveAfterDays，默认 365 天——超龄会话由 gc 归档（export + tombstone + CAS 释放；0 关闭年龄清扫，#3901/#3463） |
+| `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
+| `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
 
 ### 2.5 诊断
 
@@ -119,6 +129,7 @@
 | `BILI_DUMP_MAX_AGE_DAYS` | dump 年龄上限，默认 off(null) |
 | `BILI_FAKE_BUF_CAP` | fake-completion 缓冲上限，16 MiB |
 | `BILI_CONFLICT_SCAN` | thirdparty-scan 冲突扫描开关 |
+| `BILI_INVARIANT_JUDGE` | diagnostics.invariantJudge，默认 on——I1/I2 出站不变量法官（L1 顾问：violation 只 warn、流量永不拦；`=0` 解除武装，#3938 decision ②） |
 
 ### 2.6 安全 / 运维通道
 
@@ -153,6 +164,8 @@
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖 |
 | `BILI_RELEASE_NOTES_CHECK` | 发布说明检查（#1870，默认 ON） |
 | `BILI_RELEASE_NOTES_URL` | 发布说明 URL 覆盖 |
+| `BILI_UPDATE_POLICY_URL` | update.policyUrl——更新策略 URL 覆盖（**测试专用**：生产固定官方 repo，#3619 安全边界） |
+| `BILI_UPDATE_STAGGER_MIN_MS` / `BILI_UPDATE_STAGGER_MAX_MS` | update.staggerMin/MaxDelayMs——升级错峰窗口（env 为裸 ms；file 层另收 "15m"/"1d12h" 人读时长；0/0 = 本机回立即升级旧行为；默认上限窗 48h，#3619） |
 
 ### 2.8 图像计费 / zcode 兼容
 
@@ -162,6 +175,17 @@
 | `BILI_IMAGE_TOKEN_CAP` | 单图成本上限 live-read（#1843 L3） |
 | `BILI_ZCODE_ROUTE` | zcode 路由兼容逃生舱（`=none` / kill-switch → 降级路由） |
 | `BILI_ZCODE_SIGNING_FIXED` | zcode 固定签名 |
+| `BILI_IMAGE_RESCALE` / `BILI_IMAGE_RESCALE_MAX_DIM` | imageRescale（默认 on）/ rescale 最长边目标（默认 1600，floor 128，env-only）——出站图像降尺度：大图缩小发送、原件留本地会话存储（`0` 全尺寸透传，#3400 owner 决定） |
+
+### 2.9 插件工具 guardrails / 压缩车道开关
+
+| 变量 | 一句话用途 |
+|------|-----------|
+| `BILI_GUARDRAIL_BASH_TIMEOUT` | guardrails.bashTimeout，默认 60s——模型没写 timeout 时宿主侧注入 bash `timeout`（pi/omp host 进程读；0 = 不注入，#3066） |
+| `BILI_GUARDRAIL_MAX_OUTPUT_BYTES` | guardrails.maxOutputBytes，默认 50KB——工具输出封顶（0 = 不封顶） |
+| `BILI_GUARDRAIL_REPETITION` | guardrails.repetition，默认 on——相同调用循环熔断（warn 3 / abort 5） |
+| `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | guardrails.textRunThreshold，默认 200——输出端同字符连击熔断阈值（proxy 进程侧读，#3406 item 1；0 关闭） |
+| `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 
@@ -181,4 +205,5 @@
 ## 5. 卫生记录
 
 - **2026-10-15 远端分支卫生（#3249 执行）**：删除 origin 已合并远端分支 **1394 条**（1386 条 = 已合并 PR 的同仓 head 分支 + 8 条 = 完全并入 master 但无对应 PR 记录：`2026-08-08_release-v0.1.14`、`2026-09-26_opencode-zen-mitm`、`2026-09-30_responses-side-compaction`、`2026-10-04_plugin-fork-context-provenance`、`2026-10-13_lastmessages-tabling`、`chore/pages-enablement`、`fix/codex-custom-tool-call-text-protocol`、`revert-3189-pages-enablement`）。删除前核对：与 open PR head 交集为空。删除后 origin 剩 361 个 head（其中 128 条为 open PR 分支、201 条 closed-unmerged 且未并入 master、30 条无 PR 未并入 = 废弃工作，均不动）。另执行一次 `git worktree prune` 清掉失效 worktree 登记。
+- **2026-10-20 台账补登（本 PR）**：#3249 落地本台账时 `src/` 实际读取数已比登记数多 22（#3955 mysql、guardrails、#3128 网络预算、#3400 图像缩放、#3619 错峰、#3733 dsh compaction、#3756 snapshot shadow 等），守卫上线即全线红（master run 均被后续 push 取消所以未暴露）。本次 22 条全部补登（3 条 §1 + 19 条 §2）。
 - **机器侧纪律（owner 手工做过，记录备查，不做自动化）**：2026-10-15 手工清理 11 个陈年 bili 进程（全部零活跃连接才杀）/ /tmp 清 2.2GB / master-wt worktree 421MB / 20 个已合并本地分支 / index.db 旧归档。**杀进程保持人工**（需要人眼判断连接归属，自动化风险大于收益），每次大版本装机后人工过一遍。

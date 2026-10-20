@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -633,12 +633,32 @@ export function noVisibleContextRefusal(
     });
     if (touchable) return null;
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
-    ctx.log(`[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)]`);
+    // #3918: the "self-heals on the next model request" promise holds ONLY when
+    // the reloaded session survives between requests. When this session's
+    // last-known live weight cannot fit alongside the current residents within
+    // the byte budget, every request cycle ends with it evicted again and this
+    // exact refusal repeats forever — say so plainly instead of advising an
+    // impossible retry (the incident: a ~444 MiB image session ping-ponging
+    // against an ~87.5 MiB peer under the 512 MiB default budget).
+    const pressure = residentPressure(ctx.session.id);
+    ctx.log(pressure.permanent
+        ? `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — PERMANENT: last-known weight ${formatMiB(pressure.weightBytes)} + other residents ${formatMiB(pressure.otherBytes)} > budget ${formatMiB(pressure.budgetBytes)}; the session cannot stay resident between model requests (#3918)]`
+        : `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)]`);
     const specKey = normalizedSpecKey(ranges);
-    const repeatGuard = recordCompressFailure(ctx.session, specKey, "This failure is the proxy's missing in-memory message view, not your refs — it clears on the next model request. Wait for that turn instead of re-issuing.");
+    const repeatGuard = recordCompressFailure(ctx.session, specKey, pressure.permanent
+        ? "This failure repeats until the resident pool can hold this session alongside the others — closing another open session or raising sessions.residentMaxBytes clears it; waiting for the next turn does NOT."
+        : "This failure is the proxy's missing in-memory message view, not your refs — it clears on the next model request. Wait for that turn instead of re-issuing.");
     const loopGuard = opts?.loopTracking === false ? "" : noteCompressLoopFailure(ctx, specKey, undefined, "no-visible-context");
-    const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem. Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again. [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
+    const healClause = pressure.permanent
+        ? ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}) plus the other resident sessions (~${formatMiB(pressure.otherBytes)}) exceed the resident pool budget (${formatMiB(pressure.budgetBytes)}), so every reload of this session is evicted again and no usable view survives between model requests — retrying now or after the next turn fails identically. To recover: finish or close the other open session(s), or raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB((pressure.weightBytes ?? 0) + pressure.otherBytes)} and restart bili.`
+        : "Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again.";
+    const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem.${healClause} [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
+}
+
+function formatMiB(bytes: number | undefined): string {
+    if (bytes === undefined) return "?";
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 // #2749: display-stub re-submission guard. In plugin mode the model's only
@@ -792,6 +812,41 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
         const r = res.result;
+        // #3322: coverage-monotonicity backstop. A committed fold must never
+        // leave a previously-covered message without ANY covering block: on
+        // full-resend hosts the kernel's turn-integrity gate once judged splits
+        // against the fold's own set instead of post-fold coverage, so ids
+        // carried by consumed blocks were withdrawn wholesale — the processed
+        // view doubled (253→519), the local estimate blew past the window and
+        // preflight fail-fasted forever while upstream had headroom. Measure
+        // active-block coverage before vs after on the clone; any loss means
+        // this fold GROWS the live view, refuse it before commit (state and
+        // prefix cache untouched). Healthy folds never lose coverage: fresh
+        // folds add it, refolds preserve it, integrity withdrawals only touch
+        // direct ids of the range being folded.
+        {
+            const coveredAfter = new Set<string>();
+            for (const b of res.state.blocks) {
+                if (!b.active) continue;
+                for (const id of b.effectiveMessageIds) coveredAfter.add(id);
+            }
+            const lostCoverage = new Set<string>();
+            for (const b of ctx.session.state.blocks) {
+                if (!b.active) continue;
+                for (const id of b.effectiveMessageIds) {
+                    if (!coveredAfter.has(id)) lostCoverage.add(id);
+                }
+            }
+            if (lostCoverage.size > 0) {
+                const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+                const sample = [...lostCoverage].slice(0, 5).map((id) => saltedMsgIdForLog(id)).join(", ");
+                const specKey = normalizedSpecKey(ranges);
+                const repeatGuard = recordCompressFailure(ctx.session, specKey);
+                ctx.log(`[acp-proxy: compress REFUSED ${detail} — coverage regression: ${lostCoverage.size} previously-folded message(s) would lose ALL covering block(s) (${sample}); committing it grows the live view and can push the local estimate past the model window (#3322). State left uncommitted, prefix cache untouched.]`);
+                const receipt = `[Compression refused: coverage regression — folding these ranges would leave ${lostCoverage.size} already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.${repeatGuard !== "" ? " " + repeatGuard : ""}]`;
+                return compressResult(receipt, "refused", 0, "gate:coverage-regression");
+            }
+        }
         // #2748: host-side image notes append a ref-carrying footer to a new
         // block's summary AFTER the kernel's length validation — count that
         // wrapped mass in the net-benefit decision too. Moved above the commit

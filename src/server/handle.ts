@@ -1821,7 +1821,13 @@ async function handleRequest(
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
         if (!demotedSide && !serverToolUtility) {
-            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel));
+            // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
+            // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
+            // budget is a raw-history collapse, not intent — arm the mid-band rescue.
+            // The plugin-stamped lane is the live path; the clientHint arm is defensive —
+            // it matches only if some dsh build's wire identity is literally "dsh".
+            const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel), dshRestoreLane);
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).

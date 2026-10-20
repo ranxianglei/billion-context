@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
@@ -347,6 +347,115 @@ test("restoreOutputBudget: #3071 leaves the ceiling-known behavior unchanged (re
     const cappedSmall = { max_tokens: 1, tools, model: "small/cap" };
     restoreOutputBudget(cappedSmall, sCap, noopLog, 4096);
     assert.equal(cappedSmall.max_tokens, 4096, "known ceiling below the absolute floor is honored, not over-floored (#3071 scope)");
+});
+
+test("restoreOutputBudget: dsh-lane mid-band collapse is rescued when a ceiling is known (#3438)", () => {
+    _resetDshMidBandWarningsForTest();
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ type: "function", function: { name: "bash" } }];
+    const M = "cn:deepseek-v4.1-flash";
+    const CEIL = 393_216;
+    // Incident replay (v0.1.197, DSH desktop, responses wire): the session ran
+    // healthy at the declared cap, then the client's raw-history estimate decayed
+    // THROUGH the mid-band toward zero. Before #3438 every >200 value passed
+    // verbatim AND re-seeded the high-water; the <=200 trigger was the only
+    // rescue entry and all three observed collapses (2260/872/204) slipped past it.
+    const s = metaSession("dsh-incident");
+    const healthy = { max_output_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(healthy, s, noopLog, CEIL, true);
+    assert.equal(healthy.max_output_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the healthy value seeds the high-water");
+    for (const v of [2260, 872, 204]) {
+        const body = { max_output_tokens: v, tools, model: M };
+        restoreOutputBudget(body, s, log, CEIL, true);
+        assert.equal(body.max_output_tokens, CEIL, `${v} restored to the known ceiling (#3438)`);
+        assert.equal(s.metadata.outputBudgetHighWater, CEIL, "a collapsed value must NOT re-seed the high-water");
+    }
+    assert.ok(lines.some((l) => l.includes("output budget restored 2260 -> 393216")), "the restore is logged");
+    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band origin names itself in the log");
+    // A mid-band value far above the starve gate is the same signature.
+    const deep = { max_output_tokens: 25_484, tools, model: M };
+    restoreOutputBudget(deep, s, log, CEIL, true);
+    assert.equal(deep.max_output_tokens, CEIL, "25484 (< ceiling) is a collapse too, not a healthy small budget");
+    // The over-restoration surface is deliberate on this lane: even a plausible
+    // deliberate-looking 32K budget is raised to the declared cap — on the dsh
+    // contract the client's number is always its estimator, never intent.
+    const mid = { max_output_tokens: 32_768, tools, model: M };
+    restoreOutputBudget(mid, s, log, CEIL, true);
+    assert.equal(mid.max_output_tokens, CEIL, "32768 < 393216 is still below the declared cap -> raised");
+    // A side request (no tools) on the same lane is NEVER touched — restoring it
+    // would break its side status — and it must not seed the high-water either.
+    const side = { max_output_tokens: 1024, model: M };
+    restoreOutputBudget(side, s, log, CEIL, true);
+    assert.equal(side.max_output_tokens, 1024, "tool-less mid-band passes verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the side request did not poison the high-water");
+    // Below the starve gate the pre-existing rescue entry point still applies.
+    const starved = { max_output_tokens: 150, tools, model: M };
+    restoreOutputBudget(starved, s, log, CEIL, true);
+    assert.equal(starved.max_output_tokens, CEIL, "the <=200 entry point still rescues on the dsh lane");
+});
+
+test("restoreOutputBudget: non-dsh lanes keep trusting a below-ceiling budget (#3438 scope guard)", () => {
+    const tools = [{ name: "t" }];
+    const s = metaSession("non-dsh");
+    const body = { max_tokens: 8000, tools, model: "prov/model" };
+    restoreOutputBudget(body, s, noopLog, 393_216);
+    assert.equal(body.max_tokens, 8000, "no lane flag: a below-ceiling value is intent, forwarded verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, 8000, "recorded as the session's own proven budget");
+    const explicit = { max_tokens: 4096, tools, model: "prov/model" };
+    restoreOutputBudget(explicit, s, noopLog, 393_216, false);
+    assert.equal(explicit.max_tokens, 4096, "an explicit false behaves like absent");
+    // The <=200 starve restores to the ceiling regardless of the lane flag.
+    const starved = { max_tokens: 16, tools, model: "prov/model" };
+    restoreOutputBudget(starved, s, noopLog, 393_216, true);
+    assert.equal(starved.max_tokens, 393_216, "starve target logic is untouched by the lane flag");
+});
+
+test("restoreOutputBudget: dsh-lane mid-band WITHOUT a ceiling forwards verbatim and warns once per session+model (#3438)", () => {
+    _resetDshMidBandWarningsForTest();
+    const warns: string[] = [];
+    const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
+    const tools = [{ name: "t" }];
+    const A = "prov/unknown-model";
+    const s = metaSession("dsh-nocap");
+    const body = { max_tokens: 2260, tools, model: A };
+    restoreOutputBudget(body, s, log, undefined, true);
+    assert.equal(body.max_tokens, 2260, "no ceiling: bili cannot judge collapse from intent, forwards verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, 2260, "no-ceiling learning is unchanged (trusted verbatim)");
+    let hits = warns.filter((l) => l.includes("cannot tell a raw-history collapse from deliberate intent"));
+    assert.equal(hits.length, 1, "one warn for the unrescuable mid-band");
+    assert.match(hits[0] ?? "", /model=prov\/unknown-model/, "names the model");
+    assert.match(hits[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
+    // Deduped per session+model.
+    restoreOutputBudget({ max_tokens: 872, tools, model: A }, s, log, undefined, true);
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 1, "deduped per session+model");
+    // A different model in the same session warns of its own.
+    restoreOutputBudget({ max_tokens: 872, tools, model: "prov/other" }, s, log, undefined, true);
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "per session+model, not per session");
+    // Tool-less mid-band: not a main turn, stays silent.
+    const side = { max_tokens: 1024, model: A };
+    restoreOutputBudget(side, s, log, undefined, true);
+    assert.equal(side.max_tokens, 1024, "side request passes verbatim");
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "the side request stays silent");
+    // Non-dsh lane: silent passthrough, no new warn.
+    const other = { max_tokens: 2260, tools, model: A };
+    restoreOutputBudget(other, metaSession("plain"), log);
+    assert.equal(other.max_tokens, 2260, "no lane flag: plain passthrough");
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "no lane flag -> no new warn");
+});
+
+test("restoreOutputBudget: the <=200 starve log keeps its original wording, the mid-band names #3438", () => {
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ name: "t" }];
+    const s = metaSession("wording");
+    const starved = { max_tokens: 16, tools, model: "m/x" };
+    restoreOutputBudget(starved, s, log, 32_768, true);
+    assert.ok(lines.some((l) => l.includes("#546: client shrank it from its raw-history estimate")), "the starve wording is byte-identical to before");
+    const mid = { max_tokens: 872, tools, model: "m/x" };
+    restoreOutputBudget(mid, s, log, 32_768, true);
+    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band restore names itself");
 });
 
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
@@ -813,6 +922,54 @@ test("e2e: poisoned high-water is floored by the known output ceiling when no ro
         assert.equal(rig.lastBody && rig.lastBody.max_tokens, 16384, "client-reported max output outranks the registry listing (#1840)");
     } finally {
         setRegistryForTest({});
+        await closeRig(rig);
+    }
+});
+
+test("e2e: dsh-lane mid-band budget is restored to the declared output ceiling on the wire (#3438)", async () => {
+    // Server-level wiring proof for the incident: a dsh plugin-stamped main turn
+    // whose raw-history estimate decayed into the mid-band (above the <=200 starve
+    // gate, below the declared ceiling) must leave the proxy at the ceiling.
+    // 16K stays well inside the default 200K rig window so the downstream clamp
+    // cannot touch the restored value.
+    const CEIL = 16_384;
+    const rig = await startRig({ routeModels: { [MODEL]: { output: CEIL } } });
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = {
+            "content-type": "application/json",
+            "x-acp-session": SESSION,
+            "x-bili-plugin": "dsh",
+            "x-bili-plugin-conversation": SESSION,
+        };
+        // Host-shaped tool names: a tool literally named "compress" is a LEAKED
+        // bili tool on this lane — #1897 strips it and demotes the request to
+        // side passthrough BEFORE restoreOutputBudget ever runs (#1897 gate).
+        const tools = [
+            { name: "bash", description: "run a command", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+            { name: "read", description: "read a file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+        ];
+        // Healthy turn at the declared cap first (seeds the water mark, like the
+        // incident session before its estimate decayed).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: CEIL, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, CEIL, "at-ceiling value forwarded untouched");
+        // The incident's three collapses, one by one through the real pipeline.
+        for (const v of [2260, 872, 204]) {
+            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: v, stream: true, tools, messages: mainConversation(9) }) });
+            assert.equal(r.status, 200);
+            await r.text();
+            assert.equal(rig.lastBody && rig.lastBody.max_tokens, CEIL, `${v} restored to the declared ceiling on the wire (#3438)`);
+            assert.equal(getSession(SESSION).metadata.outputBudgetHighWater, CEIL, "the collapsed value did not re-seed the high-water");
+        }
+        // A non-dsh client on the SAME route keeps the old behavior: below-ceiling
+        // is intent there and forwards verbatim (the lane flag is the whole scope).
+        const rPlain = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SESSION + "-plain" }, body: JSON.stringify({ model: MODEL, max_tokens: 2260, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(rPlain.status, 200);
+        await rPlain.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 2260, "non-dsh lane: below-ceiling trusted verbatim (#3438 scope guard)");
+    } finally {
         await closeRig(rig);
     }
 });

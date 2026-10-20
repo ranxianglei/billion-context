@@ -233,6 +233,52 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     : [];
   if (hitProtectedRaw.length > 0) {
     const protectedSet = new Set(hitProtectedRaw);
+    // #3953: a protected message INTERIOR to the range means the fold would
+    // also cover messages that come AFTER it — typically the assistant
+    // replies to the protected user message — while the summary anchor lands
+    // at the earliest covered position, i.e. BEFORE the question it answers.
+    // Truncate the fold at the first protected message instead of carving a
+    // hole: everything from that position on (protected and post-protected
+    // alike) stays visible and causality holds. A protected message at the
+    // range TAIL (the advisory recent-zone brush this carve was built for)
+    // has nothing after it inside the range — truncation is a no-op there.
+    const firstProtectedIdx = filteredIds.findIndex((id) => protectedSet.has(id));
+    let truncatedAfter = 0;
+    if (firstProtectedIdx >= 0) {
+      const truncatable = filteredIds.length - firstProtectedIdx - hitProtectedRaw.length;
+      // Truncate only when the truncated prefix still has work to do AND the
+      // cut does not strand a tool call/result pair across it (kept call,
+      // dropped result or vice versa — the #684 gate would either fatal at
+      // the protected-zone boundary or force a withdrawal the advisory carve
+      // was never designed for). When truncation would empty the range or
+      // split a pair (protected ids at the HEAD — e.g. absorb-context
+      // protection around an absorbed pair), keep the advisory carve
+      // semantics: fold what remains, exactly as before (#3953 changes
+      // nothing there; the zone fatal below still fires only when even the
+      // carve empties the range).
+      const pairByCallId = new Map<string, [string, string]>();
+      for (const m of input.messages) {
+        if (m.contentType === "tool-call" || m.contentType === "tool-result") {
+          const key = m.toolCallId ?? m.id;
+          const pair = pairByCallId.get(key) ?? ["", ""];
+          if (m.contentType === "tool-call") pair[0] = m.id; else pair[1] = m.id;
+          pairByCallId.set(key, pair);
+        }
+      }
+      const keptIds = filteredIds.slice(0, firstProtectedIdx);
+      const droppedIds = filteredIds.slice(firstProtectedIdx);
+      const strandsPair = keptIds.some((id) => {
+        const m = input.messages.find((x) => x.id === id);
+        if (!m || (m.contentType !== "tool-call" && m.contentType !== "tool-result")) return false;
+        const pair = pairByCallId.get(m.toolCallId ?? m.id);
+        return !!pair && pair.some((half) => half !== "" && half !== id && droppedIds.includes(half));
+      });
+      if (truncatable > 0 && firstProtectedIdx > 0 && !strandsPair) {
+        truncatedAfter = truncatable;
+        filteredIds = keptIds;
+        for (const id of droppedIds) effectiveMessageIds.delete(id);
+      }
+    }
     filteredIds = filteredIds.filter((id) => !protectedSet.has(id));
     // Remove protected messages from effective coverage too, so they are NOT
     // hidden by the new block (they must stay fully visible).
@@ -258,7 +304,10 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
         ", ",
-      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.`,
+      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.` +
+        (truncatedAfter > 0
+          ? ` Range truncated at that boundary — ${truncatedAfter} later message(s) (including replies to the protected message) stay visible too, so no summary can land above the question it answers (#3953).`
+          : ""),
     );
   }
 

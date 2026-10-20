@@ -1,5 +1,6 @@
 import type { SqliteEngineName } from "./driver.ts";
 import type { MessageContentStore } from "acp-kernel";
+import type { Mysql2Module } from "./mysql.js";
 import { UnifiedStore } from "./store.ts";
 
 /** #3931 / #3388 step 1 — the storage backend contract.
@@ -14,10 +15,12 @@ import { UnifiedStore } from "./store.ts";
  *
  * `sqlite` is the default. `mysql` is IMPLEMENTED (#3388 step 2, #3931):
  * MysqlBackend implements the full contract against MySQL 8.0 (mysql2
- * driver, a bundled dependency — #3931 owner decision). The module loads
- * lazily inside openBackend("mysql", dsn), so boots that do not select
- * mysql never load mysql2; the `indexPath` argument doubles as the DSN for
- * mysql, mirroring how SqliteBackend.open consumes the index path.
+ * driver — #3931 owner decision). Driver AND module load lazily inside
+ * openBackend("mysql", dsn) through dynamic imports that survive bundling
+ * as real runtime imports (#4008: a static import of the driver would hoist
+ * to the top of dist and crash thin installs), so boots that do not select
+ * mysql never resolve mysql2; the `indexPath` argument doubles as the DSN
+ * for mysql, mirroring how SqliteBackend.open consumes the index path.
  */
 
 export type {
@@ -299,8 +302,9 @@ export function listBackendNames(): string[] {
  *  is the DSN (mysql://user:pass@host:port/db), the pool connects lazily,
  *  and `init()` (DDL + schema stamp) must run once before first use — the
  *  contract suite does this in `before`. Unknown names throw with the valid
- *  list. Async because the mysql module is dynamically imported (#3388
- *  step-2 decision: bundled dependency, lazy load). */
+ *  list. Async because the mysql driver + module are dynamically imported at
+ *  open time (#3388 step-2 decision; #4008: the driver stays external to the
+ *  bundle and must never be statically imported). */
 export async function openBackend(name: string, indexPath: string, engine?: SqliteEngineName): Promise<StorageBackend> {
     if (name === "sqlite") return SqliteBackend.open(indexPath, engine);
     if (name === "mysql") {
@@ -309,8 +313,20 @@ export async function openBackend(name: string, indexPath: string, engine?: Sqli
                 `[storage] backend "mysql" needs a DSN — set BILI_MYSQL_DSN or storage.mysql.dsn (mysql://user:pass@host:3306/db); runs on "sqlite" until then (#3388/#3931)`,
             );
         }
+        // #4008: literal dynamic import of an EXTERNAL specifier — it survives
+        // the single-file bundle as a real runtime import and resolves only
+        // now, never at module load. The pool itself still opens lazily; this
+        // only moves driver resolution from boot time to open time.
+        let driver: Mysql2Module;
+        try {
+            driver = await import("mysql2/promise");
+        } catch (err) {
+            throw new Error(
+                `[storage] mysql backend selected but the mysql2 driver cannot be loaded (${err instanceof Error ? err.message : String(err)}) — installs without a node_modules tree cannot run the mysql backend; set storage.backend="sqlite" or install with dependencies (#4008)`,
+            );
+        }
         const { MysqlBackend } = await import("./mysql.js");
-        return new MysqlBackend(indexPath);
+        return new MysqlBackend(indexPath, driver);
     }
     throw new Error(`[storage] unknown backend "${name}" — valid names: ${REGISTERED_BACKENDS.join(", ")}`);
 }

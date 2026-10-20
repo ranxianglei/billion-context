@@ -78,8 +78,9 @@ type VerdictRule = { when?: string; status?: number; body?: string };
  *  rule whose `when` substring appears in its LAST message's content, else 200
  *  SSE with usage. Routing by the last message (not the whole body) matters:
  *  every turn resends the FULL history, so a marker embedded in an earlier turn
- *  would otherwise keep matching every later turn; a same-turn resend (#1195
- *  one-resend) carries the identical last message, so the verdict stays stable.
+ *  would otherwise keep matching every later turn. A same-turn rescue resend
+ *  (#1195/#3787) carries either the identical last message or the injected
+ *  compress-instruction tail — tests add explicit rules for both shapes.
  *  Kernel summary calls (non-stream) always get a summary. */
 function makeRelay(rules: VerdictRule[] = []) {
     const received: Buffer[] = [];
@@ -275,7 +276,14 @@ test("#1839 G2: with a real-usage anchor, an estimate-grade turn sizes on the an
 test("#1839 G3: overflow arming is tagged 'overflow-arm', never billing-grade 'usage'", async () => {
     const id = "sess-1839-g3";
     const h = await startHarness(id, [
-        { when: "step two?", status: 400, body: '{"error":{"message":"prompt is too long"}}' }, // turn 2: overflow, no window number; a #1195 same-turn resend shares the last message → same verdict
+        { when: "step two?", status: 400, body: '{"error":{"message":"prompt is too long"}}' }, // turn 2: overflow, no window number
+        // #3787: a numberless overflow now triggers an in-request rescue — the
+        // refold re-send carries the injected compress instructions (marker
+        // silence clause tail) as its last message instead of the identical
+        // view the #1195 resend used to carry. Both shapes must hit the same
+        // verdict so the rejection passes through and the arm keeps its
+        // 'overflow-arm' provenance (this test's actual subject).
+        { when: "when the tool returns, continue the task directly", status: 400, body: '{"error":{"message":"prompt is too long"}}' },
     ]);
     try {
         const base = baseConversation();
@@ -283,6 +291,7 @@ test("#1839 G3: overflow arming is tagged 'overflow-arm', never billing-grade 'u
         assert.equal(r1.status, 200, "turn 1 succeeds");
         await r1.text();
 
+        assert.equal(h.relay.nonStreamCalls(), 0, "turn 1 sizing stays estimate-clean — no preflight summary calls");
         const msgs2: Msg[] = [...base, { role: "assistant", content: "ok, done." }, { role: "user", content: "step two?" }];
         const r2 = await h.post(msgs2);
         assert.equal(r2.status, 400, "overflow rejection passes through");
@@ -300,7 +309,10 @@ test("#1839 G3: overflow arming is tagged 'overflow-arm', never billing-grade 'u
         await r3.text();
         const sized = lastNudgeSized(h.logs, id);
         assert.equal(sized, armVal, "fast path still accepts the armed value — rescue chain intact");
-        assert.equal(h.relay.nonStreamCalls(), 0, "no preflight summary calls");
+        // #3787: the numberless-overflow rescue folds in-request under arm*0.9
+        // before re-sending, so summary calls from turn 2 are the rescue doing
+        // its job — the fixture's zero-summary discipline still holds for
+        // every normally-sized turn (asserted after turn 1 above).
     } finally {
         await h.close();
     }

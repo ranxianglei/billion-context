@@ -499,6 +499,14 @@ export async function readyOrigin(state: NativeInterceptState): Promise<string |
 // Observing one is therefore DIRECT EVIDENCE that this process's model channel
 // is pinned — the attach lanes consume it to decide wait/fail over spawn.
 
+// #3923: lanes without an owner hook (spawn mode — pi/opencode/dsh/omp/zcode/
+// kimi all arm the hook only in ATTACH mode) used to absorb routed-channel
+// evidence SILENTLY: baked `/bili/` URLs kept passing through to their foreign
+// origin while raw URLs followed state.origin, splitting one conversation
+// across two live instances with zero signal. Warn once per foreign origin
+// instead. (Attach lanes keep their owner-hook behavior untouched.)
+const routedMismatchWarned = new Set<string>();
+
 /** Record the origin of an already-routed model URL on the shared state and
  *  fire the owner hook on a transition (first observation or a NEW origin).
  *  MUST be called before any gate/await in the dispatch path: the recording
@@ -515,6 +523,15 @@ export function noteRoutedOrigin(state: NativeInterceptState, url: string): void
     }
     if (state.routedOrigin === origin) return;
     state.routedOrigin = origin;
+    if (state.onRoutedOriginObserved === undefined) {
+        const held = state.origin;
+        const normalizedHeld = held === undefined ? undefined : held.replace(/\/+$/, "").toLowerCase();
+        if (held !== undefined && normalizedHeld !== origin.toLowerCase() && !routedMismatchWarned.has(origin)) {
+            if (routedMismatchWarned.size >= 128) routedMismatchWarned.clear();
+            routedMismatchWarned.add(origin);
+            logHostEvent("error", "[native-client]", `bili-native: model traffic observed at ${origin} but this process's proxy is ${held} — requests will split across two bili instances and same-conversation state will desync (#394); align your client's /bili/ base URL with ${held} or stop one of the instances (#3923)`);
+        }
+    }
     state.onRoutedOriginObserved?.(origin);
 }
 

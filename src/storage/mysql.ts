@@ -2,10 +2,10 @@
  * MySQL backend for the storage contract (#3388 step 2, #3931).
  *
  * Implements the same StorageBackend operation surface as the sqlite
- * store, against MySQL 8.0 (mysql2 driver, bundled dependency per the
- * 2026-10-20 owner decision — see the #3931 comment; this module is only
- * ever reached through openBackend("mysql", dsn), so boots that do not
- * select mysql never load it).
+ * store, against MySQL 8.0 (mysql2 driver per the 2026-10-20 owner decision
+ * — see the #3931 comment). The driver stays EXTERNAL to the bundle (#4008):
+ * openBackend("mysql", dsn) loads it lazily and injects it into the
+ * constructor, so boots that do not select mysql never resolve it.
  *
  * Representation discipline mirrors src/storage/schema.ts: verbatim facts
  * (payload_json / content bytes / *_json bags) are the truth; scalar
@@ -27,7 +27,7 @@
  * hardening plan).
  */
 
-import { createPool, type Pool, type PoolConnection, type PoolOptions } from "mysql2/promise";
+import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
@@ -45,6 +45,15 @@ import type {
     WebSummaryRow,
     IngestSessionInput,
 } from "./store.js";
+
+/** The mysql2/promise driver module, injected by openBackend() at open time.
+ *  THIS FILE MUST NEVER HOLD A TOP-LEVEL VALUE IMPORT OF THE DRIVER (#4008):
+ *  under tsup's single-file bundle (splitting:false) any value import here
+ *  hoists to the top of dist/index.js and resolves at MODULE LOAD — crashing
+ *  every install without a node_modules tree with ERR_MODULE_NOT_FOUND even
+ *  when sqlite is selected. Type imports erase at compile time and are safe.
+ *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
+export type Mysql2Module = typeof import("mysql2/promise");
 
 const MYSQL_SCHEMA_VERSION = 7;
 
@@ -222,9 +231,10 @@ function nullableStr(v: unknown): string | null {
 export class MysqlBackend implements StorageBackend {
     private readonly pool: Pool;
 
-    constructor(dsnOrOpts: string | PoolOptions) {
-        this.pool =
-            typeof dsnOrOpts === "string" ? createPool(dsnOrOpts) : createPool(dsnOrOpts);
+    constructor(dsnOrOpts: string | PoolOptions, driver: Mysql2Module) {
+        this.pool = typeof dsnOrOpts === "string"
+            ? driver.createPool(dsnOrOpts)
+            : driver.createPool(dsnOrOpts);
     }
 
     /** Applies the DDL + schema-version stamp. Idempotent. */

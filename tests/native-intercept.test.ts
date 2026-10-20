@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
@@ -1138,6 +1141,42 @@ test("#1365 noteRoutedOrigin: records origin, sticky per origin, hook fires on t
     noteRoutedOrigin(state, "not a url");
     assert.equal(state.routedOrigin, "http://127.0.0.1:9999", "malformed input ignored");
     assert.equal(seen.length, 2);
+});
+
+// #3923: spawn-mode lanes (no owner hook) used to absorb routed-channel
+// evidence SILENTLY — a `/bili/` URL baked against a foreign origin kept
+// passing through to its baked instance while raw URLs followed state.origin,
+// splitting one conversation across two live instances with zero signal until
+// someone manually diffed [v=…] tags in the shared log. Now: one error line
+// per foreign origin into bili.log. Warn-only — spawn mode has no recovery
+// policy, so it never rebinds; attach lanes are untouched (their owner hook
+// handles rebinds and the fallback only fires when no hook is armed).
+
+test("#3923 noteRoutedOrigin spawn-mode fallback: foreign origin warns once per origin, never rebinds", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3923-routed-"));
+    process.env.XDG_STATE_HOME = root;
+    // XDG_STATE_HOME override replaces the base dir entirely — no .local/state
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:18802", ready: Promise.resolve("http://127.0.0.1:18802") };
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/https://api.anthropic.com/v1/messages");
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/http://127.0.0.1:8199/v1/chat/completions");
+        assert.equal(state.routedOrigin, "http://127.0.0.1:18991");
+        assert.equal(state.origin, "http://127.0.0.1:18802", "warn-only: spawn mode never rebinds");
+        let lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "one line per foreign origin, not per request");
+        assert.match(lines[0], /\[error\]/);
+        assert.ok(lines[0].includes("http://127.0.0.1:18991") && lines[0].includes("http://127.0.0.1:18802"), "names both sides");
+
+        const slashState: NativeInterceptState = { origin: "http://127.0.0.1:18993/", ready: Promise.resolve("http://127.0.0.1:18993/") };
+        noteRoutedOrigin(slashState, "http://127.0.0.1:18993/bili/http://127.0.0.1:8199/v1/messages");
+        lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "same origin modulo trailing slash is not a mismatch");
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test("#1365 pre-gate proof: first routed request records evidence while toolsReady is still pending", async () => {

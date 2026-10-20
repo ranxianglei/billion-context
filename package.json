@@ -17,7 +17,7 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs && node scripts/check-dist-external-zod.mjs",
+    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs && node scripts/check-dist-external.mjs",
     "prepare": "node scripts/check-dist-ready.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",

@@ -20,6 +20,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
+import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
@@ -313,6 +314,12 @@ export interface PreflightResult {
      *  ran; calls > 0 && attempts === 0 = pool dropped every batch before
      *  dispatch (congestion, not provider failure). */
     externalDispatch?: { calls: number; attempts: number };
+    /** #2638: some round saw at least one range that passed every list-level gate
+     *  (viability, minCompressRange, dead-range memory). The caller uses it to tell a
+     *  failed fold chain (candidates existed, none delivered — backoff is right) from
+     *  lean steady state (nothing foldable remained at all — arming the auto-fold
+     *  backoff would only cycle classic nudges at dead spans). */
+    hadFoldableCandidates: boolean;
 }
 
 function refMaps(messages: CoreMessage[], state: Session["state"]): { refToIdx: Map<string, number>; idxToRef: Map<number, string> } {
@@ -1468,7 +1475,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (epochConfirmPending(deps.session)) {
         deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
         const paused = estimateCoreMessages(messages) + (deps.wireOverhead ?? 0);
-        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit };
+        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit, hadFoldableCandidates: false };
     }
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
@@ -1499,7 +1506,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // the uncalibrated #1841 path stays byte-identical.
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
@@ -1544,6 +1551,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // skipSet keys are stable across folds because refs are content-fingerprinted,
     // so a range found unusable is never retried within this invocation.
     const skipSet = new Set<string>();
+    // #2638: seed with the session-level memory of spans whose previews returned a
+    // structural "no new compressible messages" verdict — without this, every request
+    // re-nominates and re-rejects them (the permanent rejection loop). The kernel keeps
+    // advertising them, so the list-level filter below and this seed share one source.
+    for (const key of deadSkipKeys(deps.session)) skipSet.add(key);
     // #1372: every silent skip leaves a trace — preflight and the plugin compress
     // path judge the same range at different pipeline positions, so their verdicts
     // can legitimately diverge; recording where+why makes the divergence diffable.
@@ -1552,6 +1564,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (skipReasons.length < 8 && !skipReasons.includes(reason)) skipReasons.push(safePrefix(reason, 200));
     };
     let subMinNoted = false;
+    let deadNoted = false;
+    let deadDroppedTotal = 0;
     let summaryCalls = 0;
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
@@ -1921,16 +1935,31 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // rounds and misreports "N viable ranges tried"; with them gone the
         // empty-list path below can reach the #330 soft-zone relaxation.
         const viable = viableRanges(turn.nudge?.compressibleRanges ?? []);
-        const ranges = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        const aboveMin = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        // #2638: spans whose previews returned a structural "no new compressible
+        // messages" verdict can never fold through plain refs — the kernel keeps
+        // advertising them, so without this filter every round re-walks and
+        // re-previews them. Exact key match only: a wider range that merely
+        // contains a dead chunk keeps its live members.
+        let ranges = filterDeadRanges(deps.session, aboveMin);
+        const deadDropped = aboveMin.length - ranges.length;
+        if (deadDropped > 0) {
+            deadDroppedTotal += deadDropped;
+            if (!deadNoted) {
+                deadNoted = true;
+                deps.log("debug", `[preflight] ${deadDropped} candidate range(s) suppressed: previously-dead structural verdicts (#2638)`);
+            }
+        }
         // #1372: the list-level minCompressRange filter used to drop sub-minimum
         // ranges silently — "no compressible ranges remain" gave no hint that
         // ranges existed but were all under the gate.
-        if (ranges.length === 0 && viable.length > 0 && !subMinNoted) {
+        if (ranges.length === 0 && aboveMin.length === 0 && viable.length > 0 && !subMinNoted) {
             subMinNoted = true;
             deps.log("warn", `[preflight] ${viable.length} viable range(s) are below minCompressRange (${minChars} chars); none foldable`);
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        if (ranges.length > 0) result.hadFoldableCandidates = true;
         // Field reports of the preflight marathon cut at the #568 hold line
         // with zero round visibility (both 0.1.195 fork incidents): 19 LLM
         // rounds × tens of seconds upstream each, nothing in between. One
@@ -1985,7 +2014,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         renderTags: "text-only",
                         contentStore: contentStoreOf(deps.session),
                     });
-                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+                    // #2638: structural verdicts hold under relax too (coverage-based, zone-independent) — dead mass cannot close the gap either.
+                    const relaxedRanges = filterDeadRanges(deps.session, viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars));
                     const relaxedPotential = resolvableMass(relaxedRanges);
                     if (calibrateFoldMass(relaxedPotential) * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
@@ -2057,7 +2087,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             failure = { kind: "exhausted", deterministic: true, detail: relaxed ? relaxedExhaustedDetail : subMinNoted
                 ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
-                : "no compressible ranges remain in the conversation" };
+                : deadNoted
+                    ? `no foldable compressible ranges remain: ${deadDroppedTotal} range(s) carry previously-dead structural verdicts (#2638)`
+                    : "no compressible ranges remain in the conversation" };
             break;
         }
         // #2682: two-tier dispatch order. Tier 1 = ranges entirely outside the
@@ -2471,6 +2503,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         || "the kernel created no block and reported no error";
                     deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
                     noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                    // #2638: ONLY the structural "no new compressible messages" verdicts are
+                    // regime-independent — coverage-based, they hold under the #330 relax flip
+                    // too, so the span is skipped for the rest of this invocation and
+                    // remembered across invocations. Zone/min-gate/length verdicts can clear
+                    // mid-invocation (relax, newer messages) and stay retryable. Raw errors,
+                    // not the truncated verdict: the named-block list must survive intact.
+                    const named = parseStructuralEmptyVerdict(preview.result.errors.join("\n"));
+                    if (named !== null) {
+                        skipSet.add(skipKey);
+                        recordDeadRange(deps.session, startRef, endRef, named);
+                    }
                     continue;
                 }
                 // Direct raw messages render host-side: #781 image notes live in BiliMessage
