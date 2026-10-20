@@ -12,18 +12,30 @@
  * contract). This module owns ONLY the download/cache step; driver.ts owns
  * resolution order and opening.
  *
- * Artifact: better-sqlite3 v13 ships N-API prebuilds for all eight
- * platform/arch combinations INSIDE its npm tarball (no install script, no
- * per-ABI split). N-API is ABI-stable across Node versions, but ABI stability
- * is NOT a support guarantee: v13 declares `engines: node >= 22`, and loading
- * its binding outside that range is undefined behavior rather than a clean
- * failure — on Node 20 the win32-x64 prebuild faults inside `process.dlopen`
- * (access violation, uncatchable) and the linux-x64 one faults on the first
- * `new Database()` (#3341). So the pin carries the artifact's OWN Node floor
- * next to version + sha512, and the floor gates BOTH the download and the
- * cached-copy registration: a copy that cannot legally load must never be
- * registered. We pin version + sha512 + floor in-repo; bumping any of the
- * three is a human-visible PR. Download egress honors
+ * Artifacts are pinned PER NODE MAJOR, because the binding is not portable
+ * below the floor the package declares (#3341, #3894). better-sqlite3 v13
+ * ships N-API prebuilds for all eight platform/arch combinations INSIDE its
+ * npm tarball, but it declares `engines: node >= 22` and compiles them for
+ * N-API 10, while Node 20 only provides N-API 9 — loading that binding on
+ * Node 20 is undefined behavior rather than a clean failure: the win32-x64
+ * prebuild faults inside `process.dlopen` (access violation, uncatchable) and
+ * the linux-x64 one faults on the first `new Database()`. Node 20 therefore
+ * gets the last 12.x line, which declares `engines: 20.x || 22.x || ...` and
+ * ships no binding of its own: its npm tarball is pure JS and the native half
+ * is an ABI-keyed prebuild (`better-sqlite3-v<ver>-node-v115-<target>.tar.gz`)
+ * published on the GitHub release / npmmirror binary mirrors. v12's
+ * `lib/database.js` accepts an injected `nativeBinding`, so the two halves
+ * compose without `bindings`, `prebuild-install` or any install script — the
+ * #2833 contract holds: pinned artifacts, sha512 verified on every download,
+ * no host build approval. Downgrading such users to legacy JSON storage would
+ * be the wrong answer: legacy is scheduled for removal, so "low Node" must
+ * stay on the unified lane with a lower artifact, not fall off it.
+ *
+ * A spec is eligible only when its Node floor AND (when it has one) its
+ * prebuild ABI match the running Node. When nothing is eligible the bootstrap
+ * reports `unsupported-node` instead of registering a binding that would crash
+ * the process. We pin version + sha512 + floor + per-target prebuild digests
+ * in-repo; bumping any of them is a human-visible PR. Download egress honors
  * the same proxy decision chain as model traffic (#609) and the configured
  * registry mirror (BILI_UPDATE_REGISTRY / update.registry).
  *
@@ -47,20 +59,57 @@ import { fileStorageAutoDownload, fileStorageUnified, resolveStorageMode, resolv
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
+/** The separate ABI-keyed binding artifact a JS-only npm tarball needs. */
+interface EnginePrebuild {
+    /** Node `process.versions.modules` ABI the binaries were built for (115 = Node 20). */
+    nodeAbi: string;
+    /** sha512 base64 per platform target — pinned in-repo, verified on every download. */
+    sha512Base64ByTarget: Readonly<Record<string, string>>;
+}
+
 interface EngineBootstrapSpec {
     version: string;
     /** sha512 base64 digest of the registry tarball — pinned in-repo, verified on every download. */
     sha512Base64: string;
     /** Node major floor copied from the artifact's own `engines.node`; below it the binding is undefined behavior (process crash), not a graceful failure. */
     minNodeMajor: number;
+    /** Present when the npm tarball carries no binding of its own (v12 and earlier). */
+    prebuild?: EnginePrebuild;
 }
 
-/** Pinned engine artifact (#2833). Bump version, digest AND the Node floor together in one PR. */
-const DEFAULT_ENGINE_SPEC: Readonly<EngineBootstrapSpec> = Object.freeze({
-    version: "13.0.3",
-    sha512Base64: "RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
-    minNodeMajor: 22,
-});
+/**
+ * Pinned engine artifacts (#2833), one per Node major band. Bump version,
+ * digests, floor and ABI together in one PR.
+ *
+ * Order is preference order: the newest artifact that serves the running Node
+ * wins, so a Node 22+ machine keeps the single-tarball v13 lane even though
+ * v12 could also serve it.
+ */
+const ENGINE_SPECS: readonly EngineBootstrapSpec[] = Object.freeze([
+    {
+        version: "13.0.3",
+        sha512Base64: "RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdVVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
+        minNodeMajor: 22,
+    },
+    {
+        version: "12.9.0",
+        sha512Base64: "wqUv4Gm3toFpHDQmaKD4QhZm3g1DjUBI0yzS4UBl6lElUmXFYdTQmmEDpAFa5o8FiFiymURypEnfVHzILKaxqQ==",
+        minNodeMajor: 20,
+        prebuild: {
+            nodeAbi: "115",
+            sha512Base64ByTarget: Object.freeze({
+                "linux-x64": "fNMKurhPKb0ki9mnZJK9PVazCiRugcdmauo5qGjqQjUGIrdaVWrb4nlLwU7IiyppcfLu8n/qUsQ5CEZ36uoGaw==",
+                "linux-arm64": "7q7wZe0+5LLQt2YUkocGb41B9TvEMLKIaNI+CiQUQQ2DFBO1RPr3ixj/Gtb+0noMYHjJrqtqKUMO1xMQXnE0iw==",
+                "linuxmusl-x64": "GCriICDKw7K5dNjAVo8xFpSJXcYXXBAK9RDoeuSUv6rB5IVRP96IwxeynTy4Xc21l1507Efz+I2yy6FW5gKQ/w==",
+                "linuxmusl-arm64": "2OWfVP1nklnuR8ZfCwozJcLB0ZpOTRHqAkDpsLonEF5uHZMBnOAzGtd5d+nuPU+KaS5czciU0tXZFhsCUw7dbg==",
+                "darwin-x64": "tW2Vb19+Bh+PLfcGVnrERhc9Mk50Vi8HciIc0nwIJXlPm21xzKL6uEQHMoyKIAxF+vNXxDsUoJyNRg/TgCXjkA==",
+                "darwin-arm64": "H6jehr7s1D/RSTRplCL++hneLTgpqVzgzjrX/NJCsf0OMBSKNGCd9kMYAZJjMlp0IetS39sG5PTG7AcLCTQKeg==",
+                "win32-x64": "r+BAeN980mQEdIwDcrNU3iJqzAryuOyfeICFfYHuHVclonTr2L0IlzsaGp2D50KNWUeLQrIhBCFuNoT2+iBDTw==",
+                "win32-arm64": "jMSa36VrAiLsWFtnwWX+FEs4JWIjHeduVITY44ZcHsqn7BzPcMljL8LdJ0tVVGssV8x9PuqgIqMD5gFmzcYh9w==",
+            }),
+        },
+    },
+]);
 
 const SUPPORTED_TARGETS = [
     "linux-x64", "linux-arm64",
@@ -69,10 +118,11 @@ const SUPPORTED_TARGETS = [
     "win32-x64", "win32-arm64",
 ];
 
-// Whole-download budget for the ~11 MB engine tarball. Must cover a multi-MB
-// registry fetch over a non-trivial network (corporate proxy / slow link);
-// 10 s locked Node<=21 machines into a 6 h legacy-only cooldown after one slow
-// boot (#3338). Aligned with the updater's own tarball budget (src/update.ts).
+// Whole-download budget for the engine artifacts (v13: one ~11 MB tarball;
+// v12: ~2.6 MB of JS plus a ~1 MB prebuild). Must cover a multi-MB registry
+// fetch over a non-trivial network (corporate proxy / slow link); 10 s locked
+// Node<=21 machines into a 6 h legacy-only cooldown after one slow boot
+// (#3338). Aligned with the updater's own tarball budget (src/update.ts).
 export const BOOTSTRAP_TIMEOUT_MS = 60_000;
 export const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
@@ -95,7 +145,7 @@ let specOverride: EngineBootstrapSpec | null = null;
 let platformOverride: string | null = null;
 let inFlight: Promise<BootstrapOutcome> | null = null;
 
-/** Test seam: swap the pinned artifact (version/sha) for a hermetic fixture. */
+/** Test seam: swap the pinned artifact (version/digests/floor) for a hermetic fixture. */
 export function setEngineBootstrapSpecForTests(spec: EngineBootstrapSpec | null): void {
     specOverride = spec;
 }
@@ -117,10 +167,6 @@ export function setBootstrapTimeoutMsForTests(ms: number | null): void {
     bootstrapTimeoutOverrideMs = ms;
 }
 
-function activeSpec(): EngineBootstrapSpec {
-    return specOverride ?? DEFAULT_ENGINE_SPEC;
-}
-
 /**
  * Pure floor predicate (version in -> verdict out) so tests pin the threshold
  * boundary without depending on the Node running them. An unparseable major
@@ -131,6 +177,33 @@ export function nodeMajorSatisfiesFloor(minNodeMajor: number, nodeVersion: strin
     const major = Number.parseInt(nodeVersion.split(".")[0] ?? "", 10);
     if (!Number.isFinite(major)) return true;
     return major >= minNodeMajor;
+}
+
+/** Why this spec cannot serve the running Node, or null when it can. Both
+ *  halves are load-bearing: the floor is what the package declares, the ABI is
+ *  what the binary was actually built against — a JS-only tarball whose
+ *  prebuild targets a different ABI loads just as badly as one below its floor. */
+function specUnusableReason(spec: EngineBootstrapSpec, nodeVersion: string = process.versions.node, nodeAbi: string = process.versions.modules): string | null {
+    if (!nodeMajorSatisfiesFloor(spec.minNodeMajor, nodeVersion)) {
+        return `better-sqlite3@${spec.version} needs Node.js >= ${spec.minNodeMajor}, this is ${nodeVersion}`;
+    }
+    if (spec.prebuild && spec.prebuild.nodeAbi !== nodeAbi) {
+        return `better-sqlite3@${spec.version} ships no binding for Node ABI ${nodeAbi} (its prebuild is pinned to ABI ${spec.prebuild.nodeAbi}), this is Node.js ${nodeVersion}`;
+    }
+    return null;
+}
+
+function pinnedSpecForThisNode(): EngineBootstrapSpec | null {
+    return ENGINE_SPECS.find((s) => specUnusableReason(s) === null) ?? null;
+}
+
+/** Honest "nothing fits" text: names the running Node/ABI and every pinned
+ *  band, so the report explains itself instead of blaming the network. */
+function unsupportedNodeDetail(nodeVersion: string = process.versions.node, nodeAbi: string = process.versions.modules): string {
+    const covered = ENGINE_SPECS.map((s) => (s.prebuild
+        ? `better-sqlite3@${s.version} on Node.js ${s.minNodeMajor}.x (ABI ${s.prebuild.nodeAbi})`
+        : `better-sqlite3@${s.version} on Node.js >= ${s.minNodeMajor}`)).join(" or ");
+    return `no pinned SQLite engine runs on Node.js ${nodeVersion} (ABI ${nodeAbi}) — the pinned artifacts cover ${covered}`;
 }
 
 /** Platform key matching better-sqlite3's own binding.js musl detection. */
@@ -246,15 +319,22 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     if (probeHostBetterSqlite3()) {
         return { status: "not-needed", detail: "host-provided better-sqlite3 available" };
     }
-    const spec = activeSpec();
-    if (!nodeMajorSatisfiesFloor(spec.minNodeMajor)) {
-        const detail = `better-sqlite3@${spec.version} needs Node.js >= ${spec.minNodeMajor}, this is ${process.versions.node}`;
-        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; a self-downloaded engine would crash this process on load, staying on legacy storage (upgrade Node.js to ${spec.minNodeMajor}+ for unified storage)`);
+    const spec = specOverride ?? pinnedSpecForThisNode();
+    if (!spec) {
+        const detail = unsupportedNodeDetail();
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; staying on legacy storage`);
         return { status: "unsupported-node", detail };
+    }
+    const unusable = specUnusableReason(spec);
+    if (unusable) {
+        // Never register a binding outside the range it declares: the load
+        // faults uncatchably, so a probe cannot save us — only refusing can.
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${unusable}; a self-downloaded engine would crash this process on load, staying on legacy storage`);
+        return { status: "unsupported-node", detail: unusable };
     }
     const target = platformOverride ?? platformTargetKey();
     if (cacheUsable(finalDir(spec.version), target)) {
-        if (!tryRegisterFromCache(finalDir(spec.version))) {
+        if (!tryRegisterFromCache(finalDir(spec.version), spec, target)) {
             // #3135 ⑤/#3818: the copy's bytes were sha-verified when cached,
             // so "unloadable" means the environment changed under it (major
             // Node upgrade, truncated cache write, platform drift). A cache
@@ -273,6 +353,9 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };
     }
+    if (spec.prebuild && !spec.prebuild.sha512Base64ByTarget[target]) {
+        return { status: "unsupported-platform", detail: `${target} (no pinned prebuild for better-sqlite3@${spec.version})` };
+    }
     if (!resolveSqliteAutoDownload(env, fileStorageAutoDownload())) {
         return { status: "disabled", detail: "storage.sqliteAutoDownload=false" };
     }
@@ -281,16 +364,16 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
         loggerLog("debug", `[storage] sqlite engine self-bootstrap in cooldown (${cd.reason}); skipping`);
         return { status: "cooldown", detail: cd.reason };
     }
-    loggerLog("info", `[storage] sqlite engine self-bootstrap: downloading better-sqlite3@${spec.version} (~11 MB) from ${engineMirrors().join(" → ")} ...`);
+    loggerLog("info", `[storage] sqlite engine self-bootstrap: downloading better-sqlite3@${spec.version}${spec.prebuild ? " + its Node-ABI prebuild" : ""} from ${engineMirrors().join(" → ")} ...`);
     try {
         await downloadAndInstall(spec, target, opts.resolveProxy);
-        if (!tryRegisterFromCache(finalDir(spec.version))) {
+        if (!tryRegisterFromCache(finalDir(spec.version), spec, target)) {
             // #3819 review: the bytes landed but the engine still won't load
             // (AV quarantine, truncated extract, platform drift). Same
             // semantics as a failed attempt below: arm the cooldown so a
-            // persistently broken environment stops re-downloading ~11 MB
-            // per boot, and report "failed" — "downloaded" would claim an
-            // engine that never registered.
+            // persistently broken environment stops re-downloading the
+            // artifacts per boot, and report "failed" — "downloaded" would
+            // claim an engine that never registered.
             const reason = "post-download registration failed";
             await writeCooldown(reason);
             loggerLog("warn", `[storage] sqlite engine self-bootstrap: download ok but engine still unloadable (${reason}) — continuing without it; retrying after ${COOLDOWN_MS / 3_600_000}h`);
@@ -321,10 +404,27 @@ const BUILTIN_REGISTRY_MIRRORS: readonly string[] = [
     "https://registry.npmmirror.com",
 ];
 
+/**
+ * Mirrors for the ABI-keyed prebuild tarball, which no npm registry serves —
+ * upstream publishes it as a GitHub release asset and npmmirror republishes
+ * those assets under its binary mirror. npmmirror is tried first because this
+ * path only ever runs on Node 20 (the CN-heavy population of #3338/#3385) and
+ * github.com is unreachable from mainland networks without a proxy.
+ */
+const BUILTIN_PREBUILD_MIRRORS: readonly string[] = [
+    "https://registry.npmmirror.com/-/binary/better-sqlite3",
+    "https://github.com/WiseLibs/better-sqlite3/releases/download",
+];
+
 let mirrorsOverride: readonly string[] | null = null;
+let prebuildMirrorsOverride: readonly string[] | null = null;
 
 export function setEngineMirrorsForTests(mirrors: readonly string[] | null): void {
     mirrorsOverride = mirrors;
+}
+
+export function setPrebuildMirrorsForTests(mirrors: readonly string[] | null): void {
+    prebuildMirrorsOverride = mirrors;
 }
 
 function engineMirrors(): string[] {
@@ -332,6 +432,10 @@ function engineMirrors(): string[] {
     const configured = normalizeRegistryBase(updateRegistryBase());
     const list = configured ? [configured, ...BUILTIN_REGISTRY_MIRRORS] : [...BUILTIN_REGISTRY_MIRRORS];
     return [...new Set(list)];
+}
+
+function prebuildMirrors(): string[] {
+    return prebuildMirrorsOverride ? [...prebuildMirrorsOverride] : [...BUILTIN_PREBUILD_MIRRORS];
 }
 
 /**
@@ -351,11 +455,31 @@ export function nodeSqliteUpgradeHint(nodeVersion: string = process.versions.nod
     return " — node:sqlite needs Node.js >= 22.5; upgrade Node.js for the builtin engine (engine tarball mirrors tried in order: npm + npmmirror; set BILI_UPDATE_REGISTRY or update.registry to pin one)";
 }
 
-function tryRegisterFromCache(dir: string): boolean {
+/** v12 and earlier construct with `(file, { nativeBinding })`; the extra option
+ *  is what lets a JS-only tarball bind the pinned ABI prebuild without the
+ *  `bindings` resolver or an install script. A path (not the addon object) is
+ *  passed so the binding is loaded by v12 at construction time, keeping
+ *  `dlopen` inside the one call the ABI gate has already cleared. */
+type BetterSqlite3CtorWithBinding = new (file: string, options: { nativeBinding: string }) => InstanceType<BetterSqlite3Ctor>;
+
+function withNativeBinding(Database: BetterSqlite3CtorWithBinding, addonPath: string): BetterSqlite3Ctor {
+    const Bound = function BoundDatabase(this: unknown, file: string): InstanceType<BetterSqlite3Ctor> {
+        return new Database(file, { nativeBinding: addonPath });
+    };
+    return Bound as unknown as BetterSqlite3Ctor;
+}
+
+function tryRegisterFromCache(dir: string, spec: EngineBootstrapSpec, target: string): boolean {
     try {
         const r = createRequire(path.join(dir, "package.json"));
         const mod = r("./lib/index.js") as unknown as BetterSqlite3Ctor;
-        registerSelfDownloadedBetterSqlite3(() => mod);
+        if (!spec.prebuild) {
+            registerSelfDownloadedBetterSqlite3(() => mod);
+            return true;
+        }
+        const addonPath = path.join(dir, "prebuilds", `${target}.node`);
+        if (!existsSync(addonPath)) return false;
+        registerSelfDownloadedBetterSqlite3(() => withNativeBinding(mod as unknown as BetterSqlite3CtorWithBinding, addonPath));
         return true;
     } catch (err) {
         loggerLog("debug", `[storage] sqlite engine self-bootstrap: cache registration failed (${String(err)})`);
@@ -363,12 +487,18 @@ function tryRegisterFromCache(dir: string): boolean {
     }
 }
 
+const PINNED_VERSIONS = new Set(ENGINE_SPECS.map((s) => s.version));
+
 async function pruneSiblingVersions(keepDir: string): Promise<void> {
     try {
         const entries = await fsp.readdir(cacheRoot());
         await Promise.all(entries.flatMap((e) => {
-            if (!e.startsWith("better-sqlite3-") || path.join(cacheRoot(), e) === keepDir) return [];
-            return [fsp.rm(path.join(cacheRoot(), e), { recursive: true, force: true }).catch(() => {})];
+            const dir = path.join(cacheRoot(), e);
+            if (!e.startsWith("better-sqlite3-") || dir === keepDir) return [];
+            // Pinned siblings stay: switching Node majors (20 <-> 22) must not
+            // re-download an artifact this build already knows how to load.
+            if (PINNED_VERSIONS.has(e.slice("better-sqlite3-".length))) return [];
+            return [fsp.rm(dir, { recursive: true, force: true }).catch(() => {})];
         }));
     } catch {
         // pruning is housekeeping only — never fail the bootstrap over it
@@ -382,31 +512,30 @@ async function pruneSiblingVersions(keepDir: string): Promise<void> {
 async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, resolveProxy?: (url: string) => string | undefined): Promise<void> {
     const root = cacheRoot();
     await fsp.mkdir(root, { recursive: true });
-    const tmpTgz = path.join(root, `.dl-${randomBytes(6).toString("hex")}.tgz`);
     const tmpDir = path.join(root, `.wip-${randomBytes(6).toString("hex")}`);
     try {
         // #3338 directive 2: walk the mirror list; the FIRST mirror that
         // yields a sha512-verified tarball wins. Fetch + integrity are
         // per-mirror; extraction/publishing happens once, mirror-independent.
-        let tgz: Buffer | null = null;
-        const attempted: string[] = [];
-        let lastErr: unknown = null;
-        for (const base of engineMirrors()) {
-            const url = `${base}/better-sqlite3/-/better-sqlite3-${spec.version}.tgz`;
-            attempted.push(base);
-            try {
-                tgz = await fetchVerifiedTarball(url, spec, tmpTgz, resolveProxy);
-                break;
-            } catch (err) {
-                lastErr = err;
-                loggerLog("warn", `[storage] sqlite engine self-bootstrap: mirror ${base} failed (${err instanceof Error ? err.message : String(err)}) — trying next mirror`);
-            }
+        const npmTgz = await fetchFirstMirror(
+            engineMirrors().map((base) => ({ url: `${base}/better-sqlite3/-/better-sqlite3-${spec.version}.tgz`, label: base })),
+            spec.sha512Base64,
+            root,
+            resolveProxy,
+        );
+        await extractTgzToDir(npmTgz, tmpDir, target, { withPrebuilds: !spec.prebuild });
+        if (spec.prebuild) {
+            const pinned = spec.prebuild.sha512Base64ByTarget[target];
+            if (!pinned) throw new Error(`no pinned prebuild digest for ${target}`);
+            const fileName = `better-sqlite3-v${spec.version}-node-v${spec.prebuild.nodeAbi}-${target}.tar.gz`;
+            const prebuildTgz = await fetchFirstMirror(
+                prebuildMirrors().map((base) => ({ url: `${base}/v${spec.version}/${fileName}`, label: base })),
+                pinned,
+                root,
+                resolveProxy,
+            );
+            await extractPrebuildTgz(prebuildTgz, tmpDir, target);
         }
-        if (!tgz) {
-            const reason = lastErr instanceof Error ? lastErr.message : String(lastErr);
-            throw new Error(`${reason} (tried mirrors: ${attempted.join(", ")})`);
-        }
-        await extractTgzToDir(tgz, tmpDir, target);
         const dest = finalDir(spec.version);
         if (existsSync(dest)) {
             // rename(2) over a non-empty dir is ENOTEMPTY: a stale final dir would
@@ -418,15 +547,41 @@ async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, res
         }
         await fsp.rename(tmpDir, dest);
     } finally {
-        await fsp.rm(tmpTgz, { force: true }).catch(() => {});
         await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+interface MirrorAttempt {
+    url: string;
+    /** Shown in the retry log — the mirror root, not the full asset URL. */
+    label: string;
+}
+
+async function fetchFirstMirror(attempts: readonly MirrorAttempt[], expectedSha512Base64: string, scratchDir: string, resolveProxy?: (url: string) => string | undefined): Promise<Buffer> {
+    const tmpTgz = path.join(scratchDir, `.dl-${randomBytes(6).toString("hex")}.tgz`);
+    const attempted: string[] = [];
+    let lastErr: unknown = null;
+    try {
+        for (const attempt of attempts) {
+            attempted.push(attempt.label);
+            try {
+                return await fetchVerifiedTarball(attempt.url, expectedSha512Base64, tmpTgz, resolveProxy);
+            } catch (err) {
+                lastErr = err;
+                loggerLog("warn", `[storage] sqlite engine self-bootstrap: mirror ${attempt.label} failed (${err instanceof Error ? err.message : String(err)}) — trying next mirror`);
+            }
+        }
+        const reason = lastErr instanceof Error ? lastErr.message : String(lastErr);
+        throw new Error(`${reason} (tried mirrors: ${attempted.join(", ")})`);
+    } finally {
+        await fsp.rm(tmpTgz, { force: true }).catch(() => {});
     }
 }
 
 /** One mirror attempt: stream the tarball to `tmpTgz` while hashing; return
  *  the bytes only when the pinned sha512 matches. Throws on timeout / HTTP
  *  error / integrity mismatch so the caller can advance to the next mirror. */
-async function fetchVerifiedTarball(url: string, spec: EngineBootstrapSpec, tmpTgz: string, resolveProxy?: (url: string) => string | undefined): Promise<Buffer> {
+async function fetchVerifiedTarball(url: string, expectedSha512Base64: string, tmpTgz: string, resolveProxy?: (url: string) => string | undefined): Promise<Buffer> {
     const dispatcher = proxyDispatcher(resolveProxy?.(url));
     // @types/node types RequestInit.dispatcher as its internal Dispatcher;
     // cast once here (no `as any`), same pattern as src/update.ts fetchWithEgress.
@@ -451,36 +606,61 @@ async function fetchVerifiedTarball(url: string, spec: EngineBootstrapSpec, tmpT
         await out.close();
     }
     const digest = hash.digest("base64");
-    if (digest !== spec.sha512Base64) {
-        throw new Error(`sha512 mismatch (got ${digest.slice(0, 16)}..., pinned ${spec.sha512Base64.slice(0, 16)}...) — quarantining download`);
+    if (digest !== expectedSha512Base64) {
+        throw new Error(`sha512 mismatch (got ${digest.slice(0, 16)}..., pinned ${expectedSha512Base64.slice(0, 16)}...) — quarantining download`);
     }
     return await fsp.readFile(tmpTgz);
 }
 
 // ---------------------------------------------------------------------------
 // Minimal tgz extractor (devDeps are unavailable at runtime — bili ships a
-// self-contained bundle). Supports exactly what npm tarballs of the pinned
-// package contain: regular files, directories, GNU long names ('L') and PAX
-// path records ('x'). Anything else fails loud rather than half-extracting.
-// Only lib/, prebuilds/ and package.json are materialized (~1.5 MB of the
-// 27 MB unpacked tarball — the C++ sources are build-time only).
+// self-contained bundle). Supports exactly what the pinned artifacts contain:
+// regular files, directories, GNU long names ('L') and PAX path records ('x').
+// Anything else fails loud rather than half-extracting.
 // ---------------------------------------------------------------------------
 
 const INCLUDE_EXACT = new Set(["package/package.json"]);
-const INCLUDE_PREFIXES = ["package/lib/", "package/prebuilds/"];
 
-function included(name: string): boolean {
-    return INCLUDE_EXACT.has(name) || INCLUDE_PREFIXES.some((p) => name.startsWith(p));
+function included(name: string, withPrebuilds: boolean): boolean {
+    if (INCLUDE_EXACT.has(name) || name.startsWith("package/lib/")) return true;
+    return withPrebuilds && name.startsWith("package/prebuilds/");
 }
 
-export async function extractTgzToDir(tgz: Buffer, destDir: string, target: string): Promise<void> {
+interface ExtractTgzOptions {
+    /** The npm tarball carries `prebuilds/<target>.node` itself (v13). Off for a
+     *  JS-only tarball whose binding arrives as a separate ABI prebuild (v12). */
+    withPrebuilds?: boolean;
+}
+
+export async function extractTgzToDir(tgz: Buffer, destDir: string, target: string, opts: ExtractTgzOptions = {}): Promise<void> {
+    const withPrebuilds = opts.withPrebuilds ?? true;
+    await fsp.mkdir(destDir, { recursive: true });
+    await extractTgzEntries(tgz, (name) => (included(name, withPrebuilds) ? destFor(name, destDir) : null));
+    const required = withPrebuilds
+        ? ["package.json", path.join("lib", "index.js"), path.join("prebuilds", `${target}.node`)]
+        : ["package.json", path.join("lib", "index.js")];
+    for (const rel of required) {
+        if (!existsSync(path.join(destDir, rel))) throw new Error(`tarball missing required file: ${rel}`);
+    }
+}
+
+/** Extract the ABI-keyed prebuild tarball (a single `build/Release/*.node`) to
+ *  `prebuilds/<target>.node` — the location cacheUsable() and the v12 loader
+ *  both expect, regardless of the source layout. */
+export async function extractPrebuildTgz(tgz: Buffer, destDir: string, target: string): Promise<void> {
+    const dest = path.join(destDir, "prebuilds", `${target}.node`);
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    await extractTgzEntries(tgz, (name) => (name.endsWith(".node") ? dest : null));
+    if (!existsSync(dest)) throw new Error(`prebuild tarball missing a .node binding for ${target}`);
+}
+
+async function extractTgzEntries(tgz: Buffer, resolveDest: (name: string) => string | null): Promise<void> {
     let data: Buffer;
     try {
         data = gunzipSync(tgz);
     } catch (err) {
         throw new Error(`gunzip failed: ${String(err)}`);
     }
-    await fsp.mkdir(destDir, { recursive: true });
     let off = 0;
     let pendingName: string | null = null;
     while (off + 512 <= data.length) {
@@ -504,19 +684,16 @@ export async function extractTgzToDir(tgz: Buffer, destDir: string, target: stri
             if (paxPath) pendingName = paxPath;
             continue;
         }
-        if (!included(name)) continue;
+        const dest = resolveDest(name);
+        if (dest === null) continue;
         if (typeflag === 0x30 || typeflag === 0x00) {
-            const dest = destFor(name, destDir);
             await fsp.mkdir(path.dirname(dest), { recursive: true });
             await fsp.writeFile(dest, payload);
         } else if (typeflag === 0x35) {
-            await fsp.mkdir(destFor(name, destDir), { recursive: true });
+            await fsp.mkdir(dest, { recursive: true });
         } else {
             throw new Error(`unsupported tar entry type 0x${typeflag.toString(16)} for ${name}`);
         }
-    }
-    for (const required of ["package.json", path.join("lib", "index.js"), path.join("prebuilds", `${target}.node`)]) {
-        if (!existsSync(path.join(destDir, required))) throw new Error(`tarball missing required file: ${required}`);
     }
 }
 

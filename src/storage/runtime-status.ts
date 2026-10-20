@@ -83,11 +83,12 @@ function degradeReason(): string {
         const last = sidecar.stats.lastError ? shortenError(sidecar.stats.lastError) : "unknown";
         return `unified store auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures (last: ${last})`;
     }
-    // A too-old Node is refused BEFORE any engine load, so the sidecar open ALSO
-    // fails with the generic no-engine error — surface the real floor reason first,
-    // or the sidecar-open-error branch below would shadow it (#3894).
+    // No pinned artifact serves this runtime (below every Node floor, or a Node
+    // ABI no prebuild targets), so the engine is refused BEFORE any load and the
+    // sidecar open ALSO fails with the generic no-engine error — surface the real
+    // reason first, or the sidecar-open-error branch below would shadow it (#3894).
     if (state.bootstrap?.status === "unsupported-node") {
-        return `self-downloaded SQLite engine requires a newer Node.js (${state.bootstrap.detail ?? "unknown"})`;
+        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})`;
     }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);

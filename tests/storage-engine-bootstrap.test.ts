@@ -11,6 +11,12 @@
  *                      re-fetch), integrity mismatch (quarantine + cooldown),
  *                      cooldown skip + expiry, offline fail-safe, disabled
  *                      knob, legacy-mode short-circuit, unsupported platform.
+ *   NODE BANDS       — the #3894 per-major artifact table: Node 20 downloads
+ *                      the JS-only 12.9.0 tarball PLUS its ABI-keyed prebuild
+ *                      and binds it through `nativeBinding`; a prebuild whose
+ *                      ABI does not match the running Node is refused before
+ *                      any download; a pinned prebuild-less artifact keeps the
+ *                      single-tarball lane and never touches the binary mirror.
  *   EXTRACTOR        — include filtering, required-file validation, path
  *                      traversal rejection, symlink rejection, non-gzip input.
  *   KNOB             — BILI_SQLITE_AUTO_DOWNLOAD > storage.sqliteAutoDownload
@@ -43,6 +49,7 @@ import {
 import {
     BOOTSTRAP_TIMEOUT_MS,
     ensureSqliteEngine,
+    extractPrebuildTgz,
     extractTgzToDir,
     nodeMajorSatisfiesFloor,
     nodeSqliteUpgradeHint,
@@ -52,6 +59,7 @@ import {
     setEngineBootstrapSpecForTests,
     setEngineMirrorsForTests,
     setPlatformKeyForTests,
+    setPrebuildMirrorsForTests,
     type BootstrapOutcome,
 } from "../src/storage/engine-bootstrap.ts";
 import { resolveSqliteAutoDownload } from "../src/knobs.ts";
@@ -206,6 +214,7 @@ function resetAllSeams(): void {
     clearSelfDownloadedEngineForTests();
     setEngineBootstrapSpecForTests(null);
     setEngineMirrorsForTests(null);
+    setPrebuildMirrorsForTests(null);
     setPlatformKeyForTests(null);
     setBootstrapTimeoutMsForTests(null);
     resetEngineBootstrapForTests();
@@ -1011,6 +1020,203 @@ test("bootstrap: at/above the artifact Node floor the gate does NOT fire (#3341 
         });
     } finally {
         await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Per-Node-major artifact table (#3894): a JS-only npm tarball (v12 and
+// earlier) ships no binding at all, so the bootstrap must ALSO fetch the
+// ABI-keyed prebuild and bind it through v12's `nativeBinding` option. Getting
+// this wrong is what the whole issue is about: registering a binding whose
+// floor/ABI does not match the running Node kills the process uncatchably.
+// ---------------------------------------------------------------------------
+
+/** Stub v12 lib: throws unless the loader injected a `nativeBinding` PATH —
+ *  the injection is the contract under test, and a path (not an addon object)
+ *  keeps `dlopen` inside the constructor v12 itself owns. */
+const FAKE_V12_LIB_INDEX = `const fs = require('node:fs');
+module.exports = class FakeBetterSqlite3V12 {
+    constructor(p, options) {
+        if (!options || typeof options.nativeBinding !== 'string') {
+            throw new Error('FAKE v12: nativeBinding path was not injected');
+        }
+        if (!fs.existsSync(options.nativeBinding)) {
+            throw new Error('FAKE v12: nativeBinding path does not exist: ' + options.nativeBinding);
+        }
+        this.bindingPath = options.nativeBinding;
+        this.p = p;
+        this.open = true;
+    }
+    exec() {}
+    prepare() { return { run: () => ({ changes: 1, lastInsertRowid: 1 }), get: () => ({ ok: true }), all: () => [] }; }
+    transaction(fn) { const w = () => fn(); w.immediate = w; w.deferred = w; w.exclusive = w; return w; }
+    pragma() {}
+    close() { this.open = false; }
+};`;
+
+/** JS-only npm tarball shape (v12): package.json + lib/, NO prebuilds/. */
+function fakeJsOnlyPackageTgz(): Buffer {
+    return buildTgz([
+        { name: "package/package.json", content: JSON.stringify({ name: "better-sqlite3", version: "12.9.0" }) },
+        { name: "package/lib/index.js", content: FAKE_V12_LIB_INDEX },
+        { name: "package/lib/database.js", content: "module.exports = require('./index.js');" },
+        { name: "package/deps/sqlite3.c", content: "int unused;" },
+    ]);
+}
+
+/** ABI-keyed prebuild shape: one `build/Release/better_sqlite3.node`. */
+function fakePrebuildTgz(): Buffer {
+    return buildTgz([{ name: "build/Release/better_sqlite3.node", content: Buffer.from("FAKE-ABI-NODE-BINARY") }]);
+}
+
+async function startMockBinaryMirror(body: Buffer, version: string, abi: string, target: string): Promise<MockRegistry> {
+    const expected = `/v${version}/better-sqlite3-v${version}-node-v${abi}-${target}.tar.gz`;
+    let count = 0;
+    const server = http.createServer((req, res) => {
+        count++;
+        if (req.url !== expected) {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address() as AddressInfo;
+    return {
+        base: `http://127.0.0.1:${addr.port}`,
+        requests: () => count,
+        close: () => new Promise<void>((r) => {
+            (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            server.close(() => r());
+        }),
+    };
+}
+
+test("extractor: ABI prebuild tarball lands at prebuilds/<target>.node", async () => {
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-extract-"));
+    try {
+        const target = platformTargetKey();
+        await extractPrebuildTgz(fakePrebuildTgz(), dest, target);
+        assert.ok(fs.existsSync(path.join(dest, "prebuilds", `${target}.node`)), "the binding is published where cacheUsable() and the v12 loader look");
+    } finally {
+        rmrf(dest);
+    }
+});
+
+test("extractor: an ABI prebuild tarball with no .node binding fails loud", async () => {
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-extract-"));
+    try {
+        const tgz = buildTgz([{ name: "build/Release/README.md", content: "no binding here" }]);
+        await assert.rejects(() => extractPrebuildTgz(tgz, dest, platformTargetKey()), /missing a \.node binding/);
+    } finally {
+        rmrf(dest);
+    }
+});
+
+test("bootstrap: a JS-only artifact downloads its ABI prebuild and binds it via nativeBinding (#3894)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    let binReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const target = platformTargetKey();
+        const abi = process.versions.modules;
+        const npmTgz = fakeJsOnlyPackageTgz();
+        const preTgz = fakePrebuildTgz();
+        setEngineBootstrapSpecForTests({
+            version: "12.9.0",
+            sha512Base64: sha512B64(npmTgz),
+            minNodeMajor: 20,
+            prebuild: { nodeAbi: abi, sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+        });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
+        binReg = await startMockBinaryMirror(preTgz, "12.9.0", abi, target);
+        setPrebuildMirrorsForTests([binReg.base]);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `the JS-only lane must install, got ${JSON.stringify(out)}`);
+            assert.equal(npmReg!.requests(), 1, "the npm tarball was fetched");
+            assert.equal(binReg!.requests(), 1, "the ABI prebuild was fetched from the binary mirror");
+            const cached = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-12.9.0");
+            assert.ok(fs.existsSync(path.join(cached, "prebuilds", `${target}.node`)), "the binding is cached next to the JS package");
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            assert.equal(o.source, "self-downloaded");
+            o.db.close();
+        });
+    } finally {
+        await npmReg?.close();
+        await binReg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: a prebuild whose ABI is not this Node is refused before any download (#3894)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    let binReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const target = platformTargetKey();
+        const npmTgz = fakeJsOnlyPackageTgz();
+        const preTgz = fakePrebuildTgz();
+        setEngineBootstrapSpecForTests({
+            version: "12.9.0",
+            sha512Base64: sha512B64(npmTgz),
+            minNodeMajor: 20,
+            prebuild: { nodeAbi: "999", sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+        });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
+        binReg = await startMockBinaryMirror(preTgz, "12.9.0", "999", target);
+        setPrebuildMirrorsForTests([binReg.base]);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node", `an ABI mismatch must be refused, got ${JSON.stringify(out)}`);
+            assert.match(out.detail ?? "", /no binding for Node ABI \d+/, "the detail names the ABI gap");
+            assert.equal(npmReg!.requests(), 0, "neither artifact may be downloaded");
+            assert.equal(binReg!.requests(), 0);
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-12.9.0")), "nothing materialized into the cache");
+            assert.throws(() => openSqliteDatabase(":memory:"), /no SQLite engine available/i, "no loader was registered");
+        });
+    } finally {
+        await npmReg?.close();
+        await binReg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: a self-contained artifact never touches the binary mirror (#3894 negative case)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    let binReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        npmReg = await startMockRegistry(tgz);
+        binReg = await startMockBinaryMirror(fakePrebuildTgz(), "13.0.3", process.versions.modules, platformTargetKey());
+        setPrebuildMirrorsForTests([binReg.base]);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `the single-tarball lane must keep working, got ${JSON.stringify(out)}`);
+            assert.equal(npmReg!.requests(), 1);
+            assert.equal(binReg!.requests(), 0, "a tarball that carries its own prebuilds must not hit the binary mirror");
+        });
+    } finally {
+        await npmReg?.close();
+        await binReg?.close();
         resetAllSeams();
         restoreCache(cachePrev);
         rmrf(cachePrev);

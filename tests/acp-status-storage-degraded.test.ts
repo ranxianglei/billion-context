@@ -112,18 +112,18 @@ test("#3385: healthy storage stays quiet — no degrade line", () => {
     }
 });
 
-test("#3894: below the artifact Node floor the degrade reason names the Node upgrade, not generic no-engine", () => {
+test("#3894: an unsupported Node surfaces the artifact-table reason, not generic no-engine", () => {
     // Unsupported-node refuses the engine BEFORE any load, so the sidecar open
-    // ALSO records a "no SQLite engine available" open-error. The floor reason
-    // must outrank that generic one — otherwise the user sees "better-sqlite3
-    // not installed" when the real cause is a too-old Node (#3894 dead-code fix).
+    // ALSO records a "no SQLite engine available" open-error. That reason must
+    // outrank the generic one — otherwise the user sees "better-sqlite3 not
+    // installed" when the real cause is the running Node (#3894 dead-code fix).
     const base = mkdtempSync(path.join(tmpdir(), "acp-status-3894-"));
     const snap = isolate(base);
     let store: SessionStore | null = null;
     try {
         setSqliteEnginesUnavailableForTests(true);
         _resetStorageRuntimeStatusForTest();
-        recordEngineBootstrap({ status: "unsupported-node", detail: "better-sqlite3@13.0.3 needs Node.js >= 22, this is 20.19.5" });
+        recordEngineBootstrap({ status: "unsupported-node", detail: "no pinned SQLite engine runs on Node.js 21.7.3 (ABI 120)" });
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
         _setStoreForTest(store);
 
@@ -131,8 +131,8 @@ test("#3894: below the artifact Node floor the degrade reason names the Node upg
         const text = out.text ?? "";
         assert.ok(text.includes("STORAGE —"), "the storage line is present");
         assert.ok(text.includes("⚠ degraded —"), `the degrade warning line is present (got: ${text.slice(-400)})`);
-        assert.ok(text.includes("requires a newer Node.js"), `the specific floor reason surfaces (got: ${text.slice(-400)})`);
-        assert.ok(/Node\.js >= 22/.test(text), "the reason carries the artifact's own Node floor");
+        assert.ok(text.includes("no self-downloaded SQLite engine supports this Node.js"), `the specific reason surfaces (got: ${text.slice(-400)})`);
+        assert.ok(/Node\.js 21\.7\.3/.test(text), "the reason carries the runtime the table could not serve");
     } finally {
         store?.closeQuietly();
         _setStoreForTest(null as unknown as SessionStore);
