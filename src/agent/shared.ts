@@ -367,6 +367,21 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
     if (!ok) throw new Error(`attribution report failed (${status})`);
 }
 
+type UnroutedEndpointsReport = { agent: string; paths: string[] };
+
+/** #3714: custom-wire visibility — the host reports model-shaped URLs its fetch
+ *  gate sent DIRECT (never reaching the proxy), so the server-side stat stays
+ *  blind to them. Fire-and-forget on first sighting of each distinct endpoint;
+ *  a missed report delays visibility, never touches the request path. */
+export async function reportUnroutedEndpoints(proxyBase: string, report: UnroutedEndpointsReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/unrouted`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(report),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`unrouted report failed (${status})`);
+}
+
 /** #2204: business outcome of a forwarded tool call. ok:true means the tool
  *  RAN; whether it achieved its effect rides the endpoint's machine-readable
  *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host

@@ -26,6 +26,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./s
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
+import { recordUnroutedReport, unroutedPathsUnion } from "./server/unrouted-status.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -661,6 +662,55 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
+}
+
+// #3714: a host plugin reports model-shaped URLs its fetch gate did not recognize
+// (sent DIRECT, never reaching this proxy). Inputs are bounded so a pathological
+// host cannot grow memory or bloat the status wire; latest report wins per agent.
+const UNROUTED_PATH_MAX = 512;
+const UNROUTED_PATH_CAP = 256;
+
+export function handlePluginUnrouted(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { agent?: unknown; paths?: unknown };
+    const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
+    const agent = str(body.agent, 64);
+    if (agent === undefined || !Array.isArray(body.paths)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "agent and paths[] are required" }));
+        return;
+    }
+    const cleaned: string[] = [];
+    for (const p of body.paths) {
+        if (typeof p !== "string") continue;
+        const v = p.trim();
+        if (v.length === 0 || v.length > UNROUTED_PATH_MAX || cleaned.includes(v)) continue;
+        cleaned.push(v);
+        if (cleaned.length >= UNROUTED_PATH_CAP) break;
+    }
+    recordUnroutedReport(agent, cleaned);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
+// #3714: when the instance has host-reported direct-through-unrecognized
+// endpoints, an unknown-conversation 404 (no model request ever arrived) is very
+// likely THAT cause — name the endpoints instead of leaving the reply generic.
+// Instance-level evidence: it says what this instance observed, not a per-id claim.
+const UNROUTED_NOTE_MAX = 8;
+function directThroughUnroutedNote(): string {
+    const paths = unroutedPathsUnion();
+    if (paths.length === 0) return "";
+    const shown = paths.slice(0, UNROUTED_NOTE_MAX).join(", ");
+    const more = paths.length > UNROUTED_NOTE_MAX ? ` (+${paths.length - UNROUTED_NOTE_MAX} more)` : "";
+    return ` NOTE: on this instance, model traffic was observed going DIRECT (uncompressed) through unrecognized endpoint(s) — ${shown}${more} — which bypass the proxy entirely, so this conversation has no compressible history here. To compress such an endpoint, declare it via modelEndpointPatterns (#1295)`;
 }
 
 const MAX_PENDING_REGISTERS = 64;
@@ -1903,7 +1953,7 @@ export async function handlePluginTool(
         res.end(JSON.stringify({
             ok: false,
             error: !entry
-                ? "unknown plugin conversation (no model request has arrived with this conversation id yet — if your messages ARE still reaching the model, its LLM transport may be bypassing this proxy's fetch interception (SDK-injected fetch / non-global dispatcher), the host's attribution may have left this traffic unclaimed by the proxy, or the id may be stale after a host resume; check bili.log for processTurn lines)"
+                ? `unknown plugin conversation (no model request has arrived with this conversation id yet — if your messages ARE still reaching the model, its LLM transport may be bypassing this proxy's fetch interception (SDK-injected fetch / non-global dispatcher), the host's attribution may have left this traffic unclaimed by the proxy, or the id may be stale after a host resume; check bili.log for processTurn lines)${directThroughUnroutedNote()}`
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;

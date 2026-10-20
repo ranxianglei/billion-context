@@ -793,6 +793,31 @@ export const WEB_CLIENT = `(function () {
                 attEl.innerHTML = "";
             }
         }
+        // #3714: direct-through-unrecognized-endpoint notice. Unlike the takeover
+        // banner above it is NOT gated on live===0: other channels may be compressing
+        // fine (live sessions) while these specific endpoints still go direct.
+        const urEl = $("unrouted-banner");
+        if (urEl) {
+            const ur = d.unrouted;
+            const flat = [];
+            if (ur && typeof ur === "object") {
+                for (const list of Object.values(ur)) {
+                    if (Array.isArray(list)) for (const p of list) if (typeof p === "string" && p.length > 0) flat.push(p);
+                }
+            }
+            const uniq = [...new Set(flat)];
+            const shown = uniq.slice(0, 3);
+            const more = uniq.length > 3 ? " (+more)" : "";
+            if (shown.length > 0) {
+                urEl.hidden = false;
+                urEl.classList.add("show");
+                urEl.innerHTML = "<strong>" + escapeHtml(t("sys.unrouted_direct", { list: shown.join(", ") + more })) + "</strong>";
+            } else {
+                urEl.hidden = true;
+                urEl.classList.remove("show");
+                urEl.innerHTML = "";
+            }
+        }
         const sb = $("storage-degraded-banner");
         if (sb) {
             const sg = d.storage;

@@ -53,7 +53,7 @@ import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, reportUnroutedEndpoints, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
 import { detectCompactionOverlayGap, registerCompactionDisable } from "./dsh-compaction-disable.js";
@@ -1728,6 +1728,13 @@ export function apply(ctx: PluginContext): void {
         unroutedEndpoints.add(key);
         const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
         persistClientEvent(line);
+        // #3714: the log above is host-side only — GUI hosts swallow stderr. Report
+        // the accumulated set to the proxy so acp_status + the panel can NAME these
+        // endpoints instead of leaving the user to dig through logs.
+        const base = register.base;
+        if (base !== undefined) {
+            void reportUnroutedEndpoints(base, { agent: name, paths: [...unroutedEndpoints] }).catch(() => undefined);
+        }
     };
 
     // #1884 re-sign arm: bind the host's credential service (dynamic inject —
