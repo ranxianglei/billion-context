@@ -44,6 +44,7 @@ import {
     BOOTSTRAP_TIMEOUT_MS,
     ensureSqliteEngine,
     extractTgzToDir,
+    nodeMajorSatisfiesFloor,
     nodeSqliteUpgradeHint,
     platformTargetKey,
     resetEngineBootstrapForTests,
@@ -331,7 +332,7 @@ test("bootstrap: happy path downloads, verifies sha, extracts, registers loader;
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -377,7 +378,7 @@ test("#3818 unloadable cached copy is removed and a pinned download is retried (
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -416,7 +417,7 @@ test("bootstrap: sha512 mismatch quarantines the download and arms the cooldown"
         const good = fakePackageTgz();
         const tampered = Buffer.from(good);
         tampered[tampered.length - 1] ^= 0xff;
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(good) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(good), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tampered);
         await withRegistry(reg.base, async () => {
@@ -448,7 +449,7 @@ test("bootstrap: expired cooldown re-attempts the download", async () => {
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         const sqliteDir = path.join(cachePrev, "billion-context", "sqlite");
         fs.mkdirSync(sqliteDir, { recursive: true });
@@ -473,7 +474,7 @@ test("bootstrap: stale unusable cache dir is replaced instead of looping the coo
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         // Partial/corrupt publish from a killed run: dir exists but lacks the
         // target prebuilt, so cacheUsable() is false and rename-over would ENOTEMPTY.
@@ -506,7 +507,7 @@ test("bootstrap: a download that outlasts its timeout budget aborts fail-safe an
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         const delayMs = 800;
         setBootstrapTimeoutMsForTests(Math.floor(delayMs / 5));
@@ -532,7 +533,7 @@ test("bootstrap: a slow-but-completing download succeeds once the budget covers 
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         const delayMs = 400;
         setBootstrapTimeoutMsForTests(delayMs * 10);
@@ -554,7 +555,7 @@ test("bootstrap: offline (connection refused) degrades fail-safe with cooldown, 
     const cachePrev = isolateCache();
     try {
         resetAllSeams();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: "irrelevant" });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: "irrelevant", minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         await withRegistry("http://127.0.0.1:1", async () => {
             const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
@@ -576,7 +577,7 @@ test("bootstrap: disabled knob gates the fetch (cached copies would still be use
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -598,7 +599,7 @@ test("bootstrap: legacy mode short-circuits before any probe or fetch", async ()
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -623,7 +624,7 @@ test("bootstrap: builtin present -> not-needed without touching the network", as
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: true, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -646,7 +647,7 @@ test("bootstrap: host-provided engine -> not-needed without touching the network
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: true });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -669,7 +670,7 @@ test("bootstrap: unsupported platform key -> no download attempt", async () => {
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         setPlatformKeyForTests("freebsd-arm64");
         reg = await startMockRegistry(tgz);
@@ -693,7 +694,7 @@ test("bootstrap: concurrent callers share one attempt (process-dedup)", async ()
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
@@ -821,7 +822,7 @@ test("mirror fallback: a failing first mirror falls to the next and the bootstra
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         bad = await startMockRegistry(tgz, 500); // registry up, tarball broken at the HTTP layer
         good = await startMockRegistry(tgz);
@@ -847,7 +848,7 @@ test("mirror exhaustion: the cooldown reason lists every mirror attempted (#3338
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         bad1 = await startMockRegistry(tgz, 500);
         bad2 = await startMockRegistry(tgz, 503);
@@ -875,7 +876,7 @@ test("mirror list: a configured registry is attempted before the builtins (#3338
     try {
         resetAllSeams();
         const tgz = fakePackageTgz();
-        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         // Deliberately NO mirrors override: the production list must put the
@@ -912,4 +913,106 @@ test("nodeSqliteUpgradeHint: pins the Node >= 22.5 threshold and the levers (#33
     assert.match(nodeSqliteUpgradeHint("22.4.9"), /Node\.js >= 22\.5/, "22.4.x predates node:sqlite");
     assert.match(nodeSqliteUpgradeHint("19.9.9"), /Node\.js >= 22\.5/, "19.x predates node:sqlite");
     assert.equal(nodeSqliteUpgradeHint("22.5.1"), "", "22.5.1 ships node:sqlite — no hint");
+});
+
+// ---------------------------------------------------------------------------
+// Artifact Node floor (#3341): better-sqlite3 v13 declares `engines: node >= 22`
+// and faults the process on Node 20 instead of failing cleanly, so the pinned
+// spec carries that floor and the bootstrap refuses BOTH the download and the
+// cached-copy registration below it.
+// ---------------------------------------------------------------------------
+
+test("nodeMajorSatisfiesFloor: both directions of the artifact floor (#3341)", () => {
+    assert.equal(nodeMajorSatisfiesFloor(22, "20.19.5"), false, "Node 20 is below the v13 floor");
+    assert.equal(nodeMajorSatisfiesFloor(22, "18.20.8"), false, "Node 18 is below the v13 floor");
+    assert.equal(nodeMajorSatisfiesFloor(22, "22.0.0"), true, "Node 22 satisfies the floor");
+    assert.equal(nodeMajorSatisfiesFloor(22, "22.4.9"), true, "the floor is a MAJOR floor - 22.x minors all pass");
+    assert.equal(nodeMajorSatisfiesFloor(22, "24.11.0"), true, "Node 24 satisfies the floor");
+    assert.equal(nodeMajorSatisfiesFloor(20, "20.19.5"), true, "the predicate tracks the floor it is given, not a hardcoded 22");
+    assert.equal(nodeMajorSatisfiesFloor(22, "garbage"), true, "an unparseable runtime must not brick unified storage");
+});
+
+test("bootstrap: below the artifact Node floor -> unsupported-node, no download, no cache registration (#3341)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        // minNodeMajor above ANY Node that could run this suite: the gate must
+        // fire regardless of which runtime CI uses (ubuntu/windows x 22/24).
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 99 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node", `expected the floor gate, got ${JSON.stringify(out)}`);
+            assert.match(out.detail ?? "", /better-sqlite3@13\.0\.3 needs Node\.js >= 99/, "the detail names the artifact and its floor");
+            assert.equal(reg!.requests(), 0, "below the floor the ~11 MB download must never start");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3")), "nothing materialized into the cache");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "a too-old Node is not a download failure - no cooldown armed");
+            assert.throws(() => openSqliteDatabase(":memory:"), /no SQLite engine available/i, "no loader was registered");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: a cache that already exists is left in place (and unregistered) below the floor (#3341)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 99 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        const target = platformTargetKey();
+        const cached = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+        fs.mkdirSync(path.join(cached, "lib"), { recursive: true });
+        fs.mkdirSync(path.join(cached, "prebuilds"), { recursive: true });
+        fs.writeFileSync(path.join(cached, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+        fs.writeFileSync(path.join(cached, "lib", "index.js"), FAKE_LIB_INDEX);
+        fs.writeFileSync(path.join(cached, "prebuilds", `${target}.node`), Buffer.from("FAKE-NODE-BINARY"));
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node", `expected the floor gate, got ${JSON.stringify(out)}`);
+            assert.equal(reg!.requests(), 0, "a cache hit below the floor must not trigger a re-download either");
+            assert.ok(fs.existsSync(path.join(cached, "prebuilds", `${target}.node`)), "the cached copy must survive: a Node upgrade makes it valid again");
+            assert.throws(() => openSqliteDatabase(":memory:"), /no SQLite engine available/i, "a cache below the floor must never be registered");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: at/above the artifact Node floor the gate does NOT fire (#3341 negative case)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 20 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `a satisfied floor must not block the bootstrap, got ${JSON.stringify(out)}`);
+            assert.equal(reg!.requests(), 1, "the download proceeded");
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            assert.equal(o.source, "self-downloaded");
+            o.db.close();
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
 });

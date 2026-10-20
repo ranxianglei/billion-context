@@ -14,8 +14,16 @@
  *
  * Artifact: better-sqlite3 v13 ships N-API prebuilds for all eight
  * platform/arch combinations INSIDE its npm tarball (no install script, no
- * per-ABI split — N-API is ABI-stable across Node versions). We pin version +
- * sha512 in-repo; bumping either is a human-visible PR. Download egress honors
+ * per-ABI split). N-API is ABI-stable across Node versions, but ABI stability
+ * is NOT a support guarantee: v13 declares `engines: node >= 22`, and loading
+ * its binding outside that range is undefined behavior rather than a clean
+ * failure — on Node 20 the win32-x64 prebuild faults inside `process.dlopen`
+ * (access violation, uncatchable) and the linux-x64 one faults on the first
+ * `new Database()` (#3341). So the pin carries the artifact's OWN Node floor
+ * next to version + sha512, and the floor gates BOTH the download and the
+ * cached-copy registration: a copy that cannot legally load must never be
+ * registered. We pin version + sha512 + floor in-repo; bumping any of the
+ * three is a human-visible PR. Download egress honors
  * the same proxy decision chain as model traffic (#609) and the configured
  * registry mirror (BILI_UPDATE_REGISTRY / update.registry).
  *
@@ -43,12 +51,15 @@ interface EngineBootstrapSpec {
     version: string;
     /** sha512 base64 digest of the registry tarball — pinned in-repo, verified on every download. */
     sha512Base64: string;
+    /** Node major floor copied from the artifact's own `engines.node`; below it the binding is undefined behavior (process crash), not a graceful failure. */
+    minNodeMajor: number;
 }
 
-/** Pinned engine artifact (#2833). Bump version AND digest together in one PR. */
+/** Pinned engine artifact (#2833). Bump version, digest AND the Node floor together in one PR. */
 const DEFAULT_ENGINE_SPEC: Readonly<EngineBootstrapSpec> = Object.freeze({
     version: "13.0.3",
     sha512Base64: "RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
+    minNodeMajor: 22,
 });
 
 const SUPPORTED_TARGETS = [
@@ -71,6 +82,7 @@ type BootstrapStatus =
     | "downloaded"
     | "disabled"
     | "unsupported-platform"
+    | "unsupported-node"
     | "cooldown"
     | "failed";
 
@@ -107,6 +119,18 @@ export function setBootstrapTimeoutMsForTests(ms: number | null): void {
 
 function activeSpec(): EngineBootstrapSpec {
     return specOverride ?? DEFAULT_ENGINE_SPEC;
+}
+
+/**
+ * Pure floor predicate (version in -> verdict out) so tests pin the threshold
+ * boundary without depending on the Node running them. An unparseable major
+ * counts as satisfied: `process.versions.node` is semver by contract, and
+ * bricking unified storage on an exotic runtime would be the worse failure.
+ */
+export function nodeMajorSatisfiesFloor(minNodeMajor: number, nodeVersion: string = process.versions.node): boolean {
+    const major = Number.parseInt(nodeVersion.split(".")[0] ?? "", 10);
+    if (!Number.isFinite(major)) return true;
+    return major >= minNodeMajor;
 }
 
 /** Platform key matching better-sqlite3's own binding.js musl detection. */
@@ -223,6 +247,11 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
         return { status: "not-needed", detail: "host-provided better-sqlite3 available" };
     }
     const spec = activeSpec();
+    if (!nodeMajorSatisfiesFloor(spec.minNodeMajor)) {
+        const detail = `better-sqlite3@${spec.version} needs Node.js >= ${spec.minNodeMajor}, this is ${process.versions.node}`;
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; a self-downloaded engine would crash this process on load, staying on legacy storage (upgrade Node.js to ${spec.minNodeMajor}+ for unified storage)`);
+        return { status: "unsupported-node", detail };
+    }
     const target = platformOverride ?? platformTargetKey();
     if (cacheUsable(finalDir(spec.version), target)) {
         if (!tryRegisterFromCache(finalDir(spec.version))) {
