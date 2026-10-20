@@ -1,3 +1,4 @@
+import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
@@ -689,7 +690,7 @@ export async function forward(
     // thrown detail carries the actionable state (last failure + next probe)
     // that the dispatch catch renders into the 502 body.
     const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
-    if (circuitBlock !== undefined) {
+    if (circuitBlock !== undefined && !isCodexCatalogRequest(upstreamUrl, init)) {
         log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
@@ -706,9 +707,9 @@ export async function forward(
     let firstAttemptClear: (() => void) | undefined;
     try {
         const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
-        const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+        const fetchPromise = fetchWithCodexCatalogCache(signal => fetchWithTransportRetry(upstreamUrl, init, undefined, signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
-        });
+        }), upstreamUrl, init, clientAbort.signal, log);
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
         try {
             upstreamResult = await fetchPromise;
@@ -716,10 +717,12 @@ export async function forward(
         } finally {
             clearTimeout(firstByteTimer);
         }
-        recordUpstreamConnection(upstreamUrl, proxyUrl);
-        // #1682: any resolved response proves the host is reachable again.
-        clearUpstreamAlertsForHost(upstreamUrl);
-        recordUpstreamCircuitSuccess(upstreamUrl);
+        if (!(isCodexCatalogRequest(upstreamUrl, init) && upstreamResult.response.headers.get("x-bili-model-catalog") === "offline-cache")) {
+            recordUpstreamConnection(upstreamUrl, proxyUrl);
+            // #1682: a network response proves reachability; an offline replay does not.
+            clearUpstreamAlertsForHost(upstreamUrl);
+            recordUpstreamCircuitSuccess(upstreamUrl);
+        }
     } catch (error) {
         const oversize = extractWsOversizeError(error);
         if (oversize === undefined) {

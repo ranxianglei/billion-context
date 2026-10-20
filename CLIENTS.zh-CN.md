@@ -112,6 +112,8 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 ## Codex(OpenAI Codex CLI)
 
+**模型目录临时断网（#3993）。** 经 Bili 转发的带认证 `GET https://chatgpt.com/backend-api/codex/models` 请求，在网络故障或 HTTP 500/502/503/504 时可使用最近一次完整有效的目录，避免临时发现失败导致 Codex 丢失已知窗口和工具能力。私有缓存位于既有 XDG 缓存目录的 `codex-model-catalog-v1` 子目录，按完整 URL/客户端版本以及认证、账号、组织、项目的指纹隔离，不保存原始凭证；每份最多 1 MiB、最多 16 份、最长六小时。在线发现优先，离线命中不会延长有效期；有可用缓存时，网络及响应体等待上限为四秒。客户端取消、401/403、其他明确错误和无效/空目录不会转成缓存成功。冷缓存、过期或凭证变化仍需要在线发现成功。离线返回不清除上游熔断，也不代表模型推理端点可达。不修改推理载荷、压缩模式或已配置上下文上限。
+
 **窗口对齐。** 客户端 plugin/runtime 上报及启动器传递的窗口优先于发布时的 Codex 模型表。没有上报时，本机代理只读其 `CODEX_HOME`（默认 `~/.codex`）下的 `models_cache.json` 和基础 `config.toml`，将 `model_context_window` 限制在匹配模型的 `max_context_window` 内，再应用 `effective_context_window_percent`（Codex 默认 95）；后续请求会跟随缓存更新。元数据缺失、不可读或无效时，保留内置表及未知模型 272K 的既有回退。远程代理或其他客户端 profile 应通过现有启动器/runtime 机制传递实际窗口，或设置既有的 `compress.modelContextLimit`；代理本机缓存不能证明另一台机器的配置。输出预留仍正常生效。
 
 Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:

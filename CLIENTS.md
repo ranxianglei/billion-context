@@ -426,6 +426,8 @@ two small node scripts that do the work around the client:
 
 ## Codex (OpenAI Codex CLI)
 
+**Temporary catalog outages (#3993).** For authenticated `GET https://chatgpt.com/backend-api/codex/models` requests routed through Bili, a last-valid complete catalog can cover transport failures and HTTP 500/502/503/504. This prevents transient discovery failure from discarding Codex's known context/tool capabilities. The private cache is under the existing XDG cache directory (`codex-model-catalog-v1`); it is isolated by full URL/client version and credential/account/org/project fingerprints, contains no raw credentials, and is limited to 1 MiB per catalog, 16 entries and six hours. Online discovery always takes precedence; offline hits do not extend age. With a usable cache the network/body deadline is four seconds. Caller cancellation, 401/403, other explicit errors and invalid/empty catalogs do not become cached success. Cold, expired or changed-credential requests still need successful discovery. Offline replay does not clear the upstream circuit or prove inference reachability. No inference payload, compression mode or configured context limit is changed.
+
 **Window alignment.** Client-reported plugin/runtime windows and launcher windows
 take precedence over the bundled Codex model table. Without a report, a local
 proxy reads `models_cache.json` and the base `config.toml` under its `CODEX_HOME`
