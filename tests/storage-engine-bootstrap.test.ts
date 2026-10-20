@@ -1222,3 +1222,49 @@ test("bootstrap: a self-contained artifact never touches the binary mirror (#389
         rmrf(cachePrev);
     }
 });
+
+test("bootstrap: pinned sibling cache dirs survive the prune; unpinned ones are still removed (#3894)", async () => {
+    const cachePrev = isolateCache();
+    let npmReg: MockRegistry | null = null;
+    let binReg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const target = platformTargetKey();
+        const abi = process.versions.modules;
+        const npmTgz = fakeJsOnlyPackageTgz();
+        const preTgz = fakePrebuildTgz();
+        setEngineBootstrapSpecForTests({
+            version: "12.9.0",
+            sha512Base64: sha512B64(npmTgz),
+            minNodeMajor: 20,
+            prebuild: { nodeAbi: abi, sha512Base64ByTarget: { [target]: sha512B64(preTgz) } },
+        });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        // Pre-existing siblings before this download publishes: the OTHER pinned
+        // version's dir must survive the post-publish prune (switching Node
+        // majors must not force a re-download), an unpinned legacy version must
+        // still be cleaned up.
+        const pinnedSibling = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+        const staleSibling = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-9.9.9");
+        fs.mkdirSync(path.join(pinnedSibling, "lib"), { recursive: true });
+        fs.writeFileSync(path.join(pinnedSibling, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+        fs.writeFileSync(path.join(pinnedSibling, "lib", "index.js"), FAKE_LIB_INDEX);
+        fs.mkdirSync(staleSibling, { recursive: true });
+        fs.writeFileSync(path.join(staleSibling, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "9.9.9" }));
+        npmReg = await startMockRegistry(npmTgz, 200, "12.9.0");
+        binReg = await startMockBinaryMirror(preTgz, "12.9.0", abi, target);
+        setPrebuildMirrorsForTests([binReg.base]);
+        await withRegistry(npmReg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `the JS-only lane must install, got ${JSON.stringify(out)}`);
+            assert.ok(fs.existsSync(path.join(pinnedSibling, "package.json")), "the other pinned version's cache dir survives the prune");
+            assert.ok(!fs.existsSync(staleSibling), "an unpinned legacy version is still pruned");
+        });
+    } finally {
+        await npmReg?.close();
+        await binReg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
