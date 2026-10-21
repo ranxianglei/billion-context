@@ -14,7 +14,10 @@
 //   1. CAPTURE (always on, unified sidecar permitting): every create/continue
 //      is mirrored into the unified store (`session_ext` keys
 //      `threads:mirror:*`) — create replaces the mirror (it is the client's
-//      authoritative snapshot), continue appends its delta. Storage is
+//      authoritative snapshot), continue appends its delta — and every model
+//      reply is appended from the forwarded response stream (#3744: the
+//      thread holds state server-side that the client never re-sends, so
+//      without it the mirror is blind to half the conversation). Storage is
 //      append-only chunks under the 4 MiB per-value cap.
 //   2. BUDGET: the mirror estimate (shape tokens + post-fold entries +
 //      folded summary) against the configured window. The wire itself is
@@ -105,6 +108,34 @@ const TRANSCRIPT_BYTE_CAP = 400_000;
  *  re-uploading its transcript on every continue: the next attempt lands
  *  after this window instead (#3569). */
 const SUMMARY_RETRY_COOLDOWN_MS = 10 * 60_000;
+/** #3744: headers excluded from the side-call passthrough. Everything else
+ *  the client sent rides along verbatim — under subscription OAuth the
+ *  upstream only accepts the summarizer request when it looks like the
+ *  client's own traffic (full header set, original system prefix intact). */
+const SIDE_CALL_STRIP_HEADERS = new Set([
+    // hop-by-hop / framing — meaningless or harmful on a fresh connection
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    // per-target / per-body — must describe THIS call, not the client's
+    "host", "content-length", "accept-encoding", "expect",
+]);
+/** One-shot per-request ids — replaying them on a different request got the
+ *  side-call 429'd under subscription OAuth even with full header passthrough
+ *  (#3744, variant A → B). */
+const SIDE_CALL_ONE_SHOT_HEADERS = new Set([
+    "x-client-request-id", "anthropic-dispatch-id", "x-claude-code-prompt-id",
+]);
+/** Non-streaming replies are buffered whole for the mirror, capped so a
+ *  runaway body cannot turn the observer into a media store. */
+const JSON_CAPTURE_BYTE_CAP = 8_000_000;
+/** A completed reply whose blocks were all un-replayable (thinking /
+ *  redacted_thinking only, or an abort mid-thinking) still occupies an
+ *  assistant slot in the server-side thread. The mirror records it as this
+ *  self-describing block so every later reforged create satisfies the
+ *  system-placement rule (a mid-conversation `system` must be followed by an
+ *  `assistant` message or end the array) instead of 400-ing on a permanent
+ *  ordering gap (#3744 review of #3746). */
+const EMPTY_REPLY_PLACEHOLDER = { type: "text", text: "[threads-lane] model reply carried no replayable content (thinking-only or aborted)" };
 
 const SUMMARIZER_SYSTEM = [
     "You are compressing an older slice of a coding-agent conversation so it can be replaced by your summary.",
@@ -127,6 +158,8 @@ let mirrorStore: SessionStore | undefined;
 const warnedSessions = new Set<string>();
 /** sessionId → epoch-ms until which the summary side-call is suppressed. */
 const reforgeCooldownUntil = new Map<string, number>();
+/** In-flight reply captures (the observer runs async on a tee'd branch). */
+const pendingCaptures = new Set<Promise<void>>();
 
 function laneStore(): SessionStore {
     if (!mirrorStore) mirrorStore = new SessionStore({ enabled: true });
@@ -138,6 +171,13 @@ export function __resetThreadsLaneForTests(): void {
     mirrorStore = undefined;
     warnedSessions.clear();
     reforgeCooldownUntil.clear();
+    pendingCaptures.clear();
+}
+
+/** Test seam: resolve when every in-flight reply capture has persisted (or
+ *  given up), so mirror reads are deterministic. */
+export function __awaitThreadsCapturesForTests(): Promise<void> {
+    return Promise.allSettled([...pendingCaptures]).then(() => undefined);
 }
 
 export function isThreadsBody(parsed: unknown): boolean {
@@ -264,6 +304,150 @@ export function captureThreadsTurn(
     return { available: true, meta, entries };
 }
 
+interface AssistantBlockAcc {
+    type?: string;
+    text?: string;
+    id?: string;
+    name?: string;
+    json?: string;
+}
+
+/** Reassemble the model's reply for one threads turn from the forwarded
+ *  response and append it to the mirror. The thread itself holds state
+ *  server-side that the client NEVER re-sends (continues carry only deltas),
+ *  so without this the mirror is blind to every assistant turn: budgets
+ *  undercount, summaries lose half the conversation, and tail rings end in
+ *  `user system user system …` shapes a fresh create rejects with a
+ *  placement 400 (#3744). Runs on a tee'd branch of the client-bound stream;
+ *  fail-open — any error skips the append, never breaks the turn. */
+export function observeThreadsAssistantReply(
+    sessionId: string,
+    body: ReadableStream<Uint8Array>,
+    sse: boolean,
+    signal: AbortSignal,
+    log: (level: string, msg: string) => void,
+): void {
+    const capture: Promise<void> = (async () => {
+        try {
+            const reader = body.getReader();
+            const decoder = new TextDecoder();
+            let buf = "";
+            const accs = new Map<number, AssistantBlockAcc>();
+            let sawEvent = false;
+            let jsonBytes = 0;
+            const processFrame = (frame: string): void => {
+                const datas: string[] = [];
+                for (const line of frame.split("\n")) {
+                    if (line.startsWith("data:")) datas.push(line.slice(5).trimStart());
+                }
+                if (datas.length === 0) return;
+                let ev: Record<string, unknown>;
+                try { ev = JSON.parse(datas.join("\n")) as Record<string, unknown>; } catch { return; }
+                sawEvent = true;
+                const type = typeof ev.type === "string" ? ev.type : "";
+                const index = typeof ev.index === "number" ? ev.index : -1;
+                if (type === "content_block_start") {
+                    const cb = (ev.content_block ?? {}) as Record<string, unknown>;
+                    accs.set(index, {
+                        type: typeof cb.type === "string" ? cb.type : undefined,
+                        ...(typeof cb.text === "string" ? { text: cb.text } : {}),
+                        ...(typeof cb.id === "string" ? { id: cb.id } : {}),
+                        ...(typeof cb.name === "string" ? { name: cb.name } : {}),
+                    });
+                } else if (type === "content_block_delta" && index >= 0) {
+                    const acc = accs.get(index);
+                    if (!acc) return;
+                    const delta = (ev.delta ?? {}) as Record<string, unknown>;
+                    if (delta.type === "text_delta" && typeof delta.text === "string") {
+                        acc.text = (acc.text ?? "") + delta.text;
+                    } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+                        acc.json = (acc.json ?? "") + delta.partial_json;
+                    }
+                }
+            };
+            try {
+                while (!signal.aborted) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value, { stream: true });
+                    if (sse) {
+                        buf += chunk.replace(/\r\n/g, "\n");
+                        let sep: number;
+                        while ((sep = buf.indexOf("\n\n")) !== -1) {
+                            processFrame(buf.slice(0, sep));
+                            buf = buf.slice(sep + 2);
+                        }
+                        if (buf.length > 1_000_000) buf = ""; // undelimited runaway frame — drop the fragment
+                    } else {
+                        jsonBytes += Buffer.byteLength(chunk, "utf8");
+                        if (jsonBytes <= JSON_CAPTURE_BYTE_CAP) buf += chunk;
+                    }
+                }
+            } finally {
+                try { await reader.cancel(); } catch { /* already closed/released */ }
+            }
+            buf += decoder.decode(); // flush a trailing multi-byte character split across the final chunk
+            let content: unknown[] | null;
+            if (sse) {
+                content = [];
+                for (const acc of accs.values()) {
+                    // thinking/redacted_thinking are signature-verified scratch
+                    // (#1960 family) and other block types are not replay-safe —
+                    // only text/tool_use enter the mirror.
+                    if (acc.type === "text") {
+                        content.push({ type: "text", text: acc.text ?? "" });
+                    } else if (acc.type === "tool_use") {
+                        let input: unknown = {};
+                        if (acc.json) { try { input = JSON.parse(acc.json); } catch { input = {}; } }
+                        content.push({ type: "tool_use", id: acc.id ?? "", name: acc.name ?? "", input });
+                    }
+                }
+                // sawEvent distinguishes "the reply existed but nothing
+                // replayable survived the filter" (placeholder — see
+                // EMPTY_REPLY_PLACEHOLDER) from "we observed nothing at all"
+                // (honest skip: an abort before the first event proves no
+                // reply bytes reached us).
+                if (!sawEvent) {
+                    content = null;
+                } else if (content.length === 0) {
+                    content = [EMPTY_REPLY_PLACEHOLDER];
+                }
+            } else {
+                try {
+                    const json = JSON.parse(buf) as { content?: unknown };
+                    if (!Array.isArray(json.content)) {
+                        content = null; // not a well-formed reply body — record nothing
+                    } else {
+                        content = json.content.filter((b) => {
+                            if (typeof b !== "object" || b === null) return false;
+                            const t = (b as { type?: unknown }).type;
+                            return t === "text" || t === "tool_use";
+                        }) as unknown[];
+                        if (content.length === 0) content = [EMPTY_REPLY_PLACEHOLDER];
+                    }
+                } catch {
+                    content = null;
+                }
+            }
+            if (content === null) return;
+            const entry: ThreadsMirrorEntry = { role: "assistant", content };
+            const sized = serializeEntry(entry);
+            const pushEntry: ThreadsMirrorEntry = sized.ok
+                ? sized.value
+                : { role: "assistant", content: `[threads-lane] oversized assistant reply elided from the mirror (${sized.bytes} bytes)` };
+            const store = laneStore();
+            const mirror = loadMirror(store, sessionId);
+            if (!mirror.available) return;
+            const entries = [...mirror.entries, pushEntry];
+            persistMirror(store, sessionId, { ...mirror.meta, count: entries.length }, entries, log);
+        } catch {
+            // fail-open: mirroring must never break the turn (#2926 posture)
+        }
+    })();
+    pendingCaptures.add(capture);
+    void capture.finally(() => pendingCaptures.delete(capture));
+}
+
 /** Mirror estimate: shape + folded summary + post-fold entries. The wire
  *  body is useless here (a continue is always small) — this is the lane's
  *  only budget truth. */
@@ -336,14 +520,38 @@ function renderTranscript(entries: ThreadsMirrorEntry[]): string {
     return parts.join("\n\n");
 }
 
+/** The captured client system when usable as-is (non-empty string or block
+ *  array) — otherwise undefined and the caller falls back to the hand-built
+ *  billing/summarizer system. */
+function capturedSystemVerbatim(system: unknown): unknown {
+    if (typeof system === "string") return system.trim() !== "" ? system : undefined;
+    if (Array.isArray(system)) return system.length > 0 ? system : undefined;
+    return undefined;
+}
+
 function buildSummaryRequestBody(shape: ThreadsMirrorShape | undefined, model: string | undefined, meta: ThreadsMirrorMeta, entries: ThreadsMirrorEntry[], cut: number, billingBlock: { type: "text"; text: string } | undefined): Record<string, unknown> {
+    const transcript = renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut));
+    const verbatim = capturedSystemVerbatim(shape?.system);
+    if (verbatim !== undefined) {
+        // #3744 variant B (proven against subscription OAuth): the client's
+        // original system rides untouched — billing attribution, host identity
+        // and cache-control anchors all intact — and the summarizer
+        // instructions join the USER message instead of the system slot.
+        return {
+            model: model ?? shape?.model ?? "claude-sonnet-4-5",
+            max_tokens: SUMMARY_MAX_TOKENS,
+            stream: false,
+            system: verbatim,
+            messages: [{ role: "user", content: `${transcript}\n\n---\n\n${SUMMARIZER_SYSTEM}` }],
+        };
+    }
     const system: unknown[] = billingBlock !== undefined ? [billingBlock, { type: "text", text: SUMMARIZER_SYSTEM }] : [{ type: "text", text: SUMMARIZER_SYSTEM }];
     return {
         model: model ?? shape?.model ?? "claude-sonnet-4-5",
         max_tokens: SUMMARY_MAX_TOKENS,
         stream: false,
         system,
-        messages: [{ role: "user", content: renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut)) }],
+        messages: [{ role: "user", content: transcript }],
     };
 }
 
@@ -383,6 +591,27 @@ function armReforgeCooldown(sessionId: string): void {
     for (const [id, until] of reforgeCooldownUntil) if (id !== sessionId && until < staleBefore) reforgeCooldownUntil.delete(id);
 }
 
+/** #3744: the swapped create reached upstream and was REJECTED — roll the
+ *  mirror back to its pre-reforge view (the server-side thread never changed)
+ *  and arm the same cooldown the side-call failures use, so the next continue
+ *  does not immediately re-summarize + re-rebuild into the same wall. */
+export function noteReforgeCreateRejected(
+    sessionId: string,
+    prevMeta: ThreadsMirrorMeta,
+    status: number,
+    log: (level: string, msg: string) => void,
+): void {
+    try {
+        const store = laneStore();
+        const mirror = loadMirror(store, sessionId);
+        if (mirror.available) persistMirror(store, sessionId, { ...prevMeta }, mirror.entries, log);
+    } catch {
+        // fail-open: the cooldown below still breaks the loop
+    }
+    armReforgeCooldown(sessionId);
+    log("warn", `[${sessionId}] [threads] reforged create rejected by upstream (HTTP ${status}) — mirror rolled back to pre-reforge view, summary side-call cooling down (#3744)`);
+}
+
 /** Execute an armed reforge: one summarizer side-call (client's auth, aimed
  *  at the SAME endpoint + proxy decision as the main forward — #3569), then
  *  swap the continue for a fresh create. Fail-open — any error returns
@@ -410,15 +639,17 @@ export async function executeThreadsReforge(
     }
     try {
         const summaryReq = buildSummaryRequestBody(meta.shape, typeof parsed.model === "string" ? parsed.model : undefined, meta, entries, cut, billingBlock);
-        const headers: Record<string, string> = { "content-type": "application/json" };
-        const passThrough = (name: string): void => {
-            const v = req.headers[name];
-            if (typeof v === "string") headers[name] = v;
-        };
-        passThrough("x-api-key");
-        passThrough("authorization");
-        passThrough("anthropic-version");
-        passThrough("anthropic-beta");
+        // #3744 variant B: the side-call must look like the client's own
+        // traffic — pass EVERY client header through except hop-by-hop /
+        // per-body framing and the one-shot per-request ids; bili's own
+        // x-bili-* markers never leave the proxy.
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(req.headers)) {
+            if (SIDE_CALL_STRIP_HEADERS.has(name) || SIDE_CALL_ONE_SHOT_HEADERS.has(name) || name.startsWith("x-bili-")) continue;
+            if (typeof value === "string") headers[name] = value;
+            else if (Array.isArray(value)) headers[name] = value.join(", ");
+        }
+        headers["content-type"] = "application/json";
         // Same outbound-fetch contract as every other bili call (#551 idle
         // watchdog, direct-dispatcher fallback, manual redirects); the proxy
         // decision rides the dispatcher exactly like the main forward does.

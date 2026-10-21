@@ -61,6 +61,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
+import { noteReforgeCreateRejected, observeThreadsAssistantReply } from "./threads-lane.js";
 import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -1301,6 +1302,11 @@ export async function forward(
                 }
             }
         }
+        // #3744: a reforged create that upstream REJECTS must not loop — roll
+        // the mirror back to its pre-reforge view and cool the side-call down.
+        if (prepared?.session && prepared.threadsReforgeSwapped) {
+            noteReforgeCreateRejected(prepared.session.id, prepared.threadsReforgeSwapped.prevMeta, upstream.status, (level, msg) => log(level, msg));
+        }
         // #604: relay/gateway 5xx — no usage report will arrive, so arm the
         // emergency shrink with a local estimate of the wire body we just sent
         // (see armFailureShrink for the deadlock this breaks). A generic relay
@@ -1586,6 +1592,20 @@ export async function forward(
         const [a, b] = responseBody.tee();
         responseBody = a;
         dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
+    }
+    // #3744: threads turns hold state server-side the client never re-sends —
+    // mirror the model's reply from a tee'd branch of the SAME bytes the
+    // client receives (byte-verbatim otherwise; fail-open inside).
+    if (prepared !== null && prepared.threadsLane && responseBody !== null) {
+        const [toClient, toCapture] = responseBody.tee();
+        responseBody = toClient;
+        observeThreadsAssistantReply(
+            prepared.session.id,
+            toCapture,
+            (upstream.headers.get("content-type") ?? "").includes("text/event-stream"),
+            clientAbort.signal,
+            (level, msg) => log(level, msg),
+        );
     }
     // #3129: v1internal response envelope — unwrap upstream frames so every
     // branch below (compress loop, strip pipes, JSON rewriter) reads a standard

@@ -1640,6 +1640,11 @@ export type Prepared = {
      *  for a fresh create) before the forward. Fail-open: an unsuccessful
      *  execution leaves `body` (the original continue) untouched. */
     threadsReforge?: import("./server/threads-lane.js").ThreadsReforgePlan;
+    /** [#3744] set when handle.ts swapped a continue for a reforged create.
+     *  If THAT create is rejected upstream, forward() rolls the mirror back
+     *  to `prevMeta` (the server-side thread never changed) and arms the
+     *  lane's retry cooldown instead of looping summarize→rebuild→400. */
+    threadsReforgeSwapped?: { prevMeta: import("./server/threads-lane.js").ThreadsMirrorMeta };
 };
 
 

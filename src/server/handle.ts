@@ -2407,6 +2407,10 @@ async function handleRequest(
                     );
                     if (outcome.ok && outcome.body !== undefined) {
                         prepared.body = outcome.body;
+                        // #3744: if THIS swapped create is rejected upstream,
+                        // forward() rolls the mirror back to the pre-reforge
+                        // view and arms the lane's cooldown.
+                        prepared.threadsReforgeSwapped = { prevMeta: prepared.threadsReforge.meta };
                         // The old thread is dead: no id in it can ever be a
                         // useful retarget again (#2701 tail tracking).
                         resetThreadTailTracking(session);

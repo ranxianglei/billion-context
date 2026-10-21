@@ -53,7 +53,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, validateAnthropicThreadsCreate, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -224,6 +224,11 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
                 Array.isArray(JSON.parse(vertexErrorEnvelope(streaming === true, "x").body)) ? ["WC-021 stream errors are array-wrapped"] : [],
             body: true,
         },
+        // WC-022 is the anthropic-threads lane (#3744): a `system` message is only legal when some LATER
+        // message is `assistant`, or it ends the array — so the probe array must be a NON-terminal
+        // system with no assistant behind it (a trailing system would be legal and trip nothing).
+        // End-to-end enforcement lives in tests/threads-lane.test.ts, which 400s violating creates.
+        { ruleId: "WC-022", validate: validateAnthropicThreadsCreate, body: [{ role: "user" }, { role: "system" }, { role: "user" }] },
     ];
     for (const { ruleId, validate, body } of laneProbes) {
         assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
