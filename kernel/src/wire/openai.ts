@@ -486,7 +486,11 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
           ) {
             out.push({
               role: m.originalRole === "developer" ? "developer" : "system",
-              content: typeof raw.content === "string" ? text : [{ type: "text", text }],
+              // #4201: re-lay keeps part-level extras (gateway-stamped
+              // cache_control etc.) — only the text value is replaced.
+              content: Array.isArray(raw.content)
+                ? [rewrittenTextPart(raw.content, text)]
+                : text,
             });
           } else {
             out.push(raw);
@@ -553,6 +557,17 @@ export function injectOpenaiSystem(
     (messages[0]?.role === "system" || messages[0]?.role === "developer")
   ) {
     const head = messages[0] as OpenAIMessage;
+    // #4201: a parts-array head keeps its shape — every original part stays
+    // byte-exact (part-level extras such as gateway-stamped cache_control
+    // survive; structured blocks are client data, #4166) and the injected
+    // text rides a fresh trailing text part. The "---" separator only
+    // disambiguates two texts inside ONE string field.
+    if (Array.isArray(head.content)) {
+      return [
+        { ...head, content: [...head.content, { type: "text", text: extra }] },
+        ...messages.slice(1),
+      ];
+    }
     const base = stringContent(head.content);
     const merged = base ? `${base}\n\n---\n\n${extra}` : extra;
     return [{ ...head, content: merged }, ...messages.slice(1)];
@@ -572,6 +587,19 @@ export function conversationSignalOpenai(
   const firstUser = msgs.find((m) => m?.role === "user");
   const seed = firstUser ? stringContent(firstUser.content) : "default";
   return hashId(seed);
+}
+
+/** #4201: rebuild the single text part of a rewritten system-family message
+ *  without losing any extra keys the original parts carried (a gateway or
+ *  host may stamp part-level metadata such as `cache_control`); later parts
+ *  win per key — the anthropic wire's harvest-last mark discipline. */
+function rewrittenTextPart(
+  parts: OpenAIContentPart[],
+  text: string,
+): OpenAIContentPart {
+  let base: Record<string, unknown> = {};
+  for (const p of parts) base = { ...base, ...(p as Record<string, unknown>) };
+  return { ...base, type: "text", text } as OpenAIContentPart;
 }
 
 /** #4166: true when content is a plain string or an all-text parts array —
