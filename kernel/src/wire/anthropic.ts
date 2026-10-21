@@ -341,7 +341,11 @@ function systemMessageMark(m: AnthropicSystemMessage): unknown {
 
 // Verbatim unless the kernel rewrote the text (e.g. emergency truncation of
 // a plain-text message) — re-emitting the original would undo it. A mark the
-// original lacks (host-stamped, #1637) lands on the last block.
+// original lacks (host-stamped, #1637) lands on the last block; a string
+// content cannot carry one, so it upgrades to the single-text-block form —
+// deterministic across turns and semantically identical for Anthropic, the
+// same conversion stampAnthropicSystemCacheControl applies to the head system
+// (#4199). Returning raw verbatim here would silently drop the mark.
 function rebuildSystemMessage(
   m: BiliMessage,
   mark: unknown,
@@ -352,8 +356,11 @@ function rebuildSystemMessage(
   if (text !== systemMessageText(raw) && isPlainTextSystemMessage(raw)) {
     return { role: "system", content: [{ type: "text", text, ...cc }] };
   }
-  if (!mark || systemMessageMark(raw) || typeof raw.content === "string") {
+  if (!mark || systemMessageMark(raw)) {
     return raw;
+  }
+  if (typeof raw.content === "string") {
+    return { ...raw, content: [{ type: "text", text: raw.content, ...cc }] };
   }
   const last = raw.content.length - 1;
   if (last < 0) return raw;

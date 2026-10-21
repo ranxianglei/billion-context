@@ -230,6 +230,56 @@ test("host-stamped mark lands on the last block; client marks stay put", () => {
   assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[0], pre);
 });
 
+// #4199: a mark on a string-content system message used to be dropped by the
+// verbatim early return (a string cannot carry a cache_control block). It must
+// upgrade to the single-text-block form instead; the no-mark case stays
+// byte-verbatim (pinned by "string-content system message round-trips").
+test("host-stamped mark on string-content system upgrades to block form", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: "be brief" },
+    ],
+  };
+  const flat = anthropicToCore(body as never);
+  const sys = flat.msgs[1]!;
+  // A string carries no harvestable client mark — this one arrives host-side
+  // (computeAnthropicMessageMarks, #1637), so inject it into the map directly.
+  const marks = new Map<string, unknown>([
+    [sys.id, { type: "ephemeral" }],
+  ]);
+  assert.deepEqual(coreToAnthropic(flat.msgs as never, marks)[1], {
+    role: "system",
+    content: [
+      { type: "text", text: "be brief", cache_control: { type: "ephemeral" } },
+    ],
+  });
+});
+
+test("mark + rewritten string-content system keeps the rewrite and the mark", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: "be brief" },
+    ],
+  };
+  const flat = anthropicToCore(body as never);
+  const truncated = flat.msgs.map((m, i) =>
+    i === 1 ? { ...m, text: "be brief [truncated]" } : m,
+  );
+  const marks = new Map<string, unknown>([[flat.msgs[1]!.id, { type: "ephemeral" }]]);
+  assert.deepEqual(coreToAnthropic(truncated as never, marks)[1], {
+    role: "system",
+    content: [
+      {
+        type: "text",
+        text: "be brief [truncated]",
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+  });
+});
+
 test("control-plane system cores are never folded; other cores still are", () => {
   const msgs = anthropicToCore(piBody() as never).msgs;
   for (const m of msgs) {
