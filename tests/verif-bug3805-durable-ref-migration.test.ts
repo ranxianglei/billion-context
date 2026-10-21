@@ -7,6 +7,7 @@ import { solveSmt2 } from "../verif/solve.js";
 import { assignRefs, emptyRefMap, BLOCKED_REF } from "../kernel/src/refs.js";
 import { renderVisibleRefs } from "../kernel/src/render-refs.js";
 import type { CoreMessage } from "../kernel/src/types.js";
+import { resolve, sep } from "node:path";
 
 /**
  * #3805: durable carrier ref migration re-tags an already-sent message.
@@ -51,7 +52,7 @@ const objOf = (fields: Record<string, unknown>): SymObj => ({ kind: "obj", field
 const arrOf = (ctx: Ctx, elems: SymVal[]): SymArr => ({ kind: "arr", elems, len: ctx.Real.val(elems.length) }) as never;
 
 const MARKER = "<available_skills>";
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = resolve(import.meta.dirname, "..") + sep;
 const REFS = `${REPO}kernel/src/refs.ts`;
 const RREFS = `${REPO}kernel/src/render-refs.ts`;
 

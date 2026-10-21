@@ -8,6 +8,7 @@ import { assignRefs } from "../kernel/src/refs.js";
 import { renderVisibleRefs } from "../kernel/src/render-refs.js";
 import { defaultCountTokens } from "../kernel/src/tokenize.js";
 import type { CoreMessage } from "../kernel/src/types.js";
+import { resolve, sep } from "node:path";
 
 /**
  * Generic arbitrary-input discovery (issue #3848 acceptance, directive: find
@@ -32,7 +33,7 @@ import type { CoreMessage } from "../kernel/src/types.js";
  *     message is protected.
  */
 
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = resolve(import.meta.dirname, "..") + sep;
 const REFS = `${REPO}kernel/src/refs.ts`;
 const RENDER_REFS = `${REPO}kernel/src/render-refs.ts`;
 
@@ -47,7 +48,7 @@ interface TurnOut {
 
 test("generic append-only stability: arbitrary inputs over assignRefs + renderVisibleRefs", { timeout: 300_000 }, async (t) => {
   const haveSolver = (() => { try { return solveSmt2("(set-logic ALL)(check-sat)", []).status === "sat"; } catch { return false; } })();
-  if (!haveSolver) t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
+  if (!haveSolver) return t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
 
   const ctx = newCtx();
   const strv = (v: string) => ({ kind: "str", t: ctx.String.val(v) }) as never;

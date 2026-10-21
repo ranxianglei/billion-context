@@ -2,11 +2,11 @@ import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { _resetReasoningViolationReportsForTest, isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
+import { _resetReasoningViolationReportsForTest, applyReasoningDrop, isStrictReasoningEcho, normalizeStrictEchoReasoning, planReasoningDrop, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
 import { modelIdOf, normalizeStrictEchoBody, normalizeStrictEchoResponsesInput } from "../src/strict-echo.js";
 import { dropCompressReasoning } from "../src/reasoning-drop.js";
 import type { Session } from "../src/session.js";
-import { anthropicToCore, coreToAnthropic, type AnthropicMessage, type BiliMessage } from "acp-kernel/wire";
+import { anthropicToCore, coreToAnthropic, coreToOpenai, openaiToCore, type AnthropicMessage, type BiliMessage } from "acp-kernel/wire";
 import type { OpenAIMessage } from "acp-kernel/wire";
 import { createInitialState } from "acp-kernel";
 
@@ -816,5 +816,97 @@ describe("#2864 sentinel dedup: per-identity episode reporting", () => {
         assert.match(c.lines[1]!, /first seen: tu2/);
         assert.doesNotMatch(c.lines[1]!, /first seen: tu1/);
         assert.match(c.lines[1]!, /; 1 already reported \(up to ×3 repeats\)/);
+    });
+});
+
+describe("#3922 openai wire: #651 drop vs strict-echo detection on opaque gateways", () => {
+    // Field log (#3909 pi native lane session, upstream behind an opaque
+    // gateway — no "deepseek" in origin or model): "reasoning-pair-violated:
+    // 47 assistant tool-call message(s) lack reasoning_content while 169
+    // carry it". This block pins the producer: on such a session
+    // isStrictReasoningEcho is false until a 400 learns the flag, so #651's
+    // request-time drop removes the oversized reasoning run attached to each
+    // CLOSED compress round from the outbound view only — leaving exactly the
+    // "assistant tool-call message lacking reasoning_content while siblings
+    // carry it" shape the sentinel reports. The kernel codec itself cannot
+    // drop non-empty reasoning (round-trips byte-exact) and turn-integrity
+    // forbids split-turn folds, so this drop is the only bili-side path that
+    // manufactures the shape.
+    const BIG = "x".repeat(3000); // strictly over the 2048-char size gate
+    const tc = (id: string, name: string) => ({ id, type: "function" as const, function: { name, arguments: "{}" } });
+
+    // pi lane shape: a real-tool turn carries its reasoning, a closed compress
+    // round (result + at least one later message) carries its own run.
+    function inbound(compressReasoning: string): OpenAIMessage[] {
+        return [
+            { role: "user", content: "q" },
+            { role: "assistant", content: "", reasoning_content: "think about bash", tool_calls: [tc("c-bash", "bash")] },
+            { role: "tool", tool_call_id: "c-bash", content: "ok" },
+            { role: "assistant", content: "", reasoning_content: compressReasoning, tool_calls: [tc("c-comp", "compress")] },
+            { role: "tool", tool_call_id: "c-comp", content: "compressed" },
+            { role: "user", content: "next" },
+        ];
+    }
+
+    function assistantWith(out: OpenAIMessage[], toolCallId: string): OpenAIMessage | undefined {
+        return out.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((t) => t.id === toolCallId));
+    }
+
+    beforeEach(() => _resetReasoningViolationReportsForTest());
+
+    it("repro: opaque gateway → #651 drops the closed-compress run → outbound shows the violator shape", () => {
+        const { msgs } = openaiToCore({ model: "group/sol", messages: inbound(BIG) });
+        const c = collector();
+        const strict = isStrictReasoningEcho(fakeSession(), "http://magpie.local/v1", "group/sol");
+        assert.equal(strict, false, "no deepseek in origin or model, no learned flag → not strict-echo yet");
+        const plan = planReasoningDrop(msgs, undefined, strict);
+        assert.equal(plan.size, 1, "the oversized pre-compress run is planned for drop");
+        const view = applyReasoningDrop(msgs, plan, c.log, "s3922");
+        const out = coreToOpenai(view);
+        const comp = assistantWith(out, "c-comp");
+        const bash = assistantWith(out, "c-bash");
+        assert.ok(comp && bash);
+        assert.equal("reasoning_content" in comp!, false, "the compress call lost its reasoning in the outbound view");
+        assert.equal(bash!.reasoning_content, "think about bash", "the real-tool turn keeps its reasoning");
+        warnReasoningPairs(out, c.log, "s3922");
+        const warns = c.lines.filter((l) => l.includes("reasoning-pair-violated"));
+        assert.equal(warns.length, 1);
+        assert.match(warns[0]!, /1 assistant tool-call message\(s\) lack reasoning_content while 1 carry it/);
+    });
+
+    it("learned flag heals: drop disabled, the never-persisted-away run rides back, sentinel silent", () => {
+        const { msgs } = openaiToCore({ model: "group/sol", messages: inbound(BIG) });
+        const c = collector();
+        const strict = isStrictReasoningEcho(fakeSession({ strictReasoningEcho: true }), "http://magpie.local/v1", "group/sol");
+        assert.equal(strict, true);
+        const plan = planReasoningDrop(msgs, undefined, strict);
+        assert.equal(plan.size, 0, "#684 gate: strict-echo sessions never drop");
+        const view = applyReasoningDrop(msgs, plan, c.log, "s3922b");
+        let out = coreToOpenai(view);
+        out = normalizeStrictEchoReasoning(out, strict, c.log, "s3922b");
+        const comp = assistantWith(out, "c-comp")!;
+        assert.equal(comp.reasoning_content, BIG, "the drop was outbound-view-only: the run returns once the drop stops");
+        warnReasoningPairs(out, c.log, "s3922b");
+        assert.equal(c.lines.filter((l) => l.includes("reasoning-pair-violated")).length, 0);
+    });
+
+    it("negative control: a ≤2048-char pre-compress run is kept (no violator shape)", () => {
+        const { msgs } = openaiToCore({ model: "group/sol", messages: inbound("short") });
+        const c = collector();
+        const plan = planReasoningDrop(msgs, undefined, false);
+        assert.equal(plan.size, 0, "size gate: strictly more than 2048 chars required");
+        const out = coreToOpenai(applyReasoningDrop(msgs, plan, c.log, "s3922c"));
+        warnReasoningPairs(out, c.log, "s3922c");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("negative control: deepseek-named origin keeps the run today (the gap is opaque naming only)", () => {
+        const { msgs } = openaiToCore({ model: "group/sol", messages: inbound(BIG) });
+        const c = collector();
+        const strict = isStrictReasoningEcho(fakeSession(), "https://api.deepseek.com/v1", "group/sol");
+        assert.equal(strict, true);
+        const out = coreToOpenai(applyReasoningDrop(msgs, planReasoningDrop(msgs, undefined, strict), c.log, "s3922d"));
+        warnReasoningPairs(out, c.log, "s3922d");
+        assert.equal(c.lines.length, 0);
     });
 });

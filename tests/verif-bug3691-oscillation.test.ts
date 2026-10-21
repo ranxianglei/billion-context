@@ -19,6 +19,7 @@ import { newCtx, smt2Of } from "../verif/terms.ts";
 import { solveSmt2, parseNum } from "../verif/solve.ts";
 import { truncateLargeToolOutputs } from "../kernel/src/truncate-tools.ts";
 import { defaultCountTokens } from "../kernel/src/tokenize.ts";
+import { resolve } from "node:path";
 
 const LIMIT = 2000;
 const GATE = LIMIT * 0.95; // emergencyTruncateNode gate: usage >= threshold
@@ -62,7 +63,7 @@ test("bug3691: solver finds a clip-triggering witness on the real truncation cod
     sv.kind === "str" ? { kind: "num" as const, t: ctx.ToReal((sv.t as import("../verif/terms.js").Seq).length()).div(ctx.Real.val(4)).add(ctx.Real.val(1)) } : { kind: "any" as const };
 
   const { exec } = translateFunction({
-    file: new URL("../kernel/src/truncate-tools.ts", import.meta.url).pathname,
+    file: resolve(import.meta.dirname, "../kernel/src/truncate-tools.ts"),
     function: "truncateLargeToolOutputs",
     params: { messages: msgs, tokenCount: { kind: "num", t: tok1 }, config, countTokens: { kind: "any" }, options: { kind: "obj", fields: new Map([["includeTextMessages", { kind: "bool", t: ctx.Bool.val(true) }]]) } },
     ctx,
