@@ -15,6 +15,8 @@
 // nested rows no patch layer can address by id (#1772/#2360) — this module is
 // what reaches them.
 
+import { logHostEvent } from "./host-log.js";
+
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
 const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
@@ -81,9 +83,21 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
         // Preset entries must carry the gate: sibling imports may finish out of order.
         ctx.on("internal/config", function (this: MiddlewareSelf, _raw: unknown, next: () => unknown): unknown {
             const resolved = next();
+            // #3712: this middleware is global and fires for EVERY package's config
+            // resolution — anything other than the agent preset is an expected
+            // pass-through (logging it would spam), so only the two preset-specific
+            // outcomes below are observable.
             if (this?.entry?.options?.name !== DSH_AGENT_PRESET_PACKAGE) return resolved;
             const config = (resolved ?? {}) as { plugins?: unknown };
-            if (!Array.isArray(config.plugins)) return resolved;
+            // #3712: the genuine silent-miss — we ARE the preset (gate satisfied) but
+            // its resolved shape changed so the overlay cannot reach the nested
+            // compaction rows. Pre-fix this returned untouched and was indistinguishable
+            // from success using only bili.log; now it is visible.
+            if (!Array.isArray(config.plugins)) {
+                logHostEvent("warn", "[dsh-client]", `compaction-disable overlay MISSED on ${DSH_AGENT_PRESET_PACKAGE}: resolved config has no plugins array — nested compaction rows were NOT stood down (#3354)`);
+                return resolved;
+            }
+            logHostEvent("info", "[dsh-client]", `compaction-disable overlay applied to ${DSH_AGENT_PRESET_PACKAGE}: nested compaction rows stood down (#3354)`);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
         }, { global: true });
     }
