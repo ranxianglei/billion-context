@@ -190,7 +190,10 @@ interface LedgerLine {
     /** #2131: divergence class of a be=0 pair — "head": change within the first
      *  1 KiB (model/tools/sampling-params/system region → host-side parameter
      *  change, not a history rewrite); "append": the whole shorter payload
-     *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
+     *  survives ±64 closing-bracket bytes (pure tail growth/trim) OR — #4133 —
+     *  the shared message prefix is equal modulo client-managed cache_control
+     *  migration (a rolling breakpoint moving onto the new tail mutates the
+     *  previous last message's bytes on every pure append); "mid": a
      *  mid-history rewrite; "tail" (#2982): the first divergence sits at/past
      *  the shorter body's message-array closing bracket — only trailing
      *  top-level params (host-computed max_tokens/…) or an ephemeral tail note
@@ -380,6 +383,11 @@ export interface SeamEvent {
      *  unparseable body yields no message list to walk) — never a real index;
      *  renderers must show an unknown token, not 0 (#2339). */
     msgIndex: number | null;
+    /** #4133: cc-blind twin of msgIndex — first element differing even when
+     *  client-managed cache_control migration is ignored. Equals msgIndex for a
+     *  real content change; strictly greater when the strict walk stopped on a
+     *  breakpoint move alone (rolling mark: prevMsgs-1 → prevMsgs). */
+    msgIndexCc: number | null;
     prevMsgs: number;
     curMsgs: number;
     /** #3023: present iff this event was booked as a CLIENT-side mid-history
@@ -714,37 +722,75 @@ export function learnedImageReserve(session: Session, host: string, nImages: num
     return per * nImages;
 }
 
+// #2339: the message array lives under `messages` (Anthropic/chat), `input`
+// (Responses) or `contents` (Google native) — same caliber as the send-time
+// count captures (server.ts / loop/core.ts). Reading only `.messages` made
+// every Responses/Google pair parse to zero messages: msgIndex degenerated
+// to a fallback 0 that rendered as a real "message[0]", and the count-based
+// classification arms went dead on those wires. A capped head may end mid
+// character; toString("utf8") replaces it and the truncated JSON fails to
+// parse — the same outcome as before #2868.
+function msgsOf(s: Buffer): unknown[] {
+    try {
+        const p = JSON.parse(s.toString("utf8")) as { messages?: unknown; input?: unknown; contents?: unknown };
+        const arr = p.messages ?? p.input ?? p.contents;
+        return Array.isArray(arr) ? arr : [];
+    } catch {
+        return [];
+    }
+}
+
+// #4133: deep equality with `cache_control` keys ignored at ANY depth — key
+// order stays significant (parity with the JSON.stringify comparators in this
+// file). Only the breakpoint stamp may differ; any other difference of the
+// element still breaks equality. Client-managed rolling breakpoints (Claude
+// Code / dsh style: the ephemeral mark moves to the newest message every turn)
+// mutate the PREVIOUS last message's bytes on a pure tail append — the mark
+// leaves it — so raw byte LCP stops inside that message and strict element
+// equality stops one index early. This comparator is what tells the two apart.
+function eqModCacheControl(x: unknown, y: unknown): boolean {
+    if (x === y) return true;
+    if (typeof x !== "object" || typeof y !== "object" || x === null || y === null) return false;
+    if (Array.isArray(x) !== Array.isArray(y)) return false;
+    const ax = Array.isArray(x) ? x : undefined;
+    const ay = Array.isArray(y) ? y : undefined;
+    if (ax !== undefined && ay !== undefined) {
+        if (ax.length !== ay.length) return false;
+        for (let i = 0; i < ax.length; i++) if (!eqModCacheControl(ax[i], ay[i])) return false;
+        return true;
+    }
+    const ox = x as Record<string, unknown>;
+    const oy = y as Record<string, unknown>;
+    const kx = Object.keys(ox).filter((k) => k !== "cache_control");
+    const ky = Object.keys(oy).filter((k) => k !== "cache_control");
+    if (kx.length !== ky.length) return false;
+    for (let i = 0; i < kx.length; i++) {
+        if (kx[i] !== ky[i]) return false;
+        if (!eqModCacheControl(ox[kx[i]], oy[ky[i]])) return false;
+    }
+    return true;
+}
+
 // #2868: compares UTF-8 BYTES — lcpBytes feeds byte thresholds and displays,
 // so comparing UTF-16 code units misreported every non-ASCII offset.
-function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | null; prevMsgs: number; curMsgs: number } {
+function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | null; msgIndexCc: number | null; prevMsgs: number; curMsgs: number } {
     let lcp = 0;
     const n = Math.min(a.length, b.length);
     while (lcp < n && a[lcp] === b[lcp]) lcp++;
-    // #2339: the message array lives under `messages` (Anthropic/chat), `input`
-    // (Responses) or `contents` (Google native) — same caliber as the send-time
-    // count captures (server.ts / loop/core.ts). Reading only `.messages` made
-    // every Responses/Google pair parse to zero messages: msgIndex degenerated
-    // to a fallback 0 that rendered as a real "message[0]", and the count-based
-    // classification arms went dead on those wires. A capped head may end mid
-    // character; toString("utf8") replaces it and the truncated JSON fails to
-    // parse — the same outcome as before #2868.
-    const msgsOf = (s: Buffer): unknown[] => {
-        try {
-            const p = JSON.parse(s.toString("utf8")) as { messages?: unknown; input?: unknown; contents?: unknown };
-            const arr = p.messages ?? p.input ?? p.contents;
-            return Array.isArray(arr) ? arr : [];
-        } catch {
-            return [];
-        }
-    };
     const ma = msgsOf(a);
     const mb = msgsOf(b);
-    let i = 0;
+    const lim = Math.min(ma.length, mb.length);
     const eq = (x: unknown, y: unknown): boolean => JSON.stringify(x) === JSON.stringify(y);
-    while (i < Math.min(ma.length, mb.length) && eq(ma[i], mb[i])) i++;
+    let i = 0;
+    while (i < lim && eq(ma[i], mb[i])) i++;
+    // #4133: second walk ignoring client-managed cache_control migration.
+    // Always >= msgIndex; the extra pass is bounded by the trailing
+    // cc-only-differing elements (zero work when strict equality held).
+    let ic = i;
+    while (ic < lim && eqModCacheControl(ma[ic], mb[ic])) ic++;
     // null = position unknowable (neither side yielded a message list — capped or
     // unparseable body). A bare 0 would be a real head-break index, not a fallback.
-    return { lcpBytes: lcp, msgIndex: ma.length > 0 && mb.length > 0 ? i : null, prevMsgs: ma.length, curMsgs: mb.length };
+    return { lcpBytes: lcp, msgIndex: ma.length > 0 && mb.length > 0 ? i : null, msgIndexCc: ma.length > 0 && mb.length > 0 ? ic : null, prevMsgs: ma.length, curMsgs: mb.length };
 }
 
 // #2131: byte-LCP WITHOUT the JSON parse seamLcp does — the per-call stability
@@ -816,6 +862,23 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
         }
     }
     return null;
+}
+
+// #4133: would-be-"mid" rescue for the per-call body-stability ladder — parse
+// both FULL bodies and compare the shared message prefix ignoring client-
+// managed cache_control migration (eqModCacheControl). All shared elements
+// equal modulo the marks ⇒ the only mutation between the two requests was
+// breakpoint placement ⇒ tail-append class, not a mid-history rewrite. The
+// byte ladder reaches here only after "append"/"head"/"tail" all failed, so
+// healthy pairs never pay for the parse; unparseable/empty lists keep the
+// conservative pre-fix class ("mid").
+function ccBlindSharedPrefix(a: Buffer, b: Buffer): boolean {
+    const ma = msgsOf(a);
+    const mb = msgsOf(b);
+    if (ma.length === 0 || mb.length === 0) return false;
+    const n = Math.min(ma.length, mb.length);
+    for (let i = 0; i < n; i++) if (!eqModCacheControl(ma[i], mb[i])) return false;
+    return true;
 }
 
 function detectSeam(session: Session, led: CacheLedger): void {
@@ -896,15 +959,18 @@ function detectSeam(session: Session, led: CacheLedger): void {
             return;
         }
         // #2059: tail-append turns — the previous request's ENTIRE message list
-        // survives byte-identically as this one's prefix (msgIndex == prevMsgs)
-        // and only the tail grew, so there is NO mid-history break: provider-side
-        // again. The byte-LCP test above can't see it (it demands the whole body
-        // match, which a growing conversation never satisfies), so before this the
-        // common append+no-cache case falsely cried seam. Both bodies must be
-        // uncapped: one truncated at SEAM_BODY_CAP parses to zero messages and
-        // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
-        // an empty prior list out.
-        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
+        // survives as this one's prefix and only the tail grew, so there is NO
+        // mid-history break: provider-side again. The byte-LCP test above can't
+        // see it (it demands the whole body match, which a growing conversation
+        // never satisfies), so before this the common append+no-cache case
+        // falsely cried seam. #4133: survival is judged modulo client-managed
+        // cache_control migration (msgIndexCc) — a rolling breakpoint mutates
+        // the previous last message's bytes on EVERY pure append, which the
+        // strict msgIndex read stops at prevMsgs-1 and mis-cried seam for.
+        // Both bodies must be uncapped: one truncated at SEAM_BODY_CAP parses
+        // to zero messages and would fake the msgIndexCc == prevMsgs == 0
+        // signature; prevMsgs > 0 keeps an empty prior list out.
+        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndexCc === f.prevMsgs && f.curMsgs > f.prevMsgs) {
             bookProvider();
             return;
         }
@@ -1684,7 +1750,26 @@ export function settleUsageReport(
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
                         const arrClose = messagesArrayCloseOffset(shorterFull);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : "mid";
+                        const minFull = Math.min(prevSlot.full.length, curSlot.full.length);
+                        if (lcp >= minFull - 64) {
+                            curLine.bs = "append";
+                        } else if (lcp < 1024) {
+                            curLine.bs = "head";
+                        } else if (arrClose !== null && lcp >= arrClose) {
+                            curLine.bs = "tail";
+                        } else {
+                            // #4133: would-be-"mid" rescue — client-managed rolling
+                            // cache_control breakpoints move the mark onto the new
+                            // tail message every turn and strip it from the previous
+                            // last one, so a pure tail append's byte LCP stops inside
+                            // that message (before its array close bracket) and the
+                            // ladder above reads it as a mid-history rewrite. Re-check
+                            // the shared message prefix modulo cache_control: all
+                            // shared elements equal ⇒ only breakpoint migration moved
+                            // ⇒ tail-append class. Gated here, so healthy pairs never
+                            // pay for the parse.
+                            curLine.bs = ccBlindSharedPrefix(prevSlot.full, curSlot.full) ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1776,7 +1861,10 @@ interface BodyStability {
     diverged: number;
     /** Divergence inside the first 1 KiB — host-side parameter region (model/tools/sampling/system), NOT a history rewrite. */
     head: number;
-    /** Whole shorter payload survives ±64 closing-bracket bytes — pure tail growth/trim. */
+    /** Whole shorter payload survives ±64 closing-bracket bytes (pure tail
+     *  growth/trim), or its shared message prefix is equal modulo client-managed
+     *  cache_control migration (#4133: a rolling breakpoint moving onto the new
+     *  tail mutates the previous last message's bytes on every pure append). */
     append: number;
     /** Mid-history byte change — the shape a real rewrite has. */
     mid: number;
