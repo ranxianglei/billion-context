@@ -414,13 +414,22 @@ function applyPairBoundaryAdjustments(
   if (resolved.boundaryKind === "block") {
     return resolved.messageIds;
   }
-  // Compose tool-pair and reasoning-pair boundary adjustments to a fixpoint
-  // (≤2 passes). Reasoning may pull in a tool-call whose result tool-pairs
-  // then extends for; tool-pairs may pull in a tool-call whose preceding
-  // reasoning is then drawn in. Both only ever WIDEN the range.
+  // Compose tool-pair and reasoning-pair boundary adjustments to a TRUE
+  // fixpoint (#4197). Each pass only sees pairs of messages already inside
+  // the range at the start of the pass, so an interleaved chain needs one
+  // pass PER LINK: reasoning may pull in a tool-call whose result tool-pairs
+  // then extends for, and each newly pulled member's own pair (an earlier
+  // call or reasoning run) only becomes visible on the NEXT pass. The old
+  // ≤2-pass cap truncated longer chains — the boundary still cut through a
+  // pair, leaving an orphan half outside the fold (orphaned reasoning →
+  // provider 400). Both adjusters only ever WIDEN the range, so every
+  // changing pass grows the width by at least 1 against a maximum of
+  // messages.length − 1: the loop terminates, and messages.length is a safe
+  // bound.
   let startIndex = resolved.startIndex;
   let endIndex = resolved.endIndex;
-  for (let pass = 0; pass < 2; pass++) {
+  let changed = true;
+  for (let pass = 0; changed && pass < messages.length; pass++) {
     const reasoningAdjusted = adjustBoundariesForReasoningPairs(
       startIndex,
       endIndex,
@@ -431,12 +440,11 @@ function applyPairBoundaryAdjustments(
       reasoningAdjusted.endIndex,
       messages,
     );
-    const changed =
+    changed =
       toolAdjusted.startIndex !== startIndex ||
       toolAdjusted.endIndex !== endIndex;
     startIndex = toolAdjusted.startIndex;
     endIndex = toolAdjusted.endIndex;
-    if (!changed) break;
   }
   if (startIndex === resolved.startIndex && endIndex === resolved.endIndex) {
     return resolved.messageIds;
