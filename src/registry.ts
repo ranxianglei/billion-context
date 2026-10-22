@@ -174,6 +174,19 @@ function parseCatalog(raw: string): LoadedRegistry | null {
     return null;
 }
 
+// Test seam for the network hop (the repo's established _...ForTest pattern —
+// see _setConnectFactoryForTest in upstream-proxy.ts): lets a test drive the
+// loader's failure path without reaching models.dev.
+type RegistryFetch = (
+    url: string,
+    init: NonNullable<Parameters<typeof fetchWithTimeout>[1]>,
+    timeoutMs?: number,
+) => ReturnType<typeof fetchWithTimeout>;
+let registryFetch: RegistryFetch = fetchWithTimeout;
+export function _setRegistryFetchForTest(fn: RegistryFetch | undefined): void {
+    registryFetch = fn ?? fetchWithTimeout;
+}
+
 async function fetchFresh(): Promise<LoadedRegistry | null> {
     const dispatcher = proxyDispatcher(process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY, 15_000);
     const attempts: Array<{ opts: Parameters<typeof fetchWithTimeout>[1]; label: string }> = dispatcher
@@ -181,7 +194,7 @@ async function fetchFresh(): Promise<LoadedRegistry | null> {
         : [{ opts: {}, label: "direct" }];
     for (const { opts, label } of attempts) {
         try {
-            const { response, clearTimer } = await fetchWithTimeout(REGISTRY_URL, {
+            const { response, clearTimer } = await registryFetch(REGISTRY_URL, {
                 ...opts,
                 headers: { Accept: "application/json" },
                 redirect: "follow",
@@ -219,7 +232,7 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
         }
     }
     if (loading) return loading;
-    loading = (async () => {
+    const pending = (async () => {
         const fresh = await fetchFresh();
         if (fresh) {
             cache = fresh.reg;
@@ -240,9 +253,17 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
         loggerLog("warn", `[acp-registry] could not load models.dev registry (offline + no cache + no snapshot)`);
         return null;
     })();
-    const result = await loading;
-    loading = null;
-    return result;
+    loading = pending;
+    try {
+        return await pending;
+    } finally {
+        // Clear on rejection too: previously only the success path reached
+        // `loading = null`, so one thrown load poisoned the memo and every
+        // later loadRegistry() returned the same rejected promise for the
+        // process lifetime — even after the trigger (an unsupported proxy
+        // scheme) was fixed in the environment.
+        if (loading === pending) loading = null;
+    }
 }
 
 /** Pick between the stale on-disk cache and the build-time bundled snapshot

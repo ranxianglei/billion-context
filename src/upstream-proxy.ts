@@ -140,6 +140,15 @@ function warnUnsupportedScheme(source: string, value: string, scheme: string): v
     loggerLog("warn", `[upstream-proxy] ignoring ${source}=${redactProxyUrl(value)}: scheme "${scheme}" is not supported — only http:// and https:// proxy origins work. For Clash/mihomo, point bili at the same mixed port over http:// (e.g. http://127.0.0.1:7890).`);
 }
 
+const warnedInvalidOrigins = new Set<string>();
+
+function warnInvalidProxyOrigin(value: string): void {
+    const key = redactProxyUrl(value) ?? value;
+    if (warnedInvalidOrigins.has(key)) return;
+    warnedInvalidOrigins.add(key);
+    loggerLog("warn", `[upstream-proxy] ignoring proxy=${key}: not a usable HTTP/HTTPS proxy origin (expected http://host:port).`);
+}
+
 export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
     if (!proxy?.trim()) return;
     const scheme = unsupportedProxyScheme(proxy);
@@ -362,6 +371,27 @@ export function proxyKeepAliveMaxMs(): number {
  *  PROXY_KEEPALIVE_MAX_MS. */
 export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
+    // Callers that hand over a RAW env value (the registry pre-warm at
+    // registry.ts fetchFresh) never pass through autoDetectProxy's scheme
+    // guard, so an unsupported scheme must degrade here instead of reaching
+    // ProxyAgent — its constructor throws synchronously, which turned the
+    // loader's memoized promise into a permanent rejection. Direct is the same
+    // egress autoDetectProxy would have chosen (#346/#357 intact) and the
+    // diagnostic stays identical.
+    const scheme = unsupportedProxyScheme(proxyUrl);
+    if (scheme) {
+        warnUnsupportedScheme("proxy", proxyUrl, scheme);
+        return undefined;
+    }
+    // A raw env value is not necessarily an absolute origin ("127.0.0.1:7890")
+    // and ProxyAgent throws on that too. Normalize/validate the same way the
+    // config and auto-detect paths do, and degrade instead of throwing.
+    const parsed = parseHttpProxy(proxyUrl);
+    if (!parsed) {
+        warnInvalidProxyOrigin(proxyUrl);
+        return undefined;
+    }
+    proxyUrl = parsed.url;
     const t = timeoutMs ?? upstreamTimeoutMs();
     const ka = proxyKeepAliveMaxMs();
     // #3776: include the CA identity in the key so a configured/rotated network.caFile rotates the cached agent.
