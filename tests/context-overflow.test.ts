@@ -133,6 +133,28 @@ test("Gemini 'input token count (N) exceeds' states the input count (#3450)", ()
     assert.equal(info.requestedCompletion, undefined);
 });
 
+test("DashScope 'Range of input length should be [1, N]' → overflow + input ceiling", () => {
+    // The real compatible-mode rejection (no token/length-subject phrase): while
+    // it went unrecognized, the 400 never armed the emergency shrink, so the
+    // #2313 probe kept re-forwarding the same over-long payload.
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 1000000]","type":"invalid_request_error","param":null,"code":"invalid_parameter_error"},"id":"chatcmpl-55bbf071-1040-9261-8cd4-76088d25ee5c","request_id":"55bbf071-1040-9261-8cd4-76088d25ee5c"}',
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 1000000);
+    assert.equal(info.requestedMessages, undefined);
+    assert.equal(info.requestedCompletion, undefined);
+});
+
+test("a parameter-range 400 without the input-length phrasing is NOT an overflow", () => {
+    const info = inspectContextOverflow(
+        400,
+        '{"error":{"message":"InvalidParameter: temperature should be in range [0, 2]","code":"invalid_parameter_error"}}',
+    );
+    assert.equal(info.isOverflow, false);
+});
+
 test("overflow body WITHOUT stated counts → no requested* fields (#3450 regression guard)", () => {
     // The legacy phrasing must keep behaving exactly as before (selfheal T3
     // relies on it): window only, no invented counts.
