@@ -1883,6 +1883,28 @@ function isOursZcodeMcpServer(server: unknown): boolean {
     return !!s && s.type === "stdio" && zcodeArgsMatch(s.args, ZCODE_MCP_ENTRY_RE);
 }
 
+// Pre-#1145 installs managed a `bili mcp` shim (command bili/bili.exe, args
+// ["mcp"]) instead of pointing at dist/zcode/mcp-entry.js. That shim is still
+// OURS: without recognizing it the lane reports "MCP face missing" AND
+// applyZcodeManagedConfig refuses to touch our own leftover, so an upgrade
+// could never repair the face it wrote (the user has to hand-edit the file).
+const ZCODE_LEGACY_MCP_COMMAND_RE = /(?:^|[\\/])bili(?:-proxy)?(?:\.exe)?$/i;
+
+function isLegacyOursZcodeMcpServer(server: unknown): boolean {
+    const s = zcodeAsPlain(server);
+    if (!s || s.type !== "stdio" || typeof s.command !== "string") return false;
+    if (!ZCODE_LEGACY_MCP_COMMAND_RE.test(s.command)) return false;
+    const args = s.args;
+    return Array.isArray(args) && args.length === 1 && args[0] === "mcp";
+}
+
+/** Ownership, not health: the current dist face and the legacy shim were both
+ *  written by this installer, so both may be replaced/removed — while a
+ *  user-authored "bili" server still throws (§7.3). */
+function isOurZcodeMcpOwnership(server: unknown): boolean {
+    return isOursZcodeMcpServer(server) || isLegacyOursZcodeMcpServer(server);
+}
+
 /** Managed-block apply for ~/.zcode/cli/config.json (#1145). Pure over the
  *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
  *  mcp.servers.bili when it already points at our dist — a user's own "bili"
@@ -1905,9 +1927,10 @@ function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry
     data.hooks = hooks;
     const mcp = zcodeAsPlain(data.mcp) ?? {};
     const servers = zcodeAsPlain(mcp.servers) ?? {};
-    if (servers.bili !== undefined && !isOursZcodeMcpServer(servers.bili)) {
+    if (servers.bili !== undefined && !isOurZcodeMcpOwnership(servers.bili)) {
         throw new Error(`${zcodeUserConfigFile()} already defines mcp.servers.bili owned by something else — rename or remove it first; refusing to overwrite`);
     }
+    if (isLegacyOursZcodeMcpServer(servers.bili)) notes.push("replaced the legacy bili mcp shim with this install's zcode/mcp-entry.js");
     servers.bili = { type: "stdio", command: "node", args: [opts.mcpEntry] };
     mcp.servers = servers;
     data.mcp = mcp;
@@ -1934,7 +1957,7 @@ function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<s
     const mcp = zcodeAsPlain(data.mcp);
     if (mcp) {
         const servers = zcodeAsPlain(mcp.servers);
-        if (servers && servers.bili !== undefined && isOursZcodeMcpServer(servers.bili)) {
+        if (servers && servers.bili !== undefined && isOurZcodeMcpOwnership(servers.bili)) {
             removed.push("mcp.servers.bili");
             delete servers.bili;
             if (Object.keys(servers).length === 0) delete mcp.servers;
@@ -1987,13 +2010,16 @@ function zcodeRemove(): string {
 function zcodeStatus(): string {
     let hasHook = false;
     let hasMcp = false;
+    let hasLegacyMcp = false;
     try {
         const doc = readJson(zcodeUserConfigFile());
         const sessionStart = zcodeAsPlain(zcodeAsPlain(doc.hooks)?.events)?.SessionStart;
         hasHook = Array.isArray(sessionStart) && (sessionStart as unknown[]).some(isOursZcodeHookEntry);
-        hasMcp = isOursZcodeMcpServer(zcodeAsPlain(zcodeAsPlain(doc.mcp)?.servers)?.bili);
+        const mcpServer = zcodeAsPlain(zcodeAsPlain(doc.mcp)?.servers)?.bili;
+        hasMcp = isOursZcodeMcpServer(mcpServer);
+        hasLegacyMcp = !hasMcp && isLegacyOursZcodeMcpServer(mcpServer);
     } catch {}
-    let status = hasHook && hasMcp ? "installed" : hasHook || hasMcp ? "partially installed — rerun 'bili plugin install zcode' to fix" : "not installed";
+    let status = hasHook && hasMcp ? "installed" : hasLegacyMcp ? "partially installed — legacy bili mcp shim, rerun 'bili plugin install zcode'" : hasHook || hasMcp ? "partially installed — rerun 'bili plugin install zcode' to fix" : "not installed";
     try {
         const routed = inspectZcodeRouting(resolveZcodeDataDir(process.env));
         if (routed && routed.wrapped.length > 0) status += ` (routing ${routed.kind} store: ${routed.wrapped.map((w) => w.id).join(", ")})`;
@@ -2322,9 +2348,10 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
     const hasHook = Array.isArray(sessionStart) && (sessionStart as unknown[]).some(isOursZcodeHookEntry);
     const mcpBili = zcodeAsPlain(zcodeAsPlain(doc.mcp)?.servers)?.bili;
     const hasMcp = isOursZcodeMcpServer(mcpBili);
-    if (!hasHook && !hasMcp) return laneAbsent();
+    const legacyMcp = !hasMcp && isLegacyOursZcodeMcpServer(mcpBili);
+    if (!hasHook && !hasMcp && !legacyMcp) return laneAbsent();
     const out: LanePresence = { installed: hasHook && hasMcp, pointers: [], targets: [], form: "managed-block" };
-    if (!out.installed) out.pointers.push(hasHook ? "hook present, MCP face missing" : "MCP face present, hook missing");
+    if (!out.installed) out.pointers.push(hasHook ? (legacyMcp ? "hook present, legacy bili mcp shim — rerun 'bili plugin install zcode'" : "hook present, MCP face missing") : "MCP face present, hook missing");
     const collectArgs = (args: unknown): void => {
         for (const a of Array.isArray(args) ? (args as unknown[]).map(String) : []) {
             if (path.isAbsolute(a) && /\.(js|ts)$/.test(a)) out.targets.push(a);
