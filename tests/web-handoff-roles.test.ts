@@ -9,7 +9,7 @@ import vm from "node:vm";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { createInitialState } from "acp-kernel";
 import { renderHandoff, HANDOFF_THINK_END } from "../src/export.ts";
-import type { Session } from "../src/session.ts";
+import { snapshotMessages, type Session } from "../src/session.ts";
 
 interface DomEl {
     tagName: string;
@@ -181,6 +181,65 @@ test("latest reply keeps thinking out of the answer text", () => {
         "the reasoning block renders before the answer",
     );
     assert.doesNotMatch(html, /\/reasoning/, "the end marker is not rendered as text");
+});
+
+test("reasoning boundaries survive the next request snapshot without changing stored messages", () => {
+    const cells = [
+        { id: "think", role: "assistant" as const, contentType: "reasoning" as const, text: "first thought" },
+        { id: "answer", role: "assistant" as const, contentType: "text" as const, text: "visible answer" },
+    ];
+    const user = { id: "user", role: "user" as const, contentType: "text" as const, text: "question" };
+    const session = {
+        id: "history-boundaries", meta: {}, stats: { requests: 1 },
+        metadata: { handoffResponse: { request: 1, messages: cells } },
+        state: createInitialState(), lastMessages: [user], blockContents: new Map(),
+    } as unknown as Session;
+    const render = loadRenderer();
+    for (const historical of [false, true]) {
+        if (historical) {
+            snapshotMessages(session, [user, ...cells, { ...user, id: "next", text: "next question" }]);
+            session.stats.requests++;
+            assert.equal(session.metadata.handoffResponse, undefined);
+        }
+        for (const folded of [false, true]) {
+            session.lastMessagesFolded = folded;
+            for (const full of [false, true]) {
+                const before = JSON.stringify(session);
+                const md = renderHandoff(session, full);
+                const html = render(md);
+                assert.equal(assistantRoles(html), 1);
+                assert.equal(md.split("\n").filter((line) => line === "### assistant").length, 1);
+                const think = html.match(/<details class="msg-think">[\s\S]*?<\/details>/g) ?? [];
+                assert.equal(think.length, 1);
+                assert.match(think[0]!, /first thought/);
+                assert.doesNotMatch(think[0]!, /visible answer/);
+                assert.match(html, /class="msg-out">visible answer/);
+                assert.equal(JSON.stringify(session), before);
+            }
+        }
+    }
+});
+
+test("literal reasoning-end markers remain visible in user, answer, and reasoning content", () => {
+    const render = loadRenderer();
+    for (const role of ["user", "assistant"]) {
+        const html = render(`## Conversation\n### ${role}\nA literal example:\n\`\`\`html\n${HANDOFF_THINK_END}\n\`\`\`\nEnd`);
+        assert.match(html, /&lt;!-- \/reasoning --&gt;/);
+    }
+    const session = {
+        id: "literal-markers", meta: {}, stats: { requests: 1 },
+        metadata: { handoffResponse: { request: 1, messages: [
+            { id: "r", role: "assistant", contentType: "reasoning", text: `Before\n${HANDOFF_THINK_END}\nAfter` },
+            { id: "a", role: "assistant", contentType: "text", text: `Answer\n${HANDOFF_THINK_END}\nEnd` },
+        ] } },
+        state: createInitialState(), lastMessages: [], blockContents: new Map(),
+    } as unknown as Session;
+    const html = render(renderHandoff(session, false));
+    const think = html.match(/<details class="msg-think">[\s\S]*?<\/details>/g) ?? [];
+    assert.equal(think.length, 1);
+    assert.match(think[0]!, /Before<br\/>&lt;!-- \/reasoning --&gt;<br\/>After/);
+    assert.doesNotMatch(think[0]!, /Answer/);
+    assert.equal((html.match(/&lt;!-- \/reasoning --&gt;/g) ?? []).length, 2);
 });
 
 test("handoff think marker is shared by the export and the web renderer", () => {
