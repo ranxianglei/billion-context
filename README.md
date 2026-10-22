@@ -347,7 +347,10 @@ blocks that pin things down at a glance: **GRAND LEDGER** (totals + hit% with
 an explicit `HEALTHY` verdict; misses decomposed into new content /
 compress re-pay / upstream-ttl-or-client-rewrite) · **FOLD ECONOMICS** (per-fold
 economics: net tokens saved, paid-back verdicts) · **LINE ITEMS** (anomalies
-only: hit<85% or miss≥5000). Rule of thumb: **compression itself costs ≤2%** —
+only: hit<85% or miss≥5000). Every row's timestamp carries its date
+(`MM-DD HH:MM:SS`) and a `SESSION SPAN … (Nd)` line sits under the header,
+because the ledger is session-scoped and persists across days; the `#N` request
+number is **session-global**, not a per-day counter. Rule of thumb: **compression itself costs ≤2%** —
 a healthy session sits at **95–97%**. When you see less, the attribution tells
 you which of the usual suspects it was, in this order: ① upstream cache TTL
 expiry (shows up as stable-prefix misses — the top-spikes line names idle

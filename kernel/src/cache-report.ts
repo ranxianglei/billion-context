@@ -497,7 +497,29 @@ function fmtTok(n: number): string {
 function fmtTime(at: number): string {
   const d = new Date(at);
   const p = (x: number) => String(x).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  // #4309: carry MM-DD — the ledger persists across days, so HH:MM:SS alone folds them together.
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// #4309: envelope under the header; spans the recorded (windowed) lines, not necessarily the whole session (see linesOmitted).
+function sessionSpanLine(report: CacheReport): string {
+  const ats = report.lines.map((l) => l.at);
+  if (ats.length < 2) return "";
+  let min = ats[0]!;
+  let max = ats[0]!;
+  for (const a of ats) {
+    if (a < min) min = a;
+    if (a > max) max = a;
+  }
+  const lo = new Date(min);
+  const hi = new Date(max);
+  const days =
+    Math.round(
+      (Date.UTC(hi.getFullYear(), hi.getMonth(), hi.getDate()) -
+        Date.UTC(lo.getFullYear(), lo.getMonth(), lo.getDate())) /
+        86_400_000,
+    ) + 1;
+  return `SESSION SPAN  ${fmtTime(min)} → ${fmtTime(max)}  (${days}d)`;
 }
 
 /** Render options: "summary" (default) distills to totals + verdicts +
@@ -591,7 +613,7 @@ function formatCacheReportFull(report: CacheReport): string {
       );
     else out.push("LINE ITEMS:");
     out.push(
-      "  #     time      input  cached    hit%      new    comp     ttl  fold",
+      "  #     time            input  cached    hit%      new    comp     ttl  fold",
     );
     for (const l of report.lines) {
       const fold = l.foldSeq !== null ? `#${l.foldSeq}` : "";
@@ -721,7 +743,7 @@ function formatCacheReportSummary(report: CacheReport): string {
         `LINE ITEMS (anomalies: hit<${ANOMALY_HIT_PCT}% or miss≥${fmtTok(ANOMALY_MISS_TOK)}):`,
       );
       out.push(
-        "  #     time      input  cached    hit%      new    comp     ttl  fold",
+        "  #     time            input  cached    hit%      new    comp     ttl  fold",
       );
       for (const i of kept) {
         const l = report.lines[i];
@@ -754,13 +776,11 @@ export function formatCacheReport(
   opts?: FormatCacheReportOptions,
 ): string {
   const t = report.totals;
-  const header = `ACP CACHE REPORT${sessionLabel ? ` (${sessionLabel})` : ""} — ${t.requests} requests`;
-  if (opts?.detail === "full") {
-    return [header, "", formatCacheReportFull(report)].join("\n");
-  }
-  return [
-    header + `  [summary — detail:"full" for every fold & line]`,
-    "",
-    formatCacheReportSummary(report),
-  ].join("\n");
+  const base = `ACP CACHE REPORT${sessionLabel ? ` (${sessionLabel})` : ""} — ${t.requests} requests`;
+  const head =
+    opts?.detail === "full" ? base : `${base}  [summary — detail:"full" for every fold & line]`;
+  const span = sessionSpanLine(report);
+  const body =
+    opts?.detail === "full" ? formatCacheReportFull(report) : formatCacheReportSummary(report);
+  return span ? [head, span, "", body].join("\n") : [head, "", body].join("\n");
 }

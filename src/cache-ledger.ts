@@ -2137,7 +2137,8 @@ function fmtTok(n: number): string {
 function fmtTime(at: number): string {
     const d = new Date(at);
     const p = (x: number) => String(x).padStart(2, "0");
-    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    // #4309: carry MM-DD — the ledger persists across days, so HH:MM:SS alone folds them together.
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 const SWITCH_LIST_CAP = 8;
