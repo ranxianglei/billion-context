@@ -27,7 +27,7 @@ import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
 import type { HandoffReply } from "./server/handoff-response.js";
-import { captureHandoffJson } from "./server/handoff-response.js";
+import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -3575,7 +3575,7 @@ export async function pipePluginResponsesWithStrip(
         const index = Number(meta["output_index"] ?? 0);
         const existing = replyItems.get(index);
         replyBytes += Buffer.byteLength(text) + (existing ? 0 : 128);
-        if (replyBytes > 1_500_000) { replyDropped = true; replyItems.clear(); reply.discard(); return; }
+        if (replyBytes > HANDOFF_REPLY_MAX_BYTES) { replyDropped = true; replyItems.clear(); reply.discard(); return; }
         const item = existing ?? (reasoning ? { type: "reasoning", summary: [] } : { type: "message", role: "assistant", content: [] });
         const field = reasoning ? "summary" : "content";
         const parts = (Array.isArray(item[field]) ? item[field] : []) as Array<{ type: string; text: string }>;

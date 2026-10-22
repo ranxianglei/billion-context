@@ -1,6 +1,9 @@
 import type { CoreMessage } from "acp-kernel";
 import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 import { markDirty, type Session } from "../session.js";
+import { log as loggerLog } from "../logger.js";
+
+export const HANDOFF_REPLY_MAX_BYTES = 1_500_000;
 
 export type HandoffReply = ReturnType<typeof createHandoffReply>;
 
@@ -16,7 +19,7 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
         const previous = messages.get(key);
         const size = (m: CoreMessage) => Buffer.byteLength(m.text ?? "") + Buffer.byteLength(m.toolName ?? "") + Buffer.byteLength(m.toolCallId ?? "") + 128;
         bytes += size(message) - (previous ? size(previous) : 0);
-        if (bytes > 1_500_000) { discard(); return; }
+        if (bytes > HANDOFF_REPLY_MAX_BYTES) { discard(); return; }
         messages.set(key, message);
     };
     return {
@@ -58,5 +61,8 @@ export function captureHandoffJson(reply: HandoffReply | undefined, protocol: st
             messages = googleToCore({ contents: [content] } as Parameters<typeof googleToCore>[0]).msgs;
         } else return;
         reply.replace(messages.filter((m) => m.role === "assistant"));
-    } catch { reply.discard(); }
+    } catch (err) {
+        loggerLog("debug", `[handoff] JSON reply capture skipped (codec failed for protocol ${protocol ?? "unknown"}): ${err instanceof Error ? err.message : String(err)}`);
+        reply.discard();
+    }
 }
