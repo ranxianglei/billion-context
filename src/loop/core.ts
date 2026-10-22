@@ -4,6 +4,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import type { HandoffReply } from "../server/handoff-response.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
@@ -185,6 +186,7 @@ export interface LoopCtx {
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
     session: Session;
+    reply?: HandoffReply;
     log: (msg: string) => void;
     proxyUrl?: string;
     /** #2809: diagnostic-only — the proxy the auto chain would have picked
@@ -437,6 +439,13 @@ export async function* runCompressLoop(
     systemPrompt: string,
     signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
+    let replyPart = 0;
+    let replyKind: "text" | "reasoning" | undefined;
+    const recordReplyText = (kind: "text" | "reasoning", text: string) => {
+        if (replyKind !== kind) replyPart++;
+        replyKind = kind;
+        ctx.reply?.append(`part_${replyPart}`, kind, text);
+    };
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     let roundBody: Record<string, unknown> = requestBody;
@@ -757,8 +766,10 @@ export async function* runCompressLoop(
                         }
                         tp.text += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
+                            recordReplyText("text", ev.delta);
                             yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                            recordReplyText("text", ev.delta);
                             yield fwd(adapter.emitText(ev.delta), true);
                         }
                     } else if (ev.kind === "reasoning") {
@@ -781,8 +792,10 @@ export async function* runCompressLoop(
                         if (ev.blockEnd) reasoningSealed = true;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
+                                recordReplyText("reasoning", ev.delta);
                                 yield fwd(ev.raw);
                             } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
+                                recordReplyText("reasoning", ev.delta);
                                 yield fwd(adapter.emitReasoning(ev.delta));
                             }
                         }
@@ -792,6 +805,10 @@ export async function* runCompressLoop(
                         roundParts.push({ kind: "standalone_signature", signature: ev.signature });
                     } else if (ev.kind === "tool_call") {
                         calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
+                        if (ev.passthrough) {
+                            replyKind = undefined;
+                            ctx.reply?.tool(`tool_${++replyPart}`, ev.name, ev.callId, ev.arguments);
+                        }
                     } else if (ev.kind === "usage") {
                         usage = {
                             inputTokens: ev.inputTokens,
@@ -1139,6 +1156,7 @@ export async function* runCompressLoop(
             const functionCallIds = new Set(allCalls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
+                recordReplyText("text", resolvedText);
                 yield adapter.emitText(resolvedText);
             }
 
@@ -1389,6 +1407,8 @@ export async function* runCompressLoop(
 
             for (const tc of realToolCalls) {
                 if (tc.passthrough) continue;
+                replyKind = undefined;
+                ctx.reply?.tool(`tool_${++replyPart}`, tc.name, tc.callId, tc.arguments);
                 yield adapter.emitToolCall(tc);
             }
 
@@ -1414,6 +1434,7 @@ export async function* runCompressLoop(
                     yield adapter.emitError(msg);
                     return;
                 }
+                if (!truncatedDone && streamError === undefined && finishReason !== "failed" && finishReason !== "incomplete" && finishReason !== "error" && !signal?.aborted) ctx.reply?.save();
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
                 // regenerated completion would duplicate them.

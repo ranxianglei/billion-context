@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
+import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, renderMessage, type MessageContentStore, type CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
@@ -83,7 +83,14 @@ function latestBlockTime(s: Session): number {
 }
 
 export function renderHandoff(s: Session, full: boolean): string {
+    const response = s.metadata.handoffResponse as { request?: unknown; messages?: unknown } | undefined;
+    const reply = response?.request === s.stats.requests && Array.isArray(response.messages) && response.messages.every((m): m is CoreMessage =>
+        m !== null && typeof m === "object" && typeof m.id === "string" && m.role === "assistant"
+        && ["text", "reasoning", "tool-call"].includes(m.contentType)
+        && [m.text, m.toolName, m.toolCallId].every((value) => value === undefined || typeof value === "string")
+    ) ? response.messages : [];
     const messages = s.lastMessages;
+    const latestReply = reply.length ? "\n### assistant\n\n" + reply.map(renderMessage).join("\n") + "\n" : "";
     if (messages && messages.length > 0) {
         const folded = s.lastMessagesFolded === true;
         const base = renderHandoffKernel({
@@ -103,7 +110,7 @@ export function renderHandoff(s: Session, full: boolean): string {
                 ],
             },
         });
-        return base + blockSummariesSection(s, full && folded, base);
+        return base + latestReply + blockSummariesSection(s, full && folded, base);
     }
 
     // v2 fallback: no snapshot persisted. Block summaries (+ originals with
@@ -122,7 +129,9 @@ export function renderHandoff(s: Session, full: boolean): string {
     lines.push("");
     const active = s.state.blocks.filter((b) => b.active);
     if (active.length === 0) {
-        lines.push("No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
+        lines.push(reply.length
+            ? "No persisted request snapshot is available. Only the latest assistant response is included below."
+            : "No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
     for (const b of active) {
@@ -146,7 +155,7 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("Paste the block summaries above into a new session to continue without the proxy.");
         lines.push("");
     }
-    return lines.join("\n");
+    return lines.join("\n") + latestReply;
 }
 
 // #845: the kernel handoff never emits state.blocks[].summary, and the persisted

@@ -660,6 +660,53 @@ test("plugin mode: streamed response forwards verbatim while usage is sniffed in
     }
 });
 
+test("plugin handoff includes the completed reply before another request", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const conv = "plug-handoff-latest";
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello" }]);
+        const stats = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/stats`)).json() as {
+            sessions: Array<{ id: string; label?: string }>;
+        };
+        const id = stats.sessions.find((s) => s.label === conv)!.id;
+        const detail = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`)).json() as { handoffMd: string; outputTokens: number };
+        assert.match(detail.handoffMd, /### assistant\n\nplain answer/);
+        assert.equal(detail.outputTokens, 7);
+        await callPluginAnthropic(h, conv, [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "plain answer" },
+            { role: "user", content: "continue" },
+        ]);
+        const next = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`)).json() as { handoffMd: string };
+        assert.equal(next.handoffMd.split("plain answer").length - 1, 2, "one historical reply and one newly completed reply");
+    } finally {
+        await h.close();
+    }
+});
+
+test("proxy handoff includes the completed reply for streaming and JSON requests", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        for (const stream of [true, false]) {
+            const id = `proxy-handoff-${stream}`;
+            const response = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": id },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream, messages: [{ role: "user", content: "hello" }] }),
+            });
+            assert.equal(response.status, 200);
+            await response.text();
+            const detailResponse = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`);
+            assert.equal(detailResponse.status, 200);
+            const detail = await detailResponse.json() as { handoffMd: string };
+            assert.match(detail.handoffMd, /### assistant\n/);
+            assert.ok(detail.handoffMd.includes(stream ? "plain answer" : "non-stream answer"));
+        }
+    } finally {
+        await h.close();
+    }
+});
+
 test("plugin mode: relay-echoed message_delta input_tokens:0 must not zero the sniffed input", async () => {
     // Some relays echo a schema-shaped usage in message_delta with
     // input_tokens: 0 (the spec field is normally absent — message_start is

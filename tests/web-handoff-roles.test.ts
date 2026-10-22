@@ -7,6 +7,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { createInitialState } from "acp-kernel";
+import { renderHandoff } from "../src/export.ts";
+import type { Session } from "../src/session.ts";
 
 interface DomEl {
     tagName: string;
@@ -105,6 +108,34 @@ function loadRenderer(): (md: string) => string {
 const roleCount = (html: string) => (html.match(/class="msg-role /g) || []).length;
 const userRoles = (html: string) => (html.match(/class="msg-role user"/g) || []).length;
 const assistantRoles = (html: string) => (html.match(/class="msg-role assistant"/g) || []).length;
+
+test("latest reply uses the existing assistant block without adding a heading to user content", () => {
+    const session: Session = {
+        id: "latest-reply-layout",
+        meta: {},
+        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        metadata: { handoffResponse: { request: 1, messages: [{ id: "reply", role: "assistant", contentType: "text", text: "ok" }] } },
+        createdAt: 0,
+        lastSeen: 0,
+        state: createInitialState(),
+        pendingRetrievals: [],
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        lastMessages: [{ id: "user", role: "user", contentType: "text", text: "测试 回复ok" }],
+    };
+    const render = loadRenderer();
+    for (const full of [false, true]) {
+        const md = renderHandoff(session, full);
+        const html = render(md);
+        assert.doesNotMatch(md, /## Latest assistant response/);
+        assert.equal(userRoles(html), 1);
+        assert.equal(assistantRoles(html), 1);
+        assert.match(html, /测试 回复ok/);
+        assert.match(html, /class="msg-role assistant">assistant<\/h3><p class="msg-out">ok/);
+        assert.doesNotMatch(html, /Latest assistant response/);
+    }
+});
 
 test("#2065: in-body '### ' headings stay content, not mislabeled assistant blocks", () => {
     const render = loadRenderer();
