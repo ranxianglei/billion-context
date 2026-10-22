@@ -60,6 +60,47 @@ test("defaultCountTokens: mixed ASCII + CJK", () => {
   assert.equal(count, 8);
 });
 
+// #4315: every Han ideograph bills 1 token per CHARACTER (code point), in every
+// extension block, and the chars/4 remainder is computed on CODE UNITS so a
+// supplementary-plane match (2 UTF-16 units) is never double-counted.
+test("defaultCountTokens: Han coverage across extension blocks (#4315)", () => {
+  const cases: Array<[number, string]> = [
+    [0x4e00, "basic block U+4E00"],
+    [0x9fff, "basic block tail U+9FFF"],
+    [0x3400, "extension A U+3400"],
+    [0x4dbf, "extension A tail U+4DBF"],
+    [0xf900, "compatibility ideographs U+F900"],
+    // U+FA6D is the LAST ASSIGNED compatibility ideograph; the block tail
+    // (U+FA6E–U+FAFF) is unassigned and must NOT match.
+    [0xfa6d, "compatibility ideographs tail U+FA6D"],
+    [0x2f800, "compatibility supplement U+2F800"],
+    [0x20000, "extension B U+20000"],
+    [0x2a700, "extension C U+2A700"],
+    [0x30000, "extension G U+30000"],
+  ];
+  for (const [cp, label] of cases) {
+    const text = String.fromCodePoint(cp).repeat(100);
+    assert.equal(
+      defaultCountTokens(text),
+      100,
+      `${label}: 100 chars must bill 100 tokens`,
+    );
+  }
+});
+
+test("defaultCountTokens: supplementary-plane matches do not leak into the /4 remainder (#4315)", () => {
+  // 50 basic + 50 supplementary-plane chars = 150 UTF-16 units. Old code counted
+  // 50 matched chars and left 100 units in the remainder → 50 + 25 = 75.
+  const text = "\u4e00".repeat(50) + String.fromCodePoint(0x20000).repeat(50);
+  assert.equal(defaultCountTokens(text), 100);
+});
+
+test("defaultCountTokens: ASCII behavior unchanged by the Han widening (#4315)", () => {
+  // 50 ASCII (ceil(50/4) = 13) + 50 basic Han (50) → 63, same as before the fix.
+  assert.equal(defaultCountTokens("a".repeat(50) + "\u4e00".repeat(50)), 63);
+  assert.equal(defaultCountTokens("a".repeat(100)), 25);
+});
+
 test("TokenCountFn type is compatible with createCore ports", () => {
   const tokenizer: (text: string) => number = createBpeTokenizer();
   const fast: (text: string) => number = estimateTokensFast;

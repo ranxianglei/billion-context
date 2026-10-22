@@ -547,7 +547,10 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1).blocked, false, "fits");
     assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
+    // #3900 reserves output headroom on every wire (anthropic included), so the
+    // declared window must also carry the max_tokens reservation for the payload
+    // to forward — same shape as the OpenAI case below.
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10) + 100, undefined, undefined, 1).blocked, false, "within the 15% estimator tolerance (after the #3900 reservation) → forward");
     assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
     // OpenAI wire: the output budget counts against the window → headroom reserved.

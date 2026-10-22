@@ -5,7 +5,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, defaultCountTokens } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -52,13 +52,10 @@ function okSse(inputTokens: number): string {
     );
 }
 
-// Realistic tokenizer model matching bili's own CJK-aware estimator (kernel
-// defaultCountTokens): CJK ideographs/syllables bill ~1 token each, everything
-// else ~1 token per 4 characters.
-function realisticTokens(text: string): number {
-    const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) ?? []).length;
-    return cjk + Math.ceil((text.length - cjk) / 4);
-}
+// Realistic tokenizer model: bili's own CJK-aware estimator, imported directly
+// so the mock upstream's window enforcement stays on the kernel's caliber
+// instead of drifting from a copied formula (#4315).
+const realisticTokens = defaultCountTokens;
 
 function textBlockTokens(b: unknown): number {
     if (b && typeof b === "object") {
