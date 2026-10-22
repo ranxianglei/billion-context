@@ -22,8 +22,9 @@
  *                      loads with the exact digest.
  *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
  *                      back to legacy; the legacy file stays readable.
- *   CORRUPT INDEX    — a corrupt index.db degrades the store to legacy-only
- *                      instead of bricking construction (#2771).
+ *   CORRUPT INDEX    — a corrupt index.db self-heals by quarantine instead of
+ *                      bricking construction or pinning legacy-only forever
+ *                      (#2771 guard, #3959 recovery).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
  *
@@ -375,10 +376,12 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
 });
 
 // ---------------------------------------------------------------------------
-// CORRUPT INDEX (#2771): construction degrades to legacy-only.
+// CORRUPT INDEX (#2771/#3959): construction survives via quarantine — the
+// dead index is renamed aside (never deleted), a fresh one opens, and reads
+// recover from the legacy files. The machine is never pinned legacy-only.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (#2771)", async () => {
+test("storage engine: corrupt index.db self-heals by quarantine instead of bricking construction or pinning legacy-only (#2771/#3959)", async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -388,37 +391,48 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         await store.writeNow(session);
         store.closeQuietly();
 
-        // The clean read through full mode — the digest the corrupt-index
-        // fallback must reproduce exactly from the legacy file.
+        // The clean read through full mode — the digest the post-quarantine
+        // recovery must reproduce exactly from the legacy file.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
-        const digestClean = viewDigest(toLegacyLike(viaFull));
 
         // Corrupt the index header (crashed checkpoint / stray write).
         const fd = fs.openSync(path.join(dir, "index.db"), "r+");
         fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
         fs.closeSync(fd);
 
-        // THE #2771 regression: construction must survive, reads must fall
-        // back to the legacy file, and the digest must be exact.
+        // THE #2771/#3959 regression pair: construction must survive AND the
+        // store must come back in full mode (not a permanent legacy pin).
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
-        const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
-        assert.ok(reloaded, "legacy fallback returned null over a corrupt index");
+        try {
+            const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+            assert.ok(reloaded, "post-quarantine read returned null over the fresh index");
+            assert.equal(viewStateDigest(toLegacyLike(reloaded)), viewStateDigest(toLegacyLike(viaFull)), "self-healed read state digest drift vs clean full-mode read");
+            // Writes keep working against the fresh index — no throw.
+            await store2.writeNow(reloaded);
+        } finally {
+            store2.closeQuietly();
+        }
 
-        // Regression (#2781): the failed open must have CLOSED its handle —
-        // Windows refuses to move/delete a directory while any process holds
-        // a file inside it open. On POSIX the rename is a no-op that always
-        // succeeds, so this guard only bites where the bug lives.
+        // Regression (#2781): after close NOTHING may still hold a handle in
+        // the directory — Windows refuses to move/delete a directory while
+        // any process holds a file inside it open (the healed store's live
+        // index.db handle would trip exactly this guard if close leaked it).
+        // On POSIX the rename is a no-op that always succeeds, so it only
+        // bites where the bug lives.
         const moved = dir + "-moved";
         fs.renameSync(dir, moved);
         fs.renameSync(moved, dir);
-        assert.equal(viewStateDigest(toLegacyLike(reloaded)), viewStateDigest(toLegacyLike(viaFull)), "corrupt-index fallback state digest drift vs clean full-mode read");
-        // Writes must keep working (legacy path) — no throw, file refreshed.
-        await store2.writeNow(reloaded);
-        store2.closeQuietly();
+
+        // Forensics contract: the corrupt bytes survive beside the fresh
+        // index, never deleted, under the .corrupt-<timestamp> suffix.
+        const quarantined = fs.readdirSync(dir).filter((n) => n.startsWith("index.db.corrupt-"));
+        assert.equal(quarantined.length, 1, "exactly one quarantine copy of the dead index");
+        const qHead = fs.readFileSync(path.join(dir, quarantined[0])).subarray(0, 512);
+        assert.ok(qHead.every((b) => b === 0x5a), "quarantined header keeps the corrupt bytes verbatim");
+        assert.ok(fs.existsSync(path.join(dir, "index.db")), "a fresh index.db lives next to the quarantine");
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;

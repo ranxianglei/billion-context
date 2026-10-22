@@ -136,7 +136,7 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db degrades to legacy-only instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db self-heals via quarantine instead of bricking the proxy (#2771 → #3959)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
@@ -152,18 +152,28 @@ test("review 3: corrupt index.db degrades to legacy-only instead of bricking the
             await store.writeNow(session);
             const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
             assert.ok(reloaded, "legacy fallback load must succeed");
-            assert.equal(store.replicasAvailable(), false, "shadow is unavailable while degraded");
+            // #3959: a corruption-class open failure no longer degrades
+            // permanently — the dead file is quarantined (renamed, never
+            // deleted) and a fresh index opens, so the sidecar IS available.
+            assert.equal(store.replicasAvailable(), true, "shadow must self-heal a corrupt-class index.db");
+            const quarantined = fs.readdirSync(dir).filter((f) => f.startsWith("index.db.corrupt-"));
+            assert.equal(quarantined.length, 1, "exactly one quarantined copy of the corrupt index");
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "a fresh index.db must exist after self-heal");
             await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
         } finally {
             store!.closeQuietly();
             delete process.env.BILI_STORAGE_UNIFIED;
         }
 
-        // And a later process (fresh handle) still works the same way.
+        // And a later process (fresh handle) sees the HEALED index — no
+        // re-degrade, no second quarantine.
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
             const again = new SessionStore({ dir, debounceMs: 1, enabled: true });
-            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load via legacy");
+            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load");
+            assert.equal(again.replicasAvailable(), true, "second process must see the healed index, not re-degrade");
+            const quarantined = fs.readdirSync(dir).filter((f) => f.startsWith("index.db.corrupt-"));
+            assert.equal(quarantined.length, 1, "no second quarantine on the healthy index");
             again.closeQuietly();
         } finally {
             delete process.env.BILI_STORAGE_UNIFIED;

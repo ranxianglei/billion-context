@@ -1,7 +1,9 @@
 // #3040 web surface: SQLite unified storage degrades to legacy-only through
 // several fail-open paths (#2825 contract): engine ladder exhausted,
-// self-download blocked in cooldown, corrupt index.db guard (#2771), 3-strike
-// sidecar disable. The proxy keeps running on JSON — correct — but until now
+// self-download blocked in cooldown, 3-strike sidecar disable. (A corrupt
+// index.db is NO LONGER one of them since #3959: it self-heals by quarantine
+// instead of pinning the machine legacy-only forever.) The proxy keeps
+// running on JSON — correct — but until now
 // the condition was only visible as one-time log lines, so environments that
 // cannot run SQLite were never learned about before the upcoming full-mode
 // default flip. These tests pin the wire contract the web banner reads:
@@ -20,7 +22,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -299,7 +301,7 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
     }
 });
 
-test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
+test("#3040 corrupt index.db (guard #2771): self-heals by quarantine — no permanent legacy pin, no banner (#3959)", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
     let store: SessionStore | null = null;
@@ -309,7 +311,8 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         delete process.env.BILI_STORAGE_UNIFIED;
         delete process.env.BILI_ENCRYPTION_KEY;
         const dir = process.env.BILI_SESSIONS_DIR!;
-        writeFileSync(path.join(dir, "index.db"), Buffer.from("this is definitely not a sqlite database file".repeat(8)));
+        const corruptBytes = Buffer.from("this is definitely not a sqlite database file".repeat(8));
+        writeFileSync(path.join(dir, "index.db"), corruptBytes);
         store = new SessionStore({ dir, enabled: true });
         _setStoreForTest(store);
         const upstreamPort = await freePort();
@@ -319,11 +322,15 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         try {
             const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
             assert.equal(o.storage.requested, "full");
-            assert.equal(o.storage.effective, "legacy");
-            assert.equal(o.storage.degraded, true, "corrupt index.db trips the warning");
+            assert.equal(o.storage.effective, "full", "self-heal recovers full mode instead of pinning legacy-only (#3959)");
+            assert.equal(o.storage.degraded, false, "quarantine + fresh open must NOT raise the warning");
             assert.equal(o.storage.intentionalOptOut, false);
-            assert.match(o.storage.reason ?? "", /index database failed to open/);
-            assert.equal(o.storage.engine, null);
+            assert.equal(o.storage.reason, null);
+            assert.ok(o.storage.engine, "the fresh index reports a live engine");
+            // Forensics contract: the dead file is renamed aside, never deleted.
+            const quarantined = readdirSync(dir).filter((n) => n.startsWith("index.db.corrupt-"));
+            assert.equal(quarantined.length, 1, "exactly one quarantine copy beside the fresh index");
+            assert.deepEqual(readFileSync(path.join(dir, quarantined[0])), corruptBytes, "quarantine preserves the exact corrupt bytes");
         } finally {
             await close(proxy);
         }

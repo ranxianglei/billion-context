@@ -246,6 +246,17 @@ function loadHostBetterSqlite3(): BetterSqlite3Ctor {
     return require("better-sqlite3") as unknown as BetterSqlite3Ctor;
 }
 
+/** #3959: genuine file CORRUPTION (SQLITE_CORRUPT / SQLITE_NOTADB) only —
+ *  the class where quarantining index.db is safe. Deliberately narrow:
+ *  CANTOPEN/BUSY/permission/no-engine failures may face a perfectly healthy
+ *  file behind an OS lock (#3823) and must NOT trip quarantine. */
+export function isCorruptIndexError(err: unknown): boolean {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB") return true;
+    const msg = err instanceof Error ? err.message : String(err);
+    return /database disk image is malformed/i.test(msg) || /file is not a database/i.test(msg);
+}
+
 export function openSqliteDatabase(path: string, engine?: SqliteEngineName): OpenedDatabase {
     if (enginesUnavailableForTests) {
         throw new SqliteDriverError("no SQLite engine available", "node:sqlite");

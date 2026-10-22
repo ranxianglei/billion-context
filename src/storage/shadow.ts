@@ -18,9 +18,13 @@
  * Failure policy: sidecar problems must NEVER break the legacy write path.
  * All work is try/catch'd; after MAX_CONSECUTIVE_FAILURES consecutive
  * failures the sidecar disables itself for the process (warn once) — in
- * full mode that also flips reads back to legacy-only.
+ * full mode that also flips reads back to legacy-only. Genuine index.db
+ * CORRUPTION at open time self-heals instead (#3959): the dead file is
+ * quarantined (renamed, never deleted) and a fresh index opens — the legacy
+ * JSON files remain the source of truth, so nothing is lost.
  */
 
+import { renameSync } from "node:fs";
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
@@ -29,6 +33,7 @@ import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSumma
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
+import { isCorruptIndexError } from "./driver.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
@@ -169,26 +174,54 @@ export class UnifiedShadow {
             const notice = backendSelectionNotice(selected);
             if (notice) loggerLog("warn", notice);
         }
-        let store: UnifiedStore;
+        const indexPath = `${dir}/index.db`;
+        let store: UnifiedStore | null = null;
         try {
-            store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            store = UnifiedStore.open(indexPath, undefined, { walJournalSizeLimitBytes: walLimit });
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
             // watermark behind; drop them all so this process's first save
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
-            // #2771: a corrupt/unreadable index.db must degrade to legacy-only
-            // (same shape as the encryption opt-out), never brick SessionStore
-            // construction. No auto-delete: the index may hold pinned checkpoint
-            // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
+            // #2771 kept corrupt-index recovery manual ("delete the file")
+            // because DESTRUCTION was operator policy: the index may hold
+            // pinned checkpoint blobs (#2671 Phase 2). #3959 field report:
+            // that made one corrupt index.db pin the machine to legacy-only
+            // forever until someone deleted it by hand. QUARANTINE (rename,
+            // never delete) removes the manual step without the data risk —
+            // the legacy JSON session files remain the source of truth in
+            // BOTH shadow and full mode (full keeps writing them), so a
+            // fresh index converges as sessions save/load again, and the old
+            // bytes stay on disk beside the original for forensics.
+            let quarantinedTo: string | null = null;
+            if (isCorruptIndexError(err)) {
+                quarantinedTo = quarantineCorruptIndex(indexPath);
+                if (quarantinedTo) {
+                    try {
+                        store = UnifiedStore.open(indexPath, undefined, { walJournalSizeLimitBytes: walLimit });
+                        store.resetAllIngestWatermarks();
+                    } catch (retryErr) {
+                        store = null;
+                        loggerLog("error", `[storage] fresh index open after quarantine also failed (${String(retryErr)}) — staying legacy-only`);
+                    }
+                } else {
+                    loggerLog("error", `[storage] could not quarantine corrupt index ${indexPath} (${errStr}) — staying legacy-only`);
+                }
+            }
+            if (!store) {
+                loggerLog(
+                    "warn",
+                    `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`,
+                );
+                recordSidecarOpenFailure(errStr);
+                return null;
+            }
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`,
+                `[storage] unified sidecar index was corrupt (${errStr}) — quarantined to ${quarantinedTo} and opened a fresh index; sessions re-ingest from their legacy files as they are saved/loaded`,
             );
-            recordSidecarOpenFailure(errStr);
-            return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
         recordSidecarInstance(shadow);
@@ -1029,6 +1062,32 @@ export class UnifiedShadow {
             loggerLog("warn", `[storage] sidecar sqlite close failed — handle may stay locked: ${String(err)}`);
         }
     }
+}
+
+/** #3959: rename a corrupt index.db (+ its -wal/-shm/-journal sidecars) out
+ *  of the way under a `.corrupt-<timestamp>` suffix — the same quarantine
+ *  pattern persist.ts applies to undecodable session state (#3157): kept for
+ *  forensics, never deleted, and the suffix keeps directory walkers off it
+ *  (they match *.json). Returns the main file's quarantine path, or null
+ *  when even the main rename failed (caller keeps the legacy-only degrade).
+ *  Sidecar renames are best-effort: a stale WAL left behind cannot poison
+ *  the fresh db — verified empirically (node:sqlite 22.x): a fresh open over
+ *  an orphaned unclean-exit WAL resets the WAL, integrity_check stays ok. */
+function quarantineCorruptIndex(file: string): string | null {
+    const quarantinePath = `${file}.corrupt-${Date.now()}`;
+    try {
+        renameSync(file, quarantinePath);
+    } catch {
+        return null;
+    }
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+        try {
+            renameSync(`${file}${suffix}`, `${quarantinePath}${suffix}`);
+        } catch {
+            // absent or locked — harmless (see doc comment)
+        }
+    }
+    return quarantinePath;
 }
 
 function shadowDigest(view: unknown): string {
