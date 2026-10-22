@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { createInitialState } from "acp-kernel";
-import { renderHandoff } from "../src/export.ts";
+import { renderHandoff, HANDOFF_THINK_END } from "../src/export.ts";
 import type { Session } from "../src/session.ts";
 
 interface DomEl {
@@ -135,6 +135,103 @@ test("latest reply uses the existing assistant block without adding a heading to
         assert.match(html, /class="msg-role assistant">assistant<\/h3><p class="msg-out">ok/);
         assert.doesNotMatch(html, /Latest assistant response/);
     }
+});
+
+test("latest reply keeps thinking out of the answer text", () => {
+    const session = {
+        id: "reply-thinking",
+        meta: { protocol: "openai", title: "Thinking reply" },
+        stats: { requests: 3, inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0 },
+        metadata: {
+            handoffResponse: {
+                request: 3,
+                messages: [
+                    { id: "r1", role: "assistant", contentType: "reasoning", text: "plan the answer\n\nthen write it" },
+                    { id: "r2", role: "assistant", contentType: "text", text: "最终答案在这里" },
+                ],
+            },
+        },
+        createdAt: 0,
+        lastSeen: 0,
+        state: createInitialState(),
+        pendingRetrievals: [],
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        lastMessages: [{ id: "user", role: "user", contentType: "text", text: "提问" }],
+    } as unknown as Session;
+    const render = loadRenderer();
+    const md = renderHandoff(session, false);
+    const html = render(md);
+    assert.match(md, /_reasoning_: plan the answer/);
+    assert.equal(md.split("\n").filter((l) => l === "### assistant").length, 1, "one reply stays one assistant block");
+    assert.ok(md.includes(HANDOFF_THINK_END), "reasoning cell is terminated inside the block");
+    assert.ok(
+        md.indexOf(HANDOFF_THINK_END) < md.indexOf("最终答案在这里"),
+        "the marker sits between the reasoning and the answer",
+    );
+    const thinkBoxes = html.match(/<details class="msg-think">[\s\S]*?<\/details>/g) ?? [];
+    assert.equal(thinkBoxes.length, 1);
+    assert.match(thinkBoxes[0]!, /plan the answer/);
+    assert.doesNotMatch(thinkBoxes[0]!, /最终答案在这里/, "answer must not be swallowed by the thinking box");
+    assert.match(html, /<p class="msg-out">最终答案在这里/);
+    assert.equal(assistantRoles(html), 1, "thinking and answer share one assistant card");
+    assert.ok(
+        html.indexOf('<details class="msg-think">') < html.indexOf('<p class="msg-out">最终答案在这里'),
+        "the reasoning block renders before the answer",
+    );
+    assert.doesNotMatch(html, /\/reasoning/, "the end marker is not rendered as text");
+});
+
+test("handoff think marker is shared by the export and the web renderer", () => {
+    assert.ok(WEB_CLIENT.includes(HANDOFF_THINK_END), "WEB_CLIENT mirrors the export's think-end marker");
+});
+
+test("a reply that thinks again after a tool call keeps its chronology", () => {
+    const session = {
+        id: "reply-thinking-twice",
+        meta: { protocol: "openai", title: "Interleaved reply" },
+        stats: { requests: 4, inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0 },
+        metadata: {
+            handoffResponse: {
+                request: 4,
+                messages: [
+                    { id: "r1", role: "assistant", contentType: "reasoning", text: "第一段思考" },
+                    { id: "r2", role: "assistant", contentType: "text", text: "先看工具输出" },
+                    { id: "r3", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_1", text: "{}" },
+                    { id: "r4", role: "assistant", contentType: "reasoning", text: "第二段思考" },
+                    { id: "r5", role: "assistant", contentType: "text", text: "最终答案" },
+                ],
+            },
+        },
+        createdAt: 0,
+        lastSeen: 0,
+        state: createInitialState(),
+        pendingRetrievals: [],
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        lastMessages: [{ id: "user", role: "user", contentType: "text", text: "提问" }],
+    } as unknown as Session;
+    const md = renderHandoff(session, false);
+    const html = loadRenderer()(md);
+    const order = ["第一段思考", "先看工具输出", "read(call_1)", "第二段思考", "最终答案"].map((needle) => {
+        const at = md.indexOf(needle);
+        assert.ok(at >= 0, `missing ${needle}`);
+        return at;
+    });
+    assert.deepEqual(order, [...order].sort((a, b) => a - b), "cells keep arrival order (no regrouping around the tool call)");
+    assert.equal(md.split("\n").filter((l) => l === HANDOFF_THINK_END).length, 2, "each reasoning cell is closed");
+    const thinkBoxes = html.match(/<details class="msg-think">[\s\S]*?<\/details>/g) ?? [];
+    assert.equal(thinkBoxes.length, 2, "two thinking cells stay two collapsed boxes");
+    assert.match(thinkBoxes[0]!, /第一段思考/);
+    assert.doesNotMatch(thinkBoxes[0]!, /先看工具输出/);
+    assert.match(thinkBoxes[1]!, /第二段思考/);
+    assert.doesNotMatch(thinkBoxes[1]!, /最终答案/);
+    assert.match(html, /<p class="msg-out">先看工具输出/);
+    assert.match(html, /<p class="msg-out">最终答案/);
+    assert.match(html, /msg-tool/);
+    assert.equal(assistantRoles(html), 1, "the whole turn stays one assistant card");
 });
 
 test("#2065: in-body '### ' headings stay content, not mislabeled assistant blocks", () => {

@@ -82,6 +82,28 @@ function latestBlockTime(s: Session): number {
     return latest;
 }
 
+/** Ends the reasoning cell inside a single assistant block. `renderMessage`
+ *  emits `_reasoning_: …` with no terminator, so without it the handoff
+ *  renderer folds the answer that follows into the collapsed thinking box.
+ *  An HTML comment keeps the marker invisible in rendered Markdown. */
+export const HANDOFF_THINK_END = "<!-- /reasoning -->";
+
+/** Renders one finished turn in arrival order and closes each reasoning cell so
+ *  the prose that follows it stays prose. Order is NOT regrouped: a reply can
+ *  think again after a tool call, and hoisting that second cell above the text
+ *  it followed would rewrite the turn's chronology in the handoff doc. */
+function renderReplyCells(messages: CoreMessage[]): string {
+    const cells: string[] = [];
+    for (let i = 0; i < messages.length; i += 1) {
+        const m = messages[i];
+        if (!m) continue;
+        cells.push(renderMessage(m).trimEnd());
+        const next = messages[i + 1];
+        if (m.contentType === "reasoning" && next?.contentType === "text") cells.push(HANDOFF_THINK_END);
+    }
+    return cells.join("\n\n") + "\n";
+}
+
 export function renderHandoff(s: Session, full: boolean): string {
     const response = s.metadata.handoffResponse as { request?: unknown; messages?: unknown } | undefined;
     const reply = response?.request === s.stats.requests && Array.isArray(response.messages) && response.messages.every((m): m is CoreMessage =>
@@ -90,7 +112,8 @@ export function renderHandoff(s: Session, full: boolean): string {
         && [m.text, m.toolName, m.toolCallId].every((value) => value === undefined || typeof value === "string")
     ) ? response.messages : [];
     const messages = s.lastMessages;
-    const latestReply = reply.length ? "\n### assistant\n\n" + reply.map(renderMessage).join("\n") + "\n" : "";
+    // Keep one assistant turn in arrival order, with explicit reasoning boundaries.
+    const latestReply = reply.length ? "\n### assistant\n\n" + renderReplyCells(reply) : "";
     if (messages && messages.length > 0) {
         const folded = s.lastMessagesFolded === true;
         const base = renderHandoffKernel({
