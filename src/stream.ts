@@ -6,6 +6,7 @@ import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurn
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { formatUncoveredHistory, uncoveredHistory } from "./uncovered-history.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
@@ -605,7 +606,25 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // Partial failures stay silent too: the model still owes the errors an answer
     // before any "you are done" verdict (pi #521 gate).
     if (!cleanSuccess || tier !== null) return "";
-    return `\n\n${NO_RANGES_REMAIN_TEXT}`;
+    // #4331: "no ranges remain" is scoped to the fold scanner's offer, not to
+    // actual coverage. Traffic between two fold boundaries is never offered, so
+    // the stop verdict alone would claim a completeness that does not hold.
+    let uncoveredNote = "";
+    try {
+        const uncovered = uncoveredHistory(ctx.session.state, ctx.messages, {
+            preserveRecentMessages: ctx.config.preserveRecentMessages,
+            maxRuns: 2,
+            // #1387/pi #521: a receipt must not re-nag about leftovers the fold
+            // scanner deliberately declined. Only a material blind spot (the
+            // kind a coverage audit can prove) earns a line here; acp_status
+            // shows the full inventory.
+            minTokens: 10_000,
+        });
+        uncoveredNote = formatUncoveredHistory(uncovered, { compact: true }).join(" ");
+    } catch {
+        uncoveredNote = "";
+    }
+    return uncoveredNote ? `\n\n${NO_RANGES_REMAIN_TEXT}\n${uncoveredNote}` : `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 
 // #1495: the kernel's lenient parser salvages complete entries from damaged

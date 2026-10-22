@@ -19,6 +19,7 @@ import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
+import { formatUncoveredHistory, uncoveredHistory } from "./uncovered-history.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -274,6 +275,18 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
+    }
+    // #4331: the fold scanner only offers spans it can prove from the current
+    // view; messages that fell between two fold boundaries are invisible to it
+    // yet still ride the wire on every request. Audit coverage independently so
+    // the "no compressible ranges remain" verdict never stands unqualified.
+    const uncovered = uncoveredHistory(ctx.session.state, ctx.messages, {
+        preserveRecentMessages: ctx.config.preserveRecentMessages,
+        maxRuns: 3,
+    });
+    if (uncovered.messageCount > 0) {
+        extra.push("");
+        extra.push(...formatUncoveredHistory(uncovered));
     }
     // #2362: dead refs — known to the session but no longer backed by any
     // visible or folded message (client history rewrite / host-native
