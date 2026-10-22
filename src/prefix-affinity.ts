@@ -134,16 +134,9 @@ export interface AnonymousAffinity {
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
-    /** #2791: IDENTIFIED session ids whose #2601 normalized tail fingerprint
-     *  matches this request even though the byte chain diverged — the shape of
-     *  a conversation replayed ANONYMOUSLY under a re-serialization the exact
-     *  ladder cannot see (e.g. dsh switching the profile's wire protocol: every
-     *  message changes shape, so chainHashes/itemHashes diverge from position 0
-     *  and fork-lineage LCP is 0). Diagnostics ONLY: #1486 stands, the
-     *  anonymous world never adopts an identified session — this field exists
-     *  so the server can WARN that the identified conversation just lost its
-     *  client to an anonymous fork (orphaned fold ledger, silent re-fold
-     *  downstream) instead of the loss being fully silent. */
+    /** A unique identified history replayed without identity, verified by its
+     *  full prefix at the resume evidence floor. Diagnostics only: no adoption
+     *  and no proof that the identified client stopped using its original id. */
     orphanSuspect?: string[];
 }
 
@@ -713,34 +706,17 @@ export class PrefixAffinityResolver {
         if (lineage === undefined && v1Depth > 0) {
             lineage = this.lineageOf(perItemHashes(messages).slice(-MAX_STORED_ITEMS), v1Depth);
         }
-        // #2791 orphan-suspect scan (diagnostics only): a cross-shape replay
-        //  breaks EVERY per-item hash, so the ladders above are structurally
-        //  blind to "the same conversation, replayed without identity". The
-        //  #2601 normalized tail fingerprint (churn keys dropped, content
-        //  leaves ≥ MIN_NORM_LEAF_LEN only, folded through
-        //  normalizeMessageText) survives re-serialization of the SAME turn:
-        //  fingerprint the incoming list AT THE POSITION where the identified
-        //  chain ended (entry.depth ≤ incomingDepth — a stateless replay may
-        //  have appended turns since). Matching is not adoption evidence —
-        //  it is orphan evidence: that conversation's client went anonymous
-        //  and its fold ledger is about to be orphaned by this fresh mint.
-        //  Append bound uses the simhash rung's yardstick.
+        // Identified histories are diagnostic candidates only. Reuse the resume
+        // evidence floor and require a unique full-prefix match in its hash domain;
+        // one shared tail (e.g. a title request's opener) cannot establish replay.
         let orphanSuspect: string[] | undefined;
         for (const entry of tracked.values()) {
-            if (!entry.identified) continue;
-            if (entry.normTailHash === undefined) continue;
-            if (incomingDepth < entry.depth || incomingDepth > entry.depth + ALIGN_TAIL_APPEND_MAX) continue;
-            // #2791: judge in the entry's hash domain — hv2 entries (noted
-            //  after the wire-neutral switch) carry a neutral-domain
-            //  normTailHash over NEUTRAL TURNS (turn count != raw message
-            //  count once assistants merge or multi-tool_result user
-            //  messages split); pre-upgrade hv1 entries keep the raw-wire
-            //  #2601 fingerprint.
-            const suspectTail = entry.hv === 2
-                ? neutralTailHashOf(turns, entry.depth)
-                : normalizedTailHashOf(messages, entry.depth);
-            if (suspectTail === undefined || suspectTail !== entry.normTailHash) continue;
-            (orphanSuspect ?? (orphanSuspect = [])).push(entry.sessionId);
+            if (!entry.identified || entry.depth < MIN_RESUME_PREFIX) continue;
+            const domainHashes = entry.hv === 2 ? hashes : v1Hashes;
+            if (domainHashes.length < entry.depth || domainHashes.length > entry.depth + ALIGN_TAIL_APPEND_MAX) continue;
+            if (domainHashes[entry.depth - 1] !== entry.tailHash) continue;
+            if (orphanSuspect) { orphanSuspect = undefined; break; }
+            orphanSuspect = [entry.sessionId];
         }
         const sessionId = `pfa-${sha256(`${tailHash}\u0000${incomingDepth}`).slice(0, 16)}`;
         return {

@@ -1,34 +1,6 @@
-// #2791: the silent half of an identity-loss takeover. When a host loses its
-// client identity mid-conversation (the observed case: dsh's
-// anthropic-messages lane bypasses the native-intercept fetch patch, so its
-// requests arrive with ZERO bili headers), the anonymous resolver mints a
-// fresh pfa-* session and the identified conversation's fold ledger is
-// orphaned with NO observable signal — the next request pays a full silent
-// re-fold (#2733/#2741 observed a 263%-of-window replay).
-//
-// The root cause (host fetch-capture timing) is out of bili's reach, but the
-// SILENCE is a bili-side signal-chain break and fully provable: the resolver
-// already sees (a) an identified chain whose depth the incoming anonymous
-// history reaches, and (b) the #2601 normalized tail fingerprint, which
-// survives cross-wire re-serialization of the same turn. This suite pins the
-// detection contract:
-//   - resolver level: a cross-shaped anonymous replay (every per-item hash
-//     diverges, so the exact/simhash/fork ladders are structurally blind)
-//     flags the identified chain in `orphanSuspect` WITHOUT adopting it
-//     (#1486 stands — resolution is unchanged, still a fresh pfa-* mint);
-//   - negatives: different content, an anonymous (non-identified) chain, or a
-//     replay far deeper than the append bound do NOT flag;
-//   - server level: the mint consumes the flag — a warn log line plus an
-//     `identity-orphan` conflict event on the ORPHANED session naming the
-//     fresh fork id, while the orphaned session's compression state is left
-//     untouched (the detection is diagnostics-only, never a repair).
-//
-// Harness: unit tests drive the resolver directly (same idiom as
-// issue2601-model-drift-absorption); the integration test runs one chat-lane
-// startServer rig — the detection logic is protocol-agnostic (it consumes the
-// normalized message projection), the wire shape of the replay is simulated
-// by re-serializing content strings into content-arrays, which is exactly the
-// openai-vs-anthropic shape churn that blinded the byte ladders in #2791.
+// #2791: diagnose anonymous replays only from a unique complete history
+// prefix at the resume evidence floor. Shared openers/tails do not establish
+// identity loss. Detection never adopts or changes an identified session.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -42,7 +14,7 @@ import { once } from "node:events";
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bc-2791-orphan-"));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 
-const { prefixAffinity } = await import("../src/prefix-affinity.ts");
+const { prefixAffinity, PrefixAffinityResolver, rawChainFingerprint } = await import("../src/prefix-affinity.ts");
 
 test.after(() => fs.rmSync(testRoot, { recursive: true, force: true }));
 
@@ -53,10 +25,7 @@ const msg = (i: number, tag: string): Msg => ({
     content: `${tag}-${i + 1}-` + "y".repeat(120),
 });
 
-/** The #2791 shape churn: string content -> content:[{type:"text"}] — the
- *  same turn on the anthropic lane. Every byte-ladder hash diverges; the
- *  normalized projection (content leaves ≥ MIN_NORM_LEAF_LEN + role marker)
- *  does not. */
+/** The same conversation rendered with text blocks instead of strings. */
 const crossShaped = (chain: Msg[]): unknown[] =>
     chain.map((m) => ({ role: m.role, content: [{ type: "text", text: m.content }] }));
 
@@ -72,13 +41,11 @@ function seedIdentified(conv: string, chain: Msg[]): void {
 
 test("resolver: a cross-shaped anonymous replay flags the identified chain without adopting it (#2791)", () => {
     const conv = "orphan-unit-1";
-    const chain = Array.from({ length: 6 }, (_, i) => msg(i, "conv1"));
+    const chain = Array.from({ length: 8 }, (_, i) => msg(i, "conv1"));
     seedIdentified(conv, chain);
 
-    // The anonymous replay carries the same conversation re-serialized, plus
-    // two appended turns (the host's new question) — the positional
-    // fingerprint must look at the position where the chain ended.
-    const replay = [...crossShaped(chain), msg(6, "conv1"), msg(7, "conv1")];
+    // The full stored prefix must survive protocol re-serialization and appends.
+    const replay = [...crossShaped(chain), msg(8, "conv1"), msg(9, "conv1")];
     const out = prefixAffinity.resolve(replay)!;
     assert.ok(out, "resolver returns a mint");
     assert.equal(out.via, "new", "no adoption: #1486 stands");
@@ -87,11 +54,71 @@ test("resolver: a cross-shaped anonymous replay flags the identified chain witho
     assert.deepEqual(out.orphanSuspect, [conv], "the orphaned identified chain is named");
 });
 
+test("resolver: auxiliary requests sharing an opener do not orphan identified sessions", () => {
+    for (const opener of ["你好", "你是谁", "你好啊？", "shared instruction ".repeat(40)]) {
+        const resolver = new PrefixAffinityResolver();
+        const main = [{ role: "system", content: "Main agent" }, { role: "user", content: opener }];
+        const fp = resolver.chainFingerprint(main)!;
+        resolver.note("main", fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
+        const before = resolver.exportSnapshot();
+        const out = resolver.resolve([{ role: "system", content: "Generate a title" }, { role: "user", content: opener }])!;
+        assert.equal(out.via, "new");
+        assert.equal(out.orphanSuspect, undefined, "a shared opener is not evidence of a lost identity");
+        assert.deepEqual(resolver.exportSnapshot(), before, "diagnostics never mutate the tracked sessions");
+    }
+});
+
+test("resolver: identical final turns with unrelated preceding history do not flag", () => {
+    const resolver = new PrefixAffinityResolver();
+    const original = Array.from({ length: 10 }, (_, i) => msg(i, "original"));
+    const fp = resolver.chainFingerprint(original)!;
+    resolver.note("main", fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
+    const unrelated = Array.from({ length: 10 }, (_, i) => msg(i, "unrelated"));
+    unrelated[9] = original[9]!;
+    const out = resolver.resolve(crossShaped(unrelated))!;
+    assert.equal(out.orphanSuspect, undefined, "matching only the last turn must not flag a different conversation");
+});
+
+test("resolver: shared short prefixes and ambiguous full replays do not flag", () => {
+    for (const [depth, candidates] of [[7, 1], [8, 2]] as const) {
+        const resolver = new PrefixAffinityResolver();
+        const original = Array.from({ length: depth }, (_, i) => msg(i, "shared"));
+        const fp = resolver.chainFingerprint(original)!;
+        for (let i = 0; i < candidates; i++) {
+            resolver.note(`main-${i}`, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash);
+        }
+        assert.equal(resolver.resolve(crossShaped(original))!.orphanSuspect, undefined);
+    }
+});
+
+test("resolver: a unique eight-turn full prefix still reports an anonymous replay", () => {
+    const resolver = new PrefixAffinityResolver();
+    const original = Array.from({ length: 8 }, (_, i) => msg(i, "full-prefix"));
+    const fp = resolver.chainFingerprint(original)!;
+    // Full prefix evidence works even for snapshots that lack a normalized-tail hint.
+    resolver.note("main", fp.depth, fp.tailHash, fp.itemHashes, true);
+    const out = resolver.resolve([...crossShaped(original), msg(8, "next")])!;
+    assert.deepEqual(out.orphanSuspect, ["main"]);
+    assert.equal(out.via, "new", "the diagnostic does not adopt the identified session");
+    assert.notEqual(out.sessionId, "main");
+});
+
+test("resolver: legacy entries require their full raw prefix too", () => {
+    const original = Array.from({ length: 8 }, (_, i) => msg(i, "legacy"));
+    const fp = rawChainFingerprint(original)!;
+    const resolver = new PrefixAffinityResolver();
+    resolver.importSnapshot([{ sessionId: "legacy", ...fp, identified: true, lastSeen: Date.now(), normTailHash: "a".repeat(64) }]);
+    assert.deepEqual(resolver.resolve([...original, msg(8, "next")])!.orphanSuspect, ["legacy"]);
+    const rewritten = original.map((m) => ({ ...m, content: "unrelated " + m.content }));
+    rewritten[7] = original[7]!;
+    assert.equal(resolver.resolve(rewritten)!.orphanSuspect, undefined);
+});
+
 test("resolver: different content under the same shape churn does not flag", () => {
     const conv = "orphan-unit-2";
-    seedIdentified(conv, Array.from({ length: 6 }, (_, i) => msg(i, "conv2")));
-    const foreign = crossShaped(Array.from({ length: 6 }, (_, i) => msg(i, "other")));
-    const out = prefixAffinity.resolve([...foreign, msg(6, "other"), msg(7, "other")])!;
+    seedIdentified(conv, Array.from({ length: 8 }, (_, i) => msg(i, "conv2")));
+    const foreign = crossShaped(Array.from({ length: 8 }, (_, i) => msg(i, "other")));
+    const out = prefixAffinity.resolve([...foreign, msg(8, "other"), msg(9, "other")])!;
     assert.equal(out.via, "new");
     assert.equal(out.orphanSuspect, undefined, "foreign content is not an orphan suspect");
 });
@@ -115,15 +142,15 @@ test("resolver: an anonymous chain forking again is not an orphan event", () => 
 
 test("resolver: a replay far past the append bound does not flag", () => {
     const conv = "orphan-unit-4";
-    const chain = Array.from({ length: 4 }, (_, i) => msg(i, "conv4"));
+    const chain = Array.from({ length: 8 }, (_, i) => msg(i, "conv4"));
     seedIdentified(conv, chain);
-    const deep = [...crossShaped(chain), ...Array.from({ length: 80 }, (_, i) => msg(4 + i, "conv4"))];
+    const deep = [...crossShaped(chain), ...Array.from({ length: 80 }, (_, i) => msg(8 + i, "conv4"))];
     const out = prefixAffinity.resolve(deep)!;
     assert.equal(out.via, "new");
     assert.equal(out.orphanSuspect, undefined, "out of the append window the tail fingerprint is not evidence");
 });
 
-test("server: an identity-loss takeover warns and records identity-orphan on the orphaned session (#2791)", { timeout: 120_000 }, async () => {
+test("server: auxiliary openers stay quiet while a full anonymous replay records possible identity loss (#2791)", { timeout: 120_000 }, async () => {
     const { startServer } = await import("../src/server.ts");
     const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
     const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
@@ -174,6 +201,29 @@ test("server: an identity-loss takeover warns and records identity-orphan on the
     const proxyPort = (proxy.address() as { port: number }).port;
     const base = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
     try {
+        for (const [i, opener] of ["你好", "你是谁", "你好啊？"].entries()) {
+            const cid = `${CONV}-opener-${i}`;
+            const original = [{ role: "system", content: "Main agent" }, { role: "user", content: opener }];
+            const send = async (messages: unknown[], identified: boolean): Promise<string> => {
+                const response = await fetch(base, {
+                    method: "POST",
+                    headers: { "content-type": "application/json", ...(identified ? { "x-bili-plugin": "hermes", "x-bili-plugin-conversation": cid } : {}) },
+                    body: JSON.stringify({ model: "gpt-orphan", stream: true, messages }),
+                });
+                assert.equal(response.status, 200);
+                return response.text();
+            };
+            await send(original, true);
+            const main = getSession(cid)!;
+            const refs = JSON.stringify(main.state.messageRefs);
+            assert.match(await send([{ role: "system", content: "Generate a title" }, { role: "user", content: opener }], false), /acknowledged/);
+            assert.deepEqual(conflictEventsOf(main), [], "the auxiliary request must not create an identity-orphan event");
+            assert.equal(JSON.stringify(main.state.messageRefs), refs);
+            await send([...original, { role: "assistant", content: "reply" }, { role: "user", content: "continue" }], true);
+            assert.equal(main.stats.requests, 2, "the original ID remains usable after the auxiliary request");
+            assert.deepEqual(conflictEventsOf(main), []);
+            prefixAffinity.forget(cid);
+        }
         // Phase 1: the identified (plugin) era — the conversation lives under
         // x-bili-plugin headers, exactly like the pre-switch dsh openai lane.
         const conv: Msg[] = Array.from({ length: 6 }, (_, i) => msg(i, "live"));
@@ -197,12 +247,14 @@ test("server: an identity-loss takeover warns and records identity-orphan on the
         assert.equal(resp.status, 200, "the anonymous replay is still served");
         await resp.text();
 
-        // The takeover must not be silent: the orphaned session carries an
-        // identity-orphan conflict event naming the fresh pfa-* fork.
+        // The diagnostic names the anonymous replay without claiming proven state loss.
         const events = conflictEventsOf(getSession(CONV)!).filter((e) => e.kind === "identity-orphan");
         assert.equal(events.length, 1, `exactly one identity-orphan event, got ${JSON.stringify(conflictEventsOf(getSession(CONV)!))}`);
         assert.match(events[0]!.detail, /pfa-[0-9a-f]{16}/, "the event names the fresh anonymous fork");
         assert.match(events[0]!.detail, /#2791/);
+        assert.match(events[0]!.detail, /verified full history prefix/);
+        assert.match(events[0]!.detail, /possible identity loss, original session state retained/);
+        assert.doesNotMatch(events[0]!.detail, /fold continuity lost/);
 
         // Diagnostics-only: resolution and the orphaned session's compression
         // state are untouched (#1486 stands, no repair side effects).
