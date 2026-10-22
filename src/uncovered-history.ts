@@ -1,14 +1,14 @@
 import { countMessageTokens, defaultCountTokens, type CompressionBlock, type CompressionState, type CoreMessage } from "acp-kernel";
 
 /** A contiguous run of ref-bearing messages that no active block covers. */
-export interface UncoveredRun {
+interface UncoveredRun {
     startRef: string;
     endRef: string;
     count: number;
     tokens: number;
 }
 
-export interface UncoveredHistoryReport {
+interface UncoveredHistoryReport {
     /** Largest runs, capped by `maxRuns`. */
     runs: UncoveredRun[];
     /** Total uncovered runs in the report window. */
@@ -19,7 +19,7 @@ export interface UncoveredHistoryReport {
     tokens: number;
 }
 
-export interface UncoveredHistoryOptions {
+interface UncoveredHistoryOptions {
     /** Soft-protected tail size; the last N ref-bearing messages are excluded. */
     preserveRecentMessages?: number;
     /** How many runs to list (largest first). Default 3. */
