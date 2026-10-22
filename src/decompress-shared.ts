@@ -548,11 +548,14 @@ function planTokenize(text: string): string[] {
     const out: string[] = [];
     // Rendered ref-tag markup () is proxy metadata, not plan content.
     const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ");
-    const re = /[a-z0-9]+|[\u4e00-\u9fff]/g;
+    // Every Han block via the Unicode script property (extensions, compatibility
+    // ideographs, supplement) — a literal U+4E00–9FFF range silently drops
+    // extended-Han terms from the index.
+    const re = /[a-z0-9]+|\p{Script=Han}/gu;
     let m: RegExpExecArray | null;
     while ((m = re.exec(clean.toLowerCase())) !== null) {
         const t = m[0];
-        const cjk = /[\u4e00-\u9fff]/.test(t);
+        const cjk = /\p{Script=Han}/u.test(t);
         // Latin tokens need >= 3 chars to carry signal; CJK single chars count.
         if (!cjk && t.length < 3) continue;
         if (!cjk && PLAN_STOPWORDS.has(t)) continue;

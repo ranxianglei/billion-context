@@ -122,6 +122,24 @@ test("extractPlanState: bounded to the last 40 messages", () => {
     assert.ok(st!.terms.has("kubernetes"), "in-window user turn term present");
 });
 
+test("extractPlanState: extended/compatibility/supplementary-plane Han terms are indexed (#4315)", () => {
+    const basic = "\u4e00"; // basic block (control)
+    const extA = "\u3400"; // Extension A
+    const compat = "\uf900"; // compatibility ideograph
+    const extB = "\u{20000}"; // Extension B, supplementary plane
+    const msgs: CoreMessage[] = [
+        { id: "t_plan", role: "assistant", contentType: "tool-call", toolName: "TodoWrite", text: JSON.stringify({ todos: [{ content: `${basic}${extA}${compat}${extB} support` }] }) },
+    ];
+    const st = extractPlanState(msgs);
+    assert.ok(st, "plan state extracted");
+    assert.ok(st!.terms.has(basic), "basic-block Han term indexed (unchanged behavior)");
+    assert.ok(st!.terms.has(extA), "Extension A term indexed");
+    assert.ok(st!.terms.has(compat), "compatibility ideograph term indexed");
+    assert.ok(st!.terms.has(extB), "supplementary-plane term indexed");
+    const pureExt: CoreMessage[] = [{ id: "u_ext", role: "user", contentType: "text", text: `${extA}${extB}${compat}` }];
+    assert.ok(extractPlanState(pureExt), "extended-Han-only plan still yields terms (was null before the fix)");
+});
+
 test("byte-identical output when plan state is absent or the pool fits the limit", () => {
     const f = foldBlocks(true);
     const base = executeSearchContext({ query: "token" }, f.core, f.session.state).text;

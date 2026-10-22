@@ -38,6 +38,7 @@ export const LIVE_FILES = [
     "tests/port-zone-live.test.ts",
     "tests/port-zone.test.ts",
     "tests/release-ci-gate.test.ts",
+    "tests/storage-durability.test.ts",
     "tests/test-suite-lock.test.ts",
     "tests/text-safe.test.ts",
     "tests/watchdog-health-daemon.test.ts",

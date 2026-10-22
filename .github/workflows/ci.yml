@@ -272,6 +272,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
+      # The contract suite's import chain reaches acp-kernel dist (src/config.ts);
+      # same parity as the main test lanes, which build kernel/ + pi-subagents/
+      # via their pretest hook (#2092 in-repo kernel, kernel/dist untracked).
+      - run: npm run pretest
       - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
