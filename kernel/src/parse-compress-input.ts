@@ -518,6 +518,52 @@ function parseLineEntry(
   return { range };
 }
 
+/** One entry of a plain-text (line-form) compress `content` string. Entries
+ *  whose header carries no parsable refs keep only `source`/`header` so a
+ *  consumer can re-emit them verbatim; they never claim a range. */
+export interface CompressLineContentEntry {
+  /** Normalized start ref (m-refs padded to 5 digits, lowercased). */
+  startRef?: string;
+  endRef?: string;
+  topic?: string;
+  /** Summary body verbatim (empty when the entry is header-only or unparsable). */
+  summary: string;
+  /** Original (trimmed, residue-stripped) entry text for faithful re-layout. */
+  source: string;
+  /** Trimmed first line of `source` — the refs/topic header. */
+  header: string;
+}
+
+/** Parse a plain-text (line-form) compress `content` string into structured
+ *  entries using the SAME ladder the compress tool accepts when `content` is
+ *  not a JSON array (#3975): stripJsonWrapperResidue → splitLineEntries →
+ *  per-entry parseLineEntry. hide-consumed must resolve ranges from exactly
+ *  what the tool accepts — a second, hand-rolled reader would drift. The
+ *  single-source input is already split at ref headers by splitLineEntries,
+ *  so coalesceLineEntries (array-of-siblings pairing) is not needed here. */
+export function parseLineContent(content: string): CompressLineContentEntry[] {
+  const bare = stripJsonWrapperResidue(content);
+  return splitLineEntries(bare).map((part): CompressLineContentEntry => {
+    const s = typeof part === "string" ? part : "";
+    const nl = s.indexOf("\n");
+    const base: CompressLineContentEntry = {
+      header: (nl === -1 ? s : s.slice(0, nl)).trim(),
+      summary: "",
+      source: s,
+    };
+    if (typeof part !== "string") return base;
+    const outcome = parseLineEntry(part, undefined);
+    if ("reason" in outcome) return base;
+    return {
+      ...base,
+      startRef: outcome.range.startRef,
+      endRef: outcome.range.endRef,
+      summary: outcome.range.summary,
+      topic: outcome.range.topic,
+    };
+  });
+}
+
 /** Display/retrieval label for line-form entries without an explicit topic:
  *  the summary's first markdown heading, else its first non-empty line,
  *  truncated. The topic is metadata (panels, T2 source headers, search) —
