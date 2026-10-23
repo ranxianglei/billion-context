@@ -29,10 +29,8 @@ import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
   collectFailedCompressCallIds,
-  collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
-  isMessageLatestProtected,
   isMessageProtected,
   isMessageProtectedWithPairing,
 } from "./protected.js";
@@ -1262,14 +1260,26 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
 const assignRefsNode: PipelineNode = {
   name: "assign-refs",
   run(io, ctx) {
-    const hasProtection =
+    // Ref-blocking and fold-protection are DECOUPLED (#3999). Only messages that
+    // will NEVER be demoted keep a BLOCKED ref: unrecoverable media (no stored
+    // bytes AND no re-access handle — folding them destroys the payload with no
+    // restore behind it, #1188/#2609; #5620: ref-based media (remote URL / file
+    // id) is NOT here — its handle rides the stored summary (media-refs.ts) and
+    // decompress restores it; archivable inline images are NOT here either, they
+    // stay citable per #2607) and statically-protected messages (protectedTools /
+    // predicates — every instance pinned forever). Latest-per-identity protected
+    // messages are the DEMOTABLE class (durable/* carriers, cumulative-snapshot
+    // tools such as todo_list): they are NUMBERED at birth instead. While one sits
+    // at the tail a fresh tag is append-stable, so its later demotion inserts zero
+    // bytes rather than minting a tag mid-history — the #3837 per-round prefix-
+    // cache break. Their fold exclusion stays at projection time (the
+    // unit-projection.ts / recommend.ts carve via isMessageLatestProtected), which
+    // is independent of the ref value, so numbering them never makes them foldable.
+    // This also matches rebuildCompressionState, which always numbered them.
+    const hasStaticProtection =
       ctx.config.protectedTools.length > 0 ||
       !!ctx.config.isToolProtected ||
-      !!ctx.config.isMessageProtected ||
-      (ctx.config.protectedLatestTools?.length ?? 0) > 0;
-    const latest = hasProtection
-      ? collectLatestProtected(io.messages, ctx.config)
-      : undefined;
+      !!ctx.config.isMessageProtected;
     // Refs keep the exact pre-#1947 layout for name-only patterns (a
     // protected call's unnamed result keeps a foldable ref; actual folding
     // paths pair via filterProtectedToolMessages). #1947 path patterns
@@ -1290,20 +1300,12 @@ const assignRefsNode: PipelineNode = {
       ctx.config,
     );
     const pathProtectedCallIds =
-      hasProtection && hasPathPatterns
+      hasStaticProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Unrecoverable media (no stored bytes AND no re-access handle) rides
-    // outside msg.text; folding one destroys it permanently with no restore
-    // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
-    // advertised, never folded. #5620: ref-based media (remote URL / file id)
-    // is NOT blocked — its handle rides the stored summary (media-refs.ts)
-    // and decompress restores the original. Archivable inline images fold
-    // like text and stay citable by their numeric ref for
-    // decompress({ imageRef }) (#2607).
-    const protectedFn = (m: CoreMessage) =>
+    const blockedFn = (m: CoreMessage) =>
       hasUnrecoverableMediaPayload(m) ||
-      (hasProtection
+      (hasStaticProtection
         ? (pathProtectedCallIds
             ? isMessageProtectedWithPairing(
                 m,
@@ -1311,13 +1313,12 @@ const assignRefsNode: PipelineNode = {
                 pathProtectedCallIds,
                 failedCompressCallIds,
               )
-            : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
-          (latest ? isMessageLatestProtected(m, latest) : false)
+            : isMessageProtected(m, ctx.config, failedCompressCallIds))
         : false);
     const refResult = assignRefs(io.messages, {
       existing: io.state.messageRefs,
       nextIndex: highestUsedIndex(io.state.messageRefs) + 1,
-      isProtected: protectedFn,
+      isProtected: blockedFn,
       // Ephemeral retrieval injections never consume a ref slot.
       shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
     });
