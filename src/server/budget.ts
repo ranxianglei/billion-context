@@ -10,10 +10,13 @@ export { readOutputBudget };
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
-// total instead of clamping). Non-Anthropic only — Anthropic enforces its input
-// limit independently of max_tokens (see shouldReserveOutputHeadroom). The proxy
-// owns both sides of the sum, so capping output to (window - input - margin)
-// makes the overflow impossible even when the agent ignores the compress nudge.
+// total instead of clamping). Runs on the rebuilding lanes only (openai /
+// responses / google prepare paths). The anthropic prepare path does not
+// rebuild the output budget — Anthropic enforces its input limit independently
+// of max_tokens (shouldReserveOutputHeadroom; the #3900 universal reservation
+// was reverted in #4198). The proxy owns both sides of the sum, so capping
+// output to (window - input - margin) makes the overflow impossible even when
+// the agent ignores the compress nudge.
 const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
 const OUTPUT_CLAMP_MIN_MARGIN = 2048;
 const OUTPUT_CLAMP_FLOOR = 1024;

@@ -24,7 +24,7 @@ interface DroppedOpenaiPartsReport {
     firstIndex: number;
 }
 
-// Kernel 0.0.85+/0.0.150: assistant/tool roles and the leading system/developer
+// Kernel 0.0.85+/0.0.151: assistant/tool roles and the leading system/developer
 // run still go through text-only reduction (stringContent), so only text
 // survives there (mid system/developer ride the rawOpenaiMessage sidecar, #4166).
 const DEFAULT_PRESERVED = new Set(["text"]);
