@@ -182,7 +182,10 @@ export function pixelTileEstimate(w: number, h: number): number {
     return 85 + 170 * tiles;
 }
 
-function base64ImageCost(b64: string, billing: ResolvedImageBilling, configuredCap?: number): number {
+/** Cap-applied token cost of one base64 image under `billing`. Exported so the
+ *  CoreMessage-level reserve (server.ts outboundImageReserve) charges pixels on
+ *  exactly the same scale the wire-body estimators use. */
+export function base64ImageCost(b64: string, billing: ResolvedImageBilling, configuredCap?: number): number {
     if (billing === "pixels") {
         const dims = decodeImageDims(b64);
         return applyCap(dims ? pixelTileEstimate(dims.w, dims.h) : PIXEL_IMAGE_FALLBACK_TOKENS, configuredCap);
