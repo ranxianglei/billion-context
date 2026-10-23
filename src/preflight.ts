@@ -20,8 +20,10 @@ import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
-import { proxyDispatcher } from "./upstream-proxy.js";
-import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
+import { describeUpstreamFailure, proxyDispatcher, tlsEnterpriseSignal } from "./upstream-proxy.js";
+import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess } from "./upstream-alerts.js";
+import { presentedCertOf, scheduleCertProbe } from "./upstream-cert-probe.js";
+import { isTlsTrustCode, tlsTrustRemediation, wantsCertProbe, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
@@ -1417,8 +1419,8 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
-// In-loop retry set — parity with the main model-request path's fail-fast
-// kinds (#1263/#1453 isFailFastUpstreamKind): a summary call must not die
+// In-loop retry set — parity with the main model-request path's transparently
+// replayable kinds (#1263/#1453 isTransparentReplayableKind): a summary call must not die
 // faster than the request it protects. TLS trust failures stay OUT on purpose:
 // a bad CA does not self-heal within the backoff window (the main path agrees).
 const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED"]);
@@ -1488,6 +1490,10 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
+            // #1682/#4403: any resolved response proves the host is reachable again —
+            // same invariant the relay path applies to model traffic.
+            clearUpstreamAlertsForHost(deps.url);
+            recordUpstreamCircuitSuccess(deps.url);
             return text;
         } catch (err) {
             deps.signal?.throwIfAborted();
@@ -1518,6 +1524,16 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
                 }
                 deps.log("error", `[preflight] summary failed permanently after ${attempt} attempt${attempt === 1 ? "" : "s"} (${Date.now() - sentAt}ms): ${failure.message}`);
+                // #4403 P0-3: a FINAL pre-response transport death is reachability
+                // evidence for this host — same ledger as the relay path. Post-response
+                // failures already got headers (host answered), and aborts say nothing
+                // about the upstream, so neither counts.
+                if (failure instanceof SummaryTransportError && stage === "request" && !failure.aborted) {
+                    const viaProxy = deps.proxyUrl !== undefined;
+                    recordUpstreamAlert(deps.url, err, viaProxy);
+                    recordUpstreamCircuitFailure(deps.url, err, viaProxy, describeUpstreamFailure(err, deps.url, deps.proxyUrl).message);
+                    if (wantsCertProbe(err, viaProxy)) scheduleCertProbe(deps.url);
+                }
                 throw failure;
             }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
@@ -3134,7 +3150,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             // the client regardless of which code surfaced (a cert problem is not more
                             // terminal than a gzip corruption). Only an abort (client gone / idle budget)
                             // is not worth retrying; keep that case's field omitted as before.
-                            const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
+                            // #4403 P0-1: branch on code + captured cert + enterprise signal so a
+                            // poisoned-DNS cert never gets "install this CA" advice.
+                            const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation({ code: err.code, hostname: safeHost(deps.url), enterpriseSignal: tlsEnterpriseSignal(deps.proxyUrl), cert: presentedCertOf(deps.url) })}` : "";
                             failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                             deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                         } else {

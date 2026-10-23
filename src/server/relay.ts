@@ -62,7 +62,8 @@ import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
-import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { markExpectedFailFast, wantsCertProbe, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { scheduleCertProbe } from "../upstream-cert-probe.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
@@ -1291,6 +1292,10 @@ async function forwardCaptured(
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
             const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
             recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failure.message);
+            // #4403 P0-2: a direct trust-code TLS failure is where DNS poisoning shows up —
+            // capture the presented certificate's identity for the log/502 forensics.
+            // Never through a proxy (the proxy presents its own cert, not the target's).
+            if (wantsCertProbe(error, proxyUrl !== undefined)) scheduleCertProbe(upstreamUrl);
             // #604: a network-level failure (socket reset, timeout abort) also never
             // reports usage — arm the emergency shrink like the 5xx branch below.
             if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);

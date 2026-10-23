@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS, type UpstreamFailureKind } from "../src/upstream-fail.ts";
+import { classifyUpstreamFailure, isTransparentReplayableKind, UPSTREAM_FAIL_HINTS, type UpstreamFailureKind } from "../src/upstream-fail.ts";
 import { ALERT_KINDS } from "../src/upstream-alerts.ts";
 import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
@@ -68,13 +68,13 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(undefined), "unknown");
 });
 
-test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns; #2465/#5663 adds no-route)", () => {
+test("classify: transparently-replayable set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns; #2465/#5663 adds no-route; #4403 P2-2 renames the predicate)", () => {
     assert.deepEqual(
-        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns", "upstream-unreachable"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
-        6,
+        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns", "upstream-unreachable", "upstream-headers-timeout"] as const).filter((k) => isTransparentReplayableKind(k)).length,
+        7,
     );
     for (const kind of ["client-abort", "upstream-timeout", "tls", "unknown"] as const) {
-        assert.equal(isFailFastUpstreamKind(kind), false, `${kind} must not be retried`);
+        assert.equal(isTransparentReplayableKind(kind), false, `${kind} must not be retried`);
     }
     for (const kind of Object.keys(UPSTREAM_FAIL_HINTS)) {
         assert.ok((UPSTREAM_FAIL_HINTS as Record<string, string>)[kind]!.length > 10, `hint exists for ${kind}`);
@@ -100,7 +100,7 @@ test("classify: every connect-stage errno lands in a fail-fast AND alertable kin
     for (const [code, expected] of connectStage) {
         const kind = classifyUpstreamFailure(netError(code, `connect ${code}`));
         assert.equal(kind, expected, `${code} must classify as ${expected}`);
-        assert.ok(isFailFastUpstreamKind(kind), `${code} (${kind}): pre-response death must stay replayable`);
+        assert.ok(isTransparentReplayableKind(kind), `${code} (${kind}): pre-response death must stay replayable`);
         assert.ok(ALERT_KINDS.has(kind), `${code} (${kind}): cannot-reach death must enter the alert table`);
     }
 });
