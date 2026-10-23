@@ -285,6 +285,10 @@ export interface LoopCtx {
      *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
+    /** #4397: the per-request render-tag strategy that produced this loop's outbound
+     *  bodies (the global knob can diverge — compaction-trigger requests force "none").
+     *  Stamps noteForwardedBody's rt flag; undefined falls back to the knob. */
+    renderTags?: "text-only" | "none";
 }
 
 export interface RequestOptions {
@@ -640,8 +644,9 @@ export async function* runCompressLoop(
         // noteForwardedBody is a string-only forensics sink; an opaque egress
         // envelope (Buffer) is lossy-converted — advisory pairing only, and the
         // provenance judge below already skips when the body was rewritten.
-        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag).
-        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj), !knobRenderNone());
+        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag)
+        // — per-request strategy via ctx (see LoopCtx.renderTags), knob fallback where absent.
+        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj), ctx.renderTags !== undefined ? ctx.renderTags !== "none" : !knobRenderNone());
         // #564/#2627: provenance is resolved against the array that belongs to
         // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
         // `wireArr` no longer describes it; rather than map stale indexes (which
