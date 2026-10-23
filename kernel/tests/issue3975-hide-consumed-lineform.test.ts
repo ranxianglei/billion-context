@@ -276,3 +276,41 @@ test("regression: refless plain-text garbage stays byte-identical (orphan, nothi
   assert.equal(r.messages[0]!.text, text, "unparsable-for-ranges args untouched");
   assert.equal(r.messages[1]!.text, "ok");
 });
+
+test("#3975 review: clamped block range — id-matched call falls back to full stubbing", () => {
+  // The kernel clamped the fold at an interior protected message (#3953): the
+  // stored range no longer equals what the call quoted. The live-range rewrite
+  // keeps nothing for this entry; the compaction fallback must still stub the
+  // long summary (object-array calls already degrade the same way).
+  const state = createInitialState();
+  state.blocks.push(
+    block({ blockId: "b-live", compressCallId: "call_1", active: true, startRef: "m00001", endRef: "m00048" }),
+  );
+  const [call] = pair("compress", "call_1", {
+    content: `m00001–m00050 quoted wider than folded\n${"c".repeat(500)}`,
+  });
+
+  const r = hideConsumedCompressCalls(state, [call]);
+  assert.equal(r.hidden, 0, "id-matched active carrier stays visible");
+  const kept = r.messages.find((m) => m.toolCallId === "call_1")!;
+  const out = argsOf(kept.text!)!.content as string;
+  assert.ok(out.startsWith("m00001–m00050"), "header retained verbatim");
+  assert.equal(out.split("\n")[1]!.length, 200, "rewrite kept nothing -> compact stubs the entry");
+});
+
+test("#3975 review: second pass over already-stubbed text is byte-identical (cache-stable fixpoint)", () => {
+  const mkState = (): CompressionState => {
+    const s = createInitialState();
+    s.blocks.push(
+      block({ blockId: "b-live", compressCallId: "plugin_live", active: true, startRef: "m00001", endRef: "m00050" }),
+    );
+    return s;
+  };
+  const original = `m00001–m00050 Task progress\n${"x".repeat(500)}`;
+  const [call] = pair("mcp__bili__compress", "tool_a", { content: original });
+
+  const once = hideConsumedCompressCalls(mkState(), [call], isMcp).messages[0]!.text!;
+  assert.notEqual(once, JSON.stringify({ content: original }), "first pass stubs");
+  const again = hideConsumedCompressCalls(mkState(), [{ ...call, text: once }], isMcp).messages[0]!.text!;
+  assert.equal(again, once, "stubbed output is a fixpoint — rendered bytes stable across turns");
+});
