@@ -42,7 +42,7 @@ import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { shedEgressIfOverBudget } from "../egress-shed.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
-import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
@@ -640,7 +640,8 @@ export async function* runCompressLoop(
         // noteForwardedBody is a string-only forensics sink; an opaque egress
         // envelope (Buffer) is lossy-converted — advisory pairing only, and the
         // provenance judge below already skips when the body was rewritten.
-        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag).
+        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj), !knobRenderNone());
         // #564/#2627: provenance is resolved against the array that belongs to
         // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
         // `wireArr` no longer describes it; rather than map stale indexes (which

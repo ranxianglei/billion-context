@@ -37,7 +37,7 @@ import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir, renderNone as knobRenderNone } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
@@ -1168,7 +1168,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
         // it is extracted from sentParsed (the complete object), never from the capped body head, so a
         // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
+        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag).
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed), !knobRenderNone());
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
