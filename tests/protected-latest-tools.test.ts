@@ -86,11 +86,15 @@ test("protectedLatestTools: explicit compress range cannot fold the latest todo 
     const spanEnd = msgs.find((m) => m.contentType === "text" && m.text?.startsWith("tail message 20"))!;
     const endRef = refOf(spanEnd);
     assert.ok(endRef !== null && /^m\d+$/.test(endRef), `range end ref resolved, got ${endRef}`);
-    // The latest protected pair is UNADDRESSABLE: its refs render as the
-    // literal "BLOCKED" marker, so no range (model-issued or explicit) can
-    // ever cite the live snapshot into a compress range.
-    assert.equal(refOf(latestCall), "BLOCKED", "latest todo call ref is BLOCKED");
-    assert.equal(refOf(latestResult), "BLOCKED", "latest todo result ref is BLOCKED");
+    // #3999: the latest protected pair is NUMBERED at birth (append-stable while it
+    // sits at the tail) instead of the unaddressable BLOCKED sentinel — so demoting
+    // it when a newer revision arrives inserts zero bytes. Fold-exclusion no longer
+    // rides on the ref value; the projection-time carve keeps every range from
+    // covering the live pair even though it is now addressable.
+    const liveCallRef = refOf(latestCall);
+    const liveResultRef = refOf(latestResult);
+    assert.ok(liveCallRef !== null && /^m\d+$/.test(liveCallRef), `latest todo call numbered at birth, got ${liveCallRef}`);
+    assert.ok(liveResultRef !== null && /^m\d+$/.test(liveResultRef), `latest todo result numbered at birth, got ${liveResultRef}`);
 
     // An explicit range spanning everything up to AND INCLUDING the latest
     // todo pair — the hard exclusion must carve the latest instance out.
