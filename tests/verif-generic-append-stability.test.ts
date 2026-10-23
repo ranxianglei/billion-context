@@ -48,7 +48,10 @@ interface TurnOut {
 
 test("generic append-only stability: arbitrary inputs over assignRefs + renderVisibleRefs", { timeout: 300_000 }, async (t) => {
   const haveSolver = (() => { try { return solveSmt2("(set-logic ALL)(check-sat)", []).status === "sat"; } catch { return false; } })();
-  if (!haveSolver) t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
+  // t.skip() alone does not stop the body: without return, solver-less
+  // environments fall through to the real solveSmt2 call below and fail with
+  // "no solver available" while still carrying the SKIP annotation (#4049).
+  if (!haveSolver) return t.skip("no SMT solver available (set VERIF_PYTHON or VERIF_SOLVER_CMD)");
 
   const ctx = newCtx();
   const strv = (v: string) => ({ kind: "str", t: ctx.String.val(v) }) as never;

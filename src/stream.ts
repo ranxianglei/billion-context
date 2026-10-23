@@ -357,6 +357,20 @@ function compressFailureCause(errs: string, session: Session): string {
             ? "substrate-destruction — host-native compaction or bulk client-side history rewrite landed outside bili's knowledge (#1729/#2193); structural, report it"
             : "content-changed — the messages behind those refs changed and carry new refs now";
     }
+    // #4038: "already compressed" against a ledger with ZERO active blocks is
+    // not "nothing new to fold" — it is the stale-ledger shape of the same
+    // failure domain as #2432: a model/upstream switch (or other out-of-band
+    // history rewrite) left every fold block inactive while the resident
+    // ledger still resolves remembered bN refs to them, so every retry fails
+    // identically and only a live-range re-anchor recovers. With zero active
+    // blocks the kernel can reach this verdict ONLY through inactive-block
+    // boundary resolution (message-ref consumption always records dangling
+    // refs and takes the "cannot be anchored" path), so the shape has no
+    // benign reading — route it into the substrate-destruction family so the
+    // breaker, acp_status and the panel all offer the single recovery step.
+    if (errs.includes("already compressed") && !session.state.blocks.some((b) => b.active)) {
+        return "substrate-destruction — remembered block refs point at a fold ledger whose blocks are all inactive: a model/upstream switch or other out-of-band history rewrite invalidated the folds outside bili's knowledge (#4038); nothing remembered can retry, call acp_status for live refs";
+    }
     // #3302: "unknown" now covers three sub-cases (earlier generation, typo,
     // sparse-space gap) — name the class honestly; the prefix stays stable for
     // downstream startsWith matching (acp_status verdict sections).
@@ -454,8 +468,16 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
         if (n > hiN) { hiN = n; hiId = ref; }
     }
     if (!loId || !hiId) return "";
+    const totalBlocks = ctx.session.state.blocks.length;
     const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
-    return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
+    // #4038: zero active blocks next to a resident ledger is the stale shape —
+    // name it so the model stops treating remembered bN ids as live (against
+    // this ledger they can never compress again).
+    const staleLedgerNote =
+        activeBlocks === 0 && totalBlocks > 0
+            ? ` All ${totalBlocks} resident block(s) are inactive — every bN you remember from earlier is STALE and can never compress again; target only live refs.`
+            : "";
+    return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s).${staleLedgerNote} Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
 }
 
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
