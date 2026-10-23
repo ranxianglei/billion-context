@@ -204,6 +204,9 @@
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | エクスポートの忠実性のために生テキストとして保持される最近のメッセージのトークンサイズ末尾。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | ログにアラートを出すまでの連続 EPERM 書き込み失敗回数。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM アラートの繰り返し間隔。0 の場合は 1 回のみログ出力する。 |
+| `watchdog` | object | {} (all defaults) | — | ネイティブレーンの proxy 再生 watchdog の間隔（セッションごとの zcode/claude/kimi MCP エントリ、#4006）。 |
+| `watchdog.intervalMs` | number | 30000 (floor 1000) | BILI_WATCHDOG_INTERVAL_MS | レーン watchdog のヘルスプローブ間隔；外部から kill されたレーン proxy の最悪復旧ウィンドウ = interval × failureLimit（デフォルトで約 90 秒——#4006 で実測 64 秒）。1000 未満の値はデフォルトにフォールバック（秒/ミリ秒の誤入力ガード）。 |
+| `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | レーン watchdog が proxy を再生するまでの連続プローブ失敗回数。 |
 | `storage` | object | {} (all defaults) | — | 統合 SQLite ストレージサイドカーの設定 (#2671)。 |
 | `storage.unified` | legacy\|shadow\|full\|sqlite | unset (sqlite) | BILI_STORAGE_UNIFIED | 階層型ストレージ移行スイッチ (#2671): shadow = ダイジェスト照合付き統合 SQLite ダブルライトのドライラン; full = ドロップイン読み取りパス (オーガニックインポート付きの統合優先読み込み、レガシーフォールバック); sqlite = ピュア SQLite モード - full と同じストレージ機構だが JSON エンベロープ書き込みはデフォルト OFF (SQLite インデックスが唯一の永続コピー; JSON エンベロープは書き込まれない)。デフォルト (どこでも未設定) は現在ピュア SQLite: ダブルライト fleet は #3818 以降ダイジェスト照合が安定して稼働しているため、JSON エンベロープはデフォルトでは書き込まれなくなった - 明示的な full は #3818 由来のダブルライトデフォルトを維持し、legacy は 1 行のエスケープハッチとして残る (将来の表記は同じ形: mysql = ネットワークバックエンド、json = エンベロープのみ)。ファイル階層は厳密に legacy/shadow/full/sqlite; 環境変数階層は 1/true (=shadow) と unified (=full) も受け入れ、ファイルより優先される。レーン起動ごとに 1 回のみ解決される - ホット編集には再起動が必要。暗号化 (BILI_ENCRYPTION_KEY) はサイドカーをハードブロックする。 |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | ストレージバックエンドの選択 (#3388 / #3931): 統合ストアは操作レベルの非同期 StorageBackend 契約を消費する。sqlite がデフォルト (Promise ラップされたアダプター背後の既存の UnifiedStore)。mysql は完全に配線済み (ステップ 2+3): openBackend("mysql", dsn) は MySQL 8.0 に対して実際の MysqlBackend を開く - 完全な契約サーフェス (CAS リファレンスカウント付きのインジェスト、読み取り、session_ext、リープジャーナル、アーカイブ/リストア/GC、チェックポイント、会話)、mysql2 は通常の依存関係としてバンドルされ、遅延ロードされる (mysql を選択しない起動では決してロードされない)。プロキシのホットパスは非同期シャドウファサードを通じて配線されている: セーブはシリアルバックエンドキューにエンキューされる (ウォーターマークデルタ、孤立/リープジャーナル、ダイジェストサンプリング - sqlite はゼロ await の同期高速パスを不変のまま維持)、同期読み取りは JSON エンベロープに乗る (サイドカーは ready() 経由で非同期にアタッチされる; viewFor/importRecord の同期ファサードは意図的にミスする)、レプリカ/ext/GC/エクスポート/フォークは非同期ツインを話す (#4911: フォークレーンはそれらを通じて lastLiveSeq + 行クローンに await する; フォールドアンカーバックフィル / スナップショットレンダリングのための同期ウィンドウ読み取りは意図的にエンベロープ提供される)。writerOff は sqlite のみ (エンベロープは mysql の同期読み取りパスである)。不明な名前は通知付きで sqlite にフォールバックする。レーン起動ごとに 1 回のみ解決される。 |
@@ -1107,6 +1110,13 @@
 - **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
 - **Status:** ACTIVE
 - **Description:** ストリーム途中で中断するホスト向けのフェイクコンプリーションのセーフティネット（#371）— **オプトイン**方式で、`retries: 0`（デフォルト）は #371 以前のパススルー動作。`bufCapBytes` はバッファリングされたレスポンスに対する OOM ガード。`BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP` と対応。
+
+### `watchdog`
+
+- **Type:** `{ intervalMs?: number; failureLimit?: number }`
+- **Default:** `{ intervalMs: 30000, failureLimit: 3 }`
+- **Status:** ACTIVE (#4006)
+- **Description:** セッションごとのネイティブレーン proxy 再生 watchdog の間隔——tick は各クライアント派生 MCP エントリプロセス内（zcode #1145、claude #1821、kimi #963）で実行され、proxy 本体ではない。各 tick はレーン proxy のローカルヘルスエンドポイントをプローブする（タイムアウト 2 秒）；`failureLimit` 回連続でプローブ失敗すると、エントリはセッション起動時に使用したのと同じ launcher パス経由で proxy を再生する（必要に応じて再ルーティング/再ピン留め）。したがって、外部から kill されたレーン proxy の最悪復旧ウィンドウ = interval × failureLimit（デフォルトで約 90 秒——#4006 で実測 64 秒）。両キーは env > ファイル > デフォルトで解決される；`intervalMs` は watchdog がアームされる際に一度だけ読み込まれる（次のセッションのエントリで有効）、`failureLimit` は各 tick で読み込まれる（設定ファイルの編集は実行中のエントリでも 1 tick 以内で有効）。`intervalMs` が 1000 未満の場合はデフォルトにフォールバック——秒/ミリ秒の誤入力でプローブがホットループに退行してはならない。対応変数 `BILI_WATCHDOG_INTERVAL_MS`、`BILI_WATCHDOG_FAILURE_LIMIT`。
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
@@ -2057,6 +2067,8 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WATCHDOG_FAILURE_LIMIT` | `watchdog.failureLimit` | 3 |
+| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000 (floor 1000) |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
