@@ -532,7 +532,6 @@ export function activeBlockCoveredIds(state: CompressionState | null | undefined
   }
   return set;
 }
-}
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
 // reflects exactly what crossed the wire. prepare builds the body from
