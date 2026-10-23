@@ -56,6 +56,9 @@ interface WebSessionSummary {
     cacheHitPct: number | null;
     blocks: number;
     contextWindow?: number;
+    /** #4130: declared pre-output-headroom window — present only while a
+     *  reservation shrinks the effective denominator (contextWindow = base − reserve). */
+    contextWindowBase?: number;
     lastSeen: string;
     restored?: boolean;
     /** true when the per-request cache ledger holds samples — the token
@@ -750,6 +753,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         cacheHitPct: hitPct(inputTokens, cachedTokens),
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
+        ...(typeof s.metadata.outputHeadroomBase === "number" ? { contextWindowBase: s.metadata.outputHeadroomBase } : {}),
         ...(selfHeal ? { selfHeal } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
         ...(keepalive ? { keepalive } : {}),

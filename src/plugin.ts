@@ -1,6 +1,6 @@
 import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
-import { buildStatusPanel } from "acp-kernel/panel";
+import { buildStatusPanel, formatCompactTokens } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
@@ -1712,6 +1712,14 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (obd !== undefined && obd.model !== undefined && obd.value !== undefined && obd.model === lastModel) {
         preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate (no ceiling to back it); longer replies may cut off at the output limit. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
     }
+    // #4130: the denominator above is the EFFECTIVE window (post output-headroom
+    // reservation) — tie it back to the declared one so a 200K model judging at
+    // 150K doesn't read as a misidentified window. Display-only note; the
+    // reservation itself is unchanged (#896 design).
+    const headroomBase = session.metadata.outputHeadroomBase;
+    if (typeof headroomBase === "number" && Number.isFinite(headroomBase) && headroomBase > modelContextLimit && modelContextLimit > 0) {
+        preFooter.push(`Window: judging against ${formatCompactTokens(modelContextLimit)} effective (${formatCompactTokens(headroomBase)} declared − ${formatCompactTokens(headroomBase - modelContextLimit)} output reserve)`);
+    }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
         // #1870 visibility for the silent courier, #1977 display policy:
@@ -1753,6 +1761,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             ?? pluginRuntimeInfoForConversation(conversationIdForSession(session.id), typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
             ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
+        // #4130: declared (pre-output-headroom) window while a reservation shrinks
+        // the effective denominator — additive field, machine-readable twin of the
+        // Window: note above; null when no reservation is active.
+        contextWindowBase: typeof headroomBase === "number" && Number.isFinite(headroomBase) ? headroomBase : null,
         contextTokens,
         contextTokensSource,
         contextTokensAt: observation?.at ?? null,

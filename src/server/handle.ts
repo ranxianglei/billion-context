@@ -2194,6 +2194,17 @@ async function handleRequest(
         // pre-self-heal and only for plugin sessions, so wire-mode panels fell
         // back to a hardcoded 200K.
         session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+        // #4130: tie the effective denominator back to the DECLARED window for
+        // display surfaces (/acp panel, nudge log line, Web UI bar) — a 200K
+        // model judging at 150K must not read as a misidentified window.
+        // Written only while a reservation actually shrank the window; cleared
+        // otherwise so a model/protocol switch never shows a stale annotation.
+        // Display-only: the kernel keeps judging against the value above.
+        if (reqConfig.modelContextLimit < nativeWindow) {
+            session.metadata.outputHeadroomBase = nativeWindow;
+        } else {
+            delete session.metadata.outputHeadroomBase;
+        }
         // #955 runtime-info: record the model id + window source for this
         // session so /__bili/plugin/status can show them pre-first-request and
         // post-hoc forensics can tell which source sized the window.

@@ -26,6 +26,8 @@ interface ReportData {
     systemPromptTokens?: number;
     contextTokens?: number;
     contextWindow?: number;
+    /** #4130: declared pre-output-headroom window (present while a reservation shrinks contextWindow). */
+    contextWindowBase?: number;
     contextTokensSource?: string;
     contextBest?: { tokens?: number };
     retrieveCalls?: number;
@@ -132,12 +134,19 @@ function readLedger(d: ReportData) {
     return { led, tot, seam, st, folds, lines, seamEvents, ctxBest, win };
 }
 
+// #4130: the context denominator is the EFFECTIVE window (post output-headroom
+// reservation) — append the declared-window note so the report can't be misread.
+function windowReserveNote(d: ReportData, win: number, t: (k: string, a?: Record<string, string | number>) => string, fmtW: (n: number) => string): string {
+    return d.contextWindowBase && d.contextWindowBase > win ? " (" + t("det.window_reserve", { base: fmtW(d.contextWindowBase), res: fmtW(d.contextWindowBase - win) }) + ")" : "";
+}
+
 export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): string {
     const mask = opts.mask !== false;
     const lang = opts.lang === "en" ? "en" : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const winNote = windowReserveNote(d, win, t, f.W);
     const NL = String.fromCharCode(10);
     const L: string[] = [];
     L.push("# billion-context session report");
@@ -153,7 +162,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
     L.push("- protocol: " + (d.protocol || f.none));
     L.push("- upstream: " + (f.host(d.upstreamOrigin) || f.none));
     L.push("- requests: " + (d.requests != null ? d.requests : f.none));
-    L.push("- context: " + f.W(ctxBest) + (win ? " / " + f.W(win) + " (" + (ctxBest / win * 100).toFixed(1) + "%)" : "") + (d.contextTokensSource === "estimate" ? " (estimate)" : ""));
+    L.push("- context: " + f.W(ctxBest) + (win ? " / " + f.W(win) + " (" + (ctxBest / win * 100).toFixed(1) + "%)" + winNote : "") + (d.contextTokensSource === "estimate" ? " (estimate)" : ""));
     if (Number(d.systemPromptTokens)) L.push("- system prompt: " + f.W(d.systemPromptTokens));
     if (Array.isArray(d.blockDetails)) L.push("- blocks: " + d.blockDetails.filter((b) => b.active).length + " active / " + d.blockDetails.length + " total");
     L.push("- compressions (folds): " + folds.length);
@@ -238,6 +247,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const winNote = windowReserveNote(d, win, t, f.W);
     const W = 920, PAD = 28;
     const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa";
     const SANS = "ui-sans-serif,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
@@ -297,7 +307,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     kv(t("common.protocol"), d.protocol || f.none);
     kv(t("common.upstream"), f.host(d.upstreamOrigin) || f.none);
     kv(t("common.requests"), d.requests != null ? String(d.requests) : f.none, true);
-    kv(t("common.context"), f.W(ctxBest) + (win ? " / " + f.W(win) + " (" + (ctxBest / win * 100).toFixed(1) + "%)" : "") + (d.contextTokensSource === "estimate" ? " (est.)" : ""), true);
+    kv(t("common.context"), f.W(ctxBest) + (win ? " / " + f.W(win) + " (" + (ctxBest / win * 100).toFixed(1) + "%)" + winNote : "") + (d.contextTokensSource === "estimate" ? " (est.)" : ""), true);
     if (Number(d.systemPromptTokens)) kv("system prompt", f.W(d.systemPromptTokens), true);
     if (Array.isArray(d.blockDetails)) kv("blocks", d.blockDetails.filter((b) => b.active).length + " active / " + d.blockDetails.length + " total", true);
     kv("compressions", String(folds.length), true);

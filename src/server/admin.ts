@@ -1036,6 +1036,8 @@ function sendStats(res: http.ServerResponse): void {
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
             contextWindow: typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : undefined,
+            // #4130: declared pre-output-headroom window — pairs with contextWindow (the effective denominator).
+            contextWindowBase: typeof s.metadata.outputHeadroomBase === "number" ? s.metadata.outputHeadroomBase : undefined,
             lastSeen: new Date(s.lastSeen).toISOString(),
             restored: s.restored === true,
         };

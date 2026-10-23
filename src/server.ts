@@ -2291,11 +2291,14 @@ export function diagTagSummary(messages: CoreMessage[], sessionId: string, strat
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false, surfaceOff?: string): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false, surfaceOff?: string, windowBase?: number): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
     const pct = limit > 0 ? `${Math.round((tokenCount / limit) * 100)}%` : "?";
+    // #4130: when the denominator is the post-output-headroom effective window,
+    // say so inline — a bare "65256/150000" reads as a misidentified 150K model.
+    const winNote = typeof windowBase === "number" && Number.isFinite(windowBase) && windowBase > limit ? `, window ${windowBase} − output reserve ${windowBase - limit}` : "";
     const growth = b["growth"] ?? 0;
     const floor = b["growthFloor"] ?? 0;
     const interval = b["nudgeGrowthTokens"] ?? 0;
@@ -2315,7 +2318,14 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     // the observed top-level tools so the next omnibus rename is greppable here
     // (`surface=off(top-level=[...])`) instead of arriving as a user incident.
     const offTag = surfaceOff ? `, ${surfaceOff}` : "";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}${winNote}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
+}
+
+// #4130: the declared (pre-output-headroom) window handle() records while a
+// reservation shrinks the effective denominator — display annotations only.
+export function outputHeadroomBase(session: Session): number | undefined {
+    const v = session.metadata?.outputHeadroomBase;
+    return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived

@@ -1,13 +1,5 @@
 name: CI
 
-# Same-branch pushes supersede: cancel the branch's in-progress/queued CI run
-# so a 12-leg matrix never piles up behind itself (the 8 e2e workflows have
-# had this since their split; the main CI was the gap — see the 447-run queue
-# incident on 2026-10-23).
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   push:
     # Release branches also run CI on push: ref updates made with a real

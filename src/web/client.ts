@@ -2519,6 +2519,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const cls = pct >= 90 ? "bar-fill danger" : pct >= 70 ? "bar-fill warn" : "bar-fill";
             parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxMark + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(ctxVal) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)" + ctxMark + "</span></div>");
             const ctxSubBits = [];
+            // #4130: denominator is the post-output-headroom effective window —
+            // say so, or a reserved 200K model reads as a misidentified 150K one.
+            if ((d.contextWindowBase || 0) > (d.contextWindow || 0)) {
+                ctxSubBits.push('<span title="' + escapeHtml(t("det.window_reserve_tip")) + '">' + escapeHtml(t("det.window_reserve", { base: fmtW(d.contextWindowBase), res: fmtW(d.contextWindowBase - d.contextWindow) })) + "</span>");
+            }
             if ((d.contextUpperTokens || 0) > 0 && (!best || best.kind !== "upper") && d.contextUpperTokens !== ctxVal) {
                 ctxSubBits.push(t("det.upper_bound", { v: fmtW(d.contextUpperTokens) }));
             }
