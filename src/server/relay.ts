@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { activeBlockCoveredIds, maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -779,6 +779,9 @@ async function forwardCaptured(
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            // #4401: active-block coverage — in the plugin carrier regime the
+            // covered cells' absence is the fold itself, not a drop.
+            coveredIds: activeBlockCoveredIds(prepared.session.state),
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
