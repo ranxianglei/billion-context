@@ -156,6 +156,30 @@ test("externally-owned attach posture never respawns — it waits (#1821)", asyn
     assert.equal(fx.state.failures, 0);
 });
 
+test("#4006: without an injected failureLimit the tick resolves the knob live (env tier)", async () => {
+    const savedLimit = process.env.BILI_WATCHDOG_FAILURE_LIMIT;
+    const savedCfg = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-zcode-watchdog-test.json";
+    process.env.BILI_WATCHDOG_FAILURE_LIMIT = "2";
+    try {
+        const fx = tickFixture(ORIGIN);
+        fx.deps = { ...fx.deps, failureLimit: undefined };
+        await runTicks(fx, false, 1);
+        assert.equal(fx.ensureCalls.length, 0, "first failure accumulates under limit 2");
+        await runTicks(fx, false, 1);
+        assert.equal(fx.ensureCalls.length, 1, "second consecutive failure respawns");
+        assert.equal(fx.state.failures, 0);
+        delete process.env.BILI_WATCHDOG_FAILURE_LIMIT;
+        const fx2 = tickFixture(ORIGIN);
+        fx2.deps = { ...fx2.deps, failureLimit: undefined };
+        await runTicks(fx2, false, 2);
+        assert.equal(fx2.ensureCalls.length, 0, "env unset → built-in default limit 3 still accumulates");
+    } finally {
+        if (savedLimit === undefined) delete process.env.BILI_WATCHDOG_FAILURE_LIMIT; else process.env.BILI_WATCHDOG_FAILURE_LIMIT = savedLimit;
+        if (savedCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = savedCfg;
+    }
+});
+
 test("main() short-circuits under NODE_TEST_CONTEXT", async () => {
     assert.notEqual(process.env.NODE_TEST_CONTEXT, undefined);
     await main();
