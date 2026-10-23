@@ -2636,6 +2636,13 @@ export async function pipePluginChatWithStrip(
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
     let sawTerminal = false;
+    // #4059: whether the wire's terminal byte ACTUALLY reached the client
+    // (openai [DONE], anthropic message_stop, google finish-reason chunk).
+    // sawTerminal is set at parse time and feeds the degenerate-turn retry;
+    // this flag is set only after the awaited write succeeds, so a read error
+    // caught afterwards knows the turn was already complete for the client
+    // and must end clean instead of appending a duplicate terminator.
+    let terminalForwarded = false;
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         let inputChars = 0;
@@ -3182,7 +3189,9 @@ export async function pipePluginChatWithStrip(
                         diagEvents++;
                         diagPushType("[DONE]");
                         sawTerminal = true;
+                        const deliversTerminal = !res.destroyed && !res.writableEnded;
                         await write(flushTails() + rawEvent + "\n\n");
+                        if (deliversTerminal) terminalForwarded = true;
                         continue;
                     }
                     let ev: Record<string, unknown>;
@@ -3269,7 +3278,16 @@ export async function pipePluginChatWithStrip(
                     // count before the turn may be called empty. The event's output is
                     // dropped only when the retry takes the turn over.
                     if (turnTerminal !== undefined && (await retryEmptyTurn(turnTerminal))) continue;
-                    if (out.length > 0) await write(offsetRetryIndices(out));
+                    if (out.length > 0) {
+                        // #4059: anthropic's message_stop IS its terminal byte;
+                        // google's finish-reason chunk IS its terminator. The
+                        // openai terminal byte is [DONE], tracked above.
+                        const deliversTerminalByte = protocol === "anthropic" && ev["type"] === "message_stop"
+                            || protocol === "google" && turnTerminal !== undefined;
+                        const wrote = !res.destroyed && !res.writableEnded;
+                        await write(offsetRetryIndices(out));
+                        if (deliversTerminalByte && wrote) terminalForwarded = true;
+                    }
                 }
             }
             if (done) break;
@@ -3314,6 +3332,14 @@ export async function pipePluginChatWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            return;
+        }
+        // #4059: the terminal byte already reached the client — the turn is
+        // complete from the client's side. A read failure after it is
+        // transport noise, not truncation: synthesize nothing (a duplicate
+        // [DONE]/message_stop would violate strict lifecycle validation).
+        if (terminalForwarded) {
+            loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — terminal byte already forwarded, ending clean without a duplicate terminator (#4059)`);
             return;
         }
         // #721: upstream read failed while the client is still connected —
@@ -3611,6 +3637,13 @@ export async function pipePluginResponsesWithStrip(
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
     let sawTerminal = false;
+    // #4059: whether a completion-family frame (or [DONE]) ACTUALLY reached
+    // the client. Set only after the awaited write succeeds — sawTerminal is
+    // set at parse time and feeds retryEmptyTurn, which can drop the frame —
+    // so only this flag answers "is the turn complete for the client?". A
+    // read failure caught after it must end clean, never append the
+    // contradictory upstream_stream_truncated error.
+    let terminalForwarded = false;
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         const st = tagFilter.stats();
@@ -3893,12 +3926,15 @@ export async function pipePluginResponsesWithStrip(
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr || jsonStr === "[DONE]") {
-                        if (jsonStr === "[DONE]") {
+                        const isDone = jsonStr === "[DONE]";
+                        if (isDone) {
                             diagEvents++;
                             diagPushType("[DONE]");
                             sawTerminal = true;
                         }
+                        const deliversTerminal = isDone && !res.destroyed && !res.writableEnded;
                         await write(rawEvent + "\n\n");
+                        if (deliversTerminal) terminalForwarded = true;
                         continue;
                     }
                     let ev: Record<string, unknown>;
@@ -4047,7 +4083,15 @@ export async function pipePluginResponsesWithStrip(
                             recordContextObservation(session, Math.max(0, acc.inputTokens - credit), credit > 0 ? "estimate" : "usage");
                             markDirty(session);
                         }
+                        // #4059: the completion-family frame IS the turn's
+                        // terminal for the client (completed stays completed,
+                        // failed/incomplete keep their own status — nothing is
+                        // re-voiced here). Track delivery so a read failure
+                        // caught afterwards ends clean instead of appending
+                        // a contradictory truncation error.
+                        const deliversTerminal = !res.destroyed && !res.writableEnded;
                         await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
+                        if (deliversTerminal) terminalForwarded = true;
                         continue;
                     }
                     if (type === "response.output_text.delta" && typeof ev["delta"] === "string") {
@@ -4137,6 +4181,17 @@ export async function pipePluginResponsesWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            return;
+        }
+        // #4059: the completion-family frame already reached the client — the
+        // turn is complete from the client's side. A read failure after it is
+        // transport noise, not truncation: retain the forwarded terminal
+        // result and end clean instead of appending the contradictory
+        // upstream_stream_truncated error. Held tails are empty by
+        // construction here (the terminal branch flushed them first), so
+        // nothing is dropped by skipping the flush below.
+        if (terminalForwarded) {
+            loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — terminal already forwarded, ending clean without a truncation signal (#4059)`);
             return;
         }
         // #721: upstream read failed while the client is still connected —
