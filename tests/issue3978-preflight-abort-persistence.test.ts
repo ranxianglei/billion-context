@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -239,10 +239,21 @@ async function main(): Promise<void> {
     await once(proxy, "listening");
     console.log("READY " + JSON.stringify({ port: (proxy.address() as { port: number }).port, mainUrl }));
     let last = -1;
+    let durableReported = false;
     setInterval(() => {
         const s = listSessions().find((x) => x.id === "t3978-p");
         const n = ((s && s.state.blocks) || []).filter((b) => b.active).length;
         if (n !== last) { last = n; console.log("[blocks] " + n); }
+        // In-memory blocks are not durable. Envelopes are codec-framed at rest
+        // (BILIENC1), so the test process cannot scan the file for the summary
+        // mark itself; report durability through this store's own codec-aware
+        // DISK read — the same reader path a fresh instance takes — and stop
+        // polling once it has been observed.
+        if (!durableReported && n >= 1) {
+            const rec = store.loadSync("t3978-p");
+            const dn = ((rec && rec.state.blocks) || []).filter((b) => b.active).length;
+            if (dn >= 1) { durableReported = true; console.log("[durable] " + dn); }
+        }
     }, 50);
 }
 
@@ -346,6 +357,7 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
     child.stderr?.on("data", (d: Buffer) => { errTail = (errTail + d.toString()).slice(-8192); });
     const msgs = conversation(40, "t3978p");
     let blocksSeen = 0;
+    let durableSeen = 0;
     let readyRes: ((v: { port: number; mainUrl: string }) => void) | null = null;
     const readyP = new Promise<{ port: number; mainUrl: string }>((r) => { readyRes = r; });
     let buf = "";
@@ -359,6 +371,8 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
             if (mReady) { readyRes?.(JSON.parse(mReady[1])); continue; }
             const mBlocks = line.match(/^\[blocks\] (\d+)$/);
             if (mBlocks) blocksSeen = Math.max(blocksSeen, Number(mBlocks[1]));
+            const mDurable = line.match(/^\[durable\] (\d+)$/);
+            if (mDurable) durableSeen = Math.max(durableSeen, Number(mDurable[1]));
         }
     });
     let i2: Awaited<ReturnType<typeof startProxy>> | null = null;
@@ -373,8 +387,20 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
         assert.ok(ready, `the child proxy must become ready (child stderr tail:\n${errTail.trim() || "(empty)"})`);
         fireAndForget(postTurn(ready.port, ready.mainUrl, "t3978-p", msgs));
         await waitFor(() => blocksSeen >= 1, 60_000, "the child's first committed fold");
-        // Settle the per-fold debounce writes (debounceMs=50) before the death.
-        await sleep(1000);
+        // Wait for the durable artifact itself, not a guessed settle time: the
+        // per-fold markDirty rides the store's trailing debounce (debounceMs=50),
+        // and under loaded CI runners a fixed sleep can expire before the
+        // debounced write lands (observed windows 22-1 at head 5722ac70c: the
+        // retry found NO parent record at all). `[durable] N` means the CHILD'S
+        // OWN store.loadSync — a codec-aware disk read through the same reader
+        // path a fresh instance takes — already sees N active blocks, i.e. the
+        // write #3978 promises has landed; the death then cannot race it.
+        const tDurable = Date.now();
+        while (durableSeen < 1) {
+            if (Date.now() - tDurable > 60_000) throw new Error(
+                `timeout waiting for the per-fold save to land on disk (child stderr tail:\n${errTail.trim() || "(empty)"}\nstore dir listing: ${(() => { try { return JSON.stringify(readdirSync(dir)); } catch (e) { return String(e); } })()})`);
+            await sleep(50);
+        }
         child.kill("SIGKILL");
         await once(child, "exit");
         // A fresh boot over the SAME store dir — the retry arrives under a NEW
@@ -389,10 +415,13 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
         const r = await postTurn((i2.proxy.address() as { port: number }).port, main2.url, "t3978-q", [...msgs, { role: "user", content: "t3978p continue after the aborted attempt" }]);
         assert.equal(r.status, 200, "the retry attempt must converge to a forward");
         void r.body?.cancel().catch(() => undefined);
+        // On failure, distinguish "no parent record on disk" from "record
+        // present but not adopted" without re-running the whole scenario.
+        const dirListing = (() => { try { return JSON.stringify(readdirSync(dir)); } catch (e) { return String(e); } })();
         const tail = logs.filter((l) => l.includes("t3978-q"));
         const resumeLines = tail.filter((l) => l.includes("[resume-inheritance]"));
         const inheritLine = resumeLines.find((l) => l.includes("inherited"));
-        assert.ok(inheritLine, `instance 2 must resume the persisted parent (resume lines: ${JSON.stringify(resumeLines)})`);
+        assert.ok(inheritLine, `instance 2 must resume the persisted parent (resume lines: ${JSON.stringify(resumeLines)}; store dir at retry time: ${dirListing})`);
         const bm = inheritLine.match(/(\d+) block\(s\)/);
         assert.ok(bm && Number(bm[1]) >= 1, `at least one block must have been adopted (${inheritLine})`);
         assert.ok(!tail.some((l) => l.includes("parent session is not loadable")), "the pre-fix 'starting fresh' degrade must not fire");
