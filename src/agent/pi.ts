@@ -31,8 +31,14 @@ export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
     // #2186: acp_delegate surface notifies stand-downs through the host toast
-    // when present (same channel CommandCtx already declares).
-    ui?: { notify?: (message: string, type?: string) => void } | undefined;
+    // when present (same channel CommandCtx already declares). #3912: the
+    // keyed footer status slot (pi 0.83+ ExtensionUIContext.setStatus, verified
+    // against pi-coding-agent dist types.d.ts) — optional because older hosts
+    // lack it; only the pi lane uses it here.
+    ui?: { notify?: (message: string, type?: string) => void; setStatus?: (key: string, text: string | undefined) => void } | undefined;
+    // #3912: pi's own projection estimate (ExtensionContext.getContextUsage — a
+    // pure read of the local session view). Optional because older hosts lack it.
+    getContextUsage?: () => { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
     // #1961: pi 0.99+ exposes the live model catalog on the extension ctx;
     // optional because older hosts lack it. The real ModelRegistry surface is
     // find(provider, modelId) — there is no getModel (verified against pi
@@ -583,6 +589,55 @@ function renderAcpStatus(s: Record<string, unknown>): string {
     if (requests !== null) lines.push(`  requests: ${requests}`);
     if (blocks.length > 0) lines.push(`  blocks: ${blocks.length} (${activeBlocks} active)`);
     return lines.join("\n");
+}
+
+// #3912: pi's native footer percent comes from PI'S OWN projection estimator:
+// once any recovery omission (a failed attempt re-sent without the failed
+// turn) lands after the last provider-usage anchor, pi distrusts that anchor
+// and falls back to a chars/4 count over its FULL local history. bili keeps
+// that history unfolded on purpose (the wire carries the folded view; pi's
+// disk copy stays raw for decompress fidelity), so a healthy folded session
+// can read 500%+ in the native footer while the effective request is ~20% of
+// the window. This line shows the PROXY's effective-request observation with
+// an honest grade label ("usage" = provider-measured input of the last
+// settled request; "est" = bili's calibrated estimate of the current payload,
+// which is what a failed request leaves behind — stamped fresh at prepare
+// time), a staleness marker once no newer observation lands, and an explicit
+// reconciliation note when pi's own estimate diverges far enough that the two
+// numbers need explaining side by side. Rendered into pi's keyed status slot
+// only (additive — never replaces the native footer); wiring in
+// createBiliPlugin.
+const CONTEXT_LINE_REFRESH_THROTTLE_MS = 2000;
+const CONTEXT_LINE_STALE_SOFT_MS = 5 * 60 * 1000;
+const CONTEXT_LINE_STALE_HARD_MS = 60 * 60 * 1000;
+const CONTEXT_LINE_DIVERGE_POINTS = 25;
+export const BILI_CONTEXT_STATUS_KEY = "billion-context";
+
+export function renderBiliContextLine(
+    status: Record<string, unknown> | undefined,
+    hostPercent: number | null | undefined,
+    now: number,
+): string | undefined {
+    if (status === undefined) return undefined;
+    const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    const tokens = num(status.contextTokens);
+    if (tokens === null || tokens <= 0) return undefined;
+    const source = typeof status.contextTokensSource === "string" ? status.contextTokensSource : "unavailable";
+    if (source !== "usage" && source !== "estimate") return undefined;
+    const limit = num(status.contextLimit);
+    const pct = limit !== null && limit > 0 ? (tokens / limit) * 100 : null;
+    let line = `bili ${pct !== null ? `${pct.toFixed(1)}% ` : ""}${fmtTok(tokens)}${limit !== null && limit > 0 ? `/${fmtTok(limit)}` : ""}`;
+    line += source === "usage" ? " · usage" : " · est";
+    const at = num(status.contextTokensAt);
+    if (at !== null) {
+        const ageMs = now - at;
+        if (ageMs >= CONTEXT_LINE_STALE_HARD_MS) line += " · stale";
+        else if (ageMs >= CONTEXT_LINE_STALE_SOFT_MS) line += ` · ${Math.floor(ageMs / 60_000)}m`;
+    }
+    if (pct !== null && hostPercent !== undefined && hostPercent !== null && Number.isFinite(hostPercent) && Math.abs(hostPercent - pct) >= CONTEXT_LINE_DIVERGE_POINTS) {
+        line += ` · host est ${hostPercent.toFixed(1)}%`;
+    }
+    return line;
 }
 
 function outcomeDetailsOf(output: ForwardedToolResult): Record<string, unknown> | undefined {
@@ -1681,6 +1736,59 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const name = (event as { name?: unknown }).name;
             reportSessionName(ctx, typeof name === "string" ? name : "");
         });
+        // #3912: persistent effective-context line (semantics in
+        // renderBiliContextLine above). Additive keyed status slot only —
+        // the native footer and other extensions' setFooter claims are
+        // untouched. Refreshed by the events that can change the proxy's
+        // observation: turn_end / agent_settled (settled turns) and
+        // after_provider_response (also fires for error-status responses,
+        // where no turn completes). session_start (any reason: startup /
+        // resume / new / fork / reload) force-refreshes so the incoming
+        // session repopulates or honestly clears; session_tree clears
+        // because a local rewind invalidates the last observed payload
+        // until the next request re-establishes it. Throttled; a failed
+        // refresh keeps the previous line rather than guessing. Pi lane
+        // only (issue scope); omp shares none of this wiring.
+        if (agent === "pi") {
+            let contextLineRefreshAt = 0;
+            let contextLineRefreshGen = 0;
+            const clearContextLine = (ctx: Ctx | undefined): void => {
+                const setStatus = ctx?.ui?.setStatus;
+                if (typeof setStatus !== "function") return;
+                try { setStatus(BILI_CONTEXT_STATUS_KEY, undefined); } catch { /* best-effort UI clear */ }
+            };
+            const refreshContextLine = async (ctx: Ctx | undefined, force: boolean): Promise<void> => {
+                const setStatus = ctx?.ui?.setStatus;
+                if (typeof setStatus !== "function" || ctx === undefined) return;
+                const now = Date.now();
+                if (!force && now - contextLineRefreshAt < CONTEXT_LINE_REFRESH_THROTTLE_MS) return;
+                const gen = ++contextLineRefreshGen;
+                contextLineRefreshAt = now;
+                try {
+                    const proxyBase = proxyBaseForCtx(ctx);
+                    const sid = sessionIdOf(ctx);
+                    if (proxyBase === undefined || sid === undefined || sid.length === 0) return;
+                    const status = await fetchStatus(proxyBase, sid);
+                    let hostPercent: number | null | undefined;
+                    try {
+                        const usage = ctx.getContextUsage?.();
+                        hostPercent = usage !== undefined && typeof usage.percent === "number" && Number.isFinite(usage.percent) ? usage.percent : null;
+                    } catch {
+                        hostPercent = null;
+                    }
+                    if (gen !== contextLineRefreshGen) return; // superseded — a newer refresh owns the slot
+                    setStatus(BILI_CONTEXT_STATUS_KEY, renderBiliContextLine(status, hostPercent, Date.now()));
+                } catch (err) {
+                    logHostEvent("error", "[native-client]", `bili-plugin(pi): context line refresh failed (${err instanceof Error ? err.message : String(err)})`);
+                }
+            };
+            pi.on("turn_end", (_event, ctx) => { void refreshContextLine(ctx, false); });
+            pi.on("agent_settled", (_event, ctx) => { void refreshContextLine(ctx, false); });
+            pi.on("after_provider_response", (_event, ctx) => { void refreshContextLine(ctx, false); });
+            pi.on("session_start", (_event, ctx) => { void refreshContextLine(ctx, true); });
+            pi.on("session_shutdown", (_event, ctx) => clearContextLine(ctx));
+            pi.on("session_tree", (_event, ctx) => clearContextLine(ctx));
+        }
         // #2186: acp_delegate surface for the pi lane, inlined from
         // billion-context-pi-subagents. omp never reaches the wiring (the
         // gate repeats inside) and a previously claimed surface stands down.
