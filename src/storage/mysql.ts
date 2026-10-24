@@ -58,6 +58,11 @@ export type Mysql2Module = typeof import("mysql2/promise");
 
 const MYSQL_SCHEMA_VERSION = 7;
 
+/** #4512: rows per `msg_id IN (...)` span query — same rationale as store.ts;
+ *  an unchunked statement could exceed the driver's bind-parameter cap and
+ *  throw, feeding record()'s 3-strike self-disable. 500 stays under every cap. */
+const SEQ_SPAN_QUERY_BATCH = 500;
+
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
  *  re-orders keys), BIGINT for ms-epoch timestamps and seqs, VARCHAR keys
@@ -520,20 +525,36 @@ export class MysqlBackend implements StorageBackend {
             }
             // #4316 layer 3 (mirror of store.ts): resolve coverage to canonical
             // seq bounds from the append-only transcript; unresolvable keeps 0.
+            // #4512: fetch ONLY the rows the blocks cover (union of every block's
+            // effective+direct ids), not the whole transcript — the O(full-session)
+            // scan ran on every persist. boundsForCovered only ever looks up covered
+            // ids, so restricting the map to those rows is byte-equivalent; the
+            // idx_messages_msg_id index keeps each batch to targeted lookups.
             const seqSpanById = new Map<string, [number, number]>();
             if (input.blocks.length > 0) {
-                const spanRows = (await c.query(
-                    "SELECT msg_id, seq FROM messages WHERE session_id = ?",
-                    [s.sessionId],
-                )) as unknown as Row[][];
-                for (const r of spanRows[0]) {
-                    const msgId = str(r.msg_id);
-                    const seq = Number(r.seq);
-                    const cur = seqSpanById.get(msgId);
-                    if (!cur) seqSpanById.set(msgId, [seq, seq]);
-                    else {
-                        if (seq < cur[0]) cur[0] = seq;
-                        if (seq > cur[1]) cur[1] = seq;
+                const covered = new Set<string>();
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) covered.add(id);
+                    } catch { /* malformed payload: contributes no ids */ }
+                }
+                const ids = [...covered];
+                for (let i = 0; i < ids.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const batch = ids.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    const spanRows = (await c.query(
+                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${batch.map(() => "?").join(", ")})`,
+                        [s.sessionId, ...batch],
+                    )) as unknown as Row[][];
+                    for (const r of spanRows[0]) {
+                        const msgId = str(r.msg_id);
+                        const seq = Number(r.seq);
+                        const cur = seqSpanById.get(msgId);
+                        if (!cur) seqSpanById.set(msgId, [seq, seq]);
+                        else {
+                            if (seq < cur[0]) cur[0] = seq;
+                            if (seq > cur[1]) cur[1] = seq;
+                        }
                     }
                 }
             }

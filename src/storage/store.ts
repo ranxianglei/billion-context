@@ -36,6 +36,13 @@ import type { MessageContentStore } from "acp-kernel";
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
+/** #4512: rows per `msg_id IN (...)` span query. The covered-id union grows
+ *  with fold depth, so an unchunked statement could exceed the driver's
+ *  bind-parameter cap (SQLite varies by build, 999–32766) and throw — which
+ *  in record() feeds the 3-strike self-disable, worse than the perf bug here.
+ *  500 stays under every known cap. */
+const SEQ_SPAN_QUERY_BATCH = 500;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -864,17 +871,33 @@ export class UnifiedStore {
             // only here (delta placeholders are renumbered in-transaction), so
             // the pure planner cannot know them. Coverage whose ids have no
             // transcript row (imported pre-fold) keeps the 0 placeholder.
+            // #4512: fetch ONLY the rows the blocks cover (union of every block's
+            // effective+direct ids), not the whole transcript — the O(full-session)
+            // scan ran on every persist. boundsForCovered only ever looks up covered
+            // ids, so restricting the map to those rows is byte-equivalent; the
+            // (session_id, msg_id) index keeps each batch to targeted lookups.
             const seqSpanById = new Map<string, [number, number]>();
             if (input.blocks.length > 0) {
-                const rows = this.db
-                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
-                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
-                for (const r of rows) {
-                    const cur = seqSpanById.get(r.msg_id);
-                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
-                    else {
-                        if (r.seq < cur[0]) cur[0] = r.seq;
-                        if (r.seq > cur[1]) cur[1] = r.seq;
+                const covered = new Set<string>();
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) covered.add(id);
+                    } catch { /* malformed payload: contributes no ids */ }
+                }
+                const ids = [...covered];
+                for (let i = 0; i < ids.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const batch = ids.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    const rows = this.db
+                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${batch.map(() => "?").join(", ")})`)
+                        .all(s.sessionId, ...batch) as Array<{ msg_id: string; seq: number }>;
+                    for (const r of rows) {
+                        const cur = seqSpanById.get(r.msg_id);
+                        if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                        else {
+                            if (r.seq < cur[0]) cur[0] = r.seq;
+                            if (r.seq > cur[1]) cur[1] = r.seq;
+                        }
                     }
                 }
             }
