@@ -46,7 +46,7 @@ import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrieval
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
 import { v1UnwrapStream, wrapV1Internal, wrapV1ResponseJson, wrapV1SseFrame } from "../v1internal.js";
-import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
+import { compressLoopOpenaiJson } from "../compress-loop-openai.js";
 import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
@@ -2009,6 +2009,21 @@ export async function forward(
                         { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
                     );
                 }
+                // #4019: non-stream OpenAI runs the same proxy-tool loop as the
+                // stream path — previously a one-shot rewriter passed non-compress
+                // proxy tools through unexecuted and lost the turn's answer.
+                if (prepared.protocol === "openai") {
+                    const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+                    const requestHeaders = buildForwardHeaders(headers);
+                    const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (requestBody as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
+                    json = await compressLoopOpenaiJson(
+                        json,
+                        { ...ctx, compressMessages: prepared.originalMessages },
+                        { proxyUrl, visibilityMarkers, signal: clientAbort.signal },
+                        requestBody,
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
+                    );
+                }
                 // Capture upstream usage so tokenCount (which drives nudge +
                 // emergency-truncate) reflects reality for non-streaming
                 // sessions too. The streaming loops do this in their SSE
@@ -2047,13 +2062,13 @@ export async function forward(
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
                 if (typeof out === "number") prepared.session.stats.outputTokens += out;
-                if (prepared.protocol === "openai") {
-                    await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponseAsync(json, ctx, clientAbort.signal));
-                } else if (prepared.protocol === "responses") {
+                // #4019: openai is fully rewritten by compressLoopOpenaiJson above,
+                // so it matches no branch here (the last is anthropic-specific).
+                if (prepared.protocol === "responses") {
                     await withSessionLock(prepared.session, () => rewriteResponsesJsonResponseAsync(json, ctx, clientAbort.signal));
                 } else if (prepared.protocol === "google") {
                     await withSessionLock(prepared.session, () => rewriteGoogleJsonResponseAsync(json, ctx, clientAbort.signal));
-                } else {
+                } else if (prepared.protocol === "anthropic") {
                     await withSessionLock(prepared.session, () => rewriteJsonResponseAsync(json, ctx, clientAbort.signal));
                 }
                 res.end(JSON.stringify(json));
