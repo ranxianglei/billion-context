@@ -316,7 +316,10 @@ export class UpstreamHttpError extends Error {
  *  rate-limit rejection rather than a genuine client error. GLM Coding Plan
  *  returns 400 {"code":3007,"msg":"captcha verify failed"} ~1s after large
  *  context rewrites (issue #189); every observed case recovered on retry,
- *  so such bodies are retried while plain 4xx (bad model, bad params) fail fast. */
+ *  so such bodies are retried while plain 4xx (bad model, bad params) fail
+ *  fast. "please retry" / "请重试" cover the canonical "just retry" phrasing of
+ *  risk-control gateways (issue #3606). Bare "retry" is deliberately absent —
+ *  "do not retry" / "请勿重试" must stay non-transient. */
 const TRANSIENT_BODY_MARKERS = [
     "captcha",
     "verify failed",
@@ -325,13 +328,74 @@ const TRANSIENT_BODY_MARKERS = [
     "rate limit",
     "too many requests",
     "try again",
+    "please retry",
+    "请重试",
 ];
+
+// #3606: an explicit machine self-declaration outranks prose sniffing — a
+// gateway that says its rejection is retryable means it, and enumerating
+// every vendor's wording will never converge. Bodies past this cap are too
+// large to be JSON error envelopes; skip the parse.
+const DECLARATION_BODY_CAP = 65_536;
+// Node visit budget for the declaration scan: bounds worst-case work on
+// pathological (but still small) bodies.
+const DECLARATION_NODE_BUDGET = 4_096;
 
 export function isTransientUpstreamError(status: number, body: string): boolean {
     if (status === 429 || status >= 500) return true;
     if (status < 400) return false;
     const lower = body.toLowerCase();
-    return TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker));
+    if (TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker))) return true;
+    return bodyDeclaresRetryable(body);
+}
+
+// #3606: honor the upstream's explicit retryability declaration — an "actions"
+// array containing "RETRY" (case-insensitive) or a boolean "retryable": true
+// anywhere in the error JSON. The scan walks nested objects AND string values
+// that themselves parse as JSON, because gateways wrap their envelope in a
+// string field ({"error":{"message":"{...}"}}, the shape behind issue #3606's
+// code 11101 bodies). A string "true" or an actions list without RETRY is NOT
+// a declaration — only unambiguous machine signals count.
+function bodyDeclaresRetryable(body: string): boolean {
+    if (body.length > DECLARATION_BODY_CAP) return false;
+    const root = parseJsonObject(body);
+    if (root === undefined) return false;
+    const queue: unknown[] = [root];
+    let head = 0;
+    let visited = 0;
+    while (head < queue.length && visited < DECLARATION_NODE_BUDGET) {
+        const node = queue[head++];
+        visited += 1;
+        if (typeof node === "string") {
+            const nested = parseJsonObject(node);
+            if (nested !== undefined) queue.push(nested);
+        } else if (Array.isArray(node)) {
+            for (const item of node) queue.push(item);
+        } else if (node !== null && typeof node === "object") {
+            for (const [key, value] of Object.entries(node)) {
+                const loweredKey = key.toLowerCase();
+                if (loweredKey === "actions" && Array.isArray(value)
+                    && value.some((item) => typeof item === "string" && item.toLowerCase() === "retry")) {
+                    return true;
+                }
+                if (loweredKey === "retryable" && value === true) {
+                    return true;
+                }
+                if (value !== null && typeof value === "object") queue.push(value);
+                else if (typeof value === "string" && /^[{\[]/.test(value.trimStart())) queue.push(value);
+            }
+        }
+    }
+    return false;
+}
+
+function parseJsonObject(text: string): object | undefined {
+    try {
+        const value: unknown = JSON.parse(text);
+        return typeof value === "object" && value !== null ? value : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 /** Total requests per replay attempt (initial + retries). */
