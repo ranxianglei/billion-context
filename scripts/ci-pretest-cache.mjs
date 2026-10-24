@@ -32,7 +32,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,6 +129,28 @@ export function markerIsFresh(distDir, hash) {
 }
 
 /**
+ * A verified-fresh dist must also be MTIME-fresh (#4548): the actions/cache
+ * restore brings dist files back with their archived mtimes (older than this
+ * run's checkout), so every mtime-based freshness consumer — the #3325
+ * golden-drive guard, tsup/esbuild incrementals, anything else — sees a stale
+ * dist even though the marker just proved its bytes fresh. Refresh the whole
+ * dist tree to "now" on every HIT; on MISS the real build already does the
+ * equivalent implicitly.
+ */
+function touchTree(dir) {
+    const now = new Date();
+    const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+            const p = join(d, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) utimesSync(p, now, now);
+        }
+        utimesSync(d, now, now);
+    };
+    walk(dir);
+}
+
+/**
  * The pretest loop. For each component: hash → fresh marker? HIT, skip :
  * MISS → run the real build → stamp the marker. `build`/`log` are test seams
  * (the CLI passes defaults); build failures propagate so the CLI exits 1 —
@@ -144,6 +166,7 @@ export function runPretestCache(opts = {}) {
         const hash = hashComponent(root, comp);
         const distDir = join(root, comp.dir, "dist");
         if (markerIsFresh(distDir, hash)) {
+            touchTree(distDir);
             log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}`);
             results.push({ name: comp.name, hit: true, ms: 0 });
             continue;

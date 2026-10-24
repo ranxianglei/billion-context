@@ -337,7 +337,7 @@ describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks �
 
 describe("escalation latch recovery (review gap ②) — upgrade-in-place heals", () => {
     test("3 total-loss passes latch once; a healthy resend clears the latch; post-recovery churn still repairs", () => {
-        _setStoreForTest(new SessionStore({ enabled: false })); // escalation reaps via markDirty
+        _setStoreForTest(new SessionStore({ enabled: false }));
         const originals = history();
         const session = fakeSession(originals.map((m) => m.id as string));
         const logs: { level: string; msg: string }[] = [];
@@ -357,24 +357,27 @@ describe("escalation latch recovery (review gap ②) — upgrade-in-place heals"
         }
         assert.equal(session.metadata.foldDriftEscalated, true, "latched after 3 consecutive total-drift passes");
         assert.equal(session.metadata.foldDriftStreak, 3);
+        assert.equal(session.metadata.foldEpochConfirmPending, true);
         assert.equal(logs.filter((l) => l.msg.includes("fold epoch confirmation required")).length, 1,
             "#2297: exactly ONE error line per episode");
 
-        // healthy resend of the ORIGINAL bytes: missing=0 → noop, and the
+        // Healthy resend of the ORIGINAL bytes: missing=0 → resend, and the
         // streak reset clears the latch — the upgrade-in-place recovery path.
         const healthy = reconcileFoldCoverage(session, originals, opts(log));
-        assert.equal(healthy.kind, "noop");
+        assert.equal(healthy.kind, "resend");
         assert.ok(session.metadata.foldDriftEscalated === undefined, "latch cleared on recovery");
         assert.ok(session.metadata.foldDriftStreak === undefined, "streak cleared on recovery");
+        assert.ok(session.metadata.foldEpochConfirmPending === undefined, "epoch confirmation cleared on recovery");
 
-        // Escalation reaped the destroyed block (#2695 zombie-carrier reap) —
-        // so after the latch clears the ledger is a CLEAN SLATE, not a repair
-        // target: nothing is covered, nothing missing, and the next fold
-        // cycle starts fresh. That is the upgrade-in-place contract: a
-        // v0.1.192→v0.1.196 upgrade with a latched ledger heals instead of
-        // dead-looping the doomed preflight.
-        assert.equal((session.state.blocks as unknown[]).length, 0, "destroyed substrate reaped at escalation");
-        const r = reconcileFoldCoverage(session, remint(originals, "g9"), opts(log));
-        assert.equal(r.kind, "noop", "clean slate — the lane lives, folds rebuild on the next compress cycle");
+        // #4525: epoch confirmation retains the fold snapshot so the original
+        // coverage recovers and subsequent id churn can still be repaired.
+        assert.equal(session.state.blocks.length, 1, "original fold survives escalation and recovery");
+        assert.equal(session.state.blocks[0].blockId, "blk-2915");
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, originals.map((m) => m.id));
+        const next = remint(originals, "g9");
+        const r = reconcileFoldCoverage(session, next, opts(log));
+        assert.equal(r.kind, "reanchored", "retained fold repairs post-recovery id churn");
+        assert.equal(r.unmatched, 0);
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, next.map((m) => m.id));
     });
 });
