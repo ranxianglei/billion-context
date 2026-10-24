@@ -370,6 +370,10 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
     // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
     /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
+    // DashScope compatible-mode states the ceiling as an input-length RANGE
+    // ("Range of input length should be [1, 1000000]"), with no token or length
+    // subject phrase: unlisted here, the 400 is not an overflow and nothing arms.
+    /range of input length should be \[/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -434,6 +438,10 @@ function parseOverflowWindow(text: string): number | undefined {
     // tokens allowed (1048576)." — the number after "allowed" is the window; the
     // first parenthesized number is the rejected payload and must not be used.
     m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
+    if (m) return toTokenNumber(m[1]);
+    // DashScope: "Range of input length should be [1, 1000000]" — the upper
+    // bound is the input ceiling; the lower bound is not a window.
+    m = text.match(/range of input length should be \[\s*\d[\d,]*\s*,\s*(\d[\d,]*)\s*\]/i);
     if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
