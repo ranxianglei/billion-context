@@ -2141,7 +2141,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #2146: internal lane — must not arm the model-facing loop breaker.
             const fold = parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress" }] });
             if (externalFold) for (const range of fold.ranges) range.compressCallId = newExternalCallId();
-            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            // #4228 SD1: net each fold's obs against this round's running baseline so
+            // multi-fold rounds stop printing the stale full view; token scale only —
+            // unknown-baseline sessions track chars, so skip there to avoid mixing scales.
+            const applied = applyRanges(fold, ctx, { loopTracking: false, roundBefore: baselineKnown ? currentTokens : undefined });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] ${applied.text}`);
                 noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)}`);

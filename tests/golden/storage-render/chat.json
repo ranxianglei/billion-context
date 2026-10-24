@@ -48,8 +48,8 @@
   },
   {
    "i": 9,
-   "sha": "f1e08e530a96ecb4996c0a63e840e3f374a82b095e285ffea94e70391eb32fe0",
-   "bytes": 49458
+   "sha": "b4398fa6836fa236f6ef6906bcc8b5de538275c80ac3754cd3a6e8057d9a51e1",
+   "bytes": 49622
   },
   {
    "i": 10,
@@ -80,12 +80,12 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "a4abd4cb1cc9ade667c277fb1095641d6135cae0ac2d6ee2905920365f4f56b4",
+ "stateDigest": "aa9d8f88a4ff0799050d7fcb2562b4ea8e5f713c9b54fb43ceadb19611b48054",
  "sectionDigests": {
   "state": "8390f21336885863",
   "blockContents": "94a58f96d7c5cfc3",
-  "stats": "24d705b0e39bd13c",
-  "metadata": "68d1e5ca212cef7b"
+  "stats": "ed37c3bd84f9e947",
+  "metadata": "f80fdb5786637925"
  },
  "stateKeyDigests": {
   "blocks": "d9770feee91dafc6",

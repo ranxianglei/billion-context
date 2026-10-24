@@ -101,7 +101,7 @@ test("#1294 P1: long two-section summary yields an exact fingerprint line", () =
     // clean success carries exactly the stop signal.
     assert.deepEqual(
         out.split("\n").slice(2),
-        [STEERING_2544, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
+        [STEERING_2544, "", "All compressible ranges offered this turn are folded — continue the task and do not re-issue compress(). This covers only the ranges you were offered, not a verdict that the session is at its minimum: the proxy's preflight pass keeps auto-compressing any residual overflow."],
         "header + fingerprint + #2544 steering + #1387 stop tail only",
     );
 });

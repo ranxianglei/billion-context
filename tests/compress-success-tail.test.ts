@@ -1,14 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage, CompressibleRange, NudgeDecision } from "acp-kernel";
-import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
+import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig, countMessageTokens, defaultCountTokens } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 
 // #1387: post-compress success tail — remaining-ranges snapshot (pi #420) and
 // explicit stop signal (pi #521). Cross-host wording must stay verbatim.
 const RANGES_HEADER = "Current compressible ranges (use these refs exactly as listed):";
-const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+const NO_RANGES_REMAIN_TEXT = "All compressible ranges offered this turn are folded — continue the task and do not re-issue compress(). This covers only the ranges you were offered, not a verdict that the session is at its minimum: the proxy's preflight pass keeps auto-compressing any residual overflow.";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -287,4 +287,64 @@ test("#1387: tail recompute still advertises ranges under real pressure (shouldI
     assert.ok(out.includes(RANGES_HEADER), "live ranges must be advertised under real pressure:\n" + out);
     assert.ok(out.includes("m00005"), "the unfolded over-limit range must be listed:\n" + out);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while over-limit ranges remain:\n" + out);
+});
+
+test("#4228 SD1: a multi-fold round obs nets against the running baseline, not the stale full view", () => {
+    // Preflight commitFold calls applyRanges once per range against the SAME stale
+    // ctx.messages; passing its running currentTokens as roundBefore makes each
+    // line report the live remainder instead of re-printing the whole view (#4224).
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    const roundBefore = 40000;
+    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] }), ctx, { loopTracking: false, roundBefore });
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs, "obs line must be logged on success:\n" + ctx.logs.join("\n"));
+    assert.ok(obs!.includes("(round)"), "round-aware fold must tag its ratio:\n" + obs!);
+    assert.ok(obs!.includes(`/${roundBefore} tok (round)`), "ratio denominator must be the running baseline, not the stale view:\n" + obs!);
+    // postCtx must equal roundBefore minus the NET saving (gross removed less the
+    // re-entering summary) — matching preflight's own currentTokens bookkeeping.
+    const gross = ctx.session.lastCompress?.tokensCompressed ?? 0;
+    const newSummaryTok = ctx.session.state.blocks.filter((b) => b.active).reduce((n, b) => n + defaultCountTokens(b.summary), 0);
+    const expectedPost = Math.max(0, roundBefore - Math.max(0, gross - newSummaryTok));
+    const m = /postCtx≈(\d+)/.exec(obs!);
+    assert.ok(m, "postCtx must be present:\n" + obs!);
+    assert.equal(Number(m![1]), expectedPost, `postCtx must net against the running baseline: ${obs}`);
+});
+
+test("#4228 SD1: the model-tool lane (no roundBefore) keeps the #1911 gross-over-view formula byte-identical", () => {
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] }), ctx);
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs, "obs line must be logged:\n" + ctx.logs.join("\n"));
+    assert.ok(!obs!.includes("(round)"), "model-tool lane must not carry the round marker:\n" + obs!);
+    let viewTokens = 0;
+    for (const msg of ctx.messages) viewTokens += countMessageTokens(msg);
+    const gross = ctx.session.lastCompress?.tokensCompressed ?? 0;
+    const expectedPost = Math.max(0, viewTokens - gross);
+    const mm = /postCtx≈(\d+)/.exec(obs!);
+    assert.ok(mm, "postCtx must be present:\n" + obs!);
+    assert.equal(Number(mm![1]), expectedPost, `legacy postCtx must stay gross-over-view: ${obs}`);
+    assert.ok(obs!.includes(`/${viewTokens} tok`), "legacy ratio denominator must be the full view:\n" + obs!);
+});
+
+test("#4228 SD2: the drained-offer stop signal never asserts the whole context is at its minimum", () => {
+    const msgs = [
+        textMsg("raw_1", "user", "x".repeat(20000)),
+        textMsg("raw_2", "assistant", "x".repeat(20000)),
+        textMsg("raw_3", "user", "x".repeat(5000)),
+        textMsg("raw_4", "assistant", "x".repeat(5000)),
+        textMsg("raw_5", "user", "x".repeat(5000)),
+        textMsg("raw_6", "assistant", "x".repeat(5000)),
+        textMsg("raw_7", "user", "x".repeat(5000)),
+    ];
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 5 }));
+    ctx.session.stats.lastInputTokens = 80000;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must fire when the offer drains:\n" + out);
+    assert.ok(!out.includes("already at its minimum"), "stop signal must not claim a global minimum it did not verify:\n" + out);
+    assert.ok(out.includes("only the ranges you were offered"), "stop signal must scope itself to the offer list:\n" + out);
 });

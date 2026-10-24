@@ -48,8 +48,8 @@
   },
   {
    "i": 9,
-   "sha": "2ddad1b2186f7f0444543f1b72b2f4fe3dcfe6d8cf709211a54e820b7c3a6a4a",
-   "bytes": 49528
+   "sha": "4755bb2d6ea5a5a678a02d299de34f697f9603bf216268286561dc2a349e2954",
+   "bytes": 49692
   },
   {
    "i": 10,
@@ -80,17 +80,17 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "2afbea1dbbc9381f8ec7b49a4fa6b5d55b4084ff20304f20a1f51cb120b9a49f",
+ "stateDigest": "6279cd81ed9705002a0cb24b4253ead9c78659970b5a381ab6c9365c2ef6ee9c",
  "sectionDigests": {
-  "state": "f93dc1c876c672d4",
+  "state": "449d0a0993cc0fbf",
   "blockContents": "dc7d13d250c94bb4",
-  "stats": "c6f1d434975d047d",
-  "metadata": "9c05fef8fb761941"
+  "stats": "221529b8b52e0890",
+  "metadata": "909e72d43a904361"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
   "messageRefs": "3d09c9004582bdbc",
-  "nudge": "ba03a8a4b58554a7",
+  "nudge": "d24e0962a4de3f8c",
   "stats": "23312f7d5a0b9e27",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",

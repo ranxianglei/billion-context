@@ -514,7 +514,11 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
 // Silence after success is not a stop signal — models extrapolate ghost endIds
 // past the session tail and burn a round on kernel rejection. Wording is
 // verbatim pi-side so both hosts speak the same contract.
-const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+// #4228 SD2: this stop signal fires when the prepare-time OFFER list is exhausted
+// (#2404 pins it to the pre-fold offer, never a live recompute), so it may only
+// assert that local fact — claiming the whole context is "at its minimum" contradicts
+// preflight's fresh viable-range count whenever unoffered foldable ranges remain.
+const NO_RANGES_REMAIN_TEXT = "All compressible ranges offered this turn are folded — continue the task and do not re-issue compress(). This covers only the ranges you were offered, not a verdict that the session is at its minimum: the proxy's preflight pass keeps auto-compressing any residual overflow.";
 
 // #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
 // set the model acted on) minus the just-folded spans — NOT a fresh post-fold
@@ -765,7 +769,7 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
-export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
+export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean; roundBefore?: number }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
@@ -1106,7 +1110,20 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const viewMessages = ctx.compressMessages ?? ctx.messages;
         let viewTokens = 0;
         for (const m of viewMessages) viewTokens += countMessageTokens(m);
-        const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
+        // #4228 SD1: a multi-fold round (preflight commitFold) calls this once per
+        // range against the SAME stale ctx.messages, so the single-fold delta below
+        // understates the running payload on every line after the first (the #4224
+        // "shrink 0% … postCtx≈14.5M" lines). Preflight passes its own maintained
+        // currentTokens (token scale only — the caller gates on baselineKnown) as
+        // roundBefore; netting this fold against it yields each line's honest running
+        // remainder. The model-tool lane never passes it (one call already sums every
+        // range into r.tokensCompressed), so its #1911 same-space gross-over-view
+        // ratio stays byte-identical.
+        const roundBefore = typeof opts?.roundBefore === "number" && opts.roundBefore > 0 ? opts.roundBefore : null;
+        const newSummaryTok = res.state.blocks.reduce((n, b) => n + (!beforeIds.has(b.blockId) && b.active ? defaultCountTokens(b.summary) : 0), 0);
+        const baseTokens = roundBefore ?? viewTokens;
+        const removed = roundBefore !== null ? Math.max(0, r.tokensCompressed - newSummaryTok) : r.tokensCompressed;
+        const shrinkRatio = baseTokens > 0 ? Math.min(1, removed / baseTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
         ctx.session.stats.pendingFoldUsage = true;
@@ -1117,23 +1134,24 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // upstream eviction.
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
-        const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
+        const postCtx = Math.max(0, baseTokens - removed);
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        const ratioDetail = roundBefore !== null ? `~${removed}/${baseTokens} tok (round)` : `~${r.tokensCompressed}/${viewTokens} tok`;
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (${ratioDetail}) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —
         // legitimate as a marathon-session strategy, but it rewrites the whole
         // prefix and leaves only the anchor summaries. Hosts need a
         // machine-greppable marker to audit/penalize it (the obs line alone is
         // indistinguishable from a normal fold's).
         if (shrinkRatio >= DEGENERATE_FOLD_COVERAGE) {
-            ctx.log(`[warn: degenerate-fold] [acp-compress-obs] covers ${Math.round(shrinkRatio * 100)}% of the live context (~${r.tokensCompressed}/${viewTokens} tok) leaving ${activeBlockCount} active block(s), anchor≈${anchorTok} tok — the whole prefix rewrites and the prefix cache restarts from scratch on the next request`);
+            ctx.log(`[warn: degenerate-fold] [acp-compress-obs] covers ${Math.round(shrinkRatio * 100)}% of the live context (${ratioDetail}) leaving ${activeBlockCount} active block(s), anchor≈${anchorTok} tok — the whole prefix rewrites and the prefix cache restarts from scratch on the next request`);
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
         recordCacheFoldsFromBlocks(
             ctx.session,
             res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: viewTokens, Vp: postCtx },
+            { V: baseTokens, Vp: postCtx },
         );
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
