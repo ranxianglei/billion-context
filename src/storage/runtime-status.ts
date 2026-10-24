@@ -239,6 +239,10 @@ interface StorageRuntimeStatus {
     verifyDrift: number;
     /** #3135 ④/#3818: sessions currently served from the JSON envelope because the index view drifted. */
     driftedSessions: number;
+    /** #3437: total ingests this process — denominator of the delta-path ratio. */
+    ingests: number;
+    /** #3437: ingests that rode the O(new-tail) watermark fast path (#3133). */
+    deltaIngests: number;
     /** #4175 durability trio. */
     integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
     secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
@@ -290,6 +294,10 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         // (persist.ts loadSync) while the envelope still exists.
         verifyDrift: sidecar?.stats.verifyDrift ?? 0,
         driftedSessions: sidecar?.driftedSessions.size ?? 0,
+        // #3437: the A/B retest reads deltaIngests/ingests to confirm steady-
+        // state saves ride the O(new-tail) path instead of full re-ingests.
+        ingests: sidecar?.stats.ingests ?? 0,
+        deltaIngests: sidecar?.stats.deltaIngests ?? 0,
         integrity: state.integrity,
         secondProcess: state.secondProcess,
         splitBrain: state.splitBrain,
@@ -314,6 +322,9 @@ interface StorageStatusWire {
     /** #3135 ④/#3818: drift observability on the wire. */
     verifyDrift: number;
     driftedSessions: number;
+    /** #3437: delta/full ingest split on the wire (deltaIngests/ingests ≈ 1 = steady state rides the fast path). */
+    ingests: number;
+    deltaIngests: number;
     /** #4175 durability trio. */
     integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
     secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
@@ -345,6 +356,8 @@ export function storageStatusWire(): StorageStatusWire {
         sidecarDisabled: st.sidecarDisabled,
         verifyDrift: st.verifyDrift,
         driftedSessions: st.driftedSessions,
+        ingests: st.ingests,
+        deltaIngests: st.deltaIngests,
         integrity: st.integrity,
         secondProcess: st.secondProcess,
         splitBrain: splitBrainWire(st.splitBrain),

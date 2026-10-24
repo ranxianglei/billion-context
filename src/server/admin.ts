@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
@@ -998,7 +999,10 @@ function replicaIdFromUrl(url: string, suffix = ""): string | null {
 /** GET /__bili/memory — resident-pool diagnostics (#R3): process numbers plus
  * the per-session resident breakdown (lastMessages / pluginSnapshot /
  * blockContents / contentStore / state / other). Read-only, loopback-gated
- * with the rest of /__bili. Top 25 sessions by bytes. */
+ * with the rest of /__bili. Top 25 sessions by bytes.
+ * #3437: cpuUserNs/cpuSystemNs are cumulative since process start — samplers
+ * take deltas between polls. Normalization: core-equivalents = Δns / Δwall_ns
+ * (1.0 = one core fully busy); Task-Manager-style percent = Δns / (Δwall_ns × cpus). */
 async function sendMemoryReport(res: http.ServerResponse): Promise<void> {
     let peakRssBytes: number | null = null;
     try {
@@ -1009,11 +1013,12 @@ async function sendMemoryReport(res: http.ServerResponse): Promise<void> {
         // non-linux: peak stays null
     }
     const mu = process.memoryUsage();
+    const cu = process.cpuUsage();
     const report = memoryReport();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
-        process: { rssBytes: mu.rss, heapUsedBytes: mu.heapUsed, heapTotalBytes: mu.heapTotal, externalBytes: mu.external, peakRssBytes },
+        process: { rssBytes: mu.rss, heapUsedBytes: mu.heapUsed, heapTotalBytes: mu.heapTotal, externalBytes: mu.external, peakRssBytes, cpuUserNs: cu.user, cpuSystemNs: cu.system, cpus: os.cpus().length },
         pool: report.pool,
         breakdown: report.breakdown,
         sessions: report.sessions.slice(0, 25),
