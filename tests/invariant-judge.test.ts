@@ -317,3 +317,50 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
+
+test("#4003 cap: bodies over JUDGE_BODY_CAP (4 MiB) skip the judge silently — no parse, no verdict, no throw", () => {
+  const seen: JudgeVerdict[] = [];
+  const lines: Array<[string, string]> = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  setLogCapture((level, msg) => lines.push([level, msg]));
+  try {
+    // 5 MiB of filler in ONE field: a would-be rewrite hides inside so a judge
+    // that (wrongly) parsed it would go red — the cap must skip instead.
+    const big = "x".repeat(5 * 1024 * 1024);
+    const body = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: big },
+      { role: "assistant", content: "hi REWRITTEN BY DEFECT" },
+    ] });
+    maybeRunInvariantJudge({ originalMessages: [], body, protocol: "openai", sessionId: "s-cap" });
+    assert.equal(seen.length, 0, "oversized body must not produce a verdict");
+    const hit = lines.find(([, m]) => m.includes("skipping"));
+    assert.ok(hit, "skip must be observable at debug");
+    assert.equal(hit![0], "debug");
+    // Buffer input takes the same path (relays hand Buffers too).
+    maybeRunInvariantJudge({ originalMessages: [], body: Buffer.from(body, "utf8"), protocol: "openai", sessionId: "s-cap" });
+    assert.equal(seen.length, 0);
+    // Absent body: the gate owns the empty case — zero verdicts, accurate log.
+    maybeRunInvariantJudge({ originalMessages: [], protocol: "openai", sessionId: "s-cap" });
+    assert.equal(seen.length, 0);
+    // Continuity lane: prev oversized OR next oversized → skip both.
+    const small = JSON.stringify({ model: "m", messages: [{ role: "user", content: "q" }] });
+    maybeJudgeContinuity(body, small, "openai", "s-cap");
+    maybeJudgeContinuity(small, body, "openai", "s-cap");
+    assert.equal(seen.length, 0);
+    // Continuity skips are observable at debug too (#4021 spec: both entries log).
+    const contSkips = lines.filter(([, m]) => m.includes("continuity") && m.includes("skipping"));
+    assert.ok(contSkips.length >= 2, "both continuity skips must be observable");
+    assert.ok(contSkips.every(([lvl]) => lvl === "debug"));
+    // Sanity: a small body still judges (cap did not brick the happy path).
+    const tiny = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi REWRITTEN BY DEFECT" },
+    ] });
+    maybeRunInvariantJudge({ originalMessages: [mk("user", "text", "hello"), mk("assistant", "text", "hi")], body: tiny, protocol: "openai", sessionId: "s-cap" });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].ok, false);
+  } finally {
+    _setInvariantJudgeForTest(false);
+    setLogCapture(null);
+  }
+});

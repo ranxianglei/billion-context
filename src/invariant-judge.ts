@@ -325,9 +325,29 @@ function armed(): boolean {
   return invariantJudgeEnabled();
 }
 
+/** Bodies outside this size range are skipped by the judge — a full
+ * advisory-side JSON.parse of a #3128-scale multi-GiB body is an OOM/event-loop
+ * stall vector, and the judge's own precedent (SEAM_BODY_CAP, 512 KiB) already
+ * treats oversized bodies as "partial forensics: silently skip". Skips log
+ * at debug (visible when converging a bug), never warn: a skipped diagnostic
+ * is not a defect. Const by design — no knob until an operator asks (#4003). */
+const JUDGE_BODY_CAP = 4 * 1024 * 1024;
+
+/** Byte length of a judge input body — 0 when absent; strings measured as
+ * UTF-8 bytes so strings and Buffers compare like-for-like against the cap. */
+function judgeBodyLen(body: string | Buffer | undefined): number {
+  if (!body) return 0;
+  return typeof body === "string" ? Buffer.byteLength(body) : body.length;
+}
+
 export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
+    const bodyLen = judgeBodyLen(input.body);
+    if (bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) {
+      loggerLog("debug", `[invariant-judge] body ${bodyLen}B outside judge range (≤${JUDGE_BODY_CAP}B) — skipping (advisory layer, #4003 cap)`);
+      return;
+    }
     const entry = input.originalMessages ?? [];
     const exitCores0 = parseExitCores(input.body, input.protocol);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
@@ -357,6 +377,12 @@ export function maybeJudgeContinuity(
 ): void {
   if (!armed() || !prev) return;
   try {
+    const prevLen = judgeBodyLen(prev);
+    const bodyLen = judgeBodyLen(body);
+    if (prevLen === 0 || prevLen > JUDGE_BODY_CAP || bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) {
+      loggerLog("debug", `[invariant-judge] continuity bodies ${prevLen}/${bodyLen}B outside judge range (≤${JUDGE_BODY_CAP}B) — skipping (advisory layer, #4003 cap)`);
+      return;
+    }
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;
