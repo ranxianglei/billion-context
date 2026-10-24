@@ -2295,6 +2295,18 @@ export function loadConfigFile(): FileConfig {
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
             warnInertRemovedCompressKeys(obj);
+            // #4200: the global cacheKeepalive block gets the same strict #1909
+            // validation as route-level / per-model entries (parseRouteEntry) —
+            // previously it was only KNOWN_TOP_LEVEL_KEYS-listed, so a typo'd
+            // block loaded clean at root while the identical typo under
+            // providers.<url> rejected, and resolveCacheKeepalive silently
+            // dropped the bad fields to defaults. Validation only: well-formed
+            // blocks pass through as-is. null means "absent" (the web save
+            // contract, src/web/api.ts) and is skipped; anything else invalid
+            // throws into the catch below — loud error naming the field, file
+            // treated as unreadable, exactly like a malformed file.
+            const globalKeepalive = obj.cacheKeepalive;
+            if (globalKeepalive !== undefined && globalKeepalive !== null) parseCacheKeepaliveSettings(globalKeepalive);
             value = obj as FileConfig;
         } else {
             value = {};
