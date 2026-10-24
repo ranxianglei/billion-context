@@ -45,6 +45,15 @@ const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "tls",
 ]);
 
+/** #4403 P0-3: kinds that COUNT toward opening the circuit gate. A superset of
+ *  ALERT_KINDS: unclassified ("unknown") pre-response deaths open the gate too —
+ *  three consecutive unexplained failures are enough reason to stop resending
+ *  full context — but they still never mint a banner (the alert table keeps its
+ *  "better silent than a misleading red banner" discipline). client-abort and
+ *  post-connect upstream-timeout stay out of BOTH: an abort is not bili's
+ *  problem and a post-connect timeout proves nothing about reachability. */
+const CIRCUIT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([...ALERT_KINDS, "unknown"]);
+
 const MAX_ALERTS = 32;
 
 let alerts = new Map<string, UpstreamAlert>();
@@ -187,9 +196,10 @@ export function upstreamCircuitLastFailureKind(url: string): string | undefined 
 }
 
 /** Record one FINAL pre-response transport failure (the error escaped the
- *  in-request retry ladder). Same discipline as ALERT_KINDS: client aborts,
- *  post-connect timeouts and HTTP verdicts never COUNT toward opening — only
- *  "cannot reach" failures open the circuit. `detail` (already formatted by
+ *  in-request retry ladder). CIRCUIT_KINDS discipline (#4403): client aborts,
+ *  post-connect timeouts and HTTP verdicts never COUNT toward opening;
+ *  unclassified ("unknown") failures DO count — gate only, no banner.
+ *  `detail` (already formatted by
  *  the caller) rides along so fail-fast errors stay actionable. While the
  *  circuit is OPEN this call is the half-open probe finishing without a
  *  response: the single-flight slot is released for ANY kind — an uncounted
@@ -201,7 +211,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     const now = Date.now();
     let entry = circuits.get(host);
     if (!entry) {
-        if (!ALERT_KINDS.has(kind)) return;
+        if (!CIRCUIT_KINDS.has(kind)) return;
         if (circuits.size >= MAX_CIRCUITS) {
             let oldestKey: string | undefined;
             let oldestAt = Infinity;
@@ -228,7 +238,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
         loggerLog("warn", `[acp-proxy] upstream circuit probe FAILED for ${host} (${kind}) — re-armed until ${new Date(c.nextProbeAt).toISOString()} (#3148)`);
         return;
     }
-    if (!ALERT_KINDS.has(kind)) return;
+    if (!CIRCUIT_KINDS.has(kind)) return;
     c.lastFailure = { kind, detail: shortDetail, at: now };
     c.consecutiveFailures += 1;
     if (c.consecutiveFailures >= CIRCUIT_OPEN_AFTER) {

@@ -699,6 +699,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 if (uf?.kind !== undefined) diag.kind = uf.kind;
                 if (uf?.code !== undefined) diag.code = uf.code;
                 if (uf?.hint !== undefined) diag.hint = uf.hint;
+                // #4403 P0-2: probe-captured certificate identity rides the same slice.
+                if (uf?.remoteAddress !== undefined) diag.remoteAddress = uf.remoteAddress;
+                if (uf?.certSubject !== undefined) diag.certSubject = uf.certSubject;
+                if (uf?.certIssuer !== undefined) diag.certIssuer = uf.certIssuer;
+                if (uf?.certSan !== undefined) diag.certSan = uf.certSan;
+                if (uf?.certFingerprint256 !== undefined) diag.certFingerprint256 = uf.certFingerprint256;
                 res.writeHead(status, { "content-type": "application/json" });
                 res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) }));
             } else {

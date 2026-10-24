@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS } from "../src/upstream-fail.ts";
+import { classifyUpstreamFailure, isTransparentReplayableKind, UPSTREAM_FAIL_HINTS } from "../src/upstream-fail.ts";
 import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import { proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
@@ -60,13 +60,13 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(undefined), "unknown");
 });
 
-test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns)", () => {
+test("classify: transparently-replayable set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns; #4403 P2-2 renames the predicate)", () => {
     assert.deepEqual(
-        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
+        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns"] as const).filter((k) => isTransparentReplayableKind(k)).length,
         5,
     );
     for (const kind of ["client-abort", "upstream-timeout", "tls", "unknown"] as const) {
-        assert.equal(isFailFastUpstreamKind(kind), false, `${kind} must not be retried`);
+        assert.equal(isTransparentReplayableKind(kind), false, `${kind} must not be retried`);
     }
     for (const kind of Object.keys(UPSTREAM_FAIL_HINTS)) {
         assert.ok((UPSTREAM_FAIL_HINTS as Record<string, string>)[kind]!.length > 10, `hint exists for ${kind}`);

@@ -31,8 +31,10 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
-import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
+import { classifyUpstreamFailure, wantsCertProbe, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
+import { recordUpstreamAlert, recordUpstreamCircuitFailure } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
+import { scheduleCertProbe } from "../upstream-cert-probe.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { shedEgressIfOverBudget } from "../egress-shed.js";
@@ -1552,7 +1554,14 @@ export async function* runCompressLoop(
                             : absorbed ? "context work committed; " : "";
                         const msg = `${note}the follow-up request to the model failed (${TRANSPORT_FAILURE_LABELS[kind]}) before any response — your context is intact, resend your last message to continue`;
                         ctx.log(`[acp-loop] round ${round}: re-request transport failure (${kind}); ending turn in-band instead of throwing (#1453)`);
-                        loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy)}`);
+                        const transportDetail = formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy);
+                        loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${transportDetail}`);
+                        // #4403 P0-3: the re-request hits the same upstream host as the relay —
+                        // a final transport death here is reachability evidence too. (Success
+                        // clearing needs no twin: the enclosing relay fetch already resolved.)
+                        recordUpstreamAlert(requestOptions.url, e, ctx.proxyUrl !== undefined, ctx.skippedProxy);
+                        recordUpstreamCircuitFailure(requestOptions.url, e, ctx.proxyUrl !== undefined, transportDetail);
+                        if (wantsCertProbe(e, ctx.proxyUrl !== undefined)) scheduleCertProbe(requestOptions.url);
                         yield adapter.emitError(msg);
                         return;
                     }

@@ -1,12 +1,14 @@
 import type { SummaryCandidate, SummaryWork } from "./external-summary.js";
 import { defaultCountTokens } from "acp-kernel";
-import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { classifyUpstreamFailure, isTransparentReplayableKind, wantsCertProbe } from "./upstream-fail.js";
+import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess } from "./upstream-alerts.js";
 import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.js";
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { log as loggerLog } from "./logger.js";
 import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 import { finalizeSseLineEndings } from "./sse-util.js";
-import { proxyDispatcher } from "./upstream-proxy.js";
+import { describeUpstreamFailure, proxyDispatcher } from "./upstream-proxy.js";
+import { scheduleCertProbe } from "./upstream-cert-probe.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 
 /** #3488: bounded retry budget for one candidate call. Total dispatches
@@ -254,10 +256,17 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                 } catch (error) {
                     const kind = classifyUpstreamFailure(error, { viaProxy: plan.proxyUrl !== undefined, externalAborted: signal.aborted });
                     loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} failed before response (${kind}): ${maskUrlsInText(error instanceof Error ? error.message : String(error))}`);
-                    if (attempt < SUMMARY_MAX_ATTEMPTS && !signal.aborted && isFailFastUpstreamKind(kind)) {
+                    if (attempt < SUMMARY_MAX_ATTEMPTS && !signal.aborted && isTransparentReplayableKind(kind)) {
                         await waitBeforeRetry(backoffDelayMs(attempt), signal);
                         continue;
                     }
+                    // #4403 P0-3: a FINAL pre-response failure on this host is reachability
+                    // evidence exactly like the main relay path's — account it in the same
+                    // alert/circuit ledger so a summary-only outage can still alert and trip
+                    // the circuit gate instead of dying silently per-candidate.
+                    recordUpstreamAlert(plan.url, error, plan.proxyUrl !== undefined);
+                    recordUpstreamCircuitFailure(plan.url, error, plan.proxyUrl !== undefined, describeUpstreamFailure(error, plan.url, plan.proxyUrl).message);
+                    if (wantsCertProbe(error, plan.proxyUrl !== undefined)) scheduleCertProbe(plan.url);
                     throw error;
                 }
                 try {
@@ -273,6 +282,10 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                     }
                     const result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
                     signal.throwIfAborted();
+                    // #1682/#4403: any resolved response proves the host is reachable again —
+                    // same invariant the relay path applies to model traffic.
+                    clearUpstreamAlertsForHost(plan.url);
+                    recordUpstreamCircuitSuccess(plan.url);
                     return result;
                 } finally {
                     dispatched.clearTimer();

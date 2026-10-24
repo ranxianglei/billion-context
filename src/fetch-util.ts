@@ -1,6 +1,6 @@
 import { Agent } from "undici";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { classifyUpstreamFailure, isTransparentReplayableKind } from "./upstream-fail.js";
 import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import {
     upstreamTimeoutMs as knobUpstreamTimeoutMs,
@@ -413,7 +413,7 @@ export async function fetchWithRetry(
             result = await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
         } catch (error) {
             const kind = classifyUpstreamFailure(error, { viaProxy: opts.dispatcher !== undefined, externalAborted: externalSignal?.aborted === true });
-            if (!isFailFastUpstreamKind(kind)) throw error;
+            if (!isTransparentReplayableKind(kind)) throw error;
             const lastAttempt = attempt >= maxAttempts;
             if (lastAttempt) throw error;
             const delayMs = replayBackoffMs(attempt);
@@ -439,7 +439,7 @@ export async function fetchWithRetry(
  *  (#1688): the main model-request path was single-attempt, so one millisecond
  *  DNS/reset/refused blip killed the whole round while acp-loop/preflight
  *  already replayed. Unlike fetchWithRetry this retries ONLY pre-response
- *  network deaths (isFailFastUpstreamKind — nothing reached the upstream, so a
+ *  network deaths (isTransparentReplayableKind — nothing reached the upstream, so a
  *  replay cannot double-deliver) under the same BILI_REPLAY_RETRY_MAX /
  *  BILI_REPLAY_RETRY_BASE_MS budget and backoff; it NEVER touches HTTP-level
  *  verdicts — any response (ok, 4xx, 5xx alike) is returned to the caller
@@ -460,7 +460,7 @@ export async function fetchWithTransportRetry(
             return await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
         } catch (error) {
             const kind = classifyUpstreamFailure(error, { viaProxy: opts.dispatcher !== undefined, externalAborted: externalSignal?.aborted === true });
-            if (!isFailFastUpstreamKind(kind)) throw error;
+            if (!isTransparentReplayableKind(kind)) throw error;
             const lastAttempt = attempt >= maxAttempts;
             if (lastAttempt) throw error;
             const delayMs = replayBackoffMs(attempt);

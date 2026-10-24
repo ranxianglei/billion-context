@@ -7,7 +7,8 @@ import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
-import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
+import { presentedCertOf } from "./upstream-cert-probe.js";
+import { extraCaConfigured, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import { proxyKeepAliveMaxMs as knobProxyKeepAliveMaxMs } from "./knobs.js";
 
 type ParsedHttpProxy = {
@@ -525,6 +526,31 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
     return chain;
 }
 
+// #4403 P0-1: enterprise-interception signals available IN-PROCESS. A trust-code
+// TLS failure is ambiguous between "scanner/corporate MITM re-signed it" and
+// "hijacked DNS presented a forged cert"; these are the two in-process facts
+// that tilt toward the former — a proxy in the path sitting on loopback/private
+// space (corporate inspection proxies live there) or extra CA material already
+// configured (the user is already on the trust-the-vendor-root path). When
+// neither holds, the remediation must say "verify DNS first", not "install it".
+export function tlsEnterpriseSignal(proxyUrl: string | undefined): boolean {
+    if (extraCaConfigured()) return true;
+    if (!proxyUrl) return false;
+    try {
+        return isLocalProxyTarget(new URL(proxyUrl).hostname);
+    } catch {
+        return false;
+    }
+}
+
+function isLocalProxyTarget(host: string): boolean {
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
+    if (/^f[cd][0-9a-f]{2}:?/i.test(host) || /^fe80:/i.test(host)) return true;
+    return false;
+}
+
 interface UpstreamFailureParts {
     /** Formatted one-line failure string (log line / 502 `detail` / circuit banner). */
     message: string;
@@ -560,14 +586,40 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
     let hint = hintWithSkippedProxy(kind, skipped);
-    // #3776: only TRUST-code TLS failures (interception/MITM) get the detailed
-    // remediation naming security-software HTTPS scanning — a plain protocol
-    // break (EPROTO) does not. Flows to log line, 502 body, circuit banner.
-    if (kind === "tls" && chain.some((entry) => isTlsTrustCode(entry.code))) {
-        hint = `${hint}; ${tlsTrustRemediation()}`;
+    // #3776/#4403: only TRUST-code TLS failures (interception/MITM) get the
+    // detailed remediation — a plain protocol break (EPROTO) does not. The text
+    // is branch-selected on the fired code + probe-captured cert + enterprise
+    // signal so it never leads with "install the presented CA" under hijacking.
+    // Flows to log line, 502 body, circuit banner.
+    const trustCodeEntry = kind === "tls" ? chain.find((entry) => isTlsTrustCode(entry.code)) : undefined;
+    const cert = trustCodeEntry !== undefined ? presentedCertOf(url) : undefined;
+    if (trustCodeEntry !== undefined) {
+        const trustCode = String(trustCodeEntry.code);
+        let hostname: string | undefined;
+        try { hostname = new URL(url).hostname; } catch { /* not a URL — nothing to cross-check */ }
+        hint = `${hint}; ${tlsTrustRemediation({ code: trustCode, hostname, enterpriseSignal: tlsEnterpriseSignal(proxyUrl), ...(cert ? { cert } : {}) })}`;
+        // #4403 P0-2: forensic certificate fields ride the free-text line AND
+        // the structured 502 slice — the operator can tell "enterprise scanner"
+        // from "link injection" in the log without reaching for openssl s_client.
+        if (cert) {
+            if (cert.remoteAddress !== undefined) parts.push(`probeRemote=${maskHostIn(cert.remoteAddress)}`);
+            if (cert.subject !== undefined) parts.push(`certSubject="${maskHostIn(cert.subject)}"`);
+            if (cert.issuer !== undefined) parts.push(`certIssuer="${maskHostIn(cert.issuer)}"`);
+            if (cert.san !== undefined) parts.push(`certSan=[${maskHostIn(cert.san.join(", "))}]`);
+            if (cert.fingerprint256 !== undefined) parts.push(`certFp256=${cert.fingerprint256}`);
+        }
     }
     parts.push(`hint=${hint}`);
-    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), hint } };
+    const forensics = trustCodeEntry !== undefined && cert
+        ? {
+            ...(cert.remoteAddress !== undefined ? { remoteAddress: cert.remoteAddress } : {}),
+            ...(cert.subject !== undefined ? { certSubject: cert.subject } : {}),
+            ...(cert.issuer !== undefined ? { certIssuer: cert.issuer } : {}),
+            ...(cert.san !== undefined ? { certSan: cert.san } : {}),
+            ...(cert.fingerprint256 !== undefined ? { certFingerprint256: cert.fingerprint256 } : {}),
+        }
+        : {};
+    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), hint, ...forensics } };
 }
 
 export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {
