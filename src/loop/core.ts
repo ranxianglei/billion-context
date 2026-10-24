@@ -37,7 +37,7 @@ import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { shedEgressIfOverBudget } from "../egress-shed.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
-import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
@@ -226,6 +226,10 @@ export interface LoopCtx {
      *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
+    /** #4397: the per-request render-tag strategy that produced this loop's outbound
+     *  bodies (the global knob can diverge — compaction-trigger requests force "none").
+     *  Stamps noteForwardedBody's rt flag; undefined falls back to the knob. */
+    renderTags?: "text-only" | "none";
 }
 
 export interface RequestOptions {
@@ -496,7 +500,9 @@ export async function* runCompressLoop(
         const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
-        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag)
+        // — per-request strategy via ctx (see LoopCtx.renderTags), knob fallback where absent.
+        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj), ctx.renderTags !== undefined ? ctx.renderTags !== "none" : !knobRenderNone());
         if (prevSentFull) {
             maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id);
         }

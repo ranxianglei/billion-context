@@ -2218,7 +2218,7 @@ export function noteSystemPromptFingerprint(session: Session, system: unknown, o
     const prev = session.metadata[METADATA_SYSTEM_FP] as { fp: string; size: number } | undefined;
     if (prev !== undefined && prev.fp !== fp) {
         if (opts.log !== undefined) {
-            opts.log("info", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[fold-reconcile] system prompt changed (${prev.size} → ${text.length} chars); fold state unaffected (#1921)`);
+            opts.log("info", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[fold-reconcile] system prompt changed (${prev.size} → ${text.length} chars of the INBOUND client system/developer bundle, pre-injection — not the wire system); fold state unaffected (#1921)`);
         }
     }
     session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length };

@@ -31,7 +31,7 @@ import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir, renderNone as knobRenderNone } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
@@ -741,7 +741,12 @@ async function forwardCaptured(
         // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
         // it is extracted from sentParsed (the complete object), never from the capped body head, so a
         // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
+        // #4397: stamp whether bili's render tags were active on THIS body (the #2483 suspect flag).
+        // Per-request strategy, not the global knob: compaction-trigger requests force "none"
+        // even with the knob off (prepare-responses); lanes that carry no strategy (byte-faithful
+        // passthroughs) fall back to the knob — their bodies are client bytes, so tag presence ≈
+        // session tag mode.
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed), prepared.renderTags !== undefined ? prepared.renderTags !== "none" : !knobRenderNone());
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
@@ -2146,7 +2151,7 @@ async function forwardCaptured(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, renderTags: prepared.renderTags, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's

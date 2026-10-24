@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { getCacheLedger } from "../src/cache-ledger.ts";
 import { buildTriggerForgeBody } from "../src/codex-compact.ts";
 
 // Issue #321 PR-E2: conditional interception + forgery of codex's native
@@ -282,6 +283,45 @@ test("e2e E2 (trigger form): kill-switch off (BILI_CODEX_COMPACT=pass) → forwa
         await r2.text();
         assert.equal(h.bodies.length, afterSetup + 1, "compact request forwarded to upstream");
     });
+});
+
+test("e2e E2 (trigger form): tag-free prepared body carries no rt flag even with the renderNone knob off (#4397 rt precision)", async () => {
+    const prevEnv = process.env.ACP_RENDER_NONE;
+    try {
+        delete process.env.ACP_RENDER_NONE; // knob OFF — a global-knob stamp would have set rt=1 here
+        await withHarness({ firstTurnTokens: 1000 }, async (h) => {
+            const afterSetup = await setupCompressedSession(h);
+            const s = listSessions().find((x) => x.meta.label === SESSION)!;
+            const linesBefore = getCacheLedger(s).lines.length;
+            // Non-codex UA: no codex early-dispatch (handle.ts forwards those
+            // verbatim with prepared:null, never touching the seam slot), so
+            // bili prepares the trigger body itself — renderTags forced "none"
+            // by prepare-responses regardless of the knob. The ONLY shape where
+            // per-request strategy diverges from the global knob.
+            const r2 = await fetch(h.url, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+            });
+            assert.equal(r2.status, 200);
+            await r2.text();
+            assert.equal(h.bodies.length, afterSetup + 1, "compact request forwarded to upstream");
+            // The stamp lives on the seam slot until settle consumes it into the
+            // ledger line; a trigger-form turn may end unsettled (stream-truncation
+            // frame), so accept EITHER carrier — neither may carry the #2483 flag.
+            const led = getCacheLedger(s);
+            const slotRt = s.transient?.sentBody?.rt;
+            // Attribute the line to THIS turn: an unsettled turn leaves the
+            // previous turn's (legitimately tagged) line as the last one.
+            const lineRt = led.lines.length > linesBefore ? led.lines[led.lines.length - 1]?.rt : undefined;
+            assert.ok(s.transient?.sentBody !== undefined || led.lines.length > linesBefore, "compact turn was seam-observed");
+            assert.notEqual(slotRt, 1, "seam slot carries no rt flag on a tag-free body");
+            assert.notEqual(lineRt, 1, "settled line carries no rt flag on a tag-free body");
+        });
+    } finally {
+        if (prevEnv === undefined) delete process.env.ACP_RENDER_NONE;
+        else process.env.ACP_RENDER_NONE = prevEnv;
+    }
 });
 
 test("e2e E2 (trigger form): intercept + ACP not keeping up (≥90%) → forwarded (native backstop)", async () => {
