@@ -20,7 +20,7 @@ import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBa
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
-import { lastCompressSuffix, type Session } from "./session.js";
+import { lastCompressSuffix, markDirty, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
@@ -2307,6 +2307,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
+            // #3978: persist each committed fold as it lands — a client-disconnect
+            // abort early-returns before any post-loop markDirty, and a retry under a
+            // new session id continues only if the parent's partial blocks are loadable.
+            markDirty(deps.session);
             return true;
         };
         // #2678/#2667: fold several disjoint ranges in ONE external-summary call
