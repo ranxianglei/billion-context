@@ -512,17 +512,21 @@ function makeAnthropicHeaderUpstream(calls: AnthHeaderCall[]): http.Server {
     });
 }
 
+// Filler sized so the post-fold payload keeps several elements under the 10k
+// window as the injected tool schema grows (#3193): the mock classifies a
+// one-message body as a summary call, so an over-eager fold would make the
+// forward uncountable.
 function longAnthropicMessages() {
     const msgs: Array<{ role: string; content: string }> = [];
-    // #3298: repeat(250) was knife-edge against the injected system-prompt size —
-    // growth of it (the project-attribution line) flipped the #330 soft-zone
-    // relaxation, leaving a single anchor message in the forward that this mock
-    // misclassifies as a summary call. repeat(235) restores ~700 est-tokens of
-    // margin so the guard pins behavior, not a knife-edge.
+    // #3298/#3193: repeat(250) was knife-edge against injected overhead —
+    // system-prompt growth (#3298) and the dryRun tool schema (#3193) flipped
+    // the #330 soft-zone relaxation, leaving a single anchor message in the
+    // forward that this mock misclassifies as a summary call. repeat(225)
+    // keeps ~1k est-tokens of margin so the guard pins behavior, not a
+    // knife-edge.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
-    }
+        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(225) });    }
     return msgs;
 }
 

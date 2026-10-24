@@ -265,6 +265,17 @@ entries:
     desc_zh: "窗口填满过程中发送增长提醒（仅全局层级生效）。"
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
+  - key: compress.dryRunPreview
+    type: boolean
+    default: "false"
+    env: BILI_COMPRESS_DRYRUN
+    group: compress
+    id: ct.dr
+    render: compress-row
+    desc_en: "Expose the compress tool's dryRun preview mode (validate a range and estimate savings without committing); off by default so the served schema/prompt are byte-identical to pre-feature (global level only)."
+    desc_zh: "暴露压缩工具的 dryRun 预览模式（校验范围并估算可省 token，不落盘）；默认关闭，关闭时对外 schema/提示词与引入前逐字节一致（仅全局层级生效）。"
+    site_en: "Expose the compress tool's dryRun preview mode (validate a range and estimate savings without committing); off by default so the served schema/prompt stay byte-identical to pre-feature."
+    site_zh: "暴露压缩工具的 dryRun 预览模式（校验范围并估算可省 token，不落盘）；默认关闭，关闭时对外 schema/提示词与引入前逐字节一致。"
   - key: compress.reasoning
     type: "{ drop?, threshold? }"
     default: "drop true · threshold 2048"

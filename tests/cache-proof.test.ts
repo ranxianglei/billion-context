@@ -1288,6 +1288,9 @@ async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
         }
         assert.ok(lastDirty > decimIdx, `${wire}: scenario drifted: expected zombie carriers to ride at least one post-decimation body`);
         const ZOMBIE_SETTLE_BOUND = 9; // bodies after decimIdx; measured with the reap active
+        // One driveHostCompact send pushes exactly one client turn (user +
+        // assistant = 2 core elements); used by the net-of-appends shrink check below.
+        const CLIENT_TURN_APPENDS = 2;
         assert.ok(lastDirty - decimIdx <= ZOMBIE_SETTLE_BOUND, `${wire}: zombie flap not bounded: zombie carrier last seen on body #${lastDirty}, ${lastDirty - decimIdx} bodies after decimation #${decimIdx} (bound ${ZOMBIE_SETTLE_BOUND}, #2695)`);
 
         let postFold = false;
@@ -1311,7 +1314,14 @@ async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
                     const R = layoutOf(RB, field);
                     assert.ok(firstSummaryEl(RB, R) >= 0, `${wire} fold@req#${i}: rearm round-2 lacks its summary carrier (no self-heal)`);
                     assert.ok(countSummaryEls(RB, R) <= countSummaryEls(PB, P) + 1, `${wire} fold@req#${i}: settling round-2 spawned a NEW zombie carrier (#2695)`);
-                    assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} fold@req#${i}: rearm round-2 must shrink the core`);
+                    // Net-of-appends shrink (#3193): the injected tool schema adds a
+                    // constant per-request cost that shifted the rearm fold one turn,
+                    // so round-2 can now land in the SAME body as a client turn — the
+                    // fold removes core elements while the client appends its own, and
+                    // the raw element count goes flat. The invariant kept: a no-op
+                    // fold (zombie flap, #2695) grows the core by exactly the appends
+                    // and is still caught by the strict bound.
+                    assert.ok(coreLen(RB, R) < coreLen(PB, P) + CLIENT_TURN_APPENDS, `${wire} fold@req#${i}: rearm round-2 must shrink the core net of the client's own appends`);
                     lines.push(`proof[${wire}] pair#${i - 1}->#${i} SETTLING-FOLD ok summaries=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)} (zombie ride bounded, #2695)`);
                     postFold = true;
                 } else {

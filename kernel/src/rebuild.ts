@@ -44,9 +44,12 @@ export function rebuildCompressionState(
   let blocksRebuilt = 0;
 
   for (const invocation of invocations) {
-    const { ranges } = parseCompressArgs(invocation.raw, {
+    const { ranges, dryRun } = parseCompressArgs(invocation.raw, {
       callId: invocation.callId,
     });
+    // #3185: a recorded preview never committed anything — replaying it as a
+    // real fold would fabricate blocks absent from this lineage.
+    if (dryRun) continue;
     if (ranges.length === 0) continue;
     const result = core.applyCompression({
       ranges,

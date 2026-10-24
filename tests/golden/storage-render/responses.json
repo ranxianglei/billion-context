@@ -80,12 +80,12 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "f1c5b00ba772868d48c8addcb150a54908eb308f9bd3a4fd46d7a79084effdbc",
+ "stateDigest": "08526d3552fca7ac7552cd16a221893a652fbe740c9b8dccac6db57b3d6302ee",
  "sectionDigests": {
   "state": "db313e8eba2d65fc",
   "blockContents": "b6701268a0bdcd8a",
   "stats": "327d3967b8371aa8",
-  "metadata": "e4cac45276f335cc"
+  "metadata": "b5c39d84db67f424"
  },
  "stateKeyDigests": {
   "blocks": "34b0dc17f8c24595",
@@ -98,6 +98,7 @@
   "lastPassIds": "de5c5da67428b09f",
   "hiddenOrphanRefs": "4f53cda18c2baa0c",
   "deadRefs": "74234e98afe7498f",
+  "refLedgerAligned": "74234e98afe7498f",
   "terminalStreak": "5feceb66ffc86f38",
   "nextRuleId": "6b86b273ff34fce1",
   "absorbed": "4f53cda18c2baa0c",
