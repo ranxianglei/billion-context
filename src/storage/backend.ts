@@ -67,8 +67,8 @@ export interface StorageBackend {
 
     // --- reads ------------------------------------------------------------
     getSessionRow(sessionId: string): Promise<SessionRow | null>;
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]>;
-    getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]>;
+    getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
     getCcr(sessionId: string): Promise<MessageContentStore | null>;
@@ -170,11 +170,11 @@ export class SqliteBackend implements StorageBackend {
     getSessionRow(sessionId: string): Promise<SessionRow | null> {
         return Promise.resolve(this.store.getSessionRow(sessionId));
     }
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
-        return Promise.resolve(this.store.getMessages(sessionId));
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]> {
+        return Promise.resolve(this.store.getMessages(sessionId, opts));
     }
-    getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
-        return Promise.resolve(this.store.getBlocks(sessionId));
+    getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+        return Promise.resolve(this.store.getBlocks(sessionId, opts));
     }
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
         return Promise.resolve(this.store.getDeadRefs(sessionId));
