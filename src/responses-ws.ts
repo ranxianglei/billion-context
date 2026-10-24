@@ -6,6 +6,7 @@ import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
@@ -68,6 +69,11 @@ export class ResponsesWsUpstreamError extends Error {
 
 function object(value: unknown): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPrewarmProbe(body: JsonObject): boolean {
+    return body.generate === false && Array.isArray(body.input) && body.input.every(item =>
+        object(item) && (item.type === undefined || item.type === "message") && (item.role === "developer" || item.role === "system" || item.role === "user"));
 }
 
 function describeEventType(frame: unknown): string {
@@ -644,20 +650,25 @@ class ResponsesWsSession implements WsBridgeSession {
         for (const [key, value] of Object.entries(source.headers)) {
             if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") handshakeHeaders[key] = Array.isArray(value) ? value.join(", ") : String(value);
         }
-        // Prewarm probes (empty input, generate:false) are transport-layer
-        // noise, not conversation turns. Codex sends one on every new
-        // connection and expects only a terminal event back. Routing them
-        // through the ACP pipeline would normalize the empty input into a
-        // synthesized message (#1862) and record a phantom turn in the
-        // kernel's ref sequence, shifting every later fold anchor; injecting
-        // tools and compression prompts into a no-generation request is pure
-        // byte inflation. Forward verbatim on the upstream transport.
-        if (Array.isArray(body.input) && body.input.length === 0 && body.generate === false) {
+        // Prewarm probes (generate:false replaying no conversation turn) are
+        // transport-layer noise, not conversation turns. Codex sends one on
+        // every new connection — empty input (0.147), or only its developer /
+        // user context items (startup and idle-thread warmup) — and expects
+        // only a terminal event back. Routing them through the ACP pipeline
+        // would normalize empty input into a synthesized message (#1862) and
+        // record a phantom turn in the kernel's ref sequence, shifting every
+        // later fold anchor; a context-only view also deactivates every fold
+        // block and re-injects every forged summary (#4594). Injecting tools
+        // and compression prompts into a no-generation request is pure byte
+        // inflation. Forward verbatim on the upstream transport, through the
+        // relay's upstream proxy. A history prewarm replays real turns and
+        // stays on the pipeline.
+        if (isPrewarmProbe(body)) {
             void (async () => {
                 const sendFrame = (payload: string): void => { if (peer.readyState === WebSocket.OPEN) peer.send(payload); };
                 let sawTerminal = false;
                 try {
-                    const response = await this.transport.fetch(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body) });
+                    const response = await this.transport.fetch(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body), dispatcher: proxyDispatcher(this.context.egressProxyFor?.(this.context.upstreamUrl)) });
                     if (response.body === null) {
                         const text = await response.text();
                         if (!response.ok) {
