@@ -2043,20 +2043,33 @@ function changelogCatOf(rawLine) {
         if (lp < 0) return null;
         return { kind: kind, name: nameId.slice(0, lp), cid: nameId.slice(lp + 1), text: line.slice(mark + tailLen) };
     }
+    // Terminates the reasoning cell of a reply: _reasoning_: has no end
+    // marker, so the handoff renderer would otherwise fold the answer that
+    // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
+    const HANDOFF_THINK_END = "<!-- /reasoning -->";
     function splitHandoffBody(bodyLines) {
         const segs = [];
-        for (const raw of bodyLines) {
+        let thinkClosed = false;
+        for (let i = 0; i < bodyLines.length; i++) {
+            const raw = bodyLines[i];
             if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            const activeThink = segs[segs.length - 1];
+            if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
+                if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
+                else thinkClosed = true;
+                continue;
+            }
             const tool = parseToolLine(raw);
             if (tool) { segs.push({ type: "tool", kind: tool.kind, name: tool.name, cid: tool.cid, lines: [tool.text] }); continue; }
             if (raw.indexOf("_reasoning_: ") === 0) {
                 const lastT = segs[segs.length - 1];
-                if (!lastT || lastT.type !== "think") segs.push({ type: "think", lines: [] });
+                if (!lastT || lastT.type !== "think" || thinkClosed) segs.push({ type: "think", lines: [] });
                 segs[segs.length - 1].lines.push(raw.slice("_reasoning_: ".length));
+                thinkClosed = false;
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || last.type === "think")) last.lines.push(raw);
+            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;

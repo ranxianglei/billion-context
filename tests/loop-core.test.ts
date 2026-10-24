@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { createHandoffReply } from "../src/server/handoff-response.ts";
 import type { WireProtocol } from "../src/util.ts";
 import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
 
@@ -65,6 +66,42 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
         sse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name, arguments: args }, output_index: outputIndex }),
     ].join("");
 }
+
+test("handoff uses the loop's parsed output without changing client bytes", async () => {
+    const raw = sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_reply", delta: "loop answer" })
+        + fcEvents(1, "call_read", "read", '{"path":"file.ts"}') + COMPLETED;
+    const ctx = makeCtx([], "responses");
+    const baseline = await drain(new Response(raw).body!, makeCtx([], "responses"), { input: [], stream: true }, { url: "http://mock", headers: {} });
+    const reply = createHandoffReply(ctx.session);
+    const chunks: Buffer[] = [];
+    for await (const chunk of runCompressLoop(new Response(raw).body!, { ...ctx, reply }, { input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) chunks.push(chunk);
+    assert.equal(Buffer.concat(chunks).toString(), baseline);
+    const saved = (ctx.session.metadata.handoffResponse as { messages: CoreMessage[] }).messages;
+    assert.equal(saved.find((m) => m.contentType === "text")?.text, "loop answer");
+    assert.equal(saved.find((m) => m.contentType === "tool-call")?.text, '{"path":"file.ts"}');
+    assert.equal(ctx.session.lastMessages, undefined);
+});
+
+test("handoff retains forwarded continuation text and omits a failed terminal", async () => {
+    const frame = (content: string, finish_reason: string | null = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason }] })}\n\n`;
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const fails of [false, true]) {
+            globalThis.fetch = async () => fails
+                ? new Response(frame("unfinished"))
+                : new Response(frame(" tail", "stop") + "data: [DONE]\n\n");
+            const ctx = makeCtx([], "openai");
+            const body = { messages: [], stream: true };
+            const reply = createHandoffReply(ctx.session);
+            for await (const _chunk of runCompressLoop(new Response(frame("head")).body!, { ...ctx, reply }, body, { url: "http://mock", headers: {} }, createOpenaiAdapter(body), buildCompressSystemPrompt())) {}
+            const saved = ctx.session.metadata.handoffResponse as { messages: CoreMessage[] } | undefined;
+            if (fails) assert.equal(saved, undefined);
+            else assert.equal(saved?.messages.filter((m) => m.contentType === "text").map((m) => m.text).join(""), "head tail");
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 

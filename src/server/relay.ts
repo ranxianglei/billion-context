@@ -1,4 +1,5 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
+import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
@@ -267,6 +268,7 @@ async function forwardCaptured(
     v1Meta?: Record<string, unknown>,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
+    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
@@ -1773,6 +1775,7 @@ async function forwardCaptured(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -1800,10 +1803,11 @@ async function forwardCaptured(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText, reply);
             }
         } finally {
             clearUpstreamTimer();
@@ -1932,6 +1936,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -1976,6 +1981,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2000,6 +2006,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             }
         } else if (
@@ -2011,7 +2018,7 @@ async function forwardCaptured(
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol);
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
         } else {
             await pipeThrough(responseBody, res);
         }
@@ -2146,7 +2153,7 @@ async function forwardCaptured(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
@@ -2260,6 +2267,8 @@ async function forwardCaptured(
                 } else {
                     await withSessionLock(prepared.session, () => rewriteJsonResponseAsync(json, ctx, clientAbort.signal));
                 }
+                captureHandoffJson(reply, prepared.protocol, json);
+                reply?.save();
                 res.end(JSON.stringify(json));
             } catch {
                 res.end(text);
