@@ -180,6 +180,8 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // unmatched client message bounds the client tail.
     let joinRow = -1; // view index of the TOPMOST matched row — the join point
     let clientJoin = clientMsgs.length; // first client index of the tail
+    const evidenced = new Set<number>(); // #4126: view indices the client's CURRENT view claims (every post-start chain match)
+    let walkComplete = true; // false once the seam breaks mid-history (#4052): rows below the break are unvisited, not unclaimed
     {
         const byId = new Map<string, number>(); // msgId -> view index (last occurrence)
         for (let i = 0; i < rows.length; i++) byId.set(rows[i].msg.id, i);
@@ -235,7 +237,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
                 // carries it below an already-observed question). A second
                 // consecutive unmatched message ends the chain (contiguity).
                 if (started) {
-                    if (gapped) break;
+                    if (gapped) { walkComplete = false; break; }
                     gapped = true;
                     continue;
                 }
@@ -249,6 +251,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
             }
             run++;
             cursor = hit;
+            evidenced.add(hit);
         }
         if (!started) return { ok: false, reason: "chain-not-started" }; // nothing chains: epoch-like rewrite, legacy
         // #3812: a lone match — however it matched — is not a seam. The classic
@@ -264,9 +267,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // block's covered region in the transcript (first view row whose seq
     // exceeds this block's deepest covered row; end-of-prefix when none).
     // Per-block covered seqs come from the seeds computed before the chain
-    // (#4052). A partially re-keyed block may leave a few twin rows rendering
-    // alongside the summary (bounded duplicate content, visible, never loss);
-    // that residual is the price of never guessing.
+    // (#4052).
     const anchors: { at: number; msg: BiliMessage }[] = [];
     for (const { blockId, seqs: blockSeqs } of blockSeeds) {
         let maxCover = -1;
@@ -290,11 +291,22 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // reconcile may have re-keyed the block to the client's re-minted ids
     // (#3752 upgrade turns), while the transcript rows keep fold-time ids.
     // The synthesized anchor above carries each block's summary instead.
+    // #4126 adds the evidence gate: a row the chain never claimed is content
+    // the client no longer resends (its local compaction/edit consumed it, or
+    // a frozen pluginSnapshot of an older view still pins it in the log).
+    // Rendering such a row resurrects a dead message ahead of the fold anchor
+    // — the invariant-judge I2 carrier-drift signature (steady-state on the
+    // dsh desktop relay session). Honest loss: the flanks absorb, the anchor
+    // keeps the summary. Gated off when the seam broke mid-history (#4052) or
+    // the walk hit MAX_CHAIN_WALK: there the older region was never visited —
+    // unknown, not unclaimed — and stays wholesale-rendered.
+    const evidenceGate = walkComplete && clientMsgs.length <= MAX_CHAIN_WALK;
     const merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < d; i++) {
         while (ai < anchors.length && anchors[ai].at === i) merged.push(anchors[ai++].msg);
         if (coveredSeqUnion.has(rows[i].seq)) continue;
+        if (evidenceGate && !evidenced.has(i)) continue;
         merged.push(rows[i].msg);
     }
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
