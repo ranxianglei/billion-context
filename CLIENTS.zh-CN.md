@@ -164,6 +164,8 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
+**搭配 pi-claude-bridge:压缩状态不跨 reopen/resume(#3429)。** pi-claude-bridge 每次 pi 会话启动都会拉起一个**全新的 Claude Code 子进程**,该子进程在每个模型请求上盖自己的 `x-claude-code-session-id`——pi 的稳定会话 id 根本不上这条 HTTP。bili 按它看到的 id verbatim 键控会话(此处即 `x-claude-code-session-id`),所以 reopen/resume/fork 之后桥的新 CC id 映射到空会话:已折叠历史与压缩账本不延续,launcher/native `compress` 对 pi id 返回 404(未知 plugin 会话)——同一根机制,不是两个 bug。这是桥侧的身份缺口,不是 bili 缺陷:内容从不丢失或损坏,只是压缩的*状态*重置。根治属于 pi-claude-bridge(让 CC session id 从 pi 会话 id 稳定派生);在那之前,把 pi+claude-bridge 当纯代理模式看待上下文管理。
+
 **WebSocket 覆盖(#2073,#2111 实现)。** WebSocket 连接从不经过 `globalThis.fetch`,所以原生扩展在加载时(首个模型连接之前)同时包装 `globalThis.WebSocket`(pi 的 Node 分支每次调用都读全局,Bun 分支首次调用时缓存子类——两个运行时的安装时序都因此安全)。只重写受支持的 Codex Responses 模型连接——其余 WebSocket(devtools、第三方库、已路由 URL)原样通过:
 
 | Provider / 传输 | 状态 |

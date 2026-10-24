@@ -682,6 +682,8 @@ HTTP-based provider (Anthropic, OpenAI chat/completions/responses, Gemini,
 Mistral, OpenRouter, Azure, custom relays…) rides this path as a named
 plugin-mode session.
 
+**With pi-claude-bridge: compression state does not survive reopen/resume (#3429).** pi-claude-bridge spawns a **fresh Claude Code subprocess per pi session start**, and that subprocess stamps its own `x-claude-code-session-id` on every model request — pi's stable conversation id never rides this HTTP. bili keys sessions verbatim on the id it sees (`x-claude-code-session-id` here), so after a reopen/resume/fork the bridge's new CC id maps onto an EMPTY conversation: folded history and the compression accounting do not carry over, and a launcher/native `compress` addressed to the pi id returns 404 (unknown plugin conversation) — one root mechanism, not two bugs. This is a bridge-side identity gap, not a bili defect: content is never lost or corrupted, only the *state* of compression resets. The proper fix belongs in pi-claude-bridge (derive the CC session id stably from the pi conversation id); until then, treat pi+claude-bridge as plain-proxy mode for context management.
+
 **WebSocket coverage (#2073, implemented in #2111).** A WebSocket connection never goes through `globalThis.fetch`, so the native extension also wraps `globalThis.WebSocket` at load time — before pi's first model connection (pi's Node branch reads the global per call; its Bun branch caches a subclass on first call, which is why install-time ordering is safe on both runtimes). Only supported Codex Responses model connections are rewritten — every other WebSocket (devtools, third-party libraries, already-routed URLs) passes through untouched:
 
 | Provider / transport | Status |
