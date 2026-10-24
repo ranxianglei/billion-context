@@ -1018,9 +1018,15 @@ let initialized = false;
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
+    // #4515: split the pre-listen cost into store-open (index.db open / WAL recovery on a big store) vs bounded boot, so a slow cold start names which phase ate the spawn budget.
+    const tStore = performance.now();
     const store = getStore();
+    const storeMs = Math.round(performance.now() - tStore);
     if (!store.enabled) return;
+    const tBoot = performance.now();
     const loaded = await store.boot({ maxSessions: Math.min(MAX_SESSIONS, sessionWarmMax()), maxBytes: sessionWarmMaxBytes() });
+    const bootMs = Math.round(performance.now() - tBoot);
+    loggerLog("info", `[session] startup pre-listen: store open ${storeMs}ms + bounded boot ${bootMs}ms = ${storeMs + bootMs}ms; warmed ${loaded.size} session(s) (#4515)`);
     for (const [id, s] of loaded) sessions.set(id, s);
 }
 

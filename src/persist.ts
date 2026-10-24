@@ -364,6 +364,9 @@ export class SessionStore {
     /** #3199: post-boot background alias scan (unified modes only) — null in
      *  legacy mode and until bootBounded defers work. */
     private remainderScan: Promise<void> | null = null;
+    /** #4515: how many state files the last bounded boot DECODED synchronously
+     *  in the warm window before deferring the rest (0 when nothing is warmed). */
+    private lastBootSyncParsedFiles = 0;
     /** #2674: monotonic per-process counter for unique content-store temp
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
@@ -737,8 +740,12 @@ export class SessionStore {
         this.diskFiles = [];
         this.diskFilesSeeded = true;
         this.legacyAliases.clear();
+        this.lastBootSyncParsedFiles = 0;
         const warm: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
         const canonical = new Set<string>();
+        // #4515: per-phase startup timing so a slow cold start names which phase ate the spawn budget.
+        const timings = { walk: 0, parseWindow: 0, indexUnion: 0 };
+        const tWalk = performance.now();
         const filesByRoot = new Map<string, string[]>();
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             const files = existsSync(root) ? await walkJsonFiles(root) : [];
@@ -748,6 +755,7 @@ export class SessionStore {
                 filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
             }
         }
+        timings.walk = Math.round(performance.now() - tWalk);
         // #3199: unified mode (shadow or full) — the listener must not wait
         // for the whole corpus to parse. Two stages: (1) parse a bounded
         // WINDOW of the newest files (mtime desc, stopped once the window
@@ -761,40 +769,47 @@ export class SessionStore {
         // authoritative" predicate.
         if (this.replicasAvailable()) {
             this.seedIndexedAliases(canonical);
-            const hot = (filesByRoot.get(this.sessionsDir) ?? [])
-                .map((file) => {
-                    try {
-                        const st = statSync(file);
-                        return { file, mtimeMs: st.mtimeMs, size: st.size };
-                    } catch {
-                        return null; // raced deletion between walk and stat
-                    }
-                })
-                .filter((c): c is { file: string; mtimeMs: number; size: number } => c !== null)
-                .sort((a, b) => b.mtimeMs - a.mtimeMs);
             const parsedFiles = new Set<string>();
-            const parsedCands: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
-            let windowBytes = 0;
-            for (const cand of hot) {
-                if (parsedCands.length >= limits.maxSessions && windowBytes >= limits.maxBytes) break;
-                // on-disk size lower-bounds decoded size (#2803) — cheap pre-filter
-                if (cand.size > limits.maxBytes) continue;
-                const parsed = await this.readRawFileWithBytes(cand.file);
-                parsedFiles.add(cand.file);
-                if (!parsed) continue;
-                const rec = this.parseBootPayload(parsed.value);
-                if (!rec || !fileNameMatchesId(path.basename(cand.file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
-                const savedAt = rec.payload.savedAt ?? 0;
-                if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
-                else if (rec.meta.label) this.upsertLegacyAlias(rec.meta.label, { file: cand.file, id: rec.payload.id, savedAt }, canonical);
-                const bytes = parsed.bytes;
-                if (bytes > limits.maxBytes) continue;
-                windowBytes += bytes;
-                parsedCands.push({ file: cand.file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+            if (limits.maxSessions > 0) {
+                const tParse = performance.now();
+                const hot = (filesByRoot.get(this.sessionsDir) ?? [])
+                    .map((file) => {
+                        try {
+                            const st = statSync(file);
+                            return { file, mtimeMs: st.mtimeMs, size: st.size };
+                        } catch {
+                            return null; // raced deletion between walk and stat
+                        }
+                    })
+                    .filter((c): c is { file: string; mtimeMs: number; size: number } => c !== null)
+                    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+                const parsedCands: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
+                let windowBytes = 0;
+                for (const cand of hot) {
+                    if (parsedCands.length >= limits.maxSessions && windowBytes >= limits.maxBytes) break;
+                    // on-disk size lower-bounds decoded size (#2803) — cheap pre-filter
+                    if (cand.size > limits.maxBytes) continue;
+                    const parsed = await this.readRawFileWithBytes(cand.file);
+                    parsedFiles.add(cand.file);
+                    if (!parsed) continue;
+                    const rec = this.parseBootPayload(parsed.value);
+                    if (!rec || !fileNameMatchesId(path.basename(cand.file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) continue;
+                    const savedAt = rec.payload.savedAt ?? 0;
+                    if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
+                    else if (rec.meta.label) this.upsertLegacyAlias(rec.meta.label, { file: cand.file, id: rec.payload.id, savedAt }, canonical);
+                    const bytes = parsed.bytes;
+                    if (bytes > limits.maxBytes) continue;
+                    windowBytes += bytes;
+                    parsedCands.push({ file: cand.file, id: rec.payload.id, meta: rec.meta, savedAt, bytes });
+                }
+                parsedCands.sort((a, b) => b.savedAt - a.savedAt);
+                while (parsedCands.length > limits.maxSessions || parsedCands.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) parsedCands.pop();
+                warm.push(...parsedCands);
+                timings.parseWindow = Math.round(performance.now() - tParse);
+            } else {
+                // #4515: maxSessions==0 (the #2803 default) warms NOTHING, so the sync decode window is pure waste on the pre-listen path — the background scan below does all corpus alias/canonical bookkeeping.
             }
-            parsedCands.sort((a, b) => b.savedAt - a.savedAt);
-            while (parsedCands.length > limits.maxSessions || parsedCands.reduce((sum, item) => sum + item.bytes, 0) > limits.maxBytes) parsedCands.pop();
-            warm.push(...parsedCands);
+            this.lastBootSyncParsedFiles = parsedFiles.size;
             this.remainderScan = this.scanRemainderInBackground(parsedFiles, canonical);
             void this.remainderScan;
         } else {
@@ -844,6 +859,7 @@ export class SessionStore {
         // record — the same proxy readRawFileWithBytes gives the file path
         // (#2803: the budget is a RAM proxy, not a disk one).
         if (this.shadow?.readsUnified) {
+            const tUnion = performance.now();
             let warmBytes = 0;
             for (const item of warm) warmBytes += item.bytes;
             for (const id of this.shadow.listSessionIds()) {
@@ -858,8 +874,9 @@ export class SessionStore {
                 warmBytes += bytes;
                 out.set(id, session);
             }
+            timings.indexUnion = Math.round(performance.now() - tUnion);
         }
-        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes; older states load on demand`);
+        this.log("info", `[persist] indexed ${this.diskFiles.length} state files; warmed ${out.size} sessions within ${limits.maxBytes} decoded bytes (walk ${timings.walk}ms, parseWindow ${timings.parseWindow}ms, indexUnion ${timings.indexUnion}ms); older states load on demand (#4515)`);
         return out;
     }
 
@@ -960,6 +977,11 @@ export class SessionStore {
      *  (immediate in legacy mode or when nothing was deferred). */
     backgroundScanComplete(): Promise<void> {
         return this.remainderScan ?? Promise.resolve();
+    }
+
+    /** #4515 test hook: state files the last bounded boot decoded synchronously. */
+    lastBootSyncParsedFilesForTest(): number {
+        return this.lastBootSyncParsedFiles;
     }
 
     private readEnvelopeFile(file: string, id: string): PersistedEnvelope<PersistedSession> | null {
