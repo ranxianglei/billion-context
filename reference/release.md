@@ -266,6 +266,21 @@ nothing else.
 ref (picked in the Actions UI) still works and runs every guard above — for when the
 PR dance is slower than the fire.
 
+**Conflicted ship PRs (label publish):** a lane/carve cut from an OLD tag can
+conflict with master at ship time — the fixes already landed there and master
+moved on, so GitHub's merge button refuses. Resolving on the lane is FORBIDDEN
+(`Never merge master into a lane` below — the publish tree must stay leak-free)
+and resolving on master needs a direct master push. For that case: add the
+`backport-ship` label to the OPEN ship PR (head branch must match `bugfix-v*` /
+`bugfix-release/*`, same-repo, not a fork). `release-bugfix.yml`'s
+`pull_request_target` trigger then publishes the PR's HEAD tree with every guard
+above — no merge required; the PR stays open as the publish record (the workflow
+leaves the audit comment on it). `pull_request_target` runs the master copy of the
+workflow, so lanes cut from old tags — whose own `release-bugfix.yml` predates the
+`bugfix-v*` marker and would silently skip the closed-PR path — publish correctly
+too. Master syncs later via a normal metadata-only PR, or simply advances on its
+next regular release (which must be higher anyway).
+
 **Master interaction:** merging the carve-out PR brings the version bump INTO master
 (master then equals npm latest, so the one-click fast path's drift guard sees a clean
 tree again). Master advances independently on its next normal release, which MUST be
@@ -330,7 +345,10 @@ lane, dispatches the FULL CI set, and opens the ship PR against master with a
 changelog. You merge it; `release-bugfix.yml` publishes the PRE-MERGE head tree
 (tag + carried fixes) and creates the fresh tag — which by derivation CLOSES
 this cycle: the next `backport` label automatically cuts `bugfix-v{NEXT}` from
-the fresh tag. No closeout step exists because nothing is stored.
+the fresh tag. No closeout step exists because nothing is stored. If the ship
+PR CONFLICTS with master (fixes already landed there, master moved on): do not
+resolve on the lane, do not touch master — apply the `backport-ship` label to
+publish the head tree without merging (see the carve-out channel section).
 
 ⚠ Severe fixes riding the lane: include the release-notes entry (#1870) in the
 source fix PR so the carry picks transport it — the publish gate checks the

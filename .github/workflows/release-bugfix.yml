@@ -21,8 +21,21 @@ name: Bugfix Release (carve-out)
 # deliberately does not match it, so merging the PR cannot double-publish the
 # post-merge master through the normal channel.
 #
-# Emergency fallback: manual workflow_dispatch against an explicitly chosen ref
-# (a human picks the exact ref in the Actions UI; every guard below still runs).
+# CONFLICTED SHIP PRs (label path, #4576 follow-up): a patch lane cut from an
+# OLD tag whose fixes already landed on master can CONFLICT with master on
+# merge -- GitHub's merge button then refuses, resolving on the lane would
+# absorb unreleased master work into the published head tree, and resolving on
+# master needs a direct master push. For that case the ship PR can be
+# published AS THE HEAD TREE by adding the `backport-ship` label (a
+# triage-capable human action; `labeled` fires on ADD only). pull_request_target
+# runs THIS master copy of the workflow, so lanes cut from old tags -- whose
+# own release-bugfix.yml predates the bugfix-v* marker and would silently skip
+# the closed-PR path -- publish correctly too. Fork PRs are still rejected and
+# every guard below still runs.
+#
+# Patch-lane publish (formerly the emergency fallback): manual workflow_dispatch
+# against an explicitly chosen ref (a human picks the exact ref in the Actions
+# UI; every guard below still runs).
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
@@ -38,6 +51,14 @@ name: Bugfix Release (carve-out)
 on:
   pull_request:
     types: [closed]
+    branches: [master]
+  pull_request_target:
+    # Label-gated head-tree publish for conflicted carve-out ship PRs -- see
+    # the header comment. Same base-branch filter as the closed-PR trigger
+    # above (pull_request_target supports branches filters, matched against
+    # the PR base); the resolve step additionally no-ops on every other label
+    # within milliseconds, same as the closed-PR trigger no-ops on every close.
+    types: [labeled]
     branches: [master]
   workflow_dispatch:
     inputs:
@@ -57,6 +78,7 @@ jobs:
       contents: write
       id-token: write
       actions: write
+      pull-requests: write  # backport-ship label publish: annotate the ship PR
     steps:
       - name: Validate trigger + resolve the publish ref
         id: resolve
@@ -68,6 +90,36 @@ jobs:
             SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
             if [ "$MERGED" != "true" ]; then
               echo "::notice::PR $GITHUB_EVENT_NUMBER closed without merging — nothing to publish"
+              exit 0
+            fi
+            case "$BRANCH" in
+              bugfix-v*) ;; # current patch lane (dual-lane model)
+              bugfix-release/*) ;; # legacy one-off carve-out
+              *)
+                echo "::notice::head branch '$BRANCH' is not a patch lane (bugfix-v*) or a legacy bugfix-release/* carve-out — nothing to publish"
+                exit 0
+                ;;
+            esac
+            if [ "$SAME_REPO" != "true" ]; then
+              echo "::error::fork PRs cannot use the carve-out channel (repo secrets are unavailable for them)"
+              exit 1
+            fi
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
+            # backport-ship label publish (conflicted ship PRs, #4576 follow-up):
+            # publish the HEAD tree with NO merge into master. `labeled` fires on
+            # ADD only, so reaching past the label check means a triage-capable
+            # actor armed it just now.
+            LABEL="$(jq -r '.label.name' "$GITHUB_EVENT_PATH")"
+            BRANCH="$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")"
+            SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+            STATE="$(jq -r '.pull_request.state' "$GITHUB_EVENT_PATH")"
+            SAME_REPO="$(jq -r '(.pull_request.base.repo.full_name == .pull_request.head.repo.full_name)' "$GITHUB_EVENT_PATH")"
+            if [ "$LABEL" != "backport-ship" ]; then
+              echo "::notice::label '$LABEL' is not the backport-ship gate — nothing to do"
+              exit 0
+            fi
+            if [ "$STATE" != "open" ]; then
+              echo "::notice::PR $GITHUB_EVENT_NUMBER is '$STATE' — the label gate only arms open ship PRs"
               exit 0
             fi
             case "$BRANCH" in
@@ -96,8 +148,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Switch to the carve-out PR head (pre-merge tree)
-        if: steps.resolve.outputs.proceed == 'true' && github.event_name == 'pull_request'
+      - name: Switch to the carve-out head tree (pre-merge / label publish)
+        # pull_request: pre-merge head of a MERGED ship PR (publish the exact
+        # reviewed tree, never the post-merge master). pull_request_target:
+        # head of the backport-ship-labeled PR (publish without merging).
+        if: steps.resolve.outputs.proceed == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
         run: |
           SHA="${{ steps.resolve.outputs.sha }}"
           git rev-parse --verify --quiet "${SHA}^{commit}" >/dev/null || git fetch origin "$SHA"
@@ -132,7 +187,16 @@ jobs:
         # manifests — drift fails fast here instead of shipping a release whose
         # marketplace update detection never fires. See reference/release.md.
         if: steps.resolve.outputs.proceed == 'true'
-        run: node scripts/sync-codex-plugin-version.mjs --check
+        # #4576 follow-up: lanes cut from a pre-#4449 tag do not carry the
+        # manifest sync script at all -- fail-open with a notice there instead
+        # of MODULE_NOT_FOUND (same existence-guard philosophy as release-manual's
+        # lane guard).
+        run: |
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs --check
+          else
+            echo "::notice::this tree predates #4449 (no scripts/sync-codex-plugin-version.mjs) — manifest sync check skipped for the pre-#4449 lane"
+          fi
 
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
@@ -260,6 +324,16 @@ jobs:
         run: npm publish --tag ${{ steps.pre.outputs.tag }} --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Annotate the ship PR (label publish)
+        # Head-tree publish leaves the ship PR open; leave the audit trail on
+        # the PR itself so a later reader knows publish != merge here.
+        if: github.event_name == 'pull_request_target' && steps.resolve.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "$GITHUB_EVENT_NUMBER" --body "Published v${{ steps.version.outputs.version }} from head ${{ steps.resolve.outputs.sha }} (pure carve-out head tree; master NOT involved). Keep this PR open as the publish record, or close it unmerged — merging into master is NOT required and may conflict by design." \
+            || echo "::notice::could not annotate PR $GITHUB_EVENT_NUMBER (non-fatal)"
 
       - name: Create GitHub Release
         if: steps.resolve.outputs.proceed == 'true'
