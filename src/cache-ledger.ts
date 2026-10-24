@@ -963,6 +963,106 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
     return null;
 }
 
+// #4137: marker-blind view for the per-call body-stability classifier.
+// Client-managed Anthropic prompt caching re-stamps `cache_control` breakpoints
+// onto the newest message(s) every turn (src/loop/cache-control.ts forwards
+// pre-existing client marks verbatim instead of bili's own cumulative stamps),
+// so the MARKER migrates between consecutive outbound bodies: the previous last
+// message loses its mark, the new tail gains one. A pure-append turn therefore
+// diverges in RAW bytes exactly where the marker moved — strictly before the
+// message-array close — and the raw-LCP arms could only ever land "mid" (247
+// spurious "mid-history divergence" samples on one dsh session). This strips
+// every `"cache_control":<object>` field (plus one separating comma) so the LCP
+// reflects true CONTENT growth. Single linear pass over the UTF-8 buffer; returns
+// the ORIGINAL buffer (no copy) when nothing matched, and null when the body does
+// not open with '{' (or a value object is malformed) so the caller falls back to
+// raw bytes. Whitespace-tolerant around ':' / ','; the value object is skipped
+// with a string-aware brace balance.
+const CACHE_CONTROL_KEY = [0x22, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x6f, 0x6c, 0x22]; // "cache_control"
+const CACHE_CONTROL_KEY_BYTES = Buffer.from(CACHE_CONTROL_KEY);
+
+function stripCacheControlFields(body: Buffer): Buffer | null {
+    const n = body.length;
+    if (n < CACHE_CONTROL_KEY.length || body[0] !== 123) return null; // must open with '{'
+    if (!body.includes(CACHE_CONTROL_KEY_BYTES)) return body; // no mark bytes anywhere ⇒ nothing to strip — native memmem ≫ the JS scan below (measured ~10×, #4391 review)
+    const spans: Array<[number, number]> = [];
+    let i = 0;
+    let inStr = false;
+    let esc = false;
+    while (i < n) {
+        const c = body[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === 92) esc = true; // backslash
+            else if (c === 34) inStr = false; // closing quote
+            i++;
+            continue;
+        }
+        if (c !== 34) { i++; continue; } // '"'
+        // Outside a string at a quote: does `"cache_control"` start here?
+        let isKey = true;
+        for (let t = 0; t < CACHE_CONTROL_KEY.length; t++) {
+            if (body[i + t] !== CACHE_CONTROL_KEY[t]) { isKey = false; break; }
+        }
+        if (!isKey) { inStr = true; i++; continue; } // some other string token: scan to its close
+        // `"cache_control"` matched — it is a KEY only if the next non-ws byte is ':'.
+        let j = i + CACHE_CONTROL_KEY.length;
+        while (j < n && body[j] <= 32) j++;
+        if (j >= n || body[j] !== 58) { inStr = true; i++; continue; } // not a key (a value) — scan the token to its close
+        j++;
+        while (j < n && body[j] <= 32) j++;
+        if (j >= n || body[j] !== 123) { inStr = true; i++; continue; } // key with a non-object value — scan the token to its close
+        // Skip the balanced value object (string-aware).
+        let depth = 0;
+        let k = j;
+        let vInStr = false;
+        let vEsc = false;
+        for (; k < n; k++) {
+            const vc = body[k];
+            if (vInStr) {
+                if (vEsc) vEsc = false;
+                else if (vc === 92) vEsc = true;
+                else if (vc === 34) vInStr = false;
+                continue;
+            }
+            if (vc === 34) { vInStr = true; continue; }
+            if (vc === 123) { depth++; continue; } // '{'
+            if (vc === 125) { depth--; if (depth === 0) { k++; break; } continue; } // '}'
+        }
+        if (depth !== 0) return null; // malformed value — do not guess, fall back to raw
+        // Value spans [j, k). Eat exactly ONE separating comma so an identical
+        // member reads byte-for-byte the same whether or not it carried the mark.
+        let start = i;
+        let end = k;
+        let p = i - 1;
+        while (p >= 0 && body[p] <= 32) p--;
+        if (p >= 0 && body[p] === 44) {
+            start = p; // ',' before → eat it (middle/last member)
+        } else {
+            let q = k;
+            while (q < n && body[q] <= 32) q++;
+            if (q < n && body[q] === 44) end = q + 1; // ',' after → eat it (first member)
+        }
+        spans.push([start, end]);
+        i = k;
+    }
+    if (spans.length === 0) return body; // fast path: nothing to strip
+    for (let s = 1; s < spans.length; s++) {
+        if (spans[s][0] < spans[s - 1][1]) return null; // overlapping spans ⇒ don't guess
+    }
+    const out = Buffer.allocUnsafe(n);
+    let w = 0;
+    let from = 0;
+    for (const [start, end] of spans) {
+        out.set(body.subarray(from, start), w);
+        w += start - from;
+        from = end;
+    }
+    out.set(body.subarray(from, n), w);
+    w += n - from;
+    return out.subarray(0, w);
+}
+
 function detectSeam(session: Session, led: CacheLedger): void {
     const line = led.lines[led.lines.length - 1];
     if (!line || line.unk === 1 || line.missed <= 0) return;
@@ -1845,6 +1945,20 @@ export function settleUsageReport(
                     if (curSlot.full !== null && prevSlot.full !== null) {
                         const lcp = byteLcp(prevSlot.full, curSlot.full);
                         curLine.bl = lcp;
+                        // #4137: classify on a MARKER-BLIND view. Client-managed Anthropic
+                        // caching migrates `cache_control` breakpoints onto the newest message
+                        // each turn, so a pure append's RAW bytes diverge where the marker moved
+                        // (strictly before the array close) and every raw-LCP arm below could only
+                        // ever reach "mid". Strip the migrating fields from BOTH sides — used
+                        // together only when BOTH normalize (a mixed normalized/raw pair would
+                        // compare different coordinate spaces) — so the class tracks true content
+                        // growth. bl above keeps the raw wire offset (#2868 forensic contract);
+                        // only the class moves.
+                        const prevNorm = stripCacheControlFields(prevSlot.full);
+                        const curNorm = stripCacheControlFields(curSlot.full);
+                        const normPrev = prevNorm !== null && curNorm !== null ? prevNorm : prevSlot.full;
+                        const normCur = prevNorm !== null && curNorm !== null ? curNorm : curSlot.full;
+                        const nlcp = byteLcp(normPrev, normCur);
                         // Append/trim first: "the whole shorter payload survives"
                         // is anchored to the END of the payload and stays true on
                         // small bodies where the head threshold alone would lie.
@@ -1859,13 +1973,14 @@ export function settleUsageReport(
                         // which lies inside the LONGER side's array — parsing that
                         // side would misread the pair as mid. No array locatable
                         // (unparseable body) keeps the conservative pre-fix class.
-                        const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
+                        const shorterFull = normPrev.length <= normCur.length ? normPrev : normCur;
                         const arrClose = messagesArrayCloseOffset(shorterFull);
                         // #3476: a growing logical unit (single giant message whose interior
                         // container extends in place) is byte-wise a mid-body insertion but
                         // semantically an append — recognize it in the would-be-mid slot.
-                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
+                        // #4137: judged on the same marker-blind view as every other rung.
+                        const midInsert = isMidInsertionAppend(normPrev, normCur, nlcp);
+                        curLine.bs = nlcp >= Math.min(normPrev.length, normCur.length) - 64 ? "append" : nlcp < 1024 ? "head" : arrClose !== null && nlcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1962,7 +2077,7 @@ interface BodyStability {
     head: number;
     /** Whole shorter payload survives ±64 closing-bracket bytes — pure tail growth/trim. */
     append: number;
-    /** Mid-history byte change — the shape a real rewrite has. */
+    /** Mid-history byte change in CONTENT (marker-blind, #4137) — the shape a real rewrite has. */
     mid: number;
     /** #2982: divergence at/past the shorter body's message-array closing bracket — trailing top-level params or ephemeral tail notes; shared history bytes untouched, though a provider may partition its prompt cache on a trailing field (#3803). */
     tail: number;
