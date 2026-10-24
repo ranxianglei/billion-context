@@ -480,7 +480,7 @@ two small node scripts that do the work around the client:
   nothing — so on zai-series accounts the GUI-proxy/MITM setup must keep the
   `"mitm://zcode.z.ai": { "passthrough": true }` route, which yields
   working-but-uncompressed traffic; there is currently no configuration that
-  both compresses and avoids the 405 for zai-series model traffic (#4592).
+  both compresses and avoids the 405 for zai-series model traffic (#4593).
   Native mode does not touch that surface (its model traffic flows through the
   provider store, not the GUI proxy). Separately, on v3.14+ builds
   ClientRequestSigningV4 for coding-plan accounts rejects non-HTTPS origins at
