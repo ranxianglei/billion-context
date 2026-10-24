@@ -23,7 +23,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
     // that request used to miss every admin route and get relayed onto the
     // configured upstream (a wasted request + 403 noise in the log).
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/blog" data-nav="blog" data-i18n="nav.blog">${zh("nav.blog")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
@@ -227,6 +227,10 @@ rendering/linkify in client.js into #changelog-body (collapsed by default). -->
 <div class="copy-row" style="margin-top:8px"><pre class="codebox">${caPathEsc}</pre><button class="btn sm copy-btn" data-copy="${caPath}"><span data-i18n="copy.ca">${zh("copy.ca")}</span></button></div>
 <p class="small dim" style="margin-top:10px"><span data-i18n="zcode.hint_a">${zh("zcode.hint_a")}</span> <span class="mono">~</span> <span data-i18n="zcode.hint_b">${zh("zcode.hint_b")}</span> <span class="mono">~/...</span> <span data-i18n="zcode.hint_c">${zh("zcode.hint_c")}</span></p>
 </div></div>
+</section>
+<section id="page-blog" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="bl.title">${zh("bl.title")}</h1><div class="sub" data-i18n="bl.sub">${zh("bl.sub")}</div></div></div>
+<div id="bl-list"><div class="card"><div class="card-b" data-i18n="common.loading">${zh("common.loading")}</div></div></div>
 </section>
 </main>
 <div id="toast-host" class="toast-host"></div>

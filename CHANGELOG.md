@@ -20,6 +20,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - **fork 克隆保号**:`cloneSessionRows`(store+mysql 双后端)把父会话行整段复制到子(session,seq) 保号 + lineage 列(parentSessionId/forkPointSeq 真值)+content/media CAS refcount 提升 + 幂等重放;子 append 自然从父 maxSeq+1(remapPlanToAbsolute)。fork 端点接线,存储不可用降级=kernel-only 克隆(现行为)。
 - **验收桩**:kernel 4 测(BLOCKED 偏移重排/交换原子性/无行引用保留+被夺号重安居+死 ref 不动/已对齐幂等)+host 4 测(整段克隆保号+lineage+幂等+子续号/部分分支/superseded 拒绝+当前号通过/冷加载纯视图+服务触达对齐一次+二次幂等)。
 
+### 面板内置博客与长文(#4587)
+
+- **`/__bili/blog` JSON feed + `/__bili/blog-assets/*` 图片路由**:随 npm 包内置的 markdown(website/blog/posts/*.md + website/articles.json 清单列出的仓库长文,paper 中英文)由服务端 `web/markdown.ts`(转义优先、XSS-safe)渲染进面板自己的「博客 Blog」页——卡片列表点展正文,双语随面板语言切换,离线可读;`web/markdown.ts` 顺带支持了图片引用(http(s)/面板资产路由以外的一律丢弃)和 GFM 管道表格(复用 .data 表格样式)。图片路由带穿越/编码/扩展名三重门。内容随自更新前进,GitHub Pages(#4561)仍是永远最新的完整文库。零新配置键/env/磁盘缓存。
+
 ### 修复 master 回归(搭乘)
 
 - **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。

@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -864,6 +864,69 @@ function changelogCatOf(rawLine) {
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
+    }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog() {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = items.map((it) => {
+            const zhOn = locale === "zh-CN";
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const otherTitle = zhOn ? (it.title || "") : (it.titleZh || "");
+            const ex = zhOn ? (it.excerptZh || it.excerpt || "") : (it.excerpt || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+
+            return '<div class="card bl-item" data-bl-id="' + escapeHtml(String(it.id)) + '">'
+                + '<div class="card-h bl-head"><span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (otherTitle ? ' <span class="bl-title-alt">' + escapeHtml(otherTitle) + "</span>" : "") + "</span>"
+                + '<span class="bl-caret">&#9662;</span></div>'
+                + (ex ? '<div class="card-b bl-ex">' + escapeHtml(ex) + "</div>" : "")
+                + '<div class="card-b bl-body post-body" hidden></div></div>';
+        }).join("");
+        host.querySelectorAll(".bl-item").forEach((el) => {
+            const head = el.querySelector(".bl-head");
+            const bodyEl = el.querySelector(".bl-body");
+            if (!head || !bodyEl) return;
+            head.addEventListener("click", () => {
+                bodyEl.hidden = !bodyEl.hidden;
+                const caret = el.querySelector(".bl-caret");
+                if (caret) caret.textContent = bodyEl.hidden ? "\u25BE" : "\u25B4";
+                if (bodyEl.hidden || bodyEl.dataset.filled === "1") return;
+                const item = items.find((x) => String(x.id) === el.getAttribute("data-bl-id"));
+                if (!item) return;
+                bodyEl.innerHTML = locale === "zh-CN" ? (item.htmlZh || item.html) : item.html;
+                bodyEl.dataset.filled = "1";
+            });
+        });
     }
     async function loadUpdates() {
         try {
@@ -4069,7 +4132,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
@@ -4090,6 +4153,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
         else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog();
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);

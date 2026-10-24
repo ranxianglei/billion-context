@@ -537,4 +537,20 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
    embed face a little breathing room instead of zero gutter. */
 .embed main { max-width: none; padding: 8px 10px 16px; }
 .embed .banner { margin: 8px 0 0; }
+
+/* #4587: panel-embedded blog & article view */
+.bl-head { cursor: pointer; user-select: none; }
+.bl-head:hover .bl-title { color: var(--accent); }
+.bl-date { color: var(--text-faint); font-size: 12px; }
+.bl-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bl-title-alt { color: var(--text-faint); font-weight: 400; }
+.bl-caret { color: var(--text-faint); font-size: 12px; }
+.bl-ex { color: var(--text-muted); font-size: 13px; }
+.post-body p { line-height: 1.7; }
+.post-body pre { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.post-body code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-elev); padding: 1px 5px; border-radius: 4px; }
+.post-body pre code { background: none; padding: 0; }
+.post-body blockquote { border-left: 3px solid var(--accent); margin: 12px 0; padding: 4px 14px; color: var(--text-muted); background: var(--bg-elev); border-radius: 0 8px 8px 0; }
+.post-body h2 { margin-top: 22px; }
+.post-body .md-img { max-width: 100%; border-radius: 8px; border: 1px solid var(--border-soft); }
 `;

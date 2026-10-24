@@ -179,6 +179,8 @@ billion-context/
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
+│       ├── blogfeed.ts           #   Panel blog/articles feed from bundled markdown (#4587)
+│       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
 │       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
 │       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)

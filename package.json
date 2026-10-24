@@ -103,8 +103,10 @@
     "dist",
     "dsh.bundle.patch.yml",
     "hermes-plugin",
-    "paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md",
-    "paper/figures/*.png"
+    "paper/*.md",
+    "paper/figures/*.png",
+    "website/articles.json",
+    "website/blog/posts"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
