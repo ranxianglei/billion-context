@@ -41,6 +41,7 @@ jobs:
   # or on the 30-min cron when master moved since the last green scheduled run.
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -71,6 +72,7 @@ jobs:
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

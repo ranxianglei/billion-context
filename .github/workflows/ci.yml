@@ -93,6 +93,7 @@ jobs:
   # names (branch protection keys off `test (os, node, shard)`).
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -252,6 +253,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.testMatrix) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    # 45m backstop: hung legs self-kill instead of squatting runners for GitHub's 360m default (2026-10-23 queue jam)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -308,6 +311,7 @@ jobs:
     needs: [plan]
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       mysql:
         image: mysql:8.0
@@ -349,6 +353,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.staticMatrix) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -372,6 +377,7 @@ jobs:
 
   version-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -396,6 +402,7 @@ jobs:
 
   kernel-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -449,6 +456,7 @@ jobs:
   # load-bearing core compression).
   pi-subagents-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -482,6 +490,7 @@ jobs:
   # generator goes red here. Zero-dep script: no npm install needed.
   docs-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -496,6 +505,7 @@ jobs:
   # added to src goes red here with the missing names listed.
   docs-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -510,6 +520,7 @@ jobs:
   # Not gated to pull_request so master pushes are held to the same surface.
   config-surface-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -524,6 +535,7 @@ jobs:
   # node, no install step. Not gated to pull_request, same as the guards above.
   lifecycle-ledger-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -539,6 +551,7 @@ jobs:
   # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
   lane-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -581,6 +594,7 @@ jobs:
   # plain node, no install step.
   unused-exports:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -597,6 +611,7 @@ jobs:
   # Zero-dep: plain node, no install step.
   test-import-graph:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -615,6 +630,7 @@ jobs:
   # AGENTS.md §4 rule 2 ("release commit changes ONLY version + lock if drifts").
   lock-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -641,6 +657,7 @@ jobs:
     needs: [test, static-gates]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       issues: write
       contents: read

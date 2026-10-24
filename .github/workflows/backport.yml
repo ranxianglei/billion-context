@@ -85,6 +85,7 @@ jobs:
   backport:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr || github.event.pull_request.number }}

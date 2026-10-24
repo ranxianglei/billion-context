@@ -53,6 +53,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: write
       id-token: write
