@@ -440,6 +440,7 @@ above.
 ```bash
 bili --port 9000              # change listen port
 bili --host 0.0.0.0           # listen on all interfaces (see host note below)
+bili start --lane zcode       # declare which client lane a manual instance serves (#4368)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file

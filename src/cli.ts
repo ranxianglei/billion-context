@@ -38,7 +38,7 @@ import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
-import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
+import { runLaunch, runTestPi, isLaunchClient, KNOWN_LANES, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
@@ -162,6 +162,9 @@ Options (override config file / env):
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (start: 8787; launcher default: random free port)
   --host <ADDR>                    listen host (default 127.0.0.1)
+  --lane <NAME>                    which client lane a manual 'start' instance serves (attach
+                                   identity, #4368; known lanes: all bili client names + zcode —
+                                   an unknown name is rejected at startup)
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
   --config <FILE>                  path to config JSON (default: XDG location)
   --debug                          verbose logging
@@ -180,6 +183,8 @@ Docs: https://github.com/ranxianglei/billion-context
 type Parsed = {
     command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
     client?: ClientName;
+    /** #4368: client lane a manual `start` instance declares (KNOWN_LANES). */
+    lane?: string;
     clientArgs: string[];
     mitmDomains: string[];
     overrides: Record<string, string | undefined>;
@@ -211,6 +216,7 @@ export function parseArgs(argv: string[]): Parsed {
     let command: Parsed["command"] = "start";
     const positional: string[] = [];
     let client: ClientName | undefined;
+    let lane: string | undefined;
     let clientArgs: string[] = [];
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
@@ -358,6 +364,22 @@ export function parseArgs(argv: string[]): Parsed {
                 acpCacheSession = val;
                 break;
             }
+            case "--lane": {
+                const val = argv[++i];
+                if (val === undefined || val.length === 0) {
+                    console.error(`bili: ${a} requires a non-empty value`);
+                    process.exit(2);
+                }
+                // #4368: loud-fail on unknown names — a typo'd lane would be
+                // recorded in the instance file and silently match no hook,
+                // re-creating exactly the worst-class misroute this flag fixes.
+                if (!(KNOWN_LANES as readonly string[]).includes(val)) {
+                    console.error(`bili: unknown lane "${val}" (known lanes: ${KNOWN_LANES.join(", ")})`);
+                    process.exit(2);
+                }
+                lane = val;
+                break;
+            }
             case "-F":
             case "--port":
             case "--host":
@@ -483,11 +505,16 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
+    if (lane !== undefined && command !== "start") {
+        console.error(`bili: --lane is only valid with 'start' (client launches take their lane from the client itself)`);
+        process.exit(2);
+    }
+
+    return { command, client, lane, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, lane, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -699,6 +726,13 @@ export async function main(): Promise<void> {
         await runLaunch({ client: client!, clientArgs, mitmDomains, overrides });
         return;
     }
+
+    // #4368: a manual instance declares which client lane it serves — the
+    // server records it in the instance file so same-lane hooks attach
+    // instead of spawning duplicates. Flag > env: an explicit --lane wins
+    // over a stale exported BILI_LAUNCHER_LANE (the env var stays as the
+    // escape hatch for scripts that cannot pass flags).
+    if (lane !== undefined) process.env.BILI_LAUNCHER_LANE = lane;
 
     for (const [k, v] of Object.entries(overrides)) {
         if (v !== undefined) process.env[k] = v;

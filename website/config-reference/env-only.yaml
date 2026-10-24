@@ -240,8 +240,8 @@ entries:
     kind: env-only
     audience: internal
     group: envonly
-    desc_en: "Launcher channel: lane identity of the spawning bili process."
-    desc_zh: "启动器通道：派生方 bili 进程的车道身份。"
+    desc_en: "Launcher channel: lane identity of the spawning bili process; for manual instances, declared via bili start --lane <name> (flag > env, #4368)."
+    desc_zh: "启动器通道：派生方 bili 进程的车道身份；手动实例可用 bili start --lane <name> 声明（flag > env，#4368）。"
   - key: BILI_LAUNCHER_PLUGIN
     type: string
     default: "unset"

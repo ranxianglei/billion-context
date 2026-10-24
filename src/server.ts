@@ -1099,6 +1099,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (hopping strands it serving no client while the old instance keeps the
     // real port: the orphan leak #3044 reports).
     const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
+    if (launcherLane !== undefined && launchToken === undefined) {
+        // #4368: user-declared lane on a manual daemon (bili start --lane or
+        // BILI_LAUNCHER_LANE) — announce it so an operator debugging why no
+        // client attaches can see the declared identity in the boot log.
+        log("info", `[start] declaring client lane "${launcherLane}" — same-lane hooks attach to this manual daemon instead of spawning their own (#4368)`);
+    }
+
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;

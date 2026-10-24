@@ -24,9 +24,11 @@ export interface ProxyInstanceFile {
     modelWindows: Record<string, number>;
     modelMaxOutputs?: Record<string, number>;
     launchToken?: string;
-    /** #1225: which client/lane the launcher that spawned this instance
-     *  belongs to (BILI_LAUNCHER_LANE). Absent for manual `bili start`
-     *  daemons and pre-#1225 instances — both stay shareable (wildcard). */
+    /** #1225: which client/lane this instance serves (BILI_LAUNCHER_LANE).
+     *  Set by the launcher for spawned proxies, or by `bili start --lane
+     *  <name>` / BILI_LAUNCHER_LANE for a user-declared manual daemon
+     *  (#4368). Absent for pre-#1225 instances and lane-less manual starts —
+     *  those stay wildcard-compatible. */
     lane?: string;
     /** #1225: sha256 of the entry script this instance is RUNNING. A missing
      *  fingerprint means pre-#1225 code — attaching new code to it would

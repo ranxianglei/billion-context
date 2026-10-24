@@ -1465,15 +1465,15 @@ test("ensureProxyRunning: armed daemon (no lane) stays shareable with any client
     assert.equal(handle.attached, true);
 });
 
-// #1335: the attach gate — an unarmed listener is never attached by
+// #1335: the attach gate — an unarmed LAUNCHED listener is never attached by
 // default; the hook spawns its own session-owned proxy so every session runs
 // the currently installed bili and the proxy dies with the last session
-// (#1186 semantics). #1660 narrows the gate to LANE'D instances: a lane'd
-// proxy with a dead/unarmed watchdog is a lifecycle-drift symptom and is
-// refused; a USER-ZONE instance (manual `bili start`: no lane, no launch
-// token) is deliberately maintained by the user and IS attachable — see the
-// dedicated user-zone test below.
-test("ensureProxyRunning: unarmed LANE'D listener is not attached by default — self-managed spawn (#1335/#1660)", async () => {
+// (#1186 semantics). The exemption is the USER ZONE: token-less manual
+// `bili start` daemons — with or WITHOUT a declared lane (#1660/#4368) — are
+// deliberately maintained by the user and ARE attachable; see the dedicated
+// user-zone tests below. A launch token marks a launcher-spawned child, so
+// an orphaned one (dead parent) keeps being refused here.
+test("ensureProxyRunning: unarmed SPAWNED lane'd listener (launch token present) is not attached by default — self-managed spawn (#1335)", async () => {
     let spawnCalls = 0;
     let registered = 0;
     let childToken = "";
@@ -1489,7 +1489,7 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "daemon-1", lane: "claude-native" })),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "daemon-1", lane: "claude-native", launchToken: "orphan-token" })),
             registerWatcher: async () => {
                 registered++;
                 return "refused";
@@ -1498,7 +1498,7 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
             scriptPath: FP_SCRIPT,
         },
     );
-    assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed lane'd daemon");
+    assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed launched daemon");
     assert.ok(handle.child);
     assert.equal(handle.attached, undefined);
     assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
@@ -1562,6 +1562,96 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
     assert.equal(registered, 1);
 });
 
+// #4368: a MANUAL daemon that declares its own lane (`bili start --lane`,
+// BILI_LAUNCHER_LANE) keeps the #1660 user-zone exemption — its own-lane hook
+// attaches despite the unarmed watchdog instead of spawning a duplicate.
+// The manual daemon takes no watchers (no parent pid), so the attach lands
+// with refusedWatcher set — the #1322 host-visible warning path stays live.
+test("ensureProxyRunning: unarmed LANE'd MANUAL daemon (no launch token) attaches by its own lane (#4368/#1335/#1660)", async () => {
+    let spawnCalls = 0;
+    let registered = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "zcode" },
+        {
+            spawnImpl: () => {
+                spawnCalls++;
+                return makeFakeChild(42507);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-lane-1", watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ instanceId: "manual-lane-1", lane: "zcode" }),
+            registerWatcher: async () => {
+                registered++;
+                return "refused";
+            },
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0, "the user-declared lane daemon is reused, not doubled");
+    assert.equal(handle.attached, true);
+    assert.equal(registered, 1);
+    assert.equal(handle.refusedWatcher, true, "a manual daemon takes no watchers — the #1322 warning path stays live");
+});
+
+// Negative twin: the #4368 exemption is MANUAL-only. A launcher-spawned
+// instance always carries a launch token, so an unarmed LANE'D spawned proxy
+// (a crashed session's orphan) is still refused loudly (#1335).
+test("ensureProxyRunning: unarmed LANE'd SPAWNED daemon (launch token present) is still refused (#4368/#1335)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    let registered = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "claude-native" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42508);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "orphan-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawnCalls > 0 ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "orphan-1", lane: "claude-native", launchToken: "tok-orphan" })),
+            registerWatcher: async () => {
+                registered++;
+                return "ok";
+            },
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "the orphan is refused — self-managed spawn instead");
+    assert.ok(handle.child);
+    assert.equal(handle.attached, undefined);
+    assert.equal(registered, 0, "no watcher registration against the refused orphan");
+});
+
+// Cross-lane negative: a lane-tagged manual daemon is NOT ridden by a
+// DIFFERENT lane's hook under the default own-lane policy — lane isolation
+// holds even though the candidate is user-zone-exempt from the lifecycle gate.
+test("ensureProxyRunning: a lane-tagged manual daemon is not ridden by a different lane by default (#4368/#2877)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42509);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-zcode-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawnCalls > 0 ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-zcode-1", lane: "zcode" })),
+            registerWatcher: async () => "ok",
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "own-lane policy: a different lane's manual daemon is skipped, not ridden");
+    assert.ok(handle.child);
+});
+
 test("ensureProxyRunning: a lane'd launch with port 0 binds the zone preference and settles it sticky (#1660)", async () => {
     let spawnedArgs: string[] | null = null;
     const preferred: string[] = [];
@@ -1623,7 +1713,7 @@ test("ensureProxyRunning: an unlane'd launch keeps the OS ephemeral default — 
     assert.deepEqual(settled, [], "no sticky write without a lane");
 });
 
-test("ensureProxyRunning: unverifiable lane'd listener (no watchdog field, pre-#1330 build) is treated as unarmed (#1335)", async () => {
+test("ensureProxyRunning: unverifiable LAUNCHED lane'd listener (missing watchdog field) is treated as unarmed (#1335)", async () => {
     let spawnCalls = 0;
     let childToken = "";
     let spawned = false;
@@ -1638,7 +1728,7 @@ test("ensureProxyRunning: unverifiable lane'd listener (no watchdog field, pre-#
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "stale-daemon" }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "stale-daemon", lane: "zcode" })),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "stale-daemon", lane: "zcode", launchToken: "orphan-stale" })),
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
         },
@@ -1680,7 +1770,7 @@ test("ensureProxyRunning: strictPort launch fails fast when its pinned port is h
                 },
                 fetchImpl: async () => ({ ok: true }),
                 fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
-                readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, instanceId: "daemon-1", lane: "claude-native" }),
+                readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, instanceId: "daemon-1", lane: "claude-native", launchToken: "orphan-strict" }),
                 sleep: () => Promise.resolve(),
                 scriptPath: FP_SCRIPT,
             },
@@ -7625,13 +7715,13 @@ test("attach diagnostics record a fingerprint-mismatch skip (#1623)", async () =
 
 test("attach diagnostics record a lifecycle-gate refusal (#1623)", async () => {
     const diag: string[] = [];
-    // #1660: an unarmed instance WITHOUT a lane is a user-zone manual start
-    // and attaches by default — the refusal path needs a lane'd one.
+    // #1660/#4368: a token-less manual start attaches by default even WITH a
+    // declared lane — the refusal path needs a launched (token'd) one.
     const inst = await findLiveAttachableInstance(
         { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
         {
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-            readInstanceFile: () => recordedInstance({ lane: "zcode" }),
+            readInstanceFile: () => recordedInstance({ lane: "zcode", launchToken: "orphan-diag" }),
             attachDiag: (m) => diag.push(m),
             scriptPath: FP_SCRIPT,
         },
@@ -7900,11 +7990,11 @@ test("user-actionable gate refusal stays on the terminal — not hidden with the
             { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
             {
                 fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-                readInstanceFile: () => recordedInstance({ lane: "opencode" }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode", launchToken: "orphan-term" }),
                 scriptPath: FP_SCRIPT,
             },
         );
-        assert.equal(inst, undefined, "unverifiable-watchdog lane instance is still refused");
+        assert.equal(inst, undefined, "unverifiable-watchdog launched lane instance is still refused");
         assert.ok(stderrWrites.some((m) => m.includes("refusing to attach")), `stderr was: ${JSON.stringify(stderrWrites)}`);
         assert.ok(stateLog(home).includes("refusing to attach"), "file record kept as well");
     });

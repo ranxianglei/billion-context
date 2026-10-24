@@ -64,3 +64,52 @@ test("parseArgs: doctor is a command and --json sets doctorJson (#1235)", () => 
     assert.equal(f.command, "doctor");
     assert.equal(f.doctorFix, true);
 });
+
+// #4368: a manual instance declares which client lane it serves (--lane).
+// Unknown names fail loudly at startup — a typo'd lane would be recorded in
+// the instance file and silently match no hook; the flag is 'start'-only.
+
+/** Runs fn, recording any process.exit(code) call instead of dying (parseArgs usage errors). */
+async function captureExit(fn: () => unknown): Promise<number | undefined> {
+    const prevExit = process.exit;
+    let code: number | undefined;
+    process.exit = ((c?: number) => { code = c ?? 0; }) as typeof process.exit;
+    try {
+        await fn();
+    } finally {
+        process.exit = prevExit;
+    }
+    return code;
+}
+
+test("parseArgs: start --lane <name> declares the manual instance's lane (#4368)", () => {
+    const r = parseArgs(["start", "--lane", "zcode"]);
+    assert.equal(r.command, "start");
+    assert.equal(r.lane, "zcode");
+});
+
+test("parseArgs: bare bili --lane <name> defaults to the start command (#4368)", () => {
+    const r = parseArgs(["--lane", "pi"]);
+    assert.equal(r.command, "start");
+    assert.equal(r.lane, "pi");
+});
+
+test("parseArgs: --lane=<name> equals form (#4368)", () => {
+    const r = parseArgs(["start", "--lane=zcode"]);
+    assert.equal(r.command, "start");
+    assert.equal(r.lane, "zcode");
+});
+
+test("parseArgs: --lane without a value or with an empty value exits 2 (#4368)", async () => {
+    assert.equal(await captureExit(() => parseArgs(["start", "--lane"])), 2);
+    assert.equal(await captureExit(() => parseArgs(["start", "--lane", ""])), 2);
+});
+
+test("parseArgs: unknown --lane name exits 2 (#4368)", async () => {
+    assert.equal(await captureExit(() => parseArgs(["start", "--lane", "zcdoe"])), 2);
+});
+
+test("parseArgs: --lane is rejected outside 'start' (#4368)", async () => {
+    assert.equal(await captureExit(() => parseArgs(["update", "--lane", "pi"])), 2);
+    assert.equal(await captureExit(() => parseArgs(["doctor", "--lane", "pi"])), 2);
+});

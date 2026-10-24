@@ -164,6 +164,11 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdp
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
+/** #4368: lane names a manual `bili start --lane <name>` may declare — every
+ *  built-in client lane plus zcode (native-hook only, never launchable). A
+ *  typo here would silently re-create the worst-class attach misroute, so the
+ *  CLI rejects unknown names at startup instead of recording them. */
+export const KNOWN_LANES = [...LAUNCH_CLIENTS, "zcode"] as const;
 type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
@@ -3698,27 +3703,31 @@ async function probeLiveInstances(
 /** #1335: the attach gate — a listener may be attached to only when its
  *  health reports an ARMED session-lifecycle watchdog, or the user explicitly
  *  opted in via native.attachExternal / BILI_NATIVE_ATTACH_EXTERNAL. A missing
- *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
- *  those are exactly the stale manually-started daemons behind #1322, and
- *  riding them pins every session to possibly-old code that outlives it. */
+ *  watchdog field (pre-#1330 build) is unverifiable and refused by default —
+ *  riding it pins every session to possibly-old code that outlives it (#1322);
+ *  user-zone (token-less manual) instances stay exempt below (#1660/#4368). */
 function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
     if (attachExternal) return true;
     return health.watchdog?.armed === true;
 }
 
-/** #1660: the user-sovereignty zone marker — neither a declared lane nor a
- *  launcher launch token exists only for a manually started `bili start`
- *  daemon. By definition the user maintains it (they typed the command; it
- *  has no session lifecycle BY DESIGN, not by drift), so lanes may attach to
- *  it despite the unarmed watchdog — code-fingerprint and config-shape
- *  compatibility still apply, and an older build stays incompatible. */
+/** #1660/#4368: the user-sovereignty zone marker — a manually started
+ *  `bili start` daemon carries no launcher launch token, with or without a
+ *  declared lane (#4368: `bili start --lane <name>` marks WHICH client lane
+ *  the user-maintained daemon serves; the env channel is BILI_LAUNCHER_LANE).
+ *  By definition the user maintains it (they typed the command; it has no
+ *  session lifecycle BY DESIGN, not by drift), so lanes may attach to it
+ *  despite the unarmed watchdog — code-fingerprint and config-shape
+ *  compatibility still apply, and an older build stays incompatible.
+ *  Launcher-spawned instances always carry a token and keep the full #1335
+ *  gate. */
 function isUserZoneInstance(inst: ProxyInstanceFile): boolean {
-    return inst.lane === undefined && inst.launchToken === undefined;
+    return inst.launchToken === undefined;
 }
 
 function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string {
     const reason = health.watchdog && health.watchdog.armed === false
-        ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
+        ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID)"
         : "it does not report watchdog state (older bili build) — its lifecycle is unverifiable";
     return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
 }

@@ -66,7 +66,7 @@
 | `BILI_PARENT_PID` | owner-pid 看门狗（会话生命周期归属） |
 | `BILI_STRICT_PORT` | `=1` claude SessionStart hook 退出端口重试（#964） |
 | `BILI_OPENCODE_ACP_SPEC` | 剥离版 ACP spec 临时配置**文件路径**提示 |
-| `BILI_LAUNCHER_LANE` | lane 身份戳（attach 时比对归属） |
+| `BILI_LAUNCHER_LANE` | lane 身份戳（attach 时比对归属）；手动实例可用 `bili start --lane <name>` 声明（#4368） |
 | `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` | 模型窗口/输出上限 JSON，传给子进程对齐 nudge 分母与输出预留 |
 | `BILI_INHERITED_HTTP_PROXY` / `BILI_INHERITED_HTTPS_PROXY` / `BILI_INHERITED_ALL_PROXY` / `BILI_INHERITED_NO_PROXY` | 继承调用方代理设置转发给 proxy 子进程 |
 | `BILI_MITM_HOSTS` / `BILI_MITM_DOMAINS` | MITM 主机/域名单传给子进程 |
