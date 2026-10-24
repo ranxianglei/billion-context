@@ -249,10 +249,13 @@ test("#4241: render turn with a host-side history edit — judge reconciles agai
                 assert.ok(v.ok, `main-lane verdict must be clean on a render turn: ${JSON.stringify(v.violations[0])}`);
             }
 
-            // teeth: same shape, but the outbound DROPS a frozen-prefix row —
-            // the judge must fire against the baseline (the swap must not
-            // blind it to real defects).
-            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => exitCores.filter((_, i) => i !== 3));
+            // teeth: same shape, but the outbound DROPS the last client tail
+            // row (exitCores.length - 2: the engine appends its trailing nudge
+            // as the final wire message, so the last tail row sits one before
+            // it) — the part the render lane owns byte-intact. The rendered
+            // PREFIX is exempt by design (#4241: cross-turn prefix stability
+            // is seamLcp's/shadow's job); the tail drop must fire.
+            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => exitCores.filter((_, i) => i !== exitCores.length - 2));
             verdicts.length = 0;
             const r3 = await turn(h, [...full2, { role: "user", content: "And one more. " + "TAIL_B_".repeat(80) }], label, null);
             assert.equal(r3.status, 200, r3.body);

@@ -441,6 +441,29 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
+export interface PidProbe {
+    alive: boolean;
+    /** Errno code of the failed kill-0 (e.g. "ESRCH"); undefined when the
+     *  probe succeeded or no probe ran at all (invalid pid). */
+    errCode?: string;
+}
+
+/** #3890: kill-0 with errno visibility. On Windows Node maps every
+ *  OpenProcess failure other than ERROR_ACCESS_DENIED to ESRCH, so a LIVE
+ *  process can read dead with no way to tell which Win32 error caused it.
+ *  Callers that act destructively on a dead verdict log errCode on first
+ *  sight so field episodes can be attributed. */
+export function probePid(pid: number): PidProbe {
+    if (!Number.isInteger(pid) || pid <= 0) return { alive: false };
+    try {
+        process.kill(pid, 0);
+        return { alive: true };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        return { alive: code === "EPERM", errCode: code };
+    }
+}
+
 export interface RegistryEntry {
     instanceId: string;
     pid: number;

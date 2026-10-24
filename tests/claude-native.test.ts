@@ -1615,8 +1615,10 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
         assert.ok(await canConnect(port), "proxy survives the transient sh wrapper's death");
 
         // Session end: claude dies, the proxy must follow within a few ticks.
+        // #3890 widened owner-death→exit by up to ~6s (three consecutive failed
+        // probes now confirm death instead of one) — deadline re-sized to match.
         if (claudePid > 1) killPid(claudePid);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "proxy exits with the claude session");
     } finally {
@@ -1697,17 +1699,22 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         // Grace: keeper1 dies, and BEFORE the idle grace expires a new owner
         // registers (the live race: spawner exits right after a second session
         // starts). The pending shutdown must be cancelled — the proxy stays up
-        // well past the grace window.
+        // well past the grace window. #3890: keeper1's removal now takes ~6s
+        // (three consecutive failed probes confirm death), so the late
+        // registration lands AFTER removal but INSIDE the 5s idle grace that
+        // follows it — still exercising the cancellation of an armed pending
+        // shutdown (which would otherwise fire ~11s after the death).
         if (keeperPid > 1) killPid(keeperPid);
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise((r) => setTimeout(r, 8000));
         const late = await post({ pid: keeper2Pid });
         assert.equal(late.status, 200, "late registration within the grace window accepted");
-        await new Promise((r) => setTimeout(r, 7000));
+        await new Promise((r) => setTimeout(r, 8000));
         assert.ok(await canConnect(port), "grace registration cancelled the pending shutdown");
 
         // LAST owner dies → armed proxy must follow (≤ a few ticks + grace).
+        // #3890 widened owner-death→exit by up to ~6s (confirmation ticks).
         if (keeper2Pid > 1) killPid(keeper2Pid);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "armed proxy exits when its watcher dies");
 
@@ -1915,8 +1922,9 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
         assert.equal(instMid.pid, proxyPid, "same proxy instance throughout — no respawn");
 
         // Last session exits → the proxy must follow within a few ticks.
+        // #3890 widened owner-death→exit by up to ~6s (confirmation ticks).
         if (claudeB > 1) killPid(claudeB);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "proxy exits after the LAST session");
     } finally {

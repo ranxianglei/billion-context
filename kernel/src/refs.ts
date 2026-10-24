@@ -1,4 +1,4 @@
-import type { CoreMessage, MessageRefMap } from "./types.js";
+import type { CompressionState,  CoreMessage, MessageRefMap } from "./types.js";
 
 // Ref tags render zero-padded to REF_WIDTH digits up to 99,999 ("m00001");
 // above that they widen naturally ("m100000" … "m9999999") so every tag ever
@@ -182,6 +182,108 @@ export function rebuildRefIndex(map: MessageRefMap): MessageRefMap {
     if (ref !== BLOCKED_REF) byRef[ref] = rawId;
   }
   return { byRaw: { ...map.byRaw }, byRef };
+}
+
+export interface RefRestampOutcome {
+  /** Row-backed refs that already equalled seq+1 — untouched. */
+  kept: number;
+  /** Row-backed refs re-pointed onto seq+1. */
+  restamped: number;
+  /** Unbacked refs displaced by a stamp and re-homed onto fresh numbers. */
+  rehomed: number;
+  /** BLOCKED entries — protected messages keep taking no number. */
+  blocked: number;
+  /** Old ref → rawId for EVERY mapping that changed hands. Hosts keep this
+   *  for the process lifetime so a compress call replaying pre-restart refs
+   *  (a resent in-flight tool call) is honestly rejected instead of silently
+   *  folding whatever message now owns the number. */
+  superseded: Map<string, string>;
+}
+
+/** #4316 layer 3 PR3/3 — align the existing citation space with the unified
+ *  ledger, exactly once per state. The counter path numbers messages in
+ *  arrival order but skips protected messages (BLOCKED takes no number) while
+ *  the store still gives them a row seq, so refs minted after a protected
+ *  message drift ahead of seq+1; edits and churn widen the gap. After this
+ *  call every row-backed, currently-mapped raw id holds ref = seq+1 — the
+ *  same numbers the stamped lanes (assignRefs' ledgerSeq path) mint — so the
+ *  model citation space and the storage truth agree and churn cannot renumber
+ *  citations anymore.
+ *
+ *  Scope honesty: raw ids with NO current mapping are left to assignRefs (the
+ *  stamp path aligns them on next sight); BLOCKED entries stay BLOCKED; dead
+ *  refs stay reserved; an unbacked ref displaced by a stamp is re-homed onto a
+ *  fresh number (the id-never-reused contract holds — it keeps A ref). */
+export function restampRefsToLedger(
+  state: CompressionState,
+  seqByRawId: Map<string, number>,
+): RefRestampOutcome {
+  const out: RefRestampOutcome = {
+    kept: 0,
+    restamped: 0,
+    rehomed: 0,
+    blocked: 0,
+    superseded: new Map(),
+  };
+  if (state.refLedgerAligned === true) return out;
+  const refs = state.messageRefs;
+  if (!refs || !refs.byRaw || !refs.byRef) return out;
+
+  // Scratch copies — the state is swapped only after the full pass computes
+  // without throwing (a mid-way failure must not leave a half-renumbered map).
+  const byRaw: Record<string, string> = { ...refs.byRaw };
+  const byRef: Record<string, string> = { ...refs.byRef };
+  const scratch: MessageRefMap = { byRaw, byRef };
+  const displaced: string[] = [];
+  // MessageRefMap carries no cursor field — the caller recomputes it from the
+  // highest used index (compress.ts:1047 pattern). We still track a local
+  // cursor for free-number allocation during this pass.
+  let nextIndex = highestUsedIndex(refs) + 1;
+
+  for (const [rawId, seq] of seqByRawId) {
+    const current = byRaw[rawId];
+    // Unmapped ids (never rendered, or already dead) are assignRefs'
+    // business, not ours.
+    if (current === undefined) continue;
+    if (current === BLOCKED_REF) {
+      out.blocked++;
+      continue;
+    }
+    const targetIndex = seq + 1;
+    if (targetIndex < MIN_INDEX || targetIndex > MAX_INDEX) continue;
+    const target = indexToRef(targetIndex);
+    if (current === target) {
+      out.kept++;
+      if (targetIndex + 1 > nextIndex) nextIndex = targetIndex + 1;
+      continue;
+    }
+    const occupant = byRef[target];
+    if (occupant !== undefined && occupant !== rawId) displaced.push(occupant);
+    if (byRef[current] === rawId) delete byRef[current];
+    out.superseded.set(current, rawId);
+    byRaw[rawId] = target;
+    byRef[target] = rawId;
+    out.restamped++;
+    if (targetIndex + 1 > nextIndex) nextIndex = targetIndex + 1;
+  }
+
+  // Displaced occupants lost their number to a stamp — re-home them onto
+  // fresh numbers at/after the cursor (never a dead or low reserved number).
+  for (const rawId of displaced) {
+    const held = byRaw[rawId];
+    if (held === undefined) continue;
+    if (byRef[held] === rawId) continue;
+    const free = allocateFreeRef(scratch, nextIndex);
+    out.superseded.set(held, rawId);
+    byRaw[rawId] = free.text;
+    byRef[free.text] = rawId;
+    nextIndex = free.index + 1;
+    out.rehomed++;
+  }
+
+  state.messageRefs = { byRaw, byRef };
+  state.refLedgerAligned = true;
+  return out;
 }
 
 export function highestUsedIndex(map: MessageRefMap): number {

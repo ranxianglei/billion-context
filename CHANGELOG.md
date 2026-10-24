@@ -7,6 +7,19 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### D5-5 — 渲染源窗口化 + 判官 tailStart 视图域修复
+
+- **渲染分窗(storage-review D5-5)**:`buildView` 不再全表加载正史行(数万行 × 每行媒体水合 = 每请求读放大)。新两层查询:`messageIdRows`(seq+msg_id 列,无字节,全行,驱动块锡定+接缝链)+ `uncoveredRows`(仅覆盖区间外的行取字节+媒体;covered 字节永不读——covered 行腐败不再导致渲染降级)。块锡定从字节匹配改 `msg_id` 列匹配零语义变化;两查询间隙新行的竞态→一次全量回退兼音。`unifiedTailViewRows` 保留为回退路径。
+- **判官 tailStart 视图域(#4241 回归修复)**:`snapshotRenderTailStart` 原记客户端域下标(clientJoin),但判官用它索引 `judgeBaseline`(渲染视图)——视图前缀压缩后 clientJoin 可指向视图末尾之外→判官空转(total=0 空转 clean,T1 合车后把 #4241 牙齿测试打红)。改记视图域(视图行数 − 尾巴数)。牙齿测试同步改注尾巴行(引擎尾随 nudge 占末位,最后一条尾巴在 exitCores.length − 2):渲染前缀豁免是设计内(#4241:跨轮前缀稳定归 seamLcp/shadow),尾巴行丢失必须开火。
+
+### #4316 层 3 PR3/3 — 存量编号一次性对齐正史 + fork 克隆保号
+
+- **kernel `restampRefsToLedger`**:把既有引用空间一次性重排到正史账本(ref = store 行 seq + 1)。计数器路径按到达顺序发号但受保护消息不占号,而行 seq 照发 → 两者天然漂移;编辑与 churn 拉大缺口。重排后引用空间与存储真值一致,churn 不再改写编号。诚实边界:无映射 id 留给 assignRefs 的章路径;BLOCKED 仍不占号;死 ref 保留;被夺号的无行引用重安居新号(id 永不复用契约不破);多代(同 id 多行编辑)id 由 `seqByRaw` 排除不误绑。`CompressionState.refLedgerAligned` 标记一次性(`state-hydration` 字段单一事实源自动持久化)。
+- **挂点=服务触达(getSession)非 loadSync**:loadSync 保持纯对等视图(corpus manifest 摘要钉死不动);`getSession` 双路径(内存命中/盘重载)首次触达触发对齐——同进程重启边界语义不变(新进程无 in-flight compress,半重排映射不可见)。
+- **superseded 守卫**:重排换手的旧 ref → rawId 映射记在 `Session.restampSuperseded`(进程生命周期);重发 in-flight compress 调用引用旧号 → 诚实拒绝(绝不静默折错段),提示重读 acp_status 后重发。拒绝安全不会错折,一次性代价后消失。
+- **fork 克隆保号**:`cloneSessionRows`(store+mysql 双后端)把父会话行整段复制到子(session,seq) 保号 + lineage 列(parentSessionId/forkPointSeq 真值)+content/media CAS refcount 提升 + 幂等重放;子 append 自然从父 maxSeq+1(remapPlanToAbsolute)。fork 端点接线,存储不可用降级=kernel-only 克隆(现行为)。
+- **验收桩**:kernel 4 测(BLOCKED 偏移重排/交换原子性/无行引用保留+被夺号重安居+死 ref 不动/已对齐幂等)+host 4 测(整段克隆保号+lineage+幂等+子续号/部分分支/superseded 拒绝+当前号通过/冷加载纯视图+服务触达对齐一次+二次幂等)。
+
 ### 修复 master 回归(搭乘)
 
 - **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。

@@ -18,6 +18,14 @@ entries:
     group: envonly
     desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
     desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+  - key: BILI_DSH_MAX_TESTED_VERSION
+    type: string
+    default: "0.2.0-rc.2 (CI e2e anchor)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Newest-tested @deepseek-ai/dsh build behind the dsh native lane's boot note (#4545): the running client build is resolved from the nearest node_modules/@deepseek-ai/dsh/package.json above the injected bundle; being STRICTLY NEWER than this cap earns ONE boot-time note (durable log record + banner) advising roll-back until support lands. One direction only — at-or-below-cap builds stay silent (known older-build break modes have their own overlay-latch detectors). Warns only — never gates or blocks traffic. Move the cap up as builds get verified; an EMPTY string turns the check off for this lane. Unresolvable/unparseable versions fail open to silence."
+    desc_zh: “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。”
   - key: BILI_STORAGE_BACKEND
     type: "sqlite|mysql"
     default: "sqlite"

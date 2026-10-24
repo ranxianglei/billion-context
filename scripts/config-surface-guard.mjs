@@ -134,7 +134,13 @@ function namedTypeBodies(src) {
 
 // Extract the quoted identifiers of `const <varName> = new Set([ ... ]);`.
 export function extractStringSet(src, varName) {
-    const i = src.indexOf(varName);
+    // Locate the DEFINITION (`const <name> = new Set([`), not the first textual
+    // mention: doc comments legitimately reference the identifier above its
+    // definition (#3675's header did exactly that and fed the extractor the
+    // wrong bracket window — the join(", ") in unrelated code parsed as a
+    // leaf named ", ").
+    const def = src.indexOf(varName + " = new Set([");
+    const i = def >= 0 ? def : src.indexOf(varName);
     if (i < 0) throw new Error(varName + " not found");
     const open = src.indexOf("[", i);
     const close = src.indexOf("]", open);

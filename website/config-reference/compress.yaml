@@ -355,6 +355,16 @@ entries:
     desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。"
     site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
     site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
+  - key: compress.externalSummary
+    type: object
+    default: "opt-in (disabled)"
+    group: compress
+    id: co.es
+    render: obj-item
+    desc_en: "Sends compression summaries to separately configured models referenced from the providers table; whole-chain replace semantics at all three compress levels."
+    desc_zh: "把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。"
+    site_en: "<code>externalSummary</code> — optional chain of external summary models, each target a \"provider/model\" reference into the <code>providers</code> table; disabled unless <code>enabled</code> is true, targets tried in order with fall-through (<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>). Whole-chain replace semantics at all three compress levels."
+    site_zh: "<code>externalSummary</code> —— 可选的外部摘要模型链，每个目标为指向 <code>providers</code> 表的 \"provider/model\" 引用；<code>enabled</code> 为 true 才启用，目标按顺序尝试、失败落到下一个（<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>）。三级 compress 均为整链替换语义。"
   - key: compress.acknowledgePromptsRisk
     type: boolean
     default: "false"

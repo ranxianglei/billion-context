@@ -53,7 +53,7 @@ import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, 
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -446,7 +446,15 @@ async function handleRequest(
         if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0
             && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
             dshPassthroughGuardStats.refusals += 1;
-            log("warn", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}`);
+            // #3013/#3022 (A3): first refusal warns; then every
+            // DSH_REFUSAL_STORM_LOG_EVERY-th refusal logs an info so an
+            // agentless retry storm stays visible without spamming (the
+            // field-reported storm re-fired every ~328ms — per-refusal warn
+            // would have written thousands of lines). This log line, not the
+            // #2490 ledger, is the only record on this lane.
+            if (dshPassthroughGuardStats.refusals === 1 || dshPassthroughGuardStats.refusals % DSH_REFUSAL_STORM_LOG_EVERY === 0) {
+                log(dshPassthroughGuardStats.refusals === 1 ? "warn" : "info", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}` + (dshPassthroughGuardStats.refusals === 1 ? "" : ` — retrying will keep failing (terminal, bili_final; #3013): disable dsh auto-compaction (#2474)`));
+            }
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                 res.writeHead(refusal.status, { "content-type": "application/json" });
@@ -1967,6 +1975,14 @@ async function handleRequest(
                 return;
             }
             session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;
+            // #3013/#3022 (A3): after the once-warn above, refusals were fully
+            // silent — the field storm burned 5051 refusals with zero further
+            // log lines while the user saw a stuck "生成中". Every
+            // DSH_REFUSAL_STORM_LOG_EVERY-th refusal re-surfaces with the
+            // running count and the actual levers.
+            if ((session.metadata["dshCompactionRefusals"] as number) % DSH_REFUSAL_STORM_LOG_EVERY === 0) {
+                log("info", `[${session.id}] dsh native compaction refusal #${session.metadata["dshCompactionRefusals"]} on this session (raw-ledger high-water ${(session.metadata["dshCompactionRefusedBytes"] as number)} bytes) — dsh keeps retrying because its own raw pressure ledger never shrinks (#2490), and every retry of this call will be refused (terminal, #3013). Disable dsh auto-compaction (profile recipe #2474) or manage context via bili's compress. If bili's own compression looks idle while this repeats, the nudge channel may be dead — report it (#3004/#3013).`);
+            }
             markDirty(session);
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {

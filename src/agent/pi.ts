@@ -16,7 +16,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
 import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
@@ -599,7 +599,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 // #2416: read the LIVE base — a native respawn after a proxy
@@ -619,7 +619,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // rebinding (onRoutedOriginObserved) converges env back to the
                 // observed routed origin.
                 const base = proxyBaseForCtx(ctx) ?? proxyBase;
-                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown", toolCallId);
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
@@ -1399,6 +1399,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
             const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
             if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            if (!wireMessagesLookAnthropic(payload.messages)) return undefined; // anthropic wire only — OpenAI tool shapes resend full (#3433)
             const sid = sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return undefined;
             let proxyBase = proxyBaseForCtx(ctx);

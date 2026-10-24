@@ -77,7 +77,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -772,7 +772,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(out.isError, undefined);
         // #2072: the pi host stamps its session-manager id as a confirmed
         // native caller — the captured wire body carries the flag.
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-1" }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
@@ -834,7 +834,7 @@ test("#2416: registered tools track the respawned proxy origin — live re-read 
         out = await pi.tools[0]!.execute("call-2", { content: [] }, undefined, undefined, ctx);
         assert.equal(out.isError, undefined, "the tool must reach the respawned proxy, not keep firing at the dead port");
         assert.match(out.content[0]!.text, /\[Compressed/);
-        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-2" }]);
         assert.equal(oldProxy.toolCalls.length, 1, "nothing further may hit the dead origin");
     } finally {
         if (prevEnv === undefined) delete process.env.BILLION_CONTEXT_PROXY;

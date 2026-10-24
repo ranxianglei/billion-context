@@ -241,6 +241,81 @@ test("web config API round-trips named entries verbatim (no silent drop)", async
     assert.deepEqual(loadRoutes()["https://api.anthropic.com"]?.compress, { maxContextLimitPct: 0.75 });
 });
 
+test("compress-block keys at a URL route root warn instead of sitting silently (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        "https://cap.example": {
+            modelContextLimit: 1000000,
+            outputHeadroomMaxPct: 0.15,
+            models: { m1: { context: 200000 } },
+        },
+    });
+    const routes = loadRoutes();
+    assert.deepEqual(Object.keys(routes), ["https://cap.example"]);
+    assert.equal(routes["https://cap.example"].models?.m1?.context, 200000);
+    assert.equal(routes["https://cap.example"].compress, undefined);
+    assert.equal(warnings.length, 1);
+    for (const needle of ['"https://cap.example"', "modelContextLimit", "outputHeadroomMaxPct", '.compress']) {
+        assert.ok(warnings[0].includes(needle), `warning should mention ${needle}: ${warnings[0]}`);
+    }
+});
+
+test("bound alias: compress-block keys at its root stay inert through the fold and warn (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capBridge: {
+            bind: "https://cap-bound.example",
+            modelContextLimit: 500000,
+            nudgeGrowthTokens: 77777,
+            compress: { maxContextLimitPct: 0.7 },
+        },
+    });
+    const laneRaw = loadRoutes()["https://cap-bound.example"] as Record<string, unknown> | undefined;
+    assert.ok(laneRaw);
+    assert.equal((laneRaw.compress as Record<string, unknown> | undefined)?.maxContextLimitPct, 0.7);
+    assert.equal(laneRaw.modelContextLimit, undefined);
+    assert.equal(laneRaw.nudgeGrowthTokens, undefined);
+    assert.equal(warnings.length, 1);
+    for (const needle of ['"capBridge"', "modelContextLimit", "nudgeGrowthTokens"]) {
+        assert.ok(warnings[0].includes(needle), `warning should mention ${needle}: ${warnings[0]}`);
+    }
+});
+
+test("named entry whose only fields are compress-block keys: previously zero warnings, now one (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capLonely: { outputHeadroomMaxPct: 0.2 },
+    });
+    const routes = loadRoutes();
+    assert.ok("capLonely" in routes);
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes('"capLonely"') && warnings[0].includes("outputHeadroomMaxPct"), warnings[0]);
+});
+
+test("dialing recipes keep their own loud rejection — no duplicate route-root warning (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        glmLane: {
+            baseUrl: "https://glm.example",
+            api: "openai",
+            apiKeyEnv: "GLM_KEY",
+            models: { g1: { contextWindow: 100000 } },
+            modelContextLimit: 1000000,
+        },
+    });
+    loadRoutes();
+    assert.deepEqual(warnings, []);
+});
+
+test("route-root compress-key warning fires once per signature across reloads (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, { "https://cap-reload.example": { modelContextLimit: 250000 } });
+    loadRoutes();
+    loadRoutes();
+    loadRoutes();
+    assert.equal(warnings.filter((w) => w.includes('"https://cap-reload.example"')).length, 1);
+});
+
 test("web config API still rejects legacy, invalid-proxy, and non-object entries", async (t) => {
     captureWarnings(t);
     withConfigFile(t, {});

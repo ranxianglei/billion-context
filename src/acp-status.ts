@@ -21,6 +21,7 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -182,6 +183,17 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     });
     if (scope) return toolOk(base);
     const extra: string[] = [];
+    // #3925 → #3011 C9: a fork that started with zero inherited blocks used to
+    // be invisible here — "COMPRESSED BLOCKS — none" reads as "nothing folded
+    // yet", not "inheritance was skipped". Name the gap and its recovery path:
+    // the lineage link recorded at fork detection means a bili restart lets the
+    // startup sweep inherit the parent's blocks. Suppressed once any active
+    // block exists (the gap is closed by then, however it was closed).
+    const forkSkipped = forkAdoptionSkippedOf(ctx.session);
+    if (forkSkipped && !ctx.session.state.blocks.some((b) => b.active)) {
+        extra.push("");
+        extra.push(`FORK ADOPTION SKIPPED — this session forked from ${forkSkipped.parentId} with ${forkSkipped.blocks} parent block(s) (~${Math.round(forkSkipped.tokens / 1000)}K tokens) NOT inherited because forkAdoption is disabled; the parent's already-folded history replays raw and will re-fold from scratch. Set "forkAdoption": true (or BILI_FORK_ADOPTION=1) and restart bili — the recorded lineage link lets the startup sweep inherit those blocks.`);
+    }
     // #2366: everything in the report above is LOCAL ESTIMATES (defaultCountTokens);
     // on CJK-heavy routes upstream billing runs 2–4× higher, so an agent judging
     // pressure from those figures misreads a filling window as healthy and folds

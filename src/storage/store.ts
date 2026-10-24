@@ -1241,6 +1241,49 @@ export class UnifiedStore {
         return row ? row.msg_id : null;
     }
 
+    /** #3301: message rows for the given ids — EVERY seq row matching an id
+     *  (edits append; callers keep the latest per id) plus, when
+     *  includeNeighbors, the seq±1 rows so split-form rc pairs stay adjacent
+     *  for turn-key derivation. Content bytes resolved via CAS; rows whose
+     *  blob is gone are skipped. Read-only. */
+    messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
+        if (msgIds.length === 0) return [];
+        const CHUNK = 500;
+        const rows = new Map<number, { seq: number; msgId: string; contentHash: string }>();
+        const neighborSeqs = new Set<number>();
+        for (let i = 0; i < msgIds.length; i += CHUNK) {
+            const chunk = msgIds.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ? AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as { seq: number; msg_id: string; content_hash: string }[]) {
+                if (!rows.has(r.seq)) rows.set(r.seq, { seq: r.seq, msgId: r.msg_id, contentHash: r.content_hash });
+                if (includeNeighbors) {
+                    neighborSeqs.add(r.seq - 1);
+                    neighborSeqs.add(r.seq + 1);
+                }
+            }
+        }
+        if (neighborSeqs.size > 0) {
+            const seqs = [...neighborSeqs];
+            for (let i = 0; i < seqs.length; i += CHUNK) {
+                const chunk = seqs.slice(i, i + CHUNK);
+                const ph = chunk.map(() => "?").join(",");
+                for (const r of this.db
+                    .prepare(`SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ? AND seq IN (${ph})`)
+                    .all(sessionId, ...chunk) as { seq: number; msg_id: string; content_hash: string }[]) {
+                    if (!rows.has(r.seq)) rows.set(r.seq, { seq: r.seq, msgId: r.msg_id, contentHash: r.content_hash });
+                }
+            }
+        }
+        const out: { seq: number; msgId: string; content: string }[] = [];
+        for (const r of [...rows.values()].sort((a, b) => a.seq - b.seq)) {
+            const content = this.getContent(r.contentHash);
+            if (content !== null) out.push({ seq: r.seq, msgId: r.msgId, content });
+        }
+        return out;
+    }
+
     /** Deletes one session and releases every CAS refcount it holds
      *  (GC parity with the legacy path's file removal). Rows that other
      *  sessions also reference survive via their own refcounts. Checkpoints
@@ -2117,6 +2160,143 @@ export class UnifiedStore {
             lastIngestedSeq: (row.last_ingested_seq as number | null | undefined) ?? null,
             orphansJson: (row.orphans_json as string | null | null | undefined) ?? null,
         };
+    }
+
+    /** #4316 PR3/3: raw id → canonical seq for the ledger re-stamp. Only
+     *  single-row msg_ids are returned: an id with several generations (an
+     *  edit left both bytes in the log) has no single "the" seq — picking one
+     *  would silently re-bind the citation to the wrong generation. Those
+     *  stay on their legacy refs (kept honestly instead of re-bound wrongly). */
+    /** #4316 PR3/3: live (non-retired) row count — fork endpoint's
+     *  throughSeq source (count - 1, inclusive). */
+    liveRowCount(sessionId: string): number {
+        const row = this.db
+            .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .get(sessionId) as Record<string, unknown>;
+        return (row.n as number) ?? 0;
+    }
+
+    seqByRaw(sessionId: string): Map<string, number> {
+        const rows = this.db
+            .prepare(
+                "SELECT msg_id, MIN(seq) AS seq, COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL GROUP BY msg_id",
+            )
+            .all(sessionId) as Record<string, unknown>[];
+        const out = new Map<string, number>();
+        for (const r of rows) {
+            if ((r.n as number) === 1) out.set(r.msg_id as string, r.seq as number);
+        }
+        return out;
+    }
+
+    /** #4316 PR3/3: fork adoption clones the parent's rows wholesale so the
+     *  child's cloned kernel refs keep pointing at the same ledger positions
+     *  (owner decision 2026-10-22: fork copies every number). The child
+     *  session row records the lineage; content/media CAS refcounts are
+     *  bumped per copied row. Idempotent: replaying the same clone is a no-op.
+     *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
+     *  parent's live row count - 1). */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): void {
+        this.db.transaction(() => {
+            const parent = this.getSessionRow(parentId);
+            if (parent === null) return;
+            const existing = this.getSessionRow(childId);
+            if (existing !== null) {
+                // Idempotent replay — never duplicate rows on a retried fork.
+                const already = this.db
+                    .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?")
+                    .get(childId) as Record<string, unknown>;
+                if ((already.n as number) > 0) return;
+            }
+            this.db
+                .prepare(
+                    `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
+                     SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                     WHERE session_id = ? AND seq <= ?`,
+                )
+                .run(childId, parentId, throughSeq);
+            this.db
+                .prepare(
+                    `INSERT INTO message_media (session_id, seq, media_hash)
+                     SELECT ?, seq, media_hash FROM message_media
+                     WHERE session_id = ? AND seq <= ?`,
+                )
+                .run(childId, parentId, throughSeq);
+            // One refcount bump per distinct CAS body now referenced by the
+            // child (rows sharing content must bump once each, not per row).
+            const hashes = this.db
+                .prepare(
+                    "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
+                )
+                .all(childId) as Record<string, unknown>[];
+            for (const row of hashes) this.putContentRef(row.h as string);
+            const media = this.db
+                .prepare(
+                    "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
+                )
+                .all(childId) as Record<string, unknown>[];
+            for (const row of media) this.putContentRef(row.h as string);
+            this.db
+                .prepare(
+                    `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       parent_session_id = excluded.parent_session_id,
+                       fork_point_seq = excluded.fork_point_seq`,
+                )
+                .run(
+                    childId,
+                    Date.now(),
+                    Date.now(),
+                    parentId,
+                    throughSeq,
+                );
+        });
+    }
+
+    private putContentRef(hash: string): void {
+        this.db
+            .prepare(
+                "UPDATE content SET refcount = refcount + 1 WHERE hash = ?",
+            )
+            .run(hash);
+    }
+
+    /** #D5-5 render windowing: identity-only rows (seq + msg_id) — no
+     *  content bytes, no media hydration. The render lane needs every row's
+     *  POSITION and id (block anchoring, seam chain byId), but covered rows'
+     *  BYTES never ride the outbound — loading them per request is pure read
+     *  amplification on big folded sessions. */
+    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+        const rows = this.db
+            .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+            .all(sessionId) as Record<string, unknown>[];
+        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string }));
+    }
+
+    /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
+     *  outside the covered intervals. Inclusive [start, end] pairs; overlaps
+     *  are harmless (each pair contributes an outside-of-pair conjunct).
+     *  Empty interval list = every live row. */
+    uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
+        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL";
+        const params: unknown[] = [sessionId];
+        for (const [a, b] of intervals) {
+            sql += " AND (seq < ? OR seq > ?)";
+            params.push(a, b);
+        }
+        sql += " ORDER BY seq";
+        const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+        return rows.map((r) => ({
+            seq: r.seq as number,
+            msgId: r.msg_id as string,
+            ref: (r.ref as string | null) ?? null,
+            refNum: (r.ref_num as number | null) ?? null,
+            role: r.role as string,
+            kind: r.kind as string,
+            contentHash: r.content_hash as string,
+            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+        }));
     }
 
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {

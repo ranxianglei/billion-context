@@ -30,6 +30,7 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
+import { restampRefsToLedger } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
@@ -215,6 +216,9 @@ interface PersistedSession {
      *  history and must still be pruned at export time. */
     messagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: external-converter import payload (see Session.decompositionLog) —
+     *  accepted on read; buildRecord deliberately does not emit it. */
+    decompositionLog?: CoreMessage[];
     forkContentStore?: MessageContentStore;
 }
 
@@ -1578,8 +1582,42 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
+        // #4316 layer 3 PR3/3: align the citation space with the unified
+        // ledger exactly once per state, at the ONLY safe moment — cold
+        // load. Mid-conversation alignment would shift refs the client has
+        // already seen (byte-stability contract, snapshot-render D-suite);
+        // a restart boundary has no in-flight compress call, so nothing can
+        // observe a half-renumbered map. Post-load arrivals keep minting
+        // counter refs (fresh numbers, no collision). Envelope-only loads
+        // (no rows) skip honestly.
+        this.maybeRestampToLedger(session);
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
+    }
+
+    /** #4316 PR3/3: one-time ref/ledger alignment at cold load. Guards:
+     *  state already aligned, no ref map, unified store unavailable, or no
+     *  rows for this session → no-op. Multi-generation ids (edits) are
+     *  excluded by seqByRaw itself — their legacy refs stay put. */
+    private maybeRestampToLedger(session: Session): void {
+        const state = session.state as (CompressionState & { refLedgerAligned?: boolean });
+        if (state.refLedgerAligned === true) return;
+        if (!state.messageRefs || Object.keys(state.messageRefs.byRaw).length === 0) return;
+        try {
+            const seqByRawId = this.unifiedSeqByRaw(session.id);
+            if (seqByRawId === null || seqByRawId.size === 0) return;
+            const outcome = restampRefsToLedger(state, seqByRawId);
+            if (outcome.superseded.size > 0) {
+                session.restampSuperseded = outcome.superseded;
+            }
+            state.refLedgerAligned = true;
+            this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
+            this.scheduleSave(session);
+        } catch (err) {
+            // Alignment is an optimization of the citation space, never a
+            // load blocker — a failed stamp leaves the legacy refs intact.
+            this.log("warn", `[persist] ref/ledger alignment skipped for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     /** Unified-first view load (full mode). Null on miss. */
@@ -1618,8 +1656,60 @@ export class SessionStore {
         }
     }
 
+    /** #3301: stored message decompositions (+ seq±1 neighbors) for
+     *  fold-anchor backfill after a wire-shape flip (consumed by
+     *  fold-decomposition-lookup → reconcileFoldCoverage.storedMessages).
+     *  Full mode only (same gate as the other unified reads); null when
+     *  unavailable — callers fall back to wire-side backfill. Never throws. */
+    unifiedMessageRows(sessionId: string, msgIds: readonly string[]): { seq: number; msgId: string; content: string }[] | null {
+        if (!this.shadow?.readsUnified || msgIds.length === 0) return null;
+        try {
+            return this.shadow.messagesForIds(sessionId, msgIds, true);
+        } catch {
+            return null;
+        }
+    }
+
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
+     *  re-stamp (single-row ids only — multi-generation ids are excluded by
+     *  the store). Null when the unified store is unavailable; the re-stamp
+     *  then degrades to legacy refs (honest skip, never a guess). */
+    unifiedSeqByRaw(id: string): Map<string, number> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #4316 PR3/3: live (non-retired) row count for a session — the fork
+     *  endpoint passes count - 1 as the inclusive throughSeq. -1 when the
+     *  unified store is unavailable (kernel-only fork). */
+    unifiedLiveRowCount(id: string): number {
+        if (!this.shadow) return -1;
+        try {
+            return this.shadow.liveRowCount(id);
+        } catch {
+            return -1;
+        }
+    }
+
+    /** #4316 PR3/3: fork adoption row clone (child keeps the parent's seq
+     *  values so cloned kernel refs keep pointing at the same ledger
+     *  positions). Null when the unified store is unavailable — the fork
+     *  endpoint then proceeds exactly as before (kernel-only clone). */
+    unifiedCloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        if (!this.shadow) return false;
+        try {
+            return this.shadow.cloneSessionRows(parentId, childId, throughSeq);
+        } catch {
+            return false;
+        }
     }
 
     /** #3248: raw canonical history rows (core-form message JSON, seq
@@ -1747,6 +1837,29 @@ export class SessionStore {
             return this.shadow.tailViewRows(sessionId);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
+     *  the unified store is unavailable — the render lane degrades, never
+     *  guesses. */
+    unifiedMessageIdRows(sessionId: string): { seq: number; msgId: string }[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageIdRows(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #D5-5 render windowing: content rows outside the covered intervals.
+     *  Null when the unified store is unavailable. */
+    unifiedUncoveredRows(sessionId: string, intervals: readonly [number, number][]): import("./storage/store.js").MessageRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.uncoveredRows(sessionId, intervals);
+        } catch {
+            return null;
         }
     }
 
@@ -2196,6 +2309,14 @@ export class SessionStore {
             const record = buildRecord(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
+                // #3301: external-converter import payload rides exactly ONE
+                // save into the unified index (first-open imports take the
+                // importRecord path), then is consumed so steady saves keep
+                // the delta fast path (#3133) instead of paying full
+                // re-ingests forever. buildRecord omits it, so the disk file
+                // never carries it.
+                const payload = session.decompositionLog;
+                if (payload !== undefined) session.decompositionLog = undefined;
                 // #2960 ⑤: the table holds the RAW tail (full fidelity); the
                 // envelope keeps its bounded folded view for legacy readers.
                 // ②a caveat: once foldResidentTail has folded the resident
@@ -2209,9 +2330,10 @@ export class SessionStore {
                 // folded saves present the envelope render (no override),
                 // which the delta path already routes to the full ingest.
                 const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
-                this.shadow?.record(record, tail && tail.length > 0
-                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                    : undefined, session.contentStore ?? undefined);
+                this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
+                    tail && tail.length > 0
+                        ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                        : undefined, session.contentStore ?? undefined);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -2305,6 +2427,7 @@ export class SessionStore {
         session.lastMessages = fresh.lastMessages ?? session.lastMessages;
         session.lastMessagesFolded = fresh.lastMessages !== undefined ? fresh.lastMessagesFolded : session.lastMessagesFolded;
         session.pluginSnapshot = fresh.pluginSnapshot;
+        session.decompositionLog = fresh.decompositionLog ?? session.decompositionLog;
         session.lastSeen = fresh.lastSeen;
         if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
         if (!session.meta.upstreamOrigin && fresh.meta.upstreamOrigin) session.meta.upstreamOrigin = fresh.meta.upstreamOrigin;
@@ -2850,6 +2973,7 @@ function buildSession(parsed: PersistedSession): Session {
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
         pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
+        decompositionLog: Array.isArray(parsed.decompositionLog) ? parsed.decompositionLog : undefined,
         contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,

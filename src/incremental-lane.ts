@@ -94,6 +94,19 @@ export function incrementalTurnBodyShape(raw: Buffer): boolean {
         && body.model === undefined;
 }
 
+/** Lane-side mirror of wireMessagesLookAnthropic (src/agent/incremental-client.ts — keep the two in sync): the lane ingests with anthropicToCore and re-emits with coreToAnthropic, so only the anthropic wire shape is convertible. OpenAI tool shapes (assistant.tool_calls, role:"tool"/"function", tool_call_id) would be silently dropped or mis-mapped into user text — reject loudly at the boundary instead of trusting every host to pre-filter (#3433). Empty lists PASS here: a pure sticky-system update carries no messages (the client-side predicate rejects them; the empty-without-system case is already a 400 below). */
+function laneMessagesLookAnthropic(messages: unknown): boolean {
+    if (!Array.isArray(messages)) return false;
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") return false;
+        const msg = m as { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+        if (typeof msg.role !== "string" || msg.role === "tool" || msg.role === "function") return false;
+        if (msg.tool_calls !== undefined || msg.tool_call_id !== undefined) return false;
+        if (typeof msg.content !== "string" && !Array.isArray(msg.content)) return false;
+    }
+    return true;
+}
+
 const EXT_KEY_SYSTEM = "inc:system";
 const EXT_KEY_CACHE_MARKS = "inc:cache-marks";
 const EXT_KEY_BASE_SEQ = "inc:base-seq";
@@ -581,6 +594,7 @@ export async function handleIncrementalTurn(
     if (typeof forwarded.model !== "string" || forwarded.model.length === 0) return jsonReply(res, 400, { error: "request.model is required" });
     if (!Array.isArray(payload.messages)) return jsonReply(res, 400, { error: "messages must be an array (seed: full history; delta: everything after sinceSeq; empty allowed for a pure sticky-system update)" });
     if (payload.messages.length === 0 && payload.system === undefined) return jsonReply(res, 400, { error: "messages must be a non-empty array (seed: full history; delta: everything after sinceSeq)" });
+    if (!laneMessagesLookAnthropic(payload.messages)) return jsonReply(res, 400, { error: 'messages must be anthropic wire shape — OpenAI tool shapes (assistant.tool_calls, role:"tool", tool_call_id) cannot ride the lane and stay on full resend', conversationId });
     const deltaWire = payload.messages;
     // #4491: optional client msgids parallel to messages (absent = legacy
     // content-derived identities). Identity-poisoning shapes (bad entry,

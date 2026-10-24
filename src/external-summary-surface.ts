@@ -66,6 +66,15 @@ export function armAutoFoldBackoff(session: { metadata?: Record<string, unknown>
     (session.metadata ?? (session.metadata = {})).autoFoldBackoffUntil = Date.now() + AUTO_FOLD_BACKOFF_MS;
 }
 
+/** [#3444] Measured irreducible floor of this session (system prompt + tool
+ *  schemas + live tail), recorded by an exhausted growth pass that could not
+ *  reach its target. Latest measurement wins (tracks baseline drift both ways);
+ *  a fresh session id starts unmeasured. Undefined until measured or invalid. */
+export function autoFoldFloor(session: { metadata?: Record<string, unknown> } | undefined): number | undefined {
+    const value = session?.metadata?.autoFoldFloorTokens;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** #2662: every external-summary batch of this invocation was dropped by the
  *  shared pool before a single candidate call dispatched. That shape is
  *  scheduler congestion (transient by nature), NOT evidence the summary chain
@@ -91,16 +100,19 @@ export function autoFoldEngaged(config: unknown, session: { metadata?: Record<st
  *  no fold and no backoff able to arm (PR #2581 review) — suppression must
  *  require a target strictly below the overflow bar. overflowTarget:
  *  preflight's effective bar (the codex lane lowers it); omit to use
- *  config.modelContextLimit. Mirrors the target math in server.ts's
- *  preflight — keep the two in sync. */
-export function growthFoldingArmed(config: unknown, overflowTarget?: number): boolean {
+ *  config.modelContextLimit. measuredFloor: the session's measured
+ *  irreducible floor (#3444) — a floor at/above the bar means even an
+ *  exhausted fold cannot reach the target, so the bar itself is unreachable
+ *  and suppression must release (classic nudges are the remaining channel).
+ *  Mirrors the target math in server.ts's preflight — keep the two in sync. */
+export function growthFoldingArmed(config: unknown, overflowTarget?: number, measuredFloor?: number): boolean {
     const resolved = config as ResolvedKernelConfig | undefined;
     const ext = resolved?.externalSummary;
     if (ext?.enabled !== true || ext.autoFold !== true) return false;
     const overflow = overflowTarget ?? resolved?.modelContextLimit ?? 0;
     if (!(overflow > 0)) return false;
     const configured = ext.autoFoldTargetTokens ?? Math.round(overflow / 2);
-    const target = Math.max(AUTO_FOLD_TARGET_MIN, Math.min(configured, overflow));
+    const target = Math.max(AUTO_FOLD_TARGET_MIN, Math.min(configured, overflow), measuredFloor ?? 0);
     return target < overflow;
 }
 

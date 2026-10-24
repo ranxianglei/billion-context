@@ -50,7 +50,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
+import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
@@ -62,7 +64,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
@@ -275,7 +277,18 @@ let nonWebTraceLogged = false;
 
 // #3380: once-per-process — the idempotent-adoption convergence notice must
 // not repeat per attempt (same discipline as webProfileWarned).
+// Unverified dsh client build note (#warn): once-per-process, same channel
+// discipline.
+let dshNewerBuildNoted = false; // #4545, once per process
 let regAdoptLogged = false;
+
+// #4545 newer-than-tested dsh client-build note (soft, never gates). Shared
+// machinery AND per-lane identities live in client-build-note.ts — re-exported
+// here so existing importers keep working. At-or-below-cap builds stay silent:
+// known older-build break modes already have their own overlay-latch detectors
+// (#3806 boot warning + #2474 fallback); only the untested-future direction is
+// covered.
+export { DSH_BUILD_CHECK } from "./client-build-note.js";
 
 /** #3962: one-line overlay-coverage suffix for the durable profile notes.
  * The bundle-patch gate rows target four factory preset ids a profile may not
@@ -2342,7 +2355,7 @@ export function apply(ctx: PluginContext): void {
         } catch {
             return;
         }
-        if (!Array.isArray(parsed.messages) || typeof parsed.model !== "string") return; // anthropic wire only
+        if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only — OpenAI tool shapes (tool_calls / role:"tool") resend full (#3433)
         const base = register.base ?? state.origin;
         if (base === undefined) return;
         if (!(await probeIncrementalTurns(base))) return;
@@ -2478,6 +2491,20 @@ export function apply(ctx: PluginContext): void {
         titleServices.sessions = ctx.sessions;
         titleServices.sessionTitle = ctx.sessionTitle;
         sweepLiveDshTitles();
+    }
+
+    // Newer-than-tested dsh client build (#4545): one boot-time note per
+    // process, emitted through both house channels (durable bili.log record +
+    // console banner) by the shared helper. Soft by design — a wrong guess
+    // must never gate a working session (see client-build-note.ts).
+    if (!dshNewerBuildNoted) {
+        try {
+            const found = walkUpNodeModuleVersion(path.dirname(fileURLToPath(import.meta.url)), "node_modules/@deepseek-ai/dsh/package.json");
+            if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-dsh: detected dsh build v${found}`);
+            if (emitNewerClientBuildNote(DSH_BUILD_CHECK, found)) dshNewerBuildNoted = true;
+        } catch {
+            // resolver is fail-open: layout surprises stay silent
+        }
     }
 
     // #1772/#3354: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
@@ -2688,6 +2715,11 @@ export function _resetWebProfileWarningForTest(): void {
 /** Test hook (#3651): reset the once-per-process non-web-profile trace flag. */
 export function _resetNonWebTraceForTest(): void {
     nonWebTraceLogged = false;
+}
+
+/** Test hook: reset the once-per-process unverified-dsh-build note flag. */
+export function _resetDshNewerBuildNoteForTest(): void {
+    dshNewerBuildNoted = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed

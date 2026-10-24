@@ -89,6 +89,27 @@ async function postTurn(port: number, upstreamUrl: string, session: string, pair
     return { status: res.status, body };
 }
 
+/** Flexible turn sender for #3444 fixtures that need a top-level `system`
+ *  prompt or a custom final message (the irreducible-baseline shapes). */
+async function postRaw(port: number, session: string, extra: Record<string, unknown>): Promise<{ status: number }> {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "x-api-key": "k",
+            "anthropic-version": "2023-06-01",
+            "x-acp-session": session,
+        },
+        body: JSON.stringify({ model: "test-model", max_tokens: 1024, stream: true, ...extra }),
+    });
+    await res.text();
+    return { status: res.status };
+}
+
+/** ~60KB of system prompt ≈ 15K tokens — an irreducible baseline far above
+ *  the 8192 growth target used by the #3444 fixtures. */
+const BIG_SYSTEM = `policy doc: ${"0123456789abcdef".repeat(3700)}`;
+
 const servers: { close: () => Promise<void> }[] = [];
 function trackClose(server: http.Server): void {
     servers.push({ close: () => new Promise<void>((resolve) => server.close(() => resolve(undefined))) });
@@ -409,6 +430,134 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
 });
 
 // ---------------------------------------------------------------------------
+// #3444: sub-floor targets must not storm (measured floor + benefit gate)
+// ---------------------------------------------------------------------------
+
+/** bigConversation with one extra ~4KB user pair spliced before the tail. */
+function conversationWithExtraPair(pairs: number): unknown[] {
+    const base = bigConversation(pairs) as unknown[];
+    base.pop(); // drop the trailing "final question"
+    base.push({ role: "user", content: [{ type: "text", text: `extra doc: ${"abcdef".repeat(667)}` }] });
+    base.push({ role: "assistant", content: [{ type: "text", text: "ack extra" }] });
+    base.push({ role: "user", content: [{ type: "text", text: "final question" }] });
+    return base;
+}
+
+test("#3444 sub-floor target: an exhausted fold measures the irreducible floor — marginal growth stops re-folding", async () => {
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 8192 },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    // The system prompt alone (~15K tokens) sits far above the 8192 target:
+    // no fold can ever reach it. Pre-#3444 every turn re-fired the trigger
+    // (payload >= target forever) and burned an external-summary round trip
+    // for whatever sliver was foldable — the reported fold storm.
+    const t1 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: bigConversation(12) });
+    assert.equal(t1.status, 200, "turn 1 must forward");
+    assert.ok(sum.bodies.length >= 1, `turn 1 must attempt the growth fold, got ${sum.bodies.length} summary calls`);
+    const attemptsAfterTurn1 = sum.bodies.length;
+
+    // Turn 2: same conversation plus one small extra pair (~1K tokens of real
+    // growth past the measured floor). Payload is still far above the
+    // CONFIGURED target 8192 — pre-#3444 this unconditionally re-ran the
+    // chain. Now the effective target is the measured floor, so the expected
+    // benefit (~1K) sits under the 4096-token cost bar: no new external calls.
+    const t2 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: conversationWithExtraPair(12) });
+    assert.equal(t2.status, 200, "turn 2 must forward");
+    assert.equal(sum.bodies.length, attemptsAfterTurn1, "marginal growth past a sub-floor target must NOT re-run the external chain (fold storm)");
+    const text2 = JSON.stringify(main.bodies.at(-1));
+    assert.ok(text2.includes("SUMMARY:"), "the turn-1 fold must persist in the forwarded history");
+});
+
+test("#3444 sub-benefit fold: a round trip that saves less than its cost arms the backoff instead of repeating next turn", async () => {
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 8192 },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    // Only ~3K tokens are foldable (three small pairs); the rest of the
+    // payload is the live tail — one ~15K-token final user message that no
+    // fold may touch. The trigger sees a large expected benefit and fires;
+    // the actual pass saves ~3K < 4096 AUTO_FOLD_MIN_BENEFIT_TOKENS.
+    const giantTail = bigConversation(3) as unknown[];
+    giantTail.pop();
+    giantTail.push({ role: "user", content: [{ type: "text", text: `giant paste: ${"0123456789abcdef".repeat(3750)}` }] });
+
+    const t1 = await postRaw(port, "autofold-subbenefit", { messages: giantTail });
+    assert.equal(t1.status, 200, "turn 1 must forward");
+    assert.ok(sum.bodies.length >= 1, `turn 1 dispatched the fold attempt (proves the sub-benefit path, not zero-progress), got ${sum.bodies.length}`);
+    const attemptsAfterTurn1 = sum.bodies.length;
+
+    // Turn 2: identical payload, still far above the configured target. Pre-
+    // #3444 the cheap pass repeated every turn; now the under-cost result
+    // armed the 10-minute backoff, so the chain is skipped entirely.
+    const t2 = await postRaw(port, "autofold-subbenefit", { messages: giantTail });
+    assert.equal(t2.status, 200, "turn 2 must forward (backoff = skip, not fail)");
+    assert.equal(sum.bodies.length, attemptsAfterTurn1, "a sub-benefit fold must arm the backoff — no repeat round trip next turn");
+});
+
+// ---------------------------------------------------------------------------
 // growthFoldingArmed unit truth table (#2581 review fix #1)
 // ---------------------------------------------------------------------------
 test("growthFoldingArmed: only suppress classic nudges when growth folding can actually fire", async () => {
@@ -439,6 +588,25 @@ test("growthFoldingArmed: only suppress classic nudges when growth folding can a
     assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 20_000 }, 20_000), true, "bar with headroom above AUTO_FOLD_TARGET_MIN arms");
     assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 10_000 }, 8192), false, "bar exactly at AUTO_FOLD_TARGET_MIN clamps the implicit target up to the bar — not armed");
     assert.equal(growthFoldingArmed(chain(true, 4600), 4600), false, "explicit target clamped to at least MIN above the bar is a no-op");
+    // #3444: the measured irreducible floor raises the effective target; at or
+    // above the overflow bar the target is unreachable, so suppression must release.
+    assert.equal(growthFoldingArmed(chain(true, 8192), undefined, 10_000), true, "floor 10K under the 50K window keeps arming (target raised to the floor)");
+    assert.equal(growthFoldingArmed(chain(true, 8192), undefined, 50_000), false, "floor == window disarms (bar unreachable)");
+    assert.equal(growthFoldingArmed(chain(true, 8192), undefined, 60_000), false, "floor above the window disarms");
+    assert.equal(growthFoldingArmed(chain(true, 8192), 45_000, 46_000), false, "floor above the codex-lane bar disarms");
+    assert.equal(growthFoldingArmed(chain(true, 8192), 45_000, 40_000), true, "floor below the codex-lane bar keeps arming");
+});
+
+test("autoFoldFloor: reads the measured floor from session metadata, rejecting invalid values", async () => {
+    const { autoFoldFloor } = await import("../src/external-summary-surface.ts");
+    assert.equal(autoFoldFloor(undefined), undefined);
+    assert.equal(autoFoldFloor({}), undefined);
+    assert.equal(autoFoldFloor({ metadata: {} }), undefined);
+    assert.equal(autoFoldFloor({ metadata: { autoFoldFloorTokens: 42_000 } }), 42_000);
+    assert.equal(autoFoldFloor({ metadata: { autoFoldFloorTokens: "42000" } }), undefined);
+    assert.equal(autoFoldFloor({ metadata: { autoFoldFloorTokens: Number.NaN } }), undefined);
+    assert.equal(autoFoldFloor({ metadata: { autoFoldFloorTokens: 0 } }), undefined);
+    assert.equal(autoFoldFloor({ metadata: { autoFoldFloorTokens: -5 } }), undefined);
 });
 
 // ---------------------------------------------------------------------------

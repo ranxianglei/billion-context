@@ -358,7 +358,7 @@ function round1(n: number): number {
  *  sum of first-render token counts of all refs chronologically before it.
  *  Refs are assigned in message order and never reused (kernel contract),
  *  so numeric order IS view order. */
-function prefixTokensBeforeRef(session: Session, ref: string): number {
+export function prefixTokensBeforeRef(session: Session, ref: string): number {
     const byRef = session.state?.messageRefs?.byRef;
     const snap = session.state?.tokenSnapshot;
     if (!byRef || !snap || refNum(ref) === 0) return 0;
@@ -1276,6 +1276,40 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
+    // #3307 P2-A: f.X (firstFoldStartTokens) is prefixTokensBeforeRef over the
+    // client's UN-SHRUNKEN resent history — for a stateless proxy client that far
+    // exceeds the billed input, so decomposeSample zeroes structuralExcess and the
+    // fold's re-pay falls into the unattributed seam bucket. When a genuine
+    // bili-side mid-history break is present, measure the stable prefix straight
+    // off the wire instead: the byte-LCP between this outbound and the previous
+    // marks where a summary replaced folded content, so (lcpBytes / cur.bytes) *
+    // billed input is a same-space lower bound on the pre-fold prefix. min() with
+    // the snapshot X leaves already-correct folds untouched. Gated to mid-list
+    // breaks only (a tail append lands lcpBytes near the end -> xMeasured ~= input
+    // -> no effect) and never on a client-side inbound rewrite (#3023), whose
+    // earlier divergence would understate the fold and mis-credit it.
+    if (pending.length > 0 && known && s.input > 0) {
+        const rawMissed = s.input - effCached;
+        if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
+            const curB = session.transient?.sentBody;
+            const prevB = session.transient?.settledBody;
+            if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
+                const curIn = session.transient?.inBody;
+                const prevIn = session.transient?.settledInBody;
+                const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
+                    const k = firstDivergentInboundMsg(prevIn, curIn);
+                    return k !== null && k < Math.min(prevIn.msgs, curIn.msgs);
+                })();
+                if (!clientBreak) {
+                    const lcp = seamLcp(prevB.head, curB.head);
+                    if (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs && lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength) {
+                        const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
+                        for (const p of pending) p.firstFoldStartTokens = Math.min(p.firstFoldStartTokens ?? Number.POSITIVE_INFINITY, xMeasured);
+                    }
+                }
+            }
+        }
+    }
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
@@ -2282,6 +2316,12 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2867: proxy-side mode/projection switches get their own section only
         // when observed — a session that never switches modes stays byte-identical.
         const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
+        // #3307: wire/upstream/restart carry per-event data in the report (switchEvents /
+        // restartEvents) but only their aggregate counts reached CACHE INVALIDATION — no
+        // per-line timestamps, so cross-checks (e.g. seam-vs-restart) were impossible.
+        const wireText = report.wireSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.wireSwitches, detail, "WIRE SWITCHES (client switched protocol wire between requests)") : "";
+        const upstreamText = report.upstreamSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.upstreamSwitches, detail, "UPSTREAM SWITCHES (relay/upstream origin changed between requests)") : "";
+        const restartText = report.restartDrops.count > 0 ? "\n\n" + formatModelSwitches(report.restartDrops, detail, "RESTART/REFORK (first bill under a fresh daemon boot — prefix re-billed once)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -2289,9 +2329,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -2337,11 +2377,17 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.suspects > 0) {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
-        for (const e of r.seam.events) {
+        // #3307: seamEvents holds BOTH suspect and #3023 client-side events
+        // (one shared capped ring), so listing every event here echoed host-owned
+        // rewrites under the "suspected bili rebuild" header — the ✎ CLIENT
+        // section below already owns those. List only suspects here so the two
+        // sections stay disjoint and a client insert is never misread as a seam.
+        const suspectEvents = r.seam.events.filter((e) => !e.client);
+        for (const e of suspectEvents) {
             out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
-        if (r.seam.events.length === 0) {
-            out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
+        if (suspectEvents.length === 0) {
+            out.push("    (no body-pair forensics retained for the suspect samples on this lane — aggregate flag only; client-side rewrites are listed separately below)");
         }
         out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
     }

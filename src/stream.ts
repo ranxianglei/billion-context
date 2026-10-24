@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
-import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
+import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
@@ -814,6 +814,32 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
+/** #4316 layer 3 PR3/3: does this compress call cite a ref that changed
+ *  hands in this process's one-time ledger re-stamp? Returns a one-line
+ *  explanation when at least one cited ref is superseded, null when the call
+ *  is clean (or the session never re-stamped — the common case). */
+export function supersededRefRejection(
+    ranges: { startRef: string; endRef: string }[],
+    session: Session,
+): string | null {
+    const superseded = session.restampSuperseded;
+    if (!superseded || superseded.size === 0) return null;
+    const hits: string[] = [];
+    for (const range of ranges) {
+        const start = refToIndex(range.startRef);
+        const end = refToIndex(range.endRef);
+        if (start === null || end === null) continue;
+        for (let index = start; index <= end; index++) {
+            const ref = indexToRef(index);
+            if (superseded.has(ref)) hits.push(ref);
+        }
+    }
+    if (hits.length === 0) return null;
+    const listed = hits.slice(0, 5).join(", ");
+    const more = hits.length > 5 ? ` (+${hits.length - 5} more)` : "";
+    return `ref(s) ${listed}${more} were re-numbered by the ledger alignment. Call acp_status to see the current refs.`;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
@@ -883,6 +909,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
+    // #4316 PR3/3: this process re-stamped the citation space onto the ledger
+    // at cold load; a resent in-flight call may still cite pre-restart numbers
+    // that now belong to DIFFERENT messages. Folding those would silently
+    // compress the wrong span — refuse, point at the fresh labels, let the
+    // caller re-read them. Cheap and safe: refusal never mis-folds, and the
+    // one-time cost disappears once the caller re-syncs.
+    const supersededHit = supersededRefRejection(ranges, ctx.session);
+    if (supersededHit !== null) {
+        ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededHit} (#4316 PR3/3)]`);
+        return compressResult(`[Compression REFUSED: ${supersededHit} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
+    }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
@@ -1152,8 +1189,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // with the kernel's own per-message counter instead — a same-space
         // denominator makes the ratio structurally ≤1, so #1839's
         // "trustworthy baseline" gate is subsumed and no longer needed.
-        const viewMessages = ctx.compressMessages ?? ctx.messages;
-        // #4227: id→tokens map — one scan of the view serves both meters below.
+        // #3307: "the current view" is the LIVE context being managed — the
+        // compressed outbound (ctx.messages / processedMessages), i.e. what gets
+        // billed next — NOT the client's un-shrunken resend. applyCompression
+        // still runs on ctx.compressMessages (raw message boundaries, #2627) so
+        // the fold geometry maps correctly; only the OBSERVABILITY denominator
+        // moves. A stateless client (codex_webui) re-sends its FULL history every
+        // turn, so preferring compressMessages made V ~50x the billed input and
+        // read every real fold as a ~1% shrink — postCtx/ceiling and the
+        // degenerate-fold gate below all distorted off the wrong basis.
+        // #4227: id→tokens map over the same live view — one scan serves both meters.
+        const viewMessages = ctx.messages;
         const viewTokById = new Map<string, number>();
         let viewTokens = 0;
         for (const m of viewMessages) {
@@ -1163,6 +1209,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // This-fold ratio only: lastCompress, the degenerate-fold gate and the
         // staged-compress note all judge ONE rewrite, never the session (#4227).
+        // #3307: keep the raw-inbound total alongside (log-only) so one capture
+        // shows the view-factor collapse — V=live vs Vraw=inbound — separating it
+        // from the residual chars/4-vs-BPE estimator factor without a second trip.
+        let rawViewTokens = 0;
+        for (const m of ctx.compressMessages ?? ctx.messages) rawViewTokens += countMessageTokens(m);
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -1205,11 +1256,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
-        recordCacheFoldsFromBlocks(
-            ctx.session,
-            res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: viewTokens, Vp: postCtx },
-        );
+        const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
+        // #3307: the ledger credits a fold only when firstFoldStartTokens=X < billed
+        // input, but X is a kernel chars/4 estimate vs provider-billed input — in long
+        // sessions X can land >= input and the re-pay drops unattributed. Log X plus the
+        // same-space view tokens (V/Vp) so one capture separates unit-scale from view
+        // identity as the inflation source.
+        if (newFoldBlocks.length > 0) {
+            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${prefixTokensBeforeRef(ctx.session, b.startRef)}` : `${b.blockId}=none`)).join(" ");
+            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vraw=${rawViewTokens} Vp=${postCtx} (#3307)`);
+        }
+        recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible

@@ -79,8 +79,8 @@ import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetr
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
-import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
+import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
@@ -98,7 +98,7 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
@@ -1496,6 +1496,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         closeLogger();
         process.exit(0);
     };
+    const finishDrain = (): void => {
+        flushConversations();
+        void flushAllSessions().finally(finishShutdown);
+    };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -1506,16 +1510,29 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before invoking cb, so in-flight SSE streams get a chance to finish
         // rather than being yanked mid-chunk.
         server.close(() => {
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
+            finishDrain();
         });
         // Hard fallback: if connections hang (client never closes), don't
-        // block shutdown forever — force-exit after a grace window.
-        setTimeout(() => {
-            log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
-        }, 10_000).unref?.();
+        // block shutdown forever — force-exit after a grace window. #3890:
+        // while connections are still ALIVE the window re-arms (bounded by
+        // SHUTDOWN_DRAIN_MAX_PASSES) instead of cutting in-flight upstream
+        // streams mid-response — idle keep-alives don't hold the proxy, the
+        // keep-alive reaper clears them within one window, so a healthy drain
+        // still exits promptly and a stuck socket can pin at most the cap.
+        let drainPasses = 0;
+        const armDrainBackstop = (): void => {
+            setTimeout(() => {
+                if (connRecords.size > 0 && drainPasses < SHUTDOWN_DRAIN_MAX_PASSES) {
+                    drainPasses += 1;
+                    log("warn", `shutdown grace window elapsed but liveConns=${connRecords.size} — extending drain ${drainPasses}/${SHUTDOWN_DRAIN_MAX_PASSES} (#3890)`);
+                    armDrainBackstop();
+                    return;
+                }
+                log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
+                finishDrain();
+            }, SHUTDOWN_DRAIN_GRACE_MS).unref?.();
+        };
+        armDrainBackstop();
     };
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
@@ -1543,21 +1560,44 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
         let lastStaleHb: number[] = [];
+        // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
+        const deadStreak = new Map<number, number>();
         const watcher = setInterval(() => {
             const dead: number[] = [];
             const staleByHeartbeat: number[] = [];
             const tickNow = Date.now();
             for (const pid of proxyWatchers) {
-                const alive = isPidAlive(pid);
+                const probe = probePid(pid);
                 // #3544: heartbeat-opted owners ALSO die by liveness-proof
                 // expiry — kill(pid,0) is an existence check, identity-blind
                 // under Windows pid reuse. Legacy pids (no heartbeat on record)
-                // keep kill-0-only semantics.
-                if (watcherIsDead(alive, watcherLastSeen.get(pid), tickNow, WATCHER_HEARTBEAT_GRACE_MS)) {
+                // keep kill-0-only semantics. #3890: a failed kill-0 must be
+                // CONFIRMED over consecutive ticks before it removes the pid —
+                // one transient OpenProcess failure used to be enough to kill
+                // the whole proxy while its parent lived on.
+                const decision = tickWatchedPid(probe, watcherLastSeen.get(pid), tickNow, deadStreak.get(pid), { heartbeatGraceMs: WATCHER_HEARTBEAT_GRACE_MS, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS });
+                if (decision.removed) {
                     proxyWatchers.delete(pid);
                     watcherLastSeen.delete(pid);
+                    deadStreak.delete(pid);
                     dead.push(pid);
-                    if (alive) staleByHeartbeat.push(pid);
+                    if (decision.staleHeartbeat) staleByHeartbeat.push(pid);
+                    continue;
+                }
+                if (probe.alive) {
+                    if ((deadStreak.get(pid) ?? 0) > 0) {
+                        deadStreak.delete(pid);
+                        log("info", `[watchdog] pid ${pid} alive again after failed kill-0 probe(s) — clearing death streak (#3890)`);
+                    }
+                } else {
+                    if (decision.streak === 1) {
+                        // Field instrumentation (#3890): Windows collapses every
+                        // non-ACCESS_DENIED OpenProcess failure into ESRCH, so
+                        // the errno is the only clue left to attribute false-dead
+                        // episodes — log it once per episode.
+                        log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) — requiring ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failures before believing it (#3890)`);
+                    }
+                    deadStreak.set(pid, decision.streak);
                 }
             }
             if (dead.length > 0) lastDead = dead;
@@ -1866,6 +1906,46 @@ const WATCHER_HEARTBEAT_GRACE_MS = 15_000;
 export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowMs: number, heartbeatGraceMs: number): boolean {
     if (!alive) return true;
     return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
+}
+
+// #3890: the shutdown backstop window, and how many times it may RE-ARM while
+// connections are still alive. One window is the historical hard fallback;
+// extra passes exist so an in-flight upstream stream finishes instead of being
+// cut mid-response when its owner's death triggers the exit. Worst-case total
+// drain ≈ (1 + SHUTDOWN_DRAIN_MAX_PASSES) windows.
+const SHUTDOWN_DRAIN_GRACE_MS = 10_000;
+const SHUTDOWN_DRAIN_MAX_PASSES = 10;
+
+// #3890: how many CONSECUTIVE failed kill-0 probes must agree before the
+// watchdog believes a watched pid has died. Pre-fix, ONE failed probe removed
+// the pid from the watcher set and the empty-set grace window that followed
+// never re-probed it — a single transient OpenProcess failure on Windows was
+// enough to force-exit the proxy ~6s later while its parent lived on (12 such
+// events in 2.5h against one live pid). At the 2s tick, three confirmations
+// span ~4–6s: long enough to ride out transient failures, short enough that a
+// genuinely dead parent still exits promptly.
+const WATCHER_DEAD_CONFIRM_TICKS = 3;
+
+interface WatcherTickDecision {
+    /** Remove this pid from the watcher set on this tick. */
+    removed: boolean;
+    /** Removed because the heartbeat expired while the pid still reads alive (#3544). */
+    staleHeartbeat: boolean;
+    /** Failed-probe streak after this tick (0 when alive or removed). */
+    streak: number;
+}
+
+/** #3890: pure per-pid death-streak step. A live probe resets the streak; a
+ *  failed probe increments it and only removes the pid once the streak reaches
+ *  confirmTicks. Heartbeat expiry stays immediate (it is a time-based liveness
+ *  proof, not an existence probe — #3544 semantics). */
+export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number }): WatcherTickDecision {
+    if (probe.alive) {
+        const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
+        return { removed: staleHeartbeat, staleHeartbeat, streak: 0 };
+    }
+    const streak = (prevStreak ?? 0) + 1;
+    return streak >= opts.confirmTicks ? { removed: true, staleHeartbeat: false, streak: 0 } : { removed: false, staleHeartbeat: false, streak };
 }
 
 
@@ -3268,10 +3348,20 @@ export async function preflightCompressIfNeeded(
     // floor under the documented minimum. Clamping to the minimum disarms
     // auto-fold on sub-8K windows outright (target >= overflow ⇒ growthArmed
     // false), which matches the documented feature scope.
+    // [#3444] A configured target below what this session can physically reach
+    // (system prompt + tool schemas + live tail) is UNREACHABLE: every fold
+    // lands above it and the trigger re-fires on every request (fold storm).
+    // An exhausted growth pass measures the irreducible floor into session
+    // metadata — raise the effective target to it so the trigger arms on real
+    // GROWTH past the floor instead of the permanent gap. Latest measurement
+    // wins (tracks baseline drift); a floor at/above the window collapses the
+    // arming entirely (growthArmed false ⇒ classic mode, nudge suppression
+    // releases via growthFoldingArmed's measuredFloor arg).
+    const measuredFloor = autoFoldOn ? autoFoldFloor(session) : undefined;
     const autoFoldTarget = autoFoldOn
-        ? Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget))
+        ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
         : undefined;
-    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget) — keep in sync (PR #2581 review)
+    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
@@ -3351,7 +3441,18 @@ export async function preflightCompressIfNeeded(
         : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
-    const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    // [#3444] expected-benefit gate for growth folds: once the payload sits at
+    // the (possibly floor-raised) target, every further request re-crosses it
+    // with only marginal new content — folding that burns a full external-
+    // summary round trip to save less than its fixed cost. Require the text
+    // channel to exceed the budget by at least AUTO_FOLD_MIN_BENEFIT_TOKENS
+    // before arming; below that the payload fits the window by definition and
+    // forwards as-is until enough material accrues. Classic overflow preflight
+    // is untouched (its bar is the window itself — there, firing is mandatory).
+    // Image-dominant payloads keep the original unconditional arm: images are
+    // not foldable, so their overage is not "expected benefit" at all.
+    const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
+    const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
@@ -3701,6 +3802,16 @@ export async function preflightCompressIfNeeded(
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
         setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
+        // [#3444] exhausted honest pass: the chain folded everything it could
+        // (no failure) yet the rebuilt payload still sits at/above the growth
+        // target — the target is physically unreachable for this session.
+        // Record the measured floor so the next trigger arms on real growth
+        // past it instead of re-firing every request; latest measurement wins.
+        if (growthArmed && result.failure === undefined && rebuiltTextSize + imageTokens >= compressionTarget) {
+            session.metadata.autoFoldFloorTokens = rebuiltTextSize + imageTokens;
+            markDirty(session);
+            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
+        }
     } else {
         fits = unknownBaseline
             ? result.fitsWindow
@@ -3749,6 +3860,16 @@ export async function preflightCompressIfNeeded(
             } else {
                 log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
             }
+        } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
+            // [#3444] sub-benefit fold: a full external-summary round trip saved
+            // less than its fixed cost — same economics as a zero-progress pass,
+            // so arm the same cooldown instead of paying per-request for
+            // marginal folds. Estimation error is the usual cause (the trigger
+            // believed more was over budget than the fold could actually save);
+            // #2662's congestion exemption applies unchanged.
+            log("warn", `[${session.id}] auto-fold saved only ~${result.savedTokens} tokens (< ${AUTO_FOLD_MIN_BENEFIT_TOKENS} worth) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume (#3444)`);
+            armAutoFoldBackoff(session);
+            markDirty(session);
         }
         return outbound;
     }

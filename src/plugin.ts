@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -130,13 +130,52 @@ const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
-/** #1567: folds executed through POST /__bili/plugin/tool are minted this
- *  synthetic callId, which the client can never echo back — its own re-sent
- *  compress pair is the summary carrier for such blocks, so the kernel's
- *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
+/** #1567: legacy callers without a native tool-call id get a synthetic id.
+ *  Their resent compress pair is recognized by range as a summary carrier. */
 const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
 export function isPluginFoldCallId(callId: string | undefined): boolean {
     return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
+}
+
+/** Reconnect legacy plugin blocks before the kernel mistakes their live carriers for orphans. */
+export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessage[]): number {
+    const blocks = new Map<string, typeof session.state.blocks>();
+    for (const block of session.state.blocks) {
+        if (!block.active || !block.startRef || !block.endRef) continue;
+        const key = JSON.stringify([block.startRef, block.endRef]);
+        const sameRange = blocks.get(key) ?? [];
+        sameRange.push(block);
+        blocks.set(key, sameRange);
+    }
+    const calls = new Map<string, Set<string>>();
+    const results = new Map(messages.filter((m) => m.contentType === "tool-result" && m.toolCallId).map((m) => [m.toolCallId!, m.text ?? ""]));
+    for (const message of messages) {
+        if (message.contentType !== "tool-call" || message.toolName !== "compress" || !message.toolCallId) continue;
+        try {
+            const args = JSON.parse(message.text ?? "") as { content?: unknown; startId?: unknown; endId?: unknown };
+            for (const range of Array.isArray(args?.content) ? args.content : [args]) {
+                if (!range || typeof range.startId !== "string" || typeof range.endId !== "string") continue;
+                const key = JSON.stringify([range.startId, range.endId]);
+                if (!blocks.has(key)) continue;
+                const ids = calls.get(key) ?? new Set<string>();
+                ids.add(message.toolCallId);
+                calls.set(key, ids);
+            }
+        } catch { /* Invalid historical arguments cannot establish ownership. */ }
+    }
+    let changed = 0;
+    for (const [key, sameRange] of blocks) {
+        const block = sameRange[0]!;
+        const ids = calls.get(key);
+        if (sameRange.length !== 1 || !isPluginFoldCallId(block.compressCallId) || ids?.size !== 1) continue;
+        const id = ids.values().next().value!;
+        const receipt = results.get(id);
+        if (!receipt?.startsWith("[Compressed ") || !receipt.split("\n").some((line) => line.startsWith(` · ${block.blockId} full summary `))) continue;
+        block.compressCallId = id;
+        changed++;
+    }
+    if (changed > 0) markDirty(session);
+    return changed;
 }
 
 const VERSION = (() => {
@@ -851,7 +890,7 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
-export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
     // proxy's config leaves disabled guarantees a rejected call the moment the
@@ -861,6 +900,12 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
     // #1359: the advertised name is the base-config toolName, matching the
     // plugin-lane gate (which adjudicates the same base block).
+    // #3243: toolPrompts is the pack surface's tool descriptions, resolved by the
+    // caller from the GLOBAL compress settings — the manifest has no route/model
+    // context (hosts fetch it before any request arrives), so provider/model-level
+    // promptPack still shapes each request's system prompt while registered tool
+    // descriptions follow the top-level pack only. Applied exactly like the wire
+    // injector (applyAcpToolOverrides on the ACP core arrays before extras merge).
     const absorbOn = absorbEnabled(config);
     const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
     const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
@@ -890,13 +935,15 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // run_code SDK docs). The binding note on the ACP entries teaches both
     // calling conventions, so the model neither slips a direct call the
     // harness will reject nor dodges the direct call native hosts expect.
-    const acpAnthropic = withAcpNotes(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary), "binding");
-    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary), "binding");
+    // #3243: the pack surface's tool descriptions (toolPrompts) override the
+    // stock descriptions where a promptPack declares its own.
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withAcpNotes(withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary), "binding");
+    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -1476,6 +1523,21 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
+            // #4316 PR3/3: clone the parent's unified-store rows so the
+            // child's cloned kernel refs keep pointing at the same ledger
+            // positions (owner decision 2026-10-22: fork copies every number).
+            // Degrades silently to the kernel-only clone when the store has no
+            // parent rows (legacy-only lanes) — the fork itself must never
+            // fail for a storage nicety.
+            try {
+                const store = getStore();
+                const throughSeq = store.unifiedLiveRowCount(parent.id);
+                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                    loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
+                }
+            } catch (err) {
+                loggerLog("warn", `fork ${request.childConversationId}: row clone skipped (${err instanceof Error ? err.message : String(err)}); kernel-only fork`);
+            }
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the
             // fork-created conversation supersedes it; a lingering entry would
@@ -1796,9 +1858,9 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected tool object");
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
@@ -1807,6 +1869,7 @@ export async function handlePluginTool(
     }
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
+    if (parsed.toolCallId !== undefined && (typeof parsed.toolCallId !== "string" || !parsed.toolCallId.trim() || parsed.toolCallId.length > 512)) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "toolCallId must be a non-empty string of at most 512 characters" });
     if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });
     if (parsed.expectedRevision !== undefined && !conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision requires conversationId" });
     // Explicit ids never yield to another session's outbound witness. A
@@ -1992,7 +2055,7 @@ export async function handlePluginTool(
     // may still echo one — strip it before kernel arg parsing sees it (the
     // witness hash in tool-ring.ts strips the same key).
     delete args.conversation_id;
-    const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
+    const callId = typeof parsed.toolCallId === "string" ? parsed.toolCallId : `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
     let retrievalExport: RetrievalExport | undefined;

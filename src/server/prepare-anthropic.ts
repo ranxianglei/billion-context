@@ -12,6 +12,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
@@ -21,7 +22,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, 
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -338,7 +339,8 @@ export async function prepareAnthropic(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
+        const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -393,7 +395,7 @@ export async function prepareAnthropic(
         // consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -409,7 +411,7 @@ export async function prepareAnthropic(
             suppressionBypassed: !nudgeSuppressed(session) || decideFallbackOverride,
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
-            growthFoldingArmed: growthFoldingArmed(loopConfig),
+            growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));

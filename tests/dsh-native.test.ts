@@ -87,6 +87,54 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
     }
 });
 
+// #3433: OpenAI wire shapes (assistant.tool_calls / role:"tool") must NOT be
+// converted onto the incremental lane — the lane ingests with anthropicToCore
+// and would silently drop the tool calls. They stay on full resend, exactly
+// like omp/opencode do behind wireMessagesLookAnthropic.
+test("#3433: dsh OpenAI tool shapes ride full resend; anthropic shapes still convert", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-3433" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "conversion seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            // OpenAI chat-completions shape: assistant.tool_calls + role:"tool"
+            const openaiMsgs = [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+                { role: "user", content: "now read a.txt" },
+            ];
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: openaiMsgs });
+            const init: RequestInit = { method: "POST", body: original };
+            await beforeSend(url, init);
+            assert.equal(init.body, original, "OpenAI tool shape rides full resend (body untouched)");
+            assert.equal(new Headers(init.headers ?? {}).get("x-bili-plugin-turn"), null, "no marker on the untouched body");
+
+            // control: the anthropic wire shape still converts (guard does not over-block)
+            const init2: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }) };
+            await beforeSend(url, init2);
+            const body2 = JSON.parse(init2.body as string) as { conversationId?: string };
+            assert.equal(body2.conversationId, "dsh-inc-3433", "anthropic shape still converts to a lane turn");
+            assert.equal(new Headers(init2.headers).get("x-bili-plugin-turn"), "1", "marker stamped on the anthropic turn");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+    }
+});
+
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth

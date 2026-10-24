@@ -376,8 +376,9 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
  *  partial note in `text`. Absent on legacy envelopes without the fields. */
 export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
-    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false, toolCallId?: string): Promise<ForwardedToolResult> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string } = { conversationId, tool, args: args ?? {} };
+    if (toolCallId !== undefined) body.toolCallId = toolCallId;
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
     // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).

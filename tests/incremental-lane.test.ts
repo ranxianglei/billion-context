@@ -554,3 +554,33 @@ test("incrementalTurnBodyShape accepts the incremental payload and rejects anthr
     const badSeq = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: "3", messages: [] }));
     assert.equal(incrementalTurnBodyShape(badSeq), false, "sinceSeq must be an integer");
 });
+
+// #3433: the lane ingests with anthropicToCore and re-emits with coreToAnthropic,
+// so non-anthropic message shapes must be rejected LOUDLY at the boundary —
+// converting them would silently drop assistant.tool_calls or mis-map
+// role:"tool" into user text. The client-side mirror is
+// wireMessagesLookAnthropic; this is the trust-boundary enforcement.
+test("#3433: lane rejects non-anthropic message shapes with 400, never half-converts them", async () => {
+    const h = await harness("full");
+    try {
+        const toolRole = await h.turn({ sinceSeq: 0, resync: true, messages: [
+            { role: "user", content: "hi" },
+            { role: "tool", tool_call_id: "c1", content: "out" },
+        ] });
+        assert.equal(toolRole.status, 400);
+        assert.match((toolRole.body as { error?: string }).error ?? "", /anthropic wire shape/);
+
+        const toolCalls = await h.turn({ sinceSeq: 0, resync: true, messages: [
+            { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+        ] });
+        assert.equal(toolCalls.status, 400);
+        assert.match((toolCalls.body as { error?: string }).error ?? "", /anthropic wire shape/);
+
+        // the rejections applied nothing — a valid anthropic seed still lands
+        const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(seed.status, 200);
+        assert.equal(seed.headers.get("x-bili-applied-seq"), "1");
+    } finally {
+        await h.close();
+    }
+});

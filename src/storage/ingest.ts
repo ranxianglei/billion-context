@@ -60,6 +60,12 @@ export interface LegacySessionLike {
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: external-converter import payload — original message
+     *  decompositions interned BEFORE the snapshot/tail so their rows get the
+     *  lowest seqs (they are the oldest evidence). Consumed by the full
+     *  ingest only; the delta planner falls back to the full path while it is
+     *  present (its rows would otherwise be skipped as "trusted prefix"). */
+    decompositionLog?: CoreMessage[];
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
@@ -115,6 +121,7 @@ export function toLegacyLike(s: {
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
+    decompositionLog?: LegacySessionLike["decompositionLog"];
     contentStore?: LegacySessionLike["contentStore"];
 }): LegacySessionLike {
     return {
@@ -129,6 +136,7 @@ export function toLegacyLike(s: {
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
         pluginSnapshot: s.pluginSnapshot,
+        decompositionLog: s.decompositionLog,
         contentStore: s.contentStore,
     };
 }
@@ -164,6 +172,9 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
         return seq;
     };
+    // #3301: import payload first — its rows must sit below the snapshot/tail
+    // seqs so the stored log reads oldest-evidence-first.
+    if (session.decompositionLog && session.decompositionLog.length > 0) session.decompositionLog.forEach(intern);
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
     const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
 
@@ -229,6 +240,9 @@ export function planIngestDelta(
     head?: { msgId: string } | null,
 ): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    // #3301: an import payload would be skipped as "trusted prefix" here — force
+    // the full path so its rows actually land.
+    if (session.decompositionLog && session.decompositionLog.length > 0) return null;
     const tail = session.lastMessages;
     const trustedLen = trustedTailSeqs.length;
     if (

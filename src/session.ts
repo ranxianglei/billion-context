@@ -516,6 +516,14 @@ export type Session = {
      *  prefer promoting a stable field into `meta` or `stats` once it's clear. */
     metadata: Record<string, unknown>;
     state: CompressionState;
+    /** #4316 layer 3 PR3/3: refs → raw ids that CHANGED HANDS in this
+     *  process's one-time ledger re-stamp (cold-load alignment). Process-
+     *  lifetime only — it exists precisely for the window where a resent
+     *  in-flight compress call still cites pre-restart numbers; a call citing
+     *  a superseded number is honestly rejected (never silently folded onto
+     *  the message that now owns the number). A fresh process that never
+     *  re-stamped has no map and every ref behaves normally. */
+    restampSuperseded?: Map<string, string>;
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when
@@ -546,6 +554,11 @@ export type Session = {
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: original message decompositions supplied by an external state
+     *  converter (e.g. opencode-acp migration) at import time. Transient
+     *  import payload: consumed once by the unified ingest (rows land in the
+     *  index for fold re-anchor backfill) and never written back to records. */
+    decompositionLog?: CoreMessage[];
     /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
      *  bumped by markDirty after every mutation. Keys the fork-revision cache
      *  below so status polling skips re-hashing the whole history (#2017). */

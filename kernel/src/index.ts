@@ -28,6 +28,8 @@ export {
   refForRaw,
   rawForRef,
   BLOCKED_REF,
+  restampRefsToLedger,
+  type RefRestampOutcome,
 } from "./refs.js";
 export {
   prune,

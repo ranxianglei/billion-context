@@ -9,6 +9,7 @@ import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
@@ -82,12 +83,20 @@ function loadCase(name: string): Session {
 
 /** Same digest shape as the corpus manifest (see scripts/update-storage-corpus.ts). */
 function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
+    // #4316 PR3/3: cold-load alignment sets refLedgerAligned on the served
+    // state — a marker, not view content. The parity digest strips it (the
+    // manifest predates the flag); any REAL renumbering still moves byRaw and
+    // stays pinned (the corpus cases keep their counter refs — only a state
+    // whose rows exist gets aligned, and the corpus regen writes files without
+    // a live store session).
+    const state = { ...(view.state as Record<string, unknown>) };
+    delete state.refLedgerAligned;
     return sha256(JSON.stringify(canonicalize({
         id: view.id,
         meta: view.meta,
         stats: view.stats,
         metadata: view.metadata,
-        state: view.state,
+        state,
         blockContents: [...view.blockContents.entries()],
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
@@ -397,6 +406,41 @@ test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file t
     assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
+/** #4316 PR3/3 parity oracle: the expected digest for a FULL-mode load is
+ *  the LEGACY-mode view of the same files plus the deterministic one-time
+ *  ledger alignment (same seqByRaw the full-mode load aligned against). The
+ *  corpus manifest keeps pinning the PURE view (storage-corpus suite); this
+ *  oracle pins the equivalence "full serve = legacy serve + alignment". */
+function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, seqByRawId: Map<string, number>): string {
+    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-oracle-"));
+    try {
+        fs.cpSync(caseDir, path.join(legacyDir, "case"), { recursive: true });
+        // Remove any unified sidecar so the legacy store serves the files.
+        for (const f of fs.readdirSync(path.join(legacyDir, "case"))) {
+            if (f.startsWith("index.db") || f.endsWith(".lock")) fs.rmSync(path.join(path.join(legacyDir, "case"), f), { force: true });
+        }
+        const prev = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+        let store: InstanceType<typeof SessionStore> | null = null;
+        try {
+            store = new SessionStore({ dir: path.join(legacyDir, "case"), debounceMs: 1, enabled: true });
+            const pure = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+            assert.ok(pure, "legacy oracle load returned null");
+            const view = toLegacyLike(pure);
+            const state = structuredClone(view.state as Record<string, unknown>);
+            restampRefsToLedger(state as never, seqByRawId);
+            delete state.refLedgerAligned;
+            return sessionDigest({ ...view, state: state as never });
+        } finally {
+            store?.closeQuietly();
+            if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = prev;
+        }
+    } finally {
+        try { fs.rmSync(legacyDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+}
+
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
     const meta = CASE_META["folded"]!;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-full-"));
@@ -410,21 +454,25 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "full-mode read digest drift (organic import)");
         store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
+            // #4316 PR3/3: expected = legacy view of the same files + the
+            // deterministic alignment against these very rows.
+            expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
         } finally {
             probe.close();
         }
+        assert.equal(sessionDigest(toLegacyLike(session)), expectedDigest, "full-mode read digest drift (organic import)");
         // Second store, same dir: load again — serves from the index, no
         // import churn, digest still exact.
         const store2 = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const again = store2.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(again, "second full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(again)), manifest["folded"]!.digest, "second full-mode read digest drift");
+        assert.equal(sessionDigest(toLegacyLike(again)), expectedDigest, "second full-mode read digest drift");
         store2.cancelAll();
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
@@ -508,8 +556,15 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "file-tier full read digest drift");
         store.closeQuietly();
+        const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let fileTierDigest = "";
+        try {
+            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore.seqByRaw(meta.id));
+        } finally {
+            probeStore.close();
+        }
+        assert.equal(sessionDigest(toLegacyLike(session)), fileTierDigest, "file-tier full read digest drift");
         assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
         // Env tier wins: explicit env legacy overrides file full on a fresh
         // dir — a file-tier full would have opened the sidecar and imported,

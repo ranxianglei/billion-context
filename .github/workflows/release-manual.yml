@@ -149,11 +149,21 @@ jobs:
           # #4449: plugin manifests (.agents/.claude-plugin/plugins/codex) carry
           # their version from package.json — sync them into the same release
           # commit or marketplace update detection sees a stale version.
-          node scripts/sync-codex-plugin-version.mjs
+          # Pre-b87732e2 patch lanes (cut from tags older than #4449) have no
+          # manifests and no script — `git add` fatals on the absent pathspecs
+          # and the script itself is MODULE_NOT_FOUND, killing train mode on
+          # exactly the lanes that need it. Existence-guard both.
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs
+          else
+            echo "::notice::sync-codex-plugin-version.mjs absent on this ref (pre-#4449 patch lane) — skipping manifest sync"
+          fi
 
       - name: Verify bump diff
         run: |
-          git add package.json package-lock.json .agents .claude-plugin plugins/codex
+          for P in package.json package-lock.json .agents .claude-plugin plugins/codex; do
+            [ -e "$P" ] && git add "$P"
+          done
           CHANGED="$(git diff --cached --name-only)"
           [ -n "$CHANGED" ] || { echo "::error::bump produced no changes"; exit 1; }
           BAD="$(printf '%s\n' "$CHANGED" | grep -vE '^(package\.json|package-lock\.json|\.agents/plugins/marketplace\.json|\.claude-plugin/marketplace\.json|\.claude-plugin/plugin\.json|plugins/codex/\.codex-plugin/plugin\.json)$' || true)"

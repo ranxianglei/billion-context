@@ -289,6 +289,7 @@
 | `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
 | `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。 |
+| `compress.externalSummary` | object | opt-in (disabled) | — | 把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。 |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | 必须先置 true，自定义 prompts 才会生效。 |
 | `compress.absorb.enabled` | boolean | false | — | 启用 absorb 蒸馏块。 |
 | `compress.absorb.minToolTokens` | number | 1000 | — | 可被吸收的工具结果的最小估算 token 大小。 |
@@ -353,6 +354,7 @@
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
+| `BILI_DSH_MAX_TESTED_VERSION` | string | 0.2.0-rc.2 (CI e2e anchor) | — | “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。” |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
@@ -1910,6 +1912,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MODEL_INFO_RETRY_MS` | dsh 原生模型窗口解析失败（或解析结果不带窗口）后的重试冷却（毫秒，#1812/#1836）：匹配的缓存条目没有 context window 时不视为最终结果 —— 不再让整个进程生命周期 latching 成无 header 状态，而是该冷却过期后由下一个请求触发重新解析。默认 `30000`；非数字或负值回退 `30000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | dsh 原生插件工具注册重试的退避冷却（毫秒，#2082）：manifest 拉取或工具注册瞬时失败后，下一次重试不早于该冷却发生。默认 `10000`；非数字或非正值回退 `10000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | dsh 原生插件独立恢复定时器的间隔（毫秒，#2082）：工具处于 down 状态时，即使零模型流量也持续驱动注册重试 —— 正是模型已放弃缺失工具、其他路径都不会再触发重试的场景。默认跟随 `BILI_DSH_RETRY_INTERVAL_MS`（`10000`）。测试钩子 —— NODE_TEST_CONTEXT 下除非显式设置本变量，否则定时器永不启动；生产环境保持 unset。 |
+| `BILI_DSH_MAX_TESTED_VERSION` | dsh native lane 的“高于已测最高版”启动提示的上限：插件从注入包上方最近的 `node_modules/@deepseek-ai/dsh/package.json` 读出运行中的 dsh 版本，按 semver（含 pre-release 标识符）与本上限比较；**严格高于**上限才在启动时弹**一条**持久提示（dsh 会话内可见），建议先回滚到上限版本、等适配。只覆盖“更新”一个方向：≤ 上限的旧构建保持静默——旧版的已知坏法本来就有专门的失锁探测（#3806 boot 告警 + #2474 fallback），不必重复报。只提示、绝不拦截或阻断任何流量（猜错也不能弄坏能跑的会话）。默认 = `0.2.0-rc.2`（CI e2e 锚点，.github/workflows/ci-e2e-dsh-native.yml）；新版本验证通过后把上限抬过去即可；设为**空字符串** = 彻底关掉本 lane 的检查。读不到/解析不了的版本按“不比高”处理，保持静默（“没读到”不等于“坏了”）。
 | `BILI_ADVISORY_CHECK` | 设为 `0` 禁用严重缺陷公告监视器（#1481）。默认开启 —— 它独立于 `ACP_AUTO_UPDATE` 运行，确保关闭了自动更新的安装也能被强制移出已知缺陷版本范围。fail-open：公告源不可达/格式错误只告警，绝不阻断模型流量。文件配置键：`advisoryCheck`。 |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖。默认：已配置 registry（感知 `BILI_UPDATE_REGISTRY`）上的伴生包 `billion-context-advisories`。文件配置键：`advisoryUrl`。 |
 | `BILI_RELEASE_NOTES_CHECK` | 设为 `0` 禁用发版说明可见性监视器（#1870）。默认开启 —— 纯可见性，且默认静默（#1977）：拉取伴生发版说明文档，仅当待更新跨度内含 `critical` 级条目时，才在 `acp_status` 与 `/acp` 面板提示「CRITICAL 更新已就绪待重启」（磁盘版本新于运行版本）或「存在 critical 更新」；routine/recommended 级发版永不上屏。绝不安装、绝不重启；fail-open。文件配置键：`releaseNotesCheck`。 |

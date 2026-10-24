@@ -305,7 +305,13 @@ export interface CompressionState {
    *  the next successful fold (applyCompression) — after a fold the watermark
    *  re-evaluates from scratch. Optional: pre-feature states have none (the
    *  pre-latch node clipped from scratch each turn). */
+  /** #3939 ③: emergency truncation latch entries (see above). Optional:
+     pre-existing persisted states lack it. */
   emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** #4316 layer 3 PR3/3: refs have been aligned onto the unified ledger
+     (ref = store row seq + 1) exactly once. Set by restampRefsToLedger;
+     assignRefs' stamp path keeps new arrivals aligned from then on. */
+  refLedgerAligned?: boolean;
   /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
    *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
    *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps

@@ -387,9 +387,17 @@ async function handleMessage(msg: {
                 // #2752: the business state rides MCP structuredContent (spec
                 // field alongside content; clients predating it ignore it).
                 // isError semantics are unchanged — partial stays non-error.
+                // #3472: some hosts (Claude Code via its MCP bridge) prefer
+                // structuredContent when present and drop the content text —
+                // with only {outcome, blocksCreated} every success call reached
+                // the model as bare {"outcome":"success"} and the whole report
+                // was lost. Carry the full report inside structuredContent too
+                // (structured.text, byte-identical to content[0].text) so
+                // structured-only readers see the complete receipt; the machine
+                // fields stay additive alongside it.
                 const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
                 if (out.outcome !== undefined || out.blocksCreated !== undefined) {
-                    const structured: Record<string, unknown> = {};
+                    const structured: Record<string, unknown> = { text: out.text };
                     if (out.outcome !== undefined) structured.outcome = out.outcome;
                     if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
                     result.structuredContent = structured;

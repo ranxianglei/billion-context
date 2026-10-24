@@ -6,6 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { listSessions } from "../src/session.ts";
+import { forkAdoptionSkippedOf } from "../src/fork-adoption.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -183,7 +184,7 @@ function proxyOpts(relayUrl: string, forkAdoption: boolean): ProxyOptions {
     };
 }
 
-async function runForkScenario(forkAdoption: boolean): Promise<{ parentBlocks: number; parentBlockIds: string[]; childBlockIds: string[]; childBlocks: number; childContents: number; lineage: string | undefined }> {
+async function runForkScenario(forkAdoption: boolean): Promise<{ parentId: string; parentBlocks: number; parentBlockIds: string[]; childBlockIds: string[]; childBlocks: number; childContents: number; lineage: string | undefined; derivedFromSessionId: string | undefined; derivedBlocksAdopted: boolean; forkAdoptionSkipped: ReturnType<typeof forkAdoptionSkippedOf> }> {
     const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -243,6 +244,11 @@ async function runForkScenario(forkAdoption: boolean): Promise<{ parentBlocks: n
             childBlocks: child.state.blocks.filter((b) => b.active).length,
             childContents: child.state.blocks.filter((b) => child.blockContents.has(b.blockId)).length,
             lineage: (child.metadata.anonymousPrefixAffinity as { lineage?: { reason?: string } } | undefined)?.lineage?.reason,
+            // #3925 → #3011 C9: the persistent lineage link + adoption markers
+            // must be on the child regardless of the adoption outcome.
+            derivedFromSessionId: typeof child.metadata.derivedFromSessionId === "string" ? child.metadata.derivedFromSessionId : undefined,
+            derivedBlocksAdopted: child.metadata.derivedBlocksAdopted === true,
+            forkAdoptionSkipped: forkAdoptionSkippedOf(child),
         };
         assert.equal(snapshot.lineage, "forked", "child lineage must record the fork");
 
@@ -268,7 +274,7 @@ async function runForkScenario(forkAdoption: boolean): Promise<{ parentBlocks: n
         assert.ok(followUp.length > 0, "fork follow-up must produce a reply");
 
         assert.equal(parent.state.blocks.length, parentIdCount, "parent blocks must be untouched (copy-on-fork)");
-        return { ...snapshot, parentBlockIds: [...snapshot.parentBlockIds], childBlockIds: [...snapshot.childBlockIds] };
+        return { ...snapshot, parentId: parent.id, parentBlockIds: [...snapshot.parentBlockIds], childBlockIds: [...snapshot.childBlockIds] };
     } finally {
         await close(proxy);
         await close(relay);
@@ -281,6 +287,11 @@ test("anonymous fork adopts the parent's fully-present compression blocks (#629)
     assert.equal(result.childContents, result.childBlocks, "adopted blocks must carry their summaries");
     const adopted = result.parentBlockIds.filter((id) => result.childBlockIds.includes(id));
     assert.ok(adopted.length >= 1, `child must carry the parent's block id (parent=${JSON.stringify(result.parentBlockIds)} child=${JSON.stringify(result.childBlockIds)})`);
+    // #3925 → #3011 C9: the lineage link is recorded and the derived-blocks
+    // gate closes on real adoption; nothing is marked skipped.
+    assert.equal(result.derivedFromSessionId, result.parentId, "adopting child must link its parent persistently");
+    assert.equal(result.derivedBlocksAdopted, true, "derived-blocks gate must close on real block adoption (#3351)");
+    assert.equal(result.forkAdoptionSkipped, undefined, "no skipped marker when adoption succeeded");
 });
 
 test("forkAdoption disabled leaves the fork at zero compression state", async () => {
@@ -288,4 +299,14 @@ test("forkAdoption disabled leaves the fork at zero compression state", async ()
     assert.equal(result.lineage, "forked", "fork lineage is still recorded");
     assert.equal(result.childBlocks, 0, "disabled adoption must not seed blocks");
     assert.equal(result.childContents, 0, "disabled adoption must not seed summaries");
+    // #3925 → #3011 C9: even when adoption bails, the persistent lineage link
+    // must be recorded — without it the startup sweep can never heal the child
+    // across a restart and decompress/search_context stay parent-blind for
+    // life. The skipped marker carries what was left on the table.
+    assert.equal(result.derivedFromSessionId, result.parentId, "bailed fork must still link its parent persistently");
+    assert.equal(result.derivedBlocksAdopted, false, "bailed fork must NOT close the derived-blocks gate (boot-sweep door stays open)");
+    assert.ok(result.forkAdoptionSkipped, "bailed fork must record the skipped-adoption marker for acp_status");
+    assert.equal(result.forkAdoptionSkipped?.parentId, result.parentId, "skipped marker must name the parent");
+    assert.ok((result.forkAdoptionSkipped?.blocks ?? 0) >= 1, "skipped marker must count the adoptable blocks that were left behind");
+    assert.ok((result.forkAdoptionSkipped?.tokens ?? 0) > 0, "skipped marker must carry the token inventory");
 });

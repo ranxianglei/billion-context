@@ -75,6 +75,18 @@ test("#1815: root-level promptPack (issue repro) warns through the real config-l
     }
 });
 
+test("#3876: bare top-level externalSummary gets the compress-placement hint", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        warnUnknownTopLevelKeys({ externalSummary: { enabled: true, targets: ["p/m"] } });
+        const warns = unknownKeyWarns(captured);
+        assert.equal(warns.length, 1, `expected 1 warning, got: ${captured.map((e) => e.msg).join(" | ")}`);
+        assert.ok(warns[0].msg.includes('"externalSummary" belongs under "compress" (did you mean "compress.externalSummary"?)'), warns[0].msg);
+    } finally {
+        stop();
+    }
+});
+
 test("#1815: multiple unknown keys list together; fixing some re-warns about the rest", () => {
     const { captured, stop } = captureLogs();
     try {

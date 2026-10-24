@@ -140,7 +140,7 @@ import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
-const METADATA_ANCHORS = "foldAnchors";
+export const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
 /** #2480: positional identity copy — canonical fingerprint per message,
  *  aligned 1:1 with foldAnchorOrder (same rolling window, same cap, written
@@ -539,6 +539,42 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
     return h.digest("hex").slice(0, 16);
 }
 
+/** #3301: split tagged thinking-merge text (host metadata refresh re-serializes
+ *  split-form turns as tagged reasoning spliced into content). MIRRORS
+ *  kernel/src/wire/demoted-thinking.ts FORMS + splitDemotedThinking in lockstep
+ *  (not exported from the kernel root) — keep both lists in sync. Offset-0 tag
+ *  start is the only position demotion renderers produce. Auxiliary evidence
+ *  for turn-key derivation ONLY — never identity minting. */
+const THINKING_MERGE_FORMS: readonly { open: string; close: string }[] = [
+    { open: "\x3cthink\x3e\n", close: "\n\x3c/think\x3e" },
+    { open: "\x3cthinking\x3e\n", close: "\n\x3c/thinking\x3e" },
+    { open: "```thinking\n", close: "\n```" },
+];
+
+export function extractThinkingMerge(text: string | undefined): { reasoning: string; text: string } | null {
+    if (text === undefined || text === "") return null;
+    let rest = text;
+    const parts: string[] = [];
+    for (;;) {
+        let matched = false;
+        for (const form of THINKING_MERGE_FORMS) {
+            if (!rest.startsWith(form.open)) continue;
+            const end = rest.indexOf(form.close, form.open.length);
+            if (end < 0) continue;
+            const inner = rest.slice(form.open.length, end);
+            if (inner.length === 0) continue;
+            parts.push(inner);
+            rest = rest.slice(end + form.close.length);
+            if (rest.startsWith("\n")) rest = rest.slice(1);
+            matched = true;
+            break;
+        }
+        if (!matched) break;
+    }
+    if (parts.length === 0) return null;
+    return { reasoning: parts.join("\n"), text: rest };
+}
+
 /** Turn context for the anchor seed loop: per assistant-core id, the turn
  *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
  *  steady-state pass reuses stored anchors and never pays this. */
@@ -563,7 +599,18 @@ export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
             const prev = msgs[i - 1];
             if (prev === undefined || prev.id === undefined || prev.role !== "assistant" || prev.contentType !== "reasoning" ||
                 (prev.toolCallId !== undefined && prev.toolCallId !== "")) {
-                ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+                // #3301: merged-form core — its text may be tagged reasoning + reply.
+                // The extracted pair key bridges anchors seeded from the split form
+                // (same turn, different wire shape); the raw full-text key stays for
+                // identical resends of this exact form.
+                const ex = extractThinkingMerge(m.text);
+                if (ex !== null) {
+                    const key = turnKeyOf(ex.reasoning, ex.text);
+                    const seamless = turnKeyOfSeamless(ex.reasoning, ex.text);
+                    ctx.set(m.id, seamless !== key ? { p: key, p2: seamless } : { p: key });
+                } else {
+                    ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+                }
             }
         }
     }
@@ -1068,10 +1115,20 @@ export function planReconciliation(
             if (claimedCandidates.has(cand.id)) continue;
             if (!isBareAssistantCore(cand.message)) continue;
             if (cand.message.contentType === "text") {
-                const key = turnKeyOf(undefined, cand.message.text);
-                const bucket = singleTurnKeys.get(key);
-                if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
-                else bucket.push(cand.id);
+                // #3301: a merged-form core stands in for the whole turn —
+                // register the raw full-text key AND the extracted pair key(s)
+                // so anchors seeded from either wire form match.
+                const keys = new Set<string>([turnKeyOf(undefined, cand.message.text)]);
+                const ex = extractThinkingMerge(cand.message.text);
+                if (ex !== null) {
+                    keys.add(turnKeyOf(ex.reasoning, ex.text));
+                    keys.add(turnKeyOfSeamless(ex.reasoning, ex.text));
+                }
+                for (const key of keys) {
+                    const bucket = singleTurnKeys.get(key);
+                    if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
+                    else bucket.push(cand.id);
+                }
             } else if (cand.message.contentType === "reasoning") {
                 const next = byPos.get(cand.pos + 1);
                 if (next !== undefined && !claimedCandidates.has(next.id) && isBareAssistantCore(next.message) && next.message.contentType === "text") {
@@ -1537,6 +1594,13 @@ export interface ReconcileOptions {
     /** Inbound wire items before codec expansion; auxiliary requests can
      *  project a few items into dozens of cores without carrying history. */
     inboundMessageCount?: number;
+    /** #3301: stored message decompositions for anchors that predate turn-key
+     *  backfill (pre-#2644) — after a wire-shape flip the wire-side backfill
+     *  can never fire (the old id is gone from the wire), so eligible anchors
+     *  are rebuilt from these rows BEFORE the reconciliation plan runs and the
+     *  flip pass itself claims. Latest-seq-per-id, neighbors included;
+     *  undefined = no source available (legacy-only mode). */
+    storedMessages?: CoreMessage[];
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1573,7 +1637,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
 
-    const anchors: Record<string, FoldAnchor> =
+    let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
     const oldOrder: string[] = (session.metadata[METADATA_ORDER] as string[] | undefined) ?? [];
     // #2480: self-contained positional copy {ids, canon} (#2487's storage
@@ -1587,6 +1651,35 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         positions = storedRaw.length === oldOrder.length ? { ids: oldOrder, canon: storedRaw } : undefined;
     } else if (storedRaw !== undefined && Array.isArray(storedRaw.ids) && Array.isArray(storedRaw.canon)) {
         positions = { ids: storedRaw.ids as string[], canon: storedRaw.canon as string[] };
+    }
+
+    const byId = new Map<string, CoreMessage>();
+    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    // #3301: a wire-shape flip puts legacy (pre-#2644, no p/x) ids off the wire
+    // on the FIRST post-flip pass — and this same pass rolls the order backbone
+    // forward without them, so any backfill landing later can never claim (the
+    // claim passes only iterate ids still in the backbone). Rebuild eligible
+    // anchors from the stored decomposition BEFORE the plan runs so the flip
+    // pass itself can claim. Wire bytes always win: an id present on this pass
+    // keeps its live-bytes path untouched.
+    if (opts.storedMessages !== undefined && opts.storedMessages.length > 0) {
+        const sById = new Map<string, CoreMessage>();
+        for (const m of opts.storedMessages) if (m.id !== undefined) sById.set(m.id, m);
+        const sCtx = turnContexts(opts.storedMessages);
+        let changed = false;
+        const upgraded: Record<string, FoldAnchor> = {};
+        for (const [id, a] of Object.entries(anchors)) {
+            if (a.p === undefined && a.r === "assistant" && a.t === undefined && !byId.has(id)) {
+                const sm = sById.get(id);
+                if (sm !== undefined) {
+                    upgraded[id] = anchorFrom(sm, sCtx.get(id));
+                    changed = true;
+                    continue;
+                }
+            }
+            upgraded[id] = a;
+        }
+        if (changed) anchors = upgraded;
     }
 
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
@@ -1603,8 +1696,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // freshly claimed ones — the next churn must re-anchor from post-churn
     // bytes), prune anchors for ids no longer covered, and roll the order
     // backbone forward to this pass.
-    const byId = new Map<string, CoreMessage>();
-    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
     // #2636: turn keys for freshly seeded anchors — built lazily so
     // steady-state passes (no churn) never pay the per-core normalization
     // (#2334). Only bare assistant cores can carry a turn key
