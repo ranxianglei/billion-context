@@ -48,7 +48,7 @@ test("usageSummary hides zero-usage and formats tokens", () => {
   assert.equal(usageSummary(undefined), undefined);
   assert.equal(usageSummary({ input: 0, output: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }), undefined);
   const s = usageSummary({ input: 1234, output: 56, totalTokens: 1290, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
-  assert.ok(s!.includes("1,234") && s!.includes("56"), s);
+  assert.ok(s!.includes((1234).toLocaleString()) && s!.includes("56"), s);
 });
 
 // ─── readTailSync ───────────────────────────────────────────────────────────
@@ -301,4 +301,86 @@ test("renderTranscriptBlocks renders assistant text as markdown (heading/list)",
   assert.ok(lines.some((l) => l.includes("Summary")), "heading text present");
   assert.ok(!lines.some((l) => l.trim().startsWith("#")), "markdown heading marker stripped");
   assert.ok(lines.some((l) => l.includes("first point")), "list item present");
+});
+
+test("transcript rendering treats CRLF as newlines without changing source blocks", () => {
+  const ansiTheme: InspectorTheme = {
+    fg: (_c, t) => `\x1b[32m${t}\x1b[39m`,
+    bold: (t) => `\x1b[1m${t}\x1b[22m`,
+    bg: (_c, t) => `\x1b[42m${t}\x1b[49m`,
+  };
+  const blocks: TranscriptBlock[] = [
+    { kind: "user", text: "first\r\n\r\nsecond\r\n" },
+    { kind: "thinking", text: "thinking\r\nnext" },
+    { kind: "text", text: "# Heading\r\n\r\nbody" },
+    { kind: "toolCall", name: "read", text: "", args: { path: "fixture.txt" } },
+    { kind: "toolResult", name: "read", text: "short\r\n123456\r\n\r\ntail\r\n" },
+    { kind: "toolCall", name: "bash", text: "", args: { command: "echo first\r\necho second" } },
+    { kind: "toolResult", name: "bash", text: " M file.txt\r\n", isError: true },
+  ];
+  const original = JSON.stringify(blocks);
+  const lf = blocks.map((b) => ({ ...b, text: b.text.replace(/\r\n/g, "\n") }));
+  const paintRow = (row: string): string => {
+    const cells: string[] = [];
+    let x = 0;
+    for (const char of row) {
+      if (char === "\r") x = 0;
+      else cells[x++] = char;
+    }
+    return cells.join("");
+  };
+  const frame = (row: string, width: number): string => `│ ${row}${" ".repeat(width - visibleWidth(row))} │`;
+  assert.ok(paintRow(frame("short\r", 20)).lastIndexOf("│") < 23, "negative control: an unnormalized CR shifts the border left and overwrites text");
+  for (const width of [16, 40, 80, 120]) {
+    assert.deepEqual(renderTranscriptBlocks(blocks, ansiTheme, width), renderTranscriptBlocks(lf, ansiTheme, width));
+    const lines = renderTranscriptBlocks(blocks, plainTheme, width);
+    assert.ok(lines.every((line) => !line.includes("\r")), "CR must not move the terminal cursor inside a framed row");
+    for (const line of lines) {
+      const framed = frame(line, width);
+      assert.equal(paintRow(framed), framed, "padding must not overwrite text or shift the border");
+    }
+  }
+  assert.equal(JSON.stringify(blocks), original, "stored text and tool arguments remain unchanged");
+});
+
+
+test("bash command previews treat CRLF as LF without changing arguments", () => {
+  const args = { command: "echo first\r\necho second\tend" };
+  const original = args.command;
+  assert.equal(formatToolLabel("bash", args), formatToolLabel("bash", { command: "echo first\necho second\tend" }));
+  assert.ok(!formatToolLabel("bash", args).includes("\r"));
+  assert.equal(args.command, original);
+});
+
+test("truncated tool output keeps the generated ellipsis background, including wide graphemes", () => {
+  const ansiTheme: InspectorTheme = {
+    fg: (_c, t) => `\x1b[32m${t}\x1b[39m`,
+    bold: (t) => `\x1b[1m${t}\x1b[22m`,
+    bg: (_c, t) => `\x1b[42m${t}\x1b[49m`,
+  };
+  function backgroundSpans(line: string): { text: string; painted: boolean }[] {
+    let painted = false;
+    const spans: { text: string; painted: boolean }[] = [];
+    for (const match of line.matchAll(/\x1b\[([\d;]*)m|([^\x1b]+)/g)) {
+      if (match[1] !== undefined) {
+        for (const code of match[1].split(";").map(Number)) {
+          if (code === 0 || code === 49) painted = false;
+          else if (code === 42) painted = true;
+        }
+      } else spans.push({ text: match[2]!, painted });
+    }
+    return spans;
+  }
+  for (const width of [1, 2, 3, 10, 21, 40, 80, 120]) {
+    for (const text of ["x".repeat(200), "界".repeat(200), "👩‍💻é".repeat(200), "\x1b[31m" + "x".repeat(200) + "\x1b[39m"]) {
+      const lines = renderTranscriptBlocks([{ kind: "toolResult", name: "read", text }], ansiTheme, width);
+      assertWidthSafe(lines, width);
+      const line = lines.at(-1)!;
+      const spans = backgroundSpans(line);
+      assert.ok(spans.every((s) => s.painted), `default-background notch: ${JSON.stringify(line)}`);
+      assert.ok(spans.map((s) => s.text).join("").trimEnd().endsWith("."), "truncation remains visible");
+      assert.equal(visibleWidth(line), width, "wide-character truncation padding remains painted");
+      assert.ok(line.endsWith("\x1b[49m"), "background does not leak out of the row");
+    }
+  }
 });
