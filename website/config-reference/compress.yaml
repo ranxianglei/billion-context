@@ -122,6 +122,26 @@ entries:
     desc_zh: "最近的 token 软保护、免于折叠。"
     site_en: "Kernel default ≈5000: the most recent tokens stay soft-protected from folds."
     site_zh: "内核默认约 5000：最近的 token 软保护、免于折叠。"
+  - key: compress.preserveRecentTurns
+    type: number
+    default: "off"
+    group: compress
+    id: cw.prturns
+    render: compress-row
+    desc_en: "All messages of the last N turns (turn = user message → next user message) join the soft-protected zone (#4593)."
+    desc_zh: "最近 N 轮（轮 = 一条 user 消息到下一条 user 消息）的全部消息加入软保护区（#4593）。"
+    site_en: "Opt-in per-turn retention (#4593): all messages of the last N turns stay verbatim on the wire. A submitted fold partially overlapping them is carved at the boundary with an auditable receipt warning; a fold entirely inside is rejected. Off unless set."
+    site_zh: "可选的按轮保留（#4593）：最近 N 轮的全部消息逐字保留在线路上。提交的折叠若部分覆盖则在边界处裁出并附可审计回执警告；完全落在保护区内则拒绝。默认关闭。"
+  - key: compress.protectUserMessages
+    type: boolean
+    default: "off"
+    group: compress
+    id: cw.pum
+    render: compress-row
+    desc_en: "Every user text message is hard-protected, never compressible (#4593)."
+    desc_zh: "所有 user 文本消息硬保护、永不压缩（#4593）。"
+    site_en: "Opt-in hard protection for user instructions (#4593): every user text message renders as BLOCKED and is carved out of any submitted fold with an auditable receipt warning; summary carriers are exempt. Off unless set."
+    site_zh: "可选的用户指令硬保护（#4593）：每条 user 文本消息渲染为 BLOCKED，任何提交的折叠都会将其裁出并附可审计回执警告；摘要载体除外。默认关闭。"
   - key: compress.minCompressRangeChars
     type: "number (deprecated alias: minCompressRange)"
     default: "kernel ≈5000"

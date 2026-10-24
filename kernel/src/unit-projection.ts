@@ -2,13 +2,15 @@ import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
 import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
+  collectAgedCompressCallIds,
   collectFailedCompressCallIds,
   collectLatestProtected,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
-  collectAgedCompressCallIds,
+  isUserTextMessage,
 } from "./protected.js";
+import { computeTurnRetention } from "./turn-retention.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
 import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
@@ -207,6 +209,27 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     }
   }
 
+  // #4593: the drop above is silent by design for protectedTools (longstanding
+  // behavior), but protectUserMessages removals MUST be auditable — user
+  // instructions are the non-regenerable input, so the receipt names exactly
+  // which refs were skipped and why.
+  if (input.config.protectUserMessages === true && filteredIds.length < directMessageIds.length) {
+    const kept = new Set(filteredIds);
+    const droppedUserRefs = directMessageIds
+      .filter((id) => !kept.has(id))
+      .map((id) => input.messages.find((m) => m.id === id))
+      .filter((m): m is CoreMessage => !!m && isUserTextMessage(m))
+      .map((m) => input.state.messageRefs.byRaw[m.id])
+      .filter((r): r is string => typeof r === "string");
+    if (droppedUserRefs.length > 0) {
+      warnings.push(
+        `Excluded ${droppedUserRefs.length} user message(s) ${droppedUserRefs.join(
+          ", ",
+        )} from compression range (protectUserMessages) — they stay visible outside the new block; do not target them in another compress call.`,
+      );
+    }
+  }
+
   const mediaExcluded = directMessageIds.filter((id) => {
     const msg = input.messages.find((m) => m.id === id);
     return !!msg && hasUnrecoverableMediaPayload(msg);
@@ -290,13 +313,31 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       .map((id) => input.state.messageRefs.byRaw[id])
       .filter((v): v is string => typeof v === "string");
 
+    // #4593: name every active retention regime so the receipt attributes
+    // skips to their cause. Turn-retention refs form a contiguous tail (the
+    // newest), so a count suffices to tell the two families apart.
+    const zoneParts = [
+      `the last ${input.config.preserveRecentMessages} messages and/or the most recent user message`,
+    ];
+    const retention = computeTurnRetention(input.messages, input.state, input.config);
+    let turnRetainedCount = 0;
+    if (retention) {
+      zoneParts.push(`the last ${retention.turns} turns`);
+      const retained = new Set<string>();
+      for (let i = retention.boundaryIndex; i < input.messages.length; i++) {
+        retained.add(input.messages[i]!.id);
+      }
+      turnRetainedCount = hitProtectedRaw.filter((id) => retained.has(id)).length;
+    }
+    const zoneDesc =
+      zoneParts.length > 1 ? `${zoneParts[0]} plus ${zoneParts[1]}` : zoneParts[0];
+
     if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-      const recentN = input.config.preserveRecentMessages;
       return finish({
         fatal: {
           kind: "zone",
           error: new Error(
-            `Range is entirely within the protected zone (the last ${recentN} messages and/or the most recent user message): ${hitRefs.join(
+            `Range is entirely within the protected zone (${zoneDesc}): ${hitRefs.join(
               ", ",
             )}. Adjust startId/endId to older messages.`,
           ),
@@ -306,7 +347,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
         ", ",
-      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.` +
+      )} from compression range (${zoneDesc}${turnRetainedCount > 0 ? `, of which ${turnRetainedCount} in last-turns retention` : ""}) — they stay visible outside the new block; do not target them in another compress call.` +
         (truncatedAfter > 0
           ? ` Range truncated at that boundary — ${truncatedAfter} later message(s) (including replies to the protected message) stay visible too, so no summary can land above the question it answers (#3953).`
           : ""),

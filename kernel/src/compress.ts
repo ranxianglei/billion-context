@@ -997,7 +997,11 @@ const assignRefsNode: PipelineNode = {
       ctx.config.protectedTools.length > 0 ||
       !!ctx.config.isToolProtected ||
       !!ctx.config.isMessageProtected ||
-      (ctx.config.protectedLatestTools?.length ?? 0) > 0;
+      (ctx.config.protectedLatestTools?.length ?? 0) > 0 ||
+      // #4593: protectUserMessages alone must also run protectedFn — without
+      // this gate addition its isMessageProtected branch never executes and
+      // user messages get plain foldable refs.
+      ctx.config.protectUserMessages === true;
     const latest = hasProtection
       ? collectLatestProtected(io.messages, ctx.config)
       : undefined;

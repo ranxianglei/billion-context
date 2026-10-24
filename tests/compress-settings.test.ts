@@ -394,3 +394,44 @@ test("applyCompressSettings: maps tierNudgeTokens onto kernel nudge.tierGrowthTo
     assert.equal(absent.nudge.tierGrowthTokens, undefined);
     assert.equal(base.nudge.tierGrowthTokens, undefined, "base config not mutated");
 });
+
+test("mergeCompress: preserveRecentTurns / protectUserMessages cascade per field (#4593)", () => {
+    const merged = mergeCompress(
+        { preserveRecentTurns: 3, protectUserMessages: true },
+        { preserveRecentTurns: 2 },
+        { protectUserMessages: false },
+    );
+    assert.equal(merged.preserveRecentTurns, 2);
+    assert.equal(merged.protectUserMessages, false);
+    const absent = mergeCompress({}, {}, {});
+    assert.equal(absent.preserveRecentTurns, undefined);
+    assert.equal(absent.protectUserMessages, undefined);
+});
+
+test("parseCompressSettings: preserveRecentTurns validates a finite >= 0 number, 0 = explicit off (#4593)", () => {
+    assert.equal(parseCompressSettings({ preserveRecentTurns: 3 })?.preserveRecentTurns, 3);
+    assert.equal(parseCompressSettings({ preserveRecentTurns: 0 })?.preserveRecentTurns, 0);
+    assert.equal(parseCompressSettings({ preserveRecentTurns: 3.7 })?.preserveRecentTurns, 3);
+    assert.equal(parseCompressSettings({ preserveRecentTurns: -1 }), undefined);
+    assert.equal(parseCompressSettings({ preserveRecentTurns: "3" }), undefined);
+    assert.equal(parseCompressSettings({ preserveRecentTurns: Number.NaN }), undefined);
+    assert.equal(parseCompressSettings({})?.preserveRecentTurns, undefined);
+});
+
+test("parseCompressSettings: protectUserMessages is a strict boolean (#4593)", () => {
+    assert.equal(parseCompressSettings({ protectUserMessages: true })?.protectUserMessages, true);
+    assert.equal(parseCompressSettings({ protectUserMessages: false })?.protectUserMessages, false);
+    assert.equal(parseCompressSettings({ protectUserMessages: "yes" }), undefined);
+    assert.equal(parseCompressSettings({ protectUserMessages: 1 }), undefined);
+    assert.equal(parseCompressSettings({})?.protectUserMessages, undefined);
+});
+
+test("applyCompressSettings: maps #4593 keys onto the kernel config; unset inherits base", () => {
+    const base = defaultConfig(200000);
+    const out = applyCompressSettings(base, 200000, { preserveRecentTurns: 4, protectUserMessages: true });
+    assert.equal(out.preserveRecentTurns, 4);
+    assert.equal(out.protectUserMessages, true);
+    const inherited = applyCompressSettings(base, 200000, {});
+    assert.equal(inherited.preserveRecentTurns, base.preserveRecentTurns);
+    assert.equal(inherited.protectUserMessages, base.protectUserMessages);
+});

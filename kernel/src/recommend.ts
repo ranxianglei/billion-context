@@ -32,6 +32,7 @@ import {
   isMessageProtectedWithPairing,
   isNeverPreserveRecent,
 } from "./protected.js";
+import { computeTurnRetention } from "./turn-retention.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
@@ -65,10 +66,15 @@ function isSyntheticOrPruned(
  * Compute the set of protected message refs (mNNNNN) that form the
  * "soft-protected zone" at the tail of the conversation.
  *
- * Combines three rules:
+ * Combines four rules:
  *   1. Last N messages (`config.preserveRecentMessages`)
  *   2. Last N tokens expanding backward (`config.preserveRecentTokens`)
  *   3. Last visible user message (couples to Rule 1)
+ *   4. Per-turn retention (#4593): the last N user-initiated turns form a
+ *      positional protected suffix (`config.preserveRecentTurns`; recomputed
+ *      every turn — see turn-retention.ts). A submitted range overlapping it
+ *      is carved there with an auditable receipt (like Rules 1-3); a range
+ *      entirely inside it is rejected by projectUnit.
  *
  * Then closes the tool-pair gap (#2886): if either half of a (tool-call,
  * tool-result) pair is protected, both are. Without this, `neverPreserveRecentTools`
@@ -149,6 +155,21 @@ export function computeProtectedRefs(
       const ref = state.messageRefs.byRaw[msg.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
       break;
+    }
+  }
+
+  // Rule 4 (#4593): per-turn retention — the last N user-initiated turns form
+  // a positional protected suffix. Recomputed every turn (the window slides
+  // with each new user message), which is why it lives here rather than in
+  // the permanent BLOCKED-ref decision. Fewer than N+1 visible user messages
+  // ⇒ the whole conversation is retained (boundaryIndex 0).
+  {
+    const retention = computeTurnRetention(messages, state, config);
+    if (retention) {
+      for (let i = retention.boundaryIndex; i < messages.length; i++) {
+        const ref = state.messageRefs.byRaw[messages[i]!.id];
+        if (ref && ref !== "BLOCKED") result.add(ref);
+      }
     }
   }
 
