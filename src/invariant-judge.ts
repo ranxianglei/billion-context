@@ -11,7 +11,9 @@
 //     named, count-bounded exemption list — chain checkpoint / acp_summary
 //     carriers (outbound-injected, or inbound-ECHOED by stateful hosts, which
 //     match their own twin by identity), policy reasoning drops, crush
-//     envelopes.
+//     envelopes, Responses turn separators (#564/#2627: bili's own
+//     outbound-only run-boundary markers, never present in any client's
+//     resent history — #4388).
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
@@ -38,6 +40,7 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
+import { isResponsesTurnSeparatorText } from "./turn-separator.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -106,7 +109,10 @@ function isReasoning(m: CoreMessage): boolean {
 function isCarrier(m: CoreMessage): boolean {
   if (m.summaryOfBlockId !== undefined) return true;
   const t = m.text ?? "";
-  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER);
+  // #4388: the #564 run-boundary marker rides the exemption ledger like a
+  // carrier — it is bili's own outbound-only injection (#2627), never part
+  // of the client's resent history.
+  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER) || isResponsesTurnSeparatorText(t);
 }
 
 function isSummaryCarrier(m: CoreMessage): boolean {
@@ -183,7 +189,8 @@ export function judgeInboundOutbound(
     let found = -1;
     let nearTwin = false;
     let scanned = 0;
-    for (let k = j; k < freezeEnd; k++) {
+    let k = j;
+    for (; k < freezeEnd; k++) {
       const x = exit[k];
       if (isReasoning(x)) continue;
       if (!eCarrier && isCarrier(x)) continue;
@@ -194,6 +201,19 @@ export function judgeInboundOutbound(
     }
 
     if (found < 0) {
+      // The scan consumed the WHOLE frozen window without finding e and saw
+      // nothing resembling it: exempt volume (carriers / turn separators /
+      // reasoning stacked directly before the fold carrier) pushed e's twin
+      // past the fold point — e starts the folded region, so close out
+      // honestly instead of blaming bili for the client's own pre-fold
+      // history (#4388). A nearTwin means something resembling e DID sit in
+      // the frozen window and differ — that stays a violation; attributing
+      // client-mutated heads vs bili rewrites is the loop lane's job, not a
+      // reason to silence the alarm here. A foreign NON-exempt element in the
+      // consumed window cannot ride along silently either: j >= matched always
+      // holds, so it sits at an outbound position the carrier-pin check below
+      // still scans and flags (carrier-drift).
+      if (folded && k >= freezeEnd && !nearTwin) { foldStart = i; break; }
       violations.push({
         kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
         index: i,

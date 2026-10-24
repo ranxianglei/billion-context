@@ -317,3 +317,71 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
+
+// --- #4388: Responses turn separators (#564/#2627) ride the exemption ledger ---
+
+const TURN_SEP = "[The exchange between these two assistant turns was compressed.]";
+
+test("#4388 I1: a Responses turn separator between stable messages is exempt (outbound-only #564 injection)", () => {
+  const entry = [mk("user", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [entry[0]!, mk("user", "text", TURN_SEP), entry[1]!];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.exempt?.carrier, 1);
+});
+
+test("#4388 I1: a separator stack beyond the carrier gap budget stays exempt (gap counts non-carriers only)", () => {
+  const entry = [mk("user", "text", "A"), mk("assistant", "text", "B")];
+  const seps = Array.from({ length: 6 }, () => mk("user", "text", TURN_SEP));
+  const exit = [entry[0]!, ...seps, entry[1]!];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("#4388 NEG: a near-miss user message that resembles the separator still flags mid-insertion", () => {
+  const entry = [mk("user", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [entry[0]!, mk("user", "text", `${TURN_SEP} extra words`), entry[1]!];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-insertion"));
+});
+
+test("#4388 I2: a separator stacked directly before the fold carrier does not mask or fake the fold point", () => {
+  const entry = [
+    mk("user", "text", "preamble"),
+    mk("assistant", "text", "old-1"),
+    mk("user", "text", "old-2"),
+    mk("user", "text", "new question"),
+  ];
+  const exit = [
+    mk("user", "text", "preamble"),
+    mk("user", "text", TURN_SEP),
+    mk("user", "text", "[Compressed conversation section]\nold stuff summarized", { summaryOfBlockId: "b5" }),
+    mk("user", "text", "new question"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.foldStart, 1);
+});
+
+test("#4388 NEG: an unfolded frozen prefix with a missing stable message still flags (no silent fold-out)", () => {
+  const entry = [mk("user", "text", "one"), mk("assistant", "text", "two"), mk("user", "text", "three")];
+  const exit = [mk("user", "text", "one"), mk("user", "text", "three")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop" || x.kind === "mid-history-rewrite"));
+});
+
+test("#4388 NEG: a missing stable message beside a FOREIGN unexplained element before the fold carrier still flags via carrier pinning (close-out safety backstop)", () => {
+  const entry = [mk("user", "text", "one"), mk("assistant", "text", "two"), mk("user", "text", "three")];
+  const exit = [
+    mk("user", "text", "one"),
+    mk("user", "text", "foreign element"),
+    mk("user", "text", "[Compressed conversation section]\nold stuff summarized", { summaryOfBlockId: "b1" }),
+    mk("user", "text", "three"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false, JSON.stringify(v.violations));
+  assert.ok(v.violations.some((x) => x.kind === "carrier-drift"));
+});
