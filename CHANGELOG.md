@@ -7,6 +7,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+### 面板内置官网快照(#4587)
+
+- **`/__bili/site/*` 只读站点端点**:`package.json` files 增 `website`,整站(首页/文档/博客/文库)随安装发布,新模块 `src/web/site.ts` 在保留前缀下静态服务;路径穿越、坏百分号编码与不支持的扩展名(yaml 种子、markdown 源)全部拒绝;目录缺失按 changelog 先例 fail-soft 回 JSON 错误载荷;每个 HTML 响应注入「本地 bili 代理内置副本 · 返回面板」面包屑条。面板顶栏新增「官网 / Site」入口。零新配置键/env/磁盘缓存;副本随自更新前进,GitHub Pages 仍为永远最新的正本(半小时定时重发见 #4561)。
 ### 修复 master 回归(搭乘)
 
 - **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。
