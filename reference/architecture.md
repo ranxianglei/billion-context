@@ -103,6 +103,7 @@ billion-context/
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
+│   ├── session-delete.ts         # Co-delete a conversation's compression artifacts on host-side delete (#2935)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
@@ -208,7 +209,7 @@ When navigating this codebase, these are the load-bearing entry points:
 - **Knobs** — every behavior knob resolves through `src/knobs.ts` (env > config file > default, #2030). Never add a new `process.env` read in a leaf module — see AGENTS.md "Environment Variable Discipline".
 - **Update path** — `src/update.ts` is deliberately self-contained and conservative; it installs via tarball extraction (not `npm install`) to avoid lifecycle-script surprises on user machines. It is load-bearing infrastructure: changes require a no-op validation release first (§5).
 - **Agent plugins** — `src/agent/*.ts` are thin host-specific adapters; shared logic lives in `src/agent/shared.ts`. Each host has a `-native.ts` bootstrap gate variant.
-- **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`.
+- **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`. Host-side deletion teardown (co-delete a conversation's artifacts): `src/session-delete.ts` (#2935).
 - **会话派生缓存** — `Session.transient` 持有插件工具视图与诊断请求副本；随会话淘汰释放，也纳入会话对象图的字节计量。它不写入持久化记录或上游协议；诊断截段独立复制 UTF-16 内容，避免保留完整请求底层字符串（#2920）。
 - **Wire fidelity** — `src/stream-*.ts` files handle per-protocol streaming transformation. The invariant: never alter upstream protocol shape beyond intended injection (§7.3).
 - **E2E regression** — `tests/e2e/` contains real-client suites (codex, opencode, pi, dsh) plus hermetic lanes (registry, advisory-rollback, release-canary, opencode WS, image billing); each carries its own skip gate — read the test header for the exact env var.

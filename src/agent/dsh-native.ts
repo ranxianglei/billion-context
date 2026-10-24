@@ -465,6 +465,39 @@ function reportDshSessionName(base: string | undefined, sid: string | undefined,
     });
 }
 
+// #2935: co-delete a conversation's compression artifacts when the HOST deletes
+// the conversation. Fire-and-forget like the title push above — a delete must
+// never throw into the host event bus. Unlike titles there is no dedup/re-arm:
+// a deletion is one-shot per conversation and the endpoint is idempotent, so a
+// missed push (proxy down at that instant) just leaves bounded artifacts that
+// converge on the opt-in GC (#1082).
+function reportDshSessionDelete(base: string | undefined, sid: string | undefined): void {
+    if (base === undefined || typeof sid !== "string" || sid.length === 0) return;
+    fetch(`${base}/__bili/plugin/delete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId: sid }),
+        signal: AbortSignal.timeout(5000),
+    }).catch(() => {
+        // fire-and-forget: nothing to re-arm (a deleted session stays deleted)
+    });
+}
+
+// #2935: the host shim types the session-bus payload `type` as `unknown` and
+// only `session/title` is referenced in-repo, so the exact deletion spelling is
+// not discoverable from this repo alone. Match the convention-consistent
+// destructive spellings as an EVIDENCE-PERMITLIST (not a substring filter):
+// only these explicit per-session signals act, so a wrong guess degrades to a
+// no-op rather than a spurious delete. If dsh's real spelling differs, add it
+// here — the teardown endpoint is idempotent.
+const DSH_SESSION_DELETE_TYPES: ReadonlySet<string> = new Set([
+    "session/deleted", "session/removed", "session/cleared",
+    "deleted", "removed", "cleared",
+]);
+export function isDshSessionDeleteEvent(type: unknown): boolean {
+    return typeof type === "string" && DSH_SESSION_DELETE_TYPES.has(type);
+}
+
 function seedDshSessionTitle(session: DshSessionLike): void {
     const sid = typeof session.id === "string" ? session.id : undefined;
     const get = titleServices.sessionTitle?.get;
@@ -1779,10 +1812,19 @@ export function apply(ctx: PluginContext): void {
             seedDshSessionTitle(session);
         });
         ctx.on("session/event", (session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => {
-            if (event?.type !== "session/title") return;
-            const title = event.data?.title;
-            if (typeof title !== "string" || title.length === 0) return;
-            reportDshSessionName(register.base, typeof session.id === "string" ? session.id : undefined, title);
+            const sid = typeof session.id === "string" ? session.id : undefined;
+            const type = event?.type;
+            if (type === "session/title") {
+                const title = event.data?.title;
+                if (typeof title === "string" && title.length > 0) reportDshSessionName(register.base, sid, title);
+            } else if (isDshSessionDeleteEvent(type)) {
+                reportDshSessionDelete(register.base, sid);
+            }
+        });
+        // #2935: some hosts surface deletion as its own top-level event (parallel
+        // to session/created) rather than a nested session/event type — cover both.
+        ctx.on("session/deleted", (session: DshSessionLike) => {
+            reportDshSessionDelete(register.base, typeof session.id === "string" ? session.id : undefined);
         });
     }
 

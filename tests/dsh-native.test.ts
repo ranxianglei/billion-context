@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, isDshSessionDeleteEvent, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -483,7 +483,9 @@ type NameCall = { conversationId: string; name: string };
 
 type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+type DeleteCall = { conversationId: string };
+
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void, deleteCalls?: DeleteCall[]): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -503,6 +505,19 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
                 }
                 res.writeHead(nameStatus ?? 200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true }));
+            });
+            return;
+        }
+        if (url === "/__bili/plugin/delete") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                if (deleteCalls !== undefined) {
+                    const parsed = JSON.parse(body) as { conversationId?: unknown };
+                    deleteCalls.push({ conversationId: typeof parsed.conversationId === "string" ? parsed.conversationId : "" });
+                }
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, deleted: [], deferred: [] }));
             });
             return;
         }
@@ -578,8 +593,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void, deleteCalls?: DeleteCall[]): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest, deleteCalls));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -2889,6 +2904,53 @@ test("explicit attach keeps the DSH tool base when a late routed model origin de
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
+});
+
+test("#2935: session deletion events co-delete via /__bili/plugin/delete; non-deletion events never do", async () => {
+    const names: NameCall[] = [];
+    const deletes: DeleteCall[] = [];
+    const proxy = await startMockProxy([], undefined, names, undefined, undefined, undefined, undefined, deletes);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-delete-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            // nested session/event deletion type -> teardown POST
+            ctx.emit("session/event", { id: "s-del" }, { type: "session/deleted" });
+            await waitFor(() => deletes.length === 1, "delete POST");
+            assert.deepEqual(deletes[0], { conversationId: "s-del" });
+
+            // top-level session/deleted event -> teardown POST
+            ctx.emit("session/deleted", { id: "s-top" });
+            await waitFor(() => deletes.length === 2, "top-level delete POST");
+            assert.deepEqual(deletes[1], { conversationId: "s-top" });
+
+            // non-deletion events must leave the delete lane alone
+            ctx.emit("session/event", { id: "s-t" }, { type: "session/title", data: { title: "X", messageSeqs: [1], source: { kind: "user" } } });
+            ctx.emit("session/event", { id: "s-t" }, { type: "message/append", data: {} });
+            await waitFor(() => names.length === 1, "title POST on its own lane");
+            assert.equal(deletes.length, 2, "no spurious delete POST for non-deletion events");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
+    }
+});
+
+test("#2935: isDshSessionDeleteEvent matches only explicit per-session destructive types", () => {
+    assert.equal(isDshSessionDeleteEvent("session/deleted"), true);
+    assert.equal(isDshSessionDeleteEvent("session/removed"), true);
+    assert.equal(isDshSessionDeleteEvent("deleted"), true);
+    assert.equal(isDshSessionDeleteEvent("session/title"), false);
+    assert.equal(isDshSessionDeleteEvent("message/append"), false);
+    assert.equal(isDshSessionDeleteEvent(undefined), false);
+    assert.equal(isDshSessionDeleteEvent(42), false);
 });
 
 // — #2604 host-title channel ————————————————————————————————————————————————

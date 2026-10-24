@@ -22,6 +22,7 @@ import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
+import { deleteSessionArtifacts, personaForkIds } from "./session-delete.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
@@ -882,6 +883,63 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
     markDirty(session);
     if (entry) entry.lastSeen = Date.now();
     res.end(JSON.stringify({ ok: true, conversationId }));
+}
+
+// #2935: host-side conversation deletion (dsh / other agents) co-deletes this
+// conversation's compression artifacts. Loopback-gated like every /__bili/
+// route (src/server/admin.ts). Fires only for THIS conversation's own sessions
+// plus its persona forks (<id>|sub:*); independent child conversations keep
+// their own ids and are left alone. Fire-and-forget friendly: always 200 with
+// what was actually removed, even when nothing was resident (idempotent no-op),
+// because the caller is a periodic reconcile that must not treat "nothing here"
+// as an error.
+export function handlePluginDelete(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: { conversationId?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown };
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
+        return;
+    }
+    void (async () => {
+        const resident = listSessions();
+        const targets = new Set<string>();
+        for (const s of resident) if (s.id === conversationId) targets.add(s.id);
+        for (const id of personaForkIds(conversationId, resident)) targets.add(id);
+        // The map may bind this conversation to a session whose id differs from
+        // the verbatim id (canonical/pck alias) — sweep that too.
+        const entry = conversations.get(conversationId);
+        if (entry) {
+            const bound = peekSession(entry.sessionId) ?? findSessionByCanonicalId(entry.sessionId);
+            if (bound) targets.add(bound.id);
+        }
+        const canonical = findSessionByCanonicalId(conversationId);
+        if (canonical) targets.add(canonical.id);
+        const deleted: string[] = [];
+        const deferred: string[] = [];
+        for (const id of [...targets]) {
+            const outcome = await deleteSessionArtifacts(id);
+            if (outcome.deleted) deleted.push(id);
+            else deferred.push(id);
+        }
+        for (const key of [...conversations.keys()]) {
+            if (key === conversationId || key.startsWith(`${conversationId}|sub:`)) conversations.delete(key);
+        }
+        flushConversations();
+        loggerLog("info", `[plugin-delete] conversation ${conversationId}: deleted=[${deleted.join(", ")}] deferred=[${deferred.join(", ")}]`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, conversationId, deleted, deferred }));
+    })().catch((err: unknown) => {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    });
 }
 
 // #1685: the conversation_id tool parameter is GONE from the manifest — the

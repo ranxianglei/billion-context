@@ -13,7 +13,7 @@ import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginCompact, handlePluginDelete, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
@@ -798,6 +798,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginSessionName(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/delete") {
+        // #2935: host-side conversation deletion co-deletes this conversation's
+        // compression artifacts. Inherits the /__bili/ loopback + trusted-origin
+        // gate above — no web-UI surface is exposed for it (anti-misfire).
+        try {
+            const body = await readBody(req);
+            handlePluginDelete(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
