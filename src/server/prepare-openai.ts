@@ -17,6 +17,7 @@ import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
+import { carriesCodexLocalCompactionSummary, CODEX_LOCAL_COMPACTION_MIN_MISSING, isCodexHost } from "../codex-compact.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -186,6 +187,35 @@ export async function prepareOpenai(
                 }
             }
         }
+        // #4521: codex's local auto-compaction lands on THIS wire too — a codex
+        // configured for chat completions (wire_api=chat, or a declared
+        // providers[].protocol=openai outranking the URL heuristics, #1909)
+        // never transits /v1/responses, so the #2372 detector there cannot see
+        // it. Before this it fell into the generic unannounced-rewrite path
+        // below: misclassified (unconfirmed-signal tier instead of handled
+        // native-compaction) and WITHOUT the immediate rebase — partially-alive
+        // blocks survived syncBlocks and only the #2695 zombie reap cleaned them
+        // up passes later, leaving a dead-anchor window in between. Same
+        // signature+rebase as the responses lane (#2372): codex identity + its
+        // summary template prefix in resent history + decimated fold coverage →
+        // mark AND rebase NOW so this turn's processTurn seeds fresh refs onto
+        // the compacted view instead of poisoning anchors first (the #2432
+        // death spiral). Runs after the dsh block so a profile matching both
+        // keeps the dsh precedence the responses lane has (dshHit wins there).
+        let codexRebased = false;
+        if (!dshRebased && !isTitleGen && isCodexHost(req.headers) && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeCodexCompact = coveredRealHistoryIds(session.state.blocks);
+            const codexGap = foldCoverage(coveredBeforeCodexCompact, msgs.map((m) => m.id));
+            if (codexGap && carriesCodexLocalCompactionSummary(msgs)) {
+                const missing = codexGap.expected - codexGap.matched;
+                if (missing >= CODEX_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= codexGap.expected) {
+                    recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${codexGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                    log("warn", `[${sessionId}] codex local auto-compaction detected (${codexGap.matched}/${codexGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372/#4521)`);
+                    markNativeCompactionBoundary(session);
+                    codexRebased = reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts). The verdict
@@ -274,10 +304,11 @@ export async function prepareOpenai(
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
         // the rewrite was just classified as dsh native compaction above
-        // (#2432): it is already recorded as "native-compaction" and rebased —
-        // a second "unannounced-rewrite" entry beside it would present the
-        // substrate destruction as "another compressor fighting you".
-        if (!dshRebased) {
+        // (#2432) or codex local auto-compaction (#2372/#4521): it is already
+        // recorded as "native-compaction" and rebased — a second
+        // "unannounced-rewrite" entry beside it would present the substrate
+        // destruction as "another compressor fighting you".
+        if (!dshRebased && !codexRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
             if (rewrite.churnExplained) {
                 // #4131: cross-build id re-mint (#3642) — fold-reconcile found every
