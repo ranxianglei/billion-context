@@ -53,20 +53,32 @@ export const VERIFY_EVERY_INGESTS = 20;
  *  every save, and the first clean sample re-admits the session. */
 export const DRIFT_ESCALATE_STREAK = 3;
 
-/** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
- * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
- * placeholder files under the profile dir, a path past MAX_PATH, or a
- * restricted/sandboxed process whose writes Windows integrity control refuses
- * (#3823 field report: a DSH-launched child at low integrity hit exactly this
- * class on its CA bundle) — NOT a corrupt index.db, so the generic "delete
- * the file" recovery advice misleads for that class; name the real suspects
- * instead. Empty elsewhere: every field instance of this failure domain is
- * win32-x64 (#3338/#3385/#3788/#3823), and Linux/macOS CANTOPEN causes
- * (permissions, disk full) are too varied to hint at usefully. */
+/** #3823 + #4614: on win32 two open-time error strings are OS-level refusals,
+ * not a corrupt index.db, so the generic "delete the file" recovery advice
+ * misleads for that class — name the real suspects instead:
+ *  - "unable to open database file" (SQLITE_CANTOPEN): antivirus/Defender
+ *    holding the dir, OneDrive placeholder files, a path past MAX_PATH, or a
+ *    restricted/sandboxed process (#3823 field report: a DSH-launched child at
+ *    low integrity hit exactly this class on its CA bundle);
+ *  - "attempt to write a readonly database" (SQLITE_READONLY family): the
+ *    EXISTING index.db opened fine but the first write was refused — the
+ *    #3823 mechanism surfacing differently once the file already exists
+ *    (Windows integrity control / MIC No-Write-Up: a process launched at lower
+ *    integrity than the file's label cannot write it; AV lock; exclusive
+ *    concurrent writer). Deleting the file here is worse than useless: in
+ *    unified-full mode it may hold the only copy of recent session state.
+ * Empty elsewhere: every field instance of this failure domain is win32-x64
+ * (#3338/#3385/#3788/#3823/#4614), and Linux/macOS causes (permissions, disk
+ * full) are too varied to hint at usefully. */
 export function sqliteOpenFailureHint(err: string): string {
     if (process.platform !== "win32") return "";
-    if (!/unable to open database file/i.test(err)) return "";
-    return " (win32: the OS refused to open the file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
+    if (/unable to open database file/i.test(err)) {
+        return " (win32: the OS refused to open the file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
+    }
+    if (/attempt to write a readonly database/i.test(err)) {
+        return " (win32: 'attempt to write a readonly database' on an EXISTING index.db = the file opened read-only and the first write was refused by the OS — usually Windows integrity control refusing a lower-integrity process (e.g. a DSH-spawned child) to write Medium-labeled files, antivirus/Defender holding the files, or another bili/dsh process holding them exclusively; check labels with icacls %USERPROFILE%\\.local\\share\\billion-context\\sessions\\index.db and re-apply recursive Low labeling (icacls <dir> /setintegritylevel \"(OI)(CI)Low\" /T) before restarting; do NOT delete the file — in unified-full mode it may hold the only copy of recent session state)";
+    }
+    return "";
 }
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
@@ -231,11 +243,16 @@ export class UnifiedShadow {
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
-            // node:sqlite nor a loadable better-sqlite3) — that advice only fits a genuine open
-            // failure; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
+            // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
+            // session state in unified-full mode). The delete advice fits only a genuine corrupt
+            // file; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : `${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`;
+                : hint !== ""
+                    ? hint
+                    : "; delete the file to reset the index";
             loggerLog(
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
