@@ -75,6 +75,17 @@ Effects on the proxy for that session:
 - Session identity is keyed by the conversation id (strongest signal, ahead of all legacy session headers). This also fixes multi-session safety for agents that send no session headers at all.
 - The compression philosophy system prompt, ref tags and nudges keep flowing from the proxy, exactly as in wire mode.
 
+**Optional request-body field** (plugin lanes whose host message model carries stable ids — dsh: `Message.id`, opencode: `UserMessage.id` / `ToolPart.callID`; #2938):
+
+- `_bili_toolcall_ids: string[]` — the host's own stable identifiers for every **tool unit** (each tool-call block and each tool-result message/block) of the re-sent history, **in transcript order**. It is the host-side identity side channel: fold-state reconciliation matches covered messages against these exact ids instead of guessing from content or from wire-sanitized ids, so representation drift (model switches that re-mint ids, reasoning flattening) no longer breaks fold identity.
+
+Semantics the proxy applies:
+
+- **Reserved namespace, stripped unconditionally.** The field is removed from the forwarded body on every prepare path — with or without the `x-bili-plugin` marker — because prepare paths re-serialize the parsed object and any surviving value would reach the upstream provider. Unmarked requests get it stripped but never consumed.
+- **Consumed only when well-formed and count-consistent**: an array of non-empty strings (≤ 10 000 entries; an empty array is legal only when the body carries zero tool units) whose length equals the number of tool units the proxy counts in the same body (same walk as the wire-neutral projection). Any mismatch ⇒ the whole channel is ignored for that request (honest degrade to legacy behavior; logged).
+- **Latest-wins per session.** The last valid list is kept on the session; an absent or rejected field clears it, so a stopped or misbehaving plugin can never leave a stale mapping behind.
+- **Capability gate (mandatory).** The manifest advertises `capabilities.hostIdChannel: { bodyField, maxUnits }`. Plugins MUST check it before stamping: proxies predating this change forward unknown top-level fields verbatim, so an un-gated plugin would leak its id list to the provider. Read the field name from the manifest rather than hard-coding it.
+
 ### 3. `POST /__bili/plugin/tool`
 
 Execute a tool against the conversation's compression state.

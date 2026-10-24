@@ -133,6 +133,7 @@
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { simhashHex, hammingHex } from "./affinity-simhash.js";
+import { HOSTID_BINDINGS_CAP, zipHostUnits } from "./hostid-channel.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
@@ -341,6 +342,9 @@ interface ReconciliationPlan {
     claims: Map<string, string[]>;
     byPos: number;
     byTool: number;
+    /** #2938: claims made by exact host-stable-id equality (the strongest
+     *  channel — self-minted, representation-invariant identifiers). */
+    byHost: number;
     byTwin: number;
     bySim: number;
     byOrder: number;
@@ -400,6 +404,8 @@ export interface FoldReconcileResult {
     claims: number;
     byPos: number;
     byTool: number;
+    /** #2938: cells re-anchored by exact host-stable-id equality. */
+    byHost: number;
     byTwin: number;
     bySim: number;
     byOrder: number;
@@ -811,14 +817,22 @@ function recoveryCandidateIds(blocks: ReadonlyArray<BlockLike>): Set<string> {
  *  stored positional fingerprint copy {ids, canon} (#2487's self-contained
  *  storage shape, adopted); Pass 0 claims by position + canonical fingerprint
  *  before the anchor passes run. */
+/** #2938: exact host-id claim view — THIS pass's newRawId→hostId zip plus the
+ *  persisted derivedRawId→hostId join table. Absent ⇒ pure legacy path. */
+export interface HostIdView {
+    fresh: Map<string, string>;
+    bindings: Record<string, string>;
+}
+
 export function planReconciliation(
     oldOrder: string[],
     anchors: Record<string, FoldAnchor>,
     msgs: CoreMessage[],
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
+    hostView?: HostIdView,
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, absentEverywhere: [], nearDupResidual: [] };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, absentEverywhere: [], nearDupResidual: [] };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -1014,6 +1028,51 @@ export function planReconciliation(
             plan.claims.set(oldId, [usable[0].id]);
             claimedCandidates.add(usable[0].id);
             plan.byTool++;
+        }
+    }
+
+    // Pass 1.25 — host-stable id (#2938): the strongest channel available —
+    // the host's own self-minted identifier, representation-invariant by
+    // construction (owner rule 2026-10-12: self-minted id + order are
+    // first-class, content hash a guardrail). A missing covered id claims the
+    // inbound unit whose FRESH channel slot carries the SAME host id the
+    // persisted join table says that covered id once carried. Double
+    // uniqueness gate: the host id must map to exactly ONE missing old id AND
+    // exactly one unclaimed inbound unit — any ambiguity refuses the claim
+    // (misattribution is the most expensive failure, MESSAGE-IDENTITY.md).
+    // Runs before the twin pass so an authoritative match preempts
+    // same-content guessing.
+    if (missingMiddle.length > 0 && hostView !== undefined) {
+        const hostToMissing = new Map<string, string[]>();
+        for (const oldId of missingMiddle) {
+            const h = hostView.bindings[oldId];
+            if (h === undefined) continue;
+            const arr = hostToMissing.get(h);
+            if (arr === undefined) hostToMissing.set(h, [oldId]);
+            else arr.push(oldId);
+        }
+        if (hostToMissing.size > 0) {
+            const hostToFresh = new Map<string, string[]>();
+            for (const [nid, h] of hostView.fresh) {
+                const arr = hostToFresh.get(h);
+                if (arr === undefined) hostToFresh.set(h, [nid]);
+                else arr.push(nid);
+            }
+            for (const [h, olds] of hostToMissing) {
+                if (olds.length !== 1) continue; // two old identities claim one host id → refuse both
+                const oldId = olds[0];
+                if (oldId === undefined) continue;
+                const freshIds = hostToFresh.get(h);
+                if (freshIds === undefined || freshIds.length !== 1) continue; // host repeated its id → refuse
+                const freshId = freshIds[0];
+                if (freshId === undefined || covered.has(freshId) || claimedCandidates.has(freshId)) continue;
+                const anchor = anchors[oldId];
+                const message = byId.get(freshId);
+                if (anchor?.r !== undefined && message !== undefined && message.role !== anchor.r) continue;
+                plan.claims.set(oldId, [freshId]);
+                claimedCandidates.add(freshId);
+                plan.byHost++;
+            }
         }
     }
 
@@ -1610,7 +1669,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
@@ -1620,7 +1679,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -1633,9 +1692,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS || (opts.inboundMessageCount !== undefined && opts.inboundMessageCount < SIDE_REQUEST_MAX_MSGS)) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
 
     let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1682,7 +1741,27 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         if (changed) anchors = upgraded;
     }
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    // #2938: exact host-id claim view. The validated per-request list is zipped
+    // onto THIS pass's tool units; the persisted join table answers "which
+    // host id did a vanished covered id once carry". A count mismatch between
+    // the two walks degrades to the legacy path for this request (never guess).
+    let hostView: HostIdView | undefined;
+    const hostList = session.metadata.hostToolCallIds;
+    if (Array.isArray(hostList) && hostList.length > 0) {
+        const fresh = zipHostUnits(msgs, hostList);
+        if (fresh !== undefined) {
+            const bindings = (session.metadata.hostIdBindings ?? {}) as Record<string, string>;
+            hostView = { fresh, bindings };
+            const merged: Record<string, string> = { ...bindings };
+            for (const [id, h] of fresh) merged[id] = h;
+            // Overflow clears rather than trims: a partial table would silently
+            // lose exactly the old entries claims depend on.
+            if (Object.keys(merged).length > HOSTID_BINDINGS_CAP) delete session.metadata.hostIdBindings;
+            else session.metadata.hostIdBindings = merged;
+        }
+    }
+
+    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, hostView);
     if (plan.pass0Desync) {
         loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
     }
@@ -2156,12 +2235,12 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byHost: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} by simhash corroboration` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} by order bracket` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}${plan.byShape > 0 ? `, ${plan.byShape} by shape census` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byHost > 0 ? `, ${plan.byHost} by host id` : ""}${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} by simhash corroboration` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} by order bracket` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}${plan.byShape > 0 ? `, ${plan.byShape} by shape census` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} simhash` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} order-bracket` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
@@ -2196,6 +2275,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         claims: plan.claims.size,
         byPos: plan.byPos,
         byTool: plan.byTool,
+        byHost: plan.byHost,
         byTwin: plan.byTwin,
         bySim: plan.bySim,
         byOrder: plan.byOrder,
