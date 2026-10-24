@@ -2112,6 +2112,13 @@ type FileConfig = {
         repetition?: boolean;
         textRunThreshold?: number;
     };
+    /** Native-lane proxy respawn watchdog cadence (#4006) — read in the per-session
+     *  MCP entry processes (zcode/claude/kimi), not the proxy. `intervalMs` is the
+     *  health-probe tick (default 30000, floor 1000); `failureLimit` is consecutive
+     *  failed probes before a respawn (default 3); worst-case recovery window after
+     *  an externally killed lane proxy = interval × failureLimit. Env
+     *  BILI_WATCHDOG_INTERVAL_MS / BILI_WATCHDOG_FAILURE_LIMIT win over both. */
+    watchdog?: { intervalMs?: number; failureLimit?: number };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
@@ -2169,6 +2176,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
+    // #4006:
+    "watchdog",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

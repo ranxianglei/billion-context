@@ -218,6 +218,34 @@ test("startWatchdog: fires on repeated death and survives via unref'd timer", as
     }
 });
 
+test("#4006: watchdogTick without an injected failureLimit resolves the knob live (env tier)", async () => {
+    const plan = { port: ZONE_PORT_BASE, strict: false };
+    return withEnv({ BILI_WATCHDOG_FAILURE_LIMIT: "2", BILI_CONFIG_FILE: "/nonexistent/bili-claude-watchdog-test.json" }, async () => {
+        const f = tickFixture();
+        delete f.deps.failureLimit;
+        await watchdogTick(f.state, plan, f.deps, (m) => f.logs.push(m));
+        assert.equal(f.ensureCalls.length, 0, "first failure accumulates under limit 2");
+        await watchdogTick(f.state, plan, f.deps, (m) => f.logs.push(m));
+        assert.equal(f.ensureCalls.length, 1, "second consecutive failure respawns");
+        assert.equal(f.state.failures, 0);
+    });
+});
+
+test("#4006: startWatchdog resolves BILI_WATCHDOG_INTERVAL_MS when deps omit intervalMs", async () => {
+    const f = tickFixture();
+    const state: MutableWatchdogState = { origin: ORIGIN, failures: 0 };
+    return withEnv({ BILI_WATCHDOG_INTERVAL_MS: "1000", BILI_CONFIG_FILE: "/nonexistent/bili-claude-watchdog-test.json" }, async () => {
+        const timer = startWatchdog(state, { port: ZONE_PORT_BASE, strict: false }, (m) => f.logs.push(m), f.deps);
+        try {
+            const deadline = Date.now() + 5000;
+            while (f.ensureCalls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+            assert.ok(f.ensureCalls.length >= 1, "respawn fired within the floor interval — the default 30s tick never would");
+        } finally {
+            clearInterval(timer);
+        }
+    });
+});
+
 test("main: NODE_TEST_CONTEXT short-circuits before anything runs", async () => {
     let stdio = 0;
     await withEnv({ NODE_TEST_CONTEXT: "1" }, async () => {

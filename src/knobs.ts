@@ -308,6 +308,31 @@ export function guardrailTextRunThreshold(): number {
     return n > 0 ? Math.floor(n) : 0; // 0 or negative = lane off
 }
 
+// --- native-lane proxy respawn watchdog (#4006) — read in the per-session MCP
+// entry processes (zcode/claude/kimi), which are bili processes spawned by the
+// client host; both tiers resolve exactly as they do inside the proxy. ---
+
+const LANE_WATCHDOG_INTERVAL_DEFAULT_MS = 30_000;
+const LANE_WATCHDOG_INTERVAL_FLOOR_MS = 1_000;
+const LANE_WATCHDOG_FAILURE_LIMIT_DEFAULT = 3;
+
+/** BILI_WATCHDOG_INTERVAL_MS > watchdog.intervalMs > 30000. Health-probe tick of the
+ *  per-session lane watchdogs (#1821/#963); worst-case recovery window after an
+ *  externally killed lane proxy is interval × failureLimit (~90 s at defaults, #4006).
+ *  Floor 1000 ms guards against a seconds-vs-ms typo degenerating the probe into a hot
+ *  loop; below-floor values fall back to the default. */
+export function laneWatchdogIntervalMs(): number {
+    const v = tInt("BILI_WATCHDOG_INTERVAL_MS", loadConfigFile().watchdog?.intervalMs);
+    return Number.isFinite(v) && v >= LANE_WATCHDOG_INTERVAL_FLOOR_MS ? Math.floor(v) : LANE_WATCHDOG_INTERVAL_DEFAULT_MS;
+}
+
+/** BILI_WATCHDOG_FAILURE_LIMIT > watchdog.failureLimit > 3. Consecutive failed probes
+ *  before the lane watchdog respawns the proxy (#4006). */
+export function laneWatchdogFailureLimit(): number {
+    const v = tInt("BILI_WATCHDOG_FAILURE_LIMIT", loadConfigFile().watchdog?.failureLimit);
+    return Number.isFinite(v) && v >= 1 ? Math.floor(v) : LANE_WATCHDOG_FAILURE_LIMIT_DEFAULT;
+}
+
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
 export function persistZstdEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST_ZSTD;

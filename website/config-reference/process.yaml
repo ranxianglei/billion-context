@@ -235,6 +235,30 @@ entries:
     group: process
     desc_en: "Repeat interval for the EPERM alert; 0 logs it once."
     desc_zh: "EPERM 告警的重复间隔；0 只记录一次。"
+  - key: watchdog
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.watchdog
+    site_group: proc
+    desc_en: "Native-lane proxy respawn watchdog cadence (per-session zcode/claude/kimi MCP entries, #4006)."
+    desc_zh: "原生车道 proxy 重生看门狗节拍（每会话的 zcode/claude/kimi MCP entry，#4006）。"
+    site_en: "<code>watchdog</code> — native-lane proxy respawn watchdog cadence: <span class='mech'>intervalMs 30000 (floor 1000) · failureLimit 3</span>."
+    site_zh: "<code>watchdog</code> —— 原生车道 proxy 重生看门狗节拍：<span class='mech'>intervalMs 30000（下限 1000）· failureLimit 3</span>。"
+  - key: watchdog.intervalMs
+    type: number
+    default: "30000 (floor 1000)"
+    env: BILI_WATCHDOG_INTERVAL_MS
+    group: process
+    desc_en: "Health-probe tick of the lane watchdogs; worst-case recovery window after an externally killed lane proxy = interval x failureLimit (~90 s at defaults - the 64 s measured in #4006). Values below 1000 fall back to the default (seconds-vs-ms typo guard)."
+    desc_zh: "车道看门狗的健康探针节拍；车道 proxy 被外部杀死后的最坏恢复窗口 = interval × failureLimit（默认约 90 秒——#4006 实测 64 秒）。低于 1000 的值回退默认值（秒/毫秒笔误防护）。"
+  - key: watchdog.failureLimit
+    type: number
+    default: "3"
+    env: BILI_WATCHDOG_FAILURE_LIMIT
+    group: process
+    desc_en: "Consecutive failed probes before the lane watchdog respawns the proxy."
+    desc_zh: "车道看门狗重生 proxy 前允许的连续失败探针次数。"
   - key: storage
     type: object
     default: "{} (all defaults)"

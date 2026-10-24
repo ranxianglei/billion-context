@@ -182,6 +182,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | Token-size tail of recent messages kept as raw text for export fidelity. |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | Consecutive EPERM write failures before alerting in the log. |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | Repeat interval for the EPERM alert; 0 logs it once. |
+| `watchdog` | object | {} (all defaults) | — | Native-lane proxy respawn watchdog cadence (per-session zcode/claude/kimi MCP entries, #4006). |
+| `watchdog.intervalMs` | number | 30000 (floor 1000) | BILI_WATCHDOG_INTERVAL_MS | Health-probe tick of the lane watchdogs; worst-case recovery window after an externally killed lane proxy = interval x failureLimit (~90 s at defaults - the 64 s measured in #4006). Values below 1000 fall back to the default (seconds-vs-ms typo guard). |
+| `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | Consecutive failed probes before the lane watchdog respawns the proxy. |
 | `storage` | object | {} (all defaults) | — | Unified SQLite storage sidecar settings (#2671). |
 | `storage.unified` | legacy\|shadow\|full | unset (full) | BILI_STORAGE_UNIFIED | Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). Absent everywhere now defaults to FULL (#3818 flip - the shadow dry-run reconciled cleanly since #2815, so the index is the load path; JSON envelopes keep being written, and legacy remains the one-line escape hatch). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar. |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | Storage backend selection (#3388 / #3931): the unified store consumes an operation-level async StorageBackend contract. sqlite is the default (the existing UnifiedStore behind a Promise-wrapped adapter). mysql is FULLY WIRED (steps 2+3): openBackend("mysql", dsn) opens the real MysqlBackend against MySQL 8.0 — the full contract surface (ingest with CAS refcounts, reads, session_ext, reap journal, archive/restore/gc, checkpoints, conversations), with mysql2 bundled as a regular dependency and loaded lazily (boots that never select mysql never load it). The proxy hot path is wired through the async shadow facade: saves enqueue onto a serial backend queue (watermark deltas, orphan/reap journal, digest sampling — sqlite keeps its zero-await sync fast path unchanged), SYNC reads ride the JSON envelope (the sidecar attaches asynchronously via ready(); viewFor/importRecord sync facades miss by design), replicas/ext/GC/export speak the async twins. writerOff stays sqlite-only (the envelope is the mysql sync read path). Unknown names fall back to sqlite with a notice. Resolved once per lane boot. |
@@ -994,6 +997,13 @@ Security boundary: the file controls ONLY *when* to upgrade and *which published
 - **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
 - **Status:** ACTIVE
 - **Description:** Fake-completion safety net for hosts that abort mid-stream (#371) — **opt-in**, `retries: 0` (default) is the pre-#371 passthrough. `bufCapBytes` is the OOM guard on the buffered response. Twins `BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP`.
+
+### `watchdog`
+
+- **Type:** `{ intervalMs?: number; failureLimit?: number }`
+- **Default:** `{ intervalMs: 30000, failureLimit: 3 }`
+- **Status:** ACTIVE (#4006)
+- **Description:** Cadence of the per-session native-lane proxy respawn watchdog — the tick runs inside each client-spawned MCP entry process (zcode #1145, claude #1821, kimi #963), NOT inside the proxy itself. Every tick probes the lane proxy's local health endpoint (2 s timeout); after `failureLimit` consecutive failed probes the entry respawns the proxy through the same launcher path used at session boot (re-routing/re-pinning as needed). Worst-case recovery window after an externally killed lane proxy is therefore interval × failureLimit (~90 s at defaults — the 64 s measured in #4006). Both keys resolve env > file > default; `intervalMs` is read once when the watchdog arms (takes effect on the next session's entry) while `failureLimit` is read per tick (a config-file edit takes effect within one tick even for a running entry). `intervalMs` below 1000 falls back to the default — a seconds-vs-ms typo must not degenerate the probe into a hot loop. Twins `BILI_WATCHDOG_INTERVAL_MS`, `BILI_WATCHDOG_FAILURE_LIMIT`.
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
@@ -1838,6 +1848,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WATCHDOG_FAILURE_LIMIT` | `watchdog.failureLimit` | 3 |
+| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000 (floor 1000) |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |

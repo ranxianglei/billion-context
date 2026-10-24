@@ -16,6 +16,7 @@ import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
 import { resolveZcodeNativePort } from "../config.js";
 import { closeLogger, configureLogger, log as teeLog } from "../logger.js";
 import { defaultLogFile } from "../paths.js";
+import { laneWatchdogFailureLimit, laneWatchdogIntervalMs } from "../knobs.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import type { ZcodeRoutePolicy } from "./json-edit.js";
 import {
@@ -29,8 +30,6 @@ import {
     zcodePolicyFromEnv,
 } from "./native.js";
 
-const WATCHDOG_INTERVAL_MS = 30000;
-const WATCHDOG_FAILURE_LIMIT = 3;
 const HANDOFF_TIMEOUT_MS = 5000;
 
 export interface ZcodeWatchdogDeps {
@@ -82,7 +81,7 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
     const repair = deps.repair ?? ((selfOrigin: string) => repairSharedStoreDrift({ selfOrigin, log }));
     if (await probe(state.origin)) {
         state.failures = 0;
-    } else if (state.failures + 1 < (deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT)) {
+    } else if (state.failures + 1 < (deps.failureLimit ?? laneWatchdogFailureLimit())) {
         state.failures += 1;
     } else {
         if (externallyOwned) {
@@ -122,7 +121,7 @@ function startWatchdog(
         void zcodeWatchdogTick(state, externallyOwned, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { busy = false; });
-    }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
+    }, deps.intervalMs ?? laneWatchdogIntervalMs());
     timer.unref?.();
 }
 

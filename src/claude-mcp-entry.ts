@@ -4,7 +4,8 @@
 // respawns the lane proxy when it dies MID-SESSION: the model channel rides
 // claude's own HTTP client against the static baked base URL, and nothing else
 // re-arms it until the next SessionStart hook (which does not re-run mid-session).
-// Mirrors src/zcode/mcp-entry.ts (30 s tick × 3 failures). No exit handoff is
+// Mirrors src/zcode/mcp-entry.ts (30 s tick × 3 failures by default — #4006 knobs).
+// No exit handoff is
 // needed: the proxy watches the claude host pid (parent-gone anti-orphan) and
 // the next hook drops dead pins via pid liveness (launcher.ts attach filter).
 // Logs go through the shared bili.log tee because claude does not surface this
@@ -16,11 +17,9 @@ import { resolveProxyOrigin, runMcpStdio } from "./mcp.js";
 import { configureLogger, log as teeLog } from "./logger.js";
 import { defaultLogFile } from "./paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, healthUrl } from "./launcher.js";
+import { laneWatchdogFailureLimit, laneWatchdogIntervalMs } from "./knobs.js";
 import { chooseWatchdogParentPid, planClaudeNativeBootstrap } from "./claude-native-bootstrap.js";
 import { repinClaudeManagedBaseUrl, readClaudeManagedBaseUrl } from "./plugin-install.js";
-
-const WATCHDOG_INTERVAL_MS = 30000;
-const WATCHDOG_FAILURE_LIMIT = 3;
 
 /** dist/claude-mcp-entry.js → sibling dist/index.js (the package bin) — the
  *  same guard as claude-native-bootstrap's proxyScriptPath: ensureProxyRunning's
@@ -67,7 +66,7 @@ export interface MutableWatchdogState extends WatchdogState {
  *  hook) and follows it in our own BILI_MCP_PROXY pin so bili tools keep working. */
 export async function watchdogTick(state: MutableWatchdogState, plan: { port: number; strict: boolean }, deps: WatchdogDeps, log: (msg: string) => void): Promise<void> {
     const probeFn = deps.probe ?? probeProxyHealth;
-    const limit = deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT;
+    const limit = deps.failureLimit ?? laneWatchdogFailureLimit();
     if (await probeFn(state.origin)) {
         state.failures = 0;
         return;
@@ -116,7 +115,7 @@ export function startWatchdog(state: MutableWatchdogState, plan: { port: number;
         void watchdogTick(state, plan, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { busy = false; });
-    }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
+    }, deps.intervalMs ?? laneWatchdogIntervalMs());
     timer.unref?.();
     return timer;
 }
