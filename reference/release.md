@@ -270,9 +270,12 @@ opinion): if the fix applies cleanly onto the tag-based train and stands alone t
 → small fix, fast lane. If it conflicts or depends on unreleased master work → slow
 lane, rides the next regular release. New features never take the train.
 
-**Mechanics:** the only manual steps are the label and the ship decision;
-cutting the train, backporting, and closing the cycle after ship are all
-automatic. The open train is **derived, never stored**: the newest
+**Mechanics:** the only manual steps are the label, the carry merge, and the ship
+decision; cutting the train, carrying fixes, refreshing, and closing the cycle
+after ship are all automatic. The bot never pushes the train directly — fixes
+land on it through carry PRs the owner clicks (label-time creation, owner rule
+2026-10-24 session #2: "打 backport 里面出一个一样的 pr，不是合并的时候才出").
+The open train is **derived, never stored**: the newest
 `bugfix-release/*` branch whose BASE version is strictly above the latest
 `v*` tag (suffix stripped — `v0.1.206-train` counts as 0.1.206, so once the
 tag catches up the train auto-derives as closed). Cutting one = pushing such
@@ -282,24 +285,31 @@ actions-variables API (403 "Resource not accessible by integration"; no
 `permissions:` category grants it), which is exactly how the first,
 variable-based version of the bot failed on its maiden run.
 
-1. **Route a fix onto the train**: merge its PR to master as usual, with the
-   `backport` label set BEFORE clicking merge. `backport.yml` then:
+1. **Route a fix onto the train**: add the `backport` label to its PR —
+   the carry PR appears IMMEDIATELY (label time, not merge time).
+   `backport.yml` then:
    - cuts a train automatically if none is open — `bugfix-release/v{NEXT}-train`
      from the latest released `v*` tag (NEXT = patch+1) — and says so on the PR;
-   - cherry-picks the PR's own commits onto the train (merge-commit range
-     `merge^1..merge^2`, housekeeping merges inside the PR branch excluded via
-     `--no-merges`) and pushes;
-   - dispatches the CORE CI matrix on the train head (#772: token pushes carry
-     no push events) and leaves an audit comment.
-   Only MERGE-COMMIT merges are auto-backported (the repo convention):
-   squash/rebase merges rewrite the commit SHAs, and for a multi-commit rebase
-   picking just the final commit would silently ship a PARTIAL fix — the bot
-   refuses to guess and comments the manual command instead. No label → master
-   lane only, nothing lost (the bot says so on the PR). A cherry-pick conflict
-   is the objective "not a small fix" signal — the fix stays on master and the
-   bot comments the manual command. The workflow also has a manual dispatch
-   (`pr=<number>`) as the repair path — same merged+label gates — e.g. to
-   retry a backport after a workflow bug.
+   - cherry-picks the PR's own commits onto a carry branch `backport/<n>`
+     (built from the CURRENT train tip; open-PR picks use the exact PR-branch
+     range `base..head`, housekeeping merges excluded via `--no-merges`) and
+     opens the carry PR — same content, same title, different base (the train);
+   - dispatches the CORE CI matrix on the carry branch (#772: token pushes
+     carry no push events) and leaves an audit comment with the carry link.
+   New commits pushed to the labeled PR refresh the carry branch automatically
+   (same carry PR). Merging the original PR does a final refresh; closing it
+   unmerged closes the carry PR automatically. The owner merges the carry PR
+   into the train whenever ready — that merge is the only way a fix reaches
+   the train.
+   For repairs on ALREADY-merged PRs (late label, or the manual dispatch
+   `pr=<number>`) only MERGE-COMMIT merges are auto-carried (the repo
+   convention): squash/rebase merges rewrite the commit SHAs, and for a
+   multi-commit rebase picking just the final commit would silently ship a
+   PARTIAL fix — the bot refuses to guess and comments the manual command
+   instead. No label → master lane only, nothing lost (the bot says so on the
+   PR). A cherry-pick conflict is the objective "not a small fix" signal —
+   the fix stays on master and the bot comments the manual command (a
+   previously created carry keeps its last good content).
 2. **Ship the train** (the one owner decision — releases are owner-gated,
     #2910): **Actions → "Release (one-click)" → Run workflow → tick `train`**.
     That does the whole dance: derives the open train, checks it out,
