@@ -30,7 +30,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, collectUncoveredTailItems, FORGED_TAIL_HEADER, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, renderUncoveredTailText, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -534,22 +534,34 @@ export async function prepareResponses(
             session.metadata.codexForgedSummaries = captured;
             markDirty(session);
         }
+        // #4035: the recent work BETWEEN the last fold and now sits in neither
+        // the block summaries nor codex's retention (user messages only in the
+        // trigger form, prose summary in the prompt form) — carry it in the
+        // forged handoff or it vanishes from the model's view after a local
+        // forge compaction. Coverage reads the active folds just materialized
+        // above (session.state = turn.state before this block).
+        const uncoveredTail = responsesProjection !== undefined
+            ? collectUncoveredTailItems(responsesProjection, session.state.blocks, { excludePromptTemplate: compactForm === "prompt" })
+            : [];
         // Codex recomputes its ledger from the next real request, but the
         // usage we mint here must not read as an empty context: fall back to
         // estimating the payload itself when lastInputTokens is stale/zero.
         // The reply honors parsed.stream (JSON body when not streaming).
         const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
         const total = Math.max(session.stats.lastInputTokens, est, 1);
+        const usage = { inputTokens: total, outputTokens: 0, totalTokens: total };
         codexForge = compactForm === "trigger"
             ? {
                 kind: "trigger",
-                ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+                ...buildTriggerForgeBody(summaries.join("\n\n"), usage, stream, uncoveredTail),
             }
             : {
                 kind: "prompt",
-                ...buildPromptForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+                ...buildPromptForgeBody(
+                    summaries.join("\n\n") + (uncoveredTail.length > 0 ? `\n\n${FORGED_TAIL_HEADER}\n\n${renderUncoveredTailText(uncoveredTail)}` : ""),
+                    usage, stream),
             };
-        log("info", `[${sessionId}] codex compact intercepted (${compactForm} form); forged ${stream ? "SSE" : "JSON"} with ${summaries.length} block summary(s), upstream not contacted`);
+        log("info", `[${sessionId}] codex compact intercepted (${compactForm} form); forged ${stream ? "SSE" : "JSON"} with ${summaries.length} block summary(s) + ${uncoveredTail.length} uncovered tail item(s)${uncoveredTail.length > 0 ? ` (~${Math.round(JSON.stringify(uncoveredTail).length / 1024)} KiB)` : ""}, upstream not contacted`);
     }
 
     // #1479: Responses-wire twin of the #762 repair — fold + kernel round-trip

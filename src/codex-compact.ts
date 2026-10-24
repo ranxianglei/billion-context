@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { CompressionBlock } from "acp-kernel";
+import { baseIdOf, type CompressionBlock } from "acp-kernel";
+import type { ResponseInputItem, ResponsesProjection } from "acp-kernel/wire";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
@@ -165,48 +166,235 @@ export function stripBiliCompactionItems<T>(input: T[]): T[] {
     return input.filter((item) => !isBiliCompactionItem(item));
 }
 
-// The summary text a forged blob carries (sentinel-prefixed plaintext).
-function extractBiliSummary(item: unknown): string | undefined {
-    const it = item as { encrypted_content?: unknown } | null;
-    if (!it || typeof it.encrypted_content !== "string") return undefined;
-    if (!it.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL)) return undefined;
-    const text = it.encrypted_content.slice(CODEX_COMPACT_SENTINEL.length);
-    return text.length > 0 ? text : undefined;
-}
-
-// An echoed fc_bili_ compaction item is REPLACED (in place) by a plain user
-// message carrying the extracted summary — a history-borne handoff the kernel
-// can fold again and codex's retention keeps. Rare bounded duplication (a
-// block whose anchors survived the truncation also renders) is accepted over
-// data loss. Marker items without an extractable blob (id-prefix-only, e.g.
-// minted by an older build) are still dropped; real OpenAI blobs pass through
-// untouched.
 // #1634: exact handoff header the model sees on the responses wire; the
 // output-side stripper keys off this constant (single source of truth).
 export const CODEX_FORGED_HANDOFF_HEADER = "[bili] context summary after compaction:";
 
-export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replaced: number; dropped: number } {
+// #4035: forged blobs minted since this build carry the UNCOVERED tail
+// alongside the block summaries in a v2 JSON envelope. Pre-v2 blobs stay
+// sentinel-prefixed PLAINTEXT (older builds minted them) — expansion below
+// keeps reading them byte-for-byte, so a mid-session upgrade never loses an
+// already-echoed marker.
+const CODEX_COMPACT_BLOB_V2_PREFIX = `${CODEX_COMPACT_SENTINEL}v2:`;
+
+interface CodexForgePayload {
+    v: 2;
+    summaries: string[];
+    tail: ResponseInputItem[];
+}
+
+function forgeBlob(payload: CodexForgePayload): string {
+    return `${CODEX_COMPACT_BLOB_V2_PREFIX}${JSON.stringify(payload)}`;
+}
+
+function parseForgeV2Blob(blob: string): CodexForgePayload | undefined {
+    try {
+        const parsed = JSON.parse(blob.slice(CODEX_COMPACT_BLOB_V2_PREFIX.length)) as Partial<CodexForgePayload>;
+        if (parsed.v !== 2 || !Array.isArray(parsed.summaries) || !parsed.summaries.every((s) => typeof s === "string") || !Array.isArray(parsed.tail)) return undefined;
+        return { v: 2, summaries: parsed.summaries, tail: parsed.tail };
+    } catch {
+        return undefined;
+    }
+}
+
+interface BiliForgeHandoff {
+    summaryText: string;
+    tail: ResponseInputItem[];
+}
+
+// The full handoff an echoed fc_bili_ blob carries: the fold summaries plus
+// (#4035) the uncovered recent tail captured at forge time. Legacy plain-text
+// blobs expand to summaries only; marker items with no extractable blob yield
+// undefined (drop path).
+function extractBiliForge(item: unknown): BiliForgeHandoff | undefined {
+    const it = item as { encrypted_content?: unknown } | null;
+    if (!it || typeof it.encrypted_content !== "string") return undefined;
+    const blob = it.encrypted_content;
+    if (!blob.startsWith(CODEX_COMPACT_SENTINEL)) return undefined;
+    if (blob.startsWith(CODEX_COMPACT_BLOB_V2_PREFIX)) {
+        const payload = parseForgeV2Blob(blob);
+        if (!payload) return undefined;
+        return { summaryText: payload.summaries.join("\n\n"), tail: payload.tail };
+    }
+    const text = blob.slice(CODEX_COMPACT_SENTINEL.length);
+    return text.length > 0 ? { summaryText: text, tail: [] } : undefined;
+}
+
+// Key-order-insensitive fingerprint for the echo-time dedup below: the tail
+// items were serialized by bili at forge time, the retained copies were
+// (re)serialized by codex — same logical object, possibly different key
+// order, so a naive stringify comparison would miss the overlap.
+function stableFingerprint(value: unknown): string | undefined {
+    try {
+        const walk = (v: unknown): unknown =>
+            Array.isArray(v) ? v.map(walk)
+                : v !== null && typeof v === "object"
+                    ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, val]) => [k, walk(val)]))
+                    : v;
+        return JSON.stringify(walk(value));
+    } catch {
+        return undefined;
+    }
+}
+
+// An echoed fc_bili_ compaction item is REPLACED (in place) by a plain user
+// message carrying the extracted summary — a history-borne handoff the kernel
+// can fold again and codex's retention keeps — followed (#4035) by the
+// uncovered tail items that ride behind it verbatim. Tail items codex ITSELF
+// still carries verbatim in the same input (its retention keeps recent user
+// messages) are skipped — carrying them too would double the newest turns
+// until the next fold; only what codex dropped (assistant progress, tool
+// drafts/results) is the gap this fills. Rare bounded duplication (a block
+// whose anchors survived the truncation also renders) is accepted over data
+// loss. Marker items without an extractable blob (id-prefix-only, e.g. minted
+// by an older build) are still dropped; real OpenAI blobs pass through
+// untouched.
+export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replaced: number; dropped: number; tailItems: number } {
+    const present = new Set<string>();
+    for (const item of input) {
+        if (isBiliCompactionItem(item)) continue;
+        const fp = stableFingerprint(item);
+        if (fp !== undefined) present.add(fp);
+    }
     const items: T[] = [];
     let replaced = 0;
     let dropped = 0;
+    let tailItems = 0;
     for (const item of input) {
         if (!isBiliCompactionItem(item)) {
             items.push(item);
             continue;
         }
-        const summary = extractBiliSummary(item);
-        if (summary === undefined) {
+        const handoff = extractBiliForge(item);
+        if (handoff === undefined) {
             dropped++;
             continue;
         }
         items.push({
             type: "message",
             role: "user",
-            content: [{ type: "input_text", text: `${CODEX_FORGED_HANDOFF_HEADER}\n${summary}` }],
+            content: [{ type: "input_text", text: `${CODEX_FORGED_HANDOFF_HEADER}\n${handoff.summaryText}` }],
         } as T);
+        for (const t of handoff.tail) {
+            const fp = stableFingerprint(t);
+            if (fp !== undefined && present.has(fp)) continue;
+            items.push(t as T);
+            tailItems += 1;
+        }
         replaced++;
     }
-    return { items, replaced, dropped };
+    return { items, replaced, dropped, tailItems };
+}
+
+// #4035: the resent-history items NO active fold covers — the recent work
+// between the last fold and compaction time (assistant progress, tool drafts
+// and results, reasoning). Codex's own retention keeps only USER messages
+// (remote v2 form) or adopts a prose summary (inline prompt form), so without
+// this carry the unfolded tail vanishes from the model's view after a local
+// forge compaction — exactly the loss a real upstream compaction never makes
+// (it summarizes the WHOLE input). Collection walks the projection LAYOUT
+// (one slot per input item, in order):
+//   - slots without a core id (preamble scaffolding, sys/dev, the trailing
+//     compaction_trigger) are wire furniture, not conversation content;
+//   - fully covered slots are already summarized by an active block —
+//     carrying them would duplicate folded bytes;
+//   - PARTIALLY covered multi-core slots (split user items #3642, demoted-
+//     thinking splits) are skipped honestly: carrying the whole item would
+//     resurrect bytes the kernel folded out of it;
+//   - everything else rides byte-exact (slot.original), thinking-family bytes
+//     included verbatim per the signature rule (KDD #10: move, never rewrite).
+export function collectUncoveredTailItems(
+    projection: Pick<ResponsesProjection, "layout">,
+    blocks: readonly CompressionBlock[],
+    opts?: { excludePromptTemplate?: boolean },
+): ResponseInputItem[] {
+    const covered = new Set<string>();
+    for (const b of blocks) {
+        if (!b.active) continue;
+        for (const id of b.effectiveMessageIds) covered.add(baseIdOf(id));
+    }
+    const slots = Array.isArray(projection.layout) ? projection.layout : [];
+    // Prompt form: the LAST user message IS codex's SUMMARIZATION_PROMPT
+    // template (hasCompactionPrompt anchors on it) — it is the instruction,
+    // not conversation content, and must not ride into future turns.
+    let lastUserSlot = -1;
+    for (let i = 0; i < slots.length; i++) {
+        const original = slots[i].original as ResponseInputItem | null;
+        if (original && original.type === "message" && original.role === "user") lastUserSlot = i;
+    }
+    const tail: ResponseInputItem[] = [];
+    for (let i = 0; i < slots.length; i++) {
+        const slot = slots[i];
+        if (opts?.excludePromptTemplate && i === lastUserSlot) continue;
+        const ids = Array.isArray(slot.coreIds) && slot.coreIds.length > 0 ? slot.coreIds : slot.coreId !== undefined ? [slot.coreId] : [];
+        if (ids.length === 0) continue;
+        let anyCovered = false;
+        for (const id of ids) {
+            if (covered.has(baseIdOf(id))) {
+                anyCovered = true;
+                break;
+            }
+        }
+        if (anyCovered) continue;
+        tail.push(slot.original);
+    }
+    return tail;
+}
+
+// Prompt-form channel is prose: the forged assistant message is adopted as
+// codex's summary TEXT, so the uncovered tail renders here as labeled lines
+// instead of structured items (the trigger form carries the raw items). No
+// truncation — the recent draft IS the content this fixes the loss of.
+export const FORGED_TAIL_HEADER = "[Recent work since the last fold (not yet summarized)]";
+
+function contentPartText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    const parts: string[] = [];
+    for (const p of content) {
+        const part = p as { type?: unknown; text?: unknown } | null;
+        if (!part || typeof part !== "object") continue;
+        if (typeof part.text === "string" && (part.type === "input_text" || part.type === "output_text" || part.type === "text" || part.type === undefined)) parts.push(part.text);
+        else if (part.type === "input_image" || part.type === "output_image") parts.push("[image]");
+    }
+    return parts.join("");
+}
+
+export function renderUncoveredTailText(tail: readonly ResponseInputItem[]): string {
+    const lines: string[] = [];
+    for (const item of tail) {
+        const it = item as { type?: unknown; role?: unknown; name?: unknown; call_id?: unknown; arguments?: unknown; output?: unknown; input?: unknown; summary?: unknown; content?: unknown };
+        switch (it.type) {
+            case "reasoning": {
+                const s = it.summary;
+                const text = Array.isArray(s)
+                    ? s.map((p) => (p as { text?: unknown } | null)?.text).filter((t): t is string => typeof t === "string").join("")
+                    : "";
+                if (text.trim().length > 0) lines.push(`[thinking]\n${text}`);
+                break;
+            }
+            case "message": {
+                const text = contentPartText(it.content ?? "");
+                if (text.trim().length > 0) lines.push(`[${it.role === "assistant" ? "assistant" : "user"}]\n${text}`);
+                break;
+            }
+            case "function_call":
+                lines.push(`[tool call ${String(it.call_id)}] ${String(it.name)}(${typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? "")})`);
+                break;
+            case "function_call_output":
+                lines.push(`[tool result ${String(it.call_id)}]\n${contentPartText(it.output)}`);
+                break;
+            case "custom_tool_call":
+                lines.push(`[custom tool call ${String(it.call_id)}] ${JSON.stringify(it.input ?? "")}`);
+                break;
+            case "custom_tool_call_output":
+                lines.push(`[custom tool result ${String(it.call_id)}]\n${contentPartText(it.output)}`);
+                break;
+            default:
+                break;
+        }
+    }
+    return lines.filter((l) => l.trim().length > 0).join("\n\n");
 }
 
 // Safety valve preconditions (#332): evaluable BEFORE the kernel transform so
@@ -240,11 +428,18 @@ export function buildTriggerForgeBody(
     summaryText: string,
     usage: { inputTokens: number; outputTokens: number; totalTokens: number },
     stream: boolean,
+    // #4035: uncovered recent tail to hand off. Non-empty switches the blob to
+    // the v2 JSON envelope; empty keeps the legacy plain-sentinel byte shape
+    // stable across builds (no-tail sessions see no wire change).
+    tail?: readonly ResponseInputItem[],
 ): { body: string; contentType: string } {
+    const encryptedContent = Array.isArray(tail) && tail.length > 0
+        ? forgeBlob({ v: 2, summaries: summaryText.length > 0 ? [summaryText] : [], tail: [...tail] })
+        : `${CODEX_COMPACT_SENTINEL}${summaryText}`;
     const compactionItem = {
         type: "compaction",
         id: `${CODEX_COMPACT_ID_PREFIX}${randomUUID()}`,
-        encrypted_content: `${CODEX_COMPACT_SENTINEL}${summaryText}`,
+        encrypted_content: encryptedContent,
     };
     const usageJson = {
         input_tokens: usage.inputTokens,

@@ -649,3 +649,120 @@ test("prompt-form detection is codex-only: same template from a non-codex client
         assert.ok(await reachesUpstreamRequests(h, 1, 2_000), "non-codex UA → ordinary turn");
     });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #4035: the trigger/prompt forge handed off ONLY the active-block
+// summaries. The recent work between the last fold and compaction time (here:
+// conversation messages 2..6 — assistant progress / drafts not yet folded) sat
+// in neither the summaries nor codex's retention (remote v2 keeps USER
+// messages only; inline adopts a prose summary), so after a local forge
+// compaction it vanished from the model's view — the model regressed to older
+// progress. A real upstream compaction summarizes the WHOLE input; the local
+// forge must be coverage-complete. The forged blob now carries the uncovered
+// tail (v2 envelope); on echo it expands back in place, deduping copies codex
+// itself still retains.
+// ---------------------------------------------------------------------------
+
+import { FORGED_TAIL_HEADER } from "../src/codex-compact.ts";
+
+const V2_PREFIX = "bili:acp:v2:";
+
+test("e2e #4035 (trigger form): forged handoff carries the uncovered recent tail end-to-end", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+
+        // Turn 2: native auto-compact trigger → intercepted + forged.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        const frames = (await r2.text()).split("\n\n").filter((f) => f.startsWith("data: "));
+        const e1 = JSON.parse(frames[0]!.slice("data: ".length)) as { item: { type: string; id: string; encrypted_content: string } };
+        assert.equal(e1.item.type, "compaction");
+        assert.ok(e1.item.encrypted_content.startsWith(V2_PREFIX), "uncovered tail present → v2 envelope");
+        const payload = JSON.parse(e1.item.encrypted_content.slice(V2_PREFIX.length)) as { v: number; summaries: string[]; tail: unknown[] };
+        assert.equal(payload.v, 2);
+        assert.ok(payload.summaries.some((s) => s.includes("MAIN-SUMMARY-SETUP")), "fold summary in the payload");
+        const tailJson = JSON.stringify(payload.tail);
+        for (let i = 2; i <= 6; i++) assert.ok(tailJson.includes(`WORK_${i}_content_`), `uncovered message ${i} carried in the forged blob`);
+        assert.ok(!tailJson.includes("WORK_0_content_") && !tailJson.includes("WORK_1_content_"), "covered messages are NOT re-carried (already summarized by the active block)");
+        assert.equal(h.bodies.length, afterSetup, "upstream untouched (zero-egress contract holds)");
+
+        // Turn 3: codex replays [forged item, retained recent user msgs, new
+        // turn]. The echo must expand into the summary handoff PLUS the
+        // previously-lost tail — in wire order — while deduping the retained
+        // copies (messages 5 & 6 ride once, at codex's position).
+        const r3 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [e1.item, ...conversation().slice(-2), { type: "message", role: "user", content: "continue the work" }] }),
+        });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-forge turn forwarded exactly once");
+
+        const fwd = h.bodies[h.bodies.length - 1];
+        assert.ok(!fwd.includes("fc_bili_"), "echoed bili compaction item replaced before forwarding");
+        const idx = (marker: string) => fwd.indexOf(marker);
+        const handoffIdx = idx("[bili] context summary after compaction");
+        assert.ok(handoffIdx >= 0, "summary handoff present");
+        let prev = handoffIdx;
+        for (let i = 2; i <= 6; i++) {
+            const at = idx(`WORK_${i}_content_`);
+            assert.ok(at >= 0, `previously-lost message ${i} rides back in the forwarded input`);
+            assert.ok(at > prev, `message ${i} keeps wire order behind the handoff`);
+            prev = at;
+        }
+        // Count ITEMS carrying the marker (each marker text repeats inside its
+        // message body), not raw occurrences: a doubled message would show two.
+        const fwdItems = (JSON.parse(fwd) as { input: unknown[] }).input;
+        const carriers = (marker: string) => fwdItems.filter((i) => JSON.stringify(i).includes(marker)).length;
+        assert.equal(carriers("WORK_5_content_"), 1, "codex-retained message 5 rides exactly once (tail copy deduped)");
+        assert.equal(carriers("WORK_6_content_"), 1, "codex-retained message 6 rides exactly once (tail copy deduped)");
+        assert.ok(!fwd.includes("WORK_0_content_") && !fwd.includes("WORK_1_content_"), "covered content stays summarized, not re-sent raw");
+    });
+});
+
+test("e2e #4035 (trigger form): no uncovered tail → legacy plain blob (byte-stable no-regression case)", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        // Every message is covered by an active block only if the fold spans
+        // them all — instead, send a compact whose history IS fully covered:
+        // replay just the two folded messages + trigger. Their ids are covered
+        // by the setup block, so the tail collection must come up empty.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation().slice(0, 2), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        const frames = (await r2.text()).split("\n\n").filter((f) => f.startsWith("data: "));
+        const e1 = JSON.parse(frames[0]!.slice("data: ".length)) as { item: { type: string; id: string; encrypted_content: string } };
+        assert.equal(e1.item.type, "compaction", "still forged (active block to hand off)");
+        assert.ok(!e1.item.encrypted_content.startsWith(V2_PREFIX), "empty tail → legacy plain-sentinel shape");
+        assert.ok(e1.item.encrypted_content.startsWith("bili:acp:"), "sentinel intact");
+        assert.ok(e1.item.encrypted_content.includes("MAIN-SUMMARY-SETUP"), "summary still carried");
+    });
+});
+
+test("e2e #4035 (prompt form): forged assistant text appends the rendered uncovered tail", async () => {
+    await withHarness({ firstTurnTokens: 100, mode: "intercept" }, async (h) => {
+        const after = await setupCompressedSession(h);
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify(promptFormBody(SESSION)),
+        });
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        assert.match(response.headers.get("content-type")!, /text\/event-stream/);
+        assert.ok(text.includes("MAIN-SUMMARY-SETUP-CONTEXT-FOLDED"), "block summary present");
+        assert.ok(text.includes(FORGED_TAIL_HEADER), "rendered tail section header present");
+        assert.ok(text.includes("WORK_6_content_"), "newest uncovered draft rendered into the adopted summary text");
+        assert.ok(!text.includes(CODEX_COMPACT_PROMPT_ANCHOR), "the prompt template itself is excluded from the handoff");
+        await new Promise((r) => setTimeout(r, 60));
+        assert.equal(h.bodies.length, after, "upstream untouched");
+    });
+});

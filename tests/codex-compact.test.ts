@@ -285,3 +285,156 @@ test("buildPromptForgeBody: one assistant message codex adopts as its summary (#
     assert.equal(parsed.output[0]!.content[0]!.text, summary);
     assert.equal(parsed.usage.total_tokens, 10);
 });
+
+// ---------------------------------------------------------------------------
+// #4035: trigger/prompt forge handed off ONLY the fold summaries — the recent
+// work between the last fold and compaction time (assistant progress, tool
+// drafts/results) sat in neither the summaries nor codex's retention (user
+// messages only / prose summary), so it vanished from the model's view after
+// a local forge compaction. Fix: coverage-aware handoff — the forged blob
+// carries the uncovered tail (v2 envelope), the prompt form renders it into
+// the adopted summary text, and echo-time expansion splices it back in place
+// while deduping copies codex itself still retains.
+// ---------------------------------------------------------------------------
+
+import {
+    collectUncoveredTailItems,
+    renderUncoveredTailText,
+    FORGED_TAIL_HEADER,
+    CODEX_FORGED_HANDOFF_HEADER,
+} from "../src/codex-compact.ts";
+
+type Slot = { original: unknown; coreId?: string; coreIds?: string[] };
+
+function slot(original: unknown, coreId?: string, coreIds?: string[]): Slot {
+    return coreIds !== undefined ? { original, coreIds } : { original, coreId };
+}
+
+function coveredBlock(ids: string[], active = true): CompressionBlock {
+    return { ...block(active), effectiveMessageIds: ids };
+}
+
+test("collectUncoveredTailItems: coverage-aware selection over the wire layout", () => {
+    const coveredA = { type: "message", role: "user", content: [{ type: "input_text", text: "covered A" }] };
+    const coveredB = { type: "message", role: "assistant", content: [{ type: "output_text", text: "covered B" }] };
+    const subCovered = { type: "message", role: "assistant", content: [{ type: "output_text", text: "sub-id covered" }] };
+    const trigger = { type: "compaction_trigger" };
+    const dev = { type: "message", role: "developer", content: [{ type: "input_text", text: "dev" }] };
+    const partial = { type: "message", role: "user", content: "split item" };
+    const tailA = { type: "message", role: "assistant", content: [{ type: "output_text", text: "recent draft" }] };
+    const tailB = { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: "{\"command\":\"ls\"}" };
+    const tailC = { type: "function_call_output", call_id: "call_1", output: "ok" };
+    const tailD = { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: "thinking bytes" }] };
+    const projection = { layout: [
+        slot(coveredA, "id-a"),
+        slot(coveredB, "id-b"),
+        slot(subCovered, "id-z#2"),
+        slot(trigger),
+        slot(dev),
+        slot(partial, undefined, ["id-c", "id-d"]),
+        slot(tailA, "id-e"),
+        slot(tailB, "id-f"),
+        slot(tailC, "id-g"),
+        slot(tailD, "id-h"),
+    ] };
+    const blocks = [
+        coveredBlock(["id-a", "id-b"]),
+        coveredBlock(["id-c"]),
+        coveredBlock(["id-z"]),
+        coveredBlock(["id-e"], false),
+    ];
+    const tail = collectUncoveredTailItems(projection as never, blocks);
+    assert.deepEqual(tail, [tailA, tailB, tailC, tailD], "only uncovered slots ride, byte-exact, in wire order");
+    assert.deepEqual(collectUncoveredTailItems({ layout: [slot(coveredA, "id-a")] } as never, [coveredBlock(["id-a"])]), [], "fully covered → empty");
+    assert.deepEqual(collectUncoveredTailItems({ layout: [slot(coveredA)] } as never, [coveredBlock([])]), [], "core-less slot (preamble/sys-dev/unknown-type routing) is wire furniture → never carried");
+});
+
+test("collectUncoveredTailItems: prompt template excluded only when asked", () => {
+    const u1 = { type: "message", role: "user", content: [{ type: "input_text", text: "early question" }] };
+    const a1 = { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] };
+    const template = { type: "message", role: "user", content: [{ type: "input_text", text: `${CODEX_COMPACT_PROMPT_ANCHOR} Create a handoff summary.` }] };
+    const projection = { layout: [slot(u1, "1"), slot(a1, "2"), slot(template, "3")] };
+    assert.deepEqual(collectUncoveredTailItems(projection as never, []), [u1, a1, template], "default: everything uncovered rides");
+    assert.deepEqual(collectUncoveredTailItems(projection as never, [], { excludePromptTemplate: true }), [u1, a1], "prompt form: the template is the instruction, not content");
+});
+
+test("buildTriggerForgeBody: non-empty tail switches the blob to the v2 envelope; empty stays legacy-byte-stable", () => {
+    const usage = { inputTokens: 100, outputTokens: 0, totalTokens: 100 };
+    const tail = [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "draft" }] }];
+    const { body } = buildTriggerForgeBody("SUMMARY-TEXT", usage, false, tail);
+    const parsed = JSON.parse(body) as { output: { type: string; id: string; encrypted_content: string }[] };
+    const blob = parsed.output[0]!.encrypted_content;
+    assert.ok(blob.startsWith("bili:acp:v2:"), "v2 prefix");
+    const payload = JSON.parse(blob.slice("bili:acp:v2:".length)) as { v: number; summaries: string[]; tail: unknown[] };
+    assert.equal(payload.v, 2);
+    assert.deepEqual(payload.summaries, ["SUMMARY-TEXT"]);
+    assert.deepEqual(payload.tail, tail);
+
+    const legacy = JSON.parse(buildTriggerForgeBody("S", usage, false).body) as { output: { encrypted_content: string }[] };
+    assert.equal(legacy.output[0]!.encrypted_content, "bili:acp:S", "no tail arg → legacy plain shape unchanged");
+    const empty = JSON.parse(buildTriggerForgeBody("S", usage, false, []).body) as { output: { encrypted_content: string }[] };
+    assert.equal(empty.output[0]!.encrypted_content, "bili:acp:S", "explicit empty tail → legacy plain shape (byte-stable across builds)");
+});
+
+test("replaceBiliCompactionItems: v2 blob expands into handoff + uncovered tail, deduping codex-retained copies", () => {
+    const retained = { type: "message", role: "user", content: [{ type: "input_text", text: "retained recent question" }] };
+    const draft = { type: "message", role: "assistant", content: [{ type: "output_text", text: "uncovered draft" }] };
+    const toolCall = { type: "function_call", call_id: "call_x", name: "bash", arguments: "{}" };
+    const payload = { v: 2, summaries: ["S1", "S2"], tail: [draft, retained, toolCall] };
+    const v2Item = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}v2`, encrypted_content: `bili:acp:v2:${JSON.stringify(payload)}` };
+    const next = { type: "message", role: "user", content: "next" };
+    const { items, replaced, dropped, tailItems } = replaceBiliCompactionItems([v2Item, retained, next]);
+    assert.equal(replaced, 1);
+    assert.equal(dropped, 0);
+    assert.equal(tailItems, 2, "the codex-retained copy is deduped, the two dropped-by-codex items ride");
+    assert.equal(items.length, 5, "handoff + 2 tail + 2 originals, position-preserving");
+    const handoff = items[0]! as { type: string; role: string; content: { type: string; text: string }[] };
+    assert.equal(handoff.role, "user");
+    assert.ok(handoff.content[0]!.text.startsWith(CODEX_FORGED_HANDOFF_HEADER), "handoff header");
+    assert.ok(handoff.content[0]!.text.includes("S1\n\nS2"), "summaries joined verbatim");
+    assert.deepEqual(items[1], draft, "order preserved: draft before tool call");
+    assert.deepEqual(items[2], toolCall);
+    assert.ok(items.includes(retained) && items.includes(next), "originals untouched");
+
+    // Same logical item, different key order (codex re-serializes) — the
+    // fingerprint must still catch the overlap.
+    const reordered = { role: "user", content: [{ text: "retained recent question", type: "input_text" }], type: "message" };
+    const r2 = replaceBiliCompactionItems([v2Item, reordered]);
+    assert.equal(r2.tailItems, 2, "key order must not defeat the dedup");
+});
+
+test("replaceBiliCompactionItems: malformed v2 blobs drop (fail-safe); legacy plaintext still expands", () => {
+    const badJson = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}a`, encrypted_content: "bili:acp:v2:{not json" };
+    const badVersion = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}b`, encrypted_content: `bili:acp:v2:${JSON.stringify({ v: 3, summaries: [], tail: [] })}` };
+    const badShape = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}c`, encrypted_content: `bili:acp:v2:${JSON.stringify({ v: 2, summaries: "s", tail: [] })}` };
+    const legacy = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}d`, encrypted_content: "bili:acp:legacy summary" };
+    const { items, replaced, dropped, tailItems } = replaceBiliCompactionItems([badJson, badVersion, badShape, legacy]);
+    assert.equal(dropped, 3, "all three malformed v2 shapes drop");
+    assert.equal(replaced, 1, "legacy plaintext still expands");
+    assert.equal(tailItems, 0, "legacy blobs carry no tail");
+    assert.equal(items.length, 1);
+    assert.ok(JSON.stringify(items[0]).includes("legacy summary"));
+});
+
+test("renderUncoveredTailText: labeled lines per item kind; unrenderable types filtered", () => {
+    const out = renderUncoveredTailText([
+        { type: "reasoning", summary: [{ type: "summary_text", text: "T1" }, { type: "summary_text", text: "T2" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Q" }, { type: "input_image", image_url: "x" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "A" }] },
+        { type: "function_call", call_id: "c1", name: "bash", arguments: "{\"cmd\":\"ls\"}" },
+        { type: "function_call_output", call_id: "c1", output: "ok" },
+        { type: "custom_tool_call", call_id: "c2", input: { a: 1 } },
+        { type: "custom_tool_call_output", call_id: "c2", output: "done" },
+        { type: "extra_tools" },
+    ] as never);
+    assert.ok(out.includes("[thinking]\nT1T2"), "reasoning summary parts joined");
+    assert.ok(out.includes("[user]\nQ[image]"), "user text + image placeholder");
+    assert.ok(out.includes("[assistant]\nA"));
+    assert.ok(out.includes('[tool call c1] bash({"cmd":"ls"})'), "tool call labeled with id/name/args");
+    assert.ok(out.includes("[tool result c1]\nok"));
+    assert.ok(out.includes('[custom tool call c2] {"a":1}'));
+    assert.ok(out.includes("[custom tool result c2]\ndone"));
+    assert.ok(!out.includes("extra_tools"), "unrenderable types filtered out");
+    assert.equal(renderUncoveredTailText([]), "");
+    assert.ok(FORGED_TAIL_HEADER.startsWith("["), "header is a bracketed label");
+});
