@@ -36,10 +36,14 @@ import { setLogCapture } from "../src/logger.ts";
 // negative control (no fold committed ⇒ nothing fold-like persisted, gate
 // discipline #3617); T3 = a SIGKILLed child proxy mid-marathon leaves durable
 // folds that a new-id retry on a fresh instance inherits instead of starting
-// fresh. Sizing: conversation(40) ≈ 48k tokens vs a 12k window — one batch
-// round removes at most MAX_PREFLIGHT_SUMMARY_BATCH × CHUNK_FRACTION × window
-// ≈ 28.8k (#2682), so ≥2 rounds are guaranteed and the death always lands
-// mid-marathon.
+// fresh. Inheritance needs TWO durable artifacts: the session record
+// (per-fold save) AND the parent's affinity-chain entry in the machine-shared
+// state-dir snapshot (stateDir()/prefix-affinity.json) — findResumeParent's
+// candidate source (#1486/#499), written by its own 500ms-debounced
+// single-shot persist. T3 waits for both before the kill. Sizing:
+// conversation(40) ≈ 48k tokens vs a 12k window — one batch round removes at
+// most MAX_PREFLIGHT_SUMMARY_BATCH × CHUNK_FRACTION × window ≈ 28.8k (#2682),
+// so ≥2 rounds are guaranteed and the death always lands mid-marathon.
 
 const SUMMARY_TEXT =
     "PREFLIGHT BATCH SUMMARY: the segment covered iterative debugging of a proxy pipeline. " +
@@ -174,10 +178,14 @@ function childProxySource(srcBase: string, dir: string): string {
     return `
 import http from "node:http";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
+import * as pth from "node:path";
 import { startServer } from "${srcBase}server.ts";
 import { SessionStore, _setStoreForTest } from "${srcBase}persist.ts";
 import { _setForTest as setRegistryForTest } from "${srcBase}registry.ts";
 import { listSessions } from "${srcBase}session.ts";
+import { stateDir } from "${srcBase}paths.ts";
+import { scheduleAffinityPersist } from "${srcBase}affinity-persist.ts";
 import { defaultConfig } from "acp-kernel";
 
 const SUMMARY_TEXT = ${JSON.stringify(SUMMARY_TEXT)};
@@ -240,6 +248,8 @@ async function main(): Promise<void> {
     console.log("READY " + JSON.stringify({ port: (proxy.address() as { port: number }).port, mainUrl }));
     let last = -1;
     let durableReported = false;
+    let affinityReported = false;
+    let lastAffinityNudge = 0;
     setInterval(() => {
         const s = listSessions().find((x) => x.id === "t3978-p");
         const n = ((s && s.state.blocks) || []).filter((b) => b.active).length;
@@ -253,6 +263,23 @@ async function main(): Promise<void> {
             const rec = store.loadSync("t3978-p");
             const dn = ((rec && rec.state.blocks) || []).filter((b) => b.active).length;
             if (dn >= 1) { durableReported = true; console.log("[durable] " + dn); }
+        }
+        // Second artifact: findResumeParent (#1486) matches the retry against
+        // the parent's AFFINITY CHAIN entry, which a fresh instance hydrates
+        // from stateDir()/prefix-affinity.json at boot — NOT from the session
+        // record above. That snapshot rides its own 500ms-debounced single-shot
+        // persist, whose write can lose a rename race on this machine-shared
+        // file (writeSnapshot catches and gives up, nothing re-arms it) — so
+        // verify the FILE carries t3978-p before reporting, and re-arm the
+        // persist while it does not.
+        if (!affinityReported) {
+            try {
+                const snap = JSON.parse(readFileSync(pth.join(stateDir(), "prefix-affinity.json"), "utf8"));
+                const hit = Array.isArray(snap.entries) && snap.entries.some(
+                    (e) => e && e.sessionId === "t3978-p" && typeof e.depth === "number" && typeof e.tailHash === "string" && Array.isArray(e.itemHashes));
+                if (hit) { affinityReported = true; console.log("[affinity] ok"); }
+                else if (Date.now() - lastAffinityNudge > 1000) { lastAffinityNudge = Date.now(); scheduleAffinityPersist(); }
+            } catch { /* snapshot not on disk yet — keep polling */ }
         }
     }, 50);
 }
@@ -358,6 +385,7 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
     const msgs = conversation(40, "t3978p");
     let blocksSeen = 0;
     let durableSeen = 0;
+    let affinitySeen = false;
     let readyRes: ((v: { port: number; mainUrl: string }) => void) | null = null;
     const readyP = new Promise<{ port: number; mainUrl: string }>((r) => { readyRes = r; });
     let buf = "";
@@ -373,6 +401,7 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
             if (mBlocks) blocksSeen = Math.max(blocksSeen, Number(mBlocks[1]));
             const mDurable = line.match(/^\[durable\] (\d+)$/);
             if (mDurable) durableSeen = Math.max(durableSeen, Number(mDurable[1]));
+            if (/^\[affinity\] ok$/.test(line)) affinitySeen = true;
         }
     });
     let i2: Awaited<ReturnType<typeof startProxy>> | null = null;
@@ -401,6 +430,18 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
                 `timeout waiting for the per-fold save to land on disk (child stderr tail:\n${errTail.trim() || "(empty)"}\nstore dir listing: ${(() => { try { return JSON.stringify(readdirSync(dir)); } catch (e) { return String(e); } })()})`);
             await sleep(50);
         }
+        // Second artifact (#1486/#499): the parent's affinity-chain entry in
+        // the machine-shared state-dir snapshot — findResumeParent's candidate
+        // source, which a fresh instance hydrates at boot. The record above is
+        // useless for inheritance without it (win22-1 @ a46fd0d1a: [durable]
+        // observed, then resume lines empty and the retry recompressed from
+        // zero). The child proves the FILE carries the entry before reporting.
+        const tAffinity = Date.now();
+        while (!affinitySeen) {
+            if (Date.now() - tAffinity > 60_000) throw new Error(
+                `timeout waiting for the parent's affinity chain to land in the state-dir prefix-affinity.json snapshot (child stderr tail:\n${errTail.trim() || "(empty)"})`);
+            await sleep(50);
+        }
         child.kill("SIGKILL");
         await once(child, "exit");
         // A fresh boot over the SAME store dir — the retry arrives under a NEW
@@ -421,7 +462,7 @@ test("#3978 T3: a hard process death mid-preflight still leaves durable folds a 
         const tail = logs.filter((l) => l.includes("t3978-q"));
         const resumeLines = tail.filter((l) => l.includes("[resume-inheritance]"));
         const inheritLine = resumeLines.find((l) => l.includes("inherited"));
-        assert.ok(inheritLine, `instance 2 must resume the persisted parent (resume lines: ${JSON.stringify(resumeLines)}; store dir at retry time: ${dirListing})`);
+        assert.ok(inheritLine, `instance 2 must resume the persisted parent (resume lines: ${JSON.stringify(resumeLines)}; affinity chain seen before kill: ${affinitySeen}; store dir at retry time: ${dirListing}; child stderr tail:\n${errTail.trim().slice(-2000) || "(empty)"})`);
         const bm = inheritLine.match(/(\d+) block\(s\)/);
         assert.ok(bm && Number(bm[1]) >= 1, `at least one block must have been adopted (${inheritLine})`);
         assert.ok(!tail.some((l) => l.includes("parent session is not loadable")), "the pre-fix 'starting fresh' degrade must not fire");
