@@ -122,16 +122,17 @@ const WAL_CAP = 8 * MiB;
 const CHECKPOINT_EVERY_N = 20;
 /** Truncation lands page-aligned; allow one page of measurement slack. */
 const CAP_SLACK = 4 * KiB;
-/**
- * #4506: the custom-cap case observes the plateau BETWEEN resets — after the
- * autocheckpoint truncates to the configured cap, subsequent commits keep
- * appending frames until the next reset. #4390's row identity (64-hex column
- * + idx_messages_identity entry per row) adds ~+250B of WAL frames per
- * message row, so ~192 rows of post-reset writes now overshoot by ~12 pages
- * (observed 1095952 vs 1048576). The truncate-at-checkpoint INVARIANT is
- * intact; budget the inter-reset accumulation instead of pinning one page.
- */
-const CUSTOM_CAP_SLACK = 64 * KiB;
+/** #4489: convergence deadline for the custom-cap test, in 128 KiB ingest
+ *  units. This scenario is a lone writer, so EVERY completed checkpoint
+ *  truncates the file back to the configured cap (a 128 KiB unit commits far
+ *  fewer pages than the 1 MiB cap holds on 4 KiB pages, so the post-truncation
+ *  file rests exactly at the cap). Completed checkpoints arrive on two clocks:
+ *  the built-in autocheckpoint (once >1000 pages accumulate since the last one
+ *  — a 128 KiB unit commits ≥ 32 pages, so within ⌈1000/32⌉ = 32 units) and
+ *  the cadence-tick PASSIVE (every CHECKPOINT_EVERY_N = 20 ingests); the
+ *  cadence is the tighter clock, and the truncate observes at most one unit
+ *  late (it lands inside the following commit). 20 + 1 + 3 headroom = 24. */
+const CONV_UNITS = 24;
 
 test("#3250: close() converges the WAL so a clean exit leaves nothing to replay", () => {
     const dir = tmpdir("bili-3250-close-");
@@ -290,17 +291,33 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
         // A 3 MiB burst overshoots the CUSTOM cap in-flight...
         ingest(store, "big", 3 * MiB, 120);
         assert.ok(walSize(dir) > customCap, "the burst must overshoot the custom cap in-flight");
-        // ...and once the WAL crosses the autocheckpoint window (1000 pages), the
-        // writer's own completed checkpoint truncates back to the CONFIGURED cap,
-        // not the 8 MiB default: with the default the file would sit at the
-        // ~4.4 MiB high-water mark here, never touching 1 MiB. (A lone writer's
-        // cadence-tick PASSIVE can backfill without shrinking the file — its own
-        // tail read-lock blocks the truncate — so the autocheckpoint plateau is
-        // the observable proof the configured value reached the pragma.)
-        for (let i = 2; i <= 10; i++) ingest(store, `small${i}`, 128 * KiB, 8);
+        // ...and any COMPLETED checkpoint thereafter truncates back to the
+        // CONFIGURED cap, not the 8 MiB default: with the default the file
+        // would sit at the ~4.4 MiB high-water mark here, never touching 1 MiB.
+        // A trough resting AT the configured cap is the observable proof the
+        // value reached the pragma. (In a shared directory a foreign reader can
+        // pin the snapshot and stall the truncate — #3250's field mode — but
+        // this scenario is a lone writer, so every checkpoint completes.)
+        //
+        // #4489: WHERE the 1000-page autocheckpoint window closes relative to
+        // commit boundaries depends on the runner's bundled SQLite build (page
+        // packing differs across versions/OSes), so the residue above the cap
+        // after a FIXED ingest count is environment-dependent — asserting at a
+        // fixed point raced the grow/truncate sawtooth (byte-identical red on
+        // some runners, green on others, same sha). Assert CONVERGENCE instead:
+        // keep committing 128 KiB units until a completed checkpoint brings the
+        // file back under the cap; CONV_UNITS bounds how long that can take
+        // (derived above). A pre-fix tree (limit never honored) stays at its
+        // high-water mark through all units and can never converge — the
+        // RED/GREEN discrimination holds.
+        let converged = false;
+        for (let i = 2; i <= CONV_UNITS && !converged; i++) {
+            ingest(store, `conv${i}`, 128 * KiB, 8);
+            converged = walSize(dir) <= customCap + CAP_SLACK;
+        }
         assert.ok(
-            walSize(dir) <= customCap + CUSTOM_CAP_SLACK,
-            `WAL must be truncated to the configured cap at the autocheckpoint (left ${walSize(dir)} bytes, cap ${customCap})`,
+            converged,
+            `WAL must converge to the configured cap at a completed checkpoint (last ${walSize(dir)} bytes, cap ${customCap}, ${CONV_UNITS} units exhausted)`,
         );
         assert.equal(store.getMessages("big").length, 120, "all burst rows must land");
         // A clean exit converges to zero whatever the cap.
