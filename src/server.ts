@@ -1711,6 +1711,11 @@ export type Prepared = {
      *  history the host is asking to summarize would put two compressors on
      *  one turn (#2432/#2373 pathology). */
     nativeCompact?: boolean;
+    /** #2411 Stage B: set with nativeCompact when bili's own fold summaries are
+     *  served AS the completion for the host-native compaction request — same
+     *  zero-egress contract as codexForge; forward() serves `body` without
+     *  contacting upstream. */
+    nativeCompactForge?: { body: string; contentType: string };
     /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */

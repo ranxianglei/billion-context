@@ -35,6 +35,8 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { stripTraeCodeNativeCompactInstruction } from "./traecode-compact.js";
 import { looksLikeNativeCompactionRequest } from "./native-compact-shape.js";
+import { buildOpenaiCompactForgeBody } from "./openai-compact-forge.js";
+import { codexCompactGate, mergeForgedSummaries } from "../codex-compact.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
@@ -136,6 +138,7 @@ export async function prepareOpenai(
         }
     }
 
+    let openaiTransformOk = true;
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -455,6 +458,7 @@ export async function prepareOpenai(
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
+        openaiTransformOk = false;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
@@ -527,7 +531,25 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, nativeCompact, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    // #2411 Stage B: a host-native compaction request with healthy ACP state
+    // gets bili's own fold summaries served AS the completion — upstream never
+    // contacted (zero-egress contract, codexForge class). E2 capture proved the
+    // backend answer to this request shape is an ordinary chat completion, so
+    // the forge is a standard SSE/JSON pair (src/server/openai-compact-forge.ts).
+    // No active block yet → gate fails → honest passthrough (nothing folded to
+    // hand off). Captured summaries are append-only deduped per session so a
+    // second compaction in the same session hands off everything folded so far.
+    let nativeCompactForge: Prepared["nativeCompactForge"];
+    if (nativeCompact && openaiTransformOk && codexCompactGate(session, config.modelContextLimit, true)) {
+        const prevForged = session.metadata.nativeCompactForgedSummaries as string[] | undefined;
+        const captured = mergeForgedSummaries(prevForged, session.state.blocks);
+        if (captured.length !== (prevForged?.length ?? 0)) session.metadata.nativeCompactForgedSummaries = captured;
+        const est = estimateCoreMessagesUpper(originalMessages) + countSystemAndToolsTokens(openaiSystemText || "", []);
+        const total = Math.max(session.stats.lastInputTokens, est, 1);
+        nativeCompactForge = buildOpenaiCompactForgeBody(captured.join("\n\n"), typeof parsed.model === "string" ? parsed.model : "gpt", { inputTokens: total, outputTokens: 0, totalTokens: total }, stream);
+        log("info", `[${sessionId}] host-native compaction intercepted; forged ${stream ? "SSE" : "JSON"} completion with ${captured.length} block summary(s), upstream not contacted (#2411)`);
+    }
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, nativeCompact, nativeCompactForge, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

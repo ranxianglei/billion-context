@@ -10,6 +10,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { createHash } from "node:crypto";
 import { TRAE_NATIVE_COMPACT_SENTENCE, neutralizeTraeNativeCompactInstruction, stripTraeCodeNativeCompactInstruction } from "../src/server/traecode-compact.js";
 import { looksLikeNativeCompactionRequest, stripLeadingAcpTags } from "../src/server/native-compact-shape.js";
+import { buildOpenaiCompactForgeBody, OPENAI_COMPACT_ID_PREFIX } from "../src/server/openai-compact-forge.js";
 
 process.env.NODE_ENV = "test";
 
@@ -197,10 +198,10 @@ test("e2e: TraeCode-shaped chat-completions request forwards ONE compression phi
         const sys2 = sent2.messages.find((m) => m.role === "system")?.content ?? "";
         assert.ok(!sys2.includes(TRAE_NATIVE_COMPACT_SENTENCE), "continuation request stripped too");
     } finally {
-        proxy.close();
-        await once(proxy, "close");
-        upstream.close();
-        await once(upstream, "close");
+        proxy.closeAllConnections?.();
+        await new Promise<void>((r) => proxy.close(() => r()));
+        upstream.closeAllConnections?.();
+        await new Promise<void>((r) => upstream.close(() => r()));
     }
 });
 
@@ -356,9 +357,152 @@ test("e2e: host-native compaction request forwards with ZERO bili compression su
         const sentC = JSON.parse(bodies[2]) as { tools?: Array<{ function?: { name?: string } }> };
         assert.ok(sentC.tools?.some((t) => t.function?.name === "compress"), "surface restored on the next ordinary turn");
     } finally {
-        proxy.close();
-        await once(proxy, "close");
-        upstream.close();
-        await once(upstream, "close");
+        proxy.closeAllConnections?.();
+        await new Promise<void>((r) => proxy.close(() => r()));
+        upstream.closeAllConnections?.();
+        await new Promise<void>((r) => upstream.close(() => r()));
+    }
+});
+
+// #2411 Stage B: the host-native compaction request gets bili's OWN fold
+// summaries served as the completion — upstream never contacted. E2 capture
+// (reporter): the backend's real answer to this request shape is an ordinary
+// chat completion, so the forge is a standard SSE/JSON pair.
+
+test("forge body: stream shape matches the captured terminal form", () => {
+    const { body, contentType } = buildOpenaiCompactForgeBody("SUMMARY-TEXT-ONE", "gpt-test", { inputTokens: 1234, outputTokens: 0, totalTokens: 1234 }, true);
+    assert.equal(contentType, "text/event-stream");
+    type Frame = { object?: string; id?: string; model?: string; choices?: Array<{ index: number; delta: Record<string, unknown>; finish_reason: string | null }>; usage?: Record<string, number> };
+    const frames = body.split("\n\n").filter((l) => l.startsWith("data: ") && l !== "data: [DONE]").map((l) => JSON.parse(l.slice(6)) as Frame);
+    assert.equal(frames.length, 3, "three data frames");
+    assert.ok(body.endsWith("data: [DONE]\n\n"), "terminal [DONE] frame");
+    for (const f of frames) {
+        assert.equal(f.object, "chat.completion.chunk");
+        assert.ok(String(f.id).startsWith(OPENAI_COMPACT_ID_PREFIX), "bili-forged id sentinel");
+        assert.equal(f.model, "gpt-test");
+    }
+    assert.deepEqual(frames[0].choices?.[0]?.delta, { role: "assistant" });
+    assert.equal(frames[0].choices?.[0]?.finish_reason, null);
+    assert.deepEqual(frames[1].choices?.[0]?.delta, { content: "SUMMARY-TEXT-ONE" });
+    assert.equal(frames[2].choices?.[0]?.finish_reason, "stop", "terminal finish_reason on the last frame");
+    assert.deepEqual(frames[2].usage, { prompt_tokens: 1234, completion_tokens: 0, total_tokens: 1234 });
+});
+
+test("forge body: non-stream shape is a standard chat.completion", () => {
+    const { body, contentType } = buildOpenaiCompactForgeBody("SUMMARY-TEXT-TWO", "gpt-test", { inputTokens: 55, outputTokens: 7, totalTokens: 62 }, false);
+    assert.equal(contentType, "application/json");
+    const j = JSON.parse(body) as Record<string, unknown>;
+    assert.equal(j.object, "chat.completion");
+    assert.ok(String(j.id).startsWith(OPENAI_COMPACT_ID_PREFIX));
+    assert.equal(j.model, "gpt-test");
+    const choice = (j.choices as Array<Record<string, unknown>>)[0];
+    assert.equal(choice.finish_reason, "stop");
+    assert.deepEqual(choice.message, { role: "assistant", content: "SUMMARY-TEXT-TWO" });
+    assert.deepEqual(j.usage, { prompt_tokens: 55, completion_tokens: 7, total_tokens: 62 });
+});
+
+const FORGE_SUMMARY_TEXT = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
+const FILLER = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(50); // ~2.9KB per message — pair must clear the kernel 5000-char min
+
+test("e2e: host-native compaction request served locally from ACP blocks; upstream untouched (#2411 Stage B)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const bodies: string[] = [];
+    let calls = 0;
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            calls += 1;
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (calls === 1) {
+                // round 1: the model folds the first two messages — bili executes
+                // it server-side and re-requests with the refreshed view
+                res.write(sseLine({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, id: "call_p", type: "function", function: { name: "compress", arguments: JSON.stringify({ content: [{ startId: "m00001", endId: "m00004", topic: "setup", summary: FORGE_SUMMARY_TEXT }] }) } }] }, finish_reason: null }] }));
+                res.write(sseLine({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }));
+            } else {
+                res.write(sseLine({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] }));
+                res.write(sseLine({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 2 } }));
+            }
+            res.write("data: [DONE]\n\n");
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {} as ProxyOptions["routes"],
+        modelContextLimit: 1_000_000,
+        kernelConfig: defaultConfig(1_000_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+    const conversation = [
+        { role: "system", content: "You are a coding assistant." },
+        { role: "user", content: FILLER + "question 1" },
+        { role: "assistant", content: FILLER + "answer 2" },
+        { role: "user", content: FILLER + "question 3" },
+        { role: "assistant", content: FILLER + "answer 4" },
+        { role: "user", content: FILLER + "question 5" },
+        { role: "assistant", content: FILLER + "answer 6" },
+        { role: "user", content: FILLER + "question 7" },
+        { role: "assistant", content: FILLER + "answer 8" },
+    ];
+    try {
+        // setup: same conversation prefix as the later compaction request so
+        // prefix affinity lands both on ONE session; round 1 folds m00001..m00004
+            await postChat(url, conversation);
+        assert.equal(bodies.length, 2, "setup consumed initial + post-fold re-request");
+
+        // THE compaction act: full history replay + template as last user message
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "gpt-test", stream: true, max_tokens: 1024, tools: NATIVE_TOOLS, messages: [...conversation, { role: "user", content: TEMPLATE_6861 }] }),
+        });
+        assert.equal(res.status, 200);
+        assert.ok(String(res.headers.get("content-type")).includes("text/event-stream"), "SSE response (request was stream:true)");
+        const text = await res.text();
+        assert.ok(text.includes("[Compressed conversation section]"), "forge carries the ACP fold summaries");
+        assert.ok(text.includes(FORGE_SUMMARY_TEXT), "folded-range summary text present");
+        assert.ok(!text.includes(TRAE_NATIVE_COMPACT_SENTENCE));
+        assert.ok(text.trimEnd().endsWith("data: [DONE]"), "terminal frame well-formed");
+        assert.equal(bodies.length, 2, "ZERO egress — the compaction request never reached upstream");
+
+        // gate fail-open: template-shaped request on a session WITHOUT active
+        // blocks passes through to upstream (nothing folded to hand off)
+        const res2 = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "gpt-test", stream: true, max_tokens: 1024, messages: compactBody(TEMPLATE_6861).messages }),
+        });
+        assert.equal(res2.status, 200);
+        await res2.arrayBuffer();
+        assert.equal(bodies.length, 3, "no-blocks session forwards normally (honest passthrough)");
+    } finally {
+        proxy.closeAllConnections?.();
+        await new Promise<void>((r) => proxy.close(() => r()));
+        upstream.closeAllConnections?.();
+        await new Promise<void>((r) => upstream.close(() => r()));
     }
 });
