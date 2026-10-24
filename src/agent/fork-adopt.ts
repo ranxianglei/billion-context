@@ -479,16 +479,28 @@ export function resetForkCapabilityCacheForTest(): void {
     forkCapabilityCache.clear();
 }
 
-/** Old proxies have no fork endpoints at all; probing manifest keeps adoption
- *  off their request path (and avoids harmless 404 noise). Cached per base —
- *  register.base changes when the extension re-registers with a new proxy. */
-export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch): Promise<boolean> {
+/** Capability-probe result. `definitive` separates two DIFFERENT "not capable"
+ *  outcomes that must drive different retry policy (#4266 item ⑨):
+ *  - definitive=true  — the manifest was READ but does not advertise fork (an
+ *    old proxy with no fork endpoints). Terminal: retrying can never change the
+ *    answer, so adoption closes on the first probe (keeps such proxies off the
+ *    request path and avoids repeated 404 noise).
+ *  - definitive=false — the manifest could not be read RIGHT NOW (proxy still
+ *    starting up / restarting / port changing: !res.ok, timeout, network error).
+ *    Transient: the window stays open so a later request retries within the
+ *    attempt budget instead of permanently retiring the child.
+ *  Only definitive results are cached per base (register.base changes when the
+ *  extension re-registers with a new proxy); a failed read is never cached, so a
+ *  later probe re-hits the wire and self-heals once the proxy is reachable. */
+type ForkCapabilityProbe = { capable: boolean; definitive: boolean };
+
+export async function probeForkCapability(base: string, fetchImpl?: typeof fetch): Promise<ForkCapabilityProbe> {
     const cached = forkCapabilityCache.get(base);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { capable: cached, definitive: true };
     const doFetch = fetchImpl ?? fetch;
     try {
         const res = await doFetch(`${base}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
-        if (!res.ok) return false;
+        if (!res.ok) return { capable: false, definitive: false };
         const manifest = await res.json() as { capabilities?: { fork?: { protocolVersion?: unknown } } };
         // #2671 Phase 2b: fork protocol v2 proxies advertise protocolVersion 2;
         // v1 proxies advertise 1. The adoption payload stays v1 during the
@@ -496,10 +508,16 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
         const version = manifest.capabilities?.fork?.protocolVersion;
         const capable = version === 1 || version === 2;
         forkCapabilityCache.set(base, capable);
-        return capable;
+        return { capable, definitive: true };
     } catch {
-        return false;
+        return { capable: false, definitive: false };
     }
+}
+
+/** Boolean convenience kept for direct callers/tests: true only when the probe
+ *  is capable (a failed read reports false, matching the pre-#4266 contract). */
+export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch): Promise<boolean> {
+    return (await probeForkCapability(base, fetchImpl)).capable;
 }
 
 export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown };
@@ -548,9 +566,22 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             done.add(input.child);
             return;
         }
-        if (!(await manifestForkCapable(input.base, opts?.fetchImpl))) {
-            log(`fork adoption for ${input.child} skipped — the proxy does not advertise the fork capability (#2399)`);
-            done.add(input.child);
+        const capability = await probeForkCapability(input.base, opts?.fetchImpl);
+        if (!capability.capable) {
+            if (capability.definitive) {
+                // Manifest read OK but fork not advertised (old proxy): terminal —
+                // retrying can never change the answer.
+                log(`fork adoption for ${input.child} skipped — the proxy does not advertise the fork capability (#2399)`);
+                done.add(input.child);
+            } else {
+                // Manifest unreadable right now (proxy starting/restarting/port
+                // changing) — transient. Leave the window open so a later request
+                // retries within the budget instead of permanently retiring the
+                // child (#4266 item ⑨).
+                const attempt = attempts.get(input.child) ?? 0;
+                log(`fork adoption for ${input.child} deferred — could not confirm fork capability yet (attempt ${attempt}/${maxAttempts}) (#2399/#4266)`);
+                if (attempt >= maxAttempts) done.add(input.child);
+            }
             return;
         }
         const result = await tryForkAdoption({
