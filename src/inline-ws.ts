@@ -37,9 +37,10 @@ interface InlineWsBridge {
 export async function startInlineWsBridge(options: {
     dispatchHttp: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
     log: (level: string, message: string) => void;
-    /** #2124 parity with startServer(): lets checkTunnelDestination know when
-     *  a destination resolves remotely (upstream proxy owns DNS). */
-    isEgressProxied?: (destinationUrl: string) => boolean;
+    /** #2124 parity with startServer(): the upstream proxy a destination's egress
+     *  leaves through, if any (checkTunnelDestination derives the remote-DNS flag
+     *  from it, and the prewarm probe egresses through the same proxy, #4594). */
+    egressProxyFor?: (destinationUrl: string) => string | undefined;
     /** #300/#3073 hop-chain instance identity, same as the spawned server. */
     instanceId?: string;
 }): Promise<InlineWsBridge> {
@@ -55,7 +56,7 @@ export async function startInlineWsBridge(options: {
         options.dispatchHttp,
         options.log,
         [responsesCodec, codexResponsesCodec],
-        options.isEgressProxied,
+        options.egressProxyFor,
         options.instanceId,
     );
     server.on("upgrade", (source, socket, head) => {

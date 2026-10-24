@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { on, once } from "node:events";
@@ -24,13 +25,14 @@ process.env.XDG_DATA_HOME = testHome;
 process.env.XDG_CACHE_HOME = testHome;
 
 const user = (text: string): Item => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+const developer = (text: string): Item => ({ type: "message", role: "developer", content: [{ type: "input_text", text }] });
 
 // Mirrors the captured codex 0.147.0 Responses-over-WebSocket client: the
 // upgrade targets the ordinary prefix-mode path with codex's own transport
 // headers (no plugin marker), and every request is a full `response.create`
 // replay — a `generate: false` probe with empty input first, then one
 // full-history frame per turn. Codex never sends previous_response_id.
-async function fixture() {
+async function fixture(overrides: Partial<ProxyOptions> = {}) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -48,8 +50,8 @@ async function fixture() {
         rows.push({ request, headers: req.headers });
         const id = `resp_codex_${++serial}`;
         const send = (type: string, fields: Item): void => peer.send(JSON.stringify({ type, ...fields }));
-        if (Array.isArray(request.input) && request.input.length === 0) {
-            // Probe: codex expects a terminal event, nothing more.
+        if (request.generate === false || (Array.isArray(request.input) && request.input.length === 0)) {
+            // Probe / no-generation warmup: codex expects a terminal event, nothing more.
             send("response.created", { response: { id, status: "in_progress", output: [] } });
             send("response.completed", { response: { id, status: "completed", output: [], usage: { input_tokens: 0, output_tokens: 1, total_tokens: 1 } } });
             return;
@@ -73,7 +75,7 @@ async function fixture() {
     await once(upstream, "listening");
     const config = defaultConfig(200000);
     config.preserveRecentTokens = 0;
-    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
+    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] }, ...overrides };
     const proxy = await startServer(opts);
     await once(proxy, "listening");
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
@@ -108,7 +110,7 @@ async function fixture() {
     // terminal event before sending the real turn; the test must respect the
     // same ordering or the session correctly rejects it with response_in_progress.
     const probe = (client: WebSocket = peer): Promise<Item[]> => exchange(frame([], { generate: false }), client);
-    const turn = (input: Item[], client: WebSocket = peer): Promise<Item[]> => exchange(frame(input), client);
+    const turn = (input: Item[], client: WebSocket = peer, extra: Item = {}): Promise<Item[]> => exchange(frame(input, extra), client);
     const peer = await openPeer();
     peer.on("error", e => console.error("[TEST-CLIENT-ERR]", e.message));
     return { rows, upstreamConnections, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, probe, frame, openPeer,
@@ -359,6 +361,94 @@ test("codex WS: folding covered history shrinks the replayed turn", { timeout: 3
         assert.ok(peekSession(f.sid)?.state.blocks.some(b => b.active));
         assert.equal(f.httpRequests, 0);
     } finally { await f.close(); }
+});
+
+// codex's startup / idle-thread warmup is generate:false carrying only its
+// developer/user context items. Run as a pipeline turn, that zero-conversation
+// view deactivated every fold and re-injected every forged summary (#4594).
+test("codex WS: a context-only generate:false prewarm is relayed verbatim and leaves the fold intact (#4594)", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.probe();
+        const replay: Item[] = [];
+        const play = async (text: string): Promise<void> => {
+            const reply = completed(await f.turn([...replay, user(text)]));
+            replay.push(user(text));
+            const message = (reply.output as Item[]).find(item => item.type === "message");
+            if (message) replay.push(message);
+        };
+        await play("session purpose: codex prewarm regression");
+        await play("PREWARM-BULKY " + "unique filler content ".repeat(1200));
+        const bulky = JSON.stringify((f.rows.at(-1)!.request.input as Item[]).find(item => JSON.stringify(item).includes("PREWARM-BULKY")));
+        const ref = bulky.match(/\x3cacp[^\x3e]*\x3e(m\d+)\x3c\/acp\x3e/)?.[1];
+        assert.ok(ref, bulky.slice(-300));
+        for (let i = 0; i < 4; i++) await play(`push ${i}`);
+        const args = { content: [{ startId: ref, endId: ref, summary: "SUMMARY-PREWARM-FOLD: bulky deterministic filler, folded before the prewarm arrives." }] };
+        const result = await fetch(`${f.proxyOrigin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: f.sid, tool: "compress", args }) });
+        assert.equal(((await result.json()) as { ok: boolean }).ok, true);
+        const session = peekSession(f.sid);
+        assert.ok(session);
+        assert.ok(session.state.blocks.some(b => b.active));
+        session.metadata.codexForgedSummaries = ["FORGED-SUMMARY-SENTINEL"];
+        const requests = session.stats.requests;
+        const context = [developer("codex permissions and instructions"), user("environment context: cwd=/repo shell=bash")];
+        const warm = completed(await f.turn(context, f.peer, { generate: false }));
+        assert.deepEqual(warm.output, []);
+        const sent = f.rows.at(-1)!.request;
+        assert.equal(sent.generate, false);
+        assert.deepEqual(sent.input, context, "the prewarm reaches upstream verbatim");
+        assert.deepEqual(sent.tools, [], "no ACP tools ride a no-generation request");
+        assert.ok(!JSON.stringify(sent).includes("FORGED-SUMMARY-SENTINEL"), "forged summaries are not re-injected into the prewarm");
+        assert.equal(session.stats.requests, requests, "the prewarm is not a pipeline turn");
+        assert.ok(peekSession(f.sid)?.state.blocks.some(b => b.active), "the prewarm leaves the fold active");
+    } finally { await f.close(); }
+});
+
+test("codex WS: a history-replaying generate:false prewarm stays on the ACP pipeline (#4594)", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.probe();
+        completed(await f.turn([user("history-turn")]));
+        const warm = completed(await f.turn([user("history-turn"), { type: "message", role: "assistant", content: [{ type: "output_text", text: "prior answer" }] }], f.peer, { generate: false }));
+        assert.deepEqual(warm.output, []);
+        const sent = f.rows.at(-1)!.request;
+        assert.equal(sent.generate, false);
+        assert.ok((sent.tools as Item[]).some(t => t.name === "acp_status" || t.name === "compress"), "a history prewarm is still processed by the pipeline");
+        assert.equal(peekSession(f.sid)?.stats.requests, 2);
+    } finally { await f.close(); }
+});
+
+test("codex WS: the prewarm probe egresses through the configured upstream proxy (#4594)", { timeout: 30000 }, async () => {
+    let connects = 0;
+    const tunnels = new Set<net.Socket>();
+    const upstreamProxy = http.createServer();
+    upstreamProxy.on("connect", (req, socket, head) => {
+        connects++;
+        const destination = new URL(`http://${req.url}`);
+        const tunnel = net.connect(Number(destination.port), destination.hostname, () => {
+            socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            if (head.length) tunnel.write(head);
+            tunnel.pipe(socket);
+            socket.pipe(tunnel);
+        });
+        tunnels.add(tunnel);
+        tunnel.on("error", () => socket.destroy());
+        tunnel.on("close", () => { tunnels.delete(tunnel); socket.destroy(); });
+        socket.on("error", () => tunnel.destroy());
+        socket.on("close", () => tunnel.destroy());
+    });
+    upstreamProxy.listen(0, "127.0.0.1");
+    await once(upstreamProxy, "listening");
+    const f = await fixture({ proxy: `http://127.0.0.1:${(upstreamProxy.address() as { port: number }).port}` });
+    try {
+        await f.probe();
+        assert.equal(connects, 1, "the probe's upstream WebSocket tunnels through the configured proxy");
+        assert.deepEqual(f.rows[0]?.request.input, []);
+    } finally {
+        await f.close();
+        for (const tunnel of tunnels) tunnel.destroy();
+        await new Promise<void>(resolve => upstreamProxy.close(() => resolve()));
+    }
 });
 
 test("codex WS: admission requires the conversation header and the responses path", { timeout: 30000 }, async () => {
