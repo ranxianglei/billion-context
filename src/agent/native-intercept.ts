@@ -892,6 +892,62 @@ export function bindLiveStateSlot(state: NativeInterceptState): boolean {
     return firstBind;
 }
 
+// #4129: a model request that stays pending well past normal latency against an
+// already-resolved origin is the silent-hang signature — the proxy took the
+// socket but its event loop is saturated by concurrent compression and never
+// answers (#3654). Emit ONE evidence-based note when it happens instead of going
+// dark until an external kill (supervisor rc=124/143). Above normal single-request
+// latency so legitimate large preflights rarely trip it; short enough to beat any
+// supervisor window. Tunability is a follow-up owner decision, not a new knob here.
+const MODEL_REQUEST_STALL_PROBE_MS = 20_000;
+// #4129: suppress duplicate stall notes for the same origin within this window —
+// a saturated storm leaves many requests pending at once; one note says it all.
+const STALL_ANNOUNCE_COOLDOWN_MS = 30_000;
+// #4129: test-only overrides so a suite can drive the watchdog in milliseconds.
+let stallProbeMsOverride: number | undefined;
+let stallCooldownMsOverride: number | undefined;
+// #4129: test-only emit sink — when set, announcements go here instead of the
+// log/stderr plumbing so a suite can assert on them deterministically.
+let stallSinkForTest: ((level: "info" | "warn", line: string) => void) | undefined;
+
+/** #4129: shape the one-line saturation diagnostic from a liveness verdict.
+ *  Pure so the wording contract is unit-testable without timers or sockets. */
+export function formatStallDiagnostic(origin: string, waitedMs: number, verdict: LivenessVerdict): { level: "info" | "warn"; line: string } {
+    const detail = verdict.detail !== undefined && verdict.detail !== "" ? ` (${verdict.detail})` : "";
+    const cause =
+        verdict.state === "busy"
+            ? "event loop saturated — a concurrent compression/fold is in flight (#3654); the request proceeds once it drains"
+            : verdict.state === "alive"
+                ? "proxy answers its health probe, so this specific request is queued behind in-flight work"
+                : "proxy no longer answers — recovery respawns on the next failure";
+    const level: "info" | "warn" = verdict.state === "alive" ? "info" : "warn";
+    const line = `bili-native: model request to ${origin} still pending after ${Math.round(waitedMs / 1000)}s — health=${verdict.state}${detail}; ${cause}; still waiting`;
+    return { level, line };
+}
+
+/** #4129: test-only timing override (see the module consts above). */
+export function _setStallTimingForTest(probeMs?: number, cooldownMs?: number): void {
+    stallProbeMsOverride = probeMs;
+    stallCooldownMsOverride = cooldownMs;
+}
+
+/** #4129: test-only emit override — route announcements to `sink` instead of the log/stderr plumbing. */
+export function _setStallSinkForTest(sink?: (level: "info" | "warn", line: string) => void): void {
+    stallSinkForTest = sink;
+}
+
+// #4129: EPIPE on a severed stderr pipe arrives as an ASYNC 'error' event, not a
+// sync throw — the try/catch around the write below cannot see it, and unhandled
+// it crashes the host process on the very diagnostic this feature exists to emit
+// (the same lesson #1233 learned in src/logger.ts). Arm a no-op guard once; never
+// over an error handler the host installed itself.
+let stderrPipeGuardArmed = false;
+function armStderrPipeGuard(): void {
+    if (stderrPipeGuardArmed) return;
+    stderrPipeGuardArmed = true;
+    if (process.stderr.listenerCount("error") === 0) process.stderr.on("error", () => {});
+}
+
 /** Install the global fetch patch. The first call wraps globalThis.fetch and
  *  returns true; later calls return false (a process installs one chain) BUT
  *  always rebind the live-state slot, so a host hot-reimport that re-applies
@@ -918,6 +974,41 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     // a replace we must reroute those pre-baked URLs before they touch the
     // network again. Only ever contains origins we ourselves observed dying.
     const replacedOrigins = new Set<string>();
+
+    // #4129: one stall announcement per origin per episode — a saturated storm
+    // leaves many requests pending at once; announce once, then stay quiet.
+    const lastStallAnnounce = new Map<string, number>();
+    const announceModelRequestStall = async (origin: string, waitedMs: number): Promise<void> => {
+        const now = Date.now();
+        if (now - (lastStallAnnounce.get(origin) ?? 0) < (stallCooldownMsOverride ?? STALL_ANNOUNCE_COOLDOWN_MS)) return;
+        lastStallAnnounce.set(origin, now);
+        let verdict: LivenessVerdict;
+        try {
+            verdict = await probeLiveness(origin, HEALTH_TIMEOUT_MS);
+        } catch {
+            verdict = { state: "dead", detail: "stall-probe failed" };
+        }
+        const { level, line } = formatStallDiagnostic(origin, waitedMs, verdict);
+        if (stallSinkForTest !== undefined) { stallSinkForTest(level, line); return; }
+        // Best-effort by contract: a diagnostic must never break the request path
+        // (#4129) — a broken stderr (EPIPE) or a full log must not crash the host.
+        try {
+            logHostEvent(level, "[native-client]", line);
+            // Headless runs (pi -p under a supervisor) have no TUI to corrupt and
+            // are exactly where the silent hang bites — surface it on stderr there only.
+            if (process.stderr.isTTY !== true) {
+                armStderrPipeGuard();
+                process.stderr.write(`${new Date().toISOString()} [${level}] ${line}\n`);
+            }
+        } catch {
+            // swallow — observability only
+        }
+    };
+    const watchedSend = (origin: string, doSend: () => Promise<Response>): Promise<Response> => {
+        const sentAt = Date.now();
+        const stallTimer = setTimeout(() => { void announceModelRequestStall(origin, Date.now() - sentAt); }, stallProbeMsOverride ?? MODEL_REQUEST_STALL_PROBE_MS);
+        return doSend().finally(() => clearTimeout(stallTimer));
+    };
 
     installFetchChain((send) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = fetchUrlOf(input);
@@ -1258,7 +1349,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
             const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
-            const resp = await send(stamped.input, stamped.init);
+            const resp = await watchedSend(origin, () => send(stamped.input, stamped.init));
             try {
                 state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
             } catch {
@@ -1279,7 +1370,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
                     const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
-                    const resp = await send(stamped.input, stamped.init);
+                    const resp = await watchedSend(again, () => send(stamped.input, stamped.init));
                     try {
                         state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                     } catch {
@@ -1334,5 +1425,8 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    stallProbeMsOverride = undefined;
+    stallCooldownMsOverride = undefined;
+    stallSinkForTest = undefined;
     resetFetchChainForTest(opts);
 }

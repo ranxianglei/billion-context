@@ -61,6 +61,10 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #4129 (model-stall diagnostic): the EPIPE case spawns one `node --import
+    // tsx` child in a mkdtemp XDG_STATE_HOME dir; no ports bound (targets are
+    // connect-refused loopback), so only the zone band matters
+    "tests/issue4129-model-stall-diagnostic.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
