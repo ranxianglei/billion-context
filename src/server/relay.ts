@@ -137,25 +137,25 @@ function installV1ResponseFramer(res: http.ServerResponse): void {
     }) as typeof res.end;
 }
 
-/** #604/#1839: record an upstream failure that will never report usage
- *  (relay/gateway 5xx, network-level failure). #604 raises
- *  session.stats.lastInputTokens to a local estimate of the wire body so the
- *  next prepare() lands in the kernel's emergency band (truncate.threshold =
- *  0.95) and truncates large tool results server-side — the rescue that breaks
- *  the relay-5xx deadlock (#1493 refines the arm to the OUTBOUND payload size
- *  so fitting payloads don't over-trigger). The arm STAYS load-bearing:
- *  removing it re-deadlocks exactly those sessions.
- *  #1839: the arm stays ESTIMATE-grade and the ghost it once caused is killed
- *  at the reader, not by deleting the arm — while any usage-grade anchor
- *  exists, effectiveTokenCount's anchor branch prefers lastUsageGradeTokens
- *  over every estimate-grade value, so the arm can no longer reach the nudge
- *  denominator, the display or the preflight floors (pre-fix, one aborted turn
- *  armed 719521 against a real input of 143419 and the inflated denominator
- *  persisted ~23 min). Anchor-less sessions (fresh / silent backends) size on
- *  the per-turn min(localInputEstimate, raw) views, where the arm guarantees a
- *  near-window payload still crosses the emergency band on retry. The next
- *  real usage report overwrites it. */
-function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number): void {
+/** #604/#1839/#2683: record an upstream failure that will never report usage
+ *  (relay/gateway 5xx, network-level failure) by raising
+ *  session.stats.lastInputTokens to a local READING of the outbound payload —
+ *  the billing-caliber estimate outboundPayloadBreakdown publishes (#2683:
+ *  k̂-scaled chars/4 + wire overhead + image reserve, NOT the char-count upper
+ *  bound, which overstated the baseline 1.7–4× and forced phantom folds after
+ *  model/window changes). The arm STAYS ESTIMATE-grade: since the #1492/#1839
+ *  reader quarantine no decision floor trusts an estimate-grade value (the
+ *  preflight floors, effectiveTokenCount's fast path and statusInputBaseline
+ *  all gate on source ∈ {usage, overflow-arm}), so its live effects are
+ *  sizing/budget contexts only — preflight entry budget scaling, the
+ *  responses-lane output headroom, the codex-compact gate, persistence and
+ *  displays. (The #604 era's second consumer — feeding the kernel's
+ *  tool-result truncation loop as remaining depth — is gone: every processTurn
+ *  feed is quarantined and preflight runs noEmergencyTruncate.) The next real
+ *  usage report overwrites it. A mid-session model switch does NOT retire an
+ *  estimate-grade arm (byte-scale property of the payload) — it retires only
+ *  usage/overflow-arm-grade baselines measured under the previous model. */
+function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number, calibrated?: boolean): void {
     const s = prepared.session;
     if (!Number.isFinite(est) || est <= 0) return;
     // An upstream-proven ceiling (overflow-arm) plus its route-origin evidence
@@ -175,7 +175,7 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
         // The error path returns before forward()'s trailing markDirty — the
         // arm must schedule its OWN save or it is lost on restart.
         markDirty(s);
-        log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
+        log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens${calibrated ? " (k̂-calibrated outbound reading)" : " (raw outbound reading)"}`);
     }
 }
 
@@ -788,7 +788,10 @@ async function forwardCaptured(
         if (noteCircuitFailFastLog(upstreamUrl)) {
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
         }
-        if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+        if (prepared && req.method !== "GET" && req.method !== "HEAD") {
+            const arm = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+            armFailureShrink(prepared, log, "upstream circuit open", arm.armEstimate, arm.armCalibrated);
+        }
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
         const lastKind = upstreamCircuitLastFailureKind(upstreamUrl);
         const retryAfter = upstreamCircuitRetryAfterSeconds(upstreamUrl);
@@ -858,7 +861,10 @@ async function forwardCaptured(
             recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failure.message);
             // #604: a network-level failure (socket reset, timeout abort) also never
             // reports usage — arm the emergency shrink like the 5xx branch below.
-            if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+            if (prepared && req.method !== "GET" && req.method !== "HEAD") {
+                const arm = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+                armFailureShrink(prepared, log, "network failure", arm.armEstimate, arm.armCalibrated);
+            }
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
@@ -872,7 +878,10 @@ async function forwardCaptured(
         // must be strictly smaller than what was just rejected.
         recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
 
-        if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+        if (prepared && req.method !== "GET" && req.method !== "HEAD") {
+            const arm = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+            armFailureShrink(prepared, log, "network failure", arm.armEstimate, arm.armCalibrated);
+        }
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
         const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
         const budget = limitsWsOutboundBytes();
@@ -1562,7 +1571,8 @@ async function forwardCaptured(
         // already armed by the overflow path above, and armFailureShrink's
         // overflow-arm guard keeps this estimate from demoting that ceiling (#2484).
         if (prepared?.session && upstream.status >= 500) {
-            armFailureShrink(prepared, log, `upstream ${upstream.status}`, outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+            const arm = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+            armFailureShrink(prepared, log, `upstream ${upstream.status}`, arm.armEstimate, arm.armCalibrated);
         }
         // #174: always log a non-2xx upstream response (status + request-id +
         // body snippet) — a 4xx/5xx with zero log trace is a diagnostic

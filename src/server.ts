@@ -3028,7 +3028,7 @@ export function outboundPayloadBreakdown(
     opts: ProxyOptions,
     route: ReturnType<typeof resolveUpstream>,
     reqUrl: string,
-): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
+): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number; armCalibrated: boolean } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
     const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
@@ -3037,17 +3037,25 @@ export function outboundPayloadBreakdown(
     const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const textEstimate = estimateCoreMessages(msgs);
     const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
-    // #1498-F1: the arm value is not only a preflight floor — the kernel's
-    // tool-result truncation loop consumes it as its remaining-depth input, so
-    // an optimistic text estimate (chars/4 undercounts dense JSON/code by up to
-    // ~4x, #553) stops the loop one candidate early and re-breaks the #604
-    // relay rescue. The arming quantity is therefore floored by the text char
-    // bound, which never undershoots and deliberately does NOT count image
-    // base64 — image-heavy payloads keep the billing-accurate payloadEstimate
-    // (#1493) while text-dominated near-window payloads arm deep enough for the
-    // truncation loop to clear hidden upstream tolerances (#604).
-    const armEstimate = Math.max(textEstimate, estimateCoreMessagesUpper(msgs)) + overheadEstimate + imageTokens;
-    return { textEstimate, overheadEstimate, imageTokens, payloadEstimate: textEstimate + overheadEstimate + imageTokens, armEstimate };
+    // #2683 (supersedes the #1498-F1 bound floor): the arm adopts a
+    // BILLING-CALIBER READING of this send — the same k̂-scaled outbound
+    // formula the preflight trigger uses (#1933 F1 / #2117 B) plus the image
+    // reserve — NOT the char-count upper bound. The bound was floored in
+    // because the kernel's tool-result truncation loop once consumed the arm
+    // as its remaining-depth input (#604 rescue); since the #1492/#1839 reader
+    // quarantine NO processTurn feed passes an estimate-grade arm into any
+    // band (preflight runs noEmergencyTruncate), so the bound's only live
+    // effect was phantom mass: a 1.7–4× over-reading persisted as the session
+    // baseline, inflating preflight budgets, output headroom and displays
+    // until the next usage report landed. A reading may miss LOW (chars/4
+    // undercounts dense JSON/code, #553) — acceptable because estimate-grade
+    // values are quarantined from every decision floor, and k̂ closes most of
+    // the gap where route+model provenance matches.
+    const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
+    const armRaw = textEstimate + overheadEstimate;
+    const armText = applyEstimateCalibration(armRaw, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(billingUpstream));
+    const armEstimate = Math.round(armText + imageTokens);
+    return { textEstimate, overheadEstimate, imageTokens, payloadEstimate: textEstimate + overheadEstimate + imageTokens, armEstimate, armCalibrated: armText !== armRaw };
 }
 
 /** #2078: `parsed` carries the caller's pre-parsed send body so forward() does

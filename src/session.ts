@@ -853,6 +853,39 @@ export function displayContextBest(session: {
  *  scenario (estimate-grade overshoot pinning the shown reference) lives on
  *  as a kernel test. */
 
+/** #2683: a mid-session MODEL switch invalidates billing-grade baselines. A
+ *  usage report (or overflow evidence) measured under model X bills X's
+ *  tokenizer; judging model Y's requests against it forces phantom folds —
+ *  case: 566,322 billed under a 1M-window model judged against a 400k window
+ *  after the switch fired two ~3-minute emergency folds on a payload that
+ *  already fit at 62% of the new window. Retires exactly the model-specific
+ *  readings: lastInputTokens while usage/overflow-arm grade (plus its origin
+ *  stamp), the usage anchor twin lastUsageGradeTokens, the context mirror, and
+ *  the one-shot overflow arm. The last-real-usage TIMESTAMP
+ *  (metadata.contextTokensAt) is KEPT — it is forensic display data ("when did
+ *  the last real bill arrive"), not a decision input. Estimate-grade values
+ *  SURVIVE: they are byte-scale properties of the payload itself, not of the
+ *  model that bills it (and estimate-grade values are quarantined from every
+ *  decision floor already). The calibration ring keys by model and rolls over
+ *  on its own; the cache ledger keeps its history. Same-model window changes
+ *  do NOT retire: the bill stays valid when only the declared window moves.
+ *  Returns the retired trusted baseline (0 when nothing trusted stood). */
+export function retireCrossModelBaselines(session: Session): number {
+    const st = session.stats;
+    const trusted = st.lastInputTokensSource === "usage" || st.lastInputTokensSource === "overflow-arm";
+    if (!trusted || !(st.lastInputTokens > 0)) return 0;
+    const retired = st.lastInputTokens;
+    st.lastInputTokens = 0;
+    st.lastInputTokensSource = undefined;
+    st.lastInputTokensOrigin = undefined;
+    st.lastUsageGradeTokens = undefined;
+    st.contextTokens = 0;
+    st.contextTokensSource = undefined;
+    delete st.overflowArmTokens;
+    markDirty(session);
+    return retired;
+}
+
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
  *  log their own armFailureShrink arms; this one used to be silent, so a
