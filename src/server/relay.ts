@@ -21,6 +21,7 @@ import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
+import { beginForward, endForward } from "../concurrent-forwards.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
@@ -247,11 +248,36 @@ export function armFirstByteWatchdog(o: {
     return timer;
 }
 
-export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
-    return withCacheCapture(args[4]?.session, () => forwardCaptured(...args));
+// #3102: counts in-flight model forwards per session so the degenerate-terminal
+// diagnostic line can report whether another same-session forward (the dsh
+// title-gen sidecar, #2503) was in flight when the turn ended. The counter
+// wraps the cache-captured forward; forwardInner keeps its original body.
+export async function forward(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    opts: ProxyOptions,
+    body: Buffer | string,
+    prepared: Prepared | null,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    route: ReturnType<typeof resolveUpstream>,
+    instanceId: string,
+    affinity?: string,
+    overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
+    v1Meta?: Record<string, unknown>,
+): Promise<void> {
+    const sid = prepared?.session.id;
+    const counted = sid !== undefined && req.method !== "GET" && req.method !== "HEAD";
+    if (counted) beginForward(sid);
+    try {
+        await withCacheCapture(prepared?.session, () => forwardInner(req, res, opts, body, prepared, core, config, log, route, instanceId, affinity, overflowRefold, v1Meta));
+    } finally {
+        if (counted) endForward(sid);
+    }
 }
 
-async function forwardCaptured(
+async function forwardInner(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     opts: ProxyOptions,
