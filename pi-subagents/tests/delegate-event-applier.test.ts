@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeEventApplier, type EventApplier } from "../src/delegate-tool.js";
+import type { Usage } from "../src/delegate-events.js";
 
 class MockWriter {
 	chunks: string[] = [];
@@ -146,4 +147,57 @@ test("tool activity goes to activity file, not reply", () => {
 	applier.handleEventLine(end("answer"));
 	assert.equal(reply.text, "answer");
 	assert.match(activity.text, /\[tool\] bash echo hi/);
+});
+
+// #4359: empty-reply diagnostics come from the LAST assistant message_end.
+function messageEnd(msg: Record<string, unknown>): string {
+	return `{"type":"message_end","message":${JSON.stringify(msg)}}`;
+}
+
+test("getEmptyReplyDiagnostics: undefined until any assistant message_end arrives", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(delta("partial"));
+	assert.equal(applier.getEmptyReplyDiagnostics(), undefined);
+});
+
+test("getEmptyReplyDiagnostics: captures terminal state + that turn's usage (issue case A)", () => {
+	const usages: Usage[] = [];
+	const reply = new MockWriter();
+	const applier = makeEventApplier({ showThinking: false, onUsage: (u) => usages.push(u) }, { reply, activity: null });
+	applier.handleEventLine(
+		messageEnd({
+			role: "assistant",
+			content: [],
+			stopReason: "error",
+			rawStopReason: "incomplete",
+			errorMessage: "Response incomplete without a provider reason",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		}),
+	);
+	assert.deepEqual(applier.getEmptyReplyDiagnostics(), {
+		stopReason: "error",
+		rawStopReason: "incomplete",
+	 errorMessage: "Response incomplete without a provider reason",
+		textBlocks: 0,
+		thinkingBlocks: 0,
+		usageIn: 1,
+		usageOut: 1,
+	});
+	assert.equal(usages.length, 1, "usage callback still fires for terminal+usage events");
+});
+
+test("getEmptyReplyDiagnostics: last message_end wins across turns; terminal-only events don't touch usage", () => {
+	const usages: Usage[] = [];
+	const reply = new MockWriter();
+	const applier = makeEventApplier({ showThinking: false, onUsage: (u) => usages.push(u) }, { reply, activity: null });
+	applier.handleEventLine(
+		messageEnd({ role: "assistant", content: [{ type: "text", text: "step one done" }], stopReason: "stop", usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }),
+	);
+	applier.handleEventLine(messageEnd({ role: "assistant", content: [], stopReason: "stop", rawStopReason: "completed" }));
+	const d = applier.getEmptyReplyDiagnostics();
+	assert.equal(d?.stopReason, "stop");
+	assert.equal(d?.rawStopReason, "completed");
+	assert.equal(d?.textBlocks, 0, "last turn had no text blocks");
+	assert.equal(d?.usageIn, 100, "usage stays from the last turn that carried one");
+	assert.equal(usages.length, 1, "terminal-only event must not call onUsage with fake zeros");
 });
