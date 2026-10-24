@@ -147,7 +147,7 @@ export function isTlsTrustCode(code: unknown): boolean {
 // the probe-captured certificate actually show; the unqualified call keeps the
 // verify-first default so no channel ever leads with "install this CA" without
 // evidence.
-export interface TlsTrustRemediationCtx {
+interface TlsTrustRemediationCtx {
     /** The trust code that fired — picks the branch (alt-name mismatch vs
      *  self-signed family vs expired). */
     code?: string;

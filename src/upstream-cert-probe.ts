@@ -16,7 +16,7 @@ import * as net from "node:net";
 import * as tls from "node:tls";
 import { log as loggerLog } from "./logger.js";
 
-export interface PresentedCertInfo {
+interface PresentedCertInfo {
     /** Address THIS probe connected to (probe-time resolution, not necessarily
      *  the failed request's). */
     remoteAddress?: string;
