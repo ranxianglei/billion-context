@@ -132,6 +132,26 @@ entries:
     desc_zh: "可折叠片段的最小字符数；更短的永不折叠。"
     site_en: "Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold."
     site_zh: "可折叠片段的最小字符数（内核默认约 5000），更短的永不折叠。"
+  - key: compress.maxSummaryLength
+    type: number
+    default: "kernel 20000"
+    group: compress
+    id: cw.msl
+    render: compress-row
+    desc_en: "Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded."
+    desc_zh: "单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。"
+    site_en: "Hard cap, in characters, on one generated summary (kernel default 20000): longer replies are rejected whole by the kernel check or the external-summary executor. External summarizers receive this exact cap in their instructions (#3635); 0 disables the cap."
+    site_zh: "单条生成摘要的硬上限，单位为字符（内核默认 20000）：超长的回复由内核检查或外部摘要执行器整段拒绝。外部摘要模型的指令中会写明这个确切上限（#3635）；0 禁用上限。"
+  - key: compress.minSummaryLength
+    type: number
+    default: "kernel 50"
+    group: compress
+    id: cw.mnl
+    render: compress-row
+    desc_en: "Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635)."
+    desc_zh: "生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。"
+    site_en: "Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635)."
+    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：过短的回复被整段拒绝；0 禁下限。外部摘要模型受同一下限约束（#3635）。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""

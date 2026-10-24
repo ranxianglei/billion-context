@@ -78,6 +78,8 @@ export function mergeCompress(
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
+        maxSummaryLength: pick("maxSummaryLength"),
+        minSummaryLength: pick("minSummaryLength"),
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
@@ -337,6 +339,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         compress: {
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
+            // #3635: previously unmapped, so a configured cap never reached the
+            // resolved kernel config (panel PUT and file edits were both inert).
+            maxSummaryLength: s.maxSummaryLength ?? base.compress.maxSummaryLength,
+            minSummaryLength: s.minSummaryLength ?? base.compress.minSummaryLength,
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,

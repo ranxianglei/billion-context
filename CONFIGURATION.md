@@ -100,7 +100,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `rollout.features.percent` | number | the version's baked-in plan | — | Percent of installs (0–100, fractional allowed) that see the feature. Monotonic: raising the percent never drops an already-enabled install; the bucket is prefix-stable per install. |
 | `rollout.features.salt` | string | the feature name | — | Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles). |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed). |
-| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal biliMsgIds array parallel to messages that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only POST /__bili/plugin/render endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises serverHistory. Default 0% — no behavior change until rolled out. |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out. |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
 | `security.adminRelay` | boolean | false | — | Let an embedding host (dsh web today) relay the ENTIRE /__bili/ admin surface through its own entry origin so a remote browser can open the panel (#3373). Fail-closed, file-only. The relayed hop reaches the proxy as a local non-browser client (loopback source + loopback Host, no Origin), so the admin gate stays unchanged; enabling it exposes config editing and credential writes to whoever can reach the host web entry — protect that entry (auth / reverse proxy) first. |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
@@ -267,6 +267,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.preserveRecentMessages` | number | 3 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
+| `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
+| `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
@@ -1380,6 +1382,20 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Status:** DEPRECATED (alias of `minCompressRangeChars`, kept for backward compatibility)
 - **Description:** Legacy name for `minCompressRangeChars` — same kernel mapping (`compress.minCompressRange`), same unit (characters). When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
+
+#### `maxSummaryLength`
+
+- **Type:** `number`
+- **Default:** *(kernel default `20000`)*
+- **Status:** ACTIVE (#3635)
+- **Description:** Hard cap, in **characters**, on ONE generated summary. Longer replies are rejected whole — by the kernel's all-or-nothing length check for in-model summaries and by the external-summary executor for configured chains (no truncation, no retry). Both preflight and model-tool compression paths tell external summarizers this exact cap up front (preflight since #1775, the compress path since #3635), so overshoot is a model-compliance failure with a named log reason instead of an opaque discard. `0` disables the cap. Maps to the kernel field `compress.maxSummaryLength`. Before #3635 the key was accepted nowhere: the panel PUT silently dropped it and file edits never reached the resolved config, so the effective value was always the kernel default.
+
+#### `minSummaryLength`
+
+- **Type:** `number`
+- **Default:** *(kernel default `50`)*
+- **Status:** ACTIVE (#3635)
+- **Description:** Floor, in **characters**, for generated summaries; shorter replies are rejected whole. `0` disables the floor. Maps to the kernel field `compress.minSummaryLength`. Same acceptance history as `maxSummaryLength` (#3635).
 
 #### `tiers`
 

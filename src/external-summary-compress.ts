@@ -5,7 +5,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import type { SummaryWork } from "./external-summary.js";
+import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
 // Re-exported for callers that historically imported it here; the canonical
@@ -86,9 +86,13 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
                 .map(({ topic, summary }) => ({ topic, summary })),
         });
         valid.push(range);
-        work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength,
-            maxSummaryChars: Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength),
-            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt()}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.` });
+        // #3635: state the EXACT cap the validator enforces in the instructions
+        // — the preflight path has told its summarizers this number since #1775;
+        // without it the compress path asked for output it could never accept.
+        const maxSummaryChars = Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength);
+        work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength, maxSummaryChars,
+            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt()}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
+                + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
     if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
     const batch = await plan.summarize(work, signal);
@@ -97,8 +101,10 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     for (const [index, result] of batch.results.entries()) {
         if (result.status === "success") successful.push({ ...valid[index], summary: result.summary, compressCallId: newExternalCallId() });
     }
-    ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); batch=${batch.status}`);
-    if (successful.length === 0) return compressResult("[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration.]", "refused", 0);
+    // #3635: full failure description (parity with the preflight log line) so
+    // an over-cap rejection is visible with its length reason, not bare "batch=finished".
+    ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); ${describeExternalSummaryFailure(batch)}`);
+    if (successful.length === 0) return compressResult("[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.]", "refused", 0);
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.
     // In-place refolds retain their old call id in the kernel; keep their anchor too.

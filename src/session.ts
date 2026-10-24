@@ -711,6 +711,43 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
 }
 
+// #4383: a positive usage-grade anchor below this share of the billing-caliber
+// estimate of the last main send (contextEstimateTokens) cannot describe the
+// payload this conversation actually carries — it measured a different,
+// smaller request under the same session id (title-gen/probe sidecar) or
+// predates a growth burst. 0.25 sits just inside the estimator's own error
+// band (uncalibrated chars/4 over-counts ASCII up to ~3.5× ⇒ a legitimate
+// same-payload sample lands ≈0.29× the estimate and survives; sidecar samples
+// are typically <10% and get caught), matching the k̂ clamp floor (0.25–4).
+const STALE_ANCHOR_RATIO = 0.25;
+
+/** #4383: stale-small usage-anchor guard shared by every input-baseline reader
+ *  (statusInputBaseline, effectiveTokenCount). Returns the replacement reading
+ *  — the calibrated local estimate itself (#1595's promised "ride local
+ *  estimates until a usage-grade sample lands" fallback) — when BOTH hold:
+ *   - `anchor` is below STALE_ANCHOR_RATIO × `stats.contextEstimateTokens`
+ *     (magnitude-inconsistent with what this conversation actually sends);
+ *   - `contextTokensSource === "estimate"`, i.e. a MAIN SEND has occurred
+ *     since the last settled usage report (the relay chokepoint stamps it per
+ *     send, settleUsageReport flips it back to "usage"). That freshness gate
+ *     is what separates a STALE sidecar sample (superseded by later larger
+ *     main sends) from a FRESH small one (the current send's own report,
+ *     which keeps its #1820 authority over the post-rebuild anchor).
+ *  One-directional by design: anchors ABOVE the estimate keep their #1839
+ *  precedence (fail-closed direction); only too-small poison is demoted.
+ *  Absent/non-positive estimate (legacy sessions, no main send yet) → null,
+ *  byte-identical legacy behavior. */
+export function staleSmallAnchorFallback(
+    stats: Pick<Session["stats"], "contextEstimateTokens" | "contextTokensSource">,
+    anchor: number,
+): number | null {
+    const est = stats.contextEstimateTokens;
+    return stats.contextTokensSource === "estimate"
+        && anchor > 0 && typeof est === "number" && Number.isFinite(est) && est > 0 && anchor < STALE_ANCHOR_RATIO * est
+        ? est
+        : null;
+}
+
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
  *  recompute, plugin live nudge + panel, post-compress tail. Shared by every
  *  status surface so none of them can present an estimate-grade reading as a
@@ -732,7 +769,11 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
  * sentinel. Never clamps: a REAL over-window usage report must still read
  * >100%. The JSON observation contract (contextTokens/contextTokensSource,
  * #2017) is deliberately separate — it expresses unknown explicitly rather
- * than as 0. */
+ * than as 0. On top of that, BOTH #4383 guards apply: cycle-stale
+ * (usageAnchorCycleStale — see its header below) and stale-small
+ * (staleSmallAnchorFallback — an anchor below 25% of the billing-caliber
+ * local estimate AND superseded by a later main send measured a different
+ * request under the same session id). */
 /** #4383: a usage-grade anchor is CYCLE-STALE when the freshest per-send
  *  evidence postdates the last settle: the relay send chokepoint re-stamps
  *  contextTokens/contextTokensSource="estimate" on every main-lane send
@@ -753,15 +794,11 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
 
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
-    // #4383: a cycle-stale usage anchor must not mask the live payload on
-    // status surfaces either — the panel read usage=1% at a real ~300K for
-    // four hours while the request path (effectiveTokenCount) kept sizing on
-    // the same frozen anchor. Ride the per-send upper bound (fail-closed
-    // caliber, #553/#728) until a real report re-anchors.
     if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
-    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;
+    return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 
 /** #2117: the honest best reading of "how full is this context right now" for

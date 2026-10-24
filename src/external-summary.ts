@@ -27,6 +27,9 @@ interface SummaryPoolOptions {
 interface SummaryAttempt {
     readonly targetIndex: number;
     readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled";
+    /** #3635: WHY an invalid_summary reply was rejected wholesale — before, a
+     *  discarded over-cap summary left only this bare outcome as a trace. */
+    readonly detail?: string;
 }
 
 type ExternalSummaryResult =
@@ -48,6 +51,48 @@ interface Waiter {
 
 function positiveInteger(value: number): boolean {
     return Number.isSafeInteger(value) && value > 0;
+}
+
+/** #3635: name WHY a candidate reply failed the length/shape gate. Mirrors the
+ *  validator's check order below so the stated reason always matches the cause
+ *  that rejected the reply. Pure numbers + fixed words — never echoes payload. */
+function invalidSummaryDetail(value: unknown, limits: SummaryBudget, request: Readonly<SummaryWork>): string {
+    if (typeof value !== "string" || !value.trim()) return "empty or non-string response";
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes > limits.maxSummaryBytes) return `response ${bytes} bytes exceeds byte cap ${limits.maxSummaryBytes}`;
+    const chars = value.trim().length;
+    const floor = request.minSummaryChars ?? 1;
+    if (chars < floor) return `summary ${chars} chars below floor ${floor}`;
+    return `summary ${chars} chars exceeds cap ${request.maxSummaryChars}`;
+}
+
+/** #1775/#3635: the length-budget clause every external-summarizer prompt
+ *  carries — rendered up front with the EXACT cap the validator enforces, so
+ *  the first attempt fits instead of paying full latency for a wholesale-
+ *  discarded overshoot. Omitted below the minimum-summary floor (the kernel
+ *  minimum-summary gate rejects such output anyway, so the instruction would
+ *  be counterproductive) and when the cap is unbounded (<= 0 / Infinity). */
+export function summaryLengthBudgetClause(budget: number | undefined, minChars: number): string {
+    if (budget === undefined || !Number.isFinite(budget) || budget <= 0 || budget < minChars) return "";
+    return `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${budget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`;
+}
+
+/** Describe why an external-summary batch yielded no usable summary (#2484):
+ *  the batch stop reason plus each candidate attempt's outcome, so an operator
+ *  can tell timeout / error / cancelled / invalid-plan apart instead of seeing
+ *  one opaque "failed or exceeded their budget" line. #3635: invalid_summary
+ *  attempts carry their rejection reason in parentheses. */
+export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult): string {
+    if (batch.status === "failed") return `batch=failed reason=${batch.reason}`;
+    // #2678: multi-range batches report the FIRST failing range, not slot 0 —
+    // slot 0 may have succeeded while a later range is what stopped the batch.
+    // Single-range callers see identical output (find falls back to results[0]).
+    const result = batch.results.find((entry) => entry.status !== "success") ?? batch.results[0];
+    if (!result) return `batch=${batch.status} (no result)`;
+    const parts = [`batch=${batch.status}`, `result=${result.status}`];
+    if (result.status === "failed") parts.push(`reason=${result.reason}`);
+    parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}${a.detail ? ` (${a.detail})` : ""}`).join(",")}]`);
+    return parts.join(" ");
 }
 
 function validBudget(budget: SummaryBudget): boolean {
@@ -212,7 +257,7 @@ export class ExternalSummaryExecutor {
                     || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
                     || result.value.trim().length < (request.minSummaryChars ?? 1)
                     || ((request.maxSummaryChars ?? 0) > 0 && result.value.trim().length > request.maxSummaryChars!)) {
-                    attempts.push({ targetIndex, outcome: "invalid_summary" });
+                    attempts.push({ targetIndex, outcome: "invalid_summary", detail: invalidSummaryDetail(result.value, limits, request) });
                 } else {
                     attempts.push({ targetIndex, outcome: "success" });
                     return { status: "success", summary: result.value, targetIndex, attempts };

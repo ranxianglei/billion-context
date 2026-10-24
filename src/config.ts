@@ -301,6 +301,15 @@ export type CompressSettings = {
      *  wins; across levels the deeper level wins regardless of which name it
      *  uses. */
     minCompressRange?: number;
+    /** Hard character cap on ONE generated summary; longer replies are
+     *  rejected whole by the kernel and the external-summary executor. Maps to
+     *  kernel `compress.maxSummaryLength` (default 20000; 0 = unbounded).
+     *  #3635: external summarizers are told this exact cap up front. */
+    maxSummaryLength?: number;
+    /** Character floor for generated summaries; shorter replies are rejected
+     *  whole. Maps to kernel `compress.minSummaryLength` (default 50;
+     *  0 = disabled). #3635. */
+    minSummaryLength?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
     /** Tool-name patterns whose LATEST tool-call + paired result are never
@@ -2199,6 +2208,8 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
+    // #3635: summary-length caps — previously accepted nowhere, silently dropped.
+    "maxSummaryLength", "minSummaryLength",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2861,6 +2872,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
         takeNumber(key);
+    }
+    // #3635: summary-length caps map onto kernel compress.{max,min}SummaryLength.
+    // 0 is meaningful (unbounded cap / disabled floor), negative is not — so
+    // validate stricter than takeNumber instead of reusing it.
+    for (const key of ["maxSummaryLength", "minSummaryLength"] as const) {
+        if (!(key in obj)) continue;
+        const v = obj[key];
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else (out as Record<string, unknown>)[key] = v;
     }
     // #2228: the decision side-call budget must be positive — 0/negative would
     // starve the call, so validate stricter than takeNumber.

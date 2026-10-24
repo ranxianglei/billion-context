@@ -11,7 +11,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -247,7 +247,11 @@ export function armFirstByteWatchdog(o: {
     return timer;
 }
 
-export async function forward(
+export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
+    return withCacheCapture(args[4]?.session, () => forwardCaptured(...args));
+}
+
+async function forwardCaptured(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     opts: ProxyOptions,
@@ -2238,11 +2242,7 @@ export async function forward(
                 const reportedCached: number | null = typeof cached === "number" ? cached : null;
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
-                    // wireBody — not prepared.body — is what actually went out
-                    // (compat-role / steering / chain-stamp rewrites apply after
-                    // prepare); the main chokepoint above already noted it, this
-                    // keeps the pair byte-exact if that ever moves (#1891).
-                    noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+                    // Use the send-time capture; settlement is not another send.
                     settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;

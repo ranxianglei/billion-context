@@ -516,7 +516,7 @@ export function restoreOutputBudget(
         clearNoCeilingDegraded(session, modelName);
         // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
         // collapse from intent here, so forward verbatim but surface the gap once.
-        if (dshLane === true && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
+        if (dshLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
             log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
         }
         return;

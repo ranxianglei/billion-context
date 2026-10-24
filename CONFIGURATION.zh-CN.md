@@ -100,7 +100,7 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
-| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0 (off) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 messages 平行的内部字段 biliMsgIds,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 POST /__bili/plugin/render 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 serverHistory。默认 0%,放量前无行为变化。 |
+| `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
@@ -267,6 +267,8 @@
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
+| `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
+| `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
@@ -1383,6 +1385,20 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number`
 - **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
 - **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
+
+#### `maxSummaryLength`
+
+- **类型：** `number`
+- **默认值：** *（内核默认值 `20000`）*
+- **状态：** ACTIVE（#3635）
+- **说明：** 单条生成摘要的硬上限，单位为**字符**。超长的回复被整段拒绝——模型自产摘要由内核的全有或全无长度检查拒绝，配置的摘要链由外部摘要执行器拒绝（不截断、不重试）。preflight 与模型工具两条压缩路径都会把这个确切上限提前告知外部摘要模型（preflight 自 #1775 起，compress 路径自 #3635 起），因此超长从「无声丢弃」变成有明确日志原因的模型合规问题。`0` 禁用上限。映射到内核字段 `compress.maxSummaryLength`。#3635 之前该键在任何层面都不被接受：面板 PUT 会静默丢弃它，手改配置文件也到不了生效配置，实际生效值永远是内核默认值。
+
+#### `minSummaryLength`
+
+- **类型：** `number`
+- **默认值：** *（内核默认值 `50`）*
+- **状态：** ACTIVE（#3635）
+- **说明：** 生成摘要的下限，单位为**字符**；过短的回复被整段拒绝。`0` 禁下限。映射到内核字段 `compress.minSummaryLength`。与 `maxSummaryLength` 相同的接受历史（#3635）。
 
 #### `tiers`
 

@@ -8,7 +8,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, generationParamFp, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
@@ -493,7 +493,7 @@ export async function* runCompressLoop(
         // overwrites the slot; clipped/oversized bodies retain no full copy and
         // the continuity check silently skips (no false positives from partial
         // forensics). Advisory; never blocks.
-        const prevSentFull = ctx.session.transient?.sentBody?.full ?? null;
+        const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
         noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));

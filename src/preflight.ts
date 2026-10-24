@@ -28,7 +28,10 @@ import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { isCodexClient } from "./codex-compact.js";
-import type { ExternalSummaryBatchResult } from "./external-summary.js";
+import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
+// #3635: the failure description moved to the leaf module next to its data
+// type; re-exported here for importers that historically reached it via preflight.
+export { describeExternalSummaryFailure };
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
@@ -1176,23 +1179,6 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
-/** Describe why an external-summary batch yielded no usable summary (#2484):
- *  the batch stop reason plus each candidate attempt's outcome, so an operator
- *  can tell timeout / error / cancelled / invalid-plan apart instead of seeing
- *  one opaque "failed or exceeded their budget" line. */
-export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult): string {
-    if (batch.status === "failed") return `batch=failed reason=${batch.reason}`;
-    // #2678: multi-range batches report the FIRST failing range, not slot 0 —
-    // slot 0 may have succeeded while a later range is what stopped the batch.
-    // Single-range callers see identical output (find falls back to results[0]).
-    const result = batch.results.find((entry) => entry.status !== "success") ?? batch.results[0];
-    if (!result) return `batch=${batch.status} (no result)`;
-    const parts = [`batch=${batch.status}`, `result=${result.status}`];
-    if (result.status === "failed") parts.push(`reason=${result.reason}`);
-    parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}`).join(",")}]`);
-    return parts.join(" ");
-}
-
 async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number, systemOverride?: string): Promise<SummaryOutcome> {
     // #1775: the cap used to be enforced only after the fact — an over-cap
     // assembly was discarded wholesale (the #1775 incident). Tell the model the
@@ -1203,9 +1189,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // place of the default tier-1 TASK; absent → byte-identical default below.
     const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
-        (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
-            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
-            : "");
+        summaryLengthBudgetClause(lengthBudget, MIN_SUMMARY_CHARS);
     if (deps.externalSummary) {
         const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
             maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
@@ -2476,9 +2460,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const instructions =
                         buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
                         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
-                        (perChunkBudget !== undefined && perChunkBudget >= MIN_SUMMARY_CHARS
-                            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${perChunkBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
-                            : "");
+                        summaryLengthBudgetClause(perChunkBudget, MIN_SUMMARY_CHARS);
                     nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
                     workTotal += chunks.length;
                 }

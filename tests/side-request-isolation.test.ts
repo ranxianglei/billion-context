@@ -458,6 +458,31 @@ test("restoreOutputBudget: the <=200 starve log keeps its original wording, the 
     assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band restore names itself");
 });
 
+test("restoreOutputBudget: a KNOWN ceiling with value >= ceiling is healthy — no spurious 'NO known output ceiling' warn (#4501)", () => {
+    _resetDshMidBandWarningsForTest();
+    const warns: string[] = [];
+    const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
+    const tools = [{ name: "t" }];
+    const M = "prov/capped-model";
+    const CEIL = 131_072;
+    const midBandWarns = (): number => warns.filter((w) => w.includes("NO known output ceiling")).length;
+    // Pre-#4501 the mid-band warn fired on any dsh-lane tool-carrying budget in
+    // the healthy branch — including when a ceiling WAS known (value >= ceiling) —
+    // spamming operators who had declared one. A known ceiling makes it healthy.
+    const s = metaSession("dsh-cap-known");
+    const atCap = { max_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(atCap, s, log, CEIL, true);
+    assert.equal(atCap.max_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(midBandWarns(), 0, "a KNOWN ceiling suppresses the mid-band warn");
+    const over = { max_tokens: CEIL + 1, tools, model: M };
+    restoreOutputBudget(over, s, log, CEIL, true);
+    assert.equal(over.max_tokens, CEIL + 1, "above-ceiling passes verbatim (not a collapse)");
+    assert.equal(midBandWarns(), 0, "above-ceiling is also not a missing-ceiling gap");
+    const s2 = metaSession("dsh-cap-none");
+    restoreOutputBudget({ max_tokens: CEIL, tools, model: M }, s2, log, undefined, true);
+    assert.equal(midBandWarns(), 1, "no ceiling -> the warn still fires exactly once");
+});
+
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
     _resetPluginStateForTest();
     setRegistryForTest({ "stepfun/step-5-preview": { limit: { context: 1_000_000, output: 1_000_000 } } });

@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -2422,7 +2422,10 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #1839: an overflow arm rides in here too — it is evidence, not billing,
     // but it is bounded by the declared/stated window so it cannot produce
     // the >100% ghost class, and the next real usage report overwrites it.
-    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #4383 (both guards): stale-small — a sidecar/side-request sample under
+    // the same session id, superseded by later main sends — must not freeze the
+    // meter either; fall through to the fresher measurement.
+    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2455,7 +2458,14 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // upstreams (#553/#728) are unaffected: their anchor stays absent, so the
     // fail-closed upper bounds below still apply.
     const grade = session.stats.lastUsageGradeTokens;
-    if (!anchorStale && grade !== undefined && grade > 0) return { tokens: grade, source: "usage" };
+    if (!anchorStale && grade !== undefined && grade > 0) {
+        // #4383: stale-small retained anchor — the calibrated local estimate
+        // of the current outbound is strictly better than the char-count
+        // branches below (#1839 inflation), so it wins immediately.
+        const fallback = staleSmallAnchorFallback(session.stats, grade);
+        if (fallback !== null) return { tokens: fallback, source: "estimate" };
+        return { tokens: grade, source: "usage" };
+    }
     // #553: zero-baseline ANCHOR-LESS anonymous sessions (prefix-affinity
     // mints/forks/reloads) fall back to the raw-history upper bound — see the
     // function header for why feeding 0 blinds them.

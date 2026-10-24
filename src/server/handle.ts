@@ -291,6 +291,12 @@ async function handleRequest(
     let responsesCompact: boolean;
     let route: ReturnType<typeof resolveUpstream>;
     let upstreamOrigin: string;
+    /** #4501: full destination URL this request forwards to — the single basis for
+     *  matching providers.* config keys. Path-style requests (no /bili/ tunnel, no
+     *  absolute form, non-MITM) leave resolveUpstream undefined so route?.rewrittenUrl
+     *  alone misses every per-provider declaration; reconstruct opts.upstream + path
+     *  there so config resolves identically across all request forms. */
+    let providerDestUrl: string;
     let protocol: WireProtocol | null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
@@ -340,6 +346,7 @@ async function handleRequest(
             }
         }
         upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
+        providerDestUrl = route ? route.rewrittenUrl : /^https?:\/\//i.test(urlPath) ? urlPath : `${opts.upstream}${urlPath}`;
         // #1909: user-declared wire protocol (providers[<url-prefix>].protocol)
         // outranks the built-in suffix heuristics — explicit intent beats
         // inference. Looked up by the FULL destination URL (route.rewrittenUrl
@@ -680,7 +687,7 @@ async function handleRequest(
         const model = requestModel;
         reqModelId = typeof model === "string" ? model : undefined;
         if (model) {
-            const embeddedUrl = route?.rewrittenUrl;
+            const embeddedUrl = providerDestUrl;
             // Native-window resolution order: (0) per-request TIER EVIDENCE
             // that this request runs on an expanded tier — (a) the client's
             // `anthropic-beta` larger-context negotiation (context-1m-… →
@@ -836,9 +843,9 @@ async function handleRequest(
     // #661: route-scoped passthrough — the global flag's semantics, limited to
     // requests whose upstream URL matches a provider route with
     // `passthrough: true` (upstreams that fingerprint the request body).
-    const routePassthrough = !opts.passthrough && findRoute(opts.routes, route?.rewrittenUrl)?.passthrough === true;
+    const routePassthrough = !opts.passthrough && findRoute(opts.routes, providerDestUrl)?.passthrough === true;
     if (routePassthrough && hopMarker === undefined && protocol && parsed) {
-        log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
+        log("info", `[route-passthrough] ${maskUrlsInText(providerDestUrl)} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
@@ -1890,13 +1897,13 @@ async function handleRequest(
             // The plugin-stamped lane is the live path; the clientHint arm is defensive —
             // it matches only if some dsh build's wire identity is literally "dsh".
             const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
-            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader, requestModel), dshRestoreLane);
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, providerDestUrl, opts.sessionHeader, requestModel), dshRestoreLane);
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
-        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
+        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
         // is refused BEFORE any pipeline work: not forwarded, kernel state
@@ -2230,8 +2237,8 @@ async function handleRequest(
                 const fbModel = (parsed as { model?: string }).model;
                 if (fbModel) {
                     let host: string | undefined;
-                    try { host = route?.rewrittenUrl ? new URL(route.rewrittenUrl).host : undefined; } catch { host = undefined; }
-                    const cfgOut = resolveConfiguredOutputLimit(opts.routes, route?.rewrittenUrl, fbModel);
+                    try { host = providerDestUrl ? new URL(providerDestUrl).host : undefined; } catch { host = undefined; }
+                    const cfgOut = resolveConfiguredOutputLimit(opts.routes, providerDestUrl, fbModel);
                     const regOut = peekRegistryOutputLimit(fbModel, host);
                     const budget = cfgOut !== undefined ? cfgOut : regOut;
                     if (typeof budget === "number" && budget > 0) {
@@ -2358,7 +2365,7 @@ async function handleRequest(
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
-                    const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
+                    const cs = resolveCompress(opts.routes, providerDestUrl, requestModel, opts.compress);
                     // #2228: model-decided nudge timing — resolved through the standard
                     // three-level compress cascade; presence of the object enables the
                     // side-call decision path at tier-1 arms (off unless explicitly set).
@@ -2416,7 +2423,7 @@ async function handleRequest(
                     // provider field); an absent policy stores undefined and
                     // clears any stale slot from a previous route.
                     {
-                        const destUrl = route ? route.rewrittenUrl : /^https?:\/\//i.test(urlPath) ? urlPath : `${opts.upstream}${urlPath}`;
+                        const destUrl = providerDestUrl;
                         const calibPolicy = findRoute(opts.routes, destUrl)?.calibration;
                         session.stats.lastCalibrationPolicy = calibPolicy;
                         session.stats.lastCalibrationPolicyOrigin = calibPolicy ? destUrl : undefined;

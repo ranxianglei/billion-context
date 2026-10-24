@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
     computeFoldEconomics,
     decomposeSample,
@@ -81,6 +82,9 @@ interface LedgerFold {
 }
 
 interface LedgerLine {
+    captureId?: string;
+    captureRound?: number;
+    evidence?: "out-of-order";
     seq: number;
     at: number;
     input: number;
@@ -418,6 +422,9 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  UTF-8 bytes). #2923: slots live under session.transient so the retained
  *  copies release with the session. */
 export interface SeamSlot {
+    order?: number;
+    requestId?: string;
+    round?: number;
     /** Capped head (≤ SEAM_BODY_CAP bytes) — seam forensics + JSON parse side. */
     head: Buffer;
     /** Exact outbound body size in bytes — precise cap/full detection. */
@@ -487,6 +494,49 @@ function originEvidenceJson(m: CoreMessage): string {
     return JSON.stringify(stripped);
 }
 
+// #4430: per-request pending-evidence isolation. Overlapping forwards on one
+// session (same-request re-tries, concurrent side lanes) used to share ONE
+// session.transient slot — the second forward's evidence clobbered the first's
+// before settle. Pending evidence now lives in an AsyncLocalStorage capture;
+// session.transient remains the fallback for callers outside the wrapper.
+type Capture = {
+    session: Session;
+    requestId: string;
+    round: number;
+    sentBody?: SeamSlot;
+    inBody?: InboundSlot;
+    imageFacts?: ForwardedImageFacts;
+};
+const captures = new AsyncLocalStorage<Capture>();
+let captureOrder = 0;
+
+/** Covers the entire forward, including awaited streaming/loop callbacks.
+ *  Concurrent requests keep independent pending evidence; only settled pairs
+ *  live on the session. It does not serialize upstream work or change the wire. */
+export async function withCacheCapture<T>(session: Session | undefined, fn: () => Promise<T>): Promise<T> {
+    if (!session) return fn();
+    return captures.run({ session, requestId: randomUUID(), round: 0 }, async () => {
+        try { return await fn(); }
+        finally {
+            const capture = captures.getStore();
+            if (capture) {
+                delete capture.sentBody;
+                delete capture.inBody;
+                delete capture.imageFacts;
+            }
+        }
+    });
+}
+
+function pendingCapture(session: Session): Capture | NonNullable<Session["transient"]> {
+    const capture = captures.getStore();
+    return capture?.session === session ? capture : (session.transient ??= {});
+}
+
+export function lastForwardedBody(session: Session): SeamSlot | undefined {
+    return pendingCapture(session).sentBody;
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
@@ -495,7 +545,7 @@ function originEvidenceJson(m: CoreMessage): string {
  *  over origin evidence (#4043): host-generated metering never counts as
  *  client-origin divergence, everything else does. */
 export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     if (msgs.length > INBOUND_MSG_CAP) {
         // Too many messages to fingerprint whole: keep the count (so the
         // settle-side guard can decline) but drop any stale slot from a
@@ -658,10 +708,13 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // re-deriving them.
     const buf = Buffer.from(body, "utf8");
     const digest = createHash("sha256").update(buf).digest("hex");
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
+        order: ++captureOrder,
+        requestId: "requestId" in transient ? transient.requestId : undefined,
+        round: "round" in transient ? ++transient.round : undefined,
         head: buf.byteLength > SEAM_BODY_CAP ? Buffer.from(buf.subarray(0, SEAM_BODY_CAP)) : buf,
         bytes: buf.byteLength,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
@@ -670,6 +723,10 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
     };
+    if ("round" in transient && transient.round > 1) {
+        delete transient.imageFacts;
+        delete transient.inBody;
+    }
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -725,13 +782,17 @@ const imageFactsLastSent = new WeakMap<Session, ForwardedImageFacts>();
  *  with the image facts of the round about to be sent. The next settleUsageReport
  *  consumes exactly this entry (same pairing guarantee as the seam forensics). */
 export function noteForwardedImageFacts(session: Session, facts: ForwardedImageFacts): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
-    const facts = imageFactsLastSent.get(session);
+    const capture = captures.getStore();
+    const facts = capture?.session === session ? capture.imageFacts : imageFactsLastSent.get(session);
     if (!facts) return;
-    imageFactsLastSent.delete(session);
+    if (capture?.session === session) delete capture.imageFacts;
+    else imageFactsLastSent.delete(session);
     if (facts.nImages <= 0 || billedTotal <= 0) return;
     const observed = billedTotal - facts.textSide;
     if (observed <= 0) return; // text estimate overshot the bill — no signal
@@ -922,8 +983,12 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = session.transient?.sentBody;
+    const cur = pendingCapture(session).sentBody;
     const prev = session.transient?.settledBody;
+    if (cur?.order !== undefined && prev?.order !== undefined && cur.order <= prev.order) {
+        line.evidence = "out-of-order";
+        return;
+    }
     // #2929: split the provider-side arms by idle gap — a byte-stable miss
     // after a long idle is normal TTL expiry; the same miss seconds after the
     // previous request is the abnormal provider-side failure.
@@ -1017,7 +1082,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // a bili rebuild seam. Requires BOTH inbound slots captured whole
     // (msgs <= INBOUND_MSG_CAP — an above-cap list cannot prove where it
     // broke, and a missing lane capture must keep the legacy bucket).
-    const curIn = session.transient?.inBody;
+    const curIn = pendingCapture(session).inBody;
     const prevIn = session.transient?.settledInBody;
     if (curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP) {
         const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1732,10 +1797,10 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = session.transient?.sentBody?.keyFp;
+    const curKeyFp = pendingCapture(session).sentBody?.keyFp;
     // #3803: the generation-parameter fingerprint noted for THIS request at the
     // send chokepoint — same transient-slot pairing as the credential one above.
-    const curEffFp = session.transient?.sentBody?.effFp;
+    const curEffFp = pendingCapture(session).sentBody?.effFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
@@ -1752,17 +1817,26 @@ export function settleUsageReport(
     const lastMode = s.protocol === "responses" ? (session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown) : undefined;
     const led = getCacheLedger(session);
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, effFp: curEffFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
+    const capture = captures.getStore();
+    const sample = led.lines[led.lines.length - 1];
+    if (capture?.session === session && sample) {
+        sample.captureId = capture.requestId;
+        sample.captureRound = capture.round;
+    }
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = session.transient?.sentBody;
+    const curSlot = pendingCapture(session).sentBody;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = session.transient?.settledBody;
+            const settled = session.transient?.settledBody;
+            const backwards = curSlot.order !== undefined && settled?.order !== undefined && curSlot.order <= settled.order;
+            const prevSlot = backwards ? undefined : settled;
+            if (backwards) curLine.evidence = "out-of-order";
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1807,14 +1881,17 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = session.transient?.sentBody;
-    if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
-    delete session.transient?.sentBody;
-    // #3023: settle the inbound pair with the same lifecycle — the next
-    // settle's client arm compares against THIS request's client view.
-    const seamIn = session.transient?.inBody;
-    if (seamIn !== undefined) (session.transient ??= {}).settledInBody = seamIn;
-    delete session.transient?.inBody;
+    const pending = pendingCapture(session);
+    const settled = session.transient ??= {};
+    const seamBody = pending.sentBody;
+    const backwards = seamBody?.order !== undefined && settled.settledBody?.order !== undefined && seamBody.order <= settled.settledBody.order;
+    if (seamBody !== undefined && !backwards) settled.settledBody = seamBody;
+    else delete settled.settledBody;
+    delete pending.sentBody;
+    const seamIn = pending.inBody;
+    if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
+    else delete settled.settledInBody;
+    delete pending.inBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1900,7 +1977,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
+    lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
     modelSwitches: ModelSwitchStats;
     /** #3803: host generation-parameter switches (reasoning effort / thinking config) — a provider cache-namespace flip that re-bills the whole stable prefix once, distinct from any byte change. */
     effSwitches: ModelSwitchStats;
@@ -2090,6 +2167,9 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             foldSeq: l.foldSeq,
             seam: l.seam,
             prov: l.prov,
+            captureId: l.captureId,
+            captureRound: l.captureRound,
+            evidence: l.evidence,
             bodyDigest: l.bd,
             keyFp: l.kp,
             sysFp: l.sp,
