@@ -29,7 +29,7 @@ import path from "node:path";
 import { isVersionNewer } from "../update.js";
 import { logHostEvent } from "./host-log.js";
 
-export type ClientBuildCheck = {
+type ClientBuildCheck = {
     /** Short human label used in the note text ("dsh", "pi", ...). */
     label: string;
     /** The client's npm id, as shown in the note (@deepseek-ai/dsh, ...). */

@@ -175,6 +175,12 @@ const METADATA_DRIFT_SINCE = "foldDriftSince";
 // lifetime (NOT part of resetFoldDriftState — a stateless client churns the
 // same marker-minted ids every pass forever; the episode never "ends").
 const METADATA_MARKER_CHURN_NOTED = "foldMarkerChurnNoted";
+/** #2438 F1-a: one-per-session-lifetime latch for the fold-substrate vacuum
+ *  report (stored folds exist but none exposes an anchorable covered surface —
+ *  coverage cannot re-establish until the host resends matching bytes).
+ *  Deliberately NOT part of resetFoldDriftState: the vacuum persists across
+ *  passes, so the report must not re-fire on every request of the episode. */
+const METADATA_VACUUM_NOTED = "foldVacuumNoted";
 /** Exported so the compress-failure receipt can sharpen its cause label into
  *  the substrate-destruction verdict (#2360 §2.4) without hardcoding a second
  *  copy of the key here. */
@@ -1619,6 +1625,18 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const covered = coveredIdsOf(blocks);
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
+        // #2438 F1-a: stored folds with no anchorable covered surface are a
+        // terminal state for coverage. This exit used to be silent — operators
+        // saw healthy book values while the wire was fully unfolded/doomed
+        // (the v0.1.195 retest in #2438 floor 18 produced zero log lines).
+        // Report once per session lifetime; the reset below is unchanged (the
+        // vacuum IS the episode boundary for drift-state purposes).
+        if (blocks.length > 0 && session.metadata && !session.metadata[METADATA_VACUUM_NOTED]) {
+            session.metadata[METADATA_VACUUM_NOTED] = true;
+            const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+            opts.log?.("error", `${tag}[fold-reconcile] fold substrate vacuum: ${blocks.length} stored block(s) expose no anchorable covered surface — coverage cannot re-establish until the host resends matching bytes; summaries retained (#2438 F1-a)`);
+            recordConflict(session, "fold-vacuum", `${blocks.length} stored fold block(s) with no anchorable covered surface — terminal coverage loss (#2438 F1-a)`);
+        }
         resetFoldDriftState(session);
         return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
