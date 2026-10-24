@@ -168,6 +168,27 @@ interface TlsTrustRemediationCtx {
  *  (a trusted CA signed it but for another name); self-signed family whose SAN
  *  provably lacks the target host → mitm-suspect; enterprise signal present →
  *  the original scanner/vendor-CA advice; otherwise verify-DNS-first. */
+// RFC 6125: a wildcard matches exactly ONE leftmost label ("*.example.com"
+// covers "a.example.com", never "example.com" nor "a.b.example.com"). Enterprise
+// scanners commonly re-sign whole internal domains with a single wildcard cert —
+// treating such a SAN as "lacks the host" would mislabel legitimate inspection
+// as hijacking.
+function sanCoversHost(san: string[], hostname: string): boolean {
+    const host = hostname.toLowerCase();
+    for (const entry of san) {
+        const e = entry.toLowerCase();
+        if (e === host) return true;
+        if (e.startsWith("*.")) {
+            const suffix = e.slice(1);
+            if (host.endsWith(suffix)) {
+                const label = host.slice(0, host.length - suffix.length);
+                if (label.length > 0 && !label.includes(".")) return true;
+            }
+        }
+    }
+    return false;
+}
+
 export function tlsTrustRemediation(ctx: TlsTrustRemediationCtx = {}): string {
     const host = ctx.hostname ?? "the target host";
     const verifyDns = `verify what ${host} resolves to (compare your resolver against public DoH such as 1.1.1.1 / 8.8.8.8 / 223.5.5.5)`;
@@ -178,7 +199,7 @@ export function tlsTrustRemediation(ctx: TlsTrustRemediationCtx = {}): string {
         return `the certificate IS signed by a CA this process trusts, but its names do not include ${host} — a classic sign of DNS hijacking / link injection presenting a valid-looking certificate for another domain (or a broken inspection policy). Do NOT install any new CA for this; ${verifyDns} and confirm the address you reach is the real endpoint`;
     }
     const san = ctx.cert?.san;
-    if (san !== undefined && san.length > 0 && ctx.hostname !== undefined && !san.includes(ctx.hostname)) {
+    if (san !== undefined && san.length > 0 && ctx.hostname !== undefined && !sanCoversHost(san, ctx.hostname)) {
         return `the presented certificate is self-signed/untrusted AND its subject alt names (${san.join(", ")}) do not include ${host} — pattern consistent with DNS hijacking / link injection. Do NOT install this CA; ${verifyDns}`;
     }
     if (ctx.enterpriseSignal === true) {

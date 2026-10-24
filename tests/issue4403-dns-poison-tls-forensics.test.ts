@@ -80,6 +80,17 @@ test("#4403 P0-1: SAN that DOES cover the host falls back to the verify-first de
     assert.match(hint, /security software/);
 });
 
+test("#4403 P0-1: wildcard SAN covering the host is NOT mitm-suspect (RFC 6125 single-label)", () => {
+    const hint = tlsTrustRemediation({ code: "DEPTH_ZERO_SELF_SIGNED_CERT", hostname: "api.corp.example", cert: { san: ["*.corp.example"] } });
+    assert.doesNotMatch(hint, /Do NOT install this CA/);
+    assert.match(hint, /Before installing ANY CA:/);
+});
+
+test("#4403 P0-1: wildcard SAN does not cover apex or multi-label hosts (still mitm-suspect)", () => {
+    assert.match(tlsTrustRemediation({ code: "DEPTH_ZERO_SELF_SIGNED_CERT", hostname: "corp.example", cert: { san: ["*.corp.example"] } }), /Do NOT install this CA/);
+    assert.match(tlsTrustRemediation({ code: "DEPTH_ZERO_SELF_SIGNED_CERT", hostname: "a.b.corp.example", cert: { san: ["*.corp.example"] } }), /Do NOT install this CA/);
+});
+
 test("#4403 P0-1: enterprise signal present → original scanner/vendor-CA advice", () => {
     const hint = tlsTrustRemediation({ code: "SELF_SIGNED_CERT_IN_CHAIN", hostname: "api.example.test", enterpriseSignal: true });
     assert.match(hint, /Kaspersky, enterprise DLP/);
