@@ -225,14 +225,14 @@ jobs:
   # #2637 plan #8 (owner-approved): fail-fast tiering — the ~0-1m guards gate
   # the four platform legs so a broken commit stops in tier 1 instead of
   # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
-  # skip on push/dispatch — and a SKIPPED need cascades the skip to dependents
+  # skip on push — and a SKIPPED need cascades the skip to dependents
   # (the GitHub-documented behavior; the old comment here wrongly assumed
   # "skipped needs count as satisfied" — the master-push run evidence
   # (#3145/#3035/#3027 all slipped red to master with `test: skipped`)
   # disproved it). The explicit `if` below tolerates skipped guards so:
   #   - pull_request: guards run; guard failure -> failure() -> legs skip
   #     (required checks show pending, merge blocked — #2637 semantics intact)
-  #   - push/dispatch: PR-only guards skip harmlessly, legs RUN — master gets
+  #   - push: PR-only guards skip harmlessly, legs RUN — master gets
   #     a real post-merge test signal (the missing master-push hole, #3197 era)
   test:
     needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
@@ -372,7 +372,7 @@ jobs:
 
   version-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -380,7 +380,10 @@ jobs:
       - name: Verify version field only changes on release branches
         run: |
           set -euo pipefail
-          BRANCH="${GITHUB_HEAD_REF}"
+          # GITHUB_HEAD_REF is PR-only; on workflow_dispatch (release-ci-gate
+          # dispatches this workflow at release/bugfix branch refs) fall back to
+          # GITHUB_REF_NAME so the branch-pattern exemptions below keep matching.
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
           if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
@@ -396,7 +399,7 @@ jobs:
 
   kernel-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -406,7 +409,9 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          BRANCH="${GITHUB_HEAD_REF}"
+          # GITHUB_HEAD_REF is PR-only; on workflow_dispatch fall back to
+          # GITHUB_REF_NAME (same rationale as version-guard above).
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           # Kernel release branches bump kernel/package.json alone by design.
           if [[ "$BRANCH" == *_release-kernel-v* ]]; then
             echo "✓ kernel release branch ($BRANCH) — kernel version changes allowed"
@@ -414,7 +419,13 @@ jobs:
           fi
           # Rule 1: any PR touching kernel/** must declare 'kernel-change:' in its body.
           if git diff --name-only origin/master...HEAD -- kernel/ | grep -q .; then
-            if ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
+            # Rule 1 enforcement is PR-shaped: the declaration lives in a PR
+            # body. A workflow_dispatch has no PR body — dispatch is
+            # owner-fired (release fallback / bugfix carve-out lanes), so the
+            # human gate has already happened out-of-band; skip only the
+            # body check there. Version-discipline rules below still run.
+            if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]] \
+              && ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
               echo "::error::This PR modifies kernel/ but does not declare 'kernel-change: <reason>' in its body."
               echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
               exit 1
@@ -449,7 +460,7 @@ jobs:
   # load-bearing core compression).
   pi-subagents-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -539,7 +550,7 @@ jobs:
   # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
   lane-guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
