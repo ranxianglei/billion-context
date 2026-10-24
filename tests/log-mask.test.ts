@@ -22,10 +22,12 @@ import {
     maskHostInText,
     maskHostPortForLog,
     maskIpsInText,
+    maskPathsForPublish,
     maskUrlForDiagnostics,
     maskUrlForLog,
     maskUrlsForDiagnostics,
     maskUrlsInText,
+    redactForPublish,
     redactSecretsInText,
     setMaskHostsEnabled,
 } from "../src/log-mask.ts";
@@ -680,6 +682,44 @@ test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#171
     } finally {
         setMaskHostsEnabled(true);
     }
+});
+
+// #4499: publish-path $HOME stripping — the bare-absolute-path vector #3959 proved
+// reached a public issue body. Rewrites ONLY the live home prefix, anchored on both
+// flanks so word-suffixed siblings, relative paths and URL pathnames survive untouched.
+test("maskPathsForPublish: rewrites the $HOME prefix to ~ and only that", () => {
+    const home = os.homedir();
+    assert.equal(maskPathsForPublish(`delete ${home}/.cache/bili/x.json and restart`), "delete ~/.cache/bili/x.json and restart");
+    assert.equal(maskPathsForPublish(`${home}`), "~");
+    assert.equal(maskPathsForPublish(`open (${home}/index.db) failed`), "open (~/index.db) failed");
+    // right flank is a word char -> sibling home, must stay verbatim
+    assert.equal(maskPathsForPublish(`${home}other/x`), `${home}other/x`);
+    // left flank is a word char -> relative path, must stay verbatim
+    assert.equal(maskPathsForPublish(`prefix${home}/x`), `prefix${home}/x`);
+    // left flank is a hostname word char -> URL pathname, must stay verbatim
+    assert.equal(maskPathsForPublish(`https://relay.internal/api${home}/file`), `https://relay.internal/api${home}/file`);
+    // no home present -> verbatim
+    assert.equal(maskPathsForPublish("/etc/hosts unchanged"), "/etc/hosts unchanged");
+    // dot/hyphen siblings over-mask to ~ — pinned as deliberate safe-side direction
+    // (wider anchoring would under-mask a real home followed by punctuation)
+    assert.equal(maskPathsForPublish(`${home}.bak/x`), `~.bak/x`);
+    assert.equal(maskPathsForPublish(`${home}-bob/x`), `~-bob/x`);
+});
+
+// #4499: THE single publish-boundary scrubber — secrets -> non-public hosts -> $HOME
+// paths in one pass, so a single diagnostics blob line carrying all three leaks is
+// fully cleaned (and the recovery path stays actionable as ~).
+test("redactForPublish: one pass scrubs secrets + non-public hosts + $HOME paths", () => {
+    const home = os.homedir();
+    const input = `upstream https://relay.internal/v1 failed token=abcd1234efgh5678 marker=${home}/.cache/billion-context/sqlite/.bootstrap-failed.json`;
+    const out = redactForPublish(input);
+    assert.ok(!out.includes("relay.internal"), "non-public host masked");
+    assert.ok(out.includes("<private-host>"), "masked-host placeholder present");
+    assert.ok(!out.includes("abcd1234efgh5678"), "credential value scrubbed");
+    assert.ok(!out.includes(home), "absolute home path stripped");
+    assert.ok(out.includes("~/.cache/billion-context/sqlite/.bootstrap-failed.json"), "recovery path stays actionable as ~");
+    // idempotent: a second pass changes nothing (boundary + tail apply it twice safely)
+    assert.equal(redactForPublish(out), out, "redactForPublish is idempotent");
 });
 
 test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async () => {

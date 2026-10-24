@@ -17,13 +17,16 @@
  * `--- recent conflict-related log lines ---` (the exact signatures a
  * maintainer greps to adjudicate a native-compaction episode).
  *
- * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body. Secret
- * values are replaced before serialization and redactSecretsInText is applied
- * as a sink-level net; only profile NAMES are included, never absolute paths
- * (they would leak usernames). #3811: non-public endpoint hosts are masked too —
- * config URLs and conflict-log lines run through maskUrlsForPublish, which masks
- * unconditionally so the blob stays host-safe even when BILI_LOG_MASK_HOSTS=0
- * (the local host-visibility preference must not weaken the publish boundary).
+ * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body. The single
+ * publish boundary is buildDiagnostics itself: before serialization it runs the
+ * whole blob through redactForPublish (secrets → non-public hosts → $HOME paths),
+ * so EVERY topic's section is scrubbed uniformly and the copied blob plus the
+ * prefilled issue body derive from one string (they can never diverge). Secret
+ * values are also replaced structurally (maskSecretValues) for the config block,
+ * and only profile NAMES are included, never absolute paths (a $HOME prefix is
+ * rewritten to `~` at the boundary instead). The scrubbing is unconditional — it
+ * ignores BILI_LOG_MASK_HOSTS, so the local host-visibility preference can never
+ * weaken the publish boundary (#3811/#4499).
  *
  * Contract: NEVER throws — every fs/listSessions access is guarded so a
  * broken log file or an unbuilt store degrades the blob, not the endpoint.
@@ -37,7 +40,7 @@ import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
-import { maskUrlsForPublish, redactSecretsInText } from "../log-mask.js";
+import { redactForPublish } from "../log-mask.js";
 import { getLogPath } from "../logger.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
@@ -102,10 +105,22 @@ function candidateLogLines(): string[] {
     }
 }
 
+/** #4499: per-line publish treatment shared by BOTH log tails — scrub with
+ * redactForPublish (secrets → non-public hosts → $HOME paths), then bound to
+ * LOG_LINE_MAX_CHARS so one long error line can't blow out the pasteable blob.
+ * Idempotent with the boundary scrub in buildDiagnostics (defense in depth). */
+function publishRedactLine(line: string): string {
+    const masked = redactForPublish(line);
+    return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+}
+
 /** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). */
+ * match). The caller reads the rotated pair once per report (#3813). #4499: each
+ * line is publish-redacted and bounded — parity with conflictLogTail — because
+ * raw [storage] lines carried credentials, private hosts and absolute paths into
+ * the public blob. */
 function storageLogTail(lines: string[]): string[] {
-    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
+    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES).map(publishRedactLine);
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -122,17 +137,13 @@ const CONFLICT_LOG_PATTERNS = [
 ];
 
 function conflictLogTail(lines: string[]): string[] {
+    // #4499: same publish treatment as the storage tail — redactForPublish scrubs
+    // credentials AND unconditionally masks non-public hosts (so BILI_LOG_MASK_HOSTS=0
+    // real hosts in the on-disk log still can't leak, #3811), plus $HOME paths (#4499).
     return lines
         .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
         .slice(-CONFLICT_LOG_TAIL_LINES)
-        .map((l) => {
-            // #3811: redactSecretsInText scrubs credential shapes only — a URL in a
-            // log line keeps its host. maskUrlsForPublish masks it unconditionally,
-            // so under BILI_LOG_MASK_HOSTS=0 (real hosts in the on-disk log) the
-            // published tail still cannot leak them.
-            const masked = maskUrlsForPublish(redactSecretsInText(l));
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+        .map(publishRedactLine);
 }
 
 function safeSessionCount(): number {
@@ -203,14 +214,11 @@ function hostClientVersionLines(): string[] {
     return lines;
 }
 
-// #3611: the user's config file AS WRITTEN (not the resolved options — a
-// maintainer must see what the user actually typed), secret-bearing values
-// replaced before serialization; redactSecretsInText then scrubs credential
-// SHAPES that survive (bearer/sk-/xai-/AIza/JWT, key=value pairs). #3811: none
-// of those touch a bare endpoint HOST — providers[].upstream / route-prefix
-// keys / proxy URLs are masked after serialization by maskUrlsForPublish, which
-// runs unconditionally (publish boundary, ignores BILI_LOG_MASK_HOSTS) and drops
-// userinfo/query/hash, so the old userinfo-only strip below is subsumed.
+// #3611/#4499: two-layer config scrubbing. maskSecretValues replaces values under
+// secret-NAMED keys with *** (structural); redactForPublish then catches shapes the
+// key-based pass cannot see — credential tokens, bare endpoint HOSTS (a providers[]
+// upstream or route-prefix key), and any $HOME prefix → `~`. Unconditional: publish
+// boundary, ignores BILI_LOG_MASK_HOSTS.
 const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|auth/i;
 
 function maskSecretValues(node: unknown, key?: string): unknown {
@@ -242,11 +250,11 @@ function configSectionLines(): string[] {
     }
     let text: string;
     try {
-        // #3811: maskUrlsForPublish is the outermost sink net — it masks every
-        // non-public endpoint host whether it appears as a VALUE (upstream/proxy)
-        // or a providers-table KEY, and drops userinfo/query/hash (subsuming the
-        // old userinfo-only strip). Always on: the blob is publish-boundary.
-        text = maskUrlsForPublish(redactSecretsInText(JSON.stringify(maskSecretValues(parsed))));
+        // #3811/#4499: redactForPublish is the outermost sink net — it scrubs
+        // credential shapes, masks every non-public endpoint host whether it
+        // appears as a VALUE (upstream/proxy) or a providers-table KEY, and
+        // rewrites any $HOME prefix to `~`. Always on: the blob is publish-boundary.
+        text = redactForPublish(JSON.stringify(maskSecretValues(parsed)));
     } catch {
         lines.push("(config could not be serialized)");
         return lines;
@@ -347,7 +355,11 @@ export function buildDiagnostics(topic?: string): DiagnosticsReport {
     if (def) lines.push(...def.section(ctx));
     lines.push(...hostClientVersionLines());
     lines.push(...configSectionLines());
-    const blob = lines.join("\n");
+    // #4499: THE single publish boundary. Scrub every topic's blob uniformly
+    // (secrets → non-public hosts → $HOME paths) before serialization; the copied
+    // blob and the prefilled issue body both derive from this ONE string, so they
+    // can never diverge. Unconditional — ignores BILI_LOG_MASK_HOSTS.
+    const blob = redactForPublish(lines.join("\n"));
     const title = def
         ? def.title()
         : `bili diagnostics report (v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`;

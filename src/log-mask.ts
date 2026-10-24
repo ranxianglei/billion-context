@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 
 const PRIVATE_HOST = "<private-host>";
 
@@ -133,8 +134,57 @@ function maskUrlForPublish(url: string): string {
  *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
  *  in serialized text — object values AND object keys (the providers table
  *  uses upstream URLs as keys). */
-export function maskUrlsForPublish(text: string): string {
+function maskUrlsForPublish(text: string): string {
     return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+}
+
+// Escape a literal string for safe embedding in a RegExp (maskPathsForPublish
+// builds its pattern from the live home path, which may carry metacharacters).
+function escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** #4499: publish-path filesystem-path masking for artifacts that land in a
+ * PUBLIC GitHub issue body (the diagnostics blob). Rewrites the process home
+ * directory prefix ($HOME) to `~`, so an absolute path like
+ * /home/<user>/.cache/billion-context/sqlite/.bootstrap-failed.json publishes
+ * as ~/.cache/billion-context/sqlite/.bootstrap-failed.json — the recovery lever
+ * stays ACTIONABLE while no username leaks. This closes the bare-absolute-path
+ * vector the other primitives did not cover: #3959 proved an absolute user path
+ * reached a public issue body through exactly this flow.
+ *
+ * Anchored on both flanks so word-embedded neighbours are never touched:
+ *   - LEFT — the char before the home prefix must not be a word char or `/`.
+ *     Rejects relative paths (`foo/home/<user>`) and URL pathnames, whose
+ *     preceding segment ends in a hostname word-char (and, after
+ *     maskUrlsForPublish runs first, query/hash are already dropped and hosts
+ *     masked, so a home-shaped segment inside a URL is left alone);
+ *   - RIGHT — the char after it must not be a word char. Rejects word-suffixed
+ *     sibling homes (`/home/<user>2` when $HOME=/home/<user>). Dot/hyphen
+ *     siblings (`/home/<user>.bak`, `/home/<user>-bob`) DO get rewritten to
+ *     `~…`: deliberate safe-side over-masking — widening the anchor to spare
+ *     them would under-mask a real home followed by punctuation (e.g. the
+ *     sentence-final period in `path /home/<user>.`).
+ */
+export function maskPathsForPublish(text: string): string {
+    if (!text) return text;
+    const home = homedir();
+    if (!home || home === "/") return text;
+    const re = new RegExp(`(?<![\\w/])${escapeRegExp(home)}(?![\\w])`, "g");
+    return text.replace(re, "~");
+}
+
+/** #4499: THE single publish-boundary scrubber. Composes the three layers in
+ * order — secret scrubbing → non-public host masking → home-path stripping — so
+ * every topic's diagnostics blob is uniformly cleaned before it lands in a
+ * PUBLIC GitHub issue body. Applied ONCE at the serialization point
+ * (buildDiagnostics); the copied blob and the prefilled issue body both derive
+ * from that one string so they can never diverge. Like maskUrlsForPublish and
+ * redactSecretsInText it is NEVER gated by BILI_LOG_MASK_HOSTS: the local
+ * host-visibility preference must not weaken the publish boundary. */
+export function redactForPublish(text: string): string {
+    if (!text) return text;
+    return maskPathsForPublish(maskUrlsForPublish(redactSecretsInText(text)));
 }
 
 /** Mask a URL for DIAGNOSTIC payloads (#3651): same public/private rule as
