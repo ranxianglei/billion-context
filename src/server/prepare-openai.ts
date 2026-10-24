@@ -34,6 +34,7 @@ import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { stripTraeCodeNativeCompactInstruction } from "./traecode-compact.js";
+import { looksLikeNativeCompactionRequest } from "./native-compact-shape.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
@@ -88,7 +89,20 @@ export async function prepareOpenai(
     // system prompt bytes (compress prompt added/removed) — which breaks the
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
-    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    // #2411 Class A: a host-native compaction request (the host's summarization
+    // template as last user message) IS a compression act — bili stands down its
+    // whole compression surface for that turn. Live evidence: on 11/17 captured
+    // compactions the outbound system was sys_char 11417 = 69 host chars +
+    // 11346 of bili's own compress doctrine, directly contradicting the host's
+    // "output only a summary" instruction, plus 6890 chars of compress tool
+    // schema the call must not use. Detection fails open — anchors + evidence in
+    // src/server/native-compact-shape.ts.
+    const nativeCompact = looksLikeNativeCompactionRequest(parsed);
+    if (nativeCompact && session.metadata.nativeCompactSuppressed !== true) {
+        session.metadata.nativeCompactSuppressed = true;
+        log("info", `[${sessionId}] host-native compaction request detected (summarization template as last user message) — ACP compression surface stood down for this turn (#2411)`);
+    }
+    const shouldInject = opts.compress.injectTool && !isTitleGen && !nativeCompact;
     const injectTools = shouldInject && !pluginMode;
     // #3177: DSH registers bili's ACP tools host-scope (invisible to the preset
     // agent — 0/3939 request headers carry them), so model-driven compression is
@@ -209,7 +223,10 @@ export async function prepareOpenai(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
-        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
+        // Native compaction requests carry the host's summarization system —
+        // a one-off side shape that must not perturb the conversation's
+        // fingerprint record (same rationale as the title-gen skip).
+        if (!isTitleGen && !nativeCompact) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -338,7 +355,10 @@ export async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         if (laneDecisions.compressSurfaceOn) sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect)));
-        else if (!isTitleGen && !knobRenderNone()) {
+        // #2411 Class A: native compaction requests get NO bili system text at
+        // all — not even the tags-only note (the host's 69-char summarization
+        // system must pass through byte-stable; see shouldInject above).
+        else if (!isTitleGen && !nativeCompact && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
             if (tagsOnly) sysParts.push(tagsOnly);
@@ -480,15 +500,20 @@ export async function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     // #532: title-gen side requests carry their own tiny system and would
-    // clobber the conversation's measured overhead — skip them.
-    if (!isTitleGen && openaiOutboundSystem !== undefined) {
+    // clobber the conversation's measured overhead — skip them. #2411 Class A:
+    // native compaction requests are the same class (69-char host system, zero
+    // tools) — measuring them would record near-zero overhead against a full
+    // conversation.
+    if (!isTitleGen && !nativeCompact && openaiOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(openaiOutboundSystem, toolsOut);
     }
     // #728: record this turn's outbound payload upper bound as the fallback
     // token source for upstreams that never report usage (see effectiveTokenCount).
     // Title-gen side requests are skipped like the overhead row above — their
-    // tiny payload would clobber the conversation's measurement.
-    if (!isTitleGen) {
+    // tiny payload would clobber the conversation's measurement. #2411 Class A:
+    // native compaction payloads are one-off outliers (full history + template)
+    // and would feed the k̂ learning pair a non-steady-state sample.
+    if (!isTitleGen && !nativeCompact) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
@@ -502,7 +527,7 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, nativeCompact, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

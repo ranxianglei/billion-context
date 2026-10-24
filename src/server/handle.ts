@@ -2514,8 +2514,11 @@ async function handleRequest(
                 }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
-                // reply that is already forged (#3008 prompt form).
-                if (!countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane) {
+                // reply that is already forged (#3008 prompt form). #2411 Class
+                // A: a host-native compaction request IS the compression act —
+                // folding the same history the host is asking to summarize
+                // would put two compressors on one turn; skip like codexForge.
+                if (!countTokens && !responsesCompact && !prepared.codexForge && !prepared.nativeCompact && !prepared.threadsLane) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
