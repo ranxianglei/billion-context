@@ -71,6 +71,15 @@
 // conjunction cannot reasonably be faked by a coding session. If detection
 // fires but the flavor is undecidable, we do NOT forge — we fall back to
 // verbatim passthrough (never emit a malformed verdict, #353 discipline).
+//
+// Scope (#4003 review): both signals are read from USER-message text and the
+// system block ONLY — never from tool_result payloads, assistant prose, or
+// tool schemas. The real lane always carries the wrapper and the stage
+// suffixes in user-message text and the policy copy in system; bytes echoing
+// this repo's own source or CC policy copy out of a tool_result (a grep of
+// TRANSCRIPT_MARKER, a quoted policy line) are evidence of an ECHO, not of
+// the lane, and used to satisfy the conjunction with a single decidable
+// flavor — forging a canned verdict onto the user's real turn.
 
 import type { AnthropicRequestBody } from "acp-kernel/wire";
 import { extractSystem } from "acp-kernel/wire";
@@ -97,7 +106,7 @@ const SHARED_POLICY_MARKERS = [
 ];
 const TRANSCRIPT_MARKER = "<transcript>";
 
-function messageTextOf(m: { role?: string; content?: unknown }): string {
+function messageTextOf(m: { role?: string; content?: unknown }, skipToolResults: boolean): string {
     const c = m.content;
     if (typeof c === "string") return c;
     if (!Array.isArray(c)) return "";
@@ -105,6 +114,7 @@ function messageTextOf(m: { role?: string; content?: unknown }): string {
     for (const b of c) {
         if (b === null || typeof b !== "object") continue;
         const rec = b as Record<string, unknown>;
+        if (skipToolResults && rec.type === "tool_result") continue;
         if (typeof rec.text === "string") out += rec.text;
         // tool_result blocks carry their payload under `content`
         if (rec.content !== undefined) {
@@ -123,9 +133,24 @@ function messageTextOf(m: { role?: string; content?: unknown }): string {
 
 export function requestText(parsed: AnthropicRequestBody): string {
     const parts: string[] = [extractSystem(parsed.system)];
-    for (const m of parsed.messages ?? []) parts.push(messageTextOf(m));
+    for (const m of parsed.messages ?? []) parts.push(messageTextOf(m, false));
     if (parsed.tools !== undefined) parts.push(JSON.stringify(parsed.tools));
     return parts.join("\n");
+}
+
+/** Detection text: system + USER-message text, tool_result payloads excluded
+ *  (#4003 review — see the module header). The wrapper gate below uses the
+ *  user-role subset of this. */
+function classifierScanText(parsed: AnthropicRequestBody): { scan: string; user: string } {
+    let scan = extractSystem(parsed.system);
+    let user = "";
+    for (const m of parsed.messages ?? []) {
+        if (m.role !== "user") continue;
+        const text = messageTextOf(m, true);
+        user += "\n" + text;
+        scan += "\n" + text;
+    }
+    return { scan, user };
 }
 
 /** True for BOTH stages and BOTH flavors — see the module header for why each
@@ -136,14 +161,14 @@ export function requestText(parsed: AnthropicRequestBody): string {
  *  as stop hints (any harness emitting severity/block verdict XML). Detecting on
  *  stops alone would forge a local "always allow" verdict for such traffic. */
 export function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const text = requestText(parsed);
-    if (!text.includes(TRANSCRIPT_MARKER)) return false;
+    const { scan, user } = classifierScanText(parsed);
+    if (!user.includes(TRANSCRIPT_MARKER)) return false;
     const stops = parsed.stop_sequences;
     const hasMagicStops =
         Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
     if (hasMagicStops) return true; // wrapper + magic stops: stage-1 non-fast, even if policy copy drifts
     return [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
-        .some((marker) => text.includes(marker));
+        .some((marker) => scan.includes(marker));
 }
 
 /** Which forged verdict shape this request expects. null = undecidable →
@@ -152,9 +177,9 @@ export function classifierForgeVariant(parsed: AnthropicRequestBody): "severity"
     const stops = Array.isArray(parsed.stop_sequences) ? parsed.stop_sequences : [];
     if (stops.includes("</severity>")) return "severity";
     if (stops.includes("</block>")) return "block";
-    const text = requestText(parsed);
-    const sev = SEVERITY_FLAVOR_MARKERS.some((m) => text.includes(m));
-    const blk = BLOCK_FLAVOR_MARKERS.some((m) => text.includes(m));
+    const { scan } = classifierScanText(parsed);
+    const sev = SEVERITY_FLAVOR_MARKERS.some((m) => scan.includes(m));
+    const blk = BLOCK_FLAVOR_MARKERS.some((m) => scan.includes(m));
     if (sev && !blk) return "severity";
     if (blk && !sev) return "block";
     return null;
@@ -192,7 +217,7 @@ export function estimateCjkTokens(text: string): number {
 export function summarizeAction(parsed: AnthropicRequestBody): string {
     const msgs = parsed.messages ?? [];
     for (let i = msgs.length - 1; i >= 0; i--) {
-        const t = messageTextOf(msgs[i]!).trim();
+        const t = messageTextOf(msgs[i]!, false).trim();
         if (!t) continue;
         const tail = safeSuffix(t, 320).replace(/\s+/g, " ");
         return tail.length > 240 ? "…" + tail.slice(tail.length - 240) : tail;

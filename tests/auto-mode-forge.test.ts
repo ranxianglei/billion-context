@@ -87,14 +87,48 @@ test("isAutoModeClassifier: no-stop shapes (stage-1-fast / stage-2) — policy w
     })));
 });
 
-test("isAutoModeClassifier: marker inside a tool_result payload counts (messageTextOf walk)", () => {
+test("isAutoModeClassifier: marker in USER-message text (stage-suffix shape) counts even without system copy", () => {
     assert.ok(isAutoModeClassifier(req({
         system: "You are a safety classifier.",
         messages: [{ role: "user", content: [
-            { type: "tool_result", tool_use_id: "t1", content: "Review the classification process before finalizing." },
-            { type: "text", text: "<transcript>…</transcript>" },
+            { type: "text", text: "<transcript>…</transcript>\n50 is exactly the allow/block boundary." },
         ] }],
     })));
+});
+
+test("isAutoModeClassifier: tool_result echoes are NOT lane evidence (#4003 review — self-referential false trigger)", () => {
+    // The review case: a dev session greps this repo / quotes CC policy — the
+    // wrapper literal lands in one tool_result, a policy marker in another.
+    // Old walk: conjunction satisfied → single flavor decidable → the user's
+    // real turn was answered with a canned <block>no</block> forever.
+    assert.ok(!isAutoModeClassifier(req({
+        system: "You are a safety classifier.",
+        messages: [{ role: "user", content: [
+            { type: "tool_result", tool_use_id: "t1", content: "src/auto-mode-forge.ts:83:const TRANSCRIPT_MARKER = \"<transcript>\";" },
+            { type: "tool_result", tool_use_id: "t2", content: "Err on the side of blocking" },
+            { type: "text", text: "summarize the diff" },
+        ] }],
+    })), "wrapper + marker both in tool_results only");
+    // Even a real user-text wrapper must not be armed by tool_result-carried markers.
+    assert.ok(!isAutoModeClassifier(req({
+        system: "You are a safety classifier.",
+        messages: [{ role: "user", content: [
+            { type: "tool_result", tool_use_id: "t1", content: "50 is exactly the allow/block boundary." },
+            { type: "text", text: "<transcript>…</transcript>" },
+        ] }],
+    })), "marker in tool_result, wrapper in user text");
+    // Assistant prose quoting policy copy is equally an echo, not the lane.
+    assert.ok(!isAutoModeClassifier(req({
+        system: "You are a safety classifier.",
+        messages: [
+            { role: "assistant", content: "the classifier prompt says \"Err on the side of blocking\" and wraps input in <transcript>" },
+            { role: "user", content: "continue" },
+        ],
+    })), "wrapper + marker in assistant prose");
+    assert.ok(!isAutoModeClassifier(req({
+        system: "policy: <transcript>\nErr on the side of blocking",
+        messages: [{ role: "user", content: "hello" }],
+    })), "wrapper in system, not user text");
 });
 
 test("isAutoModeClassifier: negatives — each signal alone is not enough", () => {
