@@ -1770,9 +1770,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const active = deps.session.state.blocks.filter((b) => b.active);
         return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
     };
-    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string };
+    type TierRecoveryResult = { recovered: boolean; callsUsed: number; attemptsUsed: number; netSaved: number; honestDetail: string };
     const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
         let callsUsed = 0;
+        // #3663: distillation dispatches committed, INCLUDING the ones that threw /
+        // timed out / came back unusable — callsUsed alone counts only completed
+        // folds, so a fully-failed recovery read as "0 summary call(s)" and hid
+        // the attempts the operator's logs show did happen.
+        let attemptsUsed = 0;
         let netSaved = 0;
         // #4227: the most recent measurement's nudge offer — pinned into the
         // distill fold's ctx so its receipt tail judges from the same
@@ -1908,6 +1913,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 break;
             }
             let outcome;
+            attemptsUsed += 1; // #3663: the dispatch is committed here — every post-dispatch exit (throw/unusable/drift/refuse/success) counts as an attempt
             try {
                 outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
             } catch (error) {
@@ -1975,11 +1981,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
             : stopReason === "unavailable" ? "the distillation summary was unavailable"
             : "a distillation pass produced no further shrink";
+        // #3663: state attempted-vs-completed when some dispatch failed — "0 summary
+        // call(s)" read as "nothing was tried" although the logs show calls that
+        // threw/timed out. Byte-identical to the historical phrasing when every
+        // dispatched call completed.
+        const callCountPhrase = attemptsUsed > callsUsed
+            ? `${callsUsed} of ${attemptsUsed} attempted summary call(s) completed`
+            : `${callsUsed} summary call(s)`;
         const honestDetail =
-            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
+            `futile round: folding compressible raw messages plus tier distillation (${callCountPhrase}, net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
             `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
             `Raise the model context window or restart the session.`;
-        return { recovered, callsUsed, netSaved, honestDetail };
+        return { recovered, callsUsed, attemptsUsed, netSaved, honestDetail };
     };
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
@@ -2957,7 +2970,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (!tierRecoveryAttempted && eligibleForTierRecovery()) {
             tierRecoveryAttempted = true;
             const rec = await attemptTierRecovery();
-            deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
+            const recCallPhrase = rec.attemptsUsed > rec.callsUsed ? `${rec.callsUsed} of ${rec.attemptsUsed} attempted summary call(s) completed` : `${rec.callsUsed} summary call(s)`;
+            deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${recCallPhrase}, net ~${rec.netSaved} tok saved (#2952, #3663)`);
             if (!rec.recovered) {
                 failure = { kind: "exhausted", detail: rec.honestDetail };
             }
