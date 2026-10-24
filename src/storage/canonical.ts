@@ -53,6 +53,10 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
         }
         return out;
     }
+    return canonicalScalar(value, key);
+}
+
+function canonicalScalar(value: unknown, key: string | undefined): unknown {
     if (key === "biliVersion" && typeof value === "string") return "__VER__";
     if (typeof value === "number" && Number.isFinite(value) && value > 1_600_000_000_000) return "__TS__";
     if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return "__UUID__";
@@ -61,4 +65,85 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
 
 export function sha256(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+/** Hash a storage view without materializing its canonical copy or JSON string. */
+export function canonicalDigest(value: unknown): string {
+    if (value === undefined || typeof value === "function" || typeof value === "symbol") return sha256(JSON.stringify(value));
+    const hash = createHash("sha256");
+    const chunkSize = 64 * 1024;
+    let pending = "";
+    function write(text: string): void {
+        pending += text;
+        if (pending.length >= chunkSize) {
+            hash.update(pending, "utf8");
+            pending = "";
+        }
+    }
+    function writeString(text: string): void {
+        write('"');
+        for (let start = 0; start < text.length;) {
+            let end = Math.min(start + chunkSize, text.length);
+            const last = text.charCodeAt(end - 1);
+            // Keep a surrogate pair together so JSON escaping and UTF-8 stay exact.
+            if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+            write(JSON.stringify(text.slice(start, end)).slice(1, -1));
+            start = end;
+        }
+        write('"');
+    }
+    function visit(current: unknown, key?: string): void {
+        if (Array.isArray(current)) {
+            write("[");
+            for (let i = 0; i < current.length; i++) {
+                if (i) write(",");
+                visit(current[i]);
+            }
+            write("]");
+        } else if (current instanceof Map) {
+            write('{"__map__":[');
+            let separator = "";
+            for (const [k, v] of current) {
+                write(separator + "[");
+                // canonicalize leaves Map keys untouched.
+                write(JSON.stringify(k) ?? "null");
+                write(",");
+                visit(v);
+                write("]");
+                separator = ",";
+            }
+            write("]}");
+        } else if (current instanceof Set) {
+            write('{"__set__":[');
+            let separator = "";
+            for (const v of current) {
+                write(separator);
+                visit(v);
+                separator = ",";
+            }
+            write("]}");
+        } else if (current && typeof current === "object") {
+            write("{");
+            let separator = "";
+            for (const k of Object.keys(current)) {
+                // Assigning __proto__ to canonicalize's plain output creates no JSON property.
+                if (k === "storageMode" || k === "tailGaps" || k === "__proto__") continue;
+                const v = (current as Record<string, unknown>)[k];
+                if (v === undefined || typeof v === "function" || typeof v === "symbol") continue;
+                write(separator);
+                writeString(k);
+                write(":");
+                visit(v, k);
+                separator = ",";
+            }
+            write("}");
+        } else {
+            const normalized = canonicalScalar(current, key);
+            if (typeof normalized === "string") writeString(normalized);
+            else write(JSON.stringify(normalized) ?? "null");
+        }
+    }
+    visit(value);
+    hash.update(pending, "utf8");
+    return hash.digest("hex");
 }

@@ -29,7 +29,7 @@ import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSu
 import { renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
-import { canonicalize, sha256 } from "./canonical.ts";
+import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow } from "./store.js";
@@ -1112,7 +1112,7 @@ function warnTailGaps(id: string, view: { tailGaps?: number }): void {
 }
 
 function shadowDigest(view: unknown): string {
-    return sha256(JSON.stringify(canonicalize(view)));
+    return canonicalDigest(view);
 }
 
 // #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
