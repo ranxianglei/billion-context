@@ -18,7 +18,13 @@ import { rmSync } from "node:fs";
 // family). A probe confirmed the harness holds NO self-handle at rmrf time
 // (flushAllSessions closes the store's shadow first), so this is not masking
 // an in-process leak: it re-sizes the external-lock budget to the c=4 reality.
-const RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1600, 3200, 3200] as const;
+//
+// #4046 CI lane (win22-1 @ a46fd0d1a): the #2771 corrupt-index proof then
+// spent the full ~9.6s ladder on EBUSY unlinking index.db — the same
+// external-lock family with a longer-lived lock under shard load; extend the
+// flat tail rather than the exponential front (the early rungs exist to win
+// cheap races without paying for the slow ones).
+const RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1600, 3200, 3200, 3200, 3200] as const;
 
 /** Sync sleep that is legal on any thread in Node (blocks the event loop —
  * exactly what a teardown-path retry wants; no pending I/O ordering to keep). */
