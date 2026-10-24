@@ -1284,8 +1284,8 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
             // exactly what #4215 needs named in the log (C10b).
             if (noticedForkBlindSpot) return;
             noticedForkBlindSpot = true;
-            const scoped = sidScope.getStore();
-            const scopedActive = typeof scoped === "string" && scoped.length > 0;
+            const scoped = dispatchScope.getStore();
+            const scopedActive = scoped !== undefined && scoped.sid.length > 0;
             const shape =
                 verdict.reason === "initiator-threw" ? `threw (${verdict.detail ?? "unknown"})`
                     : verdict.reason === "initiator-missing" ? "returned no agent"
@@ -1772,7 +1772,7 @@ export function apply(ctx: PluginContext): void {
     // waterfall, and the loop stamps `options.sessionId` on each request
     // object (types.d.ts: "Session identity stamped by the loop for request
     // routing"). Listening there and wrapping the stream's iteration in our
-    // sidScope means the adapter's fetches read a session id that survives
+    // dispatchScope means the adapter's fetches read a session id that survives
     // every chain shape the ambient initiator does not. Waterfall contract:
     // always call next() and faithfully pass the iterable through — a
     // listener that drops it would cut the stream (same discipline as the
