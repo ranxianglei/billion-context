@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cache from "../scripts/ci-pretest-cache.mjs";
@@ -161,6 +161,44 @@ test("a missing input is a hard error, never a silent HIT", () => {
     const { root } = makeMiniRepo();
     const broken = { name: "kernel", dir: "kernel", inputs: ["src", "does-not-exist.ts"] };
     assert.throws(() => cache.hashComponent(root, broken), /does-not-exist\.ts/);
+});
+
+test("a HIT must also be mtime-fresh — a cache-restored dist with archived old timestamps gets touched to now (#4548)", () => {
+    // Reproduces the master-red incident: actions/cache restores dist bytes
+    // with their archived mtimes (older than this checkout), the #3325
+    // golden-drive guard compares mtimes, and a verified-fresh-but-old dist
+    // is wrongly refused. The HIT path must refresh the whole dist tree.
+    const { root, write } = makeMiniRepo();
+    const seen: string[] = [];
+    cache.runPretestCache({ root, build: fakeBuild(seen) });
+
+    // Simulate the actions/cache restore: dist bytes valid, mtimes archived
+    // in the past — and prove the precondition actually looks stale first.
+    write("kernel/src/index.ts", 'export const v = "kernel";\n'); // same bytes
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(join(root, "kernel", "dist", "index.js"), old, old);
+    utimesSync(join(root, "kernel", "dist"), old, old);
+    utimesSync(join(root, "kernel", "dist", cache.MARKER_NAME), old, old);
+    // Model the checkout clock: sources checked out ~1s after the cache was
+    // archived — strictly newer than the restored dist, older than the touch.
+    const srcAt = new Date(Date.now() - 1_000);
+    utimesSync(join(root, "kernel", "src", "index.ts"), srcAt, srcAt);
+    assert.ok(
+        statSync(join(root, "kernel", "dist", "index.js")).mtimeMs < srcAt.getTime(),
+        "precondition: restored dist must look mtime-stale before the run",
+    );
+
+    const r = cache.runPretestCache({ root, build: fakeBuild(seen) });
+    assert.equal(r.find((x) => x.name === "kernel")?.hit, true);
+    assert.equal(seen.length, 2, "HIT must not rebuild");
+    assert.ok(
+        statSync(join(root, "kernel", "dist", "index.js")).mtimeMs > srcAt.getTime(),
+        "HIT must touch the dist tree past the sources (#3325 guard invariant)",
+    );
+    assert.ok(
+        statSync(join(root, "kernel", "dist")).mtimeMs > srcAt.getTime(),
+        "the dist directory itself is touched too",
+    );
 });
 
 test("build failure propagates (CLI exit path) and stamps no marker", () => {
