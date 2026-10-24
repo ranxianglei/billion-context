@@ -1393,6 +1393,14 @@ export function resetSessionCompression(session: Session): void {
     // deletes the on-disk envelope on the next save.
     session.contentStore = undefined;
     session.contentStoreDirty = true;
+    // #3011: the rebase re-issues refs and wipes the CCR store — the retained
+    // snapshot's bookkeeping (stored-ref list, wire comparability verdict,
+    // tracked byte count) describes content whose mapping no longer exists;
+    // each field re-evaluates on the parent's next request.
+    delete session.metadata.publicSnapshotStoredRefs;
+    delete session.metadata.publicSnapshotWireHash;
+    delete session.metadata.publicSnapshotBytes;
+    delete session.metadata.publicSnapshotTextComparable;
     // #1343: rebase wipes both the queued injections and their acks (context
     // rebuilt), so clear the durable ledger too — otherwise a later
     // reconcileReloadedRetrievals would misattribute this expected loss as a

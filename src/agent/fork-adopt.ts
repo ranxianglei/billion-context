@@ -59,7 +59,11 @@ type SnapshotResponse = {
 
 type ForkAdoptionResult =
     | { outcome: "adopted"; branchPoint: number; replayed: boolean }
-    | { outcome: "degraded"; reason: string };
+    // #3011: retryable carries the server's structured verdict (its error
+    // code / status class), NOT a re-parse of the reason string — the old
+    // regex /^(snapshot|fork) (error|http 5\d\d)/ missed the proxy's own
+    // documented-retryable 409 SNAPSHOT_UNAVAILABLE and gave up forever.
+    | { outcome: "degraded"; reason: string; retryable: boolean };
 
 function forkStableJson(value: unknown): string {
     if (Array.isArray(value)) return `[${value.map(forkStableJson).join(",")}]`;
@@ -390,7 +394,12 @@ async function readBoundedErrorBody(res: Response): Promise<{ code: string; erro
  * failure path returns { outcome: "degraded" } — the child then simply starts
  * a fresh conversation, exactly today's behavior; adoption is best effort.
  * A 409 PARENT_REVISION_CONFLICT (parent mutated between snapshot and fork)
- * is retried once with a fresh snapshot before degrading.
+ * is retried once with a fresh snapshot before degrading. Degraded results
+ * carry `retryable` (#3011): whether a LATER attempt can succeed — network /
+ * 5xx / 409 SNAPSHOT_UNAVAILABLE are states the parent can outlive (a fresh
+ * parent request re-establishes its raw view); deterministic 4xx verdicts
+ * (unknown parent, diverged prefix, conflicting child) cannot change in this
+ * process. Consumers classify by the field, never by the reason text.
  */
 export async function tryForkAdoption(opts: {
     base: string;
@@ -407,10 +416,10 @@ export async function tryForkAdoption(opts: {
     // projected above with pinned parity (#2469 stage 2).
     const wire = detectWireFormat(opts.body);
     if (wire === "google") {
-        return { outcome: "degraded", reason: `wire unsupported (${wire})` };
+        return { outcome: "degraded", reason: `wire unsupported (${wire})`, retryable: false };
     }
     const core = chatBodyToCore(opts.body);
-    if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
+    if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable", retryable: true };
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
@@ -421,15 +430,21 @@ export async function tryForkAdoption(opts: {
                 // SNAPSHOT_UNAVAILABLE + why) instead of hiding them behind a
                 // bare status code.
                 const detail = await readBoundedErrorBody(res);
-                return { outcome: "degraded", reason: `snapshot http ${res.status}${detail.code ? ` ${detail.code}` : ""}${detail.error ? ` (${detail.error})` : ""}` };
+                // #3011: classify by the proxy's structured verdict, not by
+                // re-parsing the reason string. 5xx and 409
+                // SNAPSHOT_UNAVAILABLE are conditions the parent can outlive
+                // (a fresh parent request re-establishes its raw view); every
+                // other 4xx names a state this process cannot fix.
+                const retryable = res.status >= 500 || (res.status === 409 && detail.code === "SNAPSHOT_UNAVAILABLE");
+                return { outcome: "degraded", reason: `snapshot http ${res.status}${detail.code ? ` ${detail.code}` : ""}${detail.error ? ` (${detail.error})` : ""}`, retryable };
             }
             snapshot = snapshotOf(await res.json());
         } catch (err) {
-            return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
+            return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}`, retryable: true };
         }
-        if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
+        if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed", retryable: false };
         const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
-        if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
+        if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match", retryable: false };
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
         const orderHash = branchPoint === snapshot.orderedMessages.length ? snapshot.orderHash : forkOrderHashOf(prefix);
         const payload = {
@@ -450,7 +465,7 @@ export async function tryForkAdoption(opts: {
                 signal: AbortSignal.timeout(FORK_TIMEOUT_MS),
             });
         } catch (err) {
-            return { outcome: "degraded", reason: `fork error ${err instanceof Error ? err.message : String(err)}` };
+            return { outcome: "degraded", reason: `fork error ${err instanceof Error ? err.message : String(err)}`, retryable: true };
         }
         if (res.status === 201 || res.status === 200) {
             let replayed = false;
@@ -468,9 +483,12 @@ export async function tryForkAdoption(opts: {
             opts.log?.(`fork for ${opts.childConversationId} hit parent revision conflict, retrying once with a fresh snapshot (#2399)`);
             continue;
         }
-        return { outcome: "degraded", reason: `fork http ${res.status}${code ? ` ${code}` : ""}` };
+        // CHILD_CONFLICT / PARENT_STATE_INCOMPLETE / BRANCH_POINT_CONFLICT and
+        // friends are deterministic verdicts about THIS child's state — only
+        // 5xx can still change under a later attempt (#3011).
+        return { outcome: "degraded", reason: `fork http ${res.status}${code ? ` ${code}` : ""}`, retryable: res.status >= 500 };
     }
-    return { outcome: "degraded", reason: "parent revision conflict retry exhausted" };
+    return { outcome: "degraded", reason: "parent revision conflict retry exhausted", retryable: false };
 }
 
 const forkCapabilityCache = new Map<string, boolean>();
@@ -565,15 +583,21 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             done.add(input.child);
             return;
         }
-        log(`fork adoption for ${input.child} degraded (${result.reason}) — the session continues without inherited compression state (#2399/#2469)`);
-        // Only transient failures (network / 5xx / unmappable body) leave the
-        // window open so a later request retries up to maxAttempts; every other
-        // outcome is terminal. Once this child's stamped request has landed, a
-        // retry can only ever meet CHILD_CONFLICT (the server registers the
-        // child conversation before any later fork POST), which latches here as
-        // a non-transient outcome (#2403 review).
-        const transient = /^(snapshot|fork) (error|http 5\d\d)/.test(result.reason) || result.reason === "body unmappable";
-        if (!transient || (attempts.get(input.child) ?? 0) >= maxAttempts) done.add(input.child);
+        // #3011: classify by the server's structured verdict on the result
+        // (retryable), never by re-parsing the reason string — the old regex
+        // missed 409 SNAPSHOT_UNAVAILABLE and gave up after one attempt.
+        // Transient outcomes leave the window open for later requests up to
+        // maxAttempts; every other outcome is terminal. Once this child's
+        // stamped request has landed, a retry can only ever meet
+        // CHILD_CONFLICT (the server registers the child conversation before
+        // any later fork POST), which latches here as non-retryable (#2403).
+        const exhausted = !result.retryable || (attempts.get(input.child) ?? 0) >= maxAttempts;
+        if (exhausted) {
+            log(`fork adoption for ${input.child} degraded (${result.reason}) — permanently disabled, no further retries in this process; the session continues without inherited compression state (#3011/#2399/#2469)`);
+            done.add(input.child);
+        } else {
+            log(`fork adoption for ${input.child} degraded (${result.reason}) — transient, will retry on a later request (attempt ${attempts.get(input.child)}/${maxAttempts}); the session continues without inherited compression state until adopted (#3011/#2399/#2469)`);
+        }
     };
     return {
         async maybeAdopt(input): Promise<void> {
