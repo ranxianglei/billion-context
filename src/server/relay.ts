@@ -182,11 +182,14 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
 /** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
  *  exact bytes, why shedding could not fit, and the current budget for context.
  *  Deliberately does NOT suggest raising the budget: the gateway just proved it
- *  rejects this size, so a bigger budget would only send the fat frame again. */
-function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
-    const why = !stats || (!stats.archived && !stats.downscaled)
+ *  rejects this size, so a bigger budget would only send the fat frame again.
+ *  #4601: `why` overrides the derived reason when shedding was never ATTEMPTED
+ *  (e.g. a verbatim-passthrough body that shedWireImages cannot parse) — claiming
+ *  "no sheddable images" there was a lie about work that was not done. */
+function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number, why?: string): string {
+    const realWhy = why ?? (!stats || (!stats.archived && !stats.downscaled)
         ? "no sheddable images outside the protected recent messages"
-        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
+        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`);
     return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
@@ -874,11 +877,12 @@ async function forwardCaptured(
 
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
+        // #4601: a non-string (verbatim passthrough) body was reported as 0.0 MiB — measure it.
+        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
         const budget = limitsWsOutboundBytes();
         const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
         if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
-            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
+            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget, typeof wireBody !== "string" ? "the body is not a JSON wire body (verbatim passthrough) — image shedding cannot apply" : undefined));
         }
         const shedSession = prepared.session;
         const { body: shrunk, stats } = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });

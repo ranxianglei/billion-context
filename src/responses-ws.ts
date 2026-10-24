@@ -569,9 +569,22 @@ class ResponsesWsResponse extends http.ServerResponse {
         if (!this.terminal && this.peer.readyState === WebSocket.OPEN) {
             let details: unknown;
             try { details = JSON.parse(this.buffer); } catch { details = undefined; }
-            this.peer.send(object(details)
-                ? JSON.stringify({ ...details, type: "error", status: this.statusCode >= 400 ? this.statusCode : 502 })
-                : errorFrame("incomplete_response", "Responses exchange ended without a terminal event", 502));
+            const status = this.statusCode >= 400 ? this.statusCode : 502;
+            if (!object(details)) {
+                this.peer.send(errorFrame("incomplete_response", "Responses exchange ended without a terminal event", status));
+            } else {
+                // #4601: the WS-lane error contract is { type, status, error: { code?, message?, headers? } }
+                // (codex parse_wrapped_websocket_error_event) — a string `error` fails that deserialization and
+                // codex waits out its idle timeout instead of failing fast. Normalize at this one conversion
+                // point; the HTTP lanes keep their own string-error contract untouched.
+                const rawError = details.error;
+                const detailText = typeof details.detail === "string" ? details.detail : "";
+                const error: Record<string, unknown> = object(rawError) ? rawError
+                    : typeof rawError === "string"
+                        ? { code: "proxy_failure", message: detailText !== "" && detailText !== rawError ? `${rawError}: ${detailText}` : rawError }
+                        : { code: "incomplete_response", message: "Responses exchange ended without a terminal event" };
+                this.peer.send(JSON.stringify({ ...details, error, type: "error", status }));
+            }
         }
         this.ended = true;
         this.emit("finish");
