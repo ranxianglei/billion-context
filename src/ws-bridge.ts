@@ -50,6 +50,9 @@ export interface WsBridgeContext {
      *  handshake — probe and turns alike — so a chained bili sees one
      *  consistent processor marker instead of marker-less probes. */
     instanceId?: string;
+    /** The upstream proxy the relay's egress uses for a destination (undefined = direct).
+     *  Codec traffic that egresses outside the relay (the prewarm probe) resolves the same route. */
+    egressProxyFor?: (destinationUrl: string) => string | undefined;
 }
 
 export interface WsBridgeCodec {
@@ -86,8 +89,8 @@ export function installWebSocketBridge(
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
     log: (level: string, message: string) => void,
     codecs: readonly WsBridgeCodec[],
-    /** #2124: whether a WS-upstream destination's egress leaves through an upstream proxy (its hostname is then resolved remotely by that proxy, not the local resolver). */
-    isEgressProxied?: (destinationUrl: string) => boolean,
+    /** #2124: the upstream proxy a WS-upstream destination's egress leaves through, if any (a proxied hostname is resolved remotely by that proxy, not the local resolver). */
+    egressProxyFor?: (destinationUrl: string) => string | undefined,
     /** #300/#3073: this server's per-instance identity for the x-bili-hop chain stamp (see WsBridgeContext.instanceId). */
     instanceId?: string,
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
@@ -127,7 +130,7 @@ export function installWebSocketBridge(
         // side requests are identified by the #1699 persona header instead).
         source.headers["x-bili-ws-lane"] = codec.name;
         void (async () => {
-            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv(), egressProxied: isEgressProxied?.(upstream) });
+            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv(), egressProxied: egressProxyFor?.(upstream) !== undefined });
             if (!verdict.ok) {
                 socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                 return;
@@ -136,7 +139,7 @@ export function installWebSocketBridge(
             wss.handleUpgrade(source, socket, head, peer => {
                 const label = `[${codec.name}] [conn=${++connectionId}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
                 const trace: WsBridgeLog = (level, message) => log(level, `${label} ${message}`);
-                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec, instanceId });
+                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec, instanceId, egressProxyFor });
                 const entry = { session, peer };
                 sessions.add(entry);
                 peer.on("error", () => {});
