@@ -58,7 +58,10 @@ for (const shape of ["one-interior-survivor", "all-missing", "small-zombie"] as 
                 if (shape === "all-missing") {
                     assert.equal(session.state.blocks.length, 1);
                     assert.equal(session.state.blocks[0].active, false);
-                    assert.equal(session.metadata.foldEpochConfirmPending === true, false);
+                    // #3641 boundary 4 / MESSAGE-IDENTITY.md epoch-confirm gate: total collapse latches
+                    // like partial coverage — the kernel deactivates the zero-coverage block, but the
+                    // snapshot is retained and folding pauses until realignment or a user-confirmed epoch.
+                    assert.equal(session.metadata.foldEpochConfirmPending === true, pass >= 3);
                 }
             }
             assert.equal(session.blockContents.get(blockId)?.full.text, original);
