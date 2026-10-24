@@ -18,6 +18,7 @@ import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
+import { resolveVisibilityMode, type VisibilityMode } from "./compress-settings.js";
 
 interface CompressLoopResponsesCtx {
     signal?: AbortSignal;
@@ -29,9 +30,9 @@ interface CompressLoopResponsesCtx {
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
     textProtocol?: boolean;
-    /** #862: when `false`, suppress 📦/❌ visibility markers (same contract as
-     *  LoopCtx.visibilityMarkers). Default (undefined) keeps markers on. */
-    visibilityMarkers?: boolean;
+    /** #862/#1701: visibility-marker delivery mode — same tri-state contract as
+     *  LoopCtx.visibilityMode (`stream` | `model-only` | `off`). */
+    visibilityMode?: VisibilityMode;
 }
 
 interface RequestOptions {
@@ -103,6 +104,7 @@ async function surfaceProxyJson(
     proxyCalls: FunctionCallAccumulator[],
     ctx: CompressLoopResponsesCtx,
 ): Promise<Record<string, unknown>> {
+    const clientMarkers = resolveVisibilityMode(ctx.visibilityMode) === "stream";
     const markers: string[] = [];
     for (const call of proxyCalls) {
         const mutating = MUTATING_PROXY_TOOLS.has(call.name);
@@ -126,7 +128,7 @@ async function surfaceProxyJson(
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} FAILED: ${String(e)}]`);
         }
-        if (ctx.visibilityMarkers !== false) markers.push(buildVisibilityMarker(call.name, result));
+        if (clientMarkers) markers.push(buildVisibilityMarker(call.name, result));
     }
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
@@ -150,6 +152,7 @@ export async function compressLoopResponsesJson(
     requestOptions: RequestOptions,
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
+    let terminalFailed: { name: string; result: string } | undefined;
     for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         current = stripResponsesText(current);
         const output = responsesJsonOutput(current);
@@ -195,9 +198,10 @@ export async function compressLoopResponsesJson(
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
                 rawArgs = call.arguments;
             }
-                const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
+            const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
+            if ((call.name === "compress" || call.name === "decompress") && toolResult.text.includes("FAILED")) terminalFailed = { name: call.name, result: toolResult.text };
+            if (resolveVisibilityMode(ctx.visibilityMode) !== "off") inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
         }
         // #1097: retrieval injections ride the re-request after their ack —
         // as user items (bili's own artifacts take the #377-sanctioned user
@@ -240,5 +244,11 @@ export async function compressLoopResponsesJson(
         }
     }
     ctx.log(`[acp-proxy: responses JSON compress loop limit (${MAX_LOOP_ROUNDS}) reached]`);
+    // #1701: mirrors the streaming loop's MAX_LOOP_ROUNDS break — a terminal compression failure left zero client-visible trace in model-only mode, so surface exactly one marker line.
+    if ((ctx.visibilityMode ?? "stream") === "model-only" && terminalFailed) {
+        const output = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
+        output.push({ type: "message", id: `msg_acp_terminal_${Date.now()}`, role: "assistant", content: [{ type: "output_text", text: buildVisibilityMarker(terminalFailed.name, terminalFailed.result) }] });
+        return { ...current, output };
+    }
     return current;
 }

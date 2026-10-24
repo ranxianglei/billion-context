@@ -45,6 +45,7 @@ import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
+import type { VisibilityMode } from "../compress-settings.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -209,12 +210,15 @@ export interface LoopCtx {
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
     protocol?: WireProtocol;
-    /** #862: when `false`, suppress the 📦/❌ ACP visibility markers emitted
-     *  after proxy tool executions — both the marker line streamed to the
-     *  client (`emitMarker`) and the orphan marker message re-injected into
-     *  rebuilt history. Default (undefined) keeps markers on. Paired
-     *  tool-call/tool-result messages are unaffected. */
-    visibilityMarkers?: boolean;
+    /** #862/#1701: visibility-marker delivery mode (resolved upstream via
+     *  resolveVisibilityMode; legacy booleans normalize there). `stream`
+     *  (default/undefined): the marker line is streamed to the client AND the
+     *  orphan marker message is re-injected into rebuilt history. `model-only`:
+     *  model-side injection on, client stream silent — a terminal compression
+     *  failure (retry exhaustion) still surfaces as one visible ❌ line.
+     *  `off`: both suppressed. Paired tool-call/tool-result messages are
+     *  unaffected in every mode. */
+    visibilityMode?: VisibilityMode;
     /** #1455: tee loop-originated upstream responses (re-request and every
      *  retry fetch) to raw SSE files — the outer request's ACP_DUMP_SSE tee
      *  only covers the FIRST response, so an internal re-request that dies
@@ -455,6 +459,9 @@ export async function* runCompressLoop(
     // in client-stored history (incoming-history stripping removes it next turn,
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
+    const visibilityMode = ctx.visibilityMode ?? "stream";
+    const clientMarkers = visibilityMode === "stream";
+    const modelMarkers = visibilityMode !== "off";
 
     const fetchUpstream = async (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
@@ -1169,7 +1176,7 @@ export async function* runCompressLoop(
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
                     proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
-                    if (ctx.visibilityMarkers !== false) {
+                    if (clientMarkers) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
@@ -1321,7 +1328,7 @@ export async function* runCompressLoop(
                             coreMessages.push(carrierMsg);
                             if (threadContinue) threadDelta.push(carrierMsg);
                         }
-                    } else if (ctx.visibilityMarkers !== false) {
+                    } else if (modelMarkers) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
                             role: "system",
@@ -1428,6 +1435,11 @@ export async function* runCompressLoop(
             if (round >= MAX_LOOP_ROUNDS) {
                 ctx.log(`[acp-loop] round ${round} hit MAX_LOOP_ROUNDS; completing gracefully`);
                 loggerLog("warn", `[acp-loop] loop limit (${MAX_LOOP_ROUNDS}) reached; completing gracefully`);
+                // #1701: in model-only mode every intermediate ❌ stayed client-silent, so a terminal failure would otherwise leave zero trace — surface exactly one.
+                if (visibilityMode === "model-only") {
+                    const terminal = [...proxyResults].reverse().find((pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"));
+                    if (terminal) yield adapter.emitMarker(terminal.name, terminal.result);
+                }
                 yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
                 return;
             }
@@ -1456,6 +1468,11 @@ export async function* runCompressLoop(
             if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
                 ctx.log(`[acp-loop] round ${round}: failed-only mutating round; completing after ${round} round(s) instead of re-requesting (#156/#4186)`);
                 loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (#156/#4186)`);
+                // #1701: in model-only mode the mid-round ❌ receipts are client-silent, so this break would otherwise leave zero client trace — surface exactly one.
+                if (visibilityMode === "model-only") {
+                    const terminal = failedMutating[failedMutating.length - 1];
+                    yield adapter.emitMarker(terminal.name, terminal.result);
+                }
                 yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
                 return;
             }
