@@ -123,10 +123,14 @@ test("protectedLatestTools [\"skill/*\"]: newest load PER skill survives, older 
 
     const oldAlpha = pairOf(msgs, "oc-alpha-0");
     assert.ok(/^m\d+$/.test(refOf(oldAlpha.call) ?? ""), "older alpha load stays foldable");
+    // #3999: latest-per-name loads are NUMBERED at birth (append-stable at the tail)
+    // instead of BLOCKED, so demoting one inserts zero bytes. The survival asserted
+    // below still holds because fold-exclusion rides on the projection-time carve,
+    // not on the ref value — the live pair is addressable yet never coverable.
     for (const id of ["oc-alpha-2", "oc-beta-1"]) {
         const { call, result } = pairOf(msgs, id);
-        assert.equal(refOf(call), "BLOCKED", `${id} latest load call BLOCKED`);
-        assert.equal(refOf(result), "BLOCKED", `${id} latest load result BLOCKED`);
+        assert.ok(/^m\d+$/.test(refOf(call) ?? ""), `${id} latest load call numbered at birth (#3999)`);
+        assert.ok(/^m\d+$/.test(refOf(result) ?? ""), `${id} latest load result numbered at birth (#3999)`);
     }
 
     // Folding the whole early history keeps exactly the newest of each name.
@@ -210,9 +214,11 @@ test("responses wire: skill({name}) loads project to skill/<name> under path pat
     const { msgs } = responsesToCore(body);
     const turn = core.processTurn({ messages: msgs, state: createInitialState(), config, tokenCount: 9999, renderTags: "text-only" });
     const refOf = (m: CoreMessage): string | null => refForRaw(turn.state.messageRefs, m.id);
+    // #3999: latest-per-name loads are numbered at birth (addressable) instead of
+    // BLOCKED; projection to skill/<name> and per-name grouping are unchanged.
     for (const id of ["call-orc", "call-light"]) {
         const { call, result } = pairOf(msgs, id);
-        assert.equal(refOf(call), "BLOCKED", `${id} latest-per-name call BLOCKED on responses wire`);
-        assert.equal(refOf(result), "BLOCKED", `${id} latest-per-name result BLOCKED on responses wire`);
+        assert.ok(/^m\d+$/.test(refOf(call) ?? ""), `${id} latest-per-name call numbered at birth on responses wire (#3999)`);
+        assert.ok(/^m\d+$/.test(refOf(result) ?? ""), `${id} latest-per-name result numbered at birth on responses wire (#3999)`);
     }
 });

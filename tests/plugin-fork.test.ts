@@ -298,9 +298,12 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
         const refs = snapshot.body.orderedMessages.map((m) => m.ref);
         assert.equal(refs.length, history.length);
         assert.ok(/^m\d{5,}$/.test(refs[0]), JSON.stringify(refs));
-        // dsh durable-guard lane (#2447) pins this carrier; the kernel BLOCKED
-        // sentinel addresses it internally and the wire renders null (#2620 final contract).
-        assert.equal(refs[1], null);
+        // dsh durable-guard lane (#2447) keeps this carrier out of folds via the
+        // projection-time carve. Post-#3999 it is NUMBERED at birth (a live mNNNNN
+        // on the wire) instead of the unaddressable BLOCKED sentinel, so demoting
+        // it later inserts zero bytes; the literal "BLOCKED" string still never
+        // crosses the wire (#2620 final contract).
+        assert.ok(/^m\d{5,}$/.test(refs[1] ?? ""), JSON.stringify(refs));
         assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
         assert.ok(refs.slice(2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
         const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
@@ -309,7 +312,13 @@ test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revision
         assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
         const childSession = resolveConversation("child").session!;
         assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
-        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        // #2620 copy-on-fork: the child reproduces the parent's ENTIRE raw→ref map
+        // exactly. Post-#3999 this all-text fixture carries no permanently-pinned
+        // message, so there is no BLOCKED entry to check — whole-map equality subsumes it.
+        const parentSession = resolveConversation("parent").session!;
+        for (const [raw, ref] of Object.entries(parentSession.state.messageRefs.byRaw)) {
+            assert.equal(childSession.state.messageRefs.byRaw[raw], ref, `child ref for ${raw} must equal parent's ${ref}`);
+        }
         await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main", 256, true, "dsh");
         assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
     } finally { await h.close(); }

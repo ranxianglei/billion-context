@@ -29,7 +29,7 @@ import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
+import { getSession, peekSession, _resetSessionsForTest, effectiveConfig } from "../src/session.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -247,12 +247,14 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
         await r.text();
         const s = peekSession("i2481-stamp");
         assert.ok(s, "dsh session exists");
-        // The stamped effective config (read by /__bili/plugin/tool) carries the
-        // guard — proven indirectly: the snapshot got a BLOCKED ref, i.e. it was
-        // recognized as protected AT ASSIGNMENT TIME on the very first turn.
+        // Guard proven directly on the stamped config: effectiveConfig() re-resolves
+        // the dsh lane classifier and applies withDurableProtection. (#3999: the live
+        // carrier is numbered at birth, so the old BLOCKED-ref witness no longer holds.)
         const sFull = getSession("i2481-stamp");
-        const blockedRefs = Object.entries(sFull.state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
-        assert.ok(blockedRefs >= 1, "the snapshot message must carry a BLOCKED ref (never advertised, never foldable)");
+        const eff = effectiveConfig(sFull, defaultConfig(200_000));
+        assert.ok(eff.protectedLatestTools?.includes("durable/*"), "dsh lane resolves the durable/* guard onto its effective config");
+        const refs = Object.values(sFull.state.messageRefs.byRaw);
+        assert.ok(refs.some((r) => /^m\d+$/.test(r)), "the live runtime-context carrier is numbered at birth (#3999)");
     } finally {
         await closeRig(rig);
     }

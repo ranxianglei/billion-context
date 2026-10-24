@@ -141,7 +141,7 @@ test("isMessageLatestProtected: matches latest call and its paired result only",
   assert.ok(!isMessageLatestProtected(msg("u", "hi"), latest), "text msg");
 });
 
-test("processTurn: only the latest todo_list pair is BLOCKED; older pairs keep refs", () => {
+test("processTurn: latest todo_list pair numbered at birth; older pairs keep refs", () => {
   const core = createCore();
   const messages: CoreMessage[] = [
     msg("a", "start"),
@@ -162,8 +162,11 @@ test("processTurn: only the latest todo_list pair is BLOCKED; older pairs keep r
   assert.equal(result.state.messageRefs.byRaw["c1"], "m00002");
   assert.equal(result.state.messageRefs.byRaw["r1"], "m00003");
   assert.equal(result.state.messageRefs.byRaw["b"], "m00004");
-  assert.equal(result.state.messageRefs.byRaw["c2"], "BLOCKED");
-  assert.equal(result.state.messageRefs.byRaw["r2"], "BLOCKED");
+  // Latest-per-identity protected messages are NUMBERED at birth (#3999): while
+  // one sits at the tail a fresh tag is append-stable, so its later demotion
+  // inserts zero bytes instead of minting a tag mid-history (#3837 cache break).
+  assert.equal(result.state.messageRefs.byRaw["c2"], "m00005");
+  assert.equal(result.state.messageRefs.byRaw["r2"], "m00006");
 });
 
 test("applyCompression: latest pair excluded from block, older pair folded", () => {
