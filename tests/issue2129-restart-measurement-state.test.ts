@@ -113,6 +113,12 @@ test("in-memory-only measurement fields ride to disk but are not restored (#2129
 
 test("corrupt persisted measurement values are rejected at restore (#2129)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-2129-rt-"));
+    // #4004: pin to shadow — under the #3818 full-mode default the read goes
+    // unified-first and serves the INTACT index row, so corrupting only the
+    // envelope never reaches these value-rejection guards. Shadow keeps the
+    // envelope as the read path so they fire (this test's original intent).
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "shadow";
     try {
         const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
         const s = makeSession("i2129-rt3");
@@ -171,6 +177,8 @@ test("corrupt persisted measurement values are rejected at restore (#2129)", asy
         assert.equal(partial.stats.calibratedEstimate, undefined, "null k̂ rejected");
         assert.equal(partial.stats.localInputEstimate, 12345, "untouched valid fields still restore");
     } finally {
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         rmrf(dir);
     }
 });
