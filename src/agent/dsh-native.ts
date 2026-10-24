@@ -1090,6 +1090,23 @@ function maybeRetry(ctx: PluginContext): void {
     void registerTools(ctx).catch(() => {});
 }
 
+/** #4134: resolves once the ACP tools are registered (toolsReady), the
+ * register has given up (dead), or 2s elapse — whichever first. Polls the
+ * register flag instead of threading a deferred through every landing path
+ * (respawn → origin → manifest → register, plus the recovery timer): cheap
+ * (25ms ticks, bounded 80 of them), and every terminal state already flips
+ * one of the two flags. */
+function registerArmed(): Promise<void> {
+    return new Promise((resolve) => {
+        const startedAt = Date.now();
+        const poll = () => {
+            if (register.toolsReady || register.dead || Date.now() - startedAt > 2000) resolve();
+            else setTimeout(poll, 25);
+        };
+        poll();
+    });
+}
+
 // #1158 L2: three-state attribution for the takeover gate. The old bare catch
 // swallowed currentInitiator() exceptions (disposed/closing agent scope) as
 // plain "no attribution", making a throwing ALS boundary indistinguishable
@@ -1671,7 +1688,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     init.headers = headers;
 }
 
-export function apply(ctx: PluginContext): void {
+export async function apply(ctx: PluginContext): Promise<void> {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
     // #3616: a fresh activation is a fresh origin world — in-flight recoveries
@@ -2542,6 +2559,19 @@ export function apply(ctx: PluginContext): void {
     // node:test drives apply() directly with a mock ctx — never patch
     // globalThis.fetch from inside a test run.
     if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+
+    // #4134: hold activation until the ACP tool registration has landed (or
+    // is provably not coming / 2s cap). The host composes each model round
+    // from the CURRENTLY registered tool set, so a fire-and-forget
+    // registration let round 1 fly with the stock tools while round 2
+    // recomposed with the ACP tools + their system sections — busting the
+    // whole prefix cache once per fresh session (and on any resume that
+    // races a slow boot). Awaited here so activation covers the first round
+    // too; bounded so a hung proxy spawn can never stall plugin load.
+    // Tests drive registration explicitly via _spawnForTest — skip the wait
+    // under NODE_TEST_CONTEXT (a mock apply() with no spawn armed would
+    // otherwise burn the full 2s cap on every call).
+    if (process.env.NODE_TEST_CONTEXT === undefined) await registerArmed();
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can
