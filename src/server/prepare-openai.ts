@@ -33,6 +33,7 @@ import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { stripTraeCodeNativeCompactInstruction } from "./traecode-compact.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
@@ -101,6 +102,25 @@ export async function prepareOpenai(
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
+    // #2411 Phase 1: TRAE Code's native auto-compact instruction ("the system
+    // will automatically compress prior messages…") reaches the model in the
+    // SAME request as bili's injected compress philosophy — two mutually
+    // exclusive "who compresses" stories. Neutralize it exactly when bili
+    // presents its own compression surface (injectTools), so the model sees one
+    // philosophy; runs BEFORE openaiToCore so kernel state and every rebuilt
+    // view carry the clean system. Evidence-permitlist match on the tracked
+    // sentence (src/server/traecode-compact.ts). No opt-out knob for now —
+    // behavior first, escape hatch only if users ask (dsh-guard rollout order).
+    if (injectTools) {
+        const trae = stripTraeCodeNativeCompactInstruction(parsed.messages);
+        if (trae.neutralized > 0 && session.metadata.traeCompactNeutralized !== true) {
+            session.metadata.traeCompactNeutralized = true;
+            log("info", `[${sessionId}] traecode native auto-compact instruction neutralized (${trae.neutralized} system message line(s)) — single compression philosophy now (#2411)`);
+        } else if (trae.shapeDrift && session.metadata.traeCompactShapeDrift !== true) {
+            session.metadata.traeCompactShapeDrift = true;
+            log("warn", `[${sessionId}] traecode tracked compact sentence present but line shape drifted — NOT neutralized; refresh TRAE_NATIVE_COMPACT_SENTENCE from a fresh dump (#2411)`);
+        }
+    }
 
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
