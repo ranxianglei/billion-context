@@ -699,8 +699,20 @@ export function prepareResponsesCompact(
     // request passes through verbatim without running processTurn (no state
     // mutation as a side effect of a compact that will not be intercepted).
     // #3686: host policy, not wire profile — declared plugin hosts are exempt.
+    // #4036: judge block activity under THIS compact request's own view (the
+    // pure probe below) instead of the last-synced stored flags — the same
+    // stale-deactivation window as the trigger form. The projection is reused
+    // by the transform so the body converts once, not twice.
+    let gateProjection: ReturnType<typeof responsesToCore> | undefined;
+    if (Array.isArray(parsed.input)) {
+        try {
+            gateProjection = responsesToCore(forgeBody);
+        } catch {
+            gateProjection = undefined;
+        }
+    }
     if (codexCompactMode() !== "intercept" || !isCodexHost(req.headers) || !Array.isArray(parsed.input)
-        || !codexCompactGatePre(session, config.modelContextLimit)) {
+        || !codexCompactGatePre(session, config.modelContextLimit, gateProjection?.msgs)) {
         return base;
     }
     // The state commit below is all-or-nothing: every non-forge path restores
@@ -716,7 +728,10 @@ export function prepareResponsesCompact(
     // foreign compaction blob.
     let transformOk = false;
     try {
-        const projection = responsesToCore(forgeBody);
+        // gateProjection is undefined only when the pre-gate probe threw on an
+        // unparseable body — re-convert here and fail into the same
+        // restore-and-passthrough catch as before (#335).
+        const projection = gateProjection ?? responsesToCore(forgeBody);
         // The forged handoff is one-shot with no tool channel: strip absorb so
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).

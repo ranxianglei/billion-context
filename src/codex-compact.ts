@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { CompressionBlock } from "acp-kernel";
+import { syncBlocks, type CompressionBlock, type CoreMessage } from "acp-kernel";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
@@ -217,12 +217,30 @@ export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replace
 // line, not a model of codex's internal threshold.
 export const CODEX_COMPACT_HEALTH_RATIO = 0.9;
 
-export function codexCompactGatePre(session: Session, effectiveLimit: number): boolean {
+// #4036: `viewMessages` — when the caller passes the CURRENT request's core
+// view, block activity is judged under THAT view via a pure syncBlocks probe
+// instead of the stored active flags. The flags reflect the LAST synced view:
+// a preceding short/side request legitimately deactivates every block whose
+// carriers left its tiny view, and a compaction request arriving before any
+// full-history recovery turn would read that stale deactivation and forward
+// verbatim. The compact request itself carries the full history — its input
+// is the authoritative evidence of whether the folds are still in play.
+// syncBlocks deep-clones and never mutates its input, so the probe keeps the
+// non-intercept path state-free (#335). Absent view → legacy stored-flag
+// judgment.
+export function codexCompactGatePre(
+    session: Session,
+    effectiveLimit: number,
+    viewMessages?: CoreMessage[],
+): boolean {
     if (effectiveLimit <= 0) return false;
     // Evidence-grade baseline only (#3008/#1492/#1839 discipline): raw
     // stats.lastInputTokens can be an uncalibrated estimate-grade value that
     // self-disables the valve at phantom pressure while real usage is far below.
     if (statusInputBaseline(session) >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
+    if (viewMessages !== undefined) {
+        return syncBlocks(viewMessages, session.state).state.blocks.some((b) => b.active);
+    }
     return session.state.blocks.some((b) => b.active);
 }
 

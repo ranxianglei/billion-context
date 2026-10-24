@@ -142,6 +142,16 @@ test("codexCompactGatePre: evidence-grade baseline only (#3008)", () => {
     assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)]), limit), true, "no source, no usage anchor → baseline 0 → forge");
 });
 
+test("codexCompactGatePre: view-aware block activity (#4036)", () => {
+    const limit = 10_000;
+    const foldBlock = (active: boolean): CompressionBlock => ({ ...block(active), effectiveMessageIds: ["h_fold_raw"] });
+    const viewMsg = (id: string) => ({ id, role: "user" as const, contentType: "text" as const, text: "x" });
+    assert.equal(codexCompactGatePre(mockSession(1_000, [foldBlock(false)]), limit, [viewMsg("h_fold_raw")]), true, "stored-inactive (prior short view) but carrier present in THIS view → forge");
+    assert.equal(codexCompactGatePre(mockSession(1_000, [foldBlock(true)]), limit, [viewMsg("h_unrelated")]), false, "stored-active but carrier absent from THIS view → honest pass-through");
+    assert.equal(codexCompactGatePre(mockSession(1_000, [foldBlock(false)]), limit), false, "no view argument → legacy stored-flag judgment");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [foldBlock(false)], { source: "usage" }), limit, [viewMsg("h_fold_raw")]), false, "view does not loosen the 90% baseline wall");
+});
+
 test("replaceBiliCompactionItems: echo becomes a summary handoff message in place", () => {
     const ours = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}x`, encrypted_content: `${CODEX_COMPACT_SENTINEL}summary text` };
     const real = { type: "compaction", id: "fc_real", encrypted_content: "opaque" };

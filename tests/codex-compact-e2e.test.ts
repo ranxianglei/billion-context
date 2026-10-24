@@ -504,6 +504,74 @@ test("e2e #332 (trigger form): intercept + healthy ACP + oversized payload → f
     });
 });
 
+// Issue #4036: a preceding short/side request legitimately deactivates every
+// block (its tiny view carries none of their carriers — reap needs 3 passes,
+// so one short view only flips active=false), and the trigger that follows
+// IMMEDIATELY — before any full-history recovery turn — must be judged against
+// its OWN view (the full history) instead of the stale stored active flags.
+// Stale flags → gate false → the oversized trigger forwarded verbatim → the
+// field event's upstream 400.
+
+test("e2e #4036 (trigger form): short side request deactivates blocks → immediate full-history trigger still intercepted", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        // Field-equivalent short request on the SAME session, no recovery turn:
+        // its one-message view carries no block carrier → syncBlocks deactivates all.
+        const rs = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "Create a title" }] }),
+        });
+        assert.equal(rs.status, 200);
+        await rs.text();
+        const sDeact = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(sDeact.state.blocks.length > 0, "blocks retained after the short view");
+        assert.ok(sDeact.state.blocks.every((b) => !b.active), "short view deactivated every block");
+
+        // Immediate trigger carrying the FULL history — before any recovery turn.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        assert.equal(r2.headers.get("content-type"), "text/event-stream", "forged SSE");
+        const text = await r2.text();
+        assert.ok(text.includes("fc_bili_"), "forged compaction item despite stale deactivation");
+        assert.ok(text.includes("resp_bili_"), "forged response id");
+        assert.equal(h.bodies.length, afterSetup + 1, "trigger never reached upstream");
+        const sAfter = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(sAfter.state.blocks.some((b) => b.active), "the trigger's own view re-activated the fold");
+    });
+});
+
+test("e2e #4036 (negative): trigger whose OWN view carries no fold is not intercepted and mutates no state", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(s.state.blocks.some((b) => b.active), "stored flags say active pre-trigger");
+        const stateBefore = JSON.stringify(s.state);
+        // Fresh unrelated history + trigger: the folded messages are absent from
+        // this view, so forging would hand off a summary the client's payload
+        // does not contain — the gate must stay honest and forward verbatim.
+        const fresh = Array.from({ length: 3 }, (_, i) => ({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Fresh unrelated history ${i}. ` + `FRESH_${i}_content_`.repeat(100) }));
+        const rawBody = JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...fresh, { type: "compaction_trigger" }] });
+        const r = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: rawBody,
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "forwarded to upstream, not forged");
+        assert.equal(h.bodies[h.bodies.length - 1], rawBody, "upstream received the exact bytes codex sent");
+        const fwd = JSON.parse(h.bodies[afterSetup]) as { input: { type: string }[] };
+        assert.equal(fwd.input[fwd.input.length - 1].type, "compaction_trigger", "trigger stays final");
+        const after = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.equal(JSON.stringify(after.state), stateBefore, "no prepare ran on the rejected trigger (state untouched)");
+    });
+});
+
 test("e2e #332 (endpoint form): intercept + gate preconditions fail → raw body forwarded, no state mutation", async () => {
     await withHarness({ mode: "intercept", firstTurnTokens: 15000 }, async (h) => {
         const afterSetup = await setupCompressedSession(h);

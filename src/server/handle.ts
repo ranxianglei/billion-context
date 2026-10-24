@@ -5,8 +5,9 @@ import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { defaultPrompts, syncBlocks, type CompressionCore, type Config, type CoreMessage, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
@@ -17,7 +18,7 @@ import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, statusInputBaseline, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
@@ -2361,7 +2362,19 @@ async function handleRequest(
                     hasCompactionTrigger((parsed as ResponsesRequestBody).input);
                 if (isCodexCompactTrigger) {
                     const mode = codexCompactMode();
-                    const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
+                    // #4036: judge block activity under THIS trigger's own view
+                    // (it carries the full history), not the last-synced stored
+                    // flags — a preceding short-view request legitimately
+                    // deactivated the blocks and would otherwise steer this
+                    // trigger verbatim to an upstream that 400s on it.
+                    // Unparseable view → legacy stored-flag judgment.
+                    let gateView: CoreMessage[] | undefined;
+                    try {
+                        gateView = responsesToCore(parsed as ResponsesRequestBody).msgs;
+                    } catch {
+                        gateView = undefined;
+                    }
+                    const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit, gateView);
                     if (mode === "intercept" && gatePre) prepared = await runPrepare();
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
@@ -2375,7 +2388,19 @@ async function handleRequest(
                     const normalized = replaced + dropped > 0;
                     const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
-                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
+                    // #4036 observability: the gate's own inputs at decision time —
+                    // limit, evidence-grade baseline + source, active/total blocks
+                    // under the view actually judged, and this request's inbound
+                    // message count (the prior request's view cardinality is the
+                    // preceding "processTurn: N msgs" line in the tee log).
+                    let gateDetail = "";
+                    if (mode === "intercept" && !gatePre) {
+                        const activeCount = gateView !== undefined
+                            ? syncBlocks(gateView, session.state).state.blocks.filter((b) => b.active).length
+                            : session.state.blocks.filter((b) => b.active).length;
+                        gateDetail = ` [limit=${reqConfig.modelContextLimit} baseline=${statusInputBaseline(session)}(${session.stats.lastInputTokensSource ?? "none"}) active=${activeCount}/${session.state.blocks.length}${gateView !== undefined ? "@view" : "@stored"} inboundMsgs=${inboundMsgs}]`;
+                    }
+                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why})${gateDetail} — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
                 }
