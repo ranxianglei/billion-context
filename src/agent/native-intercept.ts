@@ -44,6 +44,21 @@ export interface NativeInterceptState {
     origin: string | undefined;
     /** Resolves to the proxy origin once healthy, or undefined on failure. */
     ready: Promise<string | undefined>;
+    /** #4526: inline-lane Codex Responses WebSocket target — the dialable
+     *  loopback origin of the in-process engine's WS bridge
+     *  ("http://127.0.0.1:<port>"). Written once the engine settles; stays
+     *  undefined when the bridge bind failed (the channel degrades direct).
+     *  Only set in inline mode — every other lane routes WS through
+     *  state.origin exactly as before. */
+    wsOrigin?: string;
+    /** #4526: inline-lane Codex Responses WebSocket decision resolver — the
+     *  WS wrapper awaits it instead of readyOrigin in inline mode (state.origin
+     *  is frozen to the pseudo-origin that never listens, so readyOrigin would
+     *  short-circuit to an undialable URL). Resolves to wsOrigin once the
+     *  engine settles, or undefined when the bridge bind failed; a bootstrap
+     *  rejection propagates and the wrapper degrades direct. Invoking it may
+     *  trigger the memoized engine start. Absent on every non-inline lane. */
+    resolveInlineWs?: () => Promise<string | undefined>;
     /** Owner hook: re-run the bootstrap (proxy died → respawn). */
     respawn?: () => Promise<string | undefined>;
     /** Owner hook: fired once when a respawn attempt fails and the session

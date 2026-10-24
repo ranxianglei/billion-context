@@ -60,14 +60,17 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  already proxy-shaped. BILI_PI_INLINE (#3278) outranks ambient attach envs:
  *  it is a deliberate choice about WHERE compression runs (in this process),
  *  not just which proxy to use. Resolved env > file > default(off): the
- *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
- *  false disables over the file. */
+ *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE
+ *  off value (0/false/no/off) disables over the file, and any OTHER non-empty
+ *  value enables inline (#4526 — on/yes/etc. used to fall through to spawn
+ *  silently, reading as "inline does nothing"). */
 export function planNativePi(env: NodeJS.ProcessEnv, fileInline = false): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
     const inlineEnv = env.BILI_PI_INLINE?.trim().toLowerCase();
-    const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false";
-    if ((inlineEnv === "1" || inlineEnv === "true") || (!inlineEnvOff && fileInline)) return { mode: "inline" };
+    const inlineEnvOff = inlineEnv === "0" || inlineEnv === "false" || inlineEnv === "no" || inlineEnv === "off";
+    const inlineEnvOn = inlineEnv !== undefined && inlineEnv.length > 0 && !inlineEnvOff;
+    if (inlineEnvOn || (!inlineEnvOff && fileInline)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
     return { mode: "spawn" };
@@ -270,11 +273,24 @@ export function armNativePi(p: typeof plan): void {
         state.origin = INLINE_ORIGIN;
         process.env.BILLION_CONTEXT_PROXY = INLINE_ORIGIN;
         warnLegacyBcpCoResident();
+        // #4526: make the switch observable — "inline 模式，不另起 proxy" in one
+        // line, so a user who set BILI_PI_INLINE sees whether it took effect.
+        logHostEvent("info", "[native-client]", "[bili-native(pi)] inline mode active — compression runs in-process, no proxy spawned");
         const start = singleFlight(async () => {
-            await getInlineEngine();
+            const engine = await getInlineEngine();
+            // #4526: publish the dialable WS-bridge origin (undefined when the
+            // bind failed — the Codex WS channel then degrades direct).
+            state.wsOrigin = engine.wsOrigin;
             return INLINE_ORIGIN;
         });
         state.respawn = start;
+        // Lazy on purpose: awaiting it triggers the memoized engine start, so a
+        // test-context arm stays inert until something actually resolves it.
+        // A bootstrap rejection propagates to the wrapper's catch → degrade.
+        state.resolveInlineWs = async () => {
+            await start();
+            return state.wsOrigin;
+        };
         setNativeOriginWaiter({ wait: () => readyOrigin(state) });
         state.onGiveUp = () => {
             delete process.env.BILLION_CONTEXT_PROXY;
@@ -311,14 +327,25 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     // #2111: the Codex Responses WS leg shares the fetch intercept's enable
     // conditions and lifecycle — off mode patches nothing, repeated loads are
     // no-ops, and the wrapper installs before any model connection exists.
-    // Inline mode has no proxy WebSocket bridge to reach (and the pi lane
-    // does not use codex WS), so it stays unpatched there.
-    if (plan.mode !== "inline") installNativeWebSocketIntercept(state);
+    // #4526: inline mode gets it TOO — pi rides the codex provider over the
+    // Responses WebSocket lane, and its dialable endpoint is the engine's
+    // loopback WS bridge (state.resolveInlineWs/wsOrigin). The old note that
+    // "the pi lane does not use codex WS" was wrong (#2073/#2111 evidence),
+    // which left codex WS traffic bypassing compression entirely in inline
+    // mode; a bridge-bind failure degrades only that channel direct.
+    installNativeWebSocketIntercept(state);
 }
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#4526): the module-level intercept state, so suites can drive
+ *  installNativeWebSocketIntercept against exactly what armNativePi armed
+ *  (the install block itself is skipped under NODE_TEST_CONTEXT). */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
@@ -331,6 +358,8 @@ export function _noteRoutedForTest(url: string): void {
 export function _resetNativeStateForTest(): void {
     state.attach = undefined;
     state.origin = undefined;
+    state.wsOrigin = undefined;
+    state.resolveInlineWs = undefined;
     state.routedOrigin = undefined;
     state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
