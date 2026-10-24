@@ -252,6 +252,7 @@ td .chip-cmd { margin:2px 6px 2px 0; }
 .blog-nav { display: flex; gap: 18px; font-size: 14px; }
 .blog-nav a { color: var(--muted); text-decoration: none; }
 .blog-nav a:hover { color: var(--accent); }
+.blog-nav a.on { color: var(--accent); font-weight: 600; }
 .blog-wrap { max-width: 760px; margin: 0 auto; padding: 56px 24px 80px; }
 .post-article h1 { font-size: 30px; line-height: 1.25; margin: 0 0 6px; color: var(--text); }
 .post-article h2 { font-size: 22px; margin: 34px 0 10px; color: var(--text); }

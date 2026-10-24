@@ -5,8 +5,19 @@ on:
     branches: [master]
     paths:
       - "website/**"
+      # Article sources live outside website/ and are rendered at deploy time — any change to a
+      # listed source must retrigger the pipeline (see website/articles.json for what is published).
+      - "*.md"
+      - "paper/**"
+      - "tools/build-blog.mjs"
+      - "tools/build-articles.mjs"
+      - "tools/lib/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+  # Scheduled refresh: published articles may drift from the repository between pushes; re-render
+  # + redeploy every half hour so the deployed copy lags master by at most one tick.
+  schedule:
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -25,8 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Re-render generated pages from their markdown sources on every deploy (deterministic;
+      # committed copies under website/ exist for local preview only — deployment always ships
+      # fresh output). No other build step: the site itself stays dependency-free static HTML.
+      - name: Build generated pages
+        run: |
+          node tools/build-blog.mjs
+          node tools/build-articles.mjs
       - uses: actions/configure-pages@v5
-      # No build step — publish the folder contents as-is, so the site root is website/
+      # Publish the folder contents as-is; the site root is website/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website
