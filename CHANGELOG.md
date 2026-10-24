@@ -5,6 +5,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixed
+- 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
+
 ### Added
 
 ### D5-5 — 渲染源窗口化 + 判官 tailStart 视图域修复

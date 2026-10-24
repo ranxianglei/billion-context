@@ -905,6 +905,11 @@ export class UnifiedStore {
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
                     .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
+                    // #4608: preserve interval bounds across resaves. A later batch that
+                    // no longer contains the covered raws (a post-fold client resend sees
+                    // the folded view, not the raw tail) re-derives -1/-1 "unknown" from
+                    // its own log; once real evidence exists it is durable — the upsert's
+                    // CASE keeps the stored bounds when the incoming side is unknown.
                     // #4242: redirect the row BEFORE the undo/release so a
                     // released-to-zero old hash is no longer FK-referenced by
                     // this blocks row when the content DELETE fires. The
@@ -917,7 +922,9 @@ export class UnifiedStore {
                                summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                              ON CONFLICT(session_id, block_id) DO UPDATE SET
-                               ord = excluded.ord, start_seq = excluded.start_seq, end_seq = excluded.end_seq,
+                               ord = excluded.ord,
+                               start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                               end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
                                start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
                                summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
                                supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
@@ -955,7 +962,9 @@ export class UnifiedStore {
                            summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(session_id, block_id) DO UPDATE SET
-                           ord = excluded.ord, start_seq = excluded.start_seq, end_seq = excluded.end_seq,
+                           ord = excluded.ord,
+                           start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                           end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
                            start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
                            summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
                            supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,

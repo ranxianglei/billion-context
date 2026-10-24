@@ -574,7 +574,11 @@ export class MysqlBackend implements StorageBackend {
                        summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
-                       ord = VALUES(ord), start_seq = VALUES(start_seq), end_seq = VALUES(end_seq),
+                       ord = VALUES(ord),
+                        // #4608: keep durable interval evidence when a later batch can no
+                       // longer re-derive it (post-fold client resends carry no covered raws)
+                       start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
+                       end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
