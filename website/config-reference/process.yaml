@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>."
-    site_zh: "<code>network</code> —— 传输超时与重放：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>。"
+    site_en: "<code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · proxyKeepAliveMaxMs 55000</span>."
+    site_zh: "<code>network</code> —— 传输超时与重放：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · proxyKeepAliveMaxMs 55000</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -61,13 +61,6 @@ entries:
     group: process
     desc_en: "How long a failed preflight holds before the request is allowed through unreconciled."
     desc_zh: "preflight 失败后，允许请求未校准放行的持有时长。"
-  - key: network.preflightDeadEndCooldownMs
-    type: number
-    default: "300000"
-    env: BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS
-    group: process
-    desc_en: "Cooldown after a dead-end preflight before retrying reconciliation for the same session."
-    desc_zh: "死胡同 preflight 后，对同一会话重试校准的冷却时长。"
   - key: network.replayRetryMax
     type: number
     default: "3 (1 disables replays)"

@@ -158,7 +158,6 @@
 | `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | 绑定地址暴露警告在日志中的重复间隔；0 完全禁用。 |
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | 模型块之间的下游流保活心跳间隔；0 禁用心跳。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | preflight 失败后，允许请求未校准放行的持有时长。 |
-| `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
@@ -854,7 +853,6 @@
     "exposureLogIntervalMs": 3600000,     // [exposure] 遥测间隔；0 禁用
     "streamKeepAliveMs": 15000,           // 上游静默期的 SSE 保活；0 禁用
     "preflightHoldMs": 30000,             // 长 preflight 开始 hold 前的宽限
-    "preflightDeadEndCooldownMs": 300000, // preflight 死路判定后的冷却
     "proxyKeepAliveMaxMs": 55000,         // 经上游代理的连接复用上限；0 不限
     "postResponseLingerMs": 5000,         // 响应后关闭的优雅关闭预算（#1982）
     "allowPrivateHttpProviders": false    // 私网明文 HTTP provider 可选放行（#2984）
@@ -916,10 +914,10 @@
 
 ### `network`
 
-- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number; allowPrivateHttpProviders?: boolean }`
-- **默认：** `{}`（内置值依次为：`720000`、`2× 上游超时`、`3`、`1500`、未设置、`5000`、`30000`、`3600000`、`15000`、`30000`、`300000`、`55000`、`5000`、`false`）
+- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number; allowPrivateHttpProviders?: boolean }`
+- **默认：** `{}`（内置值依次为：`720000`、`2× 上游超时`、`3`、`1500`、未设置、`5000`、`30000`、`3600000`、`15000`、`30000`、`55000`、`5000`、`false`）
 - **状态：** ACTIVE
-- **说明：** 进程级传输与重试时序（毫秒）。每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`、`BILI_CA_FILE`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变；`caFile`（#3776）让 bili 自己的上游 fetch 额外信任一个根 CA PEM 文件——与内置根证书和 `NODE_EXTRA_CA_CERTS` 合并，从不替换——用于安全扫描软件/企业 MITM 重签的上游。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 进程级传输与重试时序（毫秒）。每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`、`BILI_CA_FILE`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变；`caFile`（#3776）让 bili 自己的上游 fetch 额外信任一个根 CA PEM 文件——与内置根证书和 `NODE_EXTRA_CA_CERTS` 合并，从不替换——用于安全扫描软件/企业 MITM 重签的上游。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
 
 ### `persist`
 
@@ -1797,7 +1795,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
 | `BILI_PI_INLINE` | `pi.inline` | false |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
-| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |

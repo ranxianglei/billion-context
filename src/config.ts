@@ -2270,6 +2270,7 @@ export function loadConfigFile(): FileConfig {
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
             warnInertRemovedCompressKeys(obj);
+            warnInertPreflightDeadEndCooldown(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -2454,6 +2455,21 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
     seenInertRemovedCompressKeysSignature = sig;
     loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
+}
+
+// #4079/#4105: network.preflightDeadEndCooldownMs was REMOVED wholesale with the
+// #726 dead-end cooldown (a doomed retry now re-runs a bounded walk instead of
+// freezing the session for N minutes). Old configs that still set it get a
+// one-time inert notice instead of a silent no-op (same dead-key convention as
+// the family above).
+let seenInertPreflightDeadEndCooldown = false;
+function warnInertPreflightDeadEndCooldown(obj: Record<string, unknown>): void {
+    const n = obj.network;
+    if (!n || typeof n !== "object" || Array.isArray(n)) return;
+    if ((n as Record<string, unknown>).preflightDeadEndCooldownMs === undefined) return;
+    if (seenInertPreflightDeadEndCooldown) return;
+    seenInertPreflightDeadEndCooldown = true;
+    loggerLog("warn", `[acp-config] network.preflightDeadEndCooldownMs is INERT — the #726 dead-end cooldown was removed (#4079/#4105): a doomed preflight retry re-runs a bounded walk instead of freezing the session. Remove it from the config.`);
 }
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
