@@ -261,7 +261,7 @@ function warnReopenFailed(err: unknown): void {
     }
     if (!stderrDead) {
         try {
-            process.stderr.write(`${new Date().toISOString()} [warn] ${msg}\n`);
+            process.stderr.write(`${logTimestamp()} [warn] ${msg}\n`);
         } catch { /* stderr gone */ }
     }
 }
@@ -306,6 +306,14 @@ export function configureLogger(file?: string): string | undefined {
     return file;
 }
 
+/** Line timestamp: the system's LOCAL wall-clock time, no zone suffix
+ *  (`2026-10-24T19:19:02.681`) — same shape as the old UTC stamp minus the `Z`,
+ *  so log lines read exactly like `date` on this machine. */
+export function logTimestamp(d: Date = new Date()): string {
+    const p = (n: number, w = 2): string => String(n).padStart(w, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
 /** Log a line to file + stderr. */
 export const log: Logger = (level, msg) => {
     if (capture) {
@@ -316,7 +324,7 @@ export const log: Logger = (level, msg) => {
         }
     }
     const safe = maskIpsInText(redactSecretsInText(msg));
-    const ts = new Date().toISOString();
+    const ts = logTimestamp();
     const sess = sessionCtx.getStore();
     const head = `${ts} [${level}]${sess ? ` [sess=${sess}]` : ""} [v=${VERSION}]`;
     // One prefix per PHYSICAL line (see header doc): multi-line payloads keep
