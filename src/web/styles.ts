@@ -465,6 +465,15 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .seam-ev summary { list-style: none; cursor: pointer; padding: 12px 16px; font-size: 13.5px; font-weight: 650; display: flex; align-items: baseline; gap: 8px; }
 .seam-ev summary::-webkit-details-marker { display: none; }
 .seam-ev[open] summary { border-bottom: 1px solid var(--border-soft); }
+table:is(.event-table, .fold-table) { min-width: 38rem; table-layout: fixed; }
+table:is(.event-table, .fold-table) th, table:is(.event-table, .fold-table) td { padding: 8px 14px; white-space: nowrap; text-align: center; }
+table:is(.event-table, .fold-table) th:first-child, table:is(.event-table, .fold-table) td:first-child { width: 8%; text-align: left; }
+table:is(.event-table, .fold-table) th:nth-child(2) { width: 20%; }
+table.event-table th:nth-child(3), table.event-table th:nth-child(4) { width: 14%; }
+table:is(.event-table, .fold-table) th:last-child, table:is(.event-table, .fold-table) td:last-child { text-align: right; }
+table.event-table td:last-child { white-space: normal; overflow-wrap: anywhere; }
+table:is(.event-table, .fold-table) tbody tr { cursor: default; }
+table.data.fold-table th, table.data.fold-table td { display: table-cell; }
 .qmark { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; margin-left: 5px; border-radius: 50%; background: var(--bg-muted); color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; user-select: none; vertical-align: -2px; flex: none; }
 .qmark:hover { color: var(--accent); }
 .qtip { position: fixed; z-index: 60; max-width: 380px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15); padding: 10px 12px; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
@@ -532,6 +541,10 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
    columns' <col> tracks must release their widths or the title column
    collapses and rows render double-exposed. */
 .embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+/* #4362: except the fold-detail table — its six numeric columns are the
+   payload of the session detail view, so they stay visible on the narrow
+   embed face too (horizontal scroll inside .fold-scroll instead). */
+.embed table.data.fold-table th:nth-child(n + 6), .embed table.data.fold-table td:nth-child(n + 6) { display: table-cell; }
 .embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
 /* #2560: the frame hugs its edges hard at narrow panel widths — give the
    embed face a little breathing room instead of zero gutter. */
