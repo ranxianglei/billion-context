@@ -2049,7 +2049,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (decisionTokens < textTarget) break;
+        // #4288: the round-boundary exit must judge on the payload's OWN estimate —
+        // the same floorless quantity the caller's forward gate trusts (#1839/#1492) —
+        // NOT on decisionTokens, which is floored by the session's usage baseline.
+        // After a mid-session switch to a smaller-window model that baseline was
+        // measured under the prior (wider) model and sits above the new target, so a
+        // floored comparison never trips and the loop burns the whole slow
+        // summarization ladder on a payload that already fits (the client then times
+        // out mid-ladder and the session appears stuck). The floored condition implies
+        // this one, so folding never increases relative to the old behavior.
+        if (result.payloadEstimate < limit) {
+            if (baselineFloor >= limit) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            break;
+        }
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
