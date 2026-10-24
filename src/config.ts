@@ -11,6 +11,7 @@ import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import { parseModelEndpointPatterns, type ModelEndpointPattern } from "./model-endpoints.js";
 import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
@@ -783,6 +784,11 @@ export type ProxyOptions = {
     host: string;
     upstream: string;
     routes: ProviderRoutes;
+    /** #1295: declared custom-wire model endpoints — the single source of
+     *  truth feeding BOTH the protocol classifier (proxy side) and the fetch
+     *  claim (client side). Empty = built-in path tables only. Optional so
+     *  inline test fixtures stay terse; consumers treat absent as empty. */
+    modelEndpoints?: ModelEndpointPattern[];
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
      *  Populated by loadOptions; optional so inline test fixtures (which
@@ -1450,6 +1456,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const namedProviders = loadNamedProviders(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
+    const modelEndpoints = parseModelEndpointPatterns(fileConfig.modelEndpointPatterns);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
@@ -1534,6 +1541,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         upstream,
         auxProxyFallback,
         routes,
+        modelEndpoints,
         namedProviders,
         proxy,
         proxyMode,
@@ -1738,6 +1746,9 @@ type FileConfig = {
     providersPath?: string;
     /** Inline providers, same shape as providers.json. */
     providers?: Record<string, unknown>;
+    /** #1295: declarable custom-wire model endpoints — one source feeding both
+     *  the client claim gate and the proxy protocol classifier. */
+    modelEndpointPatterns?: unknown;
     /** Global default upstream HTTP proxy (applied to all providers unless a
      *  per-URL `proxy` overrides it). `http://host:port`. */
     proxy?: string;

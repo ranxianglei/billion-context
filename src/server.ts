@@ -108,6 +108,7 @@ import { reconcileSystemAnchor } from "./system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
+import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
@@ -194,6 +195,16 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
 // tight loops. Bounded FIFO, same shape as warnedWireDropKeys.
 export const NON_CONVERSATION_RELAY_WARN_CAP = 4096;
 export const nonConversationRelayWarned = new Set<string>();
+
+// #1295 review F4: (declaration, URL-pinned protocol) pairs already warned
+// about a modelEndpointPatterns/explicitProtocol conflict — a misconfigured
+// client retries in tight loops, so one warn per pair per process suffices.
+// Bounded FIFO, same shape as nonConversationRelayWarned.
+export const declPinConflictWarned = new Set<string>();
+
+export function getDeclPinConflictStats(): { total: number } {
+    return { total: declPinConflictWarned.size };
+}
 
 // #1073/#3245: a forward-proxy-style (absolute-form) request whose authority IS
 // this instance's own listening endpoint is a fetch of us, not a tunnel — e.g.
@@ -1703,6 +1714,13 @@ export type Prepared = {
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
     codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
+    /** #1295: the request came from a declared `commandcode` endpoint — an
+     *  openai-completions-shaped conversation inside the nested CLI envelope.
+     *  The pipeline above ran on the UNWRAPPED flat body; forward() rewraps it
+     *  into the envelope at the final boundary (and every compress-loop re-send
+     *  via wireTransform) using this meta. Presence also gates the JSONL
+     *  response codecs and disables #371 fake-completion retry. */
+    commandcode?: { meta: CommandcodeEnvelopeMeta };
     /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */

@@ -261,6 +261,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li class="tg" data-i18n-html="tg.up"><strong>Upstream &amp; billing</strong></li>
           <li data-i18n-html="tt.upstream"><code>upstream</code> — fallback upstream base URL (ACP_UPSTREAM overrides).</li>
           <li data-i18n-html="tt.proxy"><code>proxy</code> — global outbound proxy. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY env → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 is rejected.</li>
+          <li data-i18n-html="tt.modelendpoints"><code>modelEndpointPatterns</code> — declare model endpoints on non-standard paths (URL prefix → wire family); empty = built-in path tables only.</li>
           <li data-i18n-html="tt.mcl2"><code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit.</li>
           <li data-i18n-html="tt.ib2"><code>imageBilling</code> — global image-token estimation: "auto" (default → pixels), "pixels" or "bytes" (explicit opt-in for byte relays).</li>
           <li data-i18n-html="tt.itc2"><code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live).</li>

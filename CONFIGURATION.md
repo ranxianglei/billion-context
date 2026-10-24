@@ -84,6 +84,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `upstreamProxy` | string | unset | — | Web-UI manual proxy tier (written by the dashboard's proxy editor); sits below BILI_UPSTREAM_PROXY in resolution order. |
 | `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | How the global proxy is sourced: auto (env/system discovery), manual (Web-UI value only), direct (never use a proxy). |
 | `providers` | record url-prefix → route entry | {} | — | Route table: URL-prefix keys to per-provider entries (models, compress, compat, …). See the Providers section. |
+| `modelEndpointPatterns` | array of { match: string, wire: "anthropic" \| "openai" \| "responses" \| "google" \| "commandcode" } | [] | — | Declarable custom-wire model endpoints: absolute URL prefixes mapped to a wire family. One config source feeds BOTH the proxy protocol classifier and the client-side fetch claim, so the two gates can no longer drift (#1295). |
 | `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit. |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | Global image-token estimation basis; live-read per request, beats every per-provider setting. |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | Global per-image token ceiling applied on top of the resolved billing mode; live-read per request. |
@@ -1227,6 +1228,25 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
 - **Default:** *(global `imageTokenCap`, then unset — no cap)*
 - **Status:** ACTIVE
 - **Description:** Per-route ceiling on the per-image token estimate (#1843), applied on top of whichever billing mode resolved for this route. Wins over the global `imageTokenCap`; the `BILI_IMAGE_TOKEN_CAP` env var wins over both. Non-numeric or non-positive values are dropped (lenient parse, same as `imageBilling`).
+
+---
+
+## Model Endpoint Patterns
+
+`modelEndpointPatterns` declares model endpoints on non-standard paths — URLs whose path shape matches none of the built-in wire families (e.g. `https://api.commandcode.ai/alpha/generate`). Without a declaration such requests are relayed byte-for-byte with zero compression (#1290); with one, both gates agree on them: the client-side fetch patch claims the request and the proxy classifies it into the declared wire family.
+
+- **Type:** array of `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" }`
+- **Default:** `[]` (built-in path tables only)
+- **Status:** ACTIVE
+- **Description:** Each entry is an absolute URL prefix plus the wire family to treat it as. Longest matching prefix wins; matching requires the same origin and a path-segment boundary (`…/alpha/generate` matches itself and subpaths, but not `…/alpha/generate2`, and never another origin). One config source feeds both the proxy's protocol classifier and the client-side fetch claim in every native entry, so the two formerly hardcoded tables can no longer drift apart (#1295). Note the two gates match different URLs on path-rewriting providers: the client claim matches the URL the client called, the proxy classifier matches the URL after route rewriting — **declare the URL the request actually lands on** (with `upstreamPath` rewriting, that is the rewritten path). Userinfo (`https://user:pass@host/…`) is rejected loudly at startup, as are `search`/`hash` components. The body-based disambiguation still applies (#1284): a declared endpoint whose body does not look like a model conversation is relayed verbatim, as are `commandcode` bodies that are not convertible streaming CLI conversations (WIRE-CONTRACTS.md). The four standard families only change classification — their pipelines run unchanged. `commandcode` is the commandcode CLI wire: a nested envelope around an openai-completions-shaped conversation with a bare JSONL event-stream response; streaming requests compress through the OpenAI-family loop (both proxy and plugin modes), non-streaming ones are demoted to verbatim relay. Declarations are read at process start — restart bili (and any native client whose fetch patch must claim the endpoint) to apply changes. A malformed entry fails startup loudly instead of being dropped silently.
+
+  ```jsonc
+  {
+    "modelEndpointPatterns": [
+      { "match": "https://api.commandcode.ai/alpha/generate", "wire": "commandcode" }
+    ]
+  }
+  ```
 
 ---
 
