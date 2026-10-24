@@ -54,10 +54,12 @@ on:
     branches: [master]
   pull_request_target:
     # Label-gated head-tree publish for conflicted carve-out ship PRs -- see
-    # the header comment. No branches filter (pull_request_target does not
-    # support one); the resolve step no-ops on every other label within
-    # milliseconds, same as the closed-PR trigger above no-ops on every close.
+    # the header comment. Same base-branch filter as the closed-PR trigger
+    # above (pull_request_target supports branches filters, matched against
+    # the PR base); the resolve step additionally no-ops on every other label
+    # within milliseconds, same as the closed-PR trigger no-ops on every close.
     types: [labeled]
+    branches: [master]
   workflow_dispatch:
     inputs:
       fast:
