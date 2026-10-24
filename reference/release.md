@@ -271,7 +271,7 @@ conflict with master at ship time — the fixes already landed there and master
 moved on, so GitHub's merge button refuses. Resolving on the lane is FORBIDDEN
 (`Never merge master into a lane` below — the publish tree must stay leak-free)
 and resolving on master needs a direct master push. For that case: add the
-`carve-out-ship` label to the OPEN ship PR (head branch must match `bugfix-v*` /
+`backport-ship` label to the OPEN ship PR (head branch must match `bugfix-v*` /
 `bugfix-release/*`, same-repo, not a fork). `release-bugfix.yml`'s
 `pull_request_target` trigger then publishes the PR's HEAD tree with every guard
 above — no merge required; the PR stays open as the publish record (the workflow
@@ -347,7 +347,7 @@ changelog. You merge it; `release-bugfix.yml` publishes the PRE-MERGE head tree
 this cycle: the next `backport` label automatically cuts `bugfix-v{NEXT}` from
 the fresh tag. No closeout step exists because nothing is stored. If the ship
 PR CONFLICTS with master (fixes already landed there, master moved on): do not
-resolve on the lane, do not touch master — apply the `carve-out-ship` label to
+resolve on the lane, do not touch master — apply the `backport-ship` label to
 publish the head tree without merging (see the carve-out channel section).
 
 ⚠ Severe fixes riding the lane: include the release-notes entry (#1870) in the

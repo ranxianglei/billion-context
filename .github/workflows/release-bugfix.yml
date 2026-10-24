@@ -26,7 +26,7 @@ name: Bugfix Release (carve-out)
 # merge -- GitHub's merge button then refuses, resolving on the lane would
 # absorb unreleased master work into the published head tree, and resolving on
 # master needs a direct master push. For that case the ship PR can be
-# published AS THE HEAD TREE by adding the `carve-out-ship` label (a
+# published AS THE HEAD TREE by adding the `backport-ship` label (a
 # triage-capable human action; `labeled` fires on ADD only). pull_request_target
 # runs THIS master copy of the workflow, so lanes cut from old tags -- whose
 # own release-bugfix.yml predates the bugfix-v* marker and would silently skip
@@ -76,7 +76,7 @@ jobs:
       contents: write
       id-token: write
       actions: write
-      pull-requests: write  # carve-out-ship label publish: annotate the ship PR
+      pull-requests: write  # backport-ship label publish: annotate the ship PR
     steps:
       - name: Validate trigger + resolve the publish ref
         id: resolve
@@ -103,7 +103,7 @@ jobs:
               exit 1
             fi
           elif [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
-            # carve-out-ship label publish (conflicted ship PRs, #4576 follow-up):
+            # backport-ship label publish (conflicted ship PRs, #4576 follow-up):
             # publish the HEAD tree with NO merge into master. `labeled` fires on
             # ADD only, so reaching past the label check means a triage-capable
             # actor armed it just now.
@@ -112,8 +112,8 @@ jobs:
             SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
             STATE="$(jq -r '.pull_request.state' "$GITHUB_EVENT_PATH")"
             SAME_REPO="$(jq -r '(.pull_request.base.repo.full_name == .pull_request.head.repo.full_name)' "$GITHUB_EVENT_PATH")"
-            if [ "$LABEL" != "carve-out-ship" ]; then
-              echo "::notice::label '$LABEL' is not the carve-out-ship gate — nothing to do"
+            if [ "$LABEL" != "backport-ship" ]; then
+              echo "::notice::label '$LABEL' is not the backport-ship gate — nothing to do"
               exit 0
             fi
             if [ "$STATE" != "open" ]; then
@@ -149,7 +149,7 @@ jobs:
       - name: Switch to the carve-out head tree (pre-merge / label publish)
         # pull_request: pre-merge head of a MERGED ship PR (publish the exact
         # reviewed tree, never the post-merge master). pull_request_target:
-        # head of the carve-out-ship-labeled PR (publish without merging).
+        # head of the backport-ship-labeled PR (publish without merging).
         if: steps.resolve.outputs.proceed == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
         run: |
           SHA="${{ steps.resolve.outputs.sha }}"
