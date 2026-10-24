@@ -1719,6 +1719,12 @@ export interface RolloutFileConfig {
     features?: Record<string, RolloutFeatureOverride | boolean | number>;
 }
 
+/** Host-only extras of the global `compress` block (outside the three-level
+ *  kernel merge). Must ride parseCompressSettings' return type: the web-UI
+ *  save path writes the PARSED result back, so an unlisted field is silently
+ *  dropped on an unchanged save. */
+type CompressFileExtras = { injectTool?: boolean; injectNudge?: boolean; timeoutSeconds?: number | null };
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -1758,10 +1764,11 @@ type FileConfig = {
     upstreamProxyMode?: string;
     logFile?: string;
     /** Global compression block (level 1 of 3). Holds the injection toggles
-     *  (`injectTool` / `injectNudge`, honored globally) plus the tuning fields
-     *  (see CompressSettings), overridden per-field by provider- and model-level
-     *  `compress`. */
-    compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
+     *  (`injectTool` / `injectNudge`) plus #2524's client-side compress hard
+     *  timeout (`timeoutSeconds`, seconds; 0/null = disabled), both honored
+     *  globally only, plus the tuning fields (see CompressSettings),
+     *  overridden per-field by provider- and model-level `compress`. */
+    compress?: CompressSettings & CompressFileExtras;
     promptCache?: { routing?: string };
     /** #3376: global idle prompt-cache keepalive block (level 1 of 2);
      *  per-provider overrides live at `providers[url].cacheKeepalive`.
@@ -2195,7 +2202,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "rules", "injectTool", "injectNudge", "timeoutSeconds",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
@@ -2830,10 +2837,10 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
-export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
+export function parseCompressSettings(v: unknown): (CompressSettings & CompressFileExtras) | undefined {
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
-    const out: CompressSettings = {};
+    const out: CompressSettings & CompressFileExtras = {};
     if (obj.externalSummary !== undefined) {
         try { out.externalSummary = parseExternalSummaryChain(obj.externalSummary); }
         catch (error) {
@@ -2955,6 +2962,16 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             if (typeof obj[key] !== "boolean") ok = false;
             else (out as Record<string, unknown>)[key] = obj[key];
         }
+    }
+    // #2524: hard timeout (seconds) for the compress tool call — enforced by
+    // the agent-side extension (shared.forwardTool), not the kernel; honored
+    // at the global level only. Positive caps the call; 0/null explicitly
+    // disables even the built-in backstop; unset keeps the built-in cap.
+    if ("timeoutSeconds" in obj) {
+        const v = obj.timeoutSeconds;
+        if (v === null) out.timeoutSeconds = null;
+        else if (typeof v === "number" && Number.isFinite(v) && v >= 0) out.timeoutSeconds = v;
+        else ok = false;
     }
     if ("acknowledgePromptsRisk" in obj) {
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;

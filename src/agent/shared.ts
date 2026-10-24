@@ -5,6 +5,8 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
+import { readFileSync } from "node:fs";
+import { configFile } from "../paths.js";
 import { envMillis } from "./native-bootstrap.js";
 import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "../proxy-tool-result.js";
 import type { ToolOutcomeKind } from "../proxy-tool-result.js";
@@ -133,13 +135,16 @@ export function destinationRoutedThroughProxy(baseUrl: string | undefined): bool
     return false;
 }
 
-async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number, externalSignal?: AbortSignal): Promise<{ ok: boolean; status: number; json: unknown }> {
+async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number, externalSignal?: AbortSignal, timeoutLabel?: string): Promise<{ ok: boolean; status: number; json: unknown }> {
     const ac = new AbortController();
     // An already-aborted external signal never fires its "abort" event, so
     // forward the state directly — otherwise only the timeout could stop
     // the request, turning an instant cancel into a timeout wait.
     if (externalSignal?.aborted) ac.abort();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    // #2524: timeoutMs <= 0 = no hard cap (explicitly disabled); the external
+    // signal remains the only abort source, and clearTimeout(undefined) below
+    // is a safe no-op.
+    const timer = timeoutMs > 0 ? setTimeout(() => ac.abort(), timeoutMs) : undefined;
     const onExternalAbort = () => ac.abort();
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
     try {
@@ -147,7 +152,7 @@ async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: 
         try {
             res = await fetch(url, { ...init, signal: ac.signal });
         } catch (err) {
-            if (ac.signal.aborted && !externalSignal?.aborted) throw new Error(`timeout after ${timeoutMs}ms: ${url}`);
+            if (ac.signal.aborted && !externalSignal?.aborted) throw new Error(`timeout after ${timeoutMs}ms${timeoutLabel ? ` (${timeoutLabel})` : ""}: ${url}`);
             throw err;
         }
         const text = await res.text();
@@ -376,6 +381,30 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
  *  partial note in `text`. Absent on legacy envelopes without the fields. */
 export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
+/** #2524: configured hard timeout (seconds) for the compress tool call, read
+ *  live from `compress.timeoutSeconds` in the global config file — so an edit
+ *  applies from the next call without a restart. Tri-state: undefined = unset
+ *  (the built-in TOOL_TIMEOUT_MS backstop applies); null or 0 = explicitly
+ *  disabled (no hard cap, host turn-abort still works); >0 = cap in seconds.
+ *  Read raw instead of through config.js on purpose: this module is a pure
+ *  protocol client and config.js drags acp-kernel into light agent bundles
+ *  (dsh-acp et al.); validation mirrors parseCompressSettings. Any failure
+ *  degrades to the built-in backstop — never breaks the tool call. */
+export function configuredCompressTimeoutSeconds(): number | null | undefined {
+    try {
+        const raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, "");
+        const root = JSON.parse(raw) as { compress?: unknown };
+        const c = root?.compress;
+        if (!c || typeof c !== "object" || Array.isArray(c)) return undefined;
+        const v = (c as Record<string, unknown>).timeoutSeconds;
+        if (v === null) return null;
+        if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+        return undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
     const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
@@ -384,11 +413,27 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
     // Truthiness guard (not .length): a host passing a non-string id degrades to
     // the legacy id-less wire instead of throwing (same shape as src/mcp.ts).
     if (nativeCaller && conversationId) body.nativeCaller = true;
+    // Base wait comes from the proxy-advertised budget (#2652) — the fixed floor
+    // when nothing is advertised. An explicit compress.timeoutSeconds (#2524)
+    // overrides it: 0/null disables the cap entirely, >0 sets a hard cap in seconds.
+    // Non-compress tools (and an unset compress value) keep the advertised/floor base.
+    let timeoutMs = effectiveToolTimeoutMs(proxyBase, tool);
+    let timeoutLabel: string | undefined;
+    if (tool === "compress") {
+        const secs = configuredCompressTimeoutSeconds();
+        if (secs === null || secs === 0) {
+            timeoutMs = 0;
+            timeoutLabel = "compress.timeoutSeconds";
+        } else if (secs !== undefined) {
+            timeoutMs = Math.max(1, Math.round(secs * 1000));
+            timeoutLabel = "compress.timeoutSeconds";
+        }
+    }
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-    }, effectiveToolTimeoutMs(proxyBase, tool), signal);
+    }, timeoutMs, signal, timeoutLabel);
     const data = json as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);
