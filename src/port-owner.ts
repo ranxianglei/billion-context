@@ -93,10 +93,13 @@ export async function findForeignOwner(
         // own pre-registration 503s and delayed pointer/registry publication
         // past callers that expect registration right after bind (#394 warn
         // timing in multi-instance-live). Bind is exclusive on every platform
-        // bili ships on (Linux EADDRINUSE; Windows per libuv issue #1360), so no
-        // foreign listener can be in that state here; a hypothetical dual-bind
-        // co-starter would be unregistered anyway — the registry/pointer layer
-        // surfaces the collision at registration time. Never foreign.
+        // bili ships on (Linux EADDRINUSE; Windows — libuv deliberately omits
+        // SO_REUSEADDR there because setting it would allow stealing a port
+        // held by another application, libuv src/win/tcp.c uv__tcp_try_bind),
+        // so no foreign listener can be in that state here; a hypothetical
+        // dual-bind co-starter would be unregistered anyway — the registry/
+        // pointer layer surfaces the collision at registration time. Never
+        // foreign.
         if (info?.reason === "starting") return undefined;
     }
     return undefined;

@@ -4999,6 +4999,9 @@ export async function ensureProxyRunning(
         // #1753: announce a healthy-but-foreign responder on the preferred port
         // at most once — silence would hide exactly the misroute this fix closes.
         let squatterAnnounced = false;
+        // #4125: same discipline for the PRIMARY settle branches (launchToken /
+        // registry-by-pid) — announce a contested claimed origin at most once.
+        let contestedAnnounced = false;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
@@ -5103,13 +5106,27 @@ export async function ensureProxyRunning(
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-                if (await probeHealth(inst.origin, fetchImpl)) {
+                // #4125: the same identity discipline as the preferred-port
+                // fallback below — a healthy answer at the origin the child
+                // CLAIMED is proof of our child only while it does not positively
+                // name a different pid. A foreign responder that took over that
+                // address must not be exported to the client as ours (one writer
+                // per copy, #991/#1225); absent pid info keeps legacy semantics.
+                const claimed = await fetchHealthInfo(inst.origin);
+                const healthy = claimed?.ok ?? (await probeHealth(inst.origin, fetchImpl));
+                if (healthy && (claimed?.pid === undefined || child.pid === undefined || claimed.pid === child.pid)) {
                     // #1660: settle the lane's sticky record on the port the
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
                     settleZonePort(inst.port);
                     startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
+                }
+                if (healthy && claimed?.pid !== undefined && child.pid !== undefined && !contestedAnnounced) {
+                    contestedAnnounced = true;
+                    attachDiag(
+                        `bili: ${inst.origin} answers health (pid ${claimed.pid}) but this launcher's child is pid ${child.pid} — refusing to claim a contested origin (#4125)`,
+                    );
                 }
                 continue;
             }
@@ -5123,10 +5140,24 @@ export async function ensureProxyRunning(
             // the preferred-port fallback below, minus the port assumption.
             if (child.pid !== undefined) {
                 const mine = listRegistry().find((e) => e.pid === child.pid);
-                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
-                    settleZonePort(mine.port);
-                    startOwnerHeartbeat(mine.origin, watchPid);
-                    return { origin: mine.origin, port: mine.port, child, logPath };
+                // #4125: same contested-origin discipline as the launchToken
+                // branch above — the registry record vouches for the pid, but a
+                // healthy answer at that origin naming a DIFFERENT pid is a
+                // foreign responder, not our child.
+                if (mine && mine.origin !== "") {
+                    const claimed = await fetchHealthInfo(mine.origin);
+                    const healthy = claimed?.ok ?? (await probeHealth(mine.origin, fetchImpl));
+                    if (healthy && (claimed?.pid === undefined || claimed.pid === child.pid)) {
+                        settleZonePort(mine.port);
+                        startOwnerHeartbeat(mine.origin, watchPid);
+                        return { origin: mine.origin, port: mine.port, child, logPath };
+                    }
+                    if (healthy && claimed?.pid !== undefined && !contestedAnnounced) {
+                        contestedAnnounced = true;
+                        attachDiag(
+                            `bili: ${mine.origin} answers health (pid ${claimed.pid}) but this launcher's child is pid ${child.pid} — refusing to claim a contested origin (#4125)`,
+                        );
+                    }
                 }
             }
             // Fallback for a child that cannot write the instance file (broken
