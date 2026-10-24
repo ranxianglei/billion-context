@@ -75,6 +75,7 @@
 | `BILI_NON_HTTP_PROVIDERS` | #1392 非 http(s) baseUrl provider 白名单传递 |
 | `BILI_PROVIDER_REWRITES` | #535 provider 改写 manifest JSON（存在即关 zcode native） |
 | `BILI_UPGRADE_REPLACEMENT` | #3044 self-restart 替换进程交接标记（UPGRADE_REPLACEMENT_ENV） |
+| `BILI_CODEX_HOOK_ORIGIN` | codex SessionStart hook 探测目标覆盖（测试/特殊配置；默认 = codex 车道 origin，#3176） |
 
 ### 2.3 网络调优（#2030 迁移家族：env > 文件 network.* > 默认）
 
