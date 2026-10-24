@@ -269,6 +269,14 @@ export async function forward(
         res.end(prepared.codexForge.body);
         return;
     }
+    // #2411 Stage B: host-native compaction request answered with bili's own
+    // fold summaries — same zero-egress contract as codexForge.
+    if (prepared?.nativeCompactForge) {
+        log("info", `[${prepared.session.id}] host-native compaction served locally (openai lane); upstream not contacted (#2411)`);
+        if (!res.headersSent) res.writeHead(200, { "content-type": prepared.nativeCompactForge.contentType });
+        res.end(prepared.nativeCompactForge.body);
+        return;
+    }
     // #2740: auto-mode classifier one-shots are answered locally — same
     // zero-egress contract as codexForge; the audit line was written in
     // prepare (this line is the egress-proof for the serve itself).

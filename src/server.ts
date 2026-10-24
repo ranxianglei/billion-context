@@ -1704,6 +1704,18 @@ export type Prepared = {
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
     codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
+    /** #2411 Class A: set by prepareOpenai when the request IS a host-native
+     *  compaction act (summarization template as last user message — see
+     *  src/server/native-compact-shape.ts). The compression surface was stood
+     *  down for this turn; preflight must skip it too — folding the same
+     *  history the host is asking to summarize would put two compressors on
+     *  one turn (#2432/#2373 pathology). */
+    nativeCompact?: boolean;
+    /** #2411 Stage B: set with nativeCompact when bili's own fold summaries are
+     *  served AS the completion for the host-native compaction request — same
+     *  zero-egress contract as codexForge; forward() serves `body` without
+     *  contacting upstream. */
+    nativeCompactForge?: { body: string; contentType: string };
     /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */
