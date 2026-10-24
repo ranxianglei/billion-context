@@ -25,9 +25,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { renameSync } from "node:fs";
-import path from "node:path";
+import { UnifiedStore, StorageIntegrityError, quarantineCorruptIndexSet, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
@@ -190,9 +188,25 @@ export class UnifiedShadow {
             if (notice) loggerLog("warn", notice);
         }
         let store: UnifiedStore;
+        // #4609: when a DEFERRED (large-db) quick_check fails minutes after
+        // boot, the handle is live and cannot be quarantined in place
+        // (Windows EBUSY, #4347) — this sink flips unified reads off for
+        // the process lifetime instead (every load falls back to the JSON
+        // envelope, the recovery source #4175 designated); ingests stop
+        // too (record() early-returns on disabled) while envelopes keep
+        // receiving every save. The marker written by the store defers the
+        // actual quarantine to the next open. Declared OUTSIDE the open
+        // try/catch: the handler is attached after construction, below it.
+        const integrityFailureSink: { handler?: (detail: string) => void } = {};
         try {
+            const openOpts = {
+                walJournalSizeLimitBytes: walLimit,
+                onQuickCheckFailure: (detail: string) => {
+                    integrityFailureSink.handler?.(detail);
+                },
+            };
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, openOpts);
             } catch (err) {
                 // #4175: quick_check failed — the file set is provably corrupt.
                 // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
@@ -201,23 +215,12 @@ export class UnifiedShadow {
                 // (full mode re-imports organically on load). No auto-delete —
                 // the corrupt original is kept for forensics.
                 if (!(err instanceof StorageIntegrityError)) throw err;
-                const stamp = Date.now();
-                const quarantined: string[] = [];
-                for (const suffix of ["", "-wal", "-shm"]) {
-                    const from = `${dir}/index.db${suffix}`;
-                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
-                    try {
-                        renameSync(from, to);
-                        quarantined.push(path.basename(to));
-                    } catch {
-                        /* absent sidecar files are fine */
-                    }
-                }
+                const quarantined = quarantineCorruptIndexSet(dir);
                 loggerLog(
                     "error",
                     `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
                 );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, openOpts);
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -244,6 +247,14 @@ export class UnifiedShadow {
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        integrityFailureSink.handler = (detail) => {
+            shadow.stats.lastError = `integrity quick_check failed (deferred, large-db lane): ${detail}`;
+            shadow.stats.disabled = true;
+            loggerLog(
+                "error",
+                `[storage] unified sidecar DISABLED for this process lifetime: ${shadow.stats.lastError} — loads fall back to JSON envelopes (#4175 recovery source); the corrupt set is quarantined at the next open`,
+            );
+        };
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;

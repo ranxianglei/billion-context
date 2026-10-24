@@ -17,14 +17,16 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync, renameSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
+import { runDeferredQuickCheck, type QuickCheckResult } from "./quick-check-worker.js";
 import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -325,6 +327,95 @@ function processAlive(pid: number): boolean {
     }
 }
 
+/** #4609: ceiling for the SYNCHRONOUS (event-loop-blocking) quick_check at
+ *  open. At or below it the check runs inline exactly as before; above it the
+ *  boot binds its port first and the scan runs in a background worker. Sized
+ *  from the slowest field-measured rate (~54 MB/s — #4609: 14 GB / 260 s) so
+ *  the worst-case inline freeze stays around five seconds even on cold
+ *  spinning media, while every realistic dev-sized db keeps the old path. */
+const QUICK_CHECK_SYNC_MAX_BYTES = 256 * 1024 * 1024;
+
+let quickCheckSyncMaxBytesOverrideForTests: number | null = null;
+
+/** Test seam (driver.ts *ForTests pattern): force the sync/deferred split
+ *  point down to test-file sizes so the deferred lane is reachable without
+ *  gigabyte fixtures. null restores the production constant. */
+export function setQuickCheckSyncMaxBytesForTests(n: number | null): void {
+    quickCheckSyncMaxBytesOverrideForTests = n;
+}
+
+function quickCheckSyncMaxBytes(): number {
+    return quickCheckSyncMaxBytesOverrideForTests ?? QUICK_CHECK_SYNC_MAX_BYTES;
+}
+
+interface QuickCheckFingerprint {
+    size: number;
+    mtimeMs: number;
+    checkedAt: number;
+}
+
+function quickCheckCachePath(dbPath: string): string {
+    // No .json extension: session-dir JSON scanners (countStateFiles-style
+    // walks, web listings) treat *.json as session STATE files — this cache
+    // is store machinery, same family as index.db.corrupt-* / .lock.
+    return `${dbPath}.quickcheck`;
+}
+
+function quarantineMarkerPath(dbPath: string): string {
+    return `${dbPath}.quarantine-pending`;
+}
+
+/** #4609: read the last-passing-check fingerprint. Any malformation → null
+ *  (fail toward RE-CHECKING, never toward skipping). The fingerprint covers
+ *  the main file only: -wal/-shm are transient recovery artifacts SQLite
+ *  itself validates/truncates during its own open replay, and any write into
+ *  the MAIN file (including a WAL checkpoint merging frames in) bumps its
+ *  size/mtime and invalidates the cache. A same-size same-millisecond rewrite
+ *  is theoretically undetectable — negligible, and the check remains a
+ *  corruption detector, not a security boundary. */
+function readQuickCheckFingerprint(dbPath: string): QuickCheckFingerprint | null {
+    try {
+        const parsed = JSON.parse(readFileSync(quickCheckCachePath(dbPath), "utf8")) as Partial<QuickCheckFingerprint>;
+        if (typeof parsed.size !== "number" || typeof parsed.mtimeMs !== "number" || typeof parsed.checkedAt !== "number") return null;
+        return { size: parsed.size, mtimeMs: parsed.mtimeMs, checkedAt: parsed.checkedAt };
+    } catch {
+        return null;
+    }
+}
+
+/** #4609: stamp the fingerprint AFTER a passing check. Best-effort — a failed
+ *  write only costs a re-scan at the next open. */
+function writeQuickCheckFingerprint(dbPath: string): void {
+    try {
+        const st = statSync(dbPath);
+        writeFileSync(quickCheckCachePath(dbPath), JSON.stringify({ size: st.size, mtimeMs: st.mtimeMs, checkedAt: Date.now() }));
+    } catch (err) {
+        loggerLog("warn", `[storage] quick_check fingerprint write failed for ${dbPath}: ${String(err)}`);
+    }
+}
+
+/** #4175/#4609: rename the corrupt index.db file set aside (same suffix
+ *  discipline as session envelopes; no auto-delete — forensics keep the
+ *  original). Returns the quarantined basenames. MUST run while NO live
+ *  handle is held — Windows refuses to move a file an open process holds
+ *  (EBUSY, #4347 probe), which is why the deferred-failure path defers the
+ *  quarantine to the next open via the marker file. */
+export function quarantineCorruptIndexSet(dir: string): string[] {
+    const stamp = Date.now();
+    const quarantined: string[] = [];
+    for (const suffix of ["", "-wal", "-shm"]) {
+        const from = `${dir}/index.db${suffix}`;
+        const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
+        try {
+            renameSync(from, to);
+            quarantined.push(basename(to));
+        } catch {
+            /* absent sidecar files are fine */
+        }
+    }
+    return quarantined;
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -335,47 +426,100 @@ export class UnifiedStore {
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
+    /** #4609: the background integrity scan owed by a large-db open (null when
+     *  none was scheduled). Tests await it; production ignores it. */
+    private readonly deferredQuickCheckPromise: Promise<QuickCheckResult | null> | null;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, deferredQuickCheckPromise: Promise<QuickCheckResult | null> | null) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
         this.lockPath = lockPath;
         this.foreignLockHolder = foreignLockHolder;
+        this.deferredQuickCheckPromise = deferredQuickCheckPromise;
+    }
+
+    /** #4609: pending deferred integrity scan for this store, if the open owed
+     *  one (large-db lane). Null otherwise. */
+    get deferredQuickCheck(): Promise<QuickCheckResult | null> | null {
+        return this.deferredQuickCheckPromise;
     }
 
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; onQuickCheckFailure?: (detail: string) => void },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
-        const { db, engine: used, source } = openSqliteDatabase(path, engine);
-        // #4175: integrity self-check BEFORE migrations — a corrupt file must
-        // never be migrated against. quick_check is the fast form (it skips
-        // index-vs-table cross-validation) and is skippable for
-        // boot-time-sensitive huge deployments via BILI_STORAGE_QUICK_CHECK=0.
-        if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
-            const started = Date.now();
-            let verdict: string;
+        // #4609: a previous DEFERRED integrity check failed on this file set.
+        // The quarantine must run BEFORE any handle exists — Windows refuses
+        // to move a file a live process still holds (EBUSY, #4347 probe):
+        // consume the marker, move the set aside, then open fresh below.
+        const markerPath = quarantineMarkerPath(path);
+        if (existsSync(markerPath)) {
+            let detail = "unknown";
             try {
-                const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
-                verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
-            } catch (err) {
-                // Corrupt header (NOTADB) throws from the statement itself, so
-                // the verdict branch never runs: close the handle we opened
-                // before rethrowing — the #2771 fallback tells operators to
-                // DELETE the file, and Windows refuses to delete a file this
-                // process still holds (unlink EBUSY, #4347 probe).
-                recordIntegrityOutcome(path, false, Date.now() - started, String(err).slice(0, 400));
-                db.close();
-                throw err;
+                detail = String((JSON.parse(readFileSync(markerPath, "utf8")) as { detail?: unknown }).detail ?? "unknown");
+            } catch {
+                /* malformed marker still quarantines */
             }
-            const durationMs = Date.now() - started;
-            recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
-            if (verdict !== "ok") {
-                db.close();
-                throw new StorageIntegrityError(path, verdict.slice(0, 400));
+            const quarantined = quarantineCorruptIndexSet(dirname(path));
+            try {
+                unlinkSync(markerPath);
+            } catch {
+                /* best-effort */
+            }
+            loggerLog("error", `[storage] deferred integrity check failed on the previous boot (${detail}) — quarantined ${quarantined.join(", ") || "nothing"} and opening fresh; JSON envelopes remain the recovery source (#4609/#4175)`);
+        }
+        const { db, engine: used, source } = openSqliteDatabase(path, engine);
+        // #4175/#4609: integrity self-check before migrations — a corrupt file
+        // must never be migrated against. Three lanes:
+        //   skip     — main file unchanged since a passing check (fingerprint);
+        //   sync     — small enough to scan inline without eating the spawn
+        //              budget (pre-#4609 behavior, kept byte-identical);
+        //   deferred — large: the port binds first, the scan runs in a
+        //              background worker after open finishes (#4609: 14 GB
+        //              took 260 s inline against a 60 s hard budget).
+        // Still skippable wholesale via BILI_STORAGE_QUICK_CHECK=0.
+        let deferredOwed = false;
+        if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
+            let st: { size: number; mtimeMs: number } | null = null;
+            try {
+                const s = statSync(path);
+                st = { size: s.size, mtimeMs: s.mtimeMs };
+            } catch {
+                st = null;
+            }
+            const fingerprint = readQuickCheckFingerprint(path);
+            if (st !== null && fingerprint !== null && fingerprint.size === st.size && fingerprint.mtimeMs === st.mtimeMs) {
+                loggerLog("info", `[storage] quick_check skipped for ${path}: unchanged since the last passing check (${Date.now() - fingerprint.checkedAt} ms ago)`);
+            } else if (st === null || st.size <= quickCheckSyncMaxBytes()) {
+                const started = Date.now();
+                let verdict: string;
+                try {
+                    const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
+                    verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
+                } catch (err) {
+                    // Corrupt header (NOTADB) throws from the statement itself, so
+                    // the verdict branch never runs: close the handle we opened
+                    // before rethrowing — the #2771 fallback tells operators to
+                    // DELETE the file, and Windows refuses to delete a file this
+                    // process still holds (unlink EBUSY, #4347 probe).
+                    recordIntegrityOutcome(path, false, Date.now() - started, String(err).slice(0, 400));
+                    db.close();
+                    throw err;
+                }
+                const durationMs = Date.now() - started;
+                recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
+                if (verdict !== "ok") {
+                    db.close();
+                    throw new StorageIntegrityError(path, verdict.slice(0, 400));
+                }
+                writeQuickCheckFingerprint(path);
+                loggerLog("info", `[storage] quick_check ok for ${path} in ${durationMs} ms`);
+            } else {
+                deferredOwed = true;
+                loggerLog("info", `[storage] quick_check deferred past boot for ${path}: ${st.size} bytes exceeds the ${quickCheckSyncMaxBytes()}-byte synchronous ceiling — the scan runs in a background worker after listen (#4609)`);
             }
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
@@ -438,7 +582,32 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
+        // #4609: the large-db scan runs AFTER the open contract above — it sees
+        // the settled state (post-migration, post-checkpoint) and, crucially,
+        // after the caller has already bound its port. A failure cannot brick
+        // this boot: the marker defers the quarantine to the next open.
+        let deferredPromise: Promise<QuickCheckResult | null> | null = null;
+        if (deferredOwed) {
+            deferredPromise = runDeferredQuickCheck(path, used, fileURLToPath(import.meta.url)).then((result) => {
+                if (result === null) return null; // inconclusive (worker died): retried at the next open
+                recordIntegrityOutcome(path, result.ok, result.durationMs, result.ok ? undefined : result.detail);
+                if (result.ok) {
+                    writeQuickCheckFingerprint(path);
+                    loggerLog("info", `[storage] deferred quick_check ok for ${path} in ${result.durationMs} ms (scanned past boot in a background worker, #4609)`);
+                } else {
+                    const detail = result.detail ?? "unknown";
+                    try {
+                        writeFileSync(quarantineMarkerPath(path), JSON.stringify({ failedAt: Date.now(), detail }));
+                    } catch (err) {
+                        loggerLog("warn", `[storage] quarantine marker write failed for ${path}: ${String(err)} — the failure stays logged; the next open re-checks instead of quarantining`);
+                    }
+                    loggerLog("error", `[storage] deferred quick_check FAILED for ${path} (${detail}) — unified reads are being disabled for this process and the file set will be quarantined at the NEXT open (this handle is live; Windows cannot move held files, #4347). JSON envelopes remain the recovery source (#4609)`);
+                    opts?.onQuickCheckFailure?.(detail);
+                }
+                return result;
+            });
+        }
+        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder, deferredPromise);
     }
 
     close(): void {

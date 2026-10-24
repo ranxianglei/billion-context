@@ -358,7 +358,7 @@
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
-| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。 |
+| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储完整性自检（#4175/#4609），分三档：自上次通过检查以来未变化（size+mtime 指纹，index.db.quickcheck）→ 跳过；≤256 MiB → 迁移之前内联跑 PRAGMA quick_check，失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）；>256 MiB → 端口先绑定、扫描在 listen 之后由后台 worker 线程执行（#4609：14 GB 库内联要 260 秒，远超启动器硬性的 60 秒 spawn 预算），后台检查失败则本进程生命周期内关闭统一读（回退信封加载）并写标记，下次开库时隔离文件组。设 0 跳过一切检查。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |

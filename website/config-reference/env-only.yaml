@@ -56,8 +56,8 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
-    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
+    desc_en: "Storage integrity self-check (#4175/#4609), three lanes: unchanged since a passing check (size+mtime fingerprint, index.db.quickcheck) -> skipped; <=256 MiB -> PRAGMA quick_check inline BEFORE migrations, and on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source); >256 MiB -> the port binds FIRST and the scan runs in a background worker after listen (#4609: a 14 GB db took 260 s inline against the launcher's hard 60 s spawn budget) - a deferred failure disables unified reads for the process lifetime (envelope fallback) and writes a marker so the NEXT open quarantines the set. Set 0 to skip every check."
+    desc_zh: "存储完整性自检（#4175/#4609），分三档：自上次通过检查以来未变化（size+mtime 指纹，index.db.quickcheck）→ 跳过；≤256 MiB → 迁移之前内联跑 PRAGMA quick_check，失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）；>256 MiB → 端口先绑定、扫描在 listen 之后由后台 worker 线程执行（#4609：14 GB 库内联要 260 秒，远超启动器硬性的 60 秒 spawn 预算），后台检查失败则本进程生命周期内关闭统一读（回退信封加载）并写标记，下次开库时隔离文件组。设 0 跳过一切检查。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"
