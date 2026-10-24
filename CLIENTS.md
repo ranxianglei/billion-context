@@ -443,24 +443,33 @@ two small node scripts that do the work around the client:
    port until it re-reads. To avoid this structurally, pin `BILLION_CONTEXT_PROXY`
    at a resident proxy (`bili start`) and let every session attach to it
    (attach mode never touches a user-owned proxy).
-- **Known limitations:** ZCode's anti-fraud fingerprinting (#661) applies to
-  MITM-rebuilt bodies on `zcode.z.ai` login traffic — native mode does not
-  touch that surface (model traffic flows through the provider store, not the
-  GUI proxy); if you also run the GUI-proxy/MITM setup, keep the
-  `"mitm://zcode.z.ai": { "passthrough": true }` route. On v3.14+ builds,
+- **Known limitations:** ZCode's anti-fraud fingerprinting (#661) rejects
+  kernel-rebuilt bodies on `zcode.z.ai` — and it is the **model** endpoint
+  (`/api/v1/zcode-plan/anthropic/v1/messages`) that trips it, not just login
+  traffic. The two coding-plan families differ by endpoint, so their fate
+  differs: **bigmodel-series** (model endpoint `open.bigmodel.cn`, outside the
+  #661 scope) gets normal compression through the GUI cert-MITM setup, whereas
+  **zai-series** (model endpoint `zcode.z.ai`, inside the #661 scope) is
+  rejected `405 / code 3012 "request has been blocked due to unusual activity."`
+  on *any* kernel pass over the model traffic — even a round-trip that folds
+  nothing — so on zai-series accounts the GUI-proxy/MITM setup must keep the
+  `"mitm://zcode.z.ai": { "passthrough": true }` route, which yields
+  working-but-uncompressed traffic; there is currently no configuration that
+  both compresses and avoids the 405 for zai-series model traffic (#4593).
+  Native mode does not touch that surface (its model traffic flows through the
+  provider store, not the GUI proxy). Separately, on v3.14+ builds
   ClientRequestSigningV4 for coding-plan accounts rejects non-HTTPS origins at
-  model creation and derives its handshake path from origin alone (dropping
-  any /bili/ prefix), so a /bili/-wrapped baseURL fails with "Client signing
-  handshake requires HTTPS." (#1621). The conflict is hardcoded on the ZCode
+  model creation and derives its handshake path from origin alone (dropping any
+  /bili/ prefix), so a /bili/-wrapped baseURL fails with "Client signing
+  handshake requires HTTPS." (#1621). That conflict is hardcoded on the ZCode
   side, so native mode detects the v3.14+ store generation and skips the
-  rewrite entirely — it logs the reason and leaves traffic direct; use the GUI
-  cert-MITM setup for compression on these accounts until ZCode ships a signing
-  fix; once it does, set `BILI_ZCODE_SIGNING_FIXED=1` and they route again. Under the default
-  `route:"all"` only those accounts are skipped — every other provider on the
-  store keeps routing; the whole-store degrade (routing entirely off) now
-  only applies under `route:"plans"`, where the plan accounts ARE the signing
-  accounts. Pre-3.14 legacy-store clients are unaffected. Inert when
-  `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
+  rewrite entirely — it logs the reason and leaves those accounts direct; once
+  ZCode ships its signing fix, set `BILI_ZCODE_SIGNING_FIXED=1` and they route
+  again. Under the default `route:"all"` only those accounts are skipped — every
+  other provider on the store keeps routing; the whole-store degrade (routing
+  entirely off) now only applies under `route:"plans"`, where the plan accounts
+  ARE the signing accounts. Pre-3.14 legacy-store clients are unaffected. Inert
+  when `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
   `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
 
 ## Codex (OpenAI Codex CLI)
