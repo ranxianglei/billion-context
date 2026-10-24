@@ -126,7 +126,7 @@ test("#4305: injectSystem appends the note only when the boundary is active", ()
     const parsed = { system: "You are a helpful assistant.", messages: [] };
     const off = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, false) as string;
     assert.ok(!off.includes(GENERATION_BOUNDARY_NOTE), "inactive: system block unchanged by this feature");
-    const on = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, true) as string;
+    const on = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, false, true) as string;
     assert.ok(on.includes(GENERATION_BOUNDARY_NOTE), "active: note rides the ACP standing block");
     assert.ok(on.startsWith("You are a helpful assistant."), "client system block stays byte-exact (appended, never merged)");
     // sysParts order contract: client head, standing prompt (attribution outermost), THEN the note.

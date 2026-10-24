@@ -2,7 +2,8 @@
 
 Static landing page + docs. No build step, no dependencies — plain HTML/CSS/JS.
 Deployed to [GitHub Pages](https://ranxianglei.github.io/billion-context/) by
-`.github/workflows/pages.yml` (publishes this folder on every push to master).
+`.github/workflows/pages.yml` — manual `workflow_dispatch` only for now: the repo
+has no GitHub Pages site yet, so auto-deploy on push is suspended (#4598).
 
 ## Local preview
 

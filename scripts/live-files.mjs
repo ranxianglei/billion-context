@@ -61,6 +61,9 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #3890: spawns the drain fixture; that fixture is listen(0) and reports
+    // READY <port>, so no zone band is needed — the entry is for the tripwire
+    "tests/issue3890-parent-gone-confirm-drain.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

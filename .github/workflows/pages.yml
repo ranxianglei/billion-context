@@ -1,11 +1,9 @@
 name: Deploy website to GitHub Pages
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "website/**"
-      - ".github/workflows/pages.yml"
+  # Push trigger suspended (#4598): the repo has no GitHub Pages site, so every
+  # website push red-lined the deploy job. Manual dispatch stays until the
+  # publishing direction is decided.
   workflow_dispatch:
 
 permissions:
