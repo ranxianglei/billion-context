@@ -410,6 +410,14 @@ entries:
     group: envonly
     desc_en: "Test hook: recovery sweep interval for the dsh lane."
     desc_zh: "测试钩子：dsh 车道恢复清扫间隔。"
+  - key: BILI_CODEX_HOOK_ORIGIN
+    type: string
+    default: "unset (route origin, then lane discovery)"
+    kind: env-only
+    audience: test
+    group: envonly
+    desc_en: "Test hook: explicit proxy origin for the Codex SessionStart bootstrap hook to probe and report to; falls back to the route bili wrote into config.toml, then sticky lane-port discovery."
+    desc_zh: "测试钩子：Codex SessionStart 引导 hook 探测/上报的显式代理 origin；未设置时回退到 bili 写入 config.toml 的路由，再到粘性车道端口发现。"
   - key: ACP_DUMP_DIR
     type: string
     default: "unset"
