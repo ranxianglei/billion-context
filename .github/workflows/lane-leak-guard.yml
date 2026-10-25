@@ -47,8 +47,9 @@ jobs:
           LEAKS="$(git log --format=%H --merges "${BASE_TAG}..HEAD" \
             | while read -r M; do
                 P2="$(git rev-parse "${M}^2" 2>/dev/null || echo "")"
-                [ -n "$P2" ] && git merge-base --is-ancestor "$P2" origin/master \
-                  && echo "$M $(git log -1 --format=%s "$M")"
+                if [ -n "$P2" ] && git merge-base --is-ancestor "$P2" origin/master; then
+                  echo "$M $(git log -1 --format=%s "$M")"
+                fi
               done)"
           if [ -n "$LEAKS" ]; then
             echo "::error::lane leak detected on $BRANCH — a merge pulled master's UNRELEASED work into the patch lane:"
