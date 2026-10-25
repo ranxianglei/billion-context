@@ -212,6 +212,8 @@ jobs:
         # v3 stage P4: the alignment PR (bugfix -> master) just merged. Cut
         # bugfix-vX.Y.Z from tag vX.Y.Z, pre-bump package.json to the next
         # patch version, push. Idempotent: an existing branch is a no-op.
+        # Born-disarmed guard (#4667): refuses to cut when the tag's tree
+        # would give the fresh lane a lane-arming publish trigger.
         # NOTE: GITHUB_TOKEN cannot apply branch protection — the announcement
         # comment tells the owner the one remaining manual click (Settings ->
         # Branches, or the PUT JSON in reference/release.md).
@@ -235,6 +237,23 @@ jobs:
           if [ -n "$LIVE" ]; then
             echo "::notice::$NEW_LANE already exists on origin ($LIVE) — idempotent no-op"
             exit 0
+          fi
+          # Born-disarmed guard (#4667): the cut lane inherits the tag's tree
+          # verbatim, workflow file included. A tag released under the v2
+          # pipeline still carries the lane-arming trigger ('branches:
+          # ["bugfix-v*", ...]'); pull_request_target runs the BASE-side copy,
+          # so the first carry merge into such a lane self-fires a real
+          # publish (the #4667 incident). Refuse loudly; fail-closed if the
+          # file cannot be inspected at all.
+          TAG_WF="$(git show "v$VER:.github/workflows/release-bugfix.yml" 2>/dev/null)" || {
+            echo "::error::cannot read .github/workflows/release-bugfix.yml from tag v$VER — auto-cut refused (fail-closed: cannot verify the lane would be born disarmed)"
+            gh pr comment "$GITHUB_EVENT_NUMBER" --body "❌ **Auto-cut refused** — tag \`v$VER\` does not carry an inspectable \`.github/workflows/release-bugfix.yml\`, so we cannot prove a lane cut from it would be born disarmed. Manual: cut \`$NEW_LANE\` from ALIGNED MASTER (not the tag), pre-bump package.json to the next patch, push, protect (reference/release.md § Lane protection)." || echo "::warning::could not annotate PR $GITHUB_EVENT_NUMBER"
+            exit 1
+          }
+          if printf '%s' "$TAG_WF" | grep -Eq 'branches:[[:space:]]*\[?"?bugfix-v\*'; then
+            echo "::error::tag v$VER's release-bugfix.yml still carries a lane-arming publish trigger (v2-era 'branches: [\"bugfix-v*\", ...]') — auto-cut refused: a lane cut from this tag would self-fire a publish on its first carry merge (the #4667 incident)"
+            gh pr comment "$GITHUB_EVENT_NUMBER" --body "❌ **Auto-cut refused (born-disarmed guard)** — tag \`v$VER\` was released under the v2 pipeline and its tree still carries the lane-arming publish trigger. Cutting \`$NEW_LANE\` from it would re-arm exactly the incident in #4667.\n\nManual: cut \`$NEW_LANE\` from ALIGNED MASTER (not the tag), pre-bump package.json to the next patch, push, protect (reference/release.md § Lane protection / Epoch-1 transition)." || echo "::warning::could not annotate PR $GITHUB_EVENT_NUMBER"
+            exit 1
           fi
           NEXT="$(node -p "(function(){const v=process.argv[1].split('.');return v[0]+'.'+v[1]+'.'+(Number(v[2])+1)})" "$VER")"
           git checkout -b "$NEW_LANE" "v$VER"
