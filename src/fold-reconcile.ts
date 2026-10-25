@@ -1362,7 +1362,7 @@ export function planReconciliation(
     // byTwin / byNorm / byTurn / byImage) run BELOW Pass 0, so by the time
     // this tier sees a gap cell every exact channel has already had its
     // bite — what remains is tiered corroboration, in order of evidence
-    // strength:
+    // strength. User-role messages stay on the exact passes above:
     //   (a) simhash: a re-rendered cell (formatting churn normalization
     //       still misses — key reordering beyond canonical-Json's reach,
     //       template re-stamps) keeps its word-shingle mass, so a 64-bit
@@ -1395,7 +1395,7 @@ export function planReconciliation(
             const message = byId.get(gap.newId);
             if (anchor === undefined || message === undefined) continue;
             // Changed user instructions must reach the model, even between unchanged neighbors.
-            if (anchor.r === "user" && anchor.c !== "image") continue;
+            if (anchor.r === "user") continue;
             if (anchor.r !== undefined && anchor.r !== message.role) continue;
             const len = message.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
@@ -1441,7 +1441,7 @@ export function planReconciliation(
     // the words still on the wire. Doctrine (order carries, content gates,
     // the id is only a hint): when a MISSING MASSES of cells still carry
     // word evidence, pair them in order instead of diagnosing destruction.
-    //   prose anchors: wordbag equality + simhash ≤ GAP bar (the same
+    //   non-user prose anchors: wordbag equality + simhash ≤ GAP bar (the same
     //     edit-honesty gate as the sim tier) — role-checked, length-guarded;
     //   textless anchors (image families, no sh/wh by construction): k-th
     //     family pairing, only when the anchor/candidate counts per
@@ -1452,7 +1452,7 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
-            if (anchor.r === "user" && anchor.c !== "image") return false;
+            if (anchor.r === "user") return false;
             if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;

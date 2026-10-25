@@ -149,8 +149,10 @@ for (const [name, editedIndexes, before, after] of [
         }
         assert.ok(outgoing.some((m) => m.id === "acp_summary_instruction-block"),
             "unchanged history remains compressed");
-        assert.ok(!outgoing.some((m) => m.id === "resent-4"),
-            "an unchanged covered message stays folded");
+        for (const i of [3, 4]) {
+            assert.ok(!outgoing.some((m) => m.id === `resent-${i}`),
+                "unchanged covered user and assistant messages stay folded");
+        }
     });
 }
 
