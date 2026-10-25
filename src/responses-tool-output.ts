@@ -122,8 +122,34 @@ export function patchResponsesInputWithToolImages(projection: ResponsesProjectio
 // #1999: same pre-codec re-voicing as patchResponsesInputWithToolImages above.
 // #4166: carriers only — client-origin mid system/developer stays verbatim.
 export function coreToResponsesWithToolImages(messages: CoreMessage[], customToolCallIds: Set<string> = new Set()): ResponseInputItem[] {
-    return systemToUser(messages, (m) => isRenderedSummaryMessage(m)).flatMap((message) => {
+    const out: ResponseInputItem[] = [];
+    let run: CoreMessage[] = [];
+    const flush = () => {
+        if (run.length === 0) return;
+        const sources = new Set(run.map((m) => (m as BiliMessage).rawResponsesItem).filter(Boolean));
+        // #4767: batch a single carrier's cores. The kernel cannot yet separate
+        // adjacent source items; retain legacy encoding there to avoid image loss.
+        if (sources.size === 1) out.push(...coreToResponses(run, customToolCallIds));
+        else for (const message of run) out.push(...coreToResponses([message], customToolCallIds));
+        run = [];
+    };
+    for (const message of messages) {
+        if (isRenderedSummaryMessage(message)) {
+            flush();
+            out.push(...coreToResponses(systemToUser([message]), customToolCallIds));
+            continue;
+        }
         const rebuilt = rebuildToolImages(message);
-        return rebuilt ? [rebuilt] : coreToResponses([message], customToolCallIds);
-    });
+        if (rebuilt) {
+            flush();
+            out.push(rebuilt);
+        } else if (message.role === "user") {
+            run.push(message);
+        } else {
+            flush();
+            out.push(...coreToResponses([message], customToolCallIds));
+        }
+    }
+    flush();
+    return out;
 }

@@ -28,6 +28,80 @@ function pngUrl(width: number, height: number, fill = 0): string {
 const imageUrl = pngUrl(2048, 1152);
 const parts = [{ type: "input_text", text: "The screenshot shows a failure." }, { type: "input_image", image_url: imageUrl, detail: "high" }];
 
+function userImageBody(n: number): { input: ResponseInputItem[] } {
+    return { input: [{ type: "message", role: "user", content: Array.from({ length: n }, (_, i) => [
+        { type: "input_text", text: `caption ${i}`, annotations: [`keep-${i}`] },
+        { type: "input_image", image_url: `https://example.test/image-${i}.png`, detail: i % 2 ? "low" : "high" },
+    ]).flat() }] };
+}
+
+test("#4767: full encoding preserves one multi-image carrier instead of repeating it per core", () => {
+    for (const n of [26, 2, 1]) {
+        const body = userImageBody(n);
+        const projection = responsesToCore(body);
+        assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+        for (const textProtocol of [false, true]) {
+            const request = createResponsesAdapter(textProtocol).buildRequest(projection.msgs, "", body);
+            assert.deepEqual((request.input as ResponseInputItem[]).filter((item) => item.role === "user"), body.input);
+        }
+    }
+});
+
+test("#4767: ordinary multipart runs stay intact on both sides of image tool outputs", () => {
+    for (const type of ["function_call_output", "custom_tool_call_output"]) {
+        const before = userImageBody(2).input;
+        const tool = { type, call_id: "image-call", output: parts };
+        const after = userImageBody(3).input;
+        const body = { input: [...before, tool, ...after] };
+        const projection = responsesToCore(body);
+        const edited = projection.msgs.map((m) => m.role === "tool" ? { ...m, text: "changed" } : m);
+        assert.deepEqual(coreToResponses(edited, projection.customToolCallIds), [
+            ...before, { ...tool, output: [{ ...parts[0], text: "changed" }, parts[1]] }, ...after,
+        ]);
+    }
+});
+
+test("#4767: full encoding preserves repeated identical image instances", () => {
+    const body = userImageBody(2);
+    const first = body.input[0];
+    assert.ok(Array.isArray(first.content));
+    first.content[3] = { ...first.content[1] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: batching adjacent source carriers must not lose the later carrier's images", () => {
+    const later = userImageBody(3).input;
+    const body = { input: [...userImageBody(2).input, ...later] };
+    const projection = responsesToCore(body);
+    const rebuilt = coreToResponses(projection.msgs, projection.customToolCallIds);
+    const wire = JSON.stringify(rebuilt);
+    // Multiplicity across separate source items remains a kernel-owned limitation.
+    assert.ok(wire.includes("https://example.test/image-2.png"));
+    assert.ok(wire.includes("caption 2"));
+});
+
+test("#4767: full encoding preserves empty history and surrounding plain history", () => {
+    assert.deepEqual(coreToResponses([]), []);
+    const body = { input: [
+        { type: "message", role: "assistant", content: "plain before" },
+        ...userImageBody(2).input,
+        { type: "message", role: "assistant", content: "plain after" },
+    ] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: summary carriers stay separate from a neighboring multipart source", () => {
+    const body = userImageBody(2);
+    const projection = responsesToCore(body);
+    const summary = { id: "acp_summary_b1", role: "system" as const, contentType: "text" as const, text: "folded history" };
+    const summaryInput = [{ type: "message", role: "user", content: "folded history" }];
+    assert.deepEqual(coreToResponses([summary, ...projection.msgs, summary], projection.customToolCallIds), [
+        ...summaryInput, ...body.input, ...summaryInput,
+    ]);
+});
+
 function toolBody(type: string, output: unknown = parts): { input: ResponseInputItem[] } {
     return { input: [{ type, call_id: "screenshot-call", output }] };
 }
