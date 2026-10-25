@@ -1394,6 +1394,8 @@ export function planReconciliation(
             const anchor = anchors[gap.oldId];
             const message = byId.get(gap.newId);
             if (anchor === undefined || message === undefined) continue;
+            // Changed user instructions must reach the model, even between unchanged neighbors.
+            if (anchor.r === "user" && anchor.c !== "image") continue;
             if (anchor.r !== undefined && anchor.r !== message.role) continue;
             const len = message.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
@@ -1450,6 +1452,7 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
+            if (anchor.r === "user" && anchor.c !== "image") return false;
             if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;

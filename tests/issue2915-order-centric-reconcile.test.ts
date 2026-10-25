@@ -28,6 +28,7 @@
 //     again (streak reset clears the latch) — upgrade-in-place recovery.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { prune } from "acp-kernel";
 import { simhashHex, hammingHex } from "../src/affinity-simhash.ts";
 import {
     normalizedIdentity,
@@ -42,7 +43,7 @@ import {
 } from "../src/fold-reconcile.ts";
 import type { CoreMessage } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import type { Session } from "../src/session.ts";
+import { createSession, type Session } from "../src/session.ts";
 
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
@@ -116,6 +117,43 @@ function planFor(old: CoreMessage[], next: CoreMessage[], positions?: { ids: str
 const storedOf = (msgs: CoreMessage[]): { ids: string[]; canon: string[] } =>
     ({ ids: msgs.map((m) => m.id as string), canon: msgs.map((m) => positionalFingerprint(m)) });
 
+for (const [name, editedIndexes, before, after] of [
+    ["changed approval", [5], "Deployment is APPROVED.", "Deployment is FORBIDDEN."],
+    ["reordered instructions", [5], "Allow Alice; deny Bob.", "Deny Alice; allow Bob."],
+    ["several reordered instructions", [5, 7, 9, 11], "Allow Alice; deny Bob.", "Deny Alice; allow Bob."],
+] satisfies Array<[string, number[], string, string]>) {
+    test(`outgoing history retains ${name} after message ids change`, () => {
+        const originals = Array.from({ length: 30 }, (_, i): CoreMessage => msg(
+            `original-${i}`, i % 2 === 0 ? "assistant" : "user",
+            `Historical context for step ${i}. `.repeat(100) + (editedIndexes.includes(i) ? before : ""),
+        ));
+        const covered = Array.from({ length: 10 }, (_, i) => `original-${i + 3}`);
+        const session = createSession(`instruction-edit-${name}`);
+        session.state.blocks.push({
+            blockId: "instruction-block", runId: "instruction-run", tier: 1,
+            summary: before, directMessageIds: [...covered], effectiveMessageIds: [...covered],
+            directBlockIds: [], compressedTokens: 4000, createdAt: 1,
+            survivedCount: 0, generation: "young", active: true,
+        });
+        reconcileFoldCoverage(session, originals, opts());
+        const resent = originals.map((m, i): CoreMessage => ({
+            ...m, id: `resent-${i}`,
+            text: editedIndexes.includes(i) ? (m.text ?? "").replace(before, after) : m.text,
+        }));
+        resent.push(msg("continue", "user", "Continue the current task."));
+        reconcileFoldCoverage(session, resent, opts());
+        const outgoing = prune(resent, session.state);
+        for (const i of editedIndexes) {
+            assert.ok(outgoing.some((m) => m.id === `resent-${i}` && m.text?.includes(after)),
+                `the corrected instruction at ${i} must reach the model`);
+        }
+        assert.ok(outgoing.some((m) => m.id === "acp_summary_instruction-block"),
+            "unchanged history remains compressed");
+        assert.ok(!outgoing.some((m) => m.id === "resent-4"),
+            "an unchanged covered message stays folded");
+    });
+}
+
 describe("Pass 0 order-centric resync (#2915)", () => {
     test("#2821 replay: full id re-mint + changed preamble + appended turn — order carries, one resync, no mass loss", () => {
         const old = history();
@@ -130,21 +168,17 @@ describe("Pass 0 order-centric resync (#2915)", () => {
         assert.equal(plan.byTwin, 0, "positional coverage leaves nothing for the twin pass");
     });
 
-    test("replacement island mid-history: resync claims both flanks, the bracket tier claims the slot (owner rule)", () => {
+    test("replacement user message stays unmatched while resync preserves both flanks", () => {
         const old = history();
         const next = remint(old, "g1");
         next[5] = msg("g1_5", "user", "EDITED: content genuinely changed"); // index 5 island (m3, prose)
         const plan = planFor(old, next, storedOf(old));
-        // the island content is neither normalized-equal nor simhash-close
-        // (JSON vs prose ≈ 30 bits), but it sits at the SAME INDEX between
-        // verified claims — owner rule: flanks match → the fold asserts the
-        // slot, not the stale bytes.
         assert.ok(plan.resyncs >= 1, `expected resyncs, got ${plan.resyncs}`);
         assert.equal(plan.byPos, 11);
-        assert.equal(plan.byOrder, 1, "the bracket tier claims the island slot");
-        assert.deepEqual(plan.unmatched, [], "no island loss");
+        assert.equal(plan.byOrder, 0, "neighboring messages cannot authorize hiding a user edit");
+        assert.deepEqual(plan.unmatched, ["m3"], "the changed user message re-enters the wire");
         assert.deepEqual(plan.claims.get("end"), ["g1_11"], "the tail span past the island keeps coverage");
-        assert.deepEqual(plan.claims.get("m3"), ["g1_5"]);
+        assert.equal(plan.claims.has("m3"), false);
     });
 
     test("insertion (net offset) still lands on the flank scans — resync never mispairs shifted cells", () => {
@@ -323,15 +357,15 @@ describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks �
         assert.deepEqual(plan.claims.get("m4"), ["g1_6"]);
     });
 
-    test("delete + insert at the same index: the bracket claims the slot (owner-sanctioned stale-cell tradeoff)", () => {
+    test("delete + insert of a user message at the same index leaves the replacement visible", () => {
         const old = history();
         const next = remint(old, "g1");
         next[5] = msg("g1_5", "user", "a genuinely different replacement turn"); // m3 replaced in place
         const plan = planFor(old, next, storedOf(old));
         assert.equal(plan.byPos, 11);
-        assert.equal(plan.byOrder, 1, "same index, verified claims on BOTH sides → assert the slot");
-        assert.deepEqual(plan.unmatched, []);
-        assert.deepEqual(plan.claims.get("m3"), ["g1_5"], "coverage rides the slot — documented tradeoff, not a guess");
+        assert.equal(plan.byOrder, 0);
+        assert.deepEqual(plan.unmatched, ["m3"]);
+        assert.equal(plan.claims.has("m3"), false, "the old summary does not cover a new user instruction");
     });
 });
 
