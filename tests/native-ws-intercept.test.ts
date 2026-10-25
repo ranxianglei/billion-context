@@ -470,6 +470,100 @@ test("adoption: non-constructor replacements are refused, previous constructor k
     });
 });
 
+// ——— Inline lane (#4526) ——————————————————————————————————————————————————————
+// In inline mode state.origin is the pseudo-origin that never listens. The
+// wrapper must route exclusively through resolveInlineWs/wsOrigin — never to
+// the frozen pseudo-origin — and degrade direct when the bridge is absent.
+
+const INLINE_ORIGIN = "http://billion-context.inline";
+const BRIDGE = "http://127.0.0.1:53210";
+const BRIDGE_REWRITTEN = `ws://127.0.0.1:53210/bili/https://chatgpt.com/backend-api/codex/responses`;
+
+function inlineState(extra?: Partial<NativeInterceptState>): NativeInterceptState {
+    return {
+        origin: INLINE_ORIGIN,
+        ready: Promise.resolve(INLINE_ORIGIN),
+        ...extra,
+    };
+}
+
+test("#4526 inline: settled bridge origin → immediate rewrite to the loopback bridge", async () => {
+    await withPatchedGlobal(async () => {
+        const dispatched: Array<[string, string]> = [];
+        const state = inlineState({
+            wsOrigin: BRIDGE,
+            resolveInlineWs: async () => BRIDGE,
+            onDispatch: (url, action) => dispatched.push([url, action]),
+        });
+        installNativeWebSocketIntercept(state);
+        const init = { headers: { "session-id": "sess-inline" } };
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, init);
+        assert.ok(ws instanceof FakeWs, "decision already made — no shell");
+        assert.equal(ws.url, BRIDGE_REWRITTEN);
+        assert.equal(ws.ctorArgs[1], init);
+        assert.deepEqual(dispatched, [[BRIDGE_REWRITTEN, "rewrite"]]);
+        // The bridge is a same-process listener, not pinned-channel evidence —
+        // recording it would false-alarm the #3923 split-brain check.
+        assert.equal(state.routedOrigin, undefined);
+    });
+});
+
+test("#4526 inline: engine still booting → shell holds until the decision settles, then routes", async () => {
+    await withPatchedGlobal(async () => {
+        let resolveDecision!: (o: string | undefined) => void;
+        const decision = new Promise<string | undefined>((resolve) => { resolveDecision = resolve; });
+        const state = inlineState({ resolveInlineWs: () => decision });
+        installNativeWebSocketIntercept(state);
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => { url: string };
+        const ws = new top(UPSTREAM_WS, {});
+        assert.ok(!(ws instanceof FakeWs), "shell stands in while the engine boots");
+        // readyOrigin short-circuits on the frozen pseudo-origin — nothing may
+        // attach there: pre-#4526 this is where the undialable URL was built.
+        await tick();
+        await tick();
+        assert.equal(FakeWs.instances.length, 0);
+        resolveDecision(BRIDGE);
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, BRIDGE_REWRITTEN);
+    });
+});
+
+test("#4526 inline: bridge bind failed → channel degrades DIRECT, not an undialable URL", async () => {
+    await withPatchedGlobal(async () => {
+        const dispatched: Array<[string, string]> = [];
+        const state = inlineState({
+            resolveInlineWs: async () => undefined,
+            onDispatch: (url, action) => dispatched.push([url, action]),
+        });
+        installNativeWebSocketIntercept(state);
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => FakeWs;
+        const ws = new top(UPSTREAM_WS, {});
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, UPSTREAM_WS, "direct connection keeps codex working uncompressed");
+        assert.equal(ws.url, UPSTREAM_WS);
+        assert.deepEqual(dispatched, [["https://chatgpt.com/backend-api/codex/responses", "direct"]]);
+    });
+});
+
+test("#4526 inline: bootstrap rejection degrades direct without an unhandled rejection", async () => {
+    await withPatchedGlobal(async () => {
+        const state = inlineState({
+            resolveInlineWs: () => Promise.reject(new Error("engine bootstrap failed")),
+        });
+        installNativeWebSocketIntercept(state);
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => FakeWs;
+        const ws = new top(UPSTREAM_WS, {});
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, UPSTREAM_WS);
+    });
+});
+
 // ——— Reset —————————————————————————————————————————————————————————————————————
 
 test("_resetForTest restores the pre-install global and clears the flag", async () => {

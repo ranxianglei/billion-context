@@ -360,8 +360,8 @@ entries:
     kind: env-only
     audience: internal
     group: envonly
-    desc_en: "Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target."
-    desc_zh: "宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。"
+    desc_en: "Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. Value table (#4526): any non-empty value except 0/false/no/off enables (previously only 1/true — on/yes silently fell back to spawn); the four off-tokens disable even over config-file pi.inline."
+    desc_zh: "宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。取值表（#4526）：除 0/false/no/off 外任何非空值均开启（此前仅认 1/true——on/yes 会静默回落 spawn）；四个关闭取值即使配置文件 pi.inline 为 true 也强制关闭。"
   - key: BILI_NATIVE_ZCODE
     type: boolean-ish
     default: "off"

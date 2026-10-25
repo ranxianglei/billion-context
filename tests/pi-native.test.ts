@@ -209,6 +209,27 @@ test("#3278: pi.inline (config file) enables the lane; env resolves over it", ()
     assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: "{}" }, true), { mode: "off" });
 });
 
+test("#4526: BILI_PI_INLINE accepts any non-empty non-off value; no/off disable over the file", () => {
+    // common on-spellings that used to silently fall through to spawn (the
+    // "inline does nothing, a server still starts" reports)
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "on" }), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "yes" }), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "ON" }), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: " True " }), { mode: "inline" });
+    // explicit off tokens — no/off included, which were unrecognized before
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "no" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "off" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "OFF" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "false" }), { mode: "spawn" });
+    // no/off now beat the config-file opt-in (previously only 0/false did)
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "no" }, true), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "off" }, true), { mode: "spawn" });
+    // blank values stay neutral — the config file decides
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "" }, true), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "   " }, true), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "" }), { mode: "spawn" });
+});
+
 test("#3278: armNativePi(inline) freezes the pseudo-origin synchronously without spawning", () => {
     const savedProxy = process.env.BILLION_CONTEXT_PROXY;
     try {

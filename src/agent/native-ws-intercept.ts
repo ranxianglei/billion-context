@@ -403,6 +403,42 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                 state.onDispatch?.(rewritten, "rewrite");
                 return new RoutedWebSocket(rewritten, ...rest);
             };
+            const resolveInlineWs = state.resolveInlineWs;
+            if (resolveInlineWs !== undefined) {
+                // #4526 inline lane: state.origin is the pseudo-origin that never
+                // listens — the only dialable endpoint is the engine's loopback WS
+                // bridge. Decision already made → route now; still booting → hold
+                // the shell until it settles (the engine start is memoized).
+                const settled = state.wsOrigin;
+                if (settled !== undefined) {
+                    const rewritten = rewriteCodexResponsesWsUrl(target, settled);
+                    // Deliberately NO noteRoutedOrigin here: the bridge is a
+                    // same-process listener, not pinned-channel evidence —
+                    // recording its loopback origin against the pseudo-origin
+                    // would fire the #3923 split-brain alarm for nothing.
+                    state.onDispatch?.(rewritten, "rewrite");
+                    return new RoutedWebSocket(rewritten, ...rest);
+                }
+                return new DeferredWebSocket(
+                    urlStr,
+                    rest,
+                    async () => {
+                        const bridge = await resolveInlineWs().catch(() => undefined as string | undefined);
+                        if (bridge === undefined) {
+                            if (!warnedDirect) {
+                                warnedDirect = true;
+                                logHostEvent("warn", "[native-client]", `bili-native(ws): inline WebSocket bridge unavailable — Codex Responses WebSocket goes DIRECT (uncompressed): ${urlStr}`);
+                            }
+                            state.onDispatch?.(target, "direct");
+                            return undefined;
+                        }
+                        const rewritten = rewriteCodexResponsesWsUrl(target, bridge);
+                        state.onDispatch?.(rewritten, "rewrite");
+                        return rewritten;
+                    },
+                    constructLive,
+                );
+            }
             const origin = state.origin;
             if (origin !== undefined) return rewrite(origin);
             // Origin still settling → defer the real connection (bounded by

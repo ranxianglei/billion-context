@@ -3,21 +3,24 @@
 // inline lane is the first consumer: model and tool-management requests are
 // routed here through a pseudo-origin instead of a spawned proxy. Deliberately
 // skipped vs startServer(): auto-update/advisory (the engine updates with its
-// host package), WebSocket bridge, port bind + announce, request watchdog
-// (in-process callers are bounded by upstream timeouts).
+// host package), full port bind + announce (only the loopback-only Codex
+// Responses WebSocket bridge binds, #4526), request watchdog (in-process
+// callers are bounded by upstream timeouts).
 import http from "node:http";
 import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
-import { ensureConfigTemplate, loadOptions } from "./config.js";
+import { ensureConfigTemplate, loadOptions, type ProxyOptions } from "./config.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
-import { resolveProxy } from "./upstream-proxy.js";
+import { resolveProxy, resolveProxyDecision } from "./upstream-proxy.js";
 import { createEngineContext, type EngineContext } from "./server.js";
 import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { log as loggerLog } from "./logger.js";
 import { buildProxyFailureResponse, isExpectedFailFast } from "./upstream-fail.js";
+import { installWebSocketBridge } from "./ws-bridge.js";
+import { codexResponsesCodec } from "./responses-ws.js";
 
 /** Pseudo-origin of the inline lane. Never DNS-resolved: any request reaching
  *  this host is served in-process by installInlineTransport before egress. */
@@ -29,6 +32,11 @@ type BodyLike = string | URLSearchParams | Blob | ArrayBuffer | ArrayBufferView 
 
 export interface InlineEngine {
     origin: string;
+    /** #4526: dialable loopback origin of this engine's Codex Responses
+     *  WebSocket bridge ("http://127.0.0.1:<port>"). undefined when the bind
+     *  failed — the client-side wrapper then sends that channel direct
+     *  (uncompressed, warned) instead of an undialable URL. */
+    wsOrigin?: string;
     /** Run one request through the shared pipeline. `rawFetch` is the host's
      *  pre-patch fetch: it becomes this engine's upstream transport (via
      *  withFetchTransport) so pipeline egress never re-enters the patched
@@ -219,7 +227,15 @@ function responseFrom(res: InlineRes): Response {
     return new Response(res.bodyStream, { status: res.statusCode, statusText: res.statusMessage || undefined, headers });
 }
 
-function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
+/** The bare per-request pipeline — exactly what startServer's dispatch calls
+ *  (server.ts). Shared by the HTTP dispatcher AND the WebSocket bridge: the
+ *  WS session wraps it with its own upstream transport via AsyncLocalStorage,
+ *  so it must NOT be pre-wrapped here. */
+function pipelineFor(ctx: EngineContext): (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void> {
+    return (req, res) => handle(req, res, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx);
+}
+
+function makeDispatcher(pipeline: ReturnType<typeof pipelineFor>, log: EngineContext["log"]): InlineEngine["dispatch"] {
     return async (input, init, rawFetch) => {
         const req = await toInlineReq(input, init);
         const res = new InlineRes();
@@ -251,24 +267,24 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             // it would rewrite the upstream URL back onto the pseudo-origin
             // and loop forever.
             const transport = (url: string, options: FetchOptions): Promise<Response> => (rawFetch ?? globalThis.fetch)(url, options as RequestInit);
-            const pipeline = withFetchTransport(
+            const run = withFetchTransport(
                 transport,
-                () => handle(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx),
+                () => pipeline(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse),
             );
-            if (abortPromise !== undefined) await Promise.race([pipeline, abortPromise]);
-            else await pipeline;
+            if (abortPromise !== undefined) await Promise.race([run, abortPromise]);
+            else await run;
         } catch (err) {
             // Mirror of startServer()'s dispatch catch (server.ts): same
             // client-abort classification, same error shape on the wire.
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-            if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
+            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
             // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
             // throttled [warn] at the throw site is the canonical record.
             else if (!isExpectedFailFast(err)) {
-                if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
-                else ctx.log("error", msg);
+                if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else log("error", msg);
             }
             // A destroyed res belongs to an aborted caller whose promise
             // carries the abort reason — the body stream is errored, so writing
@@ -290,6 +306,121 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
         if (!res.writableEnded) res.end();
         return responseFrom(res);
     };
+}
+
+interface InlineWsBridge {
+    /** Dialable loopback origin, e.g. "http://127.0.0.1:53210". */
+    origin: string;
+    close(): Promise<void>;
+}
+
+/** #4526: the inline lane's own WebSocket bridge. The engine otherwise binds
+ *  nothing, but the Codex Responses lane dials a REAL endpoint — so bind a
+ *  loopback-only upgrade listener on an ephemeral port and serve the same
+ *  per-request pipeline through installWebSocketBridge (the spawn-mode bridge
+ *  verbatim: loopback-source admission, tunnel-destination SSRF guard,
+ *  session lifecycle). unref'd so it never holds the host process open; a
+ *  bind failure degrades ONLY the WS channel direct (warned) — HTTP
+ *  compression keeps running and the engine never fails for this. */
+async function startInlineWsBridge(
+    pipeline: ReturnType<typeof pipelineFor>,
+    opts: ProxyOptions,
+    log: EngineContext["log"],
+    instanceId: string,
+): Promise<InlineWsBridge | undefined> {
+    const server = http.createServer((_req, res) => {
+        // This port exists for WebSocket upgrades only — model HTTP traffic is
+        // served in-process by the fetch chain, nothing else should land here.
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "HTTP is not served by the pi inline WebSocket bridge" }));
+    });
+    // The WS session swallows a rejecting dispatch (warn + bare end), which
+    // would leave Codex staring at a truncated stream. Render the failure
+    // into the envelope instead — same egress as the spawn-mode dispatch
+    // catch (server.ts) and makeDispatcher above: informative error, 503+
+    // Retry-After on a circuit-open fail-fast (#4254).
+    const guarded: ReturnType<typeof pipelineFor> = async (req, res) => {
+        try {
+            await pipeline(req, res);
+        } catch (err) {
+            const msg = String(err);
+            const e = err as { name?: string; message?: string };
+            const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
+            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            else if (!isExpectedFailFast(err)) {
+                if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else log("error", msg);
+            }
+            if (!res.headersSent) {
+                const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                res.writeHead(status, headers);
+                res.end(body);
+            } else {
+                res.end();
+            }
+        }
+    };
+    const wsUpgrade = installWebSocketBridge(
+        server,
+        guarded,
+        log,
+        [codexResponsesCodec],
+        (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined,
+        instanceId,
+    );
+    // Unclaimed upgrades keep the 426 contract (server.ts parity): Codex's
+    // built-in fast-fallback needs a clean 426 to switch to HTTP POST, which
+    // still gets compressed through the in-process fetch chain.
+    server.on("upgrade", (req, socket, head) => {
+        if (wsUpgrade(req, socket, head)) return;
+        socket.on("error", () => {});
+        const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
+        socket.end(
+            "HTTP/1.1 426 Upgrade Required\r\n" +
+                "Connection: close\r\n" +
+                "Content-Type: application/json\r\n" +
+                `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                "\r\n" + body,
+        );
+    });
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const onError = (err: Error) => reject(err);
+            server.once("error", onError);
+            server.listen(0, "127.0.0.1", () => {
+                server.removeListener("error", onError);
+                resolve();
+            });
+        });
+    } catch (err) {
+        log("warn", `[inline] WebSocket bridge bind failed (${String(err)}) — Codex Responses WebSocket traffic will go direct (uncompressed); HTTP compression unaffected (#4526)`);
+        try { server.closeAllConnections(); } catch { /* not listening yet */ }
+        return undefined;
+    }
+    server.unref();
+    const addr = server.address();
+    if (addr === null || typeof addr !== "object") {
+        log("warn", "[inline] WebSocket bridge bound without a readable address — treating as unavailable (#4526)");
+        return undefined;
+    }
+    log("info", `[inline] Codex Responses WebSocket bridge listening on 127.0.0.1:${addr.port} (#4526)`);
+    return {
+        origin: `http://127.0.0.1:${addr.port}`,
+        close: () => new Promise<void>((resolve) => {
+            try { server.closeAllConnections(); } catch { /* already closed */ }
+            server.close(() => resolve());
+        }),
+    };
+}
+
+let liveWsBridge: InlineWsBridge | undefined;
+
+/** Test seam: close the real bridge a booted engine bound (unref'd listeners
+ *  don't block process exit, but an open client/upstream socket does). */
+export async function _closeInlineWsBridgeForTest(): Promise<void> {
+    const bridge = liveWsBridge;
+    liveWsBridge = undefined;
+    await bridge?.close();
 }
 
 let engineFactory: () => Promise<InlineEngine> = startInlineEngine;
@@ -339,6 +470,12 @@ async function startInlineEngine(): Promise<InlineEngine> {
     const ctx = await createEngineContext(opts);
     // No bind/announce step exists inline — ready the moment context is up.
     ctx.markBootReady();
-    ctx.log("info", `[inline] compression engine running in-process (${INLINE_ORIGIN}) — no proxy spawned`);
-    return { origin: INLINE_ORIGIN, dispatch: makeDispatcher(ctx) };
+    // #4526: the one real listener the inline lane carries — the Codex
+    // Responses WebSocket bridge. A bind failure degrades only that channel;
+    // the engine itself stays healthy (HTTP compression is unaffected).
+    const pipeline = pipelineFor(ctx);
+    const wsBridge = await startInlineWsBridge(pipeline, opts, ctx.log, ctx.instanceId);
+    liveWsBridge = wsBridge;
+    ctx.log("info", `[inline] compression engine running in-process (${INLINE_ORIGIN})${wsBridge !== undefined ? `, Codex Responses WebSocket bridge at ${wsBridge.origin}` : ""} — no proxy spawned`);
+    return { origin: INLINE_ORIGIN, wsOrigin: wsBridge?.origin, dispatch: makeDispatcher(pipeline, ctx.log) };
 }

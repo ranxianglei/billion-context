@@ -483,8 +483,8 @@ entries:
     default: "false"
     env: BILI_PI_INLINE
     group: behavior
-    desc_en: "Pi inline lane (#3278): run the pi extension's compression IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin. Resolved env > file > default(off): BILI_PI_INLINE=1/true enables, BILI_PI_INLINE=0/false explicitly disables over this file value."
-    desc_zh: "pi 内联压缩通道（#3278）：pi 扩展在进程内直接压缩——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务。解析顺序 env > 文件 > 默认(off)：BILI_PI_INLINE=1/true 开启，BILI_PI_INLINE=0/false 显式关闭且优先于本文件值。"
+    desc_en: "Pi inline lane (#3278): run the pi extension's compression IN-PROCESS — no spawned proxy; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, and Codex Responses WebSocket traffic by a loopback-only upgrade bridge inside the engine (#4526; a bind failure degrades only that channel direct, warned). Resolved env > file > default(off): BILI_PI_INLINE accepts ANY non-empty value except 0/false/no/off as on (previously only 1/true — on/yes silently spawned); the four off-tokens explicitly disable over this file value."
+    desc_zh: "pi 内联压缩通道（#3278）：pi 扩展在进程内直接压缩——不派生代理进程；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，Codex Responses WebSocket 流量由引擎内的回环升级桥接服务（#4526；绑定失败仅该车道回退直连并告警）。解析顺序 env > 文件 > 默认(off)：BILI_PI_INLINE 除 0/false/no/off 外任何非空值均视为开（此前仅认 1/true——on/yes 会静默回落到 spawn）；四个关闭取值显式优先于本文件值。"
   - key: mitm.enabled
     type: boolean
     default: "true"
