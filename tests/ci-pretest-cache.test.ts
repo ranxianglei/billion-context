@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cache from "../scripts/ci-pretest-cache.mjs";
@@ -171,4 +171,33 @@ test("build failure propagates (CLI exit path) and stamps no marker", () => {
     assert.throws(() => cache.runPretestCache({ root, build: boom }), /tsc exploded/);
     // no marker for a failed component → next run is an honest MISS
     assert.equal(cache.markerIsFresh(join(root, "kernel/dist"), "anything"), false);
+});
+
+// #4497 CI storm: an actions/cache restore brings kernel/dist back byte-exact
+// (marker matches) but with the SAVED mtimes — older than the freshly
+// checked-out sources. The mtime-based #3325 guard (kernelDistStale in
+// tests/golden-storage-drive.ts) then fails the first drive of every golden
+// leg with 'Rebuild first' on perfectly correct bytes. A verified HIT must
+// present its dist as fresh: refresh mtimes, still without rebuilding.
+test("HIT refreshes restored dist mtimes so mtime guards read it fresh (#4497)", () => {
+    const { root } = makeMiniRepo();
+    const kernel = cache.COMPONENTS[0];
+    const hash = cache.hashComponent(root, kernel);
+    const dist = join(root, kernel.dir, "dist");
+
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, "index.js"), "restored-bytes");
+    writeFileSync(join(dist, cache.MARKER_NAME), `${hash}\n`);
+    // Simulate the restore: correct bytes + marker, hour-old timestamps.
+    const saved = new Date(Date.now() - 3600_000);
+    utimesSync(join(dist, "index.js"), saved, saved);
+    utimesSync(join(dist, cache.MARKER_NAME), saved, saved);
+    assert.ok(statSync(join(dist, "index.js")).mtimeMs < Date.now() - 3500_000, "premise: restore looks stale");
+
+    const seen: string[] = [];
+    const before = Date.now();
+    const r = cache.runPretestCache({ root, build: fakeBuild(seen), log: () => {} });
+    assert.equal(r.find((x) => x.name === "kernel")?.hit, true);
+    assert.ok(!seen.includes("kernel"), "a verified HIT never rebuilds");
+    assert.ok(statSync(join(dist, "index.js")).mtimeMs >= before, "HIT refreshes dist mtimes to now");
 });

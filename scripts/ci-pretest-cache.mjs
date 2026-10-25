@@ -32,7 +32,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -77,6 +77,33 @@ export const COMPONENTS = [
 
 /** Never hashed inside a walk — build outputs and deps are not inputs. */
 const SKIP_NAMES = new Set(["node_modules", "dist", "tmp", ".tmp", ".git"]);
+
+/**
+ * Refresh a tree's mtimes in place (HIT path only). A CI cache restore
+ * (actions/cache on kernel/dist / pi-subagents/dist) brings the files back
+ * with the mtimes they had when a previous leg SAVED them — byte-correct
+ * (the marker below proves dist == f(current inputs)) yet older than the
+ * freshly checked-out sources. The mtime-based #3325 guard
+ * (kernelDistStale in tests/golden-storage-drive.ts) then reads the restore
+ * as stale and fails the first drive of every golden leg with 'Rebuild
+ * first: npm run build' even though nothing needs rebuilding (#4497 CI
+ * storm: 6 shards red, ubuntu AND windows legs, correct digests behind the
+ * throw — the guard's once-per-process latch let wires 2-4 through while
+ * wire 1 died). Refreshing on HIT aligns the timestamp with the proven
+ * fact; genuinely stale workspaces still fail the marker check and rebuild,
+ * so the guard keeps its teeth.
+ */
+function touchMtimes(dir) {
+    const now = new Date();
+    const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+            const p = join(d, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) utimesSync(p, now, now);
+        }
+    };
+    walk(dir);
+}
 
 function hashFile(h, abs, rel) {
     h.update(rel);
@@ -144,6 +171,7 @@ export function runPretestCache(opts = {}) {
         const hash = hashComponent(root, comp);
         const distDir = join(root, comp.dir, "dist");
         if (markerIsFresh(distDir, hash)) {
+            touchMtimes(distDir); // a verified restore must not look stale to mtime guards
             log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}`);
             results.push({ name: comp.name, hit: true, ms: 0 });
             continue;
