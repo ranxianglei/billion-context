@@ -423,7 +423,7 @@ async function startInlineEngine(): Promise<InlineEngine> {
     const bridge = startInlineWsBridge({
         dispatchHttp,
         log: ctx.log,
-        isEgressProxied: (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined,
+        egressProxyFor: (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy,
         instanceId: ctx.instanceId,
     });
     const wsOrigin = bridge
