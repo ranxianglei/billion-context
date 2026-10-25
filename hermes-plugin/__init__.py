@@ -7,8 +7,11 @@ billion-context client with no launcher, no env vars and no fixed port:
   model traffic through it via ``HTTPS_PROXY`` + ``SSL_CERT_FILE`` (combined CA bundle) —
   the same wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
 * registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
-* stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
-  wire mode so strict backends see a clean head;
+* keeps register() inside the host's plugin-load deadline — discovery, spawn and tool
+  registration run on a background thread, and the first model request waits (bounded) for
+  readiness instead of slipping out uncompressed;
+* stamps plugin-mode headers only on requests carrying the registered ACP tools — a session
+  whose tool snapshot predates the registration rides proxy mode (server-side compression);
 * reports runtime info (model + max output tokens) to the proxy via bootstrap POSTs.
 
 Fail-open everywhere: if anything here fails, hermes simply talks to the upstream directly.
@@ -90,7 +93,7 @@ _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "AL
 # refused: origins refused by the #1338 attach gate (log dedup per process);
 # instance_id: the registry id discover_instance picked (None until an attach is chosen).
 # loaded: register() installed the cheap surfaces and started a bootstrap;
-# bootstrap: {"state": "starting"|"ready"|"failed"|"stopped", "started_at", "deadline", "error"} —
+# bootstrap: {"state": "starting"|"ready"|"failed"|"stopped", "started_at", "error"} —
 #   /acp reports it while the proxy is cold; tool_names: the manifest's tools (the visibility gate
 #   in on_llm_request compares them against the outgoing request).
 _state: Dict[str, Any] = {
