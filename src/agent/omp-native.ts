@@ -24,7 +24,8 @@
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
@@ -392,6 +393,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.e
 // patch globalThis.fetch or bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     installNativeFetchIntercept(state);
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
 }
 
 /** Test hook: point the module state at a lane origin (the incremental

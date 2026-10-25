@@ -33,7 +33,8 @@ import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { installInlineTransport } from "./pi-inline.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
@@ -308,6 +309,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     // this link instead of egressing toward a proxy port that does not exist.
     if (plan.mode === "inline") installInlineTransport();
     installNativeFetchIntercept(state);
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     // #2111: the Codex Responses WS leg shares the fetch intercept's enable
     // conditions and lifecycle — off mode patches nothing, repeated loads are
     // no-ops, and the wrapper installs before any model connection exists.

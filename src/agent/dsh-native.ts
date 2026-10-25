@@ -61,7 +61,8 @@ import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { dshContextTabEnabled, dshContextTabLabel } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1873,6 +1874,11 @@ export function apply(ctx: PluginContext): void {
         ctx.webServer.register(adminRelayRoute);
     }
 
+    // #1295: declared custom-wire endpoints — the SAME config source the proxy
+    // classifier reads. Loaded best-effort into this host process; a config
+    // change takes effect on the next host start.
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
+
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
         state.attach = true;
@@ -2082,6 +2088,7 @@ export function apply(ctx: PluginContext): void {
         }
         return refuse(url, attributionOf(ctx));
     };
+
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
     // agentless lane is not ours to manage — but a body whose optimistic
     // core-text byte-floor token count already exceeds the window has no
@@ -2105,6 +2112,12 @@ export function apply(ctx: PluginContext): void {
         return refuse(url, attr);
     };
     state.takeoverGate = (url, body, init) => {
+        // #1295: an operator-declared endpoint is explicitly "this URL IS my
+        // model API" — declaration outranks heuristic attribution (a provider
+        // plugin's LLM call may run outside dsh's ALS initiator scope). The
+        // proxy-side body disambiguation still guards against same-path
+        // non-conversation payloads being misrouted.
+        if (matchModelEndpoint(getDeclaredModelEndpoints(), url) !== undefined) return true;
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
@@ -2163,7 +2176,7 @@ export function apply(ctx: PluginContext): void {
         if (unroutedEndpoints.has(key)) return;
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
-        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …) or endpoints declared via modelEndpointPatterns in the global config.`;
         persistClientEvent(line);
     };
 

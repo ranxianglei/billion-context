@@ -46,7 +46,9 @@ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
+import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
+import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
@@ -69,7 +71,7 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
@@ -298,6 +300,10 @@ async function handleRequest(
      *  there so config resolves identically across all request forms. */
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
+    /** #1295: wire family of a declared custom endpoint (currently only
+     *  "commandcode"). Undefined for built-in families; drives the envelope
+     *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
+    let wireFamily: "commandcode" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -362,20 +368,53 @@ async function handleRequest(
                 route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${url}`,
             )
             : undefined;
-        protocol =
-            route?.explicitProtocol
-            ?? declaredProtocol
-            ?? (req.method === "POST" && bodyBuffer.length > 0
-                ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
-                    ? "openai"
-                    : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
-                      ? "anthropic"
-                      : urlPath.endsWith("/responses") || responsesCompact
-                        ? "responses"
-                        : googlePathKind(urlPath) !== null
-                          ? "google"
-                          : null
-                : null);
+        // #1295: declared endpoints are checked BEFORE the built-in path tables —
+        // one config source (src/model-endpoints.ts) feeds both this classifier
+        // and the client-side fetch claim, so the two gates can no longer drift.
+        // The target URL mirrors buildForwardTarget's derivation exactly.
+        const declaredTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${urlPath}`)
+            .replace(/^mitm:\/\//, "https://");
+        const declared = matchModelEndpoint(opts.modelEndpoints, declaredTarget);
+        if (req.method !== "POST" || bodyBuffer.length === 0) {
+            protocol = null;
+        } else if (route?.explicitProtocol !== undefined) {
+            if (declared !== undefined && route.explicitProtocol !== (declared.wire === "commandcode" ? "openai" : declared.wire)) {
+                const key = `${declared.match}|${route.explicitProtocol}`;
+                if (!declPinConflictWarned.has(key)) {
+                    declPinConflictWarned.add(key);
+                    if (declPinConflictWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                        declPinConflictWarned.delete(declPinConflictWarned.values().next().value as string);
+                    }
+                    loggerLog("warn", `modelEndpointPatterns declares ${declared.match} as ${declared.wire} but the request URL pins explicit protocol ${route.explicitProtocol}; the URL pin wins — check for a stale declaration or a client baseUrl that pins the other family`);
+                }
+            }
+            protocol = route.explicitProtocol;
+        } else if (declaredProtocol !== undefined) {
+            // #1909 providers-table declaration outranks the global pattern list
+            // (per-route specificity beats global patterns); both still beat the
+            // built-in suffix heuristics.
+            protocol = declaredProtocol;
+        } else if (declared !== undefined) {
+            if (declared.wire === "commandcode") {
+                // openai-completions request shape inside a nested CLI envelope:
+                // the internal protocol stays "openai" so kernel/loop pipelines
+                // run unchanged — wireFamily selects the envelope + JSONL codecs.
+                wireFamily = "commandcode";
+                protocol = "openai";
+            } else {
+                protocol = declared.wire;
+            }
+        } else {
+            protocol = urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
+                ? "openai"
+                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
+                  ? "anthropic"
+                  : urlPath.endsWith("/responses") || responsesCompact
+                    ? "responses"
+                    : googlePathKind(urlPath) !== null
+                      ? "google"
+                      : null;
+        }
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
         // it on a request whose body has no `model` field (#google).
@@ -539,6 +578,34 @@ async function handleRequest(
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
+    }
+    // #1295: declared commandcode endpoints wrap an openai-completions-shaped
+    // conversation in a nested CLI envelope ({params{...}}). Unwrap it here so
+    // everything below — inbound count, #1284 disambiguation, model/window
+    // resolution, session binding, kernel prepare — sees flat OpenAI.
+    // rewrapCommandcodeBody restores the envelope at the final forward boundary.
+    // Strict fidelity (#1284 precedent): a body that is not a convertible
+    // STREAMING CLI conversation relays verbatim with a one-time loud warning —
+    // never a partial conversion (WIRE-CONTRACTS.md).
+    let ccMeta: CommandcodeEnvelopeMeta | undefined;
+    if (wireFamily === "commandcode" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapCommandcodeBody(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `cc:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[commandcode] declared endpoint body is not a convertible streaming CLI conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.body;
+        ccMeta = unwrapped.meta;
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
@@ -2377,7 +2444,7 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                const runPrepare = async (): Promise<Prepared> => {
+                const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -2473,6 +2540,13 @@ async function handleRequest(
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
                     return preparedOut;
+                };
+                // #1295: stamp the envelope meta onto every Prepared for this
+                // request (initial AND preflight re-prepares both flow through).
+                const runPrepare = async (): Promise<Prepared> => {
+                    const p = await runPrepareInner();
+                    if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
+                    return p;
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2626,7 +2700,7 @@ async function handleRequest(
                                 // (protocol error event for SSE, identical JSON body for
                                 // non-stream) instead of a status code we lost.
                                 if (prepared!.stream) {
-                                    emitPreflightError(res, prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
                                         res.end(JSON.stringify({
@@ -2786,7 +2860,17 @@ async function handleRequest(
     }
     if (!prepared && !forwarded) {
         if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath) && !isV1InternalControlPlanePath(urlPath)) {
-            logUnrecognizedPath(log, req.url ?? "");
+            // A declared model endpoint (src/model-endpoints.ts) is by definition
+            // a recognized URL — GET/HEAD probes or empty-body POSTs against it
+            // are health checks, not misrouted model traffic; "unrecognized
+            // path" warnings here would be pure noise (#1295 review F6). This
+            // mirrors buildForwardTarget's URL derivation exactly.
+            const rawUrl = req.url ?? "";
+            const probeTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(rawUrl) ? rawUrl : `${opts.upstream}${urlPath}`)
+                .replace(/^mitm:\/\//, "https://");
+            if (!matchModelEndpoint(opts.modelEndpoints, probeTarget)) {
+                logUnrecognizedPath(log, req.url ?? "");
+            }
         }
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);
     }
