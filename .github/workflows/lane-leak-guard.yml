@@ -44,11 +44,17 @@ jobs:
             echo "::notice::$BRANCH forked from master at ${FORK:0:12} (strictly past base tag $BASE_TAG) — scanning ${FORK:0:12}..HEAD instead"
             BASE_TAG="$FORK"
           fi
+          # if/then/fi, not an `A && B && C` chain: on a NON-leak merge
+          # `--is-ancestor` exits 1, and as the loop body's final status that
+          # poisons pipefail -> set -e kills the job at LEAKS=$(...) with zero
+          # output (silent false red on clean lanes; swallows a real leak's line
+          # when a clean merge follows it). An if with no else returns 0.
           LEAKS="$(git log --format=%H --merges "${BASE_TAG}..HEAD" \
             | while read -r M; do
                 P2="$(git rev-parse "${M}^2" 2>/dev/null || echo "")"
-                [ -n "$P2" ] && git merge-base --is-ancestor "$P2" origin/master \
-                  && echo "$M $(git log -1 --format=%s "$M")"
+                if [ -n "$P2" ] && git merge-base --is-ancestor "$P2" origin/master; then
+                  echo "$M $(git log -1 --format=%s "$M")"
+                fi
               done)"
           if [ -n "$LEAKS" ]; then
             echo "::error::lane leak detected on $BRANCH — a merge pulled master's UNRELEASED work into the patch lane:"

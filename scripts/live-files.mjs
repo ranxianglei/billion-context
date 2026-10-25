@@ -64,6 +64,9 @@ export const LIVE_FILES = [
     // #3890: spawns the drain fixture; that fixture is listen(0) and reports
     // READY <port>, so no zone band is needed — the entry is for the tripwire
     "tests/issue3890-parent-gone-confirm-drain.test.ts",
+    // #4695: spawns git + bash children against throwaway lane repos; binds no
+    // ports, so the entry is for the SPAWN_RE tripwire only
+    "tests/lane-leak-guard.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
