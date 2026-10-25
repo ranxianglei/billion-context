@@ -987,9 +987,14 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
         deadline = time.monotonic() + SPAWN_WAIT_S
         while time.monotonic() < deadline:
             inst = read_instance_file()
-            if inst and inst.get("launch_token") == token and probe_proxy(inst["origin"]):
-                _state.update(origin=inst["origin"], mode="spawn")
-                return inst["origin"]
+            candidates = ([inst] if inst else []) + read_registry_entries()
+            for candidate in candidates:
+                if candidate.get("launch_token") != token:
+                    continue
+                if not pid_alive(candidate.get("pid")) or not probe_proxy(candidate["origin"]):
+                    continue
+                _state.update(origin=candidate["origin"], mode="spawn", instance_id=candidate["instance_id"])
+                return candidate["origin"]
             if child.poll() is not None:
                 logger.warning("billion-context: proxy child exited before becoming healthy "
                                "(code %s); log: %s", child.returncode,

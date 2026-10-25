@@ -460,6 +460,29 @@ elif SCENARIO == "no-sidecar":
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
+elif SCENARIO.startswith("spawn-registry-"):
+    install_sidecar(False)
+    class Child:
+        returncode = None
+        def poll(self):
+            return None
+        def terminate(self):
+            self.returncode = -15
+    child = Child()
+    def spawn(sidecar, port, token):
+        own = inst_rec(False, token=token if SCENARIO != "spawn-registry-wrong-token" else "foreign")
+        own["instanceId"] = "own-child"
+        if SCENARIO == "spawn-registry-dead":
+            own["pid"] = -1
+        write_registry("own-child", own)
+        write_origin(inst_rec(False, token="foreign", instance_id="last-writer"))
+        return child
+    mod._spawn_child = spawn
+    mod.pid_alive = lambda pid: pid == os.getpid()
+    mod.SPAWN_WAIT_S = 0.3
+    origin = mod.ensure_origin(mod.load_sidecar())
+    out["env_before_ready"] = origin
+    out["state_after_fail"] = "terminated" if child.returncode == -15 else "running"
 elif SCENARIO.startswith("attach-window"):
     # #3261: the host knows the model window (context_length_cache.yaml) — verify it now
     # rides both report channels; the ambiguous leg pins "no guess" on conflicting entries.
@@ -679,6 +702,8 @@ print(json.dumps(out))
 `;
 
 interface DriverOut {
+    env_before_ready?: string | null;
+    state_after_fail?: string;
     scenario: string;
     origin: string;
     pid: number;
@@ -1043,6 +1068,17 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
     });
+
+    for (const scenario of ["spawn-registry-ready", "spawn-registry-wrong-token", "spawn-registry-dead"]) {
+        test(`${scenario}: spawn readiness survives a foreign proxy-origin without accepting foreign or dead entries`, () => {
+            if (!PY) return;
+            const { out, err } = runDriver(scenario);
+            assert.ok(out, err);
+            const ready = scenario === "spawn-registry-ready";
+            assert.equal(out.env_before_ready, ready ? out.origin : null);
+            assert.equal(out.state_after_fail, ready ? "running" : "terminated");
+        });
+    }
 
     test("spawn failure: child dies -> inert, env untouched, starting marker cleaned up", () => {
         if (!PY) {
