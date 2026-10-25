@@ -5,21 +5,19 @@
  * STATE-level equality between the legacy files and the unified index. This
  * suite pins the seams that audit found unproven:
  *
- *   WIRE PARITY      — BILI_STORAGE_UNIFIED=full must be invisible on the
- *                      wire: per-turn outbound digests, fold landmarks and
- *                      the final state digest equal the COMMITTED storage
- *                      render goldens, both with a mid-conversation restart
- *                      and with the legacy file DELETED at the restart (the
- *                      index alone carries the session — the migration's
- *                      end-state promise).
+ *   WIRE PARITY      — full reads match envelope reads plus the documented
+ *                      #4316 ledger-ref migration. All post-restart bodies,
+ *                      landmarks and final digests agree, even when the
+ *                      legacy file is DELETED at restart. Pre-migration
+ *                      bodies also match the committed render goldens.
  *   STALE REJECT     — a multi-instance stale write that the guarded build
  *                      rejects must never reach index.db; the converged disk
  *                      record is what gets ingested.
  *   IMPORT GUARD     — a hand-aged legacy file (older savedAt than the
  *                      index watermark) must not re-import over newer index
  *                      state on load.
- *   ROLLBACK         — unset the env after running full → the legacy file
- *                      loads with the exact digest.
+ *   ROLLBACK         — explicitly select legacy after persisting the full
+ *                      load's migration → the file loads the exact digest.
  *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
  *                      back to legacy; the legacy file stays readable.
  *   CORRUPT INDEX    — a corrupt index.db degrades the store to legacy-only
@@ -141,11 +139,11 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
 }
 
 // ---------------------------------------------------------------------------
-// WIRE PARITY: full mode + mid-conversation restart == committed goldens.
+// WIRE PARITY: full restart == envelope restart + ledger-ref migration.
 // ---------------------------------------------------------------------------
 
 for (const wire of WIRES) {
-    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart, wire == committed goldens)`, { timeout: 240_000 }, async () => {
+    test(`storage engine: full-mode ${wire} restart matches legacy reads plus ledger alignment`, { timeout: 240_000 }, async () => {
         const golden = JSON.parse(fs.readFileSync(path.join(RENDER_ROOT, `${wire}.json`), "utf8")) as {
             turns: Array<{ i: number; sha: string }>;
             foldAt: number; editedAt: number; summaryFrom: number;
@@ -157,13 +155,20 @@ for (const wire of WIRES) {
         // slots (cacheLedger line bs/bl/be pairing, #2131) live in memory, so
         // exactly the first post-restart ledger line loses its bs fields —
         // identically in both legs. Everything else must be byte-equal.
-        const legacy = await driveWire(wire as Wire, `golden-${wire}`, { reloadAfterEdit: "keepFile" });
+        // #4316 deliberately renumbers legacy refs at the first unified cold
+        // load. Keep the independent envelope reader as the oracle, applying
+        // only that documented migration against its shadow ledger. Every
+        // post-restart byte still has to match; the old pre-migration golden
+        // remains the oracle for all turns before the restart.
+        const legacy = await driveWire(wire as Wire, `golden-${wire}`, {
+            storageUnified: "shadow", reloadAfterEdit: "keepFile", alignLegacyRefsOnReload: true,
+        });
         for (const leg of ["keepFile", "dropFile"] as const) {
             const record = await driveWire(wire as Wire, `golden-${wire}`, { storageUnified: "full", reloadAfterEdit: leg });
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
                 assert.equal(record.turns[i]!.sha, legacy.turns[i]!.sha, `${wire}/${leg}: outbound body #${i} digest drift vs legacy restart`);
-                assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: outbound body #${i} digest drift vs committed goldens (restart must not change the wire)`);
+                if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
             }
             assert.equal(record.foldAt, legacy.foldAt, `${wire}/${leg}: fold landmark drifted`);
             assert.equal(record.editedAt, legacy.editedAt, `${wire}/${leg}: edit landmark drifted`);
@@ -274,10 +279,10 @@ test("storage engine: load-side import guard skips a hand-aged legacy file (inde
 });
 
 // ---------------------------------------------------------------------------
-// ROLLBACK: full → unset env → legacy file authoritative, digest exact.
+// ROLLBACK: full → explicit legacy → legacy file authoritative, digest exact.
 // ---------------------------------------------------------------------------
 
-test("storage engine: rollback contract — unset the env and the legacy read path serves the identical state", async () => {
+test("storage engine: rollback contract — explicit legacy mode serves the identical persisted state", async () => {
     const dir = tmpdir("bili-engproof-rollback-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -295,11 +300,13 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         // tail normalization, identically under both paths.)
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        storeFull.closeQuietly();
         assert.ok(viaFull, "full-mode reload returned null");
+        // Persist the one-time cold-load alignment before exercising rollback.
+        await storeFull.writeNow(viaFull);
+        storeFull.closeQuietly();
         const digestFull = viewDigest(toLegacyLike(viaFull));
 
-        delete process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const legacy = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         store2.closeQuietly();
@@ -366,8 +373,10 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         // fallback must reproduce exactly from the legacy file.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
+        // Both replicas must contain the migration before corrupting the index.
+        await clean.writeNow(viaFull);
+        clean.closeQuietly();
 
         // #4338: everything past this point (corrupt the header → degrade
         // construction → fallback read → rename guards → write → close) runs
