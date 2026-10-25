@@ -1863,6 +1863,22 @@ export class SessionStore {
         }
     }
 
+    /** #4738: message rows restricted to the given raw ids (msg_id) — the
+     *  web display fallback for block leaves whose bytes fell out of the
+     *  client's live window (native compaction). EVERY stored version of each
+     *  id comes back; callers pick the newest (max seq). Null when the
+     *  unified store is unavailable or degraded (callers keep the legacy
+     *  lastMessages-only behavior); an empty array means "available, nothing
+     *  stored" — an honest miss. */
+    async unifiedMessageRowsByIds(sessionId: string, rawIds: string[]): Promise<import("./storage/store.js").MessageRow[] | null> {
+        if (!this.shadow || this.shadow.stats.disabled || rawIds.length === 0) return null;
+        try {
+            return await this.shadow.messageRowsByIdsAsync(sessionId, rawIds);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
     /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
      *  tick). Full mode only — in shadow the JSON tree is the truth base and
      *  rows may lag files never yet recorded, so list surfaces must walk.

@@ -765,6 +765,14 @@ export class UnifiedShadow {
         return this.sync.getMessages(sessionId);
     }
 
+    /** #4738: message rows restricted to the given identities (msg_id) —
+     *  the web display fallback for leaves pruned from the client window. */
+    messageRowsByIds(sessionId: string, msgIds: string[]): MessageRow[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.getMessagesByIds(sessionId, msgIds);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         this.assertLive();
@@ -1085,6 +1093,10 @@ export class UnifiedShadow {
 
     tailViewRowsAsync(sessionId: string): Promise<MessageRow[]> {
         return this.viaAsync([], () => this.tailViewRows(sessionId), () => this.backend!.getMessages(sessionId));
+    }
+
+    messageRowsByIdsAsync(sessionId: string, msgIds: string[]): Promise<MessageRow[]> {
+        return this.viaAsync([], () => this.messageRowsByIds(sessionId, msgIds), () => this.backend!.getMessagesByIds(sessionId, msgIds));
     }
 
     getCcrAsync(sessionId: string): Promise<MessageContentStore | null> {

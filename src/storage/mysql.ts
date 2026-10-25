@@ -31,7 +31,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex } from "./store.js";
+import { sha256Hex, MESSAGE_ID_IN_CHUNK } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend } from "./backend.js";
@@ -1030,6 +1030,34 @@ export class MysqlBackend implements StorageBackend {
                 content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
             });
         }
+        return out;
+    }
+
+    async getMessagesByIds(sessionId: string, msgIds: string[]): Promise<(MessageRow & { contentHash: string })[]> {
+        if (msgIds.length === 0) return [];
+        const out: (MessageRow & { contentHash: string })[] = [];
+        for (let i = 0; i < msgIds.length; i += MESSAGE_ID_IN_CHUNK) {
+            const chunk = msgIds.slice(i, i + MESSAGE_ID_IN_CHUNK);
+            const placeholders = chunk.map(() => "?").join(", ");
+            const [rows] = (await this.pool.query(
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${placeholders}) ORDER BY seq`,
+                [sessionId, ...chunk],
+            )) as unknown as Row[][];
+            for (const r of rows) {
+                const contentHash = str(r.content_hash);
+                out.push({
+                    seq: num(r.seq),
+                    msgId: str(r.msg_id),
+                    ref: nullableStr(r.ref),
+                    refNum: nullableNum(r.ref_num),
+                    role: str(r.role),
+                    kind: str(r.kind),
+                    contentHash,
+                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
+                });
+            }
+        }
+        out.sort((a, b) => a.seq - b.seq);
         return out;
     }
 

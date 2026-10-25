@@ -74,6 +74,9 @@ export interface StorageBackend {
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean>;
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]>;
+    /** #4738: message rows restricted to the given identities (msg_id) —
+     *  every stored version of each id, seq order; empty when none match. */
+    getMessagesByIds(sessionId: string, msgIds: string[]): Promise<(MessageRow & { contentHash: string })[]>;
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
@@ -188,6 +191,9 @@ export class SqliteBackend implements StorageBackend {
     }
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
         return Promise.resolve(this.store.getMessages(sessionId));
+    }
+    getMessagesByIds(sessionId: string, msgIds: string[]): Promise<(MessageRow & { contentHash: string })[]> {
+        return Promise.resolve(this.store.getMessagesByIds(sessionId, msgIds));
     }
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId));

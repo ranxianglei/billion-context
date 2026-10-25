@@ -97,6 +97,26 @@ test("contract: ingest → reads round-trip through the interface", async () => 
             assert.equal(parsed.id, "m2", "message content is the verbatim core JSON");
             assert.ok(typeof rows[1]!.contentHash === "string" && rows[1]!.contentHash.length > 0, "content hashes ride the rows");
 
+            // #4738: targeted identity reads — the web layer asks for exactly
+            // the ids it cannot resolve from the client window.
+            const subset = await backend.getMessagesByIds("sess-contract", ["m1"]);
+            assert.equal(subset.length, 1, "identity read returns only the matching id");
+            assert.equal((JSON.parse(subset[0]!.content) as { id?: string }).id, "m1");
+            assert.deepEqual(
+                (await backend.getMessagesByIds("sess-contract", ["m2", "m1"])).map((r) => r.seq),
+                rows.map((r) => r.seq),
+                "seq order matches the full read",
+            );
+            assert.deepEqual(await backend.getMessagesByIds("sess-contract", ["never-stored"]), [], "unknown id → empty, not an error");
+            assert.deepEqual(await backend.getMessagesByIds("sess-contract", []), [], "empty request → empty");
+            // Changed bytes under one id accumulate versions; EVERY row comes
+            // back, seq ascending, so callers can pick the newest.
+            await backend.ingestSession(planIngest(mkSession("sess-contract", [mkMsg("m1", "hello v2"), mkMsg("m2", "world " + "y".repeat(200))])));
+            const versions = await backend.getMessagesByIds("sess-contract", ["m1"]);
+            assert.equal(versions.length, 2, "every stored version of an id is returned");
+            assert.ok(versions[1]!.seq > versions[0]!.seq, "versions ascend in seq order");
+            assert.equal((JSON.parse(versions[1]!.content) as { text?: string }).text, "hello v2", "newest row carries the latest bytes");
+
             const counters = await backend.sessionCounters("sess-contract");
             assert.ok(counters, "session counters readable");
 
@@ -230,6 +250,11 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     assert.equal(rows.length, 2, "both messages landed");
     assert.equal((JSON.parse(rows[1]!.content) as { id?: string }).id, "m2", "verbatim core JSON");
     assert.ok(typeof rows[1]!.contentHash === "string" && rows[1]!.contentHash.length > 0, "content hashes ride the rows");
+    // #4738: targeted identity reads on the mysql lane too.
+    const sub = await backend.getMessagesByIds(sid, ["m1"]);
+    assert.equal(sub.length, 1, "identity read returns only the matching id");
+    assert.equal((JSON.parse(sub[0]!.content) as { id?: string }).id, "m1");
+    assert.deepEqual(await backend.getMessagesByIds(sid, ["never-stored"]), [], "unknown id → empty");
     const counters = await backend.sessionCounters(sid);
     assert.ok(counters && counters.nextBlockId >= 1, "counters readable");
     assert.ok((await backend.listSessionIds()).includes(sid), "enumerated");

@@ -36,6 +36,11 @@ import type { MessageContentStore } from "acp-kernel";
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
+/** #4738: msg_ids per IN-list in getMessagesByIds — one slot per id plus the
+ *  session slot, kept under SQLite's historical SQLITE_MAX_VARIABLE_NUMBER
+ *  floor (999) so old engines cannot reject a marathon-session leaf batch. */
+export const MESSAGE_ID_IN_CHUNK = 500;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -2306,6 +2311,44 @@ export class UnifiedStore {
             contentHash: r.content_hash as string,
             content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
         }));
+    }
+
+    /** #4738: targeted message read by identity (msg_id) — the web display
+     *  fallback for leaves whose bytes fell out of the client's live window
+     *  (native compaction pruned them from lastMessages but the append-only
+     *  log still holds them). Returns EVERY stored version of each id (split
+     *  tool-call cores share an id → distinct rows), seq order; empty when
+     *  none match. Non-retired rows only — retired (rewound/undo) history
+     *  stays out of view reads, matching every other read path (#4390).
+     *  Chunked IN-list: stays under SQLite's historical
+     *  SQLITE_MAX_VARIABLE_NUMBER floor (999, one slot per id + session). */
+    getMessagesByIds(sessionId: string, msgIds: readonly string[]): (MessageRow & { contentHash: string })[] {
+        if (msgIds.length === 0) return [];
+        const out: (MessageRow & { contentHash: string })[] = [];
+        for (let i = 0; i < msgIds.length; i += MESSAGE_ID_IN_CHUNK) {
+            const chunk = msgIds.slice(i, i + MESSAGE_ID_IN_CHUNK);
+            const placeholders = chunk.map(() => "?").join(", ");
+            const rows = this.db
+                .prepare(`SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${placeholders}) ORDER BY seq`)
+                .all(sessionId, ...chunk) as Record<string, unknown>[];
+            out.push(...rows.map((r) => this.mapMessageRow(r)));
+        }
+        out.sort((a, b) => a.seq - b.seq);
+        return out;
+    }
+
+    /** #4738: canonical row → MessageRow mapper (hydrates media from the CAS). */
+    private mapMessageRow(r: Record<string, unknown>): MessageRow & { contentHash: string } {
+        return {
+            seq: r.seq as number,
+            msgId: r.msg_id as string,
+            ref: (r.ref as string | null) ?? null,
+            refNum: (r.ref_num as number | null) ?? null,
+            role: r.role as string,
+            kind: r.kind as string,
+            contentHash: r.content_hash as string,
+            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+        };
     }
 
     getMessages(sessionId: string, opts?: { includeRetired?: boolean }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {

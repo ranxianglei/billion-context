@@ -1,4 +1,4 @@
-import { defaultCountTokens, orderedRefPair } from "acp-kernel";
+import { defaultCountTokens, orderedRefPair, type CoreMessage } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
@@ -1030,7 +1030,12 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
     const run = (async (): Promise<WebSessionDetail | null> => {
         const found = await loadSessionById(id);
         if (!found) return null;
-        return renderDetail(found.session, found.live);
+        // #4738: one batched storage read per detail render — leaves whose
+        // bytes left the client's live window (native compaction) still have
+        // their rows in the unified log; without this the pane goes fully
+        // "missing" on the client's next compaction breath.
+        const storageLeaves = await storageLeavesFor(found.session);
+        return renderDetail(found.session, found.live, storageLeaves);
     })();
     const done = run.finally(() => detailInFlight.delete(id));
     detailInFlight.set(id, done);
@@ -1082,7 +1087,65 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
     return { blocks };
 }
 
-function renderDetail(session: Session, live: boolean): WebSessionDetail {
+/** #4738: fallback leaves for block messages whose bytes are no longer in
+ *  `lastMessages` (the client's native compaction pruned them) but whose rows
+ *  survive in the unified log. One batched identity query per detail render;
+ *  null when nothing is missing OR the unified store is unavailable (legacy
+ *  behavior stands). For each id the NEWEST stored version wins (max seq):
+ *  split tool-call cores share an id, and the freshest bytes are what the
+ *  client last sent before dropping the message. */
+type StorageLeaf = { role?: string; toolName?: string; preview?: string };
+
+/** #4738: newest stored version of an id (max seq) parsed back to a message —
+ *  split tool-call cores share one msg_id across rows, and the freshest bytes
+ *  are what the client last sent before dropping the message. undefined when
+ *  no row matches or the content doesn't parse (honest miss, never fabricate). */
+function newestStoredMessage(rows: import("../storage/store.js").MessageRow[]): CoreMessage | undefined {
+    let best: import("../storage/store.js").MessageRow | undefined;
+    for (const row of rows) if (!best || row.seq > best.seq) best = row;
+    if (!best) return undefined;
+    try {
+        return JSON.parse(best.content) as CoreMessage;
+    } catch {
+        return undefined;
+    }
+}
+
+async function storageLeavesFor(session: Session): Promise<Map<string, StorageLeaf> | null> {
+    const resident = new Set((session.lastMessages || []).map((m) => m.id));
+    const byRaw = session.state.messageRefs.byRaw;
+    const missing = new Set<string>();
+    for (const b of session.state.blocks) {
+        for (const raw of b.directMessageIds || []) {
+            if (resident.has(raw)) continue;
+            const ref = byRaw[raw];
+            // only ref-bearing ids become leaves — mirror refsOf/messageLeaves
+            if (typeof ref === "string" && ref.length > 0) missing.add(raw);
+        }
+    }
+    if (missing.size === 0) return null;
+    const rows = await getDiskStore().unifiedMessageRowsByIds(session.id, [...missing]);
+    if (rows === null) return null;
+    const rowsByRaw = new Map<string, import("../storage/store.js").MessageRow[]>();
+    for (const row of rows) {
+        const group = rowsByRaw.get(row.msgId);
+        if (group) group.push(row);
+        else rowsByRaw.set(row.msgId, [row]);
+    }
+    const out = new Map<string, StorageLeaf>();
+    for (const [raw, group] of rowsByRaw) {
+        const parsed = newestStoredMessage(group);
+        if (!parsed) continue;
+        out.set(raw, {
+            role: typeof parsed.role === "string" ? parsed.role : undefined,
+            ...(typeof parsed.toolName === "string" && parsed.toolName !== "" ? { toolName: parsed.toolName } : {}),
+            preview: messagePreview(typeof parsed.text === "string" ? parsed.text : ""),
+        });
+    }
+    return out;
+}
+
+function renderDetail(session: Session, live: boolean, storageLeaves: Map<string, StorageLeaf> | null = null): WebSessionDetail {
     // renderHandoff reads lastMessages (a bounded snapshot) — safe for disk
     // sessions; the v2 fallback path renders header + block summaries.
     let handoffMd = "";
@@ -1134,9 +1197,11 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // #3917: message leaves. `lastMessages` is the newest full request the
     // client sent (folded messages included — a client never drops them because
     // of OUR folding), so the tree can name every message a block folded — ref,
-    // role, preview — without shipping a byte of full text. A raw id with no
-    // resident message (host-pruned / archived-only session) simply has no leaf;
-    // `directMessageCount` still tells the UI how many were folded.
+    // role, preview — without shipping a byte of full text. #4738: when the
+    // CLIENT itself pruned the message (native compaction), the leaf falls
+    // back to the unified log via `storageLeaves`; only a raw id absent from
+    // BOTH sources stays `missing`. `directMessageCount` always tells the UI
+    // how many were folded.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
     const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
@@ -1144,10 +1209,22 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             const ref = byRaw[raw];
             if (typeof ref !== "string" || ref.length === 0) continue;
             const msg = messageById.get(raw);
-            // #3917: a folded message whose bytes are gone from the store still
-            // gets a row — the ref is the identity the user asked for — but it
-            // carries no preview and the UI says so instead of inventing text.
             if (!msg) {
+                // #4738: bytes gone from the client window but present in the
+                // unified log (native compaction) → render from storage.
+                const stored = storageLeaves?.get(raw);
+                if (stored) {
+                    out.push({
+                        ref,
+                        ...(stored.role !== undefined ? { role: stored.role } : {}),
+                        ...(stored.toolName !== undefined ? { toolName: stored.toolName } : {}),
+                        ...(stored.preview !== undefined ? { preview: stored.preview } : {}),
+                    });
+                    continue;
+                }
+                // absent from both sources — the ref still gets a row (it is
+                // the identity the user asked for) but carries no preview and
+                // the UI says so instead of inventing text (#3917).
                 out.push({ ref, missing: true });
                 continue;
             }
@@ -1372,17 +1449,28 @@ export type MessageContentLookup =
     | { ok: true; ref: string; role: string; toolName?: string; bytes: number; totalBytes: number; truncated: boolean; text: string }
     | { ok: false; reason: "unknown-session" | "unknown-message" };
 
+/** #4738: one raw id straight from the unified log (newest version). undefined
+ *  when the store is unavailable/degraded (legacy installs) or the id has no
+ *  row — both keep the caller at its honest miss. */
+async function storedMessageById(sessionId: string, rawId: string): Promise<CoreMessage | undefined> {
+    const rows = await getDiskStore().unifiedMessageRowsByIds(sessionId, [rawId]);
+    if (rows === null || rows.length === 0) return undefined;
+    return newestStoredMessage(rows);
+}
+
 /** #3917: ONE message's text, addressed by its ref. Resolves the ref to its raw
  *  id and reads the message out of the newest request snapshot (`lastMessages`),
  *  which still carries the messages this proxy folded — folding only changes the
- *  OUTBOUND projection, never what the client keeps sending. A ref whose message
- *  is gone (host-side native compaction pruning) reports `unknown-message`
- *  instead of guessing. */
+ *  OUTBOUND projection, never what the client keeps sending. #4738: when the
+ *  CLIENT pruned it (native compaction), fall back to the unified log — same
+ *  newest-version rule as the tree leaves; only a raw id absent from BOTH
+ *  sources reports `unknown-message`. */
 export async function buildMessageContent(id: string, ref: string): Promise<MessageContentLookup> {
     const session = await sessionForContent(id);
     if (!session) return { ok: false, reason: "unknown-session" };
     const raw = session.state.messageRefs.byRef[ref];
-    const msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
+    let msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
+    if (!msg && typeof raw === "string") msg = await storedMessageById(id, raw);
     if (!msg) return { ok: false, reason: "unknown-message" };
     const text = msg.text ?? "";
     const totalBytes = utf8Bytes(text);
