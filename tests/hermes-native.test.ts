@@ -129,6 +129,11 @@ describe("installer lane (bili plugin install hermes)", () => {
         const home = track(makeTmp("nocli"));
         const emptyBin = track(makeTmp("emptybin"));
         const restore = setHermesEnv(home, emptyBin);
+        // setHermesEnv PREPENDS, so a real hermes on the developer's PATH would still resolve and
+        // the lane would take the "enabled it" branch (passing/failing by machine, not by code).
+        // This case needs an actually CLI-less PATH.
+        const prevPath = process.env.PATH;
+        process.env.PATH = emptyBin;
         try {
             const msg = pluginInstall("hermes");
             // The exact head differs by platform: a POSIX ENOENT prints "the
@@ -138,6 +143,7 @@ describe("installer lane (bili plugin install hermes)", () => {
             assert.match(msg, /enable it manually: hermes plugins enable billion-context/);
             assert.equal(hermesStatus(), "installed");
         } finally {
+            process.env.PATH = prevPath ?? "";
             restore();
         }
     });
@@ -225,6 +231,10 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
+# Deterministic cold-start control: while enabled and unreleased, the stub answers the manifest
+# and health probes with 503 (a proxy that is listening but not ready yet — the same distinction
+# the plugin's manifest-based readiness makes). No timers: the scenario sets/clears the event.
+SLOW = {"enabled": False, "release": threading.Event()}
 
 # --- hermetic YAML backend stubs for the MITM-domain discovery tests (#2838) ---
 # A minimal parser for the restricted config shape under test; lets each scenario pin exactly
@@ -285,7 +295,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/__bili/health":
+        if SLOW["enabled"] and not SLOW["release"].is_set() and (
+                self.path == "/__bili/health" or self.path == "/__bili/plugin/manifest"):
+            self._send({"error": "proxy still booting"}, 503)
+        elif self.path == "/__bili/health":
             RECORDED["health"].append(1)
             mode = os.environ.get("BC_HEALTH_WATCHDOG", "armed")
             if mode == "absent":
@@ -390,6 +403,7 @@ class FakeCtx:
         self.middlewares = {}
         self.hooks = {}
         self.commands = {}
+        self.unload = []
 
     def register_tool(self, name=None, toolset=None, schema=None, handler=None, description="", **kw):
         self.tools[name] = {"toolset": toolset, "schema": schema, "handler": handler, "description": description}
@@ -403,6 +417,29 @@ class FakeCtx:
     def register_command(self, name=None, handler=None, description="", args_hint="", argument_mode=None):
         self.commands[name] = {"handler": handler, "description": description}
         return object()
+
+    def on_unload(self, cb):
+        self.unload.append(cb)
+
+    def run_unload(self):
+        for cb in reversed(self.unload):
+            cb()
+
+CORE_TOOLS = ("compress", "decompress", "acp_status")
+
+def tool_defs(names=CORE_TOOLS):
+    """The native tools as Hermes' per-session snapshot would carry them (OpenAI chat shape)."""
+    return [{"type": "function", "function": {"name": n, "parameters": {"type": "object"}}} for n in names]
+
+def tool_defs_anthropic(names=CORE_TOOLS):
+    return [{"name": n, "input_schema": {"type": "object"}} for n in names]
+
+def mw_request(model, with_tools=True, names=CORE_TOOLS, **extra):
+    req = {"model": model}
+    if with_tools:
+        req["tools"] = tool_defs(names)
+    req.update(extra)
+    return req
 
 mod = load_module()
 mod._reset_for_test()
@@ -460,6 +497,113 @@ elif SCENARIO == "no-sidecar":
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
+elif SCENARIO == "slow-boot-ready":
+    # Cold start: the host's load deadline only bounds register(); the proxy keeps booting on the
+    # background thread. Readiness is the MANIFEST (not a TCP connect), and the release is
+    # event-driven — no sleeps, no wall-clock assumptions.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 10.0
+    mod.FIRST_REQUEST_WAIT_S = 10.0
+    SLOW["enabled"] = True
+    started = __import__("time").monotonic()
+    mod.register(ctx)
+    out["register_elapsed"] = __import__("time").monotonic() - started
+    out["state_after_register"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["tools_after_register"] = sorted(ctx.tools.keys())
+    out["commands_after_register"] = sorted(ctx.commands.keys())
+    out["unload_hooked"] = len(ctx.unload)
+    out["acp_while_starting"] = mod.acp_command("", session_id="sess-slow")
+    out["env_before_ready"] = os.environ.get("HTTPS_PROXY")
+    # Release from another thread while the first model request is parked in the middleware:
+    # proves the gate WAITS for readiness instead of letting turn 1 go out direct.
+    def release_later():
+        __import__("time").sleep(0.3)
+        SLOW["release"].set()
+    threading.Thread(target=release_later, daemon=True).start()
+    mw = ctx.middlewares["llm_request"]
+    t0 = __import__("time").monotonic()
+    first = mw(request=mw_request("slow-model"), session_id="sess-slow", model="slow-model")
+    out["gate_wait_s"] = __import__("time").monotonic() - t0
+    out["first_headers"] = first["request"]["extra_headers"] if isinstance(first, dict) else None
+    out["tools_after_ready"] = sorted(ctx.tools.keys())
+    out["state_after_ready"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["acp_after_ready"] = mod.acp_command("", session_id="sess-slow")
+    out["env_after_ready"] = os.environ.get("HTTPS_PROXY")
+    # A session whose snapshot predates the registration: readiness alone must not stamp headers.
+    out["stale_request_none"] = mw(request=mw_request("slow-model", with_tools=False),
+                                   session_id="sess-slow", model="slow-model") is None
+    out["ready_event_set"] = mod._state["ready_event"].is_set()
+elif SCENARIO == "slow-boot-fail":
+    install_sidecar(True)  # spawn path: the child exits at once, so the bootstrap fails fast
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 0.4
+    mod.FIRST_REQUEST_WAIT_S = 2.0
+    SLOW["enabled"] = True
+    mod.register(ctx)
+    out["state_after_register"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["acp_while_starting"] = mod.acp_command("", session_id="sess-fail")
+    thread = mod._state.get("thread")
+    if thread is not None:
+        thread.join(10)
+    out["state_after_fail"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["tools_after_fail"] = sorted(ctx.tools.keys())
+    out["env_after_fail"] = os.environ.get("HTTPS_PROXY")
+    out["acp_after_fail"] = mod.acp_command("", session_id="sess-fail")
+    mw = ctx.middlewares["llm_request"]
+    t0 = __import__("time").monotonic()
+    first = mw(request=mw_request("m"), session_id="sess-fail", model="m")
+    out["mw_after_fail_none"] = first is None
+    out["mw_after_fail_elapsed"] = __import__("time").monotonic() - t0
+    out["ready_event_set"] = mod._state["ready_event"].is_set()
+elif SCENARIO == "slow-boot-unload":
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 5.0
+    SLOW["enabled"] = True
+    mod.register(ctx)
+    out["state_before_unload"] = (mod._state.get("bootstrap") or {}).get("state")
+    ctx.run_unload()        # host tears the plugin down mid-bootstrap
+    SLOW["release"].set()   # the proxy would come up right after the unload — it must not matter
+    thread = mod._state.get("thread")
+    deadline = __import__("time").monotonic() + 3.0
+    while thread is not None and thread.is_alive() and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.02)
+    out["tools_after_unload"] = sorted(ctx.tools.keys())
+    out["unload_thread_alive"] = bool(thread is not None and thread.is_alive())
+    out["state_after_unload"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["env_after_unload"] = os.environ.get("HTTPS_PROXY")
+    out["mw_after_unload_none"] = ctx.middlewares["llm_request"](
+        request=mw_request("m"), session_id="s") is None
+    out["acp_after_unload"] = mod.acp_command("", session_id="s")
+elif SCENARIO == "slow-boot-restart":
+    # Re-enable without a re-import (the host keeps the module): the second register() must get a
+    # fresh generation — a stale stop event would abort its bootstrap on the first check.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 10.0
+    mod.FIRST_REQUEST_WAIT_S = 10.0
+    SLOW["enabled"] = True
+    mod.register(ctx)
+    ctx.run_unload()
+    ctx.tools.clear()          # the host disposes what the unloaded plugin registered
+    SLOW["release"].set()      # the proxy becomes healthy while the plugin is off
+    thread = mod._state.get("thread")
+    deadline = __import__("time").monotonic() + 3.0
+    while thread is not None and thread.is_alive() and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.02)
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(10)
+    out["tools_after_reenable"] = sorted(ctx.tools.keys())
+    out["state_after_reenable"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["env_after_reenable"] = os.environ.get("HTTPS_PROXY")
+    out["origin_after_reenable"] = mod._state.get("origin")
 elif SCENARIO.startswith("attach-window"):
     # #3261: the host knows the model window (context_length_cache.yaml) — verify it now
     # rides both report channels; the ambiguous leg pins "no guess" on conflicting entries.
@@ -504,9 +648,12 @@ elif SCENARIO.startswith("attach-window"):
     mod.register(ctx)
     mw = ctx.middlewares.get("llm_request")
     hook = ctx.hooks.get("pre_api_request")
-    req = {"model": win_model, "max_tokens": 100}
+    req = mw_request(win_model, max_tokens=100)
     frozen = json.loads(json.dumps(req))
     first = mw(request=req, original_request=frozen, session_id="sess-w", model=win_model, provider=win_provider, api_mode="chat")
+    # a request whose tool snapshot predates the registration must NOT get plugin headers
+    stale = mw(request=mw_request(win_model, with_tools=False), session_id="sess-w", model=win_model,
+               provider=win_provider, api_mode="chat")
     hook(session_id="sess-w", model=win_model, max_tokens=4096)
     deadline = __import__("time").monotonic() + 3.0
     while not RECORDED["runtime_info"] and __import__("time").monotonic() < deadline:
@@ -514,6 +661,7 @@ elif SCENARIO.startswith("attach-window"):
     out.update({
         "req_unmutated": req == frozen,
         "win_headers": first["request"]["extra_headers"] if isinstance(first, dict) else None,
+        "stale_headers": stale["request"]["extra_headers"] if isinstance(stale, dict) else None,
     })
 elif SCENARIO == "output-limits":
     import types
@@ -524,7 +672,8 @@ elif SCENARIO == "output-limits":
                 "group/no-cap": {"context_length": 500000}}
     mod._host_import = lambda name: types.SimpleNamespace(fetch_endpoint_model_metadata=fetch)
     mod._host_resolve = lambda name, base: 500000
-    mod._state.update(origin=ORIGIN, tools_ready=True)
+    mod._state.update(origin=ORIGIN, tools_ready=True, env_applied=True, loaded=True,
+                      tool_names=CORE_TOOLS, mode="attach")
     out["limits"] = []
     for model, base, explicit in [
         ("group/sol", "http://upstream.example/v1", None),
@@ -536,7 +685,7 @@ elif SCENARIO == "output-limits":
         ("group/sol", "http://upstream.example/v1", 4096),
     ]:
         session = "limit-" + str(len(out["limits"]))
-        req = {"model": model, "messages": []}
+        req = mw_request(model)
         context = dict(session_id=session, model=model, base_url=base)
         mod.on_llm_request(request=req, **context)
         for thread in threading.enumerate():
@@ -563,17 +712,25 @@ elif SCENARIO.startswith("attach"):
     if ctx.middlewares.get("llm_request"):
         mw = ctx.middlewares["llm_request"]
         hook = ctx.hooks.get("pre_api_request")
-        req = {"model": "test-model", "max_tokens": 100, "extra_headers": {"X-Custom": "keep"}}
+        req = mw_request("test-model", max_tokens=100, extra_headers={"X-Custom": "keep"})
         frozen = json.loads(json.dumps(req))
         first = mw(request=req, original_request=frozen, session_id="sess-1", model="test-model", provider="p", api_mode="chat")
-        second_req = {"model": "test-model", "messages": []}
+        second_req = mw_request("test-model")
         hook(session_id="sess-1", model="test-model", max_tokens=4096)
         deadline = __import__("time").monotonic() + 3.0
         while not RECORDED["runtime_info"] and __import__("time").monotonic() < deadline:
             __import__("time").sleep(0.05)
         second = mw(request=second_req, original_request=second_req, session_id="sess-1", model="test-model", provider="p", api_mode="chat")
-        cjk_req = {"model": "m-cjk", "messages": []}
+        cjk_req = mw_request("m-cjk")
         cjk = mw(request=cjk_req, original_request=cjk_req, session_id="sess-1", model="浮生云算/gpt-6.1-sol", provider="p", api_mode="chat")
+        # The tools-visibility gate: the same session can be served by a request whose snapshot
+        # does NOT carry the tools (built before the registration) — it must ride proxy mode.
+        no_tools = mw(request=mw_request("test-model", with_tools=False), session_id="sess-1",
+                      model="test-model", provider="p", api_mode="chat")
+        partial_tools = mw(request=mw_request("test-model", names=("compress", "decompress")),
+                           session_id="sess-1", model="test-model", provider="p", api_mode="chat")
+        anthropic_req = {"model": "test-model", "tools": tool_defs_anthropic()}
+        anthropic = mw(request=anthropic_req, session_id="sess-1", model="test-model", provider="p", api_mode="anthropic")
         tool_result = ctx.tools.get("compress", {}).get("handler")({}, session_id="sess-1", task_id="t1")
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
         # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
@@ -585,6 +742,9 @@ elif SCENARIO.startswith("attach"):
             "second_headers": second["request"]["extra_headers"] if isinstance(second, dict) else None,
             "second_model_kept": second["request"].get("model") if isinstance(second, dict) else None,
             "cjk_headers": cjk["request"]["extra_headers"] if isinstance(cjk, dict) else None,
+            "no_tools_none": no_tools is None,
+            "partial_tools_none": partial_tools is None,
+            "anthropic_headers": anthropic["request"]["extra_headers"] if isinstance(anthropic, dict) else None,
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
@@ -595,6 +755,12 @@ elif SCENARIO.startswith("cmd-acp"):
         install_sidecar(False)
         os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
         mod.register(ctx)
+    if SCENARIO == "cmd-acp-manifest-fail":
+        # Attach succeeded and the env is routed, but the manifest GET failed afterwards. The panel
+        # must say "proxy mode" — NOT the direct/uncompressed wording (traffic IS compressed).
+        mod._state["bootstrap"].update(state="failed", error="HTTP 500 from manifest")
+        mod._state["tools_ready"] = False
+        mod._state["tool_names"] = ()
     import inspect
     import types
     route = types.ModuleType("hermes_cli.plugin_session")
@@ -672,6 +838,7 @@ out.update({
     "refused": sorted(mod._state.get("refused") or []),
     "instance_id": mod._state.get("instance_id"),
     "commands": {k: v["description"] for k, v in ctx.commands.items()},
+    "unload_callbacks": len(ctx.unload),
     "status_calls": RECORDED["status"],
 })
 server.shutdown()
@@ -714,10 +881,46 @@ interface DriverOut {
     mitm_domains?: string[];
     mitm_warnings?: string[];
     commands?: Record<string, string>;
+    tools_after_reenable?: string[];
+    state_after_reenable?: string;
+    env_after_reenable?: string | null;
+    origin_after_reenable?: string | null;
     status_calls?: Array<Record<string, string>>;
     cmd_acp?: string | null;
     cmd_acp_cache?: string | null;
     command_results?: Array<{ session: string; panel: string; cache: string }>;
+    unload_callbacks?: number;
+    stale_headers?: Record<string, string> | null;
+    no_tools_none?: boolean;
+    partial_tools_none?: boolean;
+    anthropic_headers?: Record<string, string> | null;
+    register_elapsed?: number;
+    state_after_register?: string;
+    tools_after_register?: string[];
+    commands_after_register?: string[];
+    unload_hooked?: number;
+    acp_while_starting?: string | null;
+    env_before_ready?: string | null;
+    gate_wait_s?: number;
+    tools_after_ready?: string[];
+    state_after_ready?: string;
+    acp_after_ready?: string | null;
+    env_after_ready?: string | null;
+    stale_request_none?: boolean;
+    ready_event_set?: boolean;
+    state_after_fail?: string;
+    tools_after_fail?: string[];
+    env_after_fail?: string | null;
+    acp_after_fail?: string | null;
+    mw_after_fail_none?: boolean;
+    mw_after_fail_elapsed?: number;
+    state_before_unload?: string;
+    tools_after_unload?: string[];
+    unload_thread_alive?: boolean;
+    state_after_unload?: string;
+    env_after_unload?: string | null;
+    mw_after_unload_none?: boolean;
+    acp_after_unload?: string | null;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -767,6 +970,15 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h1["X-Custom"], "keep");
         assert.equal(h1["x-bili-plugin-max-output"], undefined);
         assert.equal(h1["x-bili-plugin-context-window"], undefined, "#3261 fail-open: no host cache file -> no window header");
+        // Cold-start gate: only a request that actually carries the registered native tools is
+        // stamped plugin-mode. A session snapshot taken before the background bootstrap (no tools
+        // key, or a partial surface) must fall back to proxy mode — otherwise the plugin-mode
+        // header makes the proxy suppress tool+nudge injection and the session silently stops
+        // compressing with no way for the model to call compress/decompress.
+        assert.equal(out!.no_tools_none, true, "no tools array -> no plugin-mode stamp");
+        assert.equal(out!.partial_tools_none, true, "snapshot raced registration (partial surface) -> no stamp");
+        assert.equal(out!.anthropic_headers!["x-bili-plugin"], "hermes", "Anthropic tool shape still counts as visible");
+        assert.equal(out!.unload_callbacks, 1, "on_unload registered so teardown can stop a late bootstrap");
         const h2 = out!.second_headers!;
         assert.equal(h2["x-bili-plugin-max-output"], "4096");
         assert.equal(out!.second_model_kept, "test-model");
@@ -814,6 +1026,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h["x-bili-plugin-model"], "group/sol");
         assert.equal(h["x-bili-plugin-context-window"], "500000", "header channel: the host's own window value");
         assert.equal(out!.req_unmutated, true);
+        assert.equal(out!.stale_headers, null, "request without the registered tools is never stamped plugin-mode");
         assert.deepEqual(out!.runtime_info, [
             { agent: "hermes", model: "group/sol", maxOutput: 4096, contextWindow: 500000, source: "hermes-native" },
         ]);
@@ -1055,6 +1268,76 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
     });
+
+    // Cold start: Hermes abandons the plugin context after its 10s load deadline and drops every
+    // registration made later, so register() must return fast and let the slow half finish on a
+    // background thread. The stub proxy answers 503 until the test releases it — readiness is the
+    // MANIFEST, and every wait is event-driven (no sleep standing in for a boot).
+    test("cold start: register returns before the proxy is ready; the first request waits instead of going direct", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("slow-boot-ready");
+        assert.ok(out, err);
+        assert.ok(out!.register_elapsed! < 2, `register must fit the host's load deadline (took ${out!.register_elapsed}s)`);
+        assert.equal(out!.state_after_register, "starting");
+        assert.deepEqual(out!.tools_after_register, [], "tools wait for the manifest — never guessed");
+        assert.deepEqual(out!.commands_after_register, ["acp", "acp-cache"], "slash commands are cheap and registered synchronously");
+        assert.equal(out!.unload_hooked, 1);
+        assert.match(out!.acp_while_starting!, /starting in the background/);
+        assert.match(out!.acp_while_starting!, /budget 10s/);
+        assert.equal(out!.env_before_ready, null, "no env routing before the proxy answers its manifest");
+        assert.ok(out!.gate_wait_s! >= 0.1, "the first model request parked until readiness instead of going out direct");
+        assert.equal(out!.first_headers!["x-bili-plugin"], "hermes");
+        assert.equal(out!.first_headers!["x-bili-plugin-conversation"], "sess-slow");
+        assert.deepEqual(out!.tools_after_ready, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.state_after_ready, "ready");
+        assert.equal(out!.env_after_ready, out!.origin);
+        assert.equal(out!.stale_request_none, true, "readiness alone never stamps a session whose snapshot predates the tools");
+        assert.equal(out!.ready_event_set, true);
+        assert.doesNotMatch(out!.acp_after_ready!, /starting in the background/);
+    });
+
+    test("cold start failure: /acp reports the failure and model traffic goes direct — never silently stalls", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("slow-boot-fail");
+        assert.ok(out, err);
+        assert.equal(out!.state_after_register, "starting");
+        assert.match(out!.acp_while_starting!, /starting in the background/);
+        assert.equal(out!.state_after_fail, "failed");
+        assert.deepEqual(out!.tools_after_fail, [], "a failed bootstrap registers nothing");
+        assert.equal(out!.env_after_fail, null, "env is not routed through an unreachable proxy");
+        assert.match(out!.acp_after_fail!, /failed to start/);
+        assert.match(out!.acp_after_fail!, /going direct/);
+        assert.equal(out!.mw_after_fail_none, true);
+        assert.ok(out!.mw_after_fail_elapsed! < 1, "a settled failure is not re-waited on every turn");
+        assert.equal(out!.ready_event_set, true);
+    });
+
+    test("unload mid-bootstrap: no late tool registration, the thread stops, and the middleware goes inert", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("slow-boot-unload");
+        assert.ok(out, err);
+        assert.equal(out!.state_before_unload, "starting");
+        assert.deepEqual(out!.tools_after_unload, [], "no register_tool after unload — the host would drop it anyway");
+        assert.equal(out!.unload_thread_alive, false, "the bootstrap thread exits on the stop event");
+        assert.equal(out!.state_after_unload, "stopped");
+        assert.equal(out!.env_after_unload, null);
+        assert.equal(out!.mw_after_unload_none, true);
+        assert.match(out!.acp_after_unload!, /plugin unloaded/);
+    });
+
+    test("re-enable after unload: the second register() bootstraps again instead of inheriting the stop", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("slow-boot-restart");
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_after_reenable, ["acp_status", "compress", "decompress"],
+            "the new generation repopulates the host's tool surface");
+        assert.equal(out!.state_after_reenable, "ready");
+        assert.equal(out!.env_after_reenable, out!.origin, "traffic is routed again");
+        assert.equal(out!.origin_after_reenable, out!.origin);
+    });
 });
 
 describe("in-session slash commands (#3697)", () => {
@@ -1119,6 +1402,15 @@ describe("in-session slash commands (#3697)", () => {
             out!.cmd_acp_cache,
             "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)",
         );
+    });
+
+    test("cmd-acp: a manifest failure after attach reports proxy mode, never claims direct traffic", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-manifest-fail");
+        assert.ok(out, err);
+        assert.match(out!.cmd_acp!, /native tool manifest is unavailable/);
+        assert.match(out!.cmd_acp!, /proxy mode/);
+        assert.doesNotMatch(out!.cmd_acp!, /going direct/);
     });
 
     test("cmd-acp-no-proxy: error text without any HTTP traffic", () => {
