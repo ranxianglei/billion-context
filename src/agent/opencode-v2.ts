@@ -48,7 +48,7 @@
 // openai tool list, src/compress-tool.ts) because reload-based refresh is not
 // available on all observed surfaces.
 
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN, withDryRunCompress } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -140,7 +140,7 @@ const TOOL_DELTA_RETRY_MS = 15000;
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
 
-const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
+const V2_BILI_TOOLS = withDryRunCompress([...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI], COMPRESS_TOOL_OPENAI_DRYRUN).map((t) => ({
     name: t.function.name,
     description: t.function.description,
     input: t.function.parameters,

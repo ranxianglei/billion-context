@@ -72,7 +72,7 @@
 //     (written by the config hook, same as the launcher/installer) is the
 //     owner-switch; no compaction-prompt surgery needed.
 
-import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
+import { ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN, withDryRunCompress } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
@@ -795,7 +795,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         } else {
             const tools: Record<string, V1Tool> = {};
             if (deps.z !== undefined) {
-                for (const t of ACP_TOOLS_OPENAI) {
+                for (const t of withDryRunCompress(ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN)) {
                     const fn = t.function;
                     tools[fn.name] = {
                         description: fn.description ?? fn.name,

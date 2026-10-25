@@ -45,7 +45,7 @@ export const EXCEPTIONS: readonly SubsetException[] = [
   {
     file: "kernel/src/compress.ts",
     code: "ENV_ACCESS",
-    fn: "applySingleRange",
+    fn: "commitFoldedRange",
     reason:
       "createdAt: Date.now() — wall-clock stamp on new blocks; orthogonal to every verified invariant, modeled as an unconstrained symbolic integer.",
   },

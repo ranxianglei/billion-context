@@ -4,7 +4,7 @@ import type { ProxyOptions } from "../config.js";
 import { type AnthropicRequestBody, type GoogleFunctionDeclaration, type GoogleTool, type OpenAITool } from "acp-kernel/wire";
 import { appendSystemText } from "../util.js";
 import { absorbEnabled, absorbToolName } from "../absorb.js";
-import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, COMPRESS_TOOL_DRYRUN, COMPRESS_TOOL_GOOGLE_DRYRUN, COMPRESS_TOOL_OPENAI_DRYRUN, COMPRESS_TOOL_RESPONSES_DRYRUN, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withDryRunCompress, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { conversationPromptSections, externalSummaryEnabled, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
@@ -71,14 +71,14 @@ export function injectTool(tools: unknown[] | undefined, extras?: readonly { nam
     // #3252: when the client's own tools are code-mode-shaped (run_code
     // present), the ACP entries get the exempt note — see compress-tool.ts.
     const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));
-    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(withDryRunCompress(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, COMPRESS_TOOL_DRYRUN), toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<unknown>(tools, acp, extras ?? [], (t) => (t as { name?: string })?.name);
 }
 
 export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): OpenAITool[] {
     // #3252: exempt note when the client tools are run_code-shaped.
     const mode = ptcNoteMode((tools ?? []).map((t) => t?.function?.name));
-    const acp = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalOn) as OpenAITool[], mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(withDryRunCompress(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, COMPRESS_TOOL_OPENAI_DRYRUN), toolPrompts), externalOn) as OpenAITool[], mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<OpenAITool>(tools, acp, extras ?? [], (t) => t?.function?.name);
 }
 
@@ -91,7 +91,7 @@ export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name
     const clientNames: (string | undefined)[] = [];
     for (const tool of tools ?? []) for (const decl of tool?.functionDeclarations ?? []) clientNames.push(decl?.name);
     const mode = ptcNoteMode(clientNames);
-    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, toolPrompts), externalOn) as GoogleFunctionDeclaration[], mode, packOwnsDescription(toolPrompts));
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(withDryRunCompress(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, COMPRESS_TOOL_GOOGLE_DRYRUN), toolPrompts), externalOn) as GoogleFunctionDeclaration[], mode, packOwnsDescription(toolPrompts));
     const wanted: { name: string }[] = extra ? [...acp, ...extra] : [...acp];
     if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
     const present = new Set<string>();
@@ -114,7 +114,7 @@ export const FORCE_TEXT_PROTOCOL = knobForceTextProtocol();
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-export function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
+export function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = withDryRunCompress(BILI_ACP_TOOLS_RESPONSES, COMPRESS_TOOL_RESPONSES_DRYRUN), toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
     // #920 rule via mergeOwnedTools: bili owns these names (see core above).
     // #3252: exempt note when the client tools are run_code-shaped.
     const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));

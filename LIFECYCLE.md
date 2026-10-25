@@ -49,6 +49,7 @@
 | `BILI_SNAPSHOT_SHADOW` | #3756 | snapshot-render 影子观测：每个 armed turn 计算快照视图但**不使用**（出站仍走 legacy 路径），与实际发送对比记 per-session 计数（面板 + `snapshot-shadow` 诊断话题）——render 引擎在 rollout 翻转前用真实流量证明健康（dry-run-then-flip，同存储 #2815 shadow→#3818 full 纪律） | render 车道转正（rollout 100% 且影子计数归稳）后退役 | 默认 on（render lane 本身 rollout 0%，纯观测） |
 | `BILI_DSH_AUTHORED_COMPACTION` | #3733 | dsh 原生 compaction summarize 调用由 #1729 guard 拒绝改为**本地应答折叠快照**（零出账；dsh 记 checkpoint、会话文件收缩） | adoption 后按 #2028 模式转 file/web 开关，env 退役（file 键 `dsh.authoredCompaction` 已镜像） | 0.1.203 dogfood 站稳后默认 on；`=0` 回 #1729 拒绝路径 |
 | `BILI_PI_INLINE` | #3278 | pi inline 模式（默认 off）：不起 proxy 进程，fetch 链在 intercept 之下的一个环节把伪 origin 流量路由进进程内引擎（inline-engine.ts，跑同 startServer 的每请求管线）；file 家 `"pi": {"inline": true}`，`=0` 显式关 | inline 车道 GA（转 §2 常设）或实验放弃后收束 | opt-in（默认 off） |
+| `BILI_COMPRESS_DRYRUN` | #3185（PR #3193） | compress 工具 dryRun 预览能力的 opt-in 开关：`"1"`/`"true"` 才启用，缺省 off——off 时 compress 工具 schema + prompt 与 #3185 前逐字节一致、无调用路由进预览路径（knobs.ts:191 `dryRunPreviewEnabled`：env > file `compress.dryRunPreview` > false） | 预览车道转正（GA）后移 §2 常设面并退役 env（file 键保留）；实验放弃则 env+file+预览代码一并收束 | opt-in（默认 off） |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）

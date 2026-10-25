@@ -280,6 +280,7 @@
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
+| `compress.dryRunPreview` | boolean | false | BILI_COMPRESS_DRYRUN | 暴露压缩工具的 dryRun 预览模式（校验范围并估算可省 token，不落盘）；默认关闭，关闭时对外 schema/提示词与引入前逐字节一致（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
@@ -1609,6 +1610,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 当使用率越过阈值时注入自动压缩 nudge 消息。设为 `false`（或 `ACP_COMPRESS_NUDGE=0`）可禁用 nudge 注入。同时禁用 `injectTool` 和 `injectNudge` 在功能上类似 `passthrough`，区别在于代理仍会跟踪 token 使用量。
 
+#### `dryRunPreview`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** ACTIVE
+- **说明：** 暴露压缩工具的 `dryRun` 预览模式——带 `dryRun: true` 的调用会校验范围并报告哪些会被折叠/排除/撤销、哪些块会被吸收、预计可省多少 token，且零副作用（不落盘、不分配 ref）。**默认关闭**：关闭时对外提供的工具 schema 与压缩提示词与引入该功能前逐字节一致（无 `dryRun` 字段、无预览指引），任何误传的 `dryRun: true` 都会被忽略，因此对现有行为完全无影响。设为 `true`（或 `BILI_COMPRESS_DRYRUN=1`）启用（仅全局层级生效）。
+
 ### 为什么第一次压缩要到 200k 才触发？
 
 压缩触发时机**不是按绝对窗口位置，而是按增长区间**：默认在开机内容之上**增长
@@ -1782,6 +1790,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_COMPRESS_DRYRUN` | `compress.dryRunPreview` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |

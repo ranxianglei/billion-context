@@ -101,6 +101,9 @@ test("content alternation: typed array alternative + typed string alternative", 
     "string",
     "items keep the line-form string alternative",
   );
+  // The base surface keeps summary REQUIRED (switch OFF == pre-feature bytes);
+  // the relaxed summary-less branches exist only in COMPRESS_PARAMETERS_DRYRUN
+  // (asserted in parse-compress-input.test.ts).
   const expectedRequired: Array<[number, string[]]> = [
     [1, ["startId", "endId", "summary"]],
     [2, ["startRef", "endRef", "summary"]],

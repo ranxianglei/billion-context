@@ -684,6 +684,61 @@ export interface ApplyCompressionResult {
   };
 }
 
+/** Input for previewCompression (#3185): applyCompression's ranges minus the
+ * summary — a dry run never consumes or validates one, so the field does not
+ * exist rather than being optional-but-ignored. */
+export interface PreviewCompressionInput {
+  ranges: {
+    startRef: string;
+    endRef: string;
+    topic?: string;
+    compressCallId?: string;
+    summaryMaxChars?: number;
+  }[];
+  messages: CoreMessage[];
+  state: CompressionState;
+  config: Config;
+  protectedMessageIds?: Set<string>;
+}
+
+/** Per-range verdict of a previewCompression (#3185) call: exactly what a
+ * real compress call would do with this range, computed without committing. */
+export interface RangePreview {
+  startRef: string;
+  endRef: string;
+  /** Exact error text a real call would produce for this range, or null. */
+  error: string | null;
+  /** Skipped because it overlaps an earlier range in the same batch. */
+  skippedOverlap?: boolean;
+  /** Already covered by active block(s); nothing new to compress. */
+  alreadyCovered?: boolean;
+  /** Block ids that would be updated in place instead of creating a fresh block. */
+  wouldRefold?: string[];
+  /** Refs folded into the new block. */
+  wouldFold?: string[];
+  /** Refs excluded from folding, by reason category. */
+  excluded?: {
+    protectedTools?: string[];
+    recentZone?: string[];
+    checkpointCarriers?: string[];
+    media?: string[];
+  };
+  /** Messages withdrawn by the turn-integrity gate, with split counts. */
+  withdrawn?: { refs: string[]; splitTurns: number; splitPairs: number };
+  /** Active block ids absorbed (deactivated) by the fold. */
+  consumedBlocks?: string[];
+  /** Estimated tokens removed (folded messages plus absorbed block summaries). */
+  estimatedTokensSaved?: number;
+  /** Non-fatal notices a real call would emit for this range. */
+  warnings?: string[];
+}
+
+export interface PreviewReport {
+  /** Batch-level rejection a real call would hit (min-range gate etc.), or null. */
+  batchError: string | null;
+  ranges: RangePreview[];
+}
+
 export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;

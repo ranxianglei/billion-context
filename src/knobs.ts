@@ -220,6 +220,17 @@ export function allowPrivateHttpProviders(): boolean {
     return fileNetwork().allowPrivateHttpProviders === true;
 }
 
+/** BILI_COMPRESS_DRYRUN > compress.dryRunPreview > false (#3185: the compress
+ *  tool's dryRun preview capability is OFF by default — when off, the served
+ *  tool schema + prompt are byte-identical to pre-#3185 and no call routes to
+ *  the preview path; positive judgment mirrors persistZstdEnabled — only
+ *  "1"/"true" enable). */
+export function dryRunPreviewEnabled(): boolean {
+    const envRaw = process.env.BILI_COMPRESS_DRYRUN;
+    if (envRaw !== undefined) return envRaw === "1" || envRaw === "true";
+    return loadConfigFile().compress?.dryRunPreview === true;
+}
+
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */

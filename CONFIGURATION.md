@@ -280,6 +280,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
+| `compress.dryRunPreview` | boolean | false | BILI_COMPRESS_DRYRUN | Expose the compress tool's dryRun preview mode (validate a range and estimate savings without committing); off by default so the served schema/prompt are byte-identical to pre-feature (global level only). |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
@@ -1604,6 +1605,13 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
 
+#### `dryRunPreview`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Expose the compress tool's `dryRun` preview mode — a call with `dryRun: true` validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved, with zero side effects (nothing stored, no refs allocated). **Off by default**: when off, the served tool schema and compression prompt are byte-identical to the pre-feature surface (no `dryRun` field, no preview guidance) and any stray `dryRun: true` argument is ignored, so existing behavior is entirely unaffected. Set `true` (or `BILI_COMPRESS_DRYRUN=1`) to enable it (global level only).
+
 ### Why the first compaction waits until 200k
 
 Compaction does **not** trigger on absolute window position — it triggers on
@@ -1785,6 +1793,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_COMPRESS_DRYRUN` | `compress.dryRunPreview` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
