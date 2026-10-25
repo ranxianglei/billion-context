@@ -265,11 +265,13 @@ async function forwardCaptured(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
+    releaseRequestInput?: () => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
+        releaseRequestInput?.();
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
@@ -279,6 +281,7 @@ async function forwardCaptured(
     // zero-egress contract as codexForge; the audit line was written in
     // prepare (this line is the egress-proof for the serve itself).
     if (prepared?.autoModeForge) {
+        releaseRequestInput?.();
         log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
         res.end(prepared.autoModeForge.body);
@@ -1444,6 +1447,11 @@ async function forwardCaptured(
             }
         }
     }
+    // No further overflow refold can run. Release its inbound-only state before
+    // consuming a potentially long response; wireBody still owns retry/echo data.
+    releaseRequestInput?.();
+    releaseRequestInput = undefined;
+    overflowRefold = undefined;
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
     // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is

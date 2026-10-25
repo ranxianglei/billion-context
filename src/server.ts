@@ -4170,20 +4170,48 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
-        let aborted = false;
-        req.on("data", (c: Buffer) => {
-            if (aborted) return;
+        let settled = false;
+        const cleanup = () => {
+            settled = true;
+            chunks.length = 0;
+            req.off("data", onData);
+            req.off("end", onEnd);
+            req.off("error", onError);
+            req.off("close", onClose);
+        };
+        const onError = (error: unknown) => {
+            if (settled) return;
+            cleanup();
+            reject(error);
+        };
+        const onData = (c: Buffer) => {
+            if (settled) return;
             size += c.length;
-            if (size > knobLimitsReceiveBytes()) {
-                aborted = true;
+            const limit = knobLimitsReceiveBytes();
+            if (size > limit) {
+                onError(new BodyTooLargeError(limit));
                 req.destroy();
-                reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
-        });
-        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
-        req.on("error", (e) => { if (!aborted) reject(e); });
+        };
+        const onEnd = () => {
+            if (settled) return;
+            try {
+                const body = Buffer.concat(chunks);
+                cleanup();
+                resolve(body);
+            } catch (error) {
+                onError(error);
+            }
+        };
+        // IncomingMessage also closes after a normal end, whose handler has
+        // already settled and removed this premature-close fallback.
+        const onClose = () => onError(new Error("request closed before body completed"));
+        req.on("data", onData);
+        req.on("end", onEnd);
+        req.on("error", onError);
+        req.on("close", onClose);
     });
 }
 

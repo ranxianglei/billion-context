@@ -40,7 +40,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -519,6 +519,9 @@ async function handleRequest(
             parsed = null;
         }
     }
+    // Capture the raw-wire verdict before unwrapping or preparing can mutate
+    // parsed. Only these scalars are needed for the post-forward bookkeeping.
+    const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
@@ -545,6 +548,7 @@ async function handleRequest(
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
+    bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -2381,10 +2385,10 @@ async function handleRequest(
             // #2155: self-heal evaluates once per HTTP request — the refold
             // re-runs prepare below but must not double-count a round.
             let selfHealRoundDone = false;
-            const runPreparedPipeline = async (
+            let runPreparedPipeline: ((
                 respondFailFast: boolean,
                 overflowWindow?: number,
-            ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
+            ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
                 const runPrepare = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
@@ -2756,7 +2760,7 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            const pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an
@@ -2771,21 +2775,36 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
+                          const next = await withSessionLock(session, () => runPreparedPipeline!(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta);
+                const releaseRequestInput = () => {
+                    // Refolding is finished before streaming starts. Drop the
+                    // input-only bindings even if forward's wrapper retains the
+                    // callback; accepted outbound bodies still support retries.
+                    bodyBuffer = Buffer.alloc(0);
+                    parsed = null;
+                    affinityMessagesCache = null;
+                    runPreparedPipeline = undefined;
+                };
+                try {
+                    await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, releaseRequestInput);
+                } finally {
+                    // Transport failures and locally forged replies can return
+                    // before the upstream response boundary.
+                    releaseRequestInput();
+                }
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, rawWireMetadata));
                 }
             }
         } finally {

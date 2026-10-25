@@ -391,10 +391,30 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
     scheduleSaveConversations();
 }
 
+interface PluginWireMetadata {
+    wireHash: string;
+    textComparable: boolean;
+}
+
+/** Capture the raw request's snapshot evidence before prepare mutates its
+ *  parsed view. Only these scalars need to survive forwarding. */
+export function preparePluginWireMetadata(rawWire: Buffer, parsedWire: unknown): PluginWireMetadata {
+    let textComparable = false;
+    try {
+        if (parsedWire !== null && typeof parsedWire === "object") {
+            const wire = parsedWire as Record<string, unknown>;
+            textComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+        }
+    } catch {
+        textComparable = false;
+    }
+    return { wireHash: createHash("sha256").update(rawWire).digest("hex"), textComparable };
+}
+
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
+export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer | PluginWireMetadata): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
     // so both the ≤200 heuristic and size-based guards are proxies that a new
@@ -515,17 +535,22 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             snapshotRefsEvaluatedStore.set(session, session.contentStore);
         }
         if (rawWire !== undefined) {
-            // The comparable verdict is a property of the wire body: hash it
-            // (native speed) and only re-parse + walk when the body actually
-            // changed, so a retry with an identical body stays cheap.
-            const wireHash = createHash("sha256").update(rawWire).digest("hex");
+            // The handler captures this evidence before forwarding so it need
+            // not retain the raw body. Buffer callers keep the hash-gated parse.
+            const wireHash = Buffer.isBuffer(rawWire)
+                ? createHash("sha256").update(rawWire).digest("hex")
+                : rawWire.wireHash;
             if (session.metadata.publicSnapshotWireHash !== wireHash) {
                 let comparable: boolean;
-                try {
-                    const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
-                    comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
-                } catch {
-                    comparable = false;
+                if (Buffer.isBuffer(rawWire)) {
+                    try {
+                        const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
+                        comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+                    } catch {
+                        comparable = false;
+                    }
+                } else {
+                    comparable = rawWire.textComparable;
                 }
                 session.metadata.publicSnapshotWireHash = wireHash;
                 if (session.metadata.publicSnapshotTextComparable !== comparable) {
