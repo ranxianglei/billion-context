@@ -69,7 +69,11 @@ test("cold load recovers the pre-fix orphan freeze before processing a request",
     assert.equal(recovered.stats.requests, 876);
     assert.equal(recovered.state.nextBlockId, 4);
     assert.deepEqual(recovered.state.blocks.map(b => b.blockId), ["b3"]);
-    assert.equal(recovered.state.messageRefs.byRef.m00003, "raw-new");
+    // Recovery is followed by #4316's one-time ledger alignment: raw-new is
+    // the first stored message, so its durable ref is seq 0 + 1.
+    assert.equal(recovered.state.messageRefs.byRaw["raw-new"], "m00001");
+    assert.equal(recovered.state.messageRefs.byRef.m00001, "raw-new");
+    assert.equal(recovered.restampSuperseded?.get("m00003"), "raw-new");
     assert.equal(recovered.lastMessages?.at(-1)?.text, "new turn");
     assert.equal(recovered.metadata.recoveryMarker, "fresh");
     assert.equal(recovered.blockContents.get("b1")?.full.text, "retained original");

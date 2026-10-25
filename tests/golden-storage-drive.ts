@@ -17,10 +17,10 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, restampRefsToLedger } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { flushAllSessions, _resetSessionsForTest } from "../src/session.ts";
+import { flushAllSessions, getSession, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 
 /**
@@ -462,6 +462,8 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
     dumpStateTo?: string;
     storageUnified?: "shadow" | "full";
     reloadAfterEdit?: "keepFile" | "dropFile";
+    // Independent legacy-read oracle for #4316's intentional cold-load migration.
+    alignLegacyRefsOnReload?: boolean;
 } = {}): Promise<GoldenRecord> {
     __goldenGuard();
     fs.mkdirSync(SCRATCH_ROOT, { recursive: true });
@@ -503,7 +505,12 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         upstream.listen(0, "127.0.0.1");
         await listen(upstream);
         const upstreamPort = (upstream.address() as { port: number }).port;
-        store = new SessionStore({ dir: sessionsDir, debounceMs: 1, enabled: true });
+        // Save at the explicit restart/final checkpoints below. A 1ms timer
+        // makes ingest/verification counts depend on machine speed, so the
+        // three reader legs can migrate refs from different ledger snapshots.
+        // The debounce exceeds the suite's four-minute deadline; it is never
+        // awaited. Delta/sampled-write behavior has storage-watermark tests.
+        store = new SessionStore({ dir: sessionsDir, debounceMs: 300_000, enabled: true });
         _setStoreForTest(store);
         setRegistryForTest({});
         proxy = await startServer(goldenProxyOptions(upstreamPort, 200_000));
@@ -558,8 +565,16 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
                     if (fs.statSync(fp).isFile() && (f as string).endsWith(".json") && !fs.existsSync(fp + ".tmp")) fs.rmSync(fp, { force: true });
                 }
             }
-            store = new SessionStore({ dir: sessionsDir, debounceMs: 1, enabled: true });
+            store = new SessionStore({ dir: sessionsDir, debounceMs: 300_000, enabled: true });
             _setStoreForTest(store);
+            if (opts.alignLegacyRefsOnReload) {
+                const loaded = getSession(sessionId);
+                const seqByRaw = store.unifiedSeqByRaw(sessionId);
+                if (!seqByRaw?.size) throw new Error("legacy alignment oracle requires a populated shadow ledger");
+                const outcome = restampRefsToLedger(loaded.state, seqByRaw);
+                if (outcome.superseded.size > 0) loaded.restampSuperseded = outcome.superseded;
+                store.scheduleSave(loaded);
+            }
         }
         // Post-edit growth: 2 trailing turns. Also load-bearing for the
         // STATE digest: the persist layer does not reliably write the final
@@ -660,7 +675,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         // orphaned inode and REOPEN the deleted path, resurrecting the tree
         // mid-rmrf (the #1646/#1910 ENOTEMPTY/EBUSY race class). The detach
         // + target-clear below are synchronous, so no interleaving window.
-        // The 1ms-debounced store writer races the same way (recreating
+        // A pending store writer races the same way (recreating
         // sessions/<provider>/ after the final flush).
         try { store?.cancelAll(); } catch { /* no store on early-exit paths */ }
         void closeLogger();
