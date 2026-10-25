@@ -114,7 +114,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.closeQuietly(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
@@ -742,71 +742,77 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
     });
 }
 
-test("HTTP fork revision and originals survive a new proxy process", { timeout: 60_000 }, async () => {
-    const h = await harness(true);
-    let child: ReturnType<typeof spawn> | undefined;
-    try {
-        await compress(h);
-        const parent = resolveConversation("parent").session!;
-        parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
-        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
-        parent.contentStoreDirty = true;
-        assert(h.store.flushSync(parent));
-        // #4316 PR3/3: cold load runs the one-time ledger alignment — the loaded
-        // state now carries refLedgerAligned. Mirror it in the expectation.
-        const persistedState = JSON.parse(JSON.stringify(parent.state));
-        persistedState.refLedgerAligned = true;
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
-        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-        const req = forkRequest(snapshot);
-        const fork = await h.request("/__bili/plugin/fork", req);
-        assert.equal(fork.status, 201);
-        const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
-        const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
-        child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
-        let stderr = "";
-        child.stderr!.on("data", (b) => { stderr += b.toString(); });
-        const port = await new Promise<number>((resolve, reject) => {
-            let stdout = "";
-            const timer = setTimeout(() => reject(new Error("restart timeout: " + stderr + stdout)), 15000);
-            child!.stdout!.on("data", (b) => {
-                stdout += b.toString();
-                const port = stdout.match(/\{"port":(\d+)\}/);
-                if (port) { clearTimeout(timer); resolve(Number(port[1])); }
+for (const storageMode of ["legacy", "full"] as const) {
+    test(`HTTP fork revision and originals survive a new proxy process (${storageMode})`, { timeout: 60_000 }, async () => {
+        const previousMode = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = storageMode;
+        const h = await harness(true);
+        let child: ReturnType<typeof spawn> | undefined;
+        try {
+            await compress(h);
+            const parent = resolveConversation("parent").session!;
+            parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
+            parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
+            parent.contentStoreDirty = true;
+            assert(h.store.flushSync(parent));
+            // #4316 PR3/3: only a unified cold load runs the one-time ledger
+            // alignment; the CI legacy baseline retains the original state.
+            const persistedState = JSON.parse(JSON.stringify(parent.state));
+            if (storageMode === "full") persistedState.refLedgerAligned = true;
+            assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const req = forkRequest(snapshot);
+            const fork = await h.request("/__bili/plugin/fork", req);
+            assert.equal(fork.status, 201);
+            const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+            const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
+            child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
+            let stderr = "";
+            child.stderr!.on("data", (b) => { stderr += b.toString(); });
+            const port = await new Promise<number>((resolve, reject) => {
+                let stdout = "";
+                const timer = setTimeout(() => reject(new Error("restart timeout: " + stderr + stdout)), 15000);
+                child!.stdout!.on("data", (b) => {
+                    stdout += b.toString();
+                    const port = stdout.match(/\{"port":(\d+)\}/);
+                    if (port) { clearTimeout(timer); resolve(Number(port[1])); }
+                });
+                child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
+                child!.once("error", (error) => { clearTimeout(timer); reject(error); });
             });
-            child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
-            child!.once("error", (error) => { clearTimeout(timer); reject(error); });
-        });
-        const call = async <Path extends string>(path: Path, body?: unknown) => {
-            const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-            return { status: r.status, body: await responseBody(r, path) };
-        };
-        const restored = await call("/__bili/plugin/snapshot?conversationId=child");
-        const restoredStatus = await call("/__bili/plugin/status?conversationId=parent&fallback=latest");
-        assert.equal(restoredStatus.status, 200);
-        assert.equal(restoredStatus.body.sessionId, "parent");
-        assert.equal(restoredStatus.body.fallback, undefined);
-        assert.equal(restoredStatus.body.sessionRevision, snapshot.parentRevision);
-        assert.equal(restoredStatus.body.contextTokensSource, "estimate");
-        assert.equal(restored.status, 200);
-        assert.equal(restored.body.parentRevision, childSnapshot.parentRevision);
-        assert.deepEqual(restored.body.orderedMessages, childSnapshot.orderedMessages);
-        assert.equal((await call("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
-        const replay = await call("/__bili/plugin/fork", req);
-        assert.equal(replay.status, 200);
-        assert.equal(replay.body.replayed, true);
-        const retrieved = await call("/__bili/plugin/tool", { conversationId: "child", tool: "acp_retrieve", args: { ref: "m00001" } });
-        assert.equal(retrieved.status, 200);
-        assert.match(retrieved.body.result, /CCR original retained independently after restart/);
-        const original = await call("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
-        assert.match(original.body.result, /first original/);
-        assert.match(original.body.result, /second original/);
-        assert(!original.body.result.includes("tail original"));
-    } finally {
-        if (child?.pid && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
-        await h.close();
-    }
-});
+            const call = async <Path extends string>(path: Path, body?: unknown) => {
+                const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+                return { status: r.status, body: await responseBody(r, path) };
+            };
+            const restored = await call("/__bili/plugin/snapshot?conversationId=child");
+            const restoredStatus = await call("/__bili/plugin/status?conversationId=parent&fallback=latest");
+            assert.equal(restoredStatus.status, 200);
+            assert.equal(restoredStatus.body.sessionId, "parent");
+            assert.equal(restoredStatus.body.fallback, undefined);
+            assert.equal(restoredStatus.body.sessionRevision, snapshot.parentRevision);
+            assert.equal(restoredStatus.body.contextTokensSource, "estimate");
+            assert.equal(restored.status, 200);
+            assert.equal(restored.body.parentRevision, childSnapshot.parentRevision);
+            assert.deepEqual(restored.body.orderedMessages, childSnapshot.orderedMessages);
+            assert.equal((await call("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
+            const replay = await call("/__bili/plugin/fork", req);
+            assert.equal(replay.status, 200);
+            assert.equal(replay.body.replayed, true);
+            const retrieved = await call("/__bili/plugin/tool", { conversationId: "child", tool: "acp_retrieve", args: { ref: "m00001" } });
+            assert.equal(retrieved.status, 200);
+            assert.match(retrieved.body.result, /CCR original retained independently after restart/);
+            const original = await call("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
+            assert.match(original.body.result, /first original/);
+            assert.match(original.body.result, /second original/);
+            assert(!original.body.result.includes("tail original"));
+        } finally {
+            if (child?.pid && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
+            await h.close();
+            if (previousMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = previousMode;
+        }
+    });
+}
 
 test("HTTP status separates real usage from a manual-compression estimate and changing generation", { timeout: 60_000 }, async () => {
     const h = await harness();
