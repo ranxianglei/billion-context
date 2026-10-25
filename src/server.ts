@@ -13,7 +13,7 @@ export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { withExitDeadline } from "./exit-deadline.js";
-import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
+import { configFileEpoch, effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -492,6 +492,11 @@ export interface EngineContext {
     log: (level: string, msg: string) => void;
     instanceId: string;
     instanceStartedAt: number;
+    /** #4705: config-file content epoch captured ONCE AT BOOT (never re-read — a
+     *  live read would always match the current file and make drift undetectable).
+     *  Served on /__bili/health; the launcher diffs it against its own epoch at
+     *  attach to surface stale-config instead of serving it silently. */
+    startupConfigEpoch: string;
     proxyWatchers: Set<number>;
     /** #3544: heartbeat opt-in liveness proof per watched pid (see watcherIsDead). */
     watcherLastSeen: Map<number, number>;
@@ -544,6 +549,8 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
     const instanceStartedAt = Date.now();
+    // #4705: boot-time config epoch — see EngineContext.startupConfigEpoch for why it must be captured here, not per call.
+    const startupConfigEpoch = configFileEpoch();
     // #2941: the bind happens BEFORE announceListening writes this instance's
     // identity files (pointer + registry entry), and the health route is
     // stateless — so between bind and registration a probe sees "healthy" for
@@ -639,6 +646,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         log,
         instanceId,
         instanceStartedAt,
+        startupConfigEpoch,
         proxyWatchers,
         initialWatcherPid,
         watcherLastSeen,
@@ -654,6 +662,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         log,
         instanceId,
         instanceStartedAt,
+        startupConfigEpoch,
         proxyWatchers,
         watcherLastSeen,
         initialWatcherPid,

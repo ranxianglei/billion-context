@@ -78,7 +78,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
+import { loadRoutes, configFileEpoch, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -4023,7 +4023,13 @@ interface HealthInfo {
      *  gate compares it against OUR version — absent on pre-#3544 builds, in
      *  which case the generation is unverifiable and no rotation happens. */
     version?: string;
-    /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
+    /** #4705: the resident's BOOT-time config-file content epoch (absent on
+     *  pre-#4705 builds → unknown, no warning). Diffed against our own
+     *  configFileEpoch() at attach: a mismatch means the user edited the config
+     *  while this helper was alive, so its process-level settings stay inert until
+     *  a shutdown+respawn. */
+    configEpoch?: string;
+    /** #1753: the spawn-wait
      *  fallback uses this to verify the healthy responder on the preferred
      *  port is the child WE spawned (and not a foreign proxy squatting it). */
     pid?: number;
@@ -4054,12 +4060,13 @@ async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boo
             ...(opts?.noKeepAlive ? { headers: { connection: "close" } } : {}),
         });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; configEpoch?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
         if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
         if (typeof data.auxProxy === "string" && data.auxProxy.length > 0) info.auxProxy = data.auxProxy;
         if (typeof data.auxProxySource === "string" && data.auxProxySource.length > 0) info.auxProxySource = data.auxProxySource;
+        if (typeof data.configEpoch === "string") info.configEpoch = data.configEpoch;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             const wd = data.watchdog as { armed: boolean; watchers?: unknown };
             const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
@@ -4219,6 +4226,19 @@ export function isNewerSameLaneHolder(
 function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
     if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
     return instanceShapeMismatch(inst, opts, foreignLanes);
+}
+
+/** #4705: attaching REUSES the resident's boot-time config — process-level opts
+ *  are cached from loadOptions() and never re-read, so a disk edit made while the
+ *  helper was alive stays inert until a shutdown+respawn. The resident's boot
+ *  epoch (health.configEpoch) vs our current one says whether the user's latest
+ *  edit is being shadowed. Returns an actionable warning, or undefined when there's
+ *  nothing to report: resident epoch absent (pre-#4705 build), either side unreadable
+ *  ("" — e.g. a different per-lane file), or the two agree. */
+export function attachConfigDriftNote(residentEpoch: string | undefined, currentEpoch: string): string | undefined {
+    if (residentEpoch === undefined || residentEpoch === "" || currentEpoch === "") return undefined;
+    if (residentEpoch === currentEpoch) return undefined;
+    return "attached helper is serving STALE config — you edited billion-context.json after this helper started, so process-level settings (compress.*, providers table, subagentSplit, modelContextLimit, …) are NOT applied yet. Fix: stop this helper (POST /__bili/shutdown) and let the host respawn it, or save the config from the bili panel.";
 }
 
 /** #1232: every healthy live instance — not just the last writer of the
@@ -5662,6 +5682,13 @@ export async function ensureProxyRunning(
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
         // port would strand every request.
+        // #4705: this attach REUSES the resident's boot-time config — if the user
+        // edited the config file since this helper started, the new values are inert
+        // until a shutdown+respawn. Say so loudly instead of letting the edit read
+        // as "broken". The resident's boot epoch rides on its health probe.
+        const residentHealth = probed.find((c) => c.inst.origin === existing.origin)?.health;
+        const driftNote = attachConfigDriftNote(residentHealth?.configEpoch, configFileEpoch());
+        if (driftNote) attachDiag(driftNote);
         return attachTo(existing);
     }
     // #5103: an explicit attachUrl target that discovery FOUND but every gate
