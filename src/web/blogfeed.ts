@@ -76,6 +76,8 @@ export function _setBlogRootForTest(root: string | null): void {
 
 /** Mirror of the website tools' frontmatter parser (key: value between --- fences). */
 function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
+    // Windows checkouts use CRLF; parse and render the same Markdown on every platform.
+    text = text.replace(/\r\n/g, "\n");
     const fm: Record<string, string> = {};
     let body = text;
     if (text.startsWith("---\n")) {

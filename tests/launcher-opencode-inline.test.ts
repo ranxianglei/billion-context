@@ -28,6 +28,7 @@ interface SpawnRecord {
     command: string;
     args: string[];
     env: NodeJS.ProcessEnv | undefined;
+    windowsVerbatimArguments?: boolean;
 }
 
 // `bili opencode-inline` (#4669): the launcher must start NO proxy, hand the
@@ -37,16 +38,12 @@ interface SpawnRecord {
 // clone (plugin injection only; 2.x directory wrapper when the host is 2.x).
 test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attach/proxy env stripped, plugin rides OPENCODE_CONFIG", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ocinline-"));
-    const prevHome = process.env.HOME;
-    const prevUserProfile = process.env.USERPROFILE;
     const prevXdg = process.env.XDG_CONFIG_HOME;
     const prevOcConfig = process.env.OPENCODE_CONFIG;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevBcp = process.env.BILLION_CONTEXT_PROXY;
     const prevHttpsProxy = process.env.HTTPS_PROXY;
     const prevMitmHosts = process.env.BILI_MITM_HOSTS;
-    process.env.HOME = home;
-    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     // Isolated config root: no user opencode.json, no ambient OPENCODE_CONFIG.
     process.env.XDG_CONFIG_HOME = path.join(home, ".config");
     delete process.env.OPENCODE_CONFIG;
@@ -75,7 +72,7 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
 
     const spawns: SpawnRecord[] = [];
     const spawnImpl: SpawnFn = (cmd, args, options) => {
-        spawns.push({ command: cmd, args: [...args], env: options?.env });
+        spawns.push({ command: cmd, args: [...args], env: options?.env, windowsVerbatimArguments: options?.windowsVerbatimArguments });
         const child = makeFakeChild(0);
         const orig = child.on!.bind(child);
         (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -109,8 +106,16 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
             { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(spawns.length, 1, "exactly one child (opencode itself) — no proxy spawn");
-        assert.equal(spawns[0].command, fakeOc);
         const env = spawns[0].env!;
+        if (process.platform === "win32") {
+            assert.equal(spawns[0].command, env.COMSPEC?.trim() ? env.COMSPEC : "cmd.exe");
+            const quotedOc = /\s/.test(fakeOc) ? `"${fakeOc}"` : fakeOc;
+            assert.deepEqual(spawns[0].args, ["/d", "/s", "/c", `"${quotedOc}"`]);
+            assert.equal(spawns[0].windowsVerbatimArguments, true);
+        } else {
+            assert.equal(spawns[0].command, fakeOc);
+            assert.deepEqual(spawns[0].args, []);
+        }
         assert.equal(env.BILI_OPENCODE_INLINE, "1");
         assert.equal(env.BILLION_CONTEXT_PROXY, undefined, "inherited BILLION_CONTEXT_PROXY must be stripped (attach would win)");
         assert.equal(env.HTTPS_PROXY, undefined, "inherited HTTPS_PROXY must be stripped (no MITM lane)");
@@ -134,9 +139,6 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
         assert.equal(clone.compaction?.auto, false, "host auto-compaction stays off (ACP owns compression)");
     } finally {
         process.exit = prevExit;
-        process.env.HOME = prevHome;
-        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
-        else process.env.USERPROFILE = prevUserProfile;
         if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prevXdg;
         if (prevOcConfig === undefined) delete process.env.OPENCODE_CONFIG;
