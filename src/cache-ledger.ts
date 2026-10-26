@@ -1291,10 +1291,17 @@ export function recordCacheSample(
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
-            const curB = session.transient?.sentBody;
+            // #4731: #3307's original read hit session.transient directly, but #4430
+            // moved the relay-lane PENDING evidence into the per-request ALS capture —
+            // on every wrapped lane (streaming, loop rounds, non-streaming) the slot
+            // was always undefined and this whole block silently died. Read the
+            // pending pair via pendingCapture (same scope as its
+            // noteForwardedBody/noteInboundMessages); the SETTLED baselines (prev*)
+            // deliberately stay on transient — settleUsageReport moves them there.
+            const curB = pendingCapture(session).sentBody;
             const prevB = session.transient?.settledBody;
             if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
-                const curIn = session.transient?.inBody;
+                const curIn = pendingCapture(session).inBody;
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
