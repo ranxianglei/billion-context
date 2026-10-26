@@ -267,6 +267,8 @@
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
+| `compress.preserveRecentTurns` | number | off | — | 最近 N 轮（轮 = 一条 user 消息到下一条 user 消息）的全部消息加入软保护区（#4593）。 |
+| `compress.protectUserMessages` | boolean | off | — | 所有 user 文本消息硬保护、永不压缩（#4593）。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
@@ -1377,6 +1379,26 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** *（内核默认值，通常为 `5000`）*
 - **状态：** ACTIVE
 - **说明：** 为最近消息保护预留的 token 预算。映射到内核字段 `preserveRecentTokens`。
+
+#### `preserveRecentTurns`
+
+- **类型：** `number`
+- **默认值：** 关闭（`0` 或未设置）
+- **状态：** ACTIVE（#4593，需要 `acp-kernel` ≥ 0.0.164）
+- **说明：** 按轮保留。一轮 = 一条 user 消息 + 到下一条 user 消息为止的全部内容。最近 N 轮的全部消息与 `preserveRecentMessages`/`preserveRecentTokens`/最新 user 钉住一起并入软保护区——同一个并集，无内部优先级。一条轮往往横跨几十条工具调用/结果，按条数保留要么截在轮中间、要么过度保留，这正是本键存在的理由。提交压缩区间时的确定行为：
+  - **区间完全落在保护区内** → 拒绝，报错 `Range is entirely within the protected zone (…)`.
+  - **区间部分重叠** → 受保护部分被过滤掉（在第一条内部受保护消息处截断，保证摘要不会落在它所回答的问题之上，#3953），其余部分正常压缩；回执里带一条可审计警告，逐条列出被跳过的 ref 及原因（`…of which N in last-turns retention`）。若剩余不足 `minCompressRange`，走既有的 too-small 拒绝。
+  - 推荐区间（`acp_status`）永不跨边界——只有手工挑选的区间才会触发过滤。
+  - 溢出松弛（#330）会把 `preserveRecentMessages`/`preserveRecentTokens` 清零，但**有意不**清本键：压力下折叠用户指令等于让本功能失效，因此无法解决的溢出会响亮地失败而不是悄悄折掉指令。
+- **示例：** `{ "compress": { "preserveRecentTurns": 3 } }`
+
+#### `protectUserMessages`
+
+- **类型：** `boolean`
+- **默认值：** 关闭（未设置 = `false`）
+- **状态：** ACTIVE（#4593，需要 `acp-kernel` ≥ 0.0.164）
+- **说明：** 硬保护所有 user 文本消息——会话中唯一不可再生的输入：工具结果可以重跑、摘要可以重写，但用户指令一旦被折进模型自写的摘要，就无法再逐字核对。保护是 HARD 排除，语义同 `protectedTools`：匹配的 ref 显示为 `BLOCKED`、永不出现在可压缩推荐里；提交的区间包含它们时会被过滤并留下可审计的回执警告（`Excluded N user message(s) … (protectUserMessages)`）；整段全是这类消息的区间会被拒绝。刻意保守：宿主注入的 runtime-context user 消息也在保护范围内（误保护只损失压缩比，误折叠会丢指令）。摘要载体——文本以内核 SUMMARY_HEADER 开头的 user 消息——与工具结果（role `tool`）不匹配。与其他 compress 字段一样，global → provider → model 最深层生效。
+- **示例：** `{ "compress": { "protectUserMessages": true } }`
 
 #### `minCompressRangeChars`
 

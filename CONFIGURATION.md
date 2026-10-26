@@ -267,6 +267,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip. |
 | `compress.preserveRecentMessages` | number | 3 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
+| `compress.preserveRecentTurns` | number | off | — | All messages of the last N turns (turn = user message → next user message) join the soft-protected zone (#4593). |
+| `compress.protectUserMessages` | boolean | off | — | Every user text message is hard-protected, never compressible (#4593). |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
 | `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
 | `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
@@ -1374,6 +1376,26 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** *(kernel default, typically `5000`)*
 - **Status:** ACTIVE
 - **Description:** Token budget reserved for recent-message protection. Maps to the kernel field `preserveRecentTokens`.
+
+#### `preserveRecentTurns`
+
+- **Type:** `number`
+- **Default:** off (`0` or unset)
+- **Status:** ACTIVE (#4593, requires `acp-kernel` ≥ 0.0.164)
+- **Description:** Per-turn retention. A "turn" is one user message plus everything up to the next user message. All messages of the last N turns join the soft-protected zone alongside `preserveRecentMessages`/`preserveRecentTokens`/the latest-user pin — one union set, no internal priority. Message counts don't bound a turn (a single turn spans dozens of tool calls/results), which is why count-based retention alone either cuts mid-turn or over-retains. Deterministic behavior for a submitted compress range:
+  - **Range entirely inside the protected zone** → rejected with `Range is entirely within the protected zone (…)`.
+  - **Range partially overlapping** → the protected part is filtered out (truncated at the first interior protected message so no summary lands above the question it answers, #3953); the rest compresses normally, and the receipt carries an auditable warning listing exactly which refs were skipped and their cause (`…of which N in last-turns retention`). If the remainder falls below `minCompressRange`, the existing too-small rejection applies.
+  - Recommended ranges (`acp_status`) never cross the boundary — only hand-picked ranges hit the carve.
+  - Overflow relaxation (#330) zeroes `preserveRecentMessages`/`preserveRecentTokens` but deliberately NOT this knob: folding user instructions under pressure defeats the feature, so an unresolvable overflow fails loudly instead.
+- **Example:** `{ "compress": { "preserveRecentTurns": 3 } }`
+
+#### `protectUserMessages`
+
+- **Type:** `boolean`
+- **Default:** off (unset = `false`)
+- **Status:** ACTIVE (#4593, requires `acp-kernel` ≥ 0.0.164)
+- **Description:** Hard-protect every user text message — the only non-regenerable input in a session: tool results can be re-run, summaries rewritten, but once a user instruction is folded into a model-written summary it can no longer be checked verbatim. Protection is a HARD exclusion like `protectedTools`: matching refs render as `BLOCKED`, are never advertised as compressible, and a submitted range containing them has them carved out with an auditable receipt warning (`Excluded N user message(s) … (protectUserMessages)`); a range consisting solely of such messages is rejected. Conservative by design: host-injected runtime-context user messages are covered too (over-protection costs compression ratio; under-protection loses instructions). Summary carriers — user-role messages whose text starts with the kernel's SUMMARY_HEADER — and tool results (role `tool`) do NOT match. Deepest level wins across global → provider → model like the other compress fields.
+- **Example:** `{ "compress": { "protectUserMessages": true } }`
 
 #### `minCompressRangeChars`
 

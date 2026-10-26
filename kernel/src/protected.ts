@@ -1,4 +1,5 @@
 import type { Config, CoreMessage } from "./types.js";
+import { SUMMARY_HEADER } from "./prune.js";
 
 /** Tools that are ALWAYS protected, regardless of user config. These are ACP's
  *  own metadata tools whose records must remain in context: compress calls
@@ -308,14 +309,37 @@ export function virtualToolPathOf(
   return config.messagePathOf?.(msg);
 }
 
+/** True for a genuine user text message — role "user", plain text content,
+ *  not a pasted summary carrier. #4593 protectUserMessages hard-protection
+ *  rides on this: user instructions are the only non-regenerable input in a
+ *  session (tool results can be re-run, summaries rewritten), so once one
+ *  leaves the wire it can no longer be checked verbatim. Summary carriers
+ *  are excluded so tier-merge of blocks that contain user messages stays
+ *  possible; host-injected runtime-context user messages ARE protected on
+ *  purpose (conservative default: over-protecting costs compression ratio,
+ *  under-protecting loses an instruction). */
+export function isUserTextMessage(msg: CoreMessage): boolean {
+  if (msg.role !== "user") return false;
+  if (msg.contentType !== "text") return false;
+  if (msg.text?.startsWith(SUMMARY_HEADER)) return false;
+  return true;
+}
+
 export function isMessageProtected(
   msg: CoreMessage,
-  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf" | "isCompressTool">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf" | "isCompressTool" | "protectUserMessages">,
   failedToolCallIds?: ReadonlySet<string>,
 ): boolean {
   // Host-declared message-level protection (#2419): applies to ANY content
   // type and outranks everything below — the host owns the decision.
   if (config.isMessageProtected?.(msg)) return true;
+
+  // #4593: user-text hard protection (protectUserMessages). Checked before
+  // the tool-path branches because its domain (role "user" text) never
+  // overlaps them.
+  if (config.protectUserMessages === true && isUserTextMessage(msg)) {
+    return true;
+  }
 
   // #4289: a compress exchange that applied ZERO ranges is refuse, not
   // metadata — no block carries its arguments and decompress never consults

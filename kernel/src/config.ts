@@ -135,6 +135,19 @@ export function validateConfig(config: Config): string[] {
   ) {
     errors.push("preserveRecentTools must be a string array");
   }
+  if (
+    config.preserveRecentTurns !== undefined &&
+    (!Number.isFinite(config.preserveRecentTurns) ||
+      config.preserveRecentTurns < 0)
+  ) {
+    errors.push("preserveRecentTurns must be a finite number >= 0");
+  }
+  if (
+    config.protectUserMessages !== undefined &&
+    typeof config.protectUserMessages !== "boolean"
+  ) {
+    errors.push("protectUserMessages must be a boolean");
+  }
   if (config.absorb) {
     if (config.absorb.enabled && !config.absorb.toolName) {
       errors.push("absorb.toolName must be a non-empty string when enabled");

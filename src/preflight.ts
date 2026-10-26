@@ -1432,6 +1432,11 @@ function readDeterministicProbeState(metadata: Record<string, unknown>): Determi
 // the soft zone is a preference, not a constraint: relax it to zero so its
 // oldest content becomes foldable. The hard protectedTools exclusion is
 // computed independently of preserveRecent* and still applies.
+// #4593 exception: preserveRecentTurns is deliberately NOT relaxed here. It is
+// an explicit user decision that the last N turns (and their user
+// instructions) must survive verbatim — folding them under overflow defeats
+// the feature's purpose, so an unresolvable overflow fails loudly instead.
+// protectUserMessages is a hard protection and never relaxes either.
 function relaxedConfig(config: Config): Config {
     return { ...config, preserveRecentMessages: 0, preserveRecentTokens: 0 };
 }

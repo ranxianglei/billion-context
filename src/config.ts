@@ -290,6 +290,20 @@ export type CompressSettings = {
     preserveRecentMessages?: number;
     /** Token budget reserved for recent messages (kernel `preserveRecentTokens`). */
     preserveRecentTokens?: number;
+    /** #4593: per-turn retention. All messages of the last N turns (a turn =
+      *  one user message plus everything up to the next user message) join
+      *  the soft-protected zone: a submitted range is truncated/carved at the
+      *  boundary with an auditable warning, and a range entirely inside it is
+      *  rejected. 0 or unset = off. Deepest level wins across global →
+      *  provider → model, like the other compress fields. Maps to kernel
+      *  `preserveRecentTurns` (acp-kernel >= 0.0.164). */
+    preserveRecentTurns?: number;
+    /** #4593: hard-protect every user text message (kernel
+      *  `protectUserMessages`). User instructions are the only non-regenerable
+      *  input in a session — once folded into a summary they can no longer be
+      *  checked verbatim. Off unless explicitly enabled at some level. Maps to
+      *  kernel `protectUserMessages` (acp-kernel >= 0.0.164). */
+    protectUserMessages?: boolean;
     /** Minimum compressible range size, in CHARACTERS (not tokens); smaller
      *  ranges are skipped. English/code averages ~4 chars per token, CJK
      *  ~1-2 chars per token, so the same number is ~4× more permissive for
@@ -2240,7 +2254,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
-    "preserveRecentMessages", "preserveRecentTokens",
+    "preserveRecentMessages", "preserveRecentTokens", "preserveRecentTurns", "protectUserMessages",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
@@ -2921,6 +2935,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj[key];
         if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
         else (out as Record<string, unknown>)[key] = v;
+    }
+    // #4593: an explicit 0 is meaningful (off), so validate >= 0 instead of
+    // takeNumber's plain finite check (same class as minPressureBenefitTokens).
+    if ("preserveRecentTurns" in obj) {
+        const v = obj.preserveRecentTurns;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else out.preserveRecentTurns = Math.floor(v);
+    }
+    if ("protectUserMessages" in obj) {
+        if (typeof obj.protectUserMessages !== "boolean") ok = false;
+        else out.protectUserMessages = obj.protectUserMessages;
     }
     // #2228: the decision side-call budget must be positive — 0/negative would
     // starve the call, so validate stricter than takeNumber.
