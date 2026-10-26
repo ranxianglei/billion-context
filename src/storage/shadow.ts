@@ -213,6 +213,16 @@ export class UnifiedShadow {
                         /* absent sidecar files are fine */
                     }
                 }
+                // #4609: the verdict cache belongs to the quarantined file set —
+                // move it along so the fresh store starts with a clean cache
+                // (its stats differ anyway; this keeps the directory honest).
+                try {
+                    const cacheFrom = `${dir}/index.db.chk`;
+                    renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
+                    quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
+                } catch {
+                    /* absent cache is fine */
+                }
                 loggerLog(
                     "error",
                     `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,

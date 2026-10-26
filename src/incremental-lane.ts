@@ -457,12 +457,26 @@ function applyTurn(
     let deltaMsgs = flat.msgs;
     if (deltaIds !== undefined) {
         const v = validateMsgIds(deltaIds, flat.msgs.length);
-        if (!v.ok) return { ok: false, status: 400, error: `msgIds invalid (${v.reason})`, serverSeq };
-        const claimed = new Set(entry.msgs.map((m) => m.id));
-        for (const id of v.ids) {
-            if (!resync && claimed.has(id)) return { ok: false, status: 400, error: "msgIds reuse an existing canonical id", serverSeq };
+        if (!v.ok && v.reason !== "length-mismatch") {
+            return { ok: false, status: 400, error: `msgIds invalid (${v.reason})`, serverSeq };
         }
-        deltaMsgs = applyMsgIdPin(flat.msgs, v.ids);
+        if (v.ok) {
+            const claimed = new Set(entry.msgs.map((m) => m.id));
+            for (const id of v.ids) {
+                if (!resync && claimed.has(id)) return { ok: false, status: 400, error: "msgIds reuse an existing canonical id", serverSeq };
+            }
+            deltaMsgs = applyMsgIdPin(flat.msgs, v.ids);
+        }
+        // !v.ok && reason === "length-mismatch": the envelope gate already
+        // proved the ids are parallel to the WIRE messages, so a mismatch
+        // HERE means the wire→core conversion expanded multi-block messages
+        // (1 wire → N core rows — assistant [text+tool_use], user
+        // [text+tool_result]) — exactly the "core conversion can legally map
+        // wire messages non-1:1" case the lane contract (#4491, envelope
+        // gate in applyIncrementalTurn) says must DEGRADE to derived ids,
+        // never hard-fail. A 400 here made every dsh/omp turn carrying a
+        // multi-block message fail forever — the client retries the same
+        // shape and has no 400 recovery (only 200/409/503 are handled).
     }
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...deltaMsgs];

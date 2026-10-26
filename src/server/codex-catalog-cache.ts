@@ -90,6 +90,7 @@ export function createCodexCatalogFetch(
 ) {
     const memory = new Map<string, Entry>();
     const invalidated = new Set<string>();
+    const replayNoted = new Set<string>();
     const clock = options.now ?? Date.now;
     const maxAge = options.maxAgeMs ?? 6 * 60 * 60 * 1000;
     const fresh = (entry: unknown): entry is Entry =>
@@ -213,6 +214,15 @@ export function createCodexCatalogFetch(
             if ([500, 502, 503, 504].includes(status)) return fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
             if (status === 304) {
                 if (!entry) return result;
+                // A 304 answers a CONDITIONAL request; this wrapper never
+                // sends If-None-Match, so a persistent one means the gateway
+                // revalidates unconditional GETs — and savedAt keeps resetting
+                // below, which would pin this cached catalog forever without
+                // any trace. Log once per credential so the loop is visible.
+                if (!replayNoted.has(key)) {
+                    replayNoted.add(key);
+                    log("warn", `[model-catalog] upstream answered 304 to an unconditional GET; replaying cached catalog as a full 200; age=${Math.floor((clock() - entry.savedAt) / 1000)}s`);
+                }
                 await remember({ ...entry, savedAt: clock() });
                 discard(result);
                 return replay(entry, false);

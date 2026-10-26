@@ -540,8 +540,13 @@ export class MysqlBackend implements StorageBackend {
                 const wantedIds = Array.from(wanted);
                 for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
                     const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    // LIVE rows only (mirror of store.ts): block bounds describe
+                    // the CURRENT replay — getMessages filters retired rows, so
+                    // a tombstoned generation must never widen the stored span.
+                    // No live rows for a covered id → -1 sentinel → the upsert's
+                    // IF(VALUES(start_seq)>=0,...) preserves stored bounds (#4608).
                     const spanRows = (await c.query(
-                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`,
+                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")}) AND retired_at IS NULL`,
                         [s.sessionId, ...ids],
                     )) as unknown as Row[][];
                     for (const r of spanRows[0]) {
@@ -723,8 +728,18 @@ export class MysqlBackend implements StorageBackend {
                 [s.sessionId, r.msgId, r.to, r.seq],
             )) as unknown as Row[][];
             for (const l of leftovers) {
+                const [lMedia] = (await c.query(
+                    "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
+                    [s.sessionId, num(l.seq)],
+                )) as unknown as Row[][];
                 await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
                 await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+                // Per-row refcount release, mirroring the SQLite twin: the
+                // deleted row owned one ref on r.to and each mapping row one
+                // on its media hash — skip this and the blobs are permanently
+                // over-counted (zero-ref GC can never reclaim them).
+                await this.releaseContent(c, r.to);
+                for (const lm of lMedia) await this.releaseContent(c, String(lm.media_hash));
             }
             await this.putContent(c, r.content, r.to);
             await c.query("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?", [r.to, s.sessionId, r.seq]);
@@ -996,16 +1011,26 @@ export class MysqlBackend implements StorageBackend {
                  WHERE session_id = ? AND seq <= ?`,
                 [childId, parentId, throughSeq],
             );
+            // Per COPIED ROW, not DISTINCT — same under-count fix as the
+            // SQLite twin: two mapping rows sharing one media_hash must bump
+            // twice or the zero-ref sweep deletes bytes a later delete path
+            // still releases twice.
             const [hashes] = (await conn.query(
-                "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
+                "SELECT content_hash AS h FROM messages WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
-            for (const row of hashes) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            for (const row of hashes) {
+                const [res] = (await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h])) as unknown as [{ affectedRows: number }, unknown];
+                if (res.affectedRows === 0) throw new Error(`cloneSessionRows: content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
+            }
             const [media] = (await conn.query(
-                "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
+                "SELECT media_hash AS h FROM message_media WHERE session_id = ?",
                 [childId],
             )) as unknown as Row[][];
-            for (const row of media) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            for (const row of media) {
+                const [res] = (await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h])) as unknown as [{ affectedRows: number }, unknown];
+                if (res.affectedRows === 0) throw new Error(`cloneSessionRows: media content row missing for hash ${String(row.h).slice(0, 16)}… — refusing to fork with an uncounted ref`);
+            }
             await conn.query(
                 `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
                  VALUES (?, ?, ?, ?, ?)

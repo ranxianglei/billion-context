@@ -50,11 +50,13 @@ test("tool arrays expose compress in every wire format", () => {
   assert.equal(names(ACP_READONLY_TOOLS_RESPONSES).includes("compress"), false);
   assert.equal(COMPRESS_TOOL.name, "compress");
   assert.equal(COMPRESS_TOOL_OPENAI.function?.name, "compress");
-  assert.deepEqual(
-    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.anyOf.map(
-      (entry) => entry.type,
-    ),
-    ["array", "string"],
+  assert.equal(
+    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.type,
+    "string",
+  );
+  assert.equal(
+    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.anyOf,
+    undefined,
   );
 });
 

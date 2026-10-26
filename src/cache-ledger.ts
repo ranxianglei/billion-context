@@ -653,7 +653,21 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") { cred = v; break; }
+            if (v !== "") {
+                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+                // re-signed EVERY request (Signature is an HMAC over the
+                // per-request date + body hash), so hashing the raw line
+                // yields a per-request-unique identity — downstream that
+                // meant the 429 governor's holds never matched (#4204 never
+                // throttled on the APIG lane it was built for), the #3376
+                // keepalive snapshot deleted itself after every forward, and
+                // #2131 cache-sample attribution fragmented into one bucket
+                // per request. The STABLE credential on that line is the
+                // Access key id — fingerprint only that.
+                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                break;
+            }
         }
     }
     if (cred === undefined) return undefined;

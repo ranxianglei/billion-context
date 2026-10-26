@@ -23,94 +23,9 @@
         "input_schema": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
+              "type": "string",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -280,94 +195,9 @@
           "parameters": {
             "type": "object",
             "properties": {
-              "topic": {
-                "type": "string",
-                "description": "Optional short title for the compressed range"
-              },
               "content": {
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "anyOf": [
-                        {
-                          "type": "string",
-                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startId",
-                            "endId",
-                            "summary"
-                          ]
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startRef",
-                            "endRef",
-                            "summary"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "type": "string"
-                  }
-                ]
+                "type": "string",
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -561,94 +391,9 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
+              "type": "string",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
