@@ -2049,7 +2049,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (decisionTokens < textTarget) break;
+        // #4288 re-land (supersedes revert f4c10bd8): judge the round-top exit on the
+        // payload's OWN floorless estimate, not decisionTokens — which is floored by a
+        // possibly-stale cross-model usage baseline that can sit above the new window,
+        // so the floored exit never trips and the ladder burns to client timeout.
+        // Use the fold TARGET (textTarget = min(limit, compressionTarget) - imageReserve),
+        // NOT the hard window limit: callers legitimately fold window-fitting payloads
+        // toward a tighter target (compressionTarget plans, codex headroom #68f6bfe3).
+        // The reverted 621c35ad form used `limit` and broke exactly those. Floored
+        // implies floorless, so folding never increases versus pre-#4288 behavior.
+        if (result.payloadEstimate < textTarget) {
+            if (baselineFloor >= textTarget) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            break;
+        }
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
