@@ -2,7 +2,10 @@
 // not leave the canonical advanced — before the fix the failed forward left it
 // ahead while no ack went out (#3344 stamps on 2xx only), so the client's plain
 // retry hit a 409 seq-mismatch and paid a full resync. Contract pinned here:
-// after a failed forward, retrying the SAME delta lands.
+// after a failed forward, retrying the SAME delta lands. The gate's other
+// direction is pinned too: once the 2xx head carrying the ack has reached the
+// client, a late crash must NOT roll back — the client already advanced, and a
+// rollback would be reverse drift (its next delta would 409).
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -228,6 +231,40 @@ test("#4867: forward THROWS before any byte reaches the client → canonical rol
         const delta = await h.turn({ sinceSeq: 1, messages: [assistantTurn(1), userTurn(2, "after-crash")] });
         assert.equal(delta.status, 200, "the client's plain retry lands after a thrown forward");
         assert.equal(delta.headers.get("x-bili-applied-seq"), "3");
+    } finally {
+        await h.close();
+    }
+});
+
+test("#4867: forward throws AFTER the 2xx head reached the client → NO rollback (ack already delivered)", async () => {
+    const h = await harness();
+    try {
+        const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1, "seed-one")] });
+        assert.equal(seed.status, 200);
+        assert.equal(seed.headers.get("x-bili-applied-seq"), "1");
+
+        // writeHead on the detached response genuinely flips headersSent — the
+        // lane sees exactly what a real mid-body crash looks like from here:
+        // the 2xx head carrying x-bili-applied-seq is already with the client.
+        const payload = JSON.stringify({ conversationId: CONVERSATION_ID, sinceSeq: 1, path: "/v1/messages", request: { model: "claude-test", max_tokens: 1024 }, messages: [assistantTurn(1)] });
+        const req = Readable.from([Buffer.from(payload)]) as unknown as http.IncomingMessage;
+        Object.assign(req, { headers: { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONVERSATION_ID }, socket: {} });
+        const res = new http.ServerResponse(req);
+        await assert.rejects(
+            handleIncrementalTurn(req, res, () => undefined, async (_synthetic, out) => {
+                out.writeHead(200, { "content-type": "application/json" });
+                throw new Error("simulated mid-body crash");
+            }),
+            /simulated mid-body crash/,
+        );
+
+        const probe = await h.probeConv();
+        assert.equal(probe.status, 200);
+        assert.equal(probe.body.conversation?.appliedSeq, 2, "no rollback once the ack head is flushed — rolling back now would desync the advanced client");
+
+        const delta = await h.turn({ sinceSeq: 2, messages: [assistantTurn(1), userTurn(2, "after-crash")] });
+        assert.equal(delta.status, 200, "a client that adopted the flushed ack continues from seq 2 without a resync");
+        assert.equal(delta.headers.get("x-bili-applied-seq"), "4");
     } finally {
         await h.close();
     }
