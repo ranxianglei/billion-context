@@ -8,7 +8,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { buildStoredPlaceholder, defaultConfig, RETRIEVE_TOOL_NAME } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -42,7 +43,7 @@ async function startHarness(marker: boolean): Promise<Harness> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ dir: path.join(os.tmpdir(), `bili-store-gate-${marker ? "marker" : "native"}-${Math.random().toString(36).slice(2)}`), debounceMs: 0 }));
     setRegistryForTest({});
     const route: Record<string, unknown> = { models: { "gpt-test": { context: 400_000 } } };
@@ -60,18 +61,27 @@ async function startHarness(marker: boolean): Promise<Harness> {
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
     return {
-        proxyPort: proxy.address().port,
+        proxyPort: (proxy.address() as { port: number }).port,
         upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
         captured,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

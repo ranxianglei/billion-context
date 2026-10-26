@@ -7,10 +7,10 @@
 export const KIMI_PROVIDER = "bili";
 export const KIMI_ALIAS = "bili-kimi";
 export const KIMI_MANAGED_BEGIN = "# bili begin (managed by billion-context — `bili plugin install kimi`)";
-export const KIMI_MANAGED_END = "# bili end";
-export const KIMI_PREV_MODEL_KEY = "# bili prev-default-model";
-export const KIMI_DEFAULT_UPSTREAM = "https://api.kimi.com/coding/v1";
-export const KIMI_CODE_PROVIDER = "managed:kimi-code";
+const KIMI_MANAGED_END = "# bili end";
+const KIMI_PREV_MODEL_KEY = "# bili prev-default-model";
+const KIMI_DEFAULT_UPSTREAM = "https://api.kimi.com/coding/v1";
+const KIMI_CODE_PROVIDER = "managed:kimi-code";
 
 interface LineDoc {
     lines: string[];
@@ -64,6 +64,35 @@ function keyValue(line: string): { key: string; strVal?: string; numVal?: number
     return undefined;
 }
 
+// #2954: capability metadata the aliased model must inherit VERBATIM from the
+// source model section — dropping them silently disables thinking/effort for
+// models that declare it. Whitelisted rather than "all unknown keys": routing
+// fields (provider/model/base_url/max_*) are resolved separately and must not
+// leak into the alias. Multi-line TOML arrays are collected until brackets
+// balance (quote- and comment-aware); an unbalanced capture is dropped
+// wholesale — emitting a truncated array would corrupt the user's config.toml.
+const KIMI_MODEL_PASSTHROUGH_KEYS = ["capabilities", "support_efforts", "default_effort"] as const;
+
+function bracketDepth(line: string): number {
+    let depth = 0;
+    let dq = false;
+    let sq = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (dq) { if (ch === '"' && line[i - 1] !== "\\") dq = false; continue; }
+        if (sq) { if (ch === "'") sq = false; continue; }
+        // #2954 review: a `#` outside quotes starts a TOML comment — brackets
+        // in it are not syntax and must not close the array early (that would
+        // emit a truncated capture).
+        if (ch === "#") break;
+        if (ch === '"') dq = true;
+        else if (ch === "'") sq = true;
+        else if (ch === "[" || ch === "{") depth += 1;
+        else if (ch === "]" || ch === "}") depth -= 1;
+    }
+    return depth;
+}
+
 /** Remove the managed block (markers inclusive). Throws on a half-present
  *  block — a lone marker means manual tampering, and guessing is worse than
  *  refusing. */
@@ -97,6 +126,8 @@ export interface KimiRouteState {
     readonly contextWindow?: number;
     readonly maxOutput?: number;
     readonly authLines: string[];
+    /** #2954: verbatim capability lines inherited from the source model. */
+    readonly extraLines?: string[];
 }
 
 export function kimiProxiedBaseUrl(port: number, upstream: string): string {
@@ -112,7 +143,7 @@ export function extractBiliUpstream(baseUrl: string): string | undefined {
  *  base_url key and the next table header — the resolver owns their meaning
  *  (an `api_key` line, an `api_key_env` line, or `api_key = ""` + an
  *  `[providers.bili.oauth]` sub-table copied from the active provider). */
-export function renderKimiManagedBlock(state: KimiRouteState, prevDefaultModel: string): string {
+function renderKimiManagedBlock(state: KimiRouteState, prevDefaultModel: string): string {
     const out: string[] = [];
     out.push(KIMI_MANAGED_BEGIN);
     out.push(`# Routes ${KIMI_ALIAS} through the local bili proxy. Managed by `);
@@ -127,6 +158,7 @@ export function renderKimiManagedBlock(state: KimiRouteState, prevDefaultModel: 
     out.push(`model = "${state.modelId}"`);
     if (state.contextWindow !== undefined) out.push(`max_context_size = ${state.contextWindow}`);
     if (state.maxOutput !== undefined) out.push(`max_output_size = ${state.maxOutput}`);
+    for (const line of state.extraLines ?? []) out.push(line);
     out.push("");
     out.push(`${KIMI_PREV_MODEL_KEY} = ${prevDefaultModel === "" ? "ABSENT" : JSON.stringify(prevDefaultModel)}`);
     out.push(KIMI_MANAGED_END);
@@ -236,7 +268,7 @@ export function unrouteKimiConfig(text: string): string {
     return closeDoc(doc);
 }
 
-export type KimiRouteResolution =
+type KimiRouteResolution =
     | {
         readonly ok: true;
         readonly upstream: string;
@@ -246,6 +278,7 @@ export type KimiRouteResolution =
         readonly maxOutput?: number;
         readonly authLines: string[];
         readonly authSource: string;
+        readonly extraLines?: string[];
     }
     | { readonly ok: false; readonly reason: string };
 
@@ -263,6 +296,9 @@ interface ModelScan {
     maxOutput?: number;
     baseUrl?: string;
     provider?: string;
+    /** #2954: verbatim source lines for whitelisted capability fields
+     *  (KIMI_MODEL_PASSTHROUGH_KEYS), multi-line arrays included. */
+    extraLines?: string[];
 }
 
 function scanText(text: string): { defaultModel?: string; providers: Map<string, ProviderScan>; models: Map<string, ModelScan> } {
@@ -270,7 +306,9 @@ function scanText(text: string): { defaultModel?: string; providers: Map<string,
     const models = new Map<string, ModelScan>();
     let defaultModel: string | undefined;
     let parts: string[] = [];
-    for (const rawLine of text.split(/\r?\n/)) {
+    const allLines = text.split(/\r?\n/);
+    for (let li = 0; li < allLines.length; li++) {
+        const rawLine = allLines[li];
         const h = headerParts(rawLine);
         if (h) {
             parts = h;
@@ -297,7 +335,24 @@ function scanText(text: string): { defaultModel?: string; providers: Map<string,
         } else if (parts[0] === "models" && parts[1]) {
             const st = models.get(parts[1]) ?? {};
             if (parts.length === 2) {
-                if (kv.key === "model" && kv.strVal !== undefined) st.modelId = kv.strVal;
+                if ((KIMI_MODEL_PASSTHROUGH_KEYS as readonly string[]).includes(kv.key)) {
+                    // #2954: inherit the field verbatim (see KIMI_MODEL_PASSTHROUGH_KEYS);
+                    // consume any continuation lines so they are never re-scanned as
+                    // top-level keys, and drop the capture if brackets never balance.
+                    const collected = [rawLine.trim()];
+                    let depth = bracketDepth(rawLine);
+                    let j = li + 1;
+                    while (depth > 0 && j < allLines.length) {
+                        const next = allLines[j];
+                        if (headerParts(next)) break;
+                        collected.push(next.trim());
+                        depth += bracketDepth(next);
+                        j += 1;
+                    }
+                    if (depth <= 0) st.extraLines = [...(st.extraLines ?? []), ...collected];
+                    li = j - 1;
+                }
+                else if (kv.key === "model" && kv.strVal !== undefined) st.modelId = kv.strVal;
                 else if (kv.key === "provider" && kv.strVal !== undefined) st.provider = kv.strVal;
                 else if (kv.key === "max_context_size" && kv.numVal !== undefined) st.window = kv.numVal;
                 else if (kv.key === "max_output_size" && kv.numVal !== undefined) st.maxOutput = kv.numVal;
@@ -307,6 +362,19 @@ function scanText(text: string): { defaultModel?: string; providers: Map<string,
         }
     }
     return { defaultModel, providers, models };
+}
+
+/** #2954: every context window config.toml declares, keyed by MODEL ID (the
+ *  section's `model` field, falling back to the section name for catalog-style
+ *  entries). Fed to the spawned proxy via BILI_LAUNCHER_MODEL_WINDOWS so
+ *  per-request window resolution knows the client's own numbers for ANY model
+ *  that flows through — not just the bootstrapped default's one-shot report. */
+export function scanKimiModelWindows(text: string): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [name, st] of scanText(text).models) {
+        if (st.window !== undefined) out[st.modelId ?? name] = st.window;
+    }
+    return out;
 }
 
 function authLinesFor(prov: ProviderScan | undefined): string[] | undefined {
@@ -345,6 +413,7 @@ export function resolveKimiRoute(text: string, env: NodeJS.ProcessEnv): KimiRout
             maxOutput: selfModel?.maxOutput,
             authLines: auth,
             authSource: KIMI_PROVIDER,
+            extraLines: selfModel?.extraLines,
         };
     }
 
@@ -376,6 +445,7 @@ export function resolveKimiRoute(text: string, env: NodeJS.ProcessEnv): KimiRout
         maxOutput: modelSection?.maxOutput,
         authLines: auth,
         authSource: providerName,
+        extraLines: modelSection?.extraLines,
     };
 }
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
-import { createCore, createInitialState } from "acp-kernel";
+import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -25,7 +25,7 @@ function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
         session: {
             id: "loop-core-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -33,6 +33,7 @@ function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
         protocol,
@@ -196,10 +197,12 @@ test("loop #9: mixed compress + real tool → forwarded (no re-request), compres
     }
 });
 
-test("loop #5: limit-hit graceful — 10 mutating rounds never degenerate empty, no crash", async () => {
+test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empty, no crash", async () => {
+    // acp_status drives the re-request path without tripping the failed-only
+    // breaker (#156/#4186), so this fixture actually reaches the loop limit.
     const mutatingRound = [
         sse("response.created", { response: { id: "resp_m", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(0, "call_status", "acp_status", "{}"),
         COMPLETED,
     ].join("");
     let fetchCalls = 0;
@@ -224,9 +227,14 @@ test("loop #5: limit-hit graceful — 10 mutating rounds never degenerate empty,
     }
 });
 
-// #156: identical failing compress re-submitted every round is a deterministic
-// failure — re-requesting only burns real upstream calls, so break early.
-test("loop #156: identical failing compress re-submitted → breaks early, not MAX_LOOP_ROUNDS", async () => {
+// #156/#4186: a failed-only mutating round completes immediately. The failed
+// frames are ephemeral (#1548): never persisted, never seen by the client.
+// Re-requesting after them lets the frames reach upstream once and then vanish
+// from the next client request — an unsanctioned mid-history rewrite of the
+// provider's frozen prefix (the seam #4186 measured in 7/17 fuzz seeds).
+// Breaking on the FIRST failed-only round keeps them off the wire entirely;
+// the streamed ❌ receipt carries the reason into the client's next turn.
+test("loop #156/#4186: failed-only compress round → completes after round 1 with ZERO re-requests", async () => {
     const failingRound = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
@@ -242,8 +250,9 @@ test("loop #156: identical failing compress re-submitted → breaks early, not M
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
+        assert.equal(fetchCalls, 0, "the failed frame NEVER reached upstream — no re-request was sent at all");
         assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
-        assert.ok(fetchCalls < MAX_LOOP_ROUNDS - 1, `broke early (fetchCalls=${fetchCalls} < ${MAX_LOOP_ROUNDS - 1}) instead of burning all rounds`);
+        assert.ok(out.includes("❌"), "failure receipt surfaced to the client so the reason survives the turn");
     } finally {
         globalThis.fetch = orig;
     }
@@ -327,12 +336,33 @@ test("loop usage: protocol unset → legacy additive behavior (prompt + cached)"
 // the agent session.
 const CAPTCHA_400_BODY = '{"code":3007,"msg":"captcha verify failed"}';
 
+// summary must be ≥ minSummaryLength (50) for the round to succeed.
 function compressRound(): string {
     return [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "Replay fold summary: shapes verified, deltas recorded, seams absent." }] })),
         COMPLETED,
     ].join("");
+}
+
+// Seeded so the compress round SUCCEEDS — a failing compress completes after
+// round 1 with no re-request (#4186), which would skip the replay under test.
+// Three non-obvious requirements: full kernel config (the bare makeCtx cast
+// lacks compress.minCompressRange → TypeError), refs pre-mapped via assignRefs
+// (the loop never mints them — server-side prepare does), and turns 2–4 padded
+// past preserveRecentTokens so turn 1 escapes the protected zone.
+function replayCtx(): ReturnType<typeof makeCtx> {
+    const ctx = makeCtx();
+    const filler = (i: string, pad: number) => `filler ${i} paragraph body. `.repeat(pad);
+    const msgs: CoreMessage[] = [];
+    for (let t = 1; t <= 4; t++) {
+        msgs.push({ id: `u${t}`, role: "user", contentType: "text", text: filler(`u${t}`, t === 1 ? 110 : 160) });
+        msgs.push({ id: `a${t}`, role: "assistant", contentType: "text", text: filler(`a${t}`, t === 1 ? 110 : 160) });
+    }
+    ctx.messages = msgs;
+    ctx.config = defaultConfig(200_000);
+    ctx.session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    return ctx;
 }
 
 test("replay retry: transient 400 (captcha) then success → retried, no error surfaced", async () => {
@@ -347,7 +377,7 @@ test("replay retry: transient 400 (captcha) then success → retried, no error s
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
@@ -371,7 +401,7 @@ test("replay retry: persistent captcha 400 → bounded retries, error names atte
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
@@ -394,7 +424,7 @@ test("replay retry: fatal 400 (invalid model) → NO retry, fail fast", async ()
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
@@ -418,7 +448,7 @@ test("replay retry: 429 then success → retried", async () => {
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
@@ -477,7 +507,7 @@ test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", as
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );

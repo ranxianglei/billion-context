@@ -1,17 +1,26 @@
 import { Agent } from "undici";
+import { currentFetchTransport } from "./fetch-transport.js";
 import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
+import {
+    upstreamTimeoutMs as knobUpstreamTimeoutMs,
+    replayMaxAttempts as knobReplayMaxAttempts,
+    replayBaseDelayMs as knobReplayBaseDelayMs,
+    maxShrinkPerCompress as knobMaxShrinkPerCompress,
+} from "./knobs.js";
 
 /** HTTP robustness helpers for the proxy.
 
   - readBody is capped: an unbounded request body is a memory-exhaustion
-    vector when the proxy listens publicly. 100 MB is generous for LLM
-    payloads (which can carry large tool results / file contents) while
-    still rejecting pathological sizes.
+    vector when the proxy listens publicly. Wire intake and rebuilt sends
+    stay capped at 100 MiB; recognized encoded requests have a separate,
+    bounded decode allowance before existing reductions run.
   - fetchWithTimeout wraps upstream requests with an AbortController so a
     stuck upstream cannot hold a client connection open forever. LLM
     streams can legitimately run for minutes, so the default is long. */
 
-export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
+export { MAX_REQUEST_BYTES } from "./request-body-budget.js";
+import { checkOutboundBody } from "./request-body-budget.js";
 export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -21,6 +30,31 @@ const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
  *  at zero after a client abort. */
 export function _liveUpstreamTimersForTest(): number {
     return liveUpstreamTimers.size;
+}
+
+// Test seam (#1770): stretch the idle timer's WALL-CLOCK delay without
+// changing the logical budget. Asserting "a healthy stream longer than the
+// budget survives" against real-timer scheduling is nondeterministic under
+// host load — the fake upstream's pacing tick and the expired idle timer share
+// one event loop, and under CPU starvation the timers phase can fire the
+// abort before the next chunk is READ (it sits unread in the socket buffer),
+// cutting a healthy stream no matter how wide the nominal margin. null =
+// production behavior (inert by default).
+let idleTimerDelayOverrideMs: number | null = null;
+export function _setIdleTimerDelayForTest(ms: number | null): void {
+    idleTimerDelayOverrideMs = ms;
+}
+
+// Test seam (#1770): how many times rearm() has re-armed the idle timer since
+// the last reset — a deterministic observation of the re-arm-per-chunk wiring
+// that wall-clock assertions cannot pin reliably under load.
+let idleRearmCount = 0;
+export function _idleRearmCountForTest(): number {
+    return idleRearmCount;
+}
+export function _resetIdleTimerSeamsForTest(): void {
+    idleTimerDelayOverrideMs = null;
+    idleRearmCount = 0;
 }
 
 /** Idle-timeout budget for upstream requests; overridable via
@@ -35,8 +69,7 @@ export function _liveUpstreamTimersForTest(): number {
  *  phases, long prefills), so any finite sub-budget false-positived healthy
  *  turns into truncations. Do not re-add a shorter timer here. */
 export function upstreamTimeoutMs(): number {
-    const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
-    return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
+    return knobUpstreamTimeoutMs();
 }
 
 // Direct (non-proxied) requests go through Node's hidden global agent, whose
@@ -44,13 +77,17 @@ export function upstreamTimeoutMs(): number {
 // killed long prefills before this watchdog ever got a chance (#551). Inject an
 // explicit Agent per timeout value so the transport layer matches the watchdog
 // instead of firing first.
-const directDispatchers = new Map<number, Agent>();
+const directDispatchers = new Map<string, Agent>();
 
 function directDispatcher(timeoutMs: number): Agent {
-    let agent = directDispatchers.get(timeoutMs);
+    // #3776: key on the CA identity too so a configured/rotated network.caFile
+    // rotates the cached Agent (and its connect.ca) instead of reusing a stale trust set.
+    const key = `${timeoutMs}\u0000${upstreamCaIdentity()}`;
+    let agent = directDispatchers.get(key);
     if (!agent) {
-        agent = new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs });
-        directDispatchers.set(timeoutMs, agent);
+        const ca = upstreamExtraCa();
+        agent = new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs, ...(ca ? { connect: { ca } } : {}) });
+        directDispatchers.set(key, agent);
     }
     return agent;
 }
@@ -60,6 +97,7 @@ export function _resetFetchUtilForTest(): void {
         try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
     }
     directDispatchers.clear();
+    _resetUpstreamCaForTest();
 }
 
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
@@ -69,6 +107,44 @@ export function _resetFetchUtilForTest(): void {
  *  `object` so any Dispatcher-shaped value (ProxyAgent from either source)
  *  is accepted, without `as any`. */
 export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: object };
+
+/** The content-codings Node's fetch (undici) transparently decodes while
+ *  consuming a response body. Anything else (zstd, x-deflate, compress, ...)
+ *  reaches the caller as raw compressed bytes with a 200 status — undici does
+ *  not reject an unsupported coding, it simply does not decode it. */
+const DECODABLE_ENCODINGS = new Set(["gzip", "x-gzip", "deflate", "br"]);
+
+/** Every body fetched through this module is PARSED by bili (SSE frames, JSON,
+ *  summaries), so the proxy must never ADVERTISE a content-coding its own
+ *  fetch cannot decode: a client advertising `zstd` makes the upstream answer
+ *  zstd, undici passes the compressed bytes through undecoded, and the parser
+ *  sees binary where SSE was promised — zero events, clean EOF, a phantom
+ *  `upstream_stream_truncated` on a perfectly healthy generation (#2993:
+ *  deepseek began honoring zstd; opencode-direct survived because its own HTTP
+ *  stack decodes zstd, undici does not). Rewrites accept-encoding down to the
+ *  decodable subset, preserving order and q-values; drops the header entirely
+ *  when nothing survives (identity). All other headers pass through untouched. */
+export function restrictAcceptEncoding(headers: FetchOptions["headers"]): FetchOptions["headers"] {
+    if (!headers) return headers;
+    const entries: Array<[string, string]> = [];
+    if (typeof Headers !== "undefined" && headers instanceof Headers) {
+        headers.forEach((v, k) => entries.push([k, v]));
+    } else if (Array.isArray(headers)) {
+        for (const pair of headers) entries.push([pair[0], String(pair[1])]);
+    } else {
+        for (const [k, v] of Object.entries(headers)) entries.push([k, String(v)]);
+    }
+    const out: Record<string, string> = {};
+    for (const [k, v] of entries) {
+        if (k.toLowerCase() !== "accept-encoding") { out[k] = v; continue; }
+        const kept = v.split(",")
+            .map((part) => part.trim())
+            .filter((part) => part !== "")
+            .filter((part) => DECODABLE_ENCODINGS.has(part.split(";")[0].trim().toLowerCase()));
+        if (kept.length > 0) out["accept-encoding"] = kept.join(", ");
+    }
+    return out;
+}
 
 /** Abort a fetch after `timeoutMs` of IDLE time. The timer starts when the
  *  fetch begins (bounding time-to-first-byte / headers) and is RE-ARMED on
@@ -95,7 +171,12 @@ export async function fetchWithTimeout(
     opts: FetchOptions,
     timeoutMs?: number,
     externalSignal?: AbortSignal,
+    // #3342: true = skip the ALS transport lookup. A plain-HTTP egress issued
+    // from INSIDE an active transport (Responses-WS falling back after a refused
+    // upgrade) must not recurse back into the intercepted WebSocket transport.
+    forceDirect?: boolean,
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
+    checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
     const controller = new AbortController();
     let cleared = false;
@@ -103,7 +184,7 @@ export async function fetchWithTimeout(
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
             controller.abort();
-        }, effective);
+        }, idleTimerDelayOverrideMs ?? effective);
         liveUpstreamTimers.add(t);
         return t;
     };
@@ -116,6 +197,7 @@ export async function fetchWithTimeout(
         if (cleared) return;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
+        idleRearmCount += 1;
         timer = armTimer();
     };
     let onExternalAbort: (() => void) | null = null;
@@ -142,7 +224,11 @@ export async function fetchWithTimeout(
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
             ...opts,
             signal: controller.signal,
-            dispatcher: opts.dispatcher ?? directDispatcher(effective),
+            // #1770 seam: when the test stretches the watchdog delay, stretch
+            // the matching transport caps too — #551 requires the undici
+            // headers/body timeouts to track the watchdog, or the transport
+            // fires first and cuts the stream itself.
+            dispatcher: opts.dispatcher ?? directDispatcher(idleTimerDelayOverrideMs ?? effective),
             // Forward-proxy correctness: never silently follow a redirect.
             // undici's default (follow) downgrades POST→GET and drops the body
             // on 301/302/303, so a redirecting upstream (CDN/WAF) turns a valid
@@ -150,13 +236,19 @@ export async function fetchWithTimeout(
             // the client, which follows it with its own policy. Internal bili
             // fetches that want to follow (registry, upstream test) opt in.
             redirect: opts.redirect ?? "manual",
+            // bili parses every body it fetches here — never advertise a content-coding
+            // undici cannot decode (#2993).
+            headers: restrictAcceptEncoding(opts.headers),
         };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
         // types RequestInit.dispatcher as its internal `Dispatcher` interface,
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const raw = await fetch(url, finalOpts as RequestInit) as Response;
+        const transport = forceDirect ? undefined : currentFetchTransport();
+        const raw = transport
+            ? await transport(url, finalOpts)
+            : await fetch(url, finalOpts as RequestInit) as Response;
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
@@ -249,15 +341,14 @@ export const REPLAY_MAX_ATTEMPTS = 3;
  *  (1 = legacy fail-fast behavior, no retry). Read on each call so tests can
  *  tune it live. */
 export function replayMaxAttempts(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_MAX);
-    return Number.isInteger(raw) && raw >= 1 ? raw : REPLAY_MAX_ATTEMPTS;
+    return knobReplayMaxAttempts();
 }
 
-/** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
- *  (0 disables the delay). Read on each call so tests can tune it live. */
+/** Default base backoff delay in ms; override tiers in knobs.replayBaseDelayMs. */
+export const REPLAY_BASE_DELAY_MS = 1500;
+
 export function replayBaseDelayMs(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_BASE_MS);
-    return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+    return knobReplayBaseDelayMs();
 }
 
 /** Max shrink FRACTION (0,1] a single compress may remove before the proxy
@@ -267,8 +358,7 @@ export function replayBaseDelayMs(): number {
  *  transition gentle and the prefix cache alive. Unset (or out of range) =
  *  no steering (legacy behavior). Read on each call so tests can tune it live. */
 export function maxShrinkPerCompress(): number | undefined {
-    const raw = Number(process.env.BILI_MAX_SHRINK_PER_COMPRESS);
-    return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : undefined;
+    return knobMaxShrinkPerCompress();
 }
 
 /** Exponential backoff for the given 1-based attempt: base * 2^(attempt-1). */

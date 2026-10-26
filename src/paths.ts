@@ -62,12 +62,13 @@ export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");
 }
 
-/** Origin of the most recently started proxy (best-effort discovery file for
- *  host-spawned MCP shells that have no env passthrough: opencode/claude/codex). */
-export function proxyOriginFile(): string {
-    return path.join(stateDir(), "proxy-origin");
+/** Last-detected routing bypass for the claude lane (#2290): written by the
+ *  SessionStart hook when the session environment indicates the managed
+ *  ANTHROPIC_BASE_URL will not be honored (e.g. Claude Desktop overrides it),
+ *  read by `bili doctor` to surface the finding after the fact. */
+export function claudeRoutingWarningFile(): string {
+    return path.join(stateDir(), "claude-routing-warning.json");
 }
-
 /** Body-dump dir (ACP_DUMP_BODY / BILI_DUMP_4XX): ACP_DUMP_DIR override first,
  *  else the XDG state dir so dumps co-locate with bili.log on every platform. */
 export function dumpsDir(): string {

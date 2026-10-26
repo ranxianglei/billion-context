@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -45,6 +46,18 @@ function okSse(): string {
 const SUMMARY_TEXT =
     "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. Key decisions: chose the preflight approach over lossy truncation because the payload must stay coherent. Files touched: src/a.ts:10, src/b.ts:20. Outcome: fixed and verified by tests.";
 
+function failedCompressSse(): string {
+    const input = JSON.stringify({ startId: "m9999999", endId: "m9999999", summary: "Invalid range; do not modify history." });
+    return (
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_compress", role: "assistant", usage: { input_tokens: 5000 } } })}\n\n` +
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool_compress", name: "compress", input: {} } })}\n\n` +
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: input } })}\n\n` +
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 50 } })}\n\n` +
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
+    );
+}
+
 function summaryJson(): string {
     return JSON.stringify({
         id: "msg_summary",
@@ -81,6 +94,13 @@ function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions;
 }
@@ -143,8 +163,10 @@ test("e2e #1195 A: stated-window overflow is rescued within the SAME request —
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 
@@ -184,8 +206,10 @@ test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 throug
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 
@@ -201,9 +225,65 @@ test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 throug
 
     const s = listSessions().find((x) => x.id === "refold-b");
     assert.ok(s, "session exists");
-    assert.equal(s!.stats.lastInputTokens, 128000, "the arm still fires — the next turn folds if it can");
-    assert.equal(s!.stats.overflowArmTokens, 128000, "#1110: the arm is recorded");
+    // #3450: the body states the rejected prompt's own size (130000) — the
+    // arm books THAT measurement; the side-request guard keeps the CEILING.
+    assert.equal(s!.stats.lastInputTokens, 130000, "the arm still fires at the upstream-measured size — the next turn folds if it can");
+    assert.equal(s!.stats.overflowArmTokens, 128000, "#1110: the arm is recorded (ceiling, unchanged by #3450)");
     assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
+});
+
+test("#2777: a failed compress after an accepted overflow fold keeps the fold for the next turn", async (t) => {
+    const upstream = await recordedUpstream((call, res) => {
+        if (call === 0) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(STATED_OVERFLOW_BODY_128K);
+        } else {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(call === 1 ? failedCompressSse() : okSse());
+        }
+    });
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer(proxyBaseOptions(upstream.port, 400_000));
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    t.after(async () => {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.server.close();
+        upstream.server.closeIdleConnections?.();
+        await once(upstream.server, "close");
+    });
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": "refold-2777" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() }),
+    });
+    assert.equal(response.status, 200);
+    const stream = await response.text();
+    const forwards = () => upstream.bodies.filter((raw) => (JSON.parse(raw) as { stream?: boolean }).stream !== false);
+    // #4186: the failed-only compress round ends the turn — there is no internal
+    // continuation re-request, and its ephemeral failure frame never reaches
+    // the upstream (old contract asserted three forwards here).
+    assert.equal(forwards().length, 2, "original overflow + accepted folded retry only");
+    assert.ok(forwards()[0].includes("MARKER_1_"), "original request contains early history");
+    assert.ok(forwards()[1].includes(SUMMARY_TEXT) && !forwards()[1].includes("MARKER_1_"), "accepted retry folded early history");
+    assert.match(stream, /Compression FAILED/, "the invalid-range receipt reaches the client");
+    // #2777 core property under the new contract: the accepted fold survives
+    // the failed compress into the NEXT turn's rebuild.
+    const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": "refold-2777" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() }),
+    });
+    assert.equal(r2.status, 200);
+    const f = forwards();
+    assert.equal(f.length, 3, "next turn hits the upstream once more");
+    assert.ok(f[2].includes(SUMMARY_TEXT), "next-turn rebuild retains the accepted summary");
+    assert.ok(!f[2].includes("MARKER_1_"), "next-turn rebuild does not resurrect folded early history");
+    assert.ok(f[2].includes("MARKER_11_"), "next-turn rebuild preserves the recent tail");
+    assert.ok(f[2].length < f[0].length, "rebuild stays smaller than the rejected original");
 });
 
 test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the RETRY's verdict, not the stale first 400 — and the arm stays for the next turn", async (t) => {
@@ -224,8 +304,10 @@ test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the R
     const proxyPort = (proxy.address() as { port: number }).port;
     t.after(async () => {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.server.close();
+        upstream.server.closeIdleConnections?.();
         await once(upstream.server, "close");
     });
 

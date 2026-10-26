@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -37,11 +38,16 @@ function okSse(inputTokens: number): string {
     );
 }
 
-function conversation(n: number): Array<{ role: string; content: string }> {
+// Per-test tag salts the content: the three tests below use the SAME
+// generator with different lengths (24/16/48), so without a salt each
+// longer history byte-prefix-matches the shorter ones and — once #1834
+// made identified resume-forks adopt the parent's blocks — the later test's
+// session legitimately resume-inherits the earlier test's blocks.
+function conversation(n: number, tag: string): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < n; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        msgs.push({ role, content: `${tag} Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return msgs;
 }
@@ -51,7 +57,13 @@ type Call = { stream: boolean; body: string };
 // Mock Anthropic upstream. Main requests are stream:true (answered with SSE);
 // preflight summarization calls are stream:false (answered with a JSON message
 // whose text is SUMMARY_TEXT when usable(idx) else empty — the proxy treats an
-// empty/too-short summary as unusable and skips that range).
+// empty/too-short summary as unusable and skips that range). The unusable
+// shape is stop_reason=max_tokens ON PURPOSE: #2832 reclassified normal-stop
+// zero-text completions (end_turn + empty) into the DETERMINISTIC class whose
+// dead-probe verdict stops the walk after three strikes — this file must keep
+// pinning the walk/budget mechanics themselves, so its failures stay on the
+// size-driven halving path the "2 calls per failed range" arithmetic below
+// describes.
 function makeUpstream(usable: (idx: number) => boolean): { server: http.Server; calls: Call[] } {
     const calls: Call[] = [];
     let summaryIdx = 0;
@@ -72,7 +84,7 @@ function makeUpstream(usable: (idx: number) => boolean): { server: http.Server; 
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
                     id: "msg_summary", type: "message", role: "assistant", model: "claude-small",
-                    content: [{ type: "text", text }], stop_reason: "end_turn",
+                    content: [{ type: "text", text }], stop_reason: "max_tokens",
                     usage: { input_tokens: 500, output_tokens: 50 },
                 }));
             }
@@ -97,6 +109,7 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
@@ -108,20 +121,20 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
     const { server: upstream, calls } = makeUpstream((idx) => idx > 1);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     // Window sits between the post-fold floor (un-foldable oldest range +
     // preserved-recent zone ≈ 10.2k for this 24-message history) and the raw
     // total (~26.6k), so folding the later usable ranges brings it under.
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 15_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-regress-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(24) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(24, "t1-regress") }),
         });
         assert.equal(r.status, 200, "the request succeeds even though the oldest range's summary is unusable");
         await r.text();
@@ -135,36 +148,41 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
         assert.ok(activeBlocks.length >= 1, `a later range was folded into a block (got ${activeBlocks.length})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("#574 truthful exhaustion: every range's summary unusable → 502 only after all ranges tried, no forward, no blocks", async () => {
+test("#574 truthful exhaustion: every range's summary unusable → honest 502 (full walk or provably-futile bail), no forward, no blocks", async () => {
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-exhaust-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(16) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(16, "t2-exhaust") }),
         });
         assert.equal(r.status, 502, "nothing compressible → fail-fast 502");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
-        assert.match(json.error?.message ?? "", /no range could be compressed/i, `exhaustion names the multi-range attempt (got: ${json.error?.message})`);
+        // #1841: the verdict may now be the futility bail (provably cannot
+        // close the gap → stop early with a quantified detail) instead of the
+        // full walk-to-end exhaustion — both are honest, neither claims success.
+        assert.match(json.error?.message ?? "", /(futile round|no range could be compressed)/i, `exhaustion names the multi-range attempt (got: ${json.error?.message})`);
 
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.ok(summaryCalls.length >= 2, `every viable range was tried, not just the first (got ${summaryCalls.length}; legacy made exactly 1)`);
+        assert.ok(summaryCalls.length >= 2, `preflight moved past the bad oldest range before stopping (got ${summaryCalls.length}; legacy made exactly 1)`);
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
 
         const s = listSessions()[0];
@@ -172,27 +190,41 @@ test("#574 truthful exhaustion: every range's summary unusable → 502 only afte
         assert.equal(activeBlocks.length, 0, "no blocks created when nothing could be compressed");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PREFLIGHT summary calls, budget-exhausted detail", async () => {
+test("#574 budget cap: many unusable ranges → the base cap (entry overshoot < 1.06x keeps the #1933 raise off) bounds the walk, budget-exhausted detail", async () => {
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
-    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    // #1841 note: with a tiny window (~20x overshoot) the futility gate now
+    // stops the walk BEFORE the budget (that ordering is pinned in
+    // tests/issue1841-preflight-futility.test.ts). To keep THIS test pinning
+    // the budget-exhausted path, the window sits just under the payload
+    // (~1.04x): the required deficit (~9K) stays far below the remaining
+    // foldable pool (~190K × 1.2) at every point, so the futility gate never
+    // fires and the BASE cap (overshoot < 1.06x → no #1933 raise, pinned
+    // raised separately in tests/preflight-round-budget.test.ts) is the
+    // binding bound: 8 failed ranges × 2 calls (whole + minimum size) = 16.
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 230_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-budget-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(48) }),
+            // #1933 sizing: 200 turns -> ~55 viable ranges, so the base-16
+            // cap runs out while compressible ranges remain visible (the walk
+            // is bounded by the budget, not by exhausting the pool).
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(200, "t3-budget") }),
         });
         assert.equal(r.status, 502, "still over-window after the budget → fail-fast 502");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
@@ -201,8 +233,13 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         assert.match(json.error?.message ?? "", /summarization budget/i, `the budget variant is reported (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
 
+        // #1933/#574: the BASE cap bounds the walk (overshoot < 1.06x keeps the
+        // raise off; the raised variant is pinned in preflight-round-budget).
+        // summarizeRange may spend an in-call fallback HTTP beyond one per
+        // counted summary call, so pin the range, not an exact count.
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.equal(summaryCalls.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT, `the call cap bounds the walk (got ${summaryCalls.length})`);
+        assert.ok(summaryCalls.length >= MAX_SUMMARY_CALLS_PER_PREFLIGHT && summaryCalls.length <= MAX_SUMMARY_CALLS_PER_PREFLIGHT + 2,
+            `the base call cap bounds the walk (got ${summaryCalls.length})`);
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
 
         const s = listSessions()[0];
@@ -210,8 +247,10 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         assert.equal(activeBlocks.length, 0, "no blocks created when nothing could be compressed");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

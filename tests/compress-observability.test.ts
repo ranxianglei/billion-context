@@ -8,6 +8,7 @@ import { maxShrinkPerCompress } from "../src/fetch-util.ts";
 import { withStagedCompressGuidance } from "../src/compress-tool.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { getCacheLedger } from "../src/cache-ledger.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -20,7 +21,7 @@ function makeCtx(messages: CoreMessage[]): Ctx {
         session: {
             id: "compress-obs-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -28,6 +29,7 @@ function makeCtx(messages: CoreMessage[]): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,
@@ -60,7 +62,7 @@ const COMPRESS_ARGS = { content: [{ startId: "m00001", endId: "m00002", summary:
 
 function runApply(ctx: Ctx, args: unknown): string {
     const ranges = parseCompressInput(args);
-    return applyRanges(ranges, ctx);
+    return applyRanges(ranges, ctx).text;
 }
 
 test("#189: applyRanges records lastCompress (shrink ratio + fold point) and logs observability", () => {
@@ -86,19 +88,71 @@ test("#189: fold point picks the EARLIEST range start across multiple ranges", (
     const ctx = makeCompressibleCtx();
     ctx.session.stats.lastInputTokens = 100000;
     const args = { content: [
-        { startId: "m00005", endId: "m00006", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m00003", endId: "m00004", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
         { startId: "m00001", endId: "m00002", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
     ] };
     runApply(ctx, args);
     assert.equal(ctx.session.lastCompress?.foldPoint, "m00001", "earliest start wins regardless of arg order");
 });
 
-test("#189: no pre-compress context → shrinkRatio 0 (no div-by-zero), still records", () => {
+test("#1911: no usage baseline → shrinkRatio is the view coverage, never 0 or >1", () => {
     const ctx = makeCompressibleCtx();
     ctx.session.stats.lastInputTokens = 0;
     const out = runApply(ctx, COMPRESS_ARGS);
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
-    assert.equal(ctx.session.lastCompress?.shrinkRatio, 0, "shrinkRatio 0 when preContext is 0");
+    const ratio = ctx.session.lastCompress?.shrinkRatio;
+    assert.ok(ratio !== undefined && ratio > 0 && ratio <= 1, `coverage-based ratio in (0,1] (got ${ratio})`);
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("~10000/16250"), `view-space denominator in obs: ${obs}`);
+    assert.ok(obs!.includes("postCtx≈6250"), `post-fold context measured from the view, not the billed baseline: ${obs}`);
+});
+
+test("#1911: stale-low baseline cannot produce shrink>100% or postCtx≈0 artifacts", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 1000;
+    const out = runApply(ctx, COMPRESS_ARGS);
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
+    assert.equal(Math.round(ctx.session.lastCompress!.shrinkRatio * 100), 62, "ratio is coverage of the live view (10000/16250), never 1000%");
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("shrink 62%"), `impossible ratio gone: ${obs}`);
+    assert.ok(obs!.includes("~10000/16250"), obs);
+    assert.ok(obs!.includes("postCtx≈6250"), `postCtx from the view, not clamped to 0: ${obs}`);
+    assert.ok(!ctx.logs.some((l) => l.includes("[warn: degenerate-fold]")), "a partial fold is not a degenerate reset");
+    assert.equal(ctx.session.stats.compressCreditTokens, 10000, "credit still accumulates for the usage netting");
+    assert.equal(ctx.session.stats.lastInputTokens, 0, "billed baseline keeps master's plain netting clamp — a post-fold estimate must not enter the usage-grade field (#1592/#1839 provenance)");
+});
+
+test("#1911: healthy baseline keeps the exact old netting", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 100000;
+    runApply(ctx, COMPRESS_ARGS);
+    assert.equal(ctx.session.stats.lastInputTokens, 90000, "netted below the folded mass → unchanged behavior");
+});
+
+test("#1911: full-context fold reports honest 100%/postCtx≈0 and gets the degenerate-reset warn marker", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.config.preserveRecentMessages = 0;
+    ctx.config.preserveRecentTokens = 0;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00007", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("shrink 100%"), `full coverage reported honestly: ${obs}`);
+    assert.ok(obs!.includes("postCtx≈0"), obs);
+    const warn = ctx.logs.find((l) => l.includes("[warn: degenerate-fold]"));
+    assert.ok(warn, "degenerate reset carries its own warn marker for host-side auditing");
+    assert.ok(warn!.includes("covers 100% of the live context"), warn);
+});
+
+test("#1911: cache ledger fold stores live-view geometry (V/Vp), never the billed baseline", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 100000; // billed scalar — pre-fix code stored this as V
+    getCacheLedger(ctx.session); // production: ledger predates its first compress (bootstrap lastBlockId below the new block)
+    runApply(ctx, COMPRESS_ARGS);
+    const folds = getCacheLedger(ctx.session).folds;
+    assert.equal(folds.length, 1, "one fold recorded");
+    assert.equal(folds[0].S, 10000, "S = tokens removed from the view");
+    assert.equal(folds[0].V, 16250, "V is the pre-fold LIVE view size, not the billed baseline");
+    assert.equal(folds[0].Vp, 6250, "Vp is the post-fold live view");
 });
 
 test("#189: failed compress records no lastCompress", () => {

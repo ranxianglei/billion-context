@@ -15,7 +15,7 @@ function makeSession(): Session {
     return {
         id: "usage-obs-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -23,6 +23,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -69,7 +70,7 @@ test("#695: applyRanges marks the next request as fold-materializing and logs th
         textMsg("raw_7", "user", "x".repeat(5000)),
     ]);
     ctx.session.stats.lastInputTokens = 100000;
-    const out = applyRanges(parseCompressInput(COMPRESS_ARGS), ctx);
+    const out = applyRanges(parseCompressInput(COMPRESS_ARGS), ctx).text;
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
     assert.equal(ctx.session.stats.pendingFoldUsage, true, "flag set for the fold-materializing request");
     const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));

@@ -1,0 +1,409 @@
+# Config reference seed — process & persistence blocks (#2107 single source of truth).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: process
+entries:
+  - key: network
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.network
+    site_group: proc
+    desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
+    desc_zh: "上游调用的传输超时、看门狗与重放策略。"
+    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>."
+    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>。"
+  - key: network.upstreamTimeoutMs
+    type: number
+    default: "720000"
+    env: BILI_UPSTREAM_TIMEOUT_MS
+    group: process
+    desc_en: "Hard ceiling on a single upstream call (12 min covers slow deep-thinking models)."
+    desc_zh: "单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。"
+  - key: network.requestWatchdogMs
+    type: number
+    default: "2× upstreamTimeoutMs"
+    env: BILI_REQUEST_WATCHDOG_MS
+    group: process
+    desc_en: "Absolute watchdog that force-aborts a stuck upstream socket even when the per-call timer was never armed."
+    desc_zh: "绝对看门狗：即使按调用计时器从未挂上，也强制中止卡死的上游套接字。"
+  - key: network.keepAliveTimeoutMs
+    type: number
+    default: "5000"
+    env: BILI_KEEP_ALIVE_TIMEOUT_MS
+    group: process
+    desc_en: "Idle keep-alive timeout for pooled upstream sockets."
+    desc_zh: "连接池内上游套接字的空闲保活超时。"
+  - key: network.clientErrorBackstopMs
+    type: number
+    default: "30000"
+    env: BILI_CLIENT_ERROR_BACKSTOP_MS
+    group: process
+    desc_en: "Backstop that aborts a client connection that stops reading a committed response."
+    desc_zh: "中止停止读取已提交响应的客户端连接的兜底超时。"
+  - key: network.exposureLogIntervalMs
+    type: number
+    default: "3600000 (0 disables the log)"
+    env: BILI_EXPOSURE_LOG_INTERVAL_MS
+    group: process
+    desc_en: "How often bound-address exposure warnings repeat in the log; 0 disables them entirely."
+    desc_zh: "绑定地址暴露警告在日志中的重复间隔；0 完全禁用。"
+  - key: network.streamKeepAliveMs
+    type: number
+    default: "15000 (0 disables)"
+    env: BILI_STREAM_KEEPALIVE_MS
+    group: process
+    desc_en: "Downstream stream keep-alive ping interval between model chunks; 0 disables pinging."
+    desc_zh: "模型块之间的下游流保活心跳间隔；0 禁用心跳。"
+  - key: network.preflightHoldMs
+    type: number
+    default: "30000"
+    env: BILI_PREFLIGHT_HOLD_MS
+    group: process
+    desc_en: "How long a failed preflight holds before the request is allowed through unreconciled."
+    desc_zh: "preflight 失败后，允许请求未校准放行的持有时长。"
+  - key: network.preflightDeadEndCooldownMs
+    type: number
+    default: "300000"
+    env: BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS
+    group: process
+    desc_en: "Cooldown after a dead-end preflight before retrying reconciliation for the same session."
+    desc_zh: "死胡同 preflight 后，对同一会话重试校准的冷却时长。"
+  - key: network.replayRetryMax
+    type: number
+    default: "3 (1 disables replays)"
+    env: BILI_REPLAY_RETRY_MAX
+    group: process
+    desc_en: "Maximum transport-failure replays of an identical request before surfacing the error."
+    desc_zh: "同一请求在向上游暴露错误前的最大传输失败重放次数。"
+  - key: network.replayRetryBaseMs
+    type: number
+    default: "1500 (0 disables the delay)"
+    env: BILI_REPLAY_RETRY_BASE_MS
+    group: process
+    desc_en: "Base backoff delay between replays (exponential)."
+    desc_zh: "重放之间的基础退避延迟（指数增长）。"
+  - key: network.throttle429Enabled
+    type: boolean
+    default: "true"
+    env: BILI_THROTTLE_429
+    group: process
+    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior."
+    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。"
+  - key: network.throttle429MaxConsecutive
+    type: number
+    default: "5"
+    env: BILI_THROTTLE_429_MAX_CONSECUTIVE
+    group: process
+    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it."
+    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。"
+  - key: network.throttle429BaseDelayMs
+    type: number
+    default: "2000"
+    env: BILI_THROTTLE_429_BASE_DELAY_MS
+    group: process
+    desc_en: "Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger)."
+    desc_zh: "429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。"
+  - key: network.throttle429MaxDelayMs
+    type: number
+    default: "30000"
+    env: BILI_THROTTLE_429_MAX_DELAY_MS
+    group: process
+    desc_en: "Ceiling for the 429 hold backoff and for the terminal-phase probe interval."
+    desc_zh: "429 hold 退避的上限，也是终局阶段探测间隔的上限。"
+  - key: network.maxShrinkPerCompress
+    type: number
+    default: "unset"
+    env: BILI_MAX_SHRINK_PER_COMPRESS
+    group: process
+    desc_en: "Cap on how much one compression may shrink history (anti-collapse guard)."
+    desc_zh: "单次压缩允许收缩历史的上限（防塌缩护栏）。"
+  - key: network.proxyKeepAliveMaxMs
+    type: number
+    default: "55000 (0 = one-shot connections)"
+    env: BILI_PROXY_KEEPALIVE_MAX_MS
+    group: process
+    desc_en: "Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings)."
+    desc_zh: "经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。"
+  - key: network.postResponseLingerMs
+    type: number
+    default: "5000"
+    env: BILI_POST_RESPONSE_LINGER_MS
+    group: process
+    desc_en: "Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop)."
+    desc_zh: "代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。"
+  - key: network.allowPrivateHttpProviders
+    type: boolean
+    default: "false"
+    env: BILI_ALLOW_PRIVATE_HTTP_PROVIDERS
+    group: process
+    desc_en: "Opt-in (#2984): admit plain-HTTP providers on private networks (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) into the agent-registry intake and summary-endpoint guards. Off by default — plaintext stays loopback-only; public IPs/domains and CGNAT (100.64/10) stay refused regardless. 1/true enables."
+    desc_zh: "可选开关（#2984）：允许私网（RFC1918、127/8、link-local、ULA、*.local/.lan/.internal）明文 HTTP provider 进入 agent-registry 接收与摘要端点守卫。默认关——明文仅回环受信；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒。1/true 启用。"
+  - key: network.receiveBodyBytes
+    type: number
+    default: "5368709120"
+    env: BILI_RECEIVE_BODY_BYTES
+    group: process
+    desc_en: "Max inbound wire bytes read into memory per request before a 413 at the receive stage. Raised from a hardcoded 100 MiB to 5 GiB (#3128 owner decision) so multi-gigabyte single requests are accepted instead of the socket being reset. Also the threshold above which a decoded request consumes one of two shared large-decode admission slots. WebSocket lanes keep the fixed 100 MiB surface."
+    desc_zh: "单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。"
+  - key: network.decodedBodyBytes
+    type: number
+    default: "10737418240"
+    env: BILI_DECODED_BODY_BYTES
+    group: process
+    desc_en: "Max DECODED bytes after content-encoding expansion (gzip/deflate/br/zstd), checked incrementally during decode (decode-stage 413). Default is 2x the receive budget, mirroring the legacy decode=2x-wire relationship; guards against decompression bombs."
+    desc_zh: "content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。"
+  - key: network.outboundBodyBytes
+    type: number
+    default: "5368709120"
+    env: BILI_OUTBOUND_BODY_BYTES
+    group: process
+    desc_en: "Max rebuilt request bytes forwarded upstream (forward-stage 413), counted as UTF-8 bytes of the final body string. Checked before the fetch so an over-budget rebuild never reaches the upstream watchdog allocation."
+    desc_zh: "转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。"
+  - key: network.wsOutboundBytes
+    type: number
+    default: "10485760"
+    env: BILI_WS_OUTBOUND_BYTES
+    group: process
+    desc_en: "Soft byte budget for the WebSocket lane only (#3701): when the final serialized Responses WS frame exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress), then whatever remains is boundedly downscaled through the jimp maxDim ladder. If the frame still does not fit and the upstream closes with 1009 before any event, one strictly smaller resend is attempted within the same request. Set 0 to disable shedding (previous send-as-is behavior). HTTP lanes are unaffected — the hard refusal cap stays network.outboundBodyBytes."
+    desc_zh: "仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。"
+  - key: network.caFile
+    type: string
+    default: "unset"
+    env: BILI_CA_FILE
+    group: process
+    desc_en: "Path to a PEM file with extra root CAs trusted by bili's OWN upstream fetches (#3776). Merged with Node's built-in roots and any NODE_EXTRA_CA_CERTS entries — never replaces them. For security software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate MITM proxy that re-signs the upstream: export that root CA to PEM and point this at it. Unset = default trust, byte-identical behavior."
+    desc_zh: "PEM 文件路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 fetch。与 Node 内置根证书及 NODE_EXTRA_CA_CERTS 中的条目合并——从不替换。安全软件做 HTTPS/加密连接扫描（卡巴斯基、企业 DLP）或企业 MITM 代理重签上游时使用：把该厂商根证书导出为 PEM 并指向此键。未设置 = 默认信任，行为逐字节不变。"
+  - key: guardrails
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.guardrails
+    site_group: proc
+    desc_en: "Guardrails: tool-output guardrails for the pi/omp plugin bundles (#3066) plus the proxy-side text-run stream guard (#3406)."
+    desc_zh: "守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。"
+    site_en: "<code>guardrails</code> — pi/omp plugin tool-output + stream text-run guardrails: <span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true · textRunThreshold 200</span>."
+    site_zh: "<code>guardrails</code> —— pi/omp 插件工具输出与流式 text-run 守卫：<span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true · textRunThreshold 200</span>。"
+  - key: guardrails.bashTimeout
+    type: number
+    default: "60"
+    env: BILI_GUARDRAIL_BASH_TIMEOUT
+    group: process
+    desc_en: "Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default)."
+    desc_zh: "模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。"
+  - key: guardrails.maxOutputBytes
+    type: number
+    default: "50000"
+    env: BILI_GUARDRAIL_MAX_OUTPUT_BYTES
+    group: process
+    desc_en: "Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output."
+    desc_zh: "pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。"
+  - key: guardrails.repetition
+    type: boolean
+    default: "true"
+    env: BILI_GUARDRAIL_REPETITION
+    group: process
+    desc_en: "Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it."
+    desc_zh: "pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。"
+  - key: guardrails.textRunThreshold
+    type: number
+    default: "200"
+    env: BILI_GUARDRAIL_TEXT_RUN_THRESHOLD
+    group: process
+    desc_en: "Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too."
+    desc_zh: "响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。"
+  - key: persist
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.persist
+    site_group: proc
+    desc_en: "Session persistence to disk under the XDG state dir."
+    desc_zh: "会话落盘持久化（XDG state 目录之下）。"
+    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
+    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
+  - key: persist.enabled
+    type: boolean
+    default: "true"
+    env: BILI_PERSIST
+    group: process
+    desc_en: "Master switch for writing session records to disk (0/false turns it off)."
+    desc_zh: "会话记录落盘总开关（0/false 关闭）。"
+  - key: persist.zstd
+    type: boolean
+    default: "false"
+    env: BILI_PERSIST_ZSTD
+    group: process
+    desc_en: "Zstd-compress persisted session files (1/true enables)."
+    desc_zh: "zstd 压缩持久化会话文件（1/true 启用）。"
+  - key: persist.debounceMs
+    type: number
+    default: "500"
+    env: BILI_PERSIST_DEBOUNCE_MS
+    group: process
+    desc_en: "Write debounce window for session files."
+    desc_zh: "会话文件写入的去抖窗口。"
+  - key: persist.tailTokens
+    type: number
+    default: "16384 (0 disables message persistence)"
+    env: BILI_PERSIST_TAIL_TOKENS
+    group: process
+    desc_en: "Token-size tail of recent messages kept as raw text for export fidelity."
+    desc_zh: "为导出保真保留的最近消息原文 token 尾部大小。"
+  - key: persist.epermAlertThreshold
+    type: number
+    default: "5"
+    env: BILI_PERSIST_EPERM_ALERT_THRESHOLD
+    group: process
+    desc_en: "Consecutive EPERM write failures before alerting in the log."
+    desc_zh: "连续 EPERM 写失败达到该次数后在日志中告警。"
+  - key: persist.epermAlertRepeatMs
+    type: number
+    default: "0 (no repeats)"
+    env: BILI_PERSIST_EPERM_ALERT_REPEAT_MS
+    group: process
+    desc_en: "Repeat interval for the EPERM alert; 0 logs it once."
+    desc_zh: "EPERM 告警的重复间隔；0 只记录一次。"
+  - key: storage
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.storage
+    site_group: proc
+    desc_en: "Unified SQLite storage sidecar settings (#2671)."
+    desc_zh: "统一 SQLite 存储边车设置（#2671）。"
+    site_en: "<code>storage</code> — unified storage sidecar: <span class='mech'>unified legacy</span> — file tier selects the lane-wide storage mode; env BILI_STORAGE_UNIFIED wins when set."
+    site_zh: "<code>storage</code> —— 统一存储边车：<span class='mech'>unified legacy</span> —— 文件层选定全 lane 存储模式；设置了 BILI_STORAGE_UNIFIED 时环境变量优先。"
+  - key: storage.unified
+    type: "legacy|shadow|full"
+    default: "unset (full)"
+    env: BILI_STORAGE_UNIFIED
+    group: process
+    desc_en: "Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback). Absent everywhere now defaults to FULL (#3818 flip - the shadow dry-run reconciled cleanly since #2815, so the index is the load path; JSON envelopes keep being written, and legacy remains the one-line escape hatch). File tier is strict legacy/shadow/full; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar."
+    desc_zh: "分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。两处均未设置时默认 full（#3818 翻转 —— shadow 干跑自 #2815 起对账一直干净，索引因此成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。"
+  - key: storage.backend
+    type: "sqlite|mysql"
+    default: "unset (sqlite)"
+    env: BILI_STORAGE_BACKEND
+    group: process
+    desc_en: "Storage backend selection (#3388 / #3931): the unified store consumes an operation-level async StorageBackend contract. sqlite is the default (the existing UnifiedStore behind a Promise-wrapped adapter). mysql is FULLY WIRED (steps 2+3): openBackend(\"mysql\", dsn) opens the real MysqlBackend against MySQL 8.0 — the full contract surface (ingest with CAS refcounts, reads, session_ext, reap journal, archive/restore/gc, checkpoints, conversations), with mysql2 bundled as a regular dependency and loaded lazily (boots that never select mysql never load it). The proxy hot path is wired through the async shadow facade: saves enqueue onto a serial backend queue (watermark deltas, orphan/reap journal, digest sampling — sqlite keeps its zero-await sync fast path unchanged), SYNC reads ride the JSON envelope (the sidecar attaches asynchronously via ready(); viewFor/importRecord sync facades miss by design), replicas/ext/GC/export speak the async twins. writerOff stays sqlite-only (the envelope is the mysql sync read path). Unknown names fall back to sqlite with a notice. Resolved once per lane boot."
+    desc_zh: "存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend(\"mysql\", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export 走异步孪生。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。"
+  - key: storage.mysql.dsn
+    type: string
+    default: "unset"
+    env: BILI_MYSQL_DSN
+    group: process
+    desc_en: "MySQL DSN for storage.backend=\"mysql\" (#3388 step 2, #3931): mysql://user:pass@host:3306/db. Consumed by the StorageBackend contract paths (hot path included — the async shadow queue). env BILI_MYSQL_DSN wins over the file key. Empty/unset = the mysql backend cannot open — the documented error names both knobs and the working default."
+    desc_zh: "storage.backend=\"mysql\" 的 MySQL DSN（#3388 第二步，#3931）：mysql://user:pass@host:3306/db。由 StorageBackend 契约路径消费（含热路径 —— 异步影子队列）。环境变量 BILI_MYSQL_DSN 优先于文件键。空/未设置 = mysql 后端无法打开 —— 文档化错误会同时列出两个旋钮和可用的默认值。"
+  - key: storage.sqliteAutoDownload
+    type: boolean
+    default: "true"
+    env: BILI_SQLITE_AUTO_DOWNLOAD
+    group: process
+    desc_en: "Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download. The tarball download walks a builtin mirror list (#3338): the configured registry (BILI_UPDATE_REGISTRY / update.registry) is tried first, then https://registry.npmjs.org, then https://registry.npmmirror.com - the first mirror that yields a sha512-verified tarball wins; a Node < 22.5 with no engine gets an explicit Node upgrade hint in the degrade reason (#3385). Engine artifacts are pinned PER RUNTIME, because a binding cannot be loaded outside the range its package declares: Node >= 22 with N-API >= 10 uses better-sqlite3 v13 (one tarball that carries its own prebuilds), while Node 20 and the Node 22.0-22.12 band - which passes v13's major floor but only ships N-API 9 - use v12.9.0 (a JS-only tarball plus its ABI-keyed prebuild, fetched from the binary mirror and bound through nativeBinding). That keeps a low Node on the unified lane instead of degrading to legacy. A runtime no pinned artifact serves (below every floor, or an ABI no prebuild targets) is refused before any load, with neither the download nor a cached copy registered, since loading such a binding crashes the process instead of failing gracefully (#3341, #3894). A failed download arms a 6-hour retry cooldown persisted as a marker file under the cache dir (billion-context/sqlite/.bootstrap-failed.json); the storage diagnostics blob shows the marker's absolute expiry time and path - delete that file and restart bili to force an immediate retry instead of waiting out the whole window (#3788)."
+    desc_zh: "SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 tarball 下载内置镜像列表兜底（#3338）：先试配置的 registry（BILI_UPDATE_REGISTRY / update.registry），再试 https://registry.npmjs.org、https://registry.npmmirror.com —— 第一个通过 sha512 校验的镜像生效；Node < 22.5 且无引擎时，降级原因会给出明确的 Node 升级提示（#3385）。引擎产物按运行时特性分别钉死，因为 binding 无法在包自身声明的范围之外加载：Node >= 22 且 N-API >= 10 用 better-sqlite3 v13（单个 tarball 自带 prebuilds），而 Node 20 与 Node 22.0–22.12（满足 v13 的大版本下限但只带 N-API 9）用 v12.9.0（纯 JS tarball 加与之 ABI 匹配的 prebuild，从二进制镜像获取并经 nativeBinding 注入）—— 低版本 Node 因此留在统一存储车道上，而不是降级到 legacy。任何钉死产物都不支持的运行时（低于所有下限，或 ABI 无对应 prebuild）会在加载之前被拒绝，下载与缓存副本注册都不进行 —— 在那里加载该 binding 会让进程崩溃，而不是优雅失败（#3341、#3894）。下载失败会置一个 6 小时的重试冷却，以标记文件形式持久化在缓存目录下（billion-context/sqlite/.bootstrap-failed.json）；storage 诊断块会显示该标记的绝对到期时间与路径 —— 删除该文件并重启 bili 即可强制立即重试，不必等完整个冷却窗口（#3788）。"
+  - key: storage.jsonWriter
+    type: "on|off"
+    default: "on"
+    env: BILI_STORAGE_JSON_WRITER
+    group: process
+    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
+    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
+  - key: storage.walJournalSizeLimitBytes
+    type: number
+    default: "8388608"
+    env: BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES
+    group: process
+    desc_en: "WAL reclamation cap for index.db-wal (#3250), in bytes: every completed checkpoint truncates the WAL file back to this size, bounding disk use and crash-recovery replay in long-lived processes. NOT a per-session data quota - data lands in index.db as it is written and the WAL only stages frames between checkpoints, so session count/size does not scale this; a large burst can overshoot temporarily until the next completed checkpoint truncates back. Higher = rarer truncate IO but more steady disk use and a longer crash-replay tail. Env tier (positive integer) wins over the file tier; a garbage or non-positive env value falls through to the file/default tier instead of failing boot. Applied when the store opens at lane boot - hot edits need a restart. The effective value appears on the unified-enable log line and in the storage diagnostics blob."
+    desc_zh: "index.db-wal 的 WAL 回收上限（#3250），单位字节：每次完成的 checkpoint 把 WAL 文件截回该大小，约束长驻进程的磁盘占用与崩溃恢复重放。不是每会话数据配额 —— 数据写入时就已落进 index.db，WAL 只是两次 checkpoint 之间的帧暂存区，会话数量/大小不会放大它；大 burst 可能暂时超出，直到下一次完成的 checkpoint 截回。调大 = truncate IO 更稀疏，但稳态磁盘占用更多、崩溃恢复重放尾更长。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。实际取值会出现在 unified-enable 日志行与 storage 诊断块中。"
+  - key: storage.archiveAfterDays
+    type: integer
+    default: "365"
+    env: BILI_STORAGE_ARCHIVE_AFTER_DAYS
+    group: process
+    desc_en: "GC age sweep window in days (#3463, #3901): sessions idle longer than this are archived - one JSON line appended to a single archive log (archive/archive.jsonl under the sessions directory — no per-session file spray), a tombstone row keeps the label and identity, content/media refs are released, and restore is one POST away. 0 disables the age sweep; POST /__bili/storage/gc always runs and takes ?vacuum=full to shrink an existing index.db (auto_vacuum=INCREMENTAL is always on for new writes). The same operations have a CLI layer (#3928): bili storage gc [--days N] [--vacuum full|incremental] [--dry-run], plus bili sessions ls/rm/archive/restore <id> (README 'Storage maintenance CLI' section). Env wins over the file tier."
+    desc_zh: "GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。"
+  - key: sessions
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.sessions
+    site_group: proc
+    desc_en: "Session-table size cap and opt-in garbage collection."
+    desc_zh: "会话表容量上限与可选垃圾回收。"
+    site_en: "<code>sessions</code> — <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> — GC is opt-in; user data is never pruned silently."
+    site_zh: "<code>sessions</code> —— <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> —— GC 为可选：用户数据不会被悄悄清理。"
+  - key: sessions.max
+    type: number
+    default: "256"
+    env: BILI_MAX_SESSIONS
+    group: process
+    desc_en: "In-memory session table cap (LRU eviction of idle sessions)."
+    desc_zh: "内存会话表上限（空闲会话 LRU 逐出）。"
+  - key: sessions.warmMax
+    type: number
+    default: "0"
+    env: BILI_SESSION_WARM_MAX
+    group: process
+    desc_en: "Bounded startup (#2803/#3050): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. Default 0 (no eager warm set — first touch pays one on-demand load; set 8 to restore the eager behavior). Capped by sessions.max."
+    desc_zh: "有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。"
+  - key: sessions.warmMaxBytes
+    type: number
+    default: "67108864"
+    env: BILI_SESSION_WARM_MAX_BYTES
+    group: process
+    desc_en: "Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed."
+    desc_zh: "启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。"
+  - key: sessions.residentMaxBytes
+    type: number
+    default: "536870912"
+    env: BILI_SESSION_RESIDENT_MAX_BYTES
+    group: process
+    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
+    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+  - key: sessions.gc.enabled
+    type: boolean
+    default: "false"
+    env: BILI_SESSION_GC
+    group: process
+    desc_en: "Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag)."
+    desc_zh: "过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。"
+  - key: sessions.gc.maxAgeDays
+    type: number
+    default: "7"
+    env: BILI_SESSION_GC_MAX_AGE_DAYS
+    group: process
+    desc_en: "GC age threshold in days."
+    desc_zh: "GC 年龄阈值（天）。"
+  - key: sessions.gc.maxTokens
+    type: number
+    default: "1000000"
+    env: BILI_SESSION_GC_MAX_TOKENS
+    group: process
+    desc_en: "GC token-size threshold per session record."
+    desc_zh: "GC 单会话记录的 token 大小阈值。"
+  - key: sessions.gc.intervalMs
+    type: number
+    default: "3600000"
+    env: BILI_SESSION_GC_INTERVAL_MS
+    group: process
+    desc_en: "GC sweep interval."
+    desc_zh: "GC 清扫间隔。"
+  - key: plugin.snapshotCapBytes
+    type: number
+    default: "104857600 (0 disables snapshots)"
+    env: BILI_PUBLIC_SNAPSHOT_CAP_BYTES
+    group: process
+    id: tt.snap
+    site_group: proc
+    desc_en: "Size cap for fork-API public snapshots served to native plugins."
+    desc_zh: "提供给原生插件的 fork API 公共快照大小上限。"
+    site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
+    site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"
+  - key: snapshot.shadow
+    type: boolean
+    default: "true (on)"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Snapshot-render shadow observability (#3756 follow-up): with the render lane still rollout-gated, every armed turn computes the would-be snapshot view, classifies the diff against the legacy outbound, and records per-session counters (web panel rows + /__bili/status snapshotShadow aggregate + the snapshot-shadow diagnostics topic). Default ON - it is the fleet-wide dry run whose error rate gates the rollout flip. Env BILI_SNAPSHOT_SHADOW wins. Turn off with false/0/off if you do not want the extra per-turn computation."
+    desc_zh: "快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。"

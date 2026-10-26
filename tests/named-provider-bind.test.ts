@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -13,6 +13,7 @@ import {
 } from "../src/config.js";
 import { handleConfigPut, readProviders } from "../src/web/api.js";
 import { setLogCapture } from "../src/logger.js";
+import { rmrf } from "./tmp-rm.ts";
 
 function withConfigFile(t: test.TestContext, providers: unknown): string {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-named-bind-"));
@@ -20,10 +21,17 @@ function withConfigFile(t: test.TestContext, providers: unknown): string {
     writeFileSync(p, JSON.stringify({ providers }, null, 2), "utf8");
     const prev = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = p;
+    // MITM off: this suite exercises bind/routing semantics; its
+    // api.anthropic.com lanes would otherwise earn the #3632 inert-lane
+    // warning and muddy the warning-count assertions below.
+    const prevMitm = process.env.BILI_MITM;
+    process.env.BILI_MITM = "0";
     t.after(() => {
         if (prev === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prev;
-        rmSync(dir, { recursive: true, force: true });
+        if (prevMitm === undefined) delete process.env.BILI_MITM;
+        else process.env.BILI_MITM = prevMitm;
+        rmrf(dir);
     });
     return p;
 }
@@ -62,7 +70,7 @@ test("bind alias applies compress/models/proxy onto the bound URL lane", (t) => 
     const routes = loadRoutes();
     assert.deepEqual(Object.keys(routes), ["https://api.anthropic.com"]);
     const lane = routes["https://api.anthropic.com"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.75);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.75);
     assert.equal(lane.models?.["claude-sonnet-4"]?.context, 200000);
     assert.equal(lane.models?.["claude-sonnet-4"]?.output, 8192);
     assert.equal(lane.proxy, "http://127.0.0.1:9999");
@@ -100,11 +108,11 @@ test("explicit URL key beats alias fields, per field; gaps are filled", (t) => {
     const routes = loadRoutes();
     assert.deepEqual(Object.keys(routes), ["https://api.anthropic.com"]);
     const lane = routes["https://api.anthropic.com"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.5);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.5);
     assert.equal(lane.compress?.emergencyThresholdPercent, 0.9);
     assert.equal(lane.compress?.outputHeadroomMaxPct, 0.3);
     assert.equal(lane.models?.m1?.context, 1000);
-    assert.equal(lane.models?.m1?.compress?.maxContextLimitPct, 0.6);
+    assert.equal((lane.models?.m1?.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.6);
     assert.equal(lane.models?.m1?.compress?.nudgeGrowthTokens, 50000);
     assert.equal(lane.models?.m2?.context, 3000);
     assert.equal(lane.proxy, "http://127.0.0.1:1111");
@@ -190,7 +198,7 @@ test("external ACP_PROVIDERS outranks inline config at every level", (t) => {
         extAlias: { bind: "https://e.example", compress: { maxContextLimitPct: 0.2, outputHeadroomMaxPct: 0.2, nudgeGrowthTokens: 888 } },
     }), "utf8");
     const lane = loadRoutes({ ACP_PROVIDERS: extPath })["https://e.example"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.1);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.1);
     assert.equal(lane.compress?.outputHeadroomMaxPct, 0.2);
     assert.equal(lane.compress?.nudgeGrowthTokens, 888);
 });
@@ -204,7 +212,7 @@ test("compactionOptIn is still consumed alongside bind", (t) => {
     const ids = resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "envopt" });
     for (const id of ["claude-bridge", "optin-only", "envopt"]) assert.ok(ids.includes(id));
     const routes = loadRoutes();
-    assert.equal(routes["https://api.anthropic.com"]?.compress?.maxContextLimitPct, 0.75);
+    assert.equal((routes["https://api.anthropic.com"]?.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.75);
     assert.ok(!("claude-bridge" in routes));
     assert.ok("optin-only" in routes);
 });
@@ -231,6 +239,81 @@ test("web config API round-trips named entries verbatim (no silent drop)", async
     const onDisk = JSON.parse(readFileSync(cfgPath, "utf8")) as { providers: Record<string, unknown> };
     assert.deepEqual(onDisk.providers["claude-bridge"], { bind: "https://api.anthropic.com", compactionOptIn: true, compress: { maxContextLimitPct: 0.75 } });
     assert.deepEqual(loadRoutes()["https://api.anthropic.com"]?.compress, { maxContextLimitPct: 0.75 });
+});
+
+test("compress-block keys at a URL route root warn instead of sitting silently (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        "https://cap.example": {
+            modelContextLimit: 1000000,
+            outputHeadroomMaxPct: 0.15,
+            models: { m1: { context: 200000 } },
+        },
+    });
+    const routes = loadRoutes();
+    assert.deepEqual(Object.keys(routes), ["https://cap.example"]);
+    assert.equal(routes["https://cap.example"].models?.m1?.context, 200000);
+    assert.equal(routes["https://cap.example"].compress, undefined);
+    assert.equal(warnings.length, 1);
+    for (const needle of ['"https://cap.example"', "modelContextLimit", "outputHeadroomMaxPct", '.compress']) {
+        assert.ok(warnings[0].includes(needle), `warning should mention ${needle}: ${warnings[0]}`);
+    }
+});
+
+test("bound alias: compress-block keys at its root stay inert through the fold and warn (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capBridge: {
+            bind: "https://cap-bound.example",
+            modelContextLimit: 500000,
+            nudgeGrowthTokens: 77777,
+            compress: { maxContextLimitPct: 0.7 },
+        },
+    });
+    const laneRaw = loadRoutes()["https://cap-bound.example"] as Record<string, unknown> | undefined;
+    assert.ok(laneRaw);
+    assert.equal((laneRaw.compress as Record<string, unknown> | undefined)?.maxContextLimitPct, 0.7);
+    assert.equal(laneRaw.modelContextLimit, undefined);
+    assert.equal(laneRaw.nudgeGrowthTokens, undefined);
+    assert.equal(warnings.length, 1);
+    for (const needle of ['"capBridge"', "modelContextLimit", "nudgeGrowthTokens"]) {
+        assert.ok(warnings[0].includes(needle), `warning should mention ${needle}: ${warnings[0]}`);
+    }
+});
+
+test("named entry whose only fields are compress-block keys: previously zero warnings, now one (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capLonely: { outputHeadroomMaxPct: 0.2 },
+    });
+    const routes = loadRoutes();
+    assert.ok("capLonely" in routes);
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes('"capLonely"') && warnings[0].includes("outputHeadroomMaxPct"), warnings[0]);
+});
+
+test("dialing recipes keep their own loud rejection — no duplicate route-root warning (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        glmLane: {
+            baseUrl: "https://glm.example",
+            api: "openai",
+            apiKeyEnv: "GLM_KEY",
+            models: { g1: { contextWindow: 100000 } },
+            modelContextLimit: 1000000,
+        },
+    });
+    loadRoutes();
+    assert.deepEqual(warnings, []);
+});
+
+test("route-root compress-key warning fires once per signature across reloads (#3675)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, { "https://cap-reload.example": { modelContextLimit: 250000 } });
+    loadRoutes();
+    loadRoutes();
+    loadRoutes();
+    assert.equal(warnings.filter((w) => w.includes('"https://cap-reload.example"')).length, 1);
 });
 
 test("web config API still rejects legacy, invalid-proxy, and non-object entries", async (t) => {

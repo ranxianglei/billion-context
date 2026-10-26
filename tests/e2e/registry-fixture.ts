@@ -1,15 +1,18 @@
 // Hermetic local npm registry fixture (verdaccio) for the ACP_TEST_REGISTRY
 // e2e suite (#1153). Brings its own registry instance on loopback — it never
 // depends on any external (even internal) service, so runs are offline,
-// deterministic, and secret-free.
+// deterministic, and secret-free. `publish` shells out to npm; on dev machines
+// with an npm guard, pass NPM_ALLOW_DANGEROUS=1 through (loopback-only — the
+// #19 private-registry allowlist cannot know this fixture's ephemeral port).
 import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { assertPortDead } from "../port-race.js";
+import { npmCliPath, npmHomeEnv, windowsSystemEnv } from "./crossplat.ts";
 
-export interface RegistryFixture {
+interface RegistryFixture {
     /** Base URL, e.g. http://127.0.0.1:43210 */
     url: string;
     port: number;
@@ -128,10 +131,17 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
 
         const runNpm = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
             new Promise((resolve, reject) => {
+                // Windows: npm.cmd cannot be spawned without a shell — run
+                // `node npm-cli.js` instead (argv stays literal, no quoting).
+                // Shell fallback passes the whole command as the file string:
+                // with shell:true, execFile prepends file to its args (`npm npm pack …`).
+                const cli = npmCliPath();
+                const tail = [...args, "--registry", url, "--no-audit", "--no-fund"];
+                const shellLine = `npm ${tail.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ")}`;
                 execFile(
-                    "npm",
-                    [...args, "--registry", url, "--no-audit", "--no-fund"],
-                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, env: { PATH: process.env.PATH ?? "", HOME: homeDir } },
+                    cli ? process.execPath : shellLine,
+                    cli ? [cli, ...tail] : [],
+                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, shell: cli ? false : true, windowsHide: true, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(homeDir), ...windowsSystemEnv(), ...(process.env.NPM_ALLOW_DANGEROUS ? { NPM_ALLOW_DANGEROUS: process.env.NPM_ALLOW_DANGEROUS } : {}) } },
                     (error, stdout, stderr) => {
                         if (error) reject(new Error(`npm ${args.join(" ")} failed: ${(stderr || error.message).slice(0, 4000)}`));
                         else resolve({ stdout, stderr });
@@ -139,7 +149,7 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
                 );
             });
 
-        return { url, port, homeDir, root, stop, publish: (tgz) => runNpm(["publish", tgz]), npm: runNpm };
+        return { url, port, homeDir, root, stop, publish: async (tgz) => { await runNpm(["publish", tgz]); }, npm: runNpm };
     } catch (err) {
         await stop();
         throw err;

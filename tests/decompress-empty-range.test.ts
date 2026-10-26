@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 process.env.BILI_PERSIST = "0";
 
-import { createCore, defaultConfig, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, type Config, type CoreMessage } from "acp-kernel";
+import { createCore, defaultConfig, DEFAULT_CCR_CONFIG, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
 import { storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
@@ -68,37 +68,37 @@ function ctxOf(f: FoldResult) {
 
 test("#1712: both range fields blank → whole-block restore, no failure", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "", endId: "" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "", endId: "" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/, `blank range fields must not fail: ${out.slice(0, 120)}`);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: whitespace-only range fields count as omitted too", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "   ", endId: "\t" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "   ", endId: "\t" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: one field missing + other blank → whole-block restore", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: one-sided non-blank still requires both, and steers to omitting them", () => {
     const f = fold({ ccr: true });
-    const outStart = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "" }, ctxOf(f));
+    const outStart = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "" }, ctxOf(f)).text;
     assert.match(outStart, /startId and endId must be given together/);
     assert.match(outStart, /omit both to restore the whole block/);
-    const outEnd = resolveDecompress({ blockId: f.blockId, endId: "m00004" }, ctxOf(f));
+    const outEnd = resolveDecompress({ blockId: f.blockId, endId: "m00004" }, ctxOf(f)).text;
     assert.match(outEnd, /startId and endId must be given together/);
 });
 
 test("#1712: plugin mode without CCR points at the working call shape instead of dead-end param filling", () => {
     const f = fold({ ccr: false, plugin: "omp" });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f)).text;
     assert.match(out, /plugin-mode session does not have/);
     assert.ok(out.includes(`{"blockId":"${f.blockId}"}`), `copy-pasteable guidance: ${out}`);
     assert.doesNotMatch(out, /is proxy-mode only/);
@@ -106,19 +106,19 @@ test("#1712: plugin mode without CCR points at the working call shape instead of
 
 test("#1712: proxy mode without CCR keeps the enable-CCR error", () => {
     const f = fold({ ccr: false });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f)).text;
     assert.match(out, /requires CCR \u2014 enable compress\.ccr\.enabled/);
 });
 
 type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; parameters?: Record<string, unknown> } };
 
-function propsOf(arr: unknown[], name: string): Record<string, unknown> | undefined {
+function propsOf(arr: unknown[], name: string): Record<string, { type?: string } | undefined> | undefined {
     const e = arr.find((t) => {
         const o = t as FlatTool;
         return o.name === name || o.function?.name === name;
     }) as FlatTool | undefined;
     if (!e) return undefined;
-    const schema = (e.input_schema ?? e.parameters ?? e.function?.parameters) as { properties?: Record<string, unknown> } | undefined;
+    const schema = (e.input_schema ?? e.parameters ?? e.function?.parameters) as { properties?: Record<string, { type?: string } | undefined> } | undefined;
     return schema?.properties;
 }
 
@@ -174,7 +174,7 @@ test("#1712: manifest (CCR off by default) never advertises decompress range arg
 });
 
 test("#1712: manifest with base CCR on advertises range args on anthropic/openai only — responses never arms CCR in plugin mode (#1271)", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
     for (const wire of ["anthropic", "openai"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.equal(props?.startId?.type, "string", `${wire}: startId advertised with base CCR on`);

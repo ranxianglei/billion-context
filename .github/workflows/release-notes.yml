@@ -1,0 +1,113 @@
+name: Publish Release Notes
+
+# #1870: publishes the companion release-notes package whenever release-notes/
+# changes. Mirrors advisories.yml: the git copy keeps a placeholder version; the
+# real version is derived from the registry (max of local and published) + 1
+# patch, so every push yields a fresh version without committing version churn.
+#
+# Entries describe releases that ALREADY exist on npm (the release gate in
+# release.yml enforces that the version being published has an entry HERE
+# first), so there is no existence gate on this side.
+#
+# Doc shape (schema 1):
+#   releases: newest-first; ≤20 entries (consumers cap the same way);
+#   fields: version (exact tag), date (YYYY-MM-DD), tier, summary.
+#   tier: "routine" (default) | "recommended" (restart-soon, record-only)
+#        | "critical" (serious defect users must act on — the only tier
+#          users ever see, #1977). Force-upgradeable defects stay in
+#          advisories/ (#1481) — entries here never trigger the safety chain.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "release-notes/**"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate release-notes payload
+        run: |
+          node -e "
+            const semver = require('semver');
+            const p = require('./release-notes/package.json').billionContextReleaseNotes;
+            if (!p || p.schema !== 1 || !Array.isArray(p.releases)) {
+              console.error('invalid billionContextReleaseNotes payload (need schema:1 + releases array)');
+              process.exit(1);
+            }
+            if (p.releases.length === 0 || p.releases.length > 20) {
+              console.error('releases must hold 1..20 entries (got ' + p.releases.length + ')');
+              process.exit(1);
+            }
+            const seen = new Set();
+            for (const e of p.releases) {
+              if (!semver.valid(e.version)) {
+                console.error('invalid version:', JSON.stringify(e.version));
+                process.exit(1);
+              }
+              if (seen.has(e.version)) {
+                console.error('duplicate entry for', e.version);
+                process.exit(1);
+              }
+              seen.add(e.version);
+              if (e.tier !== 'routine' && e.tier !== 'recommended' && e.tier !== 'critical') {
+                console.error(e.version, ': tier must be routine|recommended|critical, got', JSON.stringify(e.tier));
+                process.exit(1);
+              }
+              if (typeof e.summary !== 'string' || !e.summary.trim()) {
+                console.error(e.version, ': summary must be a non-empty string');
+                process.exit(1);
+              }
+              if (e.summary.length > 400) {
+                console.error(e.version, ': summary too long (' + e.summary.length + ' chars, cap 400)');
+                process.exit(1);
+              }
+              if (e.date !== undefined && !/^\\d{4}-\\d{2}-\\d{2}$/.test(e.date)) {
+                console.error(e.version, ': date must be YYYY-MM-DD, got', JSON.stringify(e.date));
+                process.exit(1);
+              }
+              // #3719 item4: optional bilingual summary + version targeting.
+              if (e.summaryZh !== undefined && (typeof e.summaryZh !== 'string' || !e.summaryZh.trim())) {
+                console.error(e.version, ': summaryZh must be a non-empty string when present');
+                process.exit(1);
+              }
+              if (e.summaryZh !== undefined && e.summaryZh.length > 400) {
+                console.error(e.version, ': summaryZh too long (' + e.summaryZh.length + ' chars, cap 400)');
+                process.exit(1);
+              }
+              if (e.minVersion !== undefined && !semver.valid(e.minVersion)) {
+                console.error(e.version, ': minVersion must be valid semver, got', JSON.stringify(e.minVersion));
+                process.exit(1);
+              }
+              if (e.maxVersion !== undefined && !semver.valid(e.maxVersion)) {
+                console.error(e.version, ': maxVersion must be valid semver, got', JSON.stringify(e.maxVersion));
+                process.exit(1);
+              }
+              if (e.minVersion !== undefined && e.maxVersion !== undefined && semver.gt(e.minVersion, e.maxVersion)) {
+                console.error(e.version, ': minVersion must be <= maxVersion');
+                process.exit(1);
+              }
+            }
+          "
+
+      - name: Publish next patch
+        working-directory: release-notes
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          LATEST=$(npm view billion-context-release-notes version 2>/dev/null || echo "0.0.0")
+          LOCAL=$(node -p "require('./package.json').version")
+          NEXT=$(node -e "const s=require('semver');const base=s.gt(process.argv[1],process.argv[2])?process.argv[1]:process.argv[2];const v=base.split('.');v[2]=String(Number(v[2])+1);console.log(v.join('.'))" "$LOCAL" "$LATEST")
+          npm version "$NEXT" --no-git-tag-version --allow-same-version
+          npm publish --access public

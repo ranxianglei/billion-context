@@ -7,11 +7,13 @@ import { spawn } from "node:child_process";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, isPrivateUpstreamHost, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { buildClaudePluginEnv, buildMcpConfig, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { isPrivateUpstreamHost } from "../src/private-host.ts";
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
 // (claude/codex spawned by `bili claude` / `bili codex`) bind into plugin mode
@@ -88,6 +90,13 @@ async function startRig(): Promise<Rig> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -106,13 +115,14 @@ async function startRig(): Promise<Rig> {
     };
 }
 
-function postModel(rig: Rig, sessionHeader?: string): Promise<Response> {
+function postModel(rig: Rig, sessionHeader?: string, mcpTools = false): Promise<Response> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (sessionHeader) headers["x-claude-code-session-id"] = sessionHeader;
+    const tools = mcpTools ? [{ name: "mcp__bili__acp_status", description: "status", input_schema: { type: "object", properties: {} } }] : undefined;
     return fetch(rig.modelUrl(), {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }], ...(tools ? { tools } : {}) }),
     });
 }
 
@@ -159,18 +169,49 @@ test("launcher identity binding: register arriving AFTER the first request still
     }
 });
 
-test("launcher headless pending binding: register BEFORE the first request binds the new session (codex spawn)", async () => {
+test("launcher headless pending binding: an MCP-declaring request binds the new session", async () => {
     const rig = await startRig();
     try {
         await register(rig, "headless-conv-1", { agent: "mcp" });
         // Strong signal that does NOT match the registered id (#286: anonymous
         // requests are 400 now), so the identity lookup misses and the headless
         // pending path has to fire.
-        await postModel(rig, "headless-req-1");
+        await postModel(rig, "headless-req-1", true);
         assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "wire tool injection suppressed from the very first request");
         const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-1"))).json() as { ok: boolean; pluginAgent?: string };
         assert.ok(status.ok, "pending register consumed by the new session");
         assert.equal(status.pluginAgent, "mcp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("launcher headless pending binding: native wire requests do not consume an MCP registration", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "headless-conv-2", { agent: "mcp" });
+        await postModel(rig, "native-wire-1");
+        assert.ok(rig.upstreamBodies[0]!.includes("\"compress\""), "native wire tools remain injected");
+        const before = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-2"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.equal(before.ok, false, "pending registration remains available for the MCP lane");
+        await postModel(rig, "mcp-wire-1", true);
+        const after = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-2"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(after.ok, "the later MCP request consumes the pending registration");
+        assert.equal(after.pluginAgent, "mcp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("launcher headless pending binding: native wire requests keep non-MCP headless binding", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "headless-pi-conv", { agent: "pi" });
+        await postModel(rig, "headless-pi-req");
+        assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "the non-MCP headless registration still binds");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-pi-conv"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(status.ok);
+        assert.equal(status.pluginAgent, "pi");
     } finally {
         await rig.closeAll();
     }
@@ -266,29 +307,18 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(env.HOME, "/h", "base env preserved");
     assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }).ANTHROPIC_BASE_URL, undefined, "MITM mode leaves the base URL alone");
 
+    // Vertex port, phase 1 (decisions 1/7): additive second variable, pinned to the
+    // `anthropic` wire because Vertex's :rawPredict matches no classifier arm.
+    const vxEnv = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1");
+    assert.equal(vxEnv.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com", "ANTHROPIC_BASE_URL keeps its value");
+    assert.equal(vxEnv.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, null).ANTHROPIC_VERTEX_BASE_URL, undefined, "Vertex off → no second key");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1").ANTHROPIC_VERTEX_BASE_URL, undefined, "MITM mode leaves the Vertex key alone too");
+
     const mcp = buildMcpConfig("http://127.0.0.1:8787");
     assert.equal(mcp.mcpServers.bili.command, process.execPath);
     assert.match(mcp.mcpServers.bili.args[0]!, /mcp\.js$/);
     assert.equal(mcp.mcpServers.bili.env.BILI_MCP_PROXY, "http://127.0.0.1:8787");
-
-    const codexConvId = "11111111-2222-4333-8444-555555555555";
-    const args = buildCodexMcpArgs("http://127.0.0.1:8787", codexConvId);
-    assert.deepEqual(args[0], "-c");
-    assert.match(args[1]!, /^mcp_servers\.bili\.command=/);
-    assert.match(args[3]!, /^mcp_servers\.bili\.args=/);
-    assert.match(args[5]!, /^mcp_servers\.bili\.env\.BILI_MCP_PROXY=/);
-    // codex-cli parses these -c values as TOML: args MUST be a TOML array,
-    // not a JSON-encoded string — a double-encoded value makes codex refuse
-    // to start ("invalid type: string ..., expected a sequence").
-    const argsValue = args[3]!.slice("mcp_servers.bili.args=".length);
-    assert.match(argsValue, /^\[.*\]$/, "args is a TOML array, not a stringified array");
-    const parsedArgs = JSON.parse(argsValue) as unknown[];
-    assert.ok(Array.isArray(parsedArgs) && parsedArgs.length === 1, "exactly one argument");
-    assert.ok(String(parsedArgs[0]).endsWith("mcp.js"), "argument is the mcp script path");
-    // codex passes no session id to MCP children, so the launcher injects a
-    // per-spawn conversation id for the shell's headless self-registration.
-    assert.match(args[7]!, /^mcp_servers\.bili\.env\.BILI_CONVERSATION_ID=/);
-    assert.equal(args[7]!.slice("mcp_servers.bili.env.BILI_CONVERSATION_ID=".length), JSON.stringify(codexConvId));
 });
 
 test("mcp stdio shell: manifest → tools/list → tools/call forwards to the plugin tool endpoint", async () => {
@@ -340,7 +370,7 @@ test("mcp stdio shell: manifest → tools/list → tools/call forwards to the pl
     const init = byId(1) as { result?: { serverInfo?: { name?: string } } };
     assert.equal(init.result?.serverInfo?.name, "bili");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/, "acp_status result forwarded verbatim");
@@ -382,7 +412,7 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
                     // request carries a strong signal that does NOT match the
                     // self-registered conversation id (#286: anonymous requests
                     // are 400 now), so the headless pending path has to fire.
-                    void postModel(rig, "codex-e2e-req-1").then(() => {
+                    void postModel(rig, "codex-e2e-req-1", true).then(() => {
                         send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
                         send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: {} } });
                     });
@@ -411,7 +441,7 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
 
     const byId = (n: number): Record<string, unknown> => JSON.parse(lines.find((l) => (JSON.parse(l) as { id?: number }).id === n) ?? "{}");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"], "tools listed");
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"], "tools listed");
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false, `tools/call succeeded (self-registered conversation bound)${call.result?.isError ? ": " + (call.result?.content?.[0]?.text ?? "") : ""}`);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/);

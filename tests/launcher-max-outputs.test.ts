@@ -71,7 +71,7 @@ test("parseOmpYaml: maxTokens at model-entry depth completes the entry (#971)", 
         "        contextWindow: 131072",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.deepEqual(cfg.providers.sglang?.models, [
+    assert.deepEqual(cfg.providers?.sglang?.models, [
         { id: "qwen3.8-27b", contextWindow: 262144, maxOutput: 32768 },
         { id: "other-model", contextWindow: 131072 },
     ]);
@@ -89,7 +89,7 @@ test("parseOpencodeProviders: limit object shape {context, output} (#971)", () =
             },
         },
     });
-    assert.deepEqual(cfg.providers.sglang?.models, [
+    assert.deepEqual(cfg.providers?.sglang?.models, [
         { id: "qwen3.8-27b", contextWindow: 262144, maxOutput: 32768 },
         { id: "legacy", contextWindow: 131072 },
     ]);

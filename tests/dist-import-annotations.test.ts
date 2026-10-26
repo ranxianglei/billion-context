@@ -4,7 +4,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findRelativeImportRefs, checkDistImportAnnotations } from "../scripts/check-dist-import-annotations.mjs";
+const gateSpec = "../scripts/check-dist-import-annotations.mjs";
+const { findRelativeImportRefs, checkDistImportAnnotations } = await import(gateSpec) as {
+    findRelativeImportRefs: (text: string) => string[];
+    checkDistImportAnnotations: (distDir: string) => Array<{ file: string; refs: string[] }>;
+};
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";

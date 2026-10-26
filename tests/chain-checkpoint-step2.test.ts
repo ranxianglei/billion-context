@@ -45,7 +45,7 @@ const tag = (over: Partial<ChainCheckpoint> = {}): string =>
 test("parser: accepts canonical + reordered attrs, rejects every malformed shape", () => {
     assert.deepEqual(parseChainCheckpoint(tag()), { v: 1, processor: "bili-a", issuedAt: T0, requestId: "req-1", digest: GOOD_DIGEST });
     assert.ok(parseChainCheckpoint(`${L}bili-chain digest="${GOOD_DIGEST}" request-id="r" issued-at="${T0}" processor="p" v="1"/${R}`), "attr order is irrelevant");
-    assert.equal(parseChainCheckpoint(tag({ digest: undefined }) ?? "", "x") ?? null, null);
+    assert.equal(parseChainCheckpoint(tag({ digest: undefined }) ?? ""), null, "explicit undefined digest");
     const noDigest = tag().replace(` digest="${GOOD_DIGEST}"`, "");
     assert.equal(parseChainCheckpoint(noDigest), null, "missing attr");
     assert.equal(parseChainCheckpoint(tag().replace("/" + R, ` v="1"/${R}`)), null, "duplicate attr");
@@ -273,7 +273,7 @@ function close(server: http.Server): Promise<void> {
 const MODEL = "gpt-test";
 
 function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptions>): ProxyOptions {
-    return {
+    const base: ProxyOptions = {
         port,
         host: "127.0.0.1",
         upstream,
@@ -288,9 +288,16 @@ function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptio
         passthrough: false,
         autoUpdate: false,
         logFile: "off",
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
-        ...overrides,
     };
+    return { ...base, ...overrides };
 }
 
 type Captured = { url: string; headers: http.IncomingHttpHeaders; body: string };

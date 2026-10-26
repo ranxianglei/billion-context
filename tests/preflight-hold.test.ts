@@ -12,7 +12,8 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_PREFLIGHT_HOLD_MS = "300";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -46,9 +47,14 @@ function okSse(inputTokens: number): string {
 
 function bigConversation(): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
+    // #3298: repeat(250) sat ~16 est-tokens under the 10k window after the
+    // preflight fold on old system-prompt sizes — any growth of the injected
+    // prompt (e.g. the project-attribution line) flipped the #330 soft-zone
+    // relaxation gate and ate the protected tail. repeat(235) restores ~700
+    // tokens of margin so the guard pins behavior, not a knife-edge.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        const filler = `MARKER_${i}_content_`.repeat(250);
+        const filler = `MARKER_${i}_content_`.repeat(235);
         msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;
@@ -59,6 +65,8 @@ type Call = { raw: string };
 type TimedResponse = {
     status: number;
     headers: http.IncomingHttpHeaders;
+    /** epoch ms when the request was created */
+    t0: number;
     /** ms from request start to response headers */
     tHeaderMs: number;
     /** ms from request start to response end */
@@ -77,6 +85,7 @@ function timedPost(url: string, headers: Record<string, string>, body: string): 
                 resolve({
                     status: res.statusCode ?? 0,
                     headers: res.headers,
+                    t0,
                     tHeaderMs,
                     tEndMs: Date.now() - t0,
                     body: Buffer.concat(chunks).toString("utf8"),
@@ -106,11 +115,13 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
 }
 
 test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the real stream", async () => {
     const calls: Call[] = [];
+    let summaryDoneMs = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -125,6 +136,7 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
             } else {
                 // Slow summarization call — outlives the 300ms hold grace.
                 setTimeout(() => {
+                    summaryDoneMs = Date.now();
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({
                         id: "msg_summary",
@@ -141,14 +153,14 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // Fresh session, ~13k-token history vs 10k window → preflight fires
+        // Fresh session, ~12k-token history vs 10k window → preflight fires
         // and its summarization call takes 1.5s ≫ the 300ms grace.
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
@@ -158,7 +170,13 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
         assert.equal(r.status, 200);
         assert.equal(String(r.headers["content-type"]), "text/event-stream");
         assert.equal(r.headers["x-bili-preflight"], "compressing", "early commit is marked for observability");
-        assert.ok(r.tHeaderMs < SLOW_MS, `headers arrived before summarization finished (${r.tHeaderMs}ms)`);
+        // #3147-C: assert the RELATIVE invariant (headers before the mock's
+        // actual summarization completion), not an absolute wall-clock bound —
+        // a loaded runner stalls both timers equally and used to eat the fixed
+        // margin while the behavior stayed correct. If early commit regresses,
+        // headers land at stream end, i.e. AFTER summarization finished.
+        assert.ok(summaryDoneMs > 0, "the slow summarization call completed");
+        assert.ok(r.tHeaderMs < summaryDoneMs - r.t0, `headers arrived before summarization finished (${r.tHeaderMs}ms vs ${summaryDoneMs - r.t0}ms)`);
         assert.ok(r.tEndMs >= SLOW_MS, `the response waited for the slow preflight (${r.tEndMs}ms) — the hold did real work`);
         assert.ok(r.body.includes(": bili-preflight"), "an SSE comment keep-alive was sent while compressing");
         assert.ok(r.body.includes('"text_delta"'), "the real stream content follows the keep-alive");
@@ -172,8 +190,10 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
         assert.ok(fwd.includes("MARKER_11_"), "recent protected messages remain in the payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -202,11 +222,11 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await timedPost(
@@ -225,8 +245,10 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
         assert.ok(calls.filter((c) => !c.raw.includes('"stream":true')).length >= 1, "the (slow, 429'd) summarization call happened");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -254,11 +276,11 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "gpt-resp": { context: 10_000 } }, 10_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const input = bigConversation().map((m) => ({ type: "message", role: m.role, content: m.content }));
@@ -273,14 +295,17 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
         assert.equal(calls.filter((c) => !c.raw.includes('"stream":false')).length, 0, "nothing was forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
 test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, then valid JSON", async () => {
     const calls: Call[] = [];
+    let summaryDoneMs = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -296,6 +321,7 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
             const msgs = parsed.messages;
             if (Array.isArray(msgs) && msgs.length === 2 && msgs[0]?.role === "system") {
                 setTimeout(() => {
+                    summaryDoneMs = Date.now();
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT } }] }));
                 }, SLOW_MS);
@@ -312,11 +338,11 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await timedPost(
@@ -327,7 +353,13 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         assert.equal(r.status, 200);
         assert.equal(String(r.headers["content-type"]), "application/json");
         assert.equal(r.headers["x-bili-preflight"], "compressing");
-        assert.ok(r.tHeaderMs < SLOW_MS, `headers arrived before summarization finished (${r.tHeaderMs}ms)`);
+        // #3147-C: assert the RELATIVE invariant (headers before the mock's
+        // actual summarization completion), not an absolute wall-clock bound —
+        // a loaded runner stalls both timers equally and used to eat the fixed
+        // margin while the behavior stayed correct. If early commit regresses,
+        // headers land at stream end, i.e. AFTER summarization finished.
+        assert.ok(summaryDoneMs > 0, "the slow summarization call completed");
+        assert.ok(r.tHeaderMs < summaryDoneMs - r.t0, `headers arrived before summarization finished (${r.tHeaderMs}ms vs ${summaryDoneMs - r.t0}ms)`);
         assert.ok(r.tEndMs >= SLOW_MS, `the response waited for the slow preflight (${r.tEndMs}ms)`);
         assert.ok(r.body.startsWith(" "), "whitespace keep-alive precedes the JSON body");
         const json = JSON.parse(r.body) as { choices?: Array<{ message?: { content?: string } }> };
@@ -342,8 +374,10 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         assert.ok(forwards[0]!.raw.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 
 // #1637: bili's Anthropic lane never emitted cache_control breakpoints, so
 // Anthropic-style upstreams (explicit caching) never cached anything bili
@@ -74,6 +75,13 @@ async function startRig(): Promise<Rig> {
         kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         log: false,
         sessionHeader: "x-acp-session",
         debug: false,
@@ -101,12 +109,12 @@ interface Msg {
     content: string | { type: "text"; text: string; cache_control?: unknown }[];
 }
 
-async function postModel(rig: Rig, sessionId: string, messages: Msg[], extraHeaders: Record<string, string> = {}, upstreamPortHint?: number, tools?: unknown[]): Promise<Response> {
+async function postModel(rig: Rig, sessionId: string, messages: Msg[], extraHeaders: Record<string, string> = {}, upstreamPortHint?: number, tools?: unknown[], system?: unknown): Promise<Response> {
     const port = upstreamPortHint ?? rig.portHint();
     return fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${port}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-session-affinity": sessionId, ...extraHeaders },
-        body: JSON.stringify({ model: "l1637-model", max_tokens: 8192, stream: true, messages, ...(tools ? { tools } : {}) }),
+        body: JSON.stringify({ model: "l1637-model", max_tokens: 8192, stream: true, ...(system !== undefined ? { system } : {}), messages, ...(tools ? { tools } : {}) }),
     });
 }
 
@@ -287,6 +295,64 @@ test("#1637: cap 3 — marks stop advancing once the budget is full and existing
         assert.deepEqual(markedTexts(rig.upstreamBodies[3]), ["u1", "u2", "u3"], "turn 4: frozen, no advance past cap");
         assert.deepEqual(markedTexts(rig.upstreamBodies[4]), ["u1", "u2", "u3"], "turn 5: still frozen — existing marks never dropped");
         assert.equal(markedCount(rig.upstreamBodies[4]).system, 1, "system breakpoint persists throughout");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("#1876: multi-block client system rides out byte-exact; compress prompt appended as trailing block; client mark stays in place", async () => {
+    const rig = await startRig();
+    try {
+        const system = [
+            { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
+            { type: "text", text: "YOU_ARE_CLAUDE_CODE", cache_control: { type: "ephemeral" } },
+            { type: "text", text: "REPO_CONVENTIONS" },
+        ];
+        const h1: Msg[] = [{ role: "user", content: "hello one" }, { role: "assistant", content: "ack one" }];
+        await postModel(rig, "sess-1876-a", h1, {}, undefined, undefined, system);
+        await waitFor(() => rig.upstreamBodies.length >= 1, "turn 1 forward");
+
+        const b1 = parseBody(rig.upstreamBodies[0]);
+        assert.ok(Array.isArray(b1.system), "outbound system stays a structured array");
+        assert.equal(b1.system!.length, 4, "3 client blocks + 1 appended prompt block — NOT merged into one");
+        assert.deepEqual(b1.system!.slice(0, 3), system, "client blocks byte-exact in order, cache_control on its own (non-first) block");
+        assert.equal(b1.system![3]?.cache_control, undefined, "appended prompt block carries no breakpoint");
+        assert.ok(typeof b1.system![3]?.text === "string" && b1.system![3]!.text.length > 0, "appended block carries the compress prompt");
+        assert.equal(markedCount(rig.upstreamBodies[0]).system, 1, "exactly the client's own mark — bili adds none");
+
+        // Turn 2, same client system: the whole system element must serialize
+        // identically (the prefix-cache contract the #1548 matrix pins as G).
+        const h2: Msg[] = [...h1, { role: "user", content: "hello two" }];
+        await postModel(rig, "sess-1876-a", h2, {}, undefined, undefined, system);
+        await waitFor(() => rig.upstreamBodies.length >= 2, "turn 2 forward");
+        const b2 = parseBody(rig.upstreamBodies[1]);
+        assert.deepEqual(b2.system, b1.system, "system element byte-stable across turns under the append shape");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("#1876: unmarked multi-block system — bili's fallback breakpoint lands on the appended trailing block", async () => {
+    const rig = await startRig();
+    try {
+        const system = [
+            { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
+            { type: "text", text: "YOU_ARE_CLAUDE_CODE" },
+        ];
+        const history: Msg[] = [
+            { role: "user", content: "hello one" },
+            { role: "assistant", content: "ack one" },
+            { role: "user", content: "hello two" },
+        ];
+        await postModel(rig, "sess-1876-b", history, {}, undefined, undefined, system);
+        await waitFor(() => rig.upstreamBodies.length >= 1, "forward");
+
+        const b1 = parseBody(rig.upstreamBodies[0]);
+        assert.ok(Array.isArray(b1.system));
+        assert.equal(b1.system!.length, 3, "2 client blocks + 1 appended prompt block");
+        assert.deepEqual(b1.system!.slice(0, 2), system, "client blocks byte-exact, unmarked");
+        assert.deepEqual(b1.system![2]?.cache_control, { type: "ephemeral" }, "fallback breakpoint on the appended (last) block — full cumulative coverage as before");
+        assert.equal(markedCount(rig.upstreamBodies[0]).system, 1, "exactly one system breakpoint");
     } finally {
         await rig.closeAll();
     }

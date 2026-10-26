@@ -49,7 +49,9 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { createForkAdopter } from "./fork-adopt.js";
+import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Under the cap, panels go to description verbatim;
@@ -72,6 +74,8 @@ export interface V2HttpRequestEvent {
     agent?: unknown;
     model?: { providerID?: unknown; id?: unknown };
     request?: { url?: unknown; headers?: V2Headers | null };
+    url?: unknown;
+    headers?: Record<string, string>;
 }
 
 interface V2ToolEditor {
@@ -105,14 +109,14 @@ interface V2CatalogModelEntry {
 
 export interface V2PluginContext {
     session?: {
-        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => void | Promise<V2Registration | undefined>;
+        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => V2Registration | void | Promise<V2Registration | undefined>;
         synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
-        transform?: (cb: (editor: V2ToolEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2ToolEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     command?: {
-        transform?: (cb: (editor: V2CommandEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2CommandEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     event?: { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<{ type?: unknown; data?: Record<string, unknown> }> | undefined };
     /** v2.0.x stable (probed @opencode/cli 2.0.18): ModelApi.list() →
@@ -130,6 +134,8 @@ export interface V2PluginContext {
 }
 
 const WINDOW_REFRESH_MS = 60000;
+// #2443: cooldown before re-trying a failed conditional-tool manifest fetch (pi/dsh parity); a down proxy must not be re-polled on every routed request.
+const TOOL_DELTA_RETRY_MS = 15000;
 
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
@@ -146,6 +152,9 @@ export interface V2State {
     outputs?: Map<string, number>;
     windowsAt?: number;
     windowsWarned?: boolean;
+    toolDelta?: Promise<void>;
+    toolDeltaReady?: boolean;
+    toolDeltaRetryAt?: number;
 }
 
 function refreshWindows(ctx: V2PluginContext, state: V2State): void {
@@ -179,7 +188,7 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
         // an earlier harvest still supplies a window).
         if (--pending === 0 && map.size === 0 && !state.windows && !state.windowsWarned) {
             state.windowsWarned = true;
-            console.warn("[bili-opencode] no usable model context limits found (tried ctx.model.list + ctx.catalog seams) — x-bili-plugin-context-window goes unstamped and the bili proxy falls back to registry/configured windows; opencode.json limit.context is NOT reaching the proxy");
+            logHostEvent("warn", "[native-client]", "[bili-opencode] no usable model context limits found (tried ctx.model.list + ctx.catalog seams) — x-bili-plugin-context-window goes unstamped and the bili proxy falls back to registry/configured windows; opencode.json limit.context is NOT reaching the proxy");
         }
     };
     const safeModelList = (fn?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined): Promise<{ data?: V2CatalogModelEntry[] }> => {
@@ -238,12 +247,18 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
     });
 }
 
-export interface OpencodeV2SetupOptions {
+interface OpencodeV2SetupOptions {
     /** Native mode only: called for EVERY outgoing provider request before
      *  stamping. Owns proxy discovery and URL rewriting to the self-spawned
      *  proxy (idempotent on already-routed URLs) and sets state.proxyBase
      *  when traffic is routed. Absent in launcher mode (no routing). */
     route?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** Native mode only (#3248 phase 2): called LAST in the http.request hook
+     *  (after header stamping and fork adoption) so the incremental-turn
+     *  adapters can swap the body for an incremental payload and stamp the
+     *  marker header. Absent in launcher mode. Must never throw — the hook
+     *  itself wraps it, but adapters also guard internally. */
+    incremental?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
     /** #1362: cooldown between failed derived-session register attempts (tests inject). */
     derivedRetryMs?: number;
 }
@@ -260,6 +275,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // data.sessionID + optional data.parentID); each derived sid is then
         // identity-registered once by its first stamped request. Fire-and-forget
         // with per-sid cooldown after failure; root sessions never report.
+        // #2399 stage 3: fork-child adoption. derivedParent (below) is the
+        // parent-declaration source; the http.request hook is the only V2 seam
+        // that sees BOTH the owning session id and the outgoing body. The
+        // prefix match inside tryForkAdoption is the "child truly replays the
+        // parent's history" gate #2394 requires for opencode — persona ids
+        // (#1102) that mint fresh contexts never match a parent prefix, so
+        // N=0 and no fork is posted. V1 (chat.headers only, no body seam)
+        // stays on the read-only derived register. The fire-and-forget
+        // identity register in reportDerived may claim the child id first —
+        // the proxy's fork endpoint tolerates a same-parent claim (#2399 B).
+        const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `[bili-opencode] ${line}`));
         const derivedParent = new Map<string, string>();
         const derivedReported = new Map<string, "pending" | "done">();
         const derivedRetryAt = new Map<string, number>();
@@ -306,7 +332,8 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 if (window !== undefined) headers.set("x-bili-plugin-context-window", String(window));
                 const output = state.outputs?.get(key);
                 if (output !== undefined) headers.set("x-bili-plugin-max-output", String(output));
-                headers.set("x-bili-plugin-model", model.id);
+                const modelHeader = asciiHeaderValue(model.id);
+                if (modelHeader !== undefined) headers.set("x-bili-plugin-model", modelHeader);
                 reportRuntimeInfoOnChange(state.proxyBase, { agent: "opencode", model: model.id, contextWindow: window, maxOutput: output, source: "client-config" });
             }
             reportDerived(sid);
@@ -317,6 +344,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             const url = e.request?.url;
             if (typeof url !== "string") return;
             if (options.route !== undefined) {
+                // #3308: prime the window map BEFORE the route decides — its
+                // degrade branch needs the model's context window to refuse a
+                // provably-oversized body locally instead of sending it direct
+                // into a guaranteed upstream 400. The harvest commits on
+                // microtasks, so with a slow catalog the first request still
+                // sees an empty map and keeps the documented fail-open; from
+                // the second request on the guard is armed even when bootstrap
+                // never landed. Launcher mode keeps today's ordering: harvesting
+                // without a detected proxy would only warn about headers bili
+                // never stamps there.
+                refreshWindows(ctx, state);
                 // Native mode: route owns discovery + rewriting (it is called
                 // per request even once state.proxyBase is known, because the
                 // URL rewrite must happen per request and env detection alone
@@ -328,10 +366,143 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!state.proxyBase) return;
             refreshWindows(ctx, state);
             stampHeaders(e);
+            ensureConditionalTools();
+            // #2399 stage 3: adopt the fork child before its first request
+            // reaches the proxy (see the forkAdopter comment above).
+            const forkChild = typeof e.sessionID === "string" ? e.sessionID : "";
+            const forkParent = derivedParent.get(forkChild);
+            if (forkChild.length > 0 && forkParent !== undefined && state.proxyBase) {
+                let forkBody: unknown;
+                try {
+                    // The structural type cannot know the runtime shape; opencode
+                    // hands the hook a real fetch Request (probed on 2.0.x), and
+                    // every other shape (ws handshake's synthetic request) skips.
+                    const req = e.request as Request | undefined;
+                    forkBody = typeof req?.clone === "function" ? await req.clone().json() : undefined;
+                } catch {
+                    forkBody = undefined;
+                }
+                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody });
+            }
+            // #3248 phase 2: incremental-turn divert (native adapters only —
+            // the body swap must land after routing/stamping so the marker
+            // header rides the SAME request the host will send).
+            if (options.incremental !== undefined) {
+                try {
+                    await options.incremental(e, state);
+                } catch {
+                    // never break the host's request on adapter failure
+                }
+            }
         };
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
+
+        try {
+            const wsReg = await ctx.session?.hook?.("experimental.ws.handshake", async (e) => {
+                // #2491: intercept any /responses endpoint (custom OpenAI-compatible
+                // providers were silently left uncompressed over WS); #2359 azure
+                // header-cap handling stays server-side in responses-ws egress.
+                if (pluginDisabled() || typeof e.url !== "string" || !/^wss?:\/\//.test(e.url)) return;
+                const httpUrl = e.url.replace(/^ws/, "http");
+                if (!new URL(httpUrl).pathname.endsWith("/responses")) return;
+                const requestEvent: V2HttpRequestEvent = { sessionID: e.sessionID, agent: e.agent, model: e.model, request: new Request(httpUrl, { headers: e.headers }) };
+                await httpRequestHook(requestEvent);
+                const pinned = proxyBaseFromUrl(typeof requestEvent.request?.url === "string" ? requestEvent.request.url : undefined);
+                if (pinned && !state.proxyBase) {
+                    state.proxyBase = pinned;
+                    refreshWindows(ctx, state);
+                    stampHeaders(requestEvent);
+                }
+                const routed = requestEvent.request;
+                if (!state.proxyBase || typeof routed?.url !== "string" || !routed.url.startsWith(`${state.proxyBase}/bili/`)) return;
+                e.url = routed.url.replace("/bili/http", "/bili/responses/http").replace(/^http/, "ws");
+                e.headers = Object.fromEntries((routed as Request).headers.entries());
+            });
+            if (wsReg) registrations.push(wsReg);
+        } catch {
+            logHostEvent("warn", "[native-client]", "[bili-opencode] WebSocket handshake hook unavailable; Responses WebSocket traffic is not intercepted by this host");
+        }
+
+        const makeToolExecutor = (toolName: string): ((input: Record<string, unknown>, c: { sessionID: string }) => Promise<{ content: string }>) => async (args, tctx) => {
+            if (pluginDisabled()) return { content: "bili: disabled (BILLION_CONTEXT_PLUGIN=0)" };
+            const base = state.proxyBase ?? proxyBaseFromEnv();
+            if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
+            try {
+                // Panel-first for acp_status: the proxy's status endpoint renders the same rich panel the /acp command shows; the forwarded kernel tool returns the legacy flat report. acp_status is read-only, so reading the panel changes no state. Fall back to the tool call when no panel comes back (older proxy, unknown conversation).
+                if (toolName === "acp_status") {
+                    const status = await fetchStatus(base, tctx.sessionID);
+                    const panel = status?.["panel"];
+                    if (typeof panel === "string" && panel.length > 0) return { content: panel };
+                }
+                const result = await forwardTool(base, tctx.sessionID, toolName, args, undefined, true);
+                // #2204: the V2 tool shape carries no error flag — a business failure rides the "[decompress FAILED:" receipt text the model reads.
+                return { content: result.text };
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (msg.includes("no model request has arrived with this conversation id yet")) {
+                    return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
+                }
+                return { content: msg };
+            }
+        };
+
+        const STATIC_TOOL_NAMES = new Set(V2_BILI_TOOLS.map((t) => t.name));
+
+        // #2443: the static list covers only the always-on core. The manifest is the host's authoritative declaration of the CONDITIONAL surface (acp_retrieve while CCR is armed, acp_rule while rules are on); without consulting it a CCR placeholder points at a tool the model can never call. The base is discovered lazily (native bootstrap / per-request routing), so register the delta on first routed request — single-flight, degrading inertly (tools stay unregistered) when the manifest is unreachable.
+        const ensureConditionalTools = (): void => {
+            if (state.toolDeltaReady || state.toolDelta !== undefined || pluginDisabled()) return;
+            const base = state.proxyBase;
+            if (base === undefined) return;
+            const retryAt = state.toolDeltaRetryAt;
+            if (retryAt !== undefined && Date.now() < retryAt) return;
+            state.toolDelta = fetchManifest(base, "openai")
+                .then((tools) => {
+                    const delta = tools.filter((t) => !STATIC_TOOL_NAMES.has(t.name));
+                    if (delta.length > 0 && ctx.tool?.transform) {
+                        const extraReg = ctx.tool.transform((editor) => {
+                            for (const t of delta) {
+                                editor.add({
+                                    name: t.name,
+                                    description: t.description,
+                                    input: t.inputSchema,
+                                    options: { codemode: false, permission: "allow" },
+                                    execute: makeToolExecutor(t.name),
+                                });
+                            }
+                        });
+                        // #2443: latch readiness only when the registration
+                        // actually settles. A rejected transform previously
+                        // left toolDeltaReady=true with the conditional tools
+                        // (acp_retrieve / acp_rule) silently absent until host
+                        // restart — no retry, no log (PR #2581 review). Now:
+                        // surface the rejection and re-arm the retry cadence
+                        // (the outer .finally clears toolDelta, so the next
+                        // routed request re-runs this whole probe).
+                        void Promise.resolve(extraReg)
+                            .then((reg) => { if (reg) registrations.push(reg); })
+                            .then(() => {
+                                state.toolDeltaReady = true;
+                                state.toolDeltaRetryAt = undefined;
+                            })
+                            .catch((err) => {
+                                logHostEvent("error", "[native-client]", `bili: opencode conditional-tool registration rejected (${err instanceof Error ? err.message : String(err)}) — will retry on the next routed request (#2443)`);
+                                state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
+                            });
+                        return;
+                    }
+                    state.toolDeltaReady = true;
+                    state.toolDeltaRetryAt = undefined;
+                })
+                .catch((err) => {
+                    console.error(`bili: opencode conditional-tool manifest fetch failed (${err instanceof Error ? err.message : String(err)}) — acp_retrieve/acp_rule stay unregistered; will retry on the next routed request (#2656)`);
+                    state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
+                })
+                .finally(() => {
+                    state.toolDelta = undefined;
+                });
+        };
 
         const toolReg = await ctx.tool?.transform?.((editor) => {
             for (const t of V2_BILI_TOOLS) {
@@ -340,33 +511,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     description: t.description,
                     input: t.input,
                     options: { codemode: false, permission: "allow" },
-                    execute: async (args, tctx) => {
-                        if (pluginDisabled()) return { content: "bili: disabled (BILLION_CONTEXT_PLUGIN=0)" };
-                        const base = state.proxyBase ?? proxyBaseFromEnv();
-                        if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
-                        try {
-                            // Panel-first for acp_status: the proxy's status
-                            // endpoint renders the same rich panel the /acp
-                            // command shows; the forwarded kernel tool returns
-                            // the legacy flat report. acp_status is read-only,
-                            // so reading the panel changes no state. Fall back
-                            // to the tool call when no panel comes back (older
-                            // proxy, unknown conversation).
-                            if (t.name === "acp_status") {
-                                const status = await fetchStatus(base, tctx.sessionID);
-                                const panel = status?.["panel"];
-                                if (typeof panel === "string" && panel.length > 0) return { content: panel };
-                            }
-                            const result = await forwardTool(base, tctx.sessionID, t.name, args);
-                            return { content: result };
-                        } catch (err) {
-                            const msg = err instanceof Error ? err.message : String(err);
-                            if (msg.includes("no model request has arrived with this conversation id yet")) {
-                                return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
-                            }
-                            return { content: msg };
-                        }
-                    },
+                    execute: makeToolExecutor(t.name),
                 });
             }
         });
@@ -408,7 +553,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                             version = undefined;
                                         }
                                         text = version !== undefined
-                                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                                            ? `billion-context@${version} — proxy connected via ${base}, no ACP session yet. Send a model request, then run /acp again.`
                                             : "bili: no ACP session yet (send a model request first, then run /acp)";
                                     } else if (!status) {
                                         // fetchStatus soft-fails to undefined both when the proxy 404s an absent or
@@ -416,7 +561,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                         // manifest to claim "connected" only when it answers.
                                         const version = await fetchProxyVersion(base).catch(() => undefined);
                                         text = version !== undefined
-                                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                                            ? `billion-context@${version} — proxy connected via ${base}, no ACP session yet. Send a model request, then run /acp again.`
                                             : "bili: cannot reach the bili proxy (run `bili start`, then run /acp again)";
                                     } else {
                                         const errText = status?.error;
@@ -466,7 +611,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp-cache again)";
                             } else {
                                 try {
-                                    text = await forwardTool(base, sid, "acp_cache", toolArgs);
+                                    text = (await forwardTool(base, sid, "acp_cache", toolArgs, undefined, true)).text;
                                 } catch (err) {
                                     const msg = err instanceof Error ? err.message : String(err);
                                     text = msg.includes("no model request has arrived")
@@ -486,7 +631,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             });
             if (commandReg) registrations.push(commandReg);
         } catch (err) {
-            console.warn(`[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
+            logHostEvent("warn", "[native-client]", `[bili-opencode] /acp command registration unavailable; continuing without it: ${err instanceof Error ? err.message : String(err)}`);
         }
 
         const subscription = ctx.event?.subscribe?.({ signal: ac.signal });

@@ -118,7 +118,7 @@ test("responses wire round-2: lifecycle references stay valid and remapped ids f
     );
 
     const round2Item = events.find(
-        (e) => e.event === "response.output_item.added" && typeof e.data.item?.id === "string" && String(e.data.item.id).startsWith("msg-proxy-2-"),
+        (e) => e.event === "response.output_item.added" && typeof (e.data.item as Record<string, unknown>)?.id === "string" && String((e.data.item as Record<string, unknown>).id).startsWith("msg-proxy-2-"),
     );
     assert.ok(round2Item, "round-2 message item forwarded with remapped id (native streaming, not buffered)");
     const round2Id = String((round2Item.data.item as Record<string, unknown>).id);
@@ -138,6 +138,66 @@ test("responses wire round-2: lifecycle references stay valid and remapped ids f
     sanitizeResponsesInputIds([replay]);
     assert.deepEqual(replay, expected, "next-turn replay keeps the full message without its proxy id");
     assert.equal(completedItem.id, round2Id, "stream lifecycle ids remain intact");
+});
+
+test("responses wire round-2: custom_tool_call input delta/done frames are forwarded in re-request rounds (#1864)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "acp_status", arguments: "" } }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_1", output_index: 0, delta: "{}" }),
+        sse("response.function_call_arguments.done", { item_id: "fc_1", output_index: 0, arguments: "{}" }),
+        sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "acp_status", arguments: "{}" } }),
+        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [] } }),
+    ].join("");
+
+    const fullInput = '{"cmd":"ls -la"}';
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        sse("response.output_item.added", { output_index: 0, item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: "" } }),
+        sse("response.custom_tool_call_input.delta", { item_id: "ctc_1", output_index: 0, delta: '{"cmd":' }),
+        sse("response.custom_tool_call_input.delta", { item_id: "ctc_1", output_index: 0, delta: '"ls -la"}' }),
+        sse("response.custom_tool_call_input.done", { item_id: "ctc_1", output_index: 0, input: fullInput }),
+        sse("response.output_item.done", { output_index: 0, item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: fullInput } }),
+        sse("response.completed", { response: { id: "resp_2", status: "completed", output: [] } }),
+    ].join("");
+
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(round2, { status: 200 });
+    }) as typeof fetch;
+
+    const chunks: Buffer[] = [];
+    try {
+        const ctx = makeCtx("resp-round2-ctc");
+        for await (const chunk of runCompressLoop(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-5", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(),
+            buildCompressSystemPrompt(),
+        )) {
+            chunks.push(chunk);
+        }
+    } finally {
+        globalThis.fetch = orig;
+    }
+    assert.equal(fetchCalls, 1, "re-request after proxy tool");
+    const events = parseOut(Buffer.concat(chunks).toString("utf8"));
+
+    const ctcAdded = events.filter((e) => e.event === "response.output_item.added" && (e.data.item as Record<string, unknown>)?.type === "custom_tool_call");
+    assert.equal(ctcAdded.length, 1, "round-2 custom_tool_call item added frame forwarded");
+    const deltas = events.filter((e) => e.event === "response.custom_tool_call_input.delta");
+    assert.equal(deltas.length, 2, "both incremental input delta frames forwarded in round > 1");
+    assert.equal(deltas.map((e) => e.data.delta).join(""), fullInput, "deltas reconstruct the streaming input verbatim");
+    const inputDone = events.filter((e) => e.event === "response.custom_tool_call_input.done");
+    assert.equal(inputDone.length, 1, "input done frame forwarded in round > 1");
+    assert.equal(inputDone[0].data.input, fullInput, "input done carries the full input");
+    const ctcDone = events.filter((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.type === "custom_tool_call");
+    assert.equal(ctcDone.length, 1, "custom_tool_call item done frame forwarded");
+    assert.equal((ctcDone[0].data.item as Record<string, unknown>).input, fullInput, "done item carries the full input");
 });
 
 test("sanitizeResponsesInputIds rewrites over-long ids deterministically and heals poisoned rollouts (#242)", () => {
@@ -162,4 +222,17 @@ test("sanitizeResponsesInputIds rewrites over-long ids deterministically and hea
     sanitizeResponsesInputIds(undefined as unknown as unknown[]);
     sanitizeResponsesInputIds("not-an-array" as unknown as unknown[]);
     assert.ok(true, "non-array input tolerated");
+});
+
+test("sanitizeResponsesInputIds heals marker- message ids minted before WC-015", () => {
+    const input = [
+        { type: "message", id: "marker-1791393957942-2", role: "assistant", content: [{ type: "output_text", text: "[ACP] marker" }] },
+        { type: "message", id: "msg_short_ok", role: "assistant", content: [] },
+        { type: "reasoning", id: "rs_1" },
+    ];
+    sanitizeResponsesInputIds(input);
+    const [marker, providerMessage, providerReasoning] = input as Array<Record<string, unknown>>;
+    assert.ok(!("id" in marker), "legacy marker id is dropped so the upstream replays the full message");
+    assert.equal(providerMessage.id, "msg_short_ok", "provider message ids still pass through byte-identical (#1474)");
+    assert.equal(providerReasoning.id, "rs_1", "provider reasoning ids untouched");
 });

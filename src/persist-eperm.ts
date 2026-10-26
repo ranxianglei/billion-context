@@ -21,7 +21,7 @@ const LOCK_CODES = /\b(EPERM|EBUSY|EACCES)\b/;
 // (no " (total " substring), and the count is the kernel's consecutive total.
 const WRITE_FAIL_RE = /^\[persist\] write failed for (.+?) \(total (\d+)x\): (.+)$/;
 
-export type PersistEpermAlertOptions = {
+type PersistEpermAlertOptions = {
     dir: string;
     threshold?: number;
     repeatMs?: number;

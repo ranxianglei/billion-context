@@ -15,6 +15,13 @@
 // The first-request stamp race (#1243) is pinned by every stamp assertion:
 // a one-shot `pi -p` fires before_provider_headers exactly once, inside the
 // proxy bootstrap window.
+//
+// #2268 adds the real pi-subagents lane: an UNMODIFIED builtin role (delegate)
+// runs as an in-process child whose allowlist grants no ACP names — the proxy
+// must serve it through the capability-aware proxy-style channel while keeping
+// named-session identity; the parent's pure plugin mode stays untouched.
+// pi-subagents installs hermetically at the pinned version (skips when the
+// registry is unreachable).
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -43,6 +50,7 @@ const ACP_TOOLS = [
   "acp_status",
   "acp_cache",
 ] as const;
+const PI_SUBAGENTS_VERSION = "0.76.1";
 
 function piAvailable(): boolean {
   try {
@@ -53,6 +61,46 @@ function piAvailable(): boolean {
 }
 function distBuilt(): boolean {
   return fs.existsSync(PI_NATIVE_ENTRY);
+}
+
+// pi-subagents is installed hermetically into a suite-local dir (isolated from
+// the repo — npm install in a dir WITHOUT its own package.json walks up to the
+// repo root and pollutes package.json). Returns the package dir, or null when
+// the registry is unreachable (the #2268 test then skips; the rest of the
+// suite never depends on it). Cached across tests in one run.
+let pisPkgCache: string | null | undefined;
+async function ensurePiSubagents(): Promise<string | null> {
+  if (pisPkgCache !== undefined) return pisPkgCache;
+  const dir = path.join(WORK_ROOT, "pis-install");
+  const pkg = path.join(dir, "node_modules", "pi-subagents");
+  if (!fs.existsSync(path.join(pkg, "package.json"))) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "package.json"),
+        JSON.stringify({ name: "pis-install", private: true }, null, 2),
+      );
+      const r = spawnSync(
+        "npm",
+        [
+          "install",
+          `pi-subagents@${PI_SUBAGENTS_VERSION}`,
+          "--no-audit",
+          "--no-fund",
+        ],
+        { cwd: dir, timeout: 120_000, stdio: ["ignore", "ignore", "pipe"] },
+      );
+      if (r.status !== 0 || !fs.existsSync(path.join(pkg, "package.json"))) {
+        pisPkgCache = null;
+        return null;
+      }
+    } catch {
+      pisPkgCache = null;
+      return null;
+    }
+  }
+  pisPkgCache = pkg;
+  return pkg;
 }
 
 const run = process.env.ACP_TEST_E2E_NATIVE === "1";
@@ -79,13 +127,17 @@ function filler(lines: number): string {
 
 type OracleEntry = {
   t: number;
+  wire?: "openai" | "anthropic" | "responses";
   stream: boolean;
   plugin: string | null;
   conv: string | null;
+  model?: string | null;
   tools: string[];
   nmsg: number;
   roles: string;
   acpRefs: string[];
+  acpTagCount?: number;
+  fillerHits?: number;
   toolResults: { name: string; content: string }[];
   queueIdx: number;
   toolName: string | null;
@@ -267,6 +319,39 @@ async function startCtx(): Promise<Ctx> {
               },
             ],
           },
+          // Second lane on a DIFFERENT wire (#2791): switching provider
+          // mid-session must not fork the bili session/conv or re-fold.
+          fakeant: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "anthropic-messages",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-ant-model",
+                name: "Fake Anthropic",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
+          // Third wire (#2791 responses column): the openai-responses API —
+          // the input[]-items render whose neutral projection was the last
+          // un-projected lane (src/affinity-neutral.ts input_text/output_text).
+          fakeresp: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "openai-responses",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-resp-model",
+                name: "Fake Responses",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
         },
       },
       null,
@@ -339,9 +424,9 @@ function teardown(ctx: Ctx): void {
 function piRun(
   ctx: Ctx,
   prompt: string,
-  opts: { resume?: boolean } = {},
+  opts: { resume?: boolean; model?: string } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const args = ["-p", "--model", "fake/fake-model"];
+  const args = ["-p", "--model", opts.model ?? "fake/fake-model"];
   if (opts.resume) args.push("--continue");
   args.push(prompt);
   const outFile = path.join(ctx.work, `pi-${Date.now()}.out`);
@@ -618,6 +703,491 @@ if (checkOnly) {
       assert.ok(
         withBlocks.length >= 1,
         `at least one persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
+      );
+    },
+  );
+
+  test(
+    "pi cross-protocol switch keeps the session, conv, and fold (#2791)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+
+      // Same skeleton as the compress test: load filler, then fold on
+      // --continue. Run three CONTINUES on a DIFFERENT provider whose wire is
+      // anthropic-messages — the exact shape of a user swapping models
+      // mid-conversation in a model-picker. The #2791 regression (pre-fix)
+      // forked an anonymous session here: fold ledger orphaned, filler
+      // re-arrived 263% unfolded, upstream re-folded from scratch.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      const fold = await piRun(
+        ctx,
+        "请调用probe_tool;请调用compress;请调用acp_status",
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+
+      const switchRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fakeant/fake-ant-model",
+      });
+      assert.equal(
+        switchRun.code,
+        0,
+        `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+      );
+
+      // And BACK onto the openai wire — the reverse direction of the switch
+      // must not fork either (a render asymmetry would only appear here).
+      const backRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fake/fake-model",
+      });
+      assert.equal(
+        backRun.code,
+        0,
+        `back run failed (code=${backRun.code}); stderr:\n${backRun.stderr}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      const openaiRows = oracle.filter((o) => o.wire !== "anthropic");
+      const anthropicRows = oracle.filter((o) => o.wire === "anthropic");
+      assert.ok(
+        openaiRows.length >= 1,
+        `openai wire rows must exist (got ${oracle.length} total)`,
+      );
+      assert.ok(
+        anthropicRows.length >= 1,
+        `anthropic wire rows must exist after the provider switch (got ${anthropicRows.length}/${oracle.length})`,
+      );
+      // The switched lane still rides the bili plugin with the SAME
+      // conversation id — a fork would mint a second conv here.
+      for (const o of anthropicRows) {
+        assert.equal(o.plugin, "pi", "anthropic-lane request must stay plugin-stamped (x-bili-plugin)");
+        assert.equal(
+          o.model,
+          "fake-ant-model",
+          `anthropic-lane request must carry the switched model (got ${o.model})`,
+        );
+      }
+      const convs = new Set(oracle.map((o) => o.conv));
+      assert.equal(
+        convs.size,
+        1,
+        `exactly ONE conversation id across both wires (got ${[...convs].join(", ")})`,
+      );
+
+      // Exactly one fold for the whole scenario, counted by model-EMITTED
+      // compress calls (the executed fold's tool_result legitimately persists
+      // in every later resend). The switched lane must NOT re-compress
+      // orphaned history (#2791's silent re-fold symptom).
+      const compressCalls = oracle.filter((o) => o.toolName === "compress");
+      assert.equal(
+        compressCalls.length,
+        1,
+        `compress must be CALLED exactly once across the protocol switch (got ${compressCalls.length})`,
+      );
+
+      // History inheritance: the first anthropic request re-sends the whole
+      // conversation (fork would arrive with a fresh 1-3-message history).
+      // The native lane rewrites the outbound body lazily (window-gated), so
+      // filler text may legitimately still be present — the fold's ledger is
+      // the session state, pinned by the blocks assertion below.
+      const firstAnth = anthropicRows[0];
+      assert.ok(
+        firstAnth.nmsg >= 6,
+        `first anthropic request must inherit the conversation history (nmsg=${firstAnth.nmsg}; a fork would arrive nearly empty)`,
+      );
+
+      // The reverse switch re-enters the openai lane AFTER the anthropic
+      // turns — same conversation, still exactly one compress.
+      const anthIdx = oracle.findIndex((o) => o.wire === "anthropic");
+      const backRow = oracle.slice(anthIdx + 1).find((o) => o.wire === "openai");
+      assert.ok(backRow, "openai-wire rows must resume after the anthropic switch (reverse direction)");
+
+      // One persisted bili session with blocks — a protocol-switch fork would
+      // have written a SECOND session file with an empty ledger.
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
+      );
+    },
+  );
+
+  test(
+    "pi openai→responses switch keeps the session, conv, and fold (#2791 responses column)",
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      try {
+        // Load + fold on the openai-completions wire (same shape as the
+        // compress test above — 4 probe rounds so the run-1 filler message
+        // sits OUTSIDE the protected zone when `compress` arrives).
+        const load = await piRun(
+          ctx,
+          `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+        );
+        assert.equal(load.code, 0, `load run failed; stderr:\n${load.stderr}`);
+        const fold = await piRun(
+          ctx,
+          "请调用probe_tool;请调用compress;请调用acp_status",
+          { resume: true },
+        );
+        assert.equal(fold.code, 0, `fold run failed; stderr:\n${fold.stderr}`);
+
+        // Switch mid-session onto the openai-RESPONSES wire (input[] items
+        // render). Before the neutral-projection fix the responses renders
+        // hashed to canon blobs → prefix resolve missed → pfa-* fork.
+        const switchRun = await piRun(ctx, "请调用probe_tool", {
+          resume: true,
+          model: "fakeresp/fake-resp-model",
+        });
+        assert.equal(
+          switchRun.code,
+          0,
+          `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+        );
+
+        const oracle = readOracle(ctx.reqLog);
+        const respRows = oracle.filter((o) => o.wire === "responses");
+        assert.ok(respRows.length >= 1, "no responses-wire requests reached the fake upstream");
+        for (const row of respRows) {
+          assert.equal(row.plugin, "pi", `responses row must be plugin-stamped (got ${row.plugin})`);
+          assert.equal(row.model, "fake-resp-model");
+        }
+        const convs = new Set(oracle.filter((o) => o.plugin === "pi").map((o) => o.conv));
+        assert.equal(convs.size, 1, `fork across the switch: convs=${[...convs].join(", ")}`);
+        const compressCalls = oracle.filter((o) => o.toolName === "compress").length;
+        assert.equal(compressCalls, 1, `the fold must be REUSED, not re-executed (compressCalls=${compressCalls})`);
+        assert.ok(
+          respRows[0].nmsg >= 6,
+          `first responses request must inherit the conversation history (nmsg=${respRows[0].nmsg}; a fork would arrive nearly empty)`,
+        );
+      } finally {
+        await stopProxiesGracefully(ctx);
+      }
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
+      );
+    },
+  );
+
+  test(
+    "pi-subagents unmodified delegate child: proxy-style ACP channel fallback (#2268)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const pisPkg = await ensurePiSubagents();
+      if (!pisPkg) {
+        t.skip(
+          `pi-subagents@${PI_SUBAGENTS_VERSION} unavailable (npm registry unreachable)`,
+        );
+        return;
+      }
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      const settingsPath = path.join(ctx.piAgentDir, "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+        packages: string[];
+      };
+      settings.packages.push(pisPkg);
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+      // The parent's scripted subagent call spawns the UNMODIFIED builtin
+      // delegate role in-process; its task text scripts the CHILD'S queue
+      // (separate conversation key) so the child makes one real ACP round trip.
+      const r = await piRun(
+        ctx,
+        '请调用subagent {"agent":"delegate","task":"请调用acp_status"}',
+      );
+      assert.equal(
+        r.code,
+        0,
+        `pi -p failed (code=${r.code}); stderr:\n${r.stderr}`,
+      );
+      assert.match(
+        r.stdout,
+        /收到#done/,
+        `parent must finish the scripted loop; stdout:\n${r.stdout}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      const parentConv = oracle.find((o) =>
+        o.lastUser.includes("请调用subagent"),
+      )?.conv;
+      assert.ok(parentConv, "parent request must be present in the oracle");
+      const childRows = oracle.filter(
+        (o) => o.plugin === "pi" && o.conv !== parentConv,
+      );
+      // First child turn + the loop iteration that carries the ephemeral
+      // acp_status result back into the child's request.
+      assert.ok(
+        childRows.length >= 2,
+        `expected >=2 plugin-stamped child requests, got ${childRows.length} (oracle convs: ${JSON.stringify([...new Set(oracle.map((o) => o.conv))])}`,
+      );
+      // Fallback channel active: every child request carries BOTH the role's
+      // original whitelist and the wire-injected ACP core four.
+      const CORE_ACP = ["compress", "decompress", "search_context", "acp_status"];
+      const DELEGATE_WHITELIST = [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "edit",
+        "write",
+        "contact_supervisor",
+      ];
+      for (const o of childRows) {
+        for (const n of [...CORE_ACP, ...DELEGATE_WHITELIST]) {
+          assert.ok(
+            o.tools.includes(n),
+            `child request tools must include ${n}; got ${JSON.stringify(o.tools)}`,
+          );
+        }
+      }
+      const statusRow = childRows.find((o) =>
+        o.toolResults.some((tr) => tr.name === "acp_status"),
+      );
+      assert.ok(
+        statusRow,
+        "acp_status must have executed server-side with its result fed back to the child",
+      );
+      assert.match(
+        statusRow.toolResults.find((tr) => tr.name === "acp_status")!.content,
+        /ACTIVE SURFACE[\s\S]*CONTEXT BREAKDOWN/,
+        "acp_status result must be the status report",
+      );
+      // The once-per-session channel-fallback log pins the detection itself
+      // (marker + allowlist verdict), including the extracted role name.
+      assert.match(
+        biliLog(ctx),
+        /\[pi-subagents\] child "delegate" role allowlist lacks ACP context tools/,
+        "proxy must log the pi-subagents channel fallback for the delegate child",
+      );
+      // The parent stays pure plugin mode: full ACP surface registered locally.
+      const parentLate = oracle.filter(
+        (o) =>
+          o.conv === parentConv &&
+          ACP_TOOLS.every((n) => o.tools.includes(n)),
+      );
+      assert.ok(
+        parentLate.length >= 1,
+        "parent session must keep its full plugin-mode ACP tool surface",
+      );
+      // Named identity persists for BOTH sessions, still plugin-bound.
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.ok(
+        sessions.length >= 2,
+        `expected parent + child persisted sessions, got ${sessions.length}`,
+      );
+      assert.ok(
+        sessions.every((s) => s.parsed.payload?.metadata?.pluginAgent === "pi"),
+        `all persisted sessions must bind pluginAgent=pi, got ${JSON.stringify(sessions.map((s) => s.parsed.payload?.metadata?.pluginAgent))}`,
+      );
+    },
+  );
+
+  test(
+    "pi-subagents unmodified delegate child (fork): real compress fold through the fallback channel (#2268)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const pisPkg = await ensurePiSubagents();
+      if (!pisPkg) {
+        t.skip(
+          `pi-subagents@${PI_SUBAGENTS_VERSION} unavailable (npm registry unreachable)`,
+        );
+        return;
+      }
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      const settingsPath = path.join(ctx.piAgentDir, "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+        packages: string[];
+      };
+      settings.packages.push(pisPkg);
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+      // Run one loads bulky tagged filler into the PARENT session (persisted,
+      // with a leaf) — the raw material a forked child inherits. Inside the
+      // child it sits far enough behind the task prompt to leave the kernel's
+      // protected zone (last 5 messages / last 5000 tokens / most recent user
+      // message), so the scripted compress has a legal target.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      // Run two: the parent's scripted subagent call spawns the UNMODIFIED
+      // builtin delegate role in-process with an explicit fork; the child's
+      // task text scripts the CHILD'S queue (separate conversation key) into a
+      // real compress round trip plus a post-fold status call.
+      const fold = await piRun(
+        ctx,
+        '请调用subagent {"agent":"delegate","task":"请调用compress;请调用acp_status","context":"fork"}',
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+      assert.match(
+        fold.stdout,
+        /收到#done/,
+        `parent must finish the scripted loop; stdout:\n${fold.stdout}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      // The parent is the conversation whose model emitted the subagent tool
+      // call (the delegate whitelist cannot carry it); the forked child gets
+      // its own conversation id.
+      const parentConv = oracle.find((o) => o.toolName === "subagent")?.conv;
+      assert.ok(parentConv, "parent subagent-call request must be in the oracle");
+      const childRows = oracle.filter(
+        (o) => o.plugin === "pi" && o.conv !== parentConv,
+      );
+      // Forked-history turn + compress-result turn + acp_status-result turn.
+      assert.ok(
+        childRows.length >= 3,
+        `expected >=3 plugin-stamped child requests, got ${childRows.length} (oracle convs: ${JSON.stringify([...new Set(oracle.map((o) => o.conv))])}`,
+      );
+      // Fallback channel active on EVERY child request: the role's original
+      // whitelist survives AND the wire-injected ACP core four ride along.
+      const CORE_ACP = [
+        "compress",
+        "decompress",
+        "search_context",
+        "acp_status",
+      ];
+      const DELEGATE_WHITELIST = [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "edit",
+        "write",
+        "contact_supervisor",
+      ];
+      for (const o of childRows) {
+        for (const n of [...CORE_ACP, ...DELEGATE_WHITELIST]) {
+          assert.ok(
+            o.tools.includes(n),
+            `child request tools must include ${n}; got ${JSON.stringify(o.tools)}`,
+          );
+        }
+      }
+      // REAL compression inside the unmodified delegate child: the scripted
+      // compress folded the inherited filler server-side and the receipt came
+      // back into the child's conversation.
+      const compressRow = childRows.find((o) =>
+        o.toolResults.some((tr) => tr.name === "compress"),
+      );
+      assert.ok(
+        compressRow,
+        "compress must have executed server-side with its result fed back to the child",
+      );
+      const compressResult =
+        compressRow!.toolResults.find((tr) => tr.name === "compress")!.content;
+      assert.doesNotMatch(
+        compressResult,
+        /FAILED|Validation failed/,
+        `compress must succeed, got: ${compressResult.slice(0, 200)}`,
+      );
+      assert.match(
+        compressResult,
+        /\[Compressed m\d+[–-]m\d+ → \d+ block\(s\), ~\d+ tokens saved\.\]/,
+        `compress result must report the fold, got: ${compressResult.slice(0, 200)}`,
+      );
+      const statusRow = childRows.find((o) =>
+        o.toolResults.some((tr) => tr.name === "acp_status"),
+      );
+      assert.ok(
+        statusRow,
+        "post-fold acp_status must have executed with its result fed back",
+      );
+      assert.match(
+        statusRow.toolResults.find((tr) => tr.name === "acp_status")!.content,
+        /ACTIVE SURFACE[\s\S]*CONTEXT BREAKDOWN/,
+        "acp_status result must be the status report",
+      );
+      // The once-per-session channel-fallback log pins the detection itself
+      // (marker + allowlist verdict), including the extracted role name.
+      assert.match(
+        biliLog(ctx),
+        /\[pi-subagents\] child "delegate" role allowlist lacks ACP context tools/,
+        "proxy must log the pi-subagents channel fallback for the delegate child",
+      );
+      // The parent stays pure plugin mode: full ACP surface registered locally.
+      const parentLate = oracle.filter(
+        (o) =>
+          o.conv === parentConv &&
+          ACP_TOOLS.every((n) => o.tools.includes(n)),
+      );
+      assert.ok(
+        parentLate.length >= 1,
+        "parent session must keep its full plugin-mode ACP tool surface",
+      );
+      // Named identity persists for BOTH sessions, still plugin-bound; the
+      // compressed block lands in the CHILD's session (the parent never folds
+      // in this scenario).
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.ok(
+        sessions.length >= 2,
+        `expected parent + child persisted sessions, got ${sessions.length}`,
+      );
+      assert.ok(
+        sessions.every((s) => s.parsed.payload?.metadata?.pluginAgent === "pi"),
+        `all persisted sessions must bind pluginAgent=pi, got ${JSON.stringify(sessions.map((s) => s.parsed.payload?.metadata?.pluginAgent))}`,
+      );
+      const withBlocks = sessions.filter((s) => {
+        const blocks = s.parsed.payload?.state?.blocks;
+        return (
+          blocks !== undefined &&
+          blocks !== null &&
+          Object.keys(blocks as Record<string, unknown>).length >= 1
+        );
+      });
+      assert.ok(
+        withBlocks.length >= 1,
+        `the child's persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
       );
     },
   );

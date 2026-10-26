@@ -1,19 +1,81 @@
 name: CI Windows codex overlay (#686)
 
 on:
+  # three-layer CI (#3295): NO push trigger by design — master's signal is
+  # ci.yml core runs + the gated 30-min cron below (the pre-#3295 "#3085:
+  # every master PR + push" default no longer holds). pull_request events
+  # exist only to feed the ci:full label gate; the gate job skips everything
+  # else, so a plain PR never runs this lane.
   pull_request:
-    branches: [master]
-  push:
-    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
+  # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
+  schedule:
+    - cron: '13/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  workflow_dispatch: {}
+
+concurrency:
+  # #2637 plan #3: schedule-safe group — master pushes must not cancel the
+  # day's nightly run; same-ref pushes still supersede each other.
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: windows-codex-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # Real-machine layer for issue #686: on a hosted Windows runner, confirm codex
 # accepts the `<CODEX_HOME>-bili` overlay from `bili codex` and registers bili.
 # Headless and key-free because `codex mcp list` reads config.toml only and
 # never calls a model (the secret-backed ubuntu e2e still covers model round-trip).
 jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-windows-codex.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
   windows-codex-overlay:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     name: codex accepts CODEX_HOME overlay + registers bili MCP
     runs-on: windows-latest
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,6 +95,14 @@ jobs:
       - name: Install codex CLI
         shell: pwsh
         run: npm install -g @openai/codex
+      # #2196 hard gate (deterministic, no model calls — unlike the soft-gated
+      # verify below): the Windows argv pass-through contract must hold on a real
+      # machine — full corpus round-trip with the child's RECEIVED argv asserted
+      # item-by-item, official-npm-layout detection against the real global
+      # install, and the wrapper's --help booting through plain node.
+      - name: Windows argv pass-through tests (#2196)
+        shell: pwsh
+        run: node --import tsx --test tests/win-cmd-argv.test.ts
       # Non-obvious on purpose: do NOT remove continue-on-error until one clean
       # run proves codex boots unauthenticated on windows-latest. The transcript
       # artifact shows what happened so this can then become a hard gate.
@@ -46,4 +116,124 @@ jobs:
         with:
           name: windows-codex-mcp-output
           path: windows-codex-mcp-output.txt
+          if-no-files-found: ignore
+
+  # Real-machine regression for issue #2195: on a hosted Windows runner, two
+  # SEQUENTIAL `bili codex exec` launches must both leave their threads in the
+  # REAL home's active state_5.sqlite. Windows file copies preserve the source
+  # mtime and a WAL-only commit leaves the main db's bytes AND mtime untouched,
+  # so the stale-generation-wins failure is reproducible HERE but not on POSIX
+  # (the deterministic unit twin lives in tests/launcher-sqlite-overlay.test.ts).
+   # #2222 adds the shared-state lane (CODEX_SQLITE_HOME): the overlay must hold
+   # no sqlite files at all and native runs see every thread immediately.
+   # #3203 adds the CONCURRENT lane: two bili codex sessions on one CODEX_HOME
+   # both run, each in its own -s<N> slot, threads land in one live db.
+   # Zero tokens: every model call goes to the local fake upstream.
+  windows-codex-sequential-home:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    name: sequential bili codex launches keep all threads in the real home (#2195)
+    runs-on: windows-latest
+    # 30 (not 20): the #2222 shared-state lane and the #3203 concurrent lane
+    # add real-launch steps to this job.
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    timeout-minutes: 30
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Pinned like ci-e2e-fake.yml (#815): an unpinned @latest would let a
+      # codex release change the baseline behavior under this gate.
+      - name: Install codex CLI
+        shell: pwsh
+        run: npm i -g @openai/codex@0.147.0
+      - name: Print codex version
+        shell: pwsh
+        run: codex --version
+      - name: Install deps
+        shell: pwsh
+        run: npm ci
+      - name: Build
+        shell: pwsh
+        run: npm run build
+      - name: Run the #2195 + #1965 + #2222 + #3203 real-launch lanes
+        shell: pwsh
+        run: $env:ACP_TEST_E2E_FAKE = "1"; node --import tsx --test --test-name-pattern "#2195|#1965|#2222|#3203" tests/e2e/e2e-codex-fake.test.ts
+      - name: Collect E2E artifacts
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tmp/e2e-artifacts | Out-Null
+          Get-ChildItem -Directory tmp/e2e-codex-2195-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+          Get-ChildItem -Directory tmp/e2e-codex-1965-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+          Get-ChildItem -Directory tmp/e2e-codex-2222-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+          Get-ChildItem -Directory tmp/e2e-codex-3203-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-windows-sequential-home
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore
+
+  # Real-machine layer for issue #2197: on hosted Windows, the REAL launcher
+  # (`dist/index.js codex`) must route providers that live ONLY in a selected
+  # `-p` profile file or ONLY in `-c` CLI overrides through bili — with a PLAIN
+  # base_url (no /bili/ pre-bake) against local fake upstreams. The test suite
+  # fails loudly (never silently skips) when the gate is enabled and codex is
+  # unresolvable via PATH/PATHEXT. Same staged-gate convention as the #686 job
+  # above: continue-on-error until one clean run proves the lane, then promote.
+  windows-codex-profile-routing:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    name: codex -p profile / CLI provider routes through bili (#2197)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Pinned like ci-e2e-fake.yml (#815): an unpinned @latest would let a
+      # codex release change the baseline behavior under this gate.
+      - name: Install codex CLI
+        shell: pwsh
+        run: npm i -g @openai/codex@0.147.0
+      - name: Install deps
+        shell: pwsh
+        run: npm ci
+      - name: Build
+        shell: pwsh
+        run: npm run build
+      - name: Hermetic #2197 routing e2e (real codex, local fakes)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $env:ACP_TEST_E2E_FAKE = "1"
+          node --import tsx --test --test-name-pattern "#2197" tests/e2e/e2e-codex-fake.test.ts 2>&1 | Tee-Object -FilePath windows-codex-2197-output.txt
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-codex-2197-output
+          path: windows-codex-2197-output.txt
           if-no-files-found: ignore

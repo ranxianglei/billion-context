@@ -91,3 +91,18 @@ test("estimateWireOverhead: empty payload → ~0 (no system, no tools)", () => {
     assert.ok(estimateWireOverhead("anthropic", JSON.stringify({ messages: [] })) <= 1);
     assert.ok(estimateWireOverhead("responses", JSON.stringify({})) <= 1);
 });
+
+// #2078: forward() now parses the sent body once and passes the object through;
+// the pre-parsed path must yield byte-identical numbers to the legacy
+// string-re-parse path for every protocol.
+test("estimateWireOverhead: pre-parsed object ≡ legacy string re-parse (#2078)", () => {
+    const cases: Array<[Parameters<typeof estimateWireOverhead>[0], Record<string, unknown>]> = [
+        ["anthropic", { model: "m", system: "S".repeat(4000), tools: [{ name: "t", description: "D".repeat(2000), input_schema: {} }], messages: [] }],
+        ["openai", { messages: [{ role: "system", content: "SYS ".repeat(300) }, { role: "developer", content: "DEV ".repeat(300) }, { role: "user", content: "U".repeat(40000) }] }],
+        ["responses", { instructions: "I".repeat(4000), input: [{ type: "message", role: "developer", content: [{ type: "input_text", text: "P1 ".repeat(300) }] }] }],
+        ["google", { model: "m", systemInstruction: { parts: [{ text: "G".repeat(4000) }] }, contents: [] }],
+    ];
+    for (const [protocol, obj] of cases) {
+        assert.equal(estimateWireOverhead(protocol, obj), estimateWireOverhead(protocol, JSON.stringify(obj)), `${protocol}: pre-parsed must equal legacy`);
+    }
+});

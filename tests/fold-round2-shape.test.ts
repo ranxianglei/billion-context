@@ -69,7 +69,7 @@ test("#1592 chat fold round-2 renders the next turn's shape (no run separators, 
             const reply = `Reply Turn ${label}: done. ` + FILLER(Number(label), 0.2);
             const compressArgs = triggerShould(body) ? triggerArgs() : undefined;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const line = (o: unknown): void => res.write(`data: ${JSON.stringify(o)}\n\n`);
+            const line = (o: unknown) => res.write(`data: ${JSON.stringify(o)}\n\n`);
             if (compressArgs !== undefined) {
                 line({ id: `c_${captured.length}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_cmp_${folds}`, type: "function", function: { name: "compress", arguments: compressArgs } }] } }] });
                 line({ id: `c_${captured.length}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100, completion_tokens: 2 } });
@@ -127,7 +127,7 @@ test("#1592 chat fold round-2 renders the next turn's shape (no run separators, 
             hist.push({ role: "tool", tool_call_id: `call_t${t}`, content: `total 8\n` + FILLER(200 + t, 9) });
         }
     } finally {
-        server.close(); upstream.close();
+        server.close(); server.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.();
         await Promise.allSettled([once(server, "close"), once(upstream, "close")]);
     }
 

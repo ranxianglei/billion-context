@@ -11,11 +11,23 @@
 // which overrides the default binding for that one call only. No registration
 // is issued for per-call ids — the proxy resolves them directly and flips the
 // target session to plugin mode on successful execution.
+// #2024: a fifth channel for hosts that stamp per-call MACHINE metadata —
+// Codex ≥0.160 puts the real thread id on every tools/call at _meta.threadId
+// (codex-rs core/src/mcp_tool_call.rs with_mcp_tool_call_ids_meta; its
+// sessionId is a transient run id and is deliberately NOT consumed). A valid
+// non-empty native id overrides BOTH the model-transcribed conversation_id
+// and any stale env/default binding for that one call only, is flagged to the
+// proxy as host-stamped (body field nativeCaller), and is NEVER written back
+// to this shim's global conversationId — main/sub-agent threads sharing one
+// MCP process must not clobber each other's binding. Absent or malformed
+// metadata leaves the legacy channels untouched.
 
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "./proxy-tool-result.js";
+import type { ToolOutcomeKind } from "./proxy-tool-result.js";
 
 const VERSION = (() => {
     try {
@@ -64,6 +76,10 @@ export function resolveProxyOrigin(): string {
 }
 
 const TOOL_TIMEOUT_MS = 60_000;
+// #2652: slack added on top of a proxy-advertised summary budget when sizing the
+// compress-call HTTP wait — covers the non-budgeted work around the batch outside the
+// totalTimeoutMs clock (same rationale as src/agent/shared.ts).
+const TOOL_TIMEOUT_OVERHEAD_MARGIN_MS = 30_000;
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // #656: hosts that resume a session (claude --resume forks a NEW session id)
@@ -75,6 +91,7 @@ const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // the resumed one must not adopt a sibling's conversation.
 const ORPHAN_ADOPT = IDENTITY_BINDING && process.env.BILI_MCP_NO_ORPHAN_ADOPT !== "1";
 let manifestTools: McpToolDef[] = [];
+let manifestMaxToolDurationMs: number | undefined;
 let conversationId = CONVERSATION_FROM_ENV;
 // #760: every conversation this shim has ever registered — the default
 // binding plus any per-call ids seen so far (issue-once each).
@@ -97,11 +114,26 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 async function fetchManifest(): Promise<void> {
     const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
-    const data = (await res.json()) as { tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]> };
+    const data = (await res.json()) as {
+        tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]>;
+        capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } };
+    };
+    // #2652: learn the summary budget ceiling so compress calls wait for it.
+    const advertised = data.capabilities?.externalSummary?.maxToolDurationMs;
+    if (typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0) manifestMaxToolDurationMs = advertised;
     // Anthropic wire shape is the canonical MCP-compatible schema source.
     const anthropic = data.tools?.anthropic ?? [];
     manifestTools = anthropic.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema }));
     if (manifestTools.length === 0) throw new Error("manifest served no anthropic tools");
+}
+
+/** #2652: only compress invokes the external summary executor (bounded by
+ *  totalTimeoutMs), so only it grows past the base floor — and only when the proxy
+ *  advertised a budget. Everything else keeps the historical floor. */
+function effectiveToolTimeoutMs(tool: string): number {
+    if (tool !== "compress") return TOOL_TIMEOUT_MS;
+    if (manifestMaxToolDurationMs === undefined) return TOOL_TIMEOUT_MS;
+    return Math.max(TOOL_TIMEOUT_MS, manifestMaxToolDurationMs + TOOL_TIMEOUT_OVERHEAD_MARGIN_MS);
 }
 
 let manifestPromise: Promise<void> | null = null;
@@ -113,23 +145,53 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined): Promise<string> {
-    const effectiveConversationId = conversationIdOverride ?? conversationId;
+// #2752: same contract as agent/shared.ts's ForwardedToolResult — the endpoint's
+// machine-readable outcome/blocksCreated ride through (defensively parsed) so
+// the shim can expose them as MCP structuredContent; `text` carries the appended
+// partial note for clients that only render content text.
+export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
+
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
     for (let attempt = 0; ; attempt++) {
+        // Recomputed per attempt: an in-loop adoption (#656/#4168) rewrites the
+        // global binding, and the retry must carry the NEW id — capturing it
+        // once above the loop would silently re-POST the stale one.
+        const effectiveConversationId = conversationIdOverride ?? conversationId;
         let res: Response;
         try {
+            const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args };
+            // #2024: flag host-stamped per-call identity (Codex _meta.threadId) so
+            // the proxy ranks it above a content-based witness. Static env/meta
+            // bindings and model-transcribed ids are NOT flagged — their
+            // precedence stays exactly as #1685 wrote it.
+            if (nativeCaller && effectiveConversationId) body.nativeCaller = true;
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId: effectiveConversationId, tool, args }),
+                body: JSON.stringify(body),
                 signal: AbortSignal.timeout(timeoutMs),
             });
         } catch (err) {
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
-        if (res.ok && data.ok) return data.result ?? "";
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown; code?: unknown; witnessSessions?: unknown; namedSessionLastSeen?: unknown; witnessLastSeen?: unknown };
+        // #1875: ok:true means the tool RAN; the business effect rides outcome.
+        // failure/refusal receipts become MCP isError so hosts surface them to
+        // the model — partial still counts as success.
+        if (res.ok && data.ok) {
+            const outcome = parseToolOutcome(data.outcome);
+            const blocksCreated = parseBlocksCreated(data.blocksCreated);
+            let text = data.result ?? "";
+            // #2752: same partial-note contract as agent/shared.ts — only a
+            // partial fold gains the appended line; every other envelope keeps
+            // its exact historical bytes.
+            if (outcome === "partial") text += `\n${partialOutcomeNote(blocksCreated)}`;
+            const out: McpForwardedToolResult = { text, failed: outcome === "failure" || outcome === "refused" };
+            if (outcome !== undefined) out.outcome = outcome;
+            if (blocksCreated !== undefined) out.blocksCreated = blocksCreated;
+            return out;
+        }
         // #656: the shim's captured id was never registered — the host likely
         // resumed its session and forked a new id after this shim spawned.
         // Adopt the proxy's latest active conversation and retry once. Armed
@@ -140,6 +202,33 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             typeof data.error === "string" && data.error.includes("no model request has arrived")
         ) {
             if (await adoptLatestActiveConversation()) continue;
+        }
+        // #4168: the captured id still RESOLVES, but the host moved the
+        // conversation to a new session id after this shim spawned (claude's
+        // native-compaction continuation / resume) — every call now fails
+        // closed on the outbound-witness conflict instead of ever 404ing, so
+        // the #656 adoption above never fires and the session is stuck for
+        // good. Extend the same one-shot adoption to this failure: adopt the
+        // UNIQUE witnessing session only when the proxy's recency facts prove
+        // traffic moved there AFTER the bound session's last activity.
+        // Multiple witnesses, missing facts (older proxy), or a still-fresh
+        // binding all stay on the loud 409 — fail closed, never guess.
+        if (
+            res.status === 409 && attempt === 0 && ORPHAN_ADOPT && conversationIdOverride === undefined && conversationId &&
+            data.code === "TOOL_CONVERSATION_CONFLICT"
+        ) {
+            const witnesses = Array.isArray(data.witnessSessions)
+                ? data.witnessSessions.filter((x): x is string => typeof x === "string" && x.length > 0)
+                : [];
+            const namedSeen = typeof data.namedSessionLastSeen === "number" ? data.namedSessionLastSeen : NaN;
+            const witnessSeen = typeof data.witnessLastSeen === "number" ? data.witnessLastSeen : NaN;
+            if (witnesses.length === 1 && witnesses[0] !== conversationId && Number.isFinite(namedSeen) && Number.isFinite(witnessSeen) && witnessSeen > namedSeen) {
+                process.stderr.write(
+                    `[bili-mcp] captured conversation id ${conversationId} is stale — the host moved this conversation to ${witnesses[0]} (resume/native compaction?); re-binding\n`,
+                );
+                conversationId = witnesses[0];
+                continue;
+            }
         }
         throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     }
@@ -168,13 +257,19 @@ async function adoptLatestActiveConversation(): Promise<boolean> {
     }
 }
 
+// Test seam: forwardTool's adoption rewrites the module-level binding, so
+// tests need a deterministic way to reset it between cases.
+export function _resetMcpBindingForTest(nextConversationId?: string): void {
+    conversationId = nextConversationId;
+}
+
 const ERR_TOOL = -32602;
 
 async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string } };
+        _meta?: { ui?: { sessionId?: string }; threadId?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -226,6 +321,12 @@ async function handleMessage(msg: {
                 sendError(id, -32002, "server not initialized");
                 return;
             }
+            if (degradedReason !== undefined) {
+                // #1892: idle shim — advertise nothing rather than blocking on
+                // (or erroring against) an origin that is not there.
+                sendResult(id, { tools: [] });
+                return;
+            }
             try {
                 await ensureManifest();
                 sendResult(id, { tools: manifestTools });
@@ -239,6 +340,10 @@ async function handleMessage(msg: {
             const rawArgs: Record<string, unknown> = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
             if (!tool) {
                 sendError(id, ERR_TOOL, "params.name is required");
+                return;
+            }
+            if (degradedReason !== undefined) {
+                sendResult(id, { content: [{ type: "text", text: `bili is idle: ${degradedReason}` }], isError: true });
                 return;
             }
             // #760: per-call conversation_id — the model copies the id the
@@ -255,17 +360,49 @@ async function handleMessage(msg: {
             // stripped, exactly as before.
             const perCallRaw = rawArgs.conversation_id;
             const perCall = typeof perCallRaw === "string" ? perCallRaw.trim() : "";
-            const keepForSearch = tool === "search_context" && perCall.length > 0 && typeof conversationId === "string" && conversationId.length > 0;
+            // #2024: Codex stamps the real thread id on every tools/call via
+            // _meta.threadId (see file header). Validated strictly — anything
+            // that is not a non-empty string after trim is treated as ABSENT
+            // so malformed metadata can never shadow the legacy channels.
+            // Per-call only: this value never touches the global
+            // `conversationId` below. _meta.sessionId (transient run id) is
+            // deliberately not consumed.
+            const metaThreadId = params._meta?.threadId;
+            const nativeThreadId = typeof metaThreadId === "string" && metaThreadId.trim().length > 0 ? metaThreadId.trim() : undefined;
+            // A native caller counts as "bound" for the search-target
+            // exception (#841 extended by #2024): the call routes to the
+            // native thread while args.conversation_id stays the read-only
+            // target — even when no env/default binding exists (previously
+            // the target would have been mistaken for the caller).
+            const keepForSearch = tool === "search_context" && perCall.length > 0 && (nativeThreadId !== undefined || (typeof conversationId === "string" && conversationId.length > 0));
             const args = { ...rawArgs };
             if (!keepForSearch) delete args.conversation_id;
-            const routeOverride = keepForSearch ? undefined : perCall || undefined;
+            const routeOverride = nativeThreadId ?? (keepForSearch ? undefined : perCall || undefined);
             // #1685: with no binding and no per-call id, forward anyway — the
             // proxy routes the id-less POST itself (outbound tool_use witness,
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride);
-                sendResult(id, { content: [{ type: "text", text }], isError: false });
+                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined);
+                // #2752: the business state rides MCP structuredContent (spec
+                // field alongside content; clients predating it ignore it).
+                // isError semantics are unchanged — partial stays non-error.
+                // #3472: some hosts (Claude Code via its MCP bridge) prefer
+                // structuredContent when present and drop the content text —
+                // with only {outcome, blocksCreated} every success call reached
+                // the model as bare {"outcome":"success"} and the whole report
+                // was lost. Carry the full report inside structuredContent too
+                // (structured.text, byte-identical to content[0].text) so
+                // structured-only readers see the complete receipt; the machine
+                // fields stay additive alongside it.
+                const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
+                if (out.outcome !== undefined || out.blocksCreated !== undefined) {
+                    const structured: Record<string, unknown> = { text: out.text };
+                    if (out.outcome !== undefined) structured.outcome = out.outcome;
+                    if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
+                    result.structuredContent = structured;
+                }
+                sendResult(id, result);
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC
                 // errors, so the host surfaces them to the model.
@@ -305,8 +442,16 @@ async function mcpMain(): Promise<void> {
     process.stdin.on("end", () => process.exit(0));
 }
 
+/** Set when this shim serves WITHOUT a live proxy behind it (#1892,
+ *  zcode mcp-entry): tools/list answers an empty list instead of timing out
+ *  against a dead origin, and tools/call returns a loud isError explaining
+ *  why. The process stays a valid MCP server so the host handshake completes
+ *  instead of seeing the child die pre-initialize. */
+let degradedReason: string | undefined;
+
 /** CLI entry (`bili mcp`): the stdio loop keeps the process alive. */
-export function runMcpStdio(): void {
+export function runMcpStdio(opts: { degraded?: string } = {}): void {
+    degradedReason = opts.degraded;
     void mcpMain();
 }
 

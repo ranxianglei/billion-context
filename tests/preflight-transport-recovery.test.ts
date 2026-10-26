@@ -72,6 +72,7 @@ async function withUpstream(handler: (res: http.ServerResponse, attempt: number)
     } finally {
         const closed = once(server, "close");
         server.close();
+        server.closeIdleConnections?.();
         server.closeAllConnections();
         await closed;
     }
@@ -120,7 +121,7 @@ test("preflight shares one attempt budget across HTTP 503 and body transport fai
     });
 });
 
-test("preflight reports gzip decoding failure with its cause and does not retry it", async () => {
+test("preflight reports gzip decoding failure with its cause, skips the in-loop retry, but keeps it client-retryable", async () => {
     await withUpstream(res => {
         res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip" });
         res.end("not gzip");
@@ -128,7 +129,9 @@ test("preflight reports gzip decoding failure with its cause and does not retry 
         const f = fixture(url);
         const result = await preflightCompress(f.deps, f.messages);
         assert.equal(attempts(), 1);
-        assert.equal(result.failure?.retryable, undefined);
+        // #1987: the call did not complete — no upstream verdict on the content — so the
+        // client may still retry the turn even though bili does not loop on it here.
+        assert.equal(result.failure?.retryable, true);
         assert.match(result.failure?.detail ?? "", /body.*Z_DATA_ERROR/);
         assert.equal(f.session.state.blocks.length, 0);
     });
@@ -171,24 +174,82 @@ test("preflight cancellation during HTTP backoff does not make another request",
     });
 });
 
-test("preflight never retries unknown or abort errors and does not echo sensitive exception text", async () => {
+test("preflight never retries unknown or abort errors in-loop and does not echo sensitive exception text", async () => {
     const secret = "https://user:secret@example.invalid/?api_key=private-key";
-    const errors = [
-        new TypeError(secret, { cause: new Error(secret) }),
-        Object.assign(new Error(secret, { cause: Object.assign(new Error(secret), { code: "ECONNRESET" }) }), { name: "AbortError" }),
+    // #1987: an unknown transport death is still retryable FOR THE CLIENT (no upstream
+    // verdict was rendered); an abort is not. In-loop, neither is retried.
+    const cases: Array<[unknown, boolean | undefined]> = [
+        [new TypeError(secret, { cause: new Error(secret) }), true],
+        [Object.assign(new Error(secret, { cause: Object.assign(new Error(secret), { code: "ECONNRESET" }) }), { name: "AbortError" }), undefined],
     ];
     const originalFetch = globalThis.fetch;
     try {
-        for (const error of errors) {
+        for (const [error, expectedRetryable] of cases) {
             let attempts = 0;
             globalThis.fetch = async () => { attempts++; throw error; };
             const f = fixture("http://127.0.0.1/unused");
             const result = await preflightCompress(f.deps, f.messages);
             assert.equal(attempts, 1);
-            assert.equal(result.failure?.retryable, undefined);
+            assert.equal(result.failure?.retryable, expectedRetryable);
             assert.match(result.failure?.detail ?? "", /summary request failed/);
             const visible = f.logs.join("\n") + result.failure?.detail;
             assert.doesNotMatch(visible, /secret|private-key|example\.invalid/);
+            assert.equal(f.session.state.blocks.length, 0);
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+function netFailure(code: string, message: string): Error {
+    return new TypeError("fetch failed", { cause: Object.assign(new Error(message), { code }) });
+}
+
+test("preflight retries connect-timeout and DNS summary failures within the budget (#1987 main-path parity)", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect timeout"], ["ENOTFOUND", "DNS failure"]] as const) {
+            let attempts = 0;
+            globalThis.fetch = async () => { attempts++; throw netFailure(code, label); };
+            const f = fixture("http://127.0.0.1/unused");
+            const result = await preflightCompress(f.deps, f.messages);
+            // The main model-request path replays exactly these kinds (#1453); the
+            // summary path used to die on attempt 1 for them.
+            assert.equal(attempts, 3, `${code}: full replay budget consumed`);
+            assert.equal(result.failure?.kind, "upstream");
+            assert.equal(result.failure?.retryable, true);
+            assert.match(result.failure?.detail ?? "", new RegExp(`code=${code}`));
+            assert.equal(f.session.state.blocks.length, 0);
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("preflight marks TLS trust failures client-retryable without in-loop retry and names the CA remedy (#1987)", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const [code, withHint] of [
+            ["DEPTH_ZERO_SELF_SIGNED_CERT", true],
+            ["CERT_HAS_EXPIRED", true],
+            ["EPROTO", false],
+        ] as Array<[string, boolean]>) {
+            let attempts = 0;
+            globalThis.fetch = async () => { attempts++; throw netFailure(code, `tls ${code}`); };
+            const f = fixture("http://127.0.0.1/unused");
+            const result = await preflightCompress(f.deps, f.messages);
+            // A bad CA does not self-heal in the backoff window — no in-loop retry
+            // (the main path treats tls kinds the same way) — but the turn itself
+            // stays retryable once the operator fixes the CA.
+            assert.equal(attempts, 1, `${code}: no in-loop retry`);
+            assert.equal(result.failure?.kind, "upstream");
+            assert.equal(result.failure?.retryable, true, `${code}: client-retryable`);
+            if (withHint) {
+                assert.match(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
+                assert.match(result.failure?.detail ?? "", /security software/);
+            } else {
+                assert.doesNotMatch(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
+            }
             assert.equal(f.session.state.blocks.length, 0);
         }
     } finally {

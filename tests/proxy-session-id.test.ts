@@ -44,8 +44,14 @@ test("preferPromptCacheKeyIdentity: stronger signals win over prompt_cache_key",
 });
 
 test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps fingerprint", () => {
-    for (const body of [{ input: [] }, { input: [], prompt_cache_key: "   " }, { input: [], prompt_cache_key: 42 }]) {
-        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+    type RespBody = Parameters<typeof conversationIdentityResponses>[0];
+    const pckBodies: { input: RespBody["input"]; prompt_cache_key?: string | number }[] = [
+        { input: [] },
+        { input: [], prompt_cache_key: "   " },
+        { input: [], prompt_cache_key: 42 },
+    ];
+    for (const body of pckBodies) {
+        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body as RespBody, undefined), body);
         assert.equal(id!.source, "content-fingerprint");
         assert.equal(id!.clientProvided, false);
     }
@@ -82,6 +88,18 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({ "session-id": "E" }), "E");
     assert.equal(clientConversationHeader({ session_id: "F" }), "F");
     assert.equal(clientConversationHeader({}), undefined);
+    // #2779: OpenCode 2.x ships its own id ONLY in x-opencode-session-id; the
+    // inherited affinity values ride x-session-affinity / x-session-id /
+    // x-opencode-session alongside it and must not win.
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "N", "x-session-affinity": "A", "x-session-id": "I", "x-opencode-session": "O" }), "N");
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "N" }), "N");
+    // Blank native header falls back to the affinity chain below it.
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "   ", "x-session-affinity": "A" }), "A");
+    // Client-specific headers above it keep their precedence.
+    assert.equal(clientConversationHeader({ "x-claude-code-session-id": "S", "x-opencode-session-id": "N" }), "S");
+    assert.equal(clientConversationHeader({ "x-mavis-session-id": "M", "x-opencode-session-id": "N" }), "M");
+    // Explicit plugin identity still outranks everything else.
+    assert.equal(clientConversationHeader({ "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "P", "x-opencode-session-id": "N" }), "P");
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {

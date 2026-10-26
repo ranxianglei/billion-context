@@ -88,11 +88,12 @@ class CloseOnceRes extends EventEmitter {
 }
 
 test("consecutive backpressure waits after a single close do not hang", async () => {
-    const res = new CloseOnceRes() as unknown as Parameters<typeof awaitDrain>[0];
+    const raw = new CloseOnceRes();
+    const res = raw as unknown as Parameters<typeof awaitDrain>[0];
     await withTimeout((async () => {
-        if (!res.write()) await awaitDrain(res);
-        if (!res.write()) await awaitDrain(res);
-        res.end();
+        if (!raw.write()) await awaitDrain(res);
+        if (!raw.write()) await awaitDrain(res);
+        raw.end();
     })(), 500, "second backpressure wait after disconnect");
 });
 

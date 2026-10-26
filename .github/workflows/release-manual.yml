@@ -7,6 +7,11 @@ on:
         description: "Version to publish. Blank = auto next patch over npm latest."
         required: false
         default: ""
+      train:
+        description: "RETIRED 2026-10-25 (was: ship the open patch train). Patch lanes are now merge-gated: merging the final carry PR INTO the protected lane publishes (release-bugfix.yml pull_request_target). This box refuses; see reference/release.md."
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: one-click-release
@@ -18,6 +23,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +33,36 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      - name: Resolve the patch lane (train mode)
+        # Dual-lane model: `train=true` ships the CURRENT patch lane instead
+        # of master. The lane is DERIVED from the latest v* tag (never
+        # stored): `bugfix-v<latest-tag>` — every carried fix lives there
+        # until this release cuts the next tag. This release commit lands on
+        # the LANE branch and publishes via the carve-out channel on ship-PR
+        # merge — never via the direct master push below.
+        id: train
+        if: inputs.train == true
+        run: |
+          set -euo pipefail
+          echo "::error::train mode is RETIRED (2026-10-25) — its direct-push mechanics predate protected lanes. Ship the lane by MERGING its final carry PR INTO it (merge-gated publish in release-bugfix.yml); see reference/release.md"
+          exit 1
+          if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
+          TRAIN="bugfix-v${LAST#v}"
+          git fetch -q origin "+refs/heads/$TRAIN:refs/remotes/origin/$TRAIN" || true
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$TRAIN"; then
+            git checkout --quiet -B train "refs/tags/$LAST"
+            git push -q origin "HEAD:$TRAIN"
+            echo "lane $TRAIN did not exist — cut it from tag $LAST (it will be EMPTY)"
+          else
+            git checkout --quiet -B train "origin/$TRAIN"
+          fi
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/$LAST^{commit})" ]; then
+            echo "::error::train mode: lane $TRAIN holds no carried fixes yet (tree == tag $LAST). Un-tick the box for a normal release, or label a fix PR 'backport' first."
+            exit 1
+          fi
+          echo "name=$TRAIN" >> "$GITHUB_OUTPUT"
+          echo "train mode: shipping $TRAIN ($(git rev-list --count "$LAST..HEAD") carried fix(es) over tag $LAST)"
 
       - name: Resolve version
         id: version
@@ -50,11 +86,19 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Drift guard
+        env:
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
-          MASTER_V="$(node -p "require('./package.json').version")"
+          TREE_V="$(node -p "require('./package.json').version")"
           NPM_V="$(npm view billion-context version)"
-          if [ "$MASTER_V" != "$NPM_V" ]; then
-            echo "::error::master package.json ($MASTER_V) != npm latest ($NPM_V). Sync master with the last published release before one-click releasing."
+          if [ -z "$NPM_V" ]; then
+            echo "::error::cannot read the npm latest version of billion-context"
+            exit 1
+          fi
+          WHAT="master"
+          [ -n "$TRAIN_NAME" ] && WHAT="patch train $TRAIN_NAME"
+          if [ "$TREE_V" != "$NPM_V" ]; then
+            echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
             exit 1
           fi
           if [ "${{ steps.version.outputs.version }}" = "$NPM_V" ]; then
@@ -68,6 +112,26 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Verify release-notes entry (#1870)
+        # Policy (2026-10-04 revision of #1870): entries are OPT-IN severity
+        # declarations. Only severe releases need one; ordinary releases ship
+        # silently with NO entry. Missing entry => notice + pass. A present
+        # entry is validated and logged. Prereleases (dev channel) exempt.
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          case "$VER" in
+            *-*) echo "prerelease $VER — release-notes gate skipped"; exit 0 ;;
+          esac
+          node -e "
+            const notes = require('./release-notes/package.json').billionContextReleaseNotes;
+            const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
+            if (!entry) {
+              console.log('::notice::release ' + process.argv[1] + ' has no release-notes entry — shipping silently (entries are opt-in; only severe releases need one). See release-notes/README.md (#1870).');
+              process.exit(0);
+            }
+            console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
+          " "$VER"
 
       - name: Bump version
         run: |
@@ -83,37 +147,68 @@ jobs:
               console.log(`${f}: replaced ${n} occurrence(s)`);
             }
           ' "$(node -p "require('./package.json').version")" "${{ steps.version.outputs.version }}"
+          # #4449: plugin manifests (.agents/.claude-plugin/plugins/codex) carry
+          # their version from package.json — sync them into the same release
+          # commit or marketplace update detection sees a stale version.
+          # Pre-b87732e2 patch lanes (cut from tags older than #4449) have no
+          # manifests and no script — `git add` fatals on the absent pathspecs
+          # and the script itself is MODULE_NOT_FOUND, killing train mode on
+          # exactly the lanes that need it. Existence-guard both.
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs
+          else
+            echo "::notice::sync-codex-plugin-version.mjs absent on this ref (pre-#4449 patch lane) — skipping manifest sync"
+          fi
 
       - name: Verify bump diff
         run: |
-          git add package.json package-lock.json
+          for P in package.json package-lock.json .agents .claude-plugin plugins/codex; do
+            [ -e "$P" ] && git add "$P"
+          done
           CHANGED="$(git diff --cached --name-only)"
-          EXPECT="package-lock.json
-          package.json"
-          if [ "$CHANGED" != "$EXPECT" ]; then
-            echo "::error::bump touched unexpected files: $CHANGED"
+          [ -n "$CHANGED" ] || { echo "::error::bump produced no changes"; exit 1; }
+          BAD="$(printf '%s\n' "$CHANGED" | grep -vE '^(package\.json|package-lock\.json|\.agents/plugins/marketplace\.json|\.claude-plugin/marketplace\.json|\.claude-plugin/plugin\.json|plugins/codex/\.codex-plugin/plugin\.json)$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::bump touched unexpected files: $BAD"
             exit 1
           fi
 
-      - name: Pre-flight gate
-        # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
-        env:
-          ACP_TEST_CLAUDE_NATIVE: "1"
+      - name: Pre-flight gate (fast sanity)
+        # #3539: the full `npm test` used to serialize here (~30-40 min on one
+        # shared 2-core runner) and then run AGAIN as the sharded CI matrix —
+        # the same suites twice per release chain. The full suite is now owned
+        # exclusively by the CI lanes dispatched at the exact publish sha
+        # below (policy 2026-10-10 unchanged); the Full CI gate blocks publish
+        # until they are all green, so coverage is identical — only the
+        # executor moved from this job to the parallel lane matrix.
         run: |
           npm ci
           npm run typecheck
-          npm test
           npm run build
 
       - name: Commit and push to master
         id: push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VER="${{ steps.version.outputs.version }}"
           git commit -q -m "release v$VER"
+          if [ -n "$TRAIN_NAME" ]; then
+            # Train mode: the release commit lands ON THE TRAIN; publishing is
+            # the carve-out channel (release-bugfix on ship-PR merge), never a
+            # direct master push.
+            if ! git push -q origin "HEAD:$TRAIN_NAME"; then
+              echo "::error::push to train $TRAIN_NAME failed — nothing published, aborting."
+              exit 1
+            fi
+            echo "train ship commit pushed to $TRAIN_NAME"
+            echo "needs_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$TRAIN_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git push -q origin HEAD:master; then
             echo "pushed release commit to master"
             echo "direct=true" >> "$GITHUB_OUTPUT"
@@ -135,12 +230,158 @@ jobs:
           echo "pr_branch=${BR}" >> "$GITHUB_OUTPUT"
           exit 0
 
+      - name: Full CI dispatch (missing lanes at the release commit)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. The direct-push commit lands on master via GITHUB_TOKEN,
+        # which fires no push events — nothing runs CI on it. Dispatch every
+        # missing lane at master (idempotent); the Full CI gate step below
+        # blocks publish until all lanes are green. The script first refuses
+        # to dispatch if master's head is no longer the release commit
+        # (#3539) and cancels stale in-flight runs from this attempt.
+        # CI_FULL_DISPATCH: the direct path had the same CORE-default gap the
+        # fallback path fixed (#3539) — without it ci.yml lands only the CORE
+        # matrix at the release sha, and a windows+node-24-only regression
+        # can publish before any CI leg sees it.
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_FULL_DISPATCH: "1"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Full CI gate (all lanes green at the release commit)
+        # Hard precondition for publish: every required lane green at the
+        # publish sha. Any red lane or timeout ⇒ release fails, nothing is
+        # published. The dispatch step above already refused to fire when
+        # master's head was not this commit (#3539); a later push does not
+        # invalidate runs already landed at it.
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --wait
+
+      - name: Dispatch full CI on fallback branch
+        if: steps.push.outputs.needs_pr == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_FULL_DISPATCH: "1"
+        run: |
+          # GITHUB_TOKEN ref updates deliver no push events, so the push
+          # trigger in ci.yml never fires on this branch. An explicit
+          # workflow_dispatch on the same ref produces check runs on the head
+          # sha → required status checks pass → the auto-PR is mergeable
+          # without approving its gated pull_request runs (#772, #1744).
+          # #3539: dispatch the COMPLETE lane set (ci.yml FULL matrix + every
+          # e2e lane) in one pass — previously only ci.yml CORE landed here
+          # and release.yml re-ran the rest after merge, paying for the same
+          # suites up to three times per chain. With everything green at the
+          # PR head, release.yml's gate reuses the runs and publishes without
+          # extra CI. The script verifies the branch head matches before
+          # dispatching and cancels stale in-flight runs from this attempt.
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="$PR_BRANCH"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Reconcile backport-labeled PRs vs the lane (ship-time audit)
+        # The dual-lane contract: intent to ride the next patch release is
+        # expressed by the `backport` label (on the source PR) and/or an open
+        # `backport-carry` PR against this lane. A cherry-pick conflict is
+        # visible inside its carry PR but easy to overlook at ship time, and
+        # CI green on the lane head says nothing about ABSENT fixes (#4474).
+        # This audit cross-checks, at the last human decision point (the ship
+        # PR), every backport-labeled merge since the lane's base tag against
+        # the cherry-pick -x trailers on the lane, AND every OPEN carry PR
+        # targeting this lane, rendering any no-show loudly in the ship PR
+        # body. It never fails the run: the owner may legitimately ship
+        # without the straggler — but they must SEE it.
+        id: reconcile
+        if: steps.train.outputs.name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin master --tags
+          # HEAD = train + ship commit; HEAD~1 = last pick. The nearest tag
+          # reachable from there is the tag this train was cut from.
+          BASE_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1)"
+          MISSING=""
+          LABELED=0
+          on_train() {  # every own-commit of the PR must have a pick trailer
+            for C in $1; do
+              if [ -z "$(git log HEAD --grep="cherry picked from commit ${C}" --format=%H)" ]; then
+                return 1
+              fi
+            done
+            return 0
+          }
+          audit_pr() {  # $1 = PR number, $2 = commit range / single sha
+            local LABELS
+            LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '[.labels[].name] | join(",")' 2>/dev/null || true)"
+            case ",$LABELS," in *,backport,*) ;; *) return 0 ;; esac
+            LABELED=$((LABELED+1))
+            if ! on_train "$2"; then
+              local TITLE
+              TITLE="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '.title' 2>/dev/null || echo '?')"
+              MISSING="${MISSING}- #$1 ${TITLE}"$'\n'
+            fi
+          }
+          # 1) merge-commit merges: "Merge pull request #N from …" — range M^1..M^2
+          for M in $(git log --merges --ancestry-path "${BASE_TAG}..origin/master" --format='%H'); do
+            N="$(git log -1 --format='%s' "$M" | sed -n 's/^Merge pull request #\([0-9]*\) from .*/\1/p')"
+            [ -z "$N" ] && continue
+            audit_pr "$N" "$(git rev-list --no-merges "${M}^1..${M}^2")"
+          done
+          # 2) squash-shape merges: subject ends in "(#N)" — single sha
+          while read -r C SUBJECT; do
+            N="${SUBJECT##*(#}"
+            N="${N%)}"
+            case "$N" in ''|*[!0-9]*) continue ;; esac
+            audit_pr "$N" "$C"
+          done < <(git log --no-merges "${BASE_TAG}..origin/master" --format='%H %s' | grep -E '\(#[0-9]+\)$' || true)
+          # 3) open carry PRs against THIS lane — shipped around (unmerged,
+          #    possibly still holding conflicts) = deliberately left behind;
+          #    the human must see it at the last decision point.
+          while read -r N TITLE; do
+            [ -z "$N" ] && continue
+            LABELED=$((LABELED+1))
+            MISSING="${MISSING}- PR #$N ${TITLE} (open/unmerged against this lane at ship time)"$'\n'
+          done < <(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$TRAIN_NAME" \
+            --json number,title --jq '.[] | [(.number|tostring), .title] | @tsv' 2>/dev/null || true)
+          echo "labeled=$LABELED" >> "$GITHUB_OUTPUT"
+          echo "audited ${LABELED} backport-labeled item(s) since ${BASE_TAG} against $TRAIN_NAME"
+          if [ -n "$MISSING" ]; then
+            {
+              echo "missing_md<<RECONCILE_EOF"
+              printf '## \u26a0\ufe0f Backport-labeled but NOT on this lane\n\nThese fixes expressed backport intent but their commits are absent from `%s` — a merged source PR whose picks all conflicted (no clean carry to merge), or a PR still open against the lane at ship time (possibly still holding conflicts). Ship only if leaving them for the next REGULAR release is acceptable:\n\n%s' "$TRAIN_NAME" "$MISSING"
+              echo "RECONCILE_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning::backport-labeled item(s) missing from $TRAIN_NAME — see the ship PR body"
+          fi
+
       - name: Open fallback PR (best effort)
         if: steps.push.outputs.needs_pr == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          TRAIN_NAME: ${{ steps.train.outputs.name }}
+          RECONCILE: ${{ steps.reconcile.outputs.missing_md }}
         run: |
           VER="${{ steps.version.outputs.version }}"
           LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
@@ -152,11 +393,16 @@ jobs:
           fi
           PAYLOAD_FILE="$(mktemp)"
           BODY_FILE="$(mktemp)"
-          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" node -e '
+          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" TRAIN_NAME="$TRAIN_NAME" node -e '
             const fs = require("fs");
+            const intro = process.env.TRAIN_NAME
+              ? "Ship PR for the patch train (dual-lane release): merging publishes the PRE-MERGE head tree — the base tag plus exactly this train\u2019s fixes, none of master\u2019s unreleased work — via release-bugfix.yml."
+              : "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.";
+            const warn = process.env.RECONCILE ? process.env.RECONCILE + "\n" : "";
             const body = [
-              "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.",
+              intro,
               "",
+              warn,
               "## Changes since " + (process.env.LAST_TAG || "n/a"),
               "",
               process.env.NOTES || "(no changes recorded)",
@@ -209,6 +455,28 @@ jobs:
           echo "::warning::NOTHING WAS PUBLISHED YET — auto-PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
           echo "::warning::Finish the release with one click: ${LINK} (then merge to publish v${VER})"
           exit 0
+
+      - name: Wait for full CI green on fallback branch (track head)
+        if: steps.push.outputs.needs_pr == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          WAIT_TRACK_HEAD: "1"
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          # Certifies "fallback PR ready": every required lane green at the
+          # CURRENT branch head. If master gets merged into the release branch
+          # mid-wait (the v0.1.198 queue stomp, #3534), the head moves: stale
+          # in-flight runs at the old head are cancelled and missing lanes are
+          # re-dispatched at the new head instead of burning runners on a
+          # superseded sha. On timeout the PR stays open with CI still running
+          # — watch the PR, nothing is lost.
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="$PR_BRANCH"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --wait
 
       - name: Check if prerelease
         id: pre

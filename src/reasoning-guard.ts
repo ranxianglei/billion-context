@@ -1,5 +1,6 @@
 import { fetchWithTimeout } from "./fetch-util.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { scrubLoneSurrogatesOnWire } from "./text-safe.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { awaitDrain } from "./server/stream-io.js";
 
 /** Minimal server-response surface the guard writes SSE frames to. Kept apart
@@ -56,7 +57,7 @@ interface ResolvedGuard {
 
 type Usage = Record<string, unknown>;
 
-export function resolveGuardConfig(cfg: ReasoningGuardConfig | undefined): ResolvedGuard {
+function resolveGuardConfig(cfg: ReasoningGuardConfig | undefined): ResolvedGuard {
     const c = cfg ?? {};
     return {
         maxContinue: numOr(c.maxContinue, 3),
@@ -212,7 +213,7 @@ export function nextRoundBody(baseBody: Record<string, unknown>, inputItems: unk
     return body;
 }
 
-export interface GuardParams {
+interface GuardParams {
     firstResponse: Response;
     clearFirstTimer: () => void;
     upstreamUrl: string;
@@ -223,6 +224,9 @@ export interface GuardParams {
     res: SseSink;
     config: ReasoningGuardConfig;
     log: (msg: string) => void;
+    /** #1884: re-sign each rebuilt round before it hits the wire (armed
+     *  re-sign lane only; undefined on unsigned traffic). */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 interface FoldState {
@@ -341,22 +345,30 @@ async function consumeRound(
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    const drainOnce = (): { terminal: Record<string, unknown> } | null => {
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const ev = parseFrame(frame);
+            if (ev === null || ev === DONE_SENTINEL) continue;
+            const term = processEvent(ev, st, res);
+            if (term) return { terminal: term };
+        }
+        return null;
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
             buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-                const frame = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
-                const ev = parseFrame(frame);
-                if (ev === null || ev === DONE_SENTINEL) continue;
-                const term = processEvent(ev, st, res);
-                if (term) return { terminal: term };
-            }
+            const term = drainOnce();
+            if (term) return term;
         }
+        buf = finalizeSseLineEndings(buf);
+        const finalTerm = drainOnce();
+        if (finalTerm) return finalTerm;
         return { error: "upstream_eof" };
     } catch (e) {
         return { error: e instanceof Error ? e.message : String(e) };
@@ -529,12 +541,17 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
             prepareNextRound(st);
             st.roundNo++;
             const nextBody = nextRoundBody(st.baseBody, [...st.origInput, ...st.replayTail]);
+            // #816 family: the replayed tail can carry lone surrogate halves —
+            // scrub the wire body (and what resign signs) or strict upstreams
+            // reject the whole round.
+            const roundBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(nextBody));
             let roundRes: Awaited<ReturnType<typeof fetchWithTimeout>>;
+            p.resign?.(p.reqHeaders, roundBodyStr);
             try {
                 roundRes = await fetchWithTimeout(p.upstreamUrl, {
                     method: "POST",
                     headers: p.reqHeaders,
-                    body: JSON.stringify(nextBody),
+                    body: roundBodyStr,
                     dispatcher: p.dispatcher,
                 }, undefined, p.signal);
             } catch {

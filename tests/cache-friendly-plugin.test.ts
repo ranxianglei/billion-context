@@ -7,13 +7,18 @@
 // Plugin-mode carrier semantics: the ACP-native agent OWNS compression — it
 // executes `compress` locally through the plugin tool API and re-sends the
 // call + result in its own persisted history on every later request (pi
-// semantics: pairs stay at their chronological position forever). The proxy
-// therefore re-injects the in-place acp_summary carrier from block state on
-// every request. Since the #1567 fix the carrier is STRIPPED per-block, but
-// self-verified: only while that exact fold's compress pair actually rides
-// the (post-prepare) inbound history. A pair pruned client-side or hidden by
-// the kernel (KEEP_LAST_ORPHANED) keeps the anchor, so an active fold never
-// has zero carriers. This suite pins that behavior byte-for-byte.
+// semantics: pairs stay at their chronological position forever). That pair
+// IS the wire summary carrier — the agent's view never renders the kernel
+// acp_summary (KDD#7). Since the #1567 fix the kernel-rendered anchor is
+// STRIPPED per-block, self-verified: only while that exact fold's compress
+// pair rides the (post-prepare) inbound history quoting an ACTIVE block's
+// range (#3769 carrier exemption). The moment a pair stops riding (client
+// drop), its anchor re-carries the summary from that turn on (#1567
+// fail-safe); a pair whose block died (swallowed by a wider fold) loses its
+// carrier status and is swept at the swallowing fold's boundary, together
+// with genuinely failed compress records sitting at/after the fold's start
+// ref (fold-gated sweep, #3769). This suite pins that behavior
+// byte-for-byte.
 //
 // Invariants pinned per wire (bodies = consecutive upstream-bound request
 // payloads of one session, compared as flat unit lists — text blocks and
@@ -22,33 +27,55 @@
 //       an EXACT byte-prefix of the next (mid-history never mutates); the
 //       volatile tail slots (chain checkpoint / nudge / imgNote / retrieval
 //       note, ≤ 4) may only appear as a contiguous tail run;
+//       #3159 (google lane only): Vertex rejects plain text after a
+//       functionResponse part inside one user content, so coreToGoogle
+//       forwards such a content with the plain-text parts LEADING — when a
+//       user content ending on tool results gains new text parts between
+//       turns, the previous body's trailing tool units shift right past the
+//       inserted text run (assertPrefix's allowCanonShift sanctions exactly
+//       that move); every other byte stays an exact prefix;
 //   P2 fold transitions (client re-sends its compress pair after a
 //       /__bili/plugin/tool fold):
-//        P2a the pre-fold span is replaced by exactly the expected carrier
-//            units and nothing else moves or mutates (exact reconstruction);
-//        P2b the in-place carrier is stripped from every post-fold turn
-//            while the client's pair rides inbound — occurrence counts
-//            pinned: exactly 2 summary-text hits per post-fold turn (the
-//            fold spec echoed in the re-sent tool_call args + the tail
-//            quote inside the persistently re-sent tool result) and ZERO
-//            carrier markers (#1567 fix);
-//        P2c fail-safe (#1567 hardening): the anchor re-carries the summary
-//            whenever the pair does NOT ride inbound — the client stops
-//            re-sending it, or the kernel hid it (KEEP_LAST_ORPHANED) —
-//            pinned by the two hardening subtests at the bottom of this file;
-//   P3 multi-fold: two folds in one session; both pairs stay visible
-//       (≤ KEEP_LAST_ORPHANED) and the pair-quote counts stay constant across
-//       all later turns;
+//        P2a the pre-fold span is replaced by exactly the expected units and
+//            nothing else moves or mutates (exact reconstruction; when the
+//            span touches m00001 the session head survives as boundary,
+//            mid-history spans are consumed whole);
+//        P2b the pair RIDES inbound from its fold turn on and IS the summary
+//            carrier — occurrence counts pinned: ZERO kernel anchors
+//            (SUM_MARKER) while any pair rides, and exactly TWO summary-text
+//            hits per riding pair (re-sent call args + tool-result receipt);
+//        P2c fail-safe (#1567 hardening): the anchor carries the summary
+//            whenever the pair does NOT ride inbound — the drop-pair subtest
+//            pins that a client-side pair drop surfaces exactly its anchor
+//            once, then stays append-stable (no flapping);
+//   P3 multi-fold: two folds in one session; each pair rides alongside its
+//       siblings as its own carrier, anchors stay stripped for the life of
+//       the pairs, per-fold summary counts constant, quiet turns
+//       append-stable (keep-two rotation is gone, #3769);
 //   P4 no transient acp_loop_* artifact leaks into any forwarded body
 //      (plugin mode has none by construction — pin it);
 //   P5 marker/tag hygiene: every content text unit carries exactly one
 //       well-formed head render tag; the marker→ref map is constant across
 //       ALL turns (ids are never reused); refs unique per turn; OPEN/CLOSE
-//       balanced; the system layer is byte-stable across all turns.
+//       balanced; the system layer is byte-stable across all turns. At a
+//       SANCTIONED native-compaction boundary the era splits: refs re-seeded
+//       onto the compacted view belong to a new era and the old-era map does
+//       not constrain them (eraBreak option) — within each era the map stays
+//       constant;
+//   P6 dsh native-compaction rebase (#2596/#2658, all four wires): after a
+//       live fold, the host replaces its history with [checkpoint framing,
+//       retained tail] (the dsh compaction landing — the #2596 cache-loss
+//       lane). The dual-signal gate must rebase in the SAME turn: the
+//       forwarded body carries exactly the compacted view (framing + tail
+//       markers), the dead fold's summary/pair artifacts must NOT re-enter
+//       the wire, and every later turn is APPEND-stable from the compacted
+//       base — a missing lane implementation (the #2658 regression class:
+//       rebase shipped on only 2 of 4 wires) fails here per wire.
 //
 // Scenario (main, all wires): t1=[q1,a1,q2,a2], t2=+q3,a3, t3=+q4,a4,
 // foldA(m00001..m00002)+pairA@t4, t5=+q5,a5, foldB(m00003..m00005)+pairB@t6,
-// t7=+q7,a7, t8=+q8,a8 — every historical pair rides every later request.
+// t7=+q7,a7, t8=+q8,a8 — each pair rides as its fold's carrier from its
+// fold turn on; anchors stay stripped while their pairs ride (#1567/#3769).
 //
 // Scope notes: tool protocol only (the default). The swallow/back-to-back
 // fold geometries get a dedicated anthropic subtest (kernel-side behavior,
@@ -63,10 +90,13 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { getSession } from "../src/session.ts";
+import { DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const LT = "\x3c";
@@ -255,7 +285,7 @@ function keyOf(u: Unit): string {
     if (u.k === "text") {
         if (u.x.includes(SUM_A)) return "SA";
         if (u.x.includes(SUM_B)) return "SB";
-        const m = u.x.match(/\b([qa][1-8])-marker\b/);
+        const m = u.x.match(/\b([qa][0-9]+)-marker\b/);
         if (m) return m[1]!;
         return "TXT:" + u.x.slice(0, 24);
     }
@@ -274,11 +304,26 @@ function canonEq(a: Unit[], b: Unit[], label: string): void {
     }
 }
 
-function assertPrefix(prev: Unit[], next: Unit[], label: string, expectNew: string[]): void {
-    for (let i = 0; i < prev.length; i++) {
-        assert.ok(eqUnit(prev[i]!, next[i]!), `${label}: mid-history unit[${i}] mutated\n previous=${JSON.stringify(prev[i])}\n next    =${JSON.stringify(next[i])}`);
+// #3159 (google lane only): a user content ending on functionResponse parts
+// is forwarded with new plain-text parts LEADING, so between turns the
+// previous body's trailing tool units shift right past an inserted run of
+// text units from that same content. allowCanonShift sanctions exactly that
+// move — text-unit insertions immediately before a surviving byte-equal tool
+// unit — and nothing else; any other mutation still fails.
+function assertPrefix(prev: Unit[], next: Unit[], label: string, expectNew: string[], allowCanonShift = false): void {
+    let pi = 0;
+    let ni = 0;
+    while (pi < prev.length) {
+        if (ni < next.length && eqUnit(prev[pi]!, next[ni]!)) { pi++; ni++; continue; }
+        const p = prev[pi]!;
+        const n = ni < next.length ? next[ni]! : null;
+        assert.ok(allowCanonShift && p.k !== "text" && n !== null && n.k === "text", `${label}: mid-history unit[${pi}] mutated\n previous=${JSON.stringify(p)}\n next    =${JSON.stringify(n)}`);
+        let k = 0;
+        while (ni + k < next.length && next[ni + k]!.k === "text") k++;
+        assert.ok(k > 0 && ni + k < next.length && eqUnit(p, next[ni + k]!), `${label}: unit[${pi}] not realigned after ${k} inserted text unit(s)\n previous=${JSON.stringify(p)}\n next    =${JSON.stringify(next.slice(ni, ni + k + 1))}`);
+        ni += k;
     }
-    const added = next.slice(prev.length);
+    const added = next.slice(ni);
     assert.deepEqual(added.map(keyOf), expectNew, `${label}: appended units ${JSON.stringify(added.map(keyOf))} != expected ${JSON.stringify(expectNew)}`);
 }
 
@@ -306,8 +351,14 @@ function assertSlotsTail(c: Canon, label: string): void {
     assert.ok(kinds === "" || /(?:chain|nudge|imgnote|retrnote)(?:,(?:chain|nudge|imgnote|retrnote))*$/.test(kinds), `${label}: unexpected slot kinds ${kinds}`);
 }
 
-function assertTagPolicy(cans: Canon[], label: string): void {
+function assertTagPolicy(cans: Canon[], label: string, eraBreak?: number): void {
+    // eraBreak: index of the turn whose request is the SANCTIONED
+    // native-compaction boundary. Refs before/after belong to different
+    // eras (the rebase re-seeds the ref space onto the compacted view), so
+    // the marker→ref map is pinned constant WITHIN each era only —
+    // cross-era re-issue is sanctioned, never a bug.
     const seen = new Map<string, string>();
+    const seenNext = new Map<string, string>();
     for (let t = 0; t < cans.length; t++) {
         const c = cans[t]!;
         const occ = c.raw.split(OPEN_TAG).length - 1;
@@ -325,12 +376,13 @@ function assertTagPolicy(cans: Canon[], label: string): void {
             assert.ok(m, `${label} t${t + 1}: content unit missing well-formed head tag: ${JSON.stringify(u.x.slice(0, 60))}`);
             const ref = m[2]!;
             refs.push(ref);
-            const km = u.x.match(/\b([qa][1-8])-marker\b/);
+            const km = u.x.match(/\b([qa][0-9]+)-marker\b/);
             if (km) {
                 const marker = km[1]!;
-                const prevRef = seen.get(marker);
+                const active = eraBreak === undefined || t < eraBreak ? seen : seenNext;
+                const prevRef = active.get(marker);
                 if (prevRef) assert.equal(ref, prevRef, `${label} t${t + 1}: ref reuse — ${marker} was ${prevRef}, now ${ref}`);
-                else seen.set(marker, ref);
+                else active.set(marker, ref);
             }
         }
         assert.equal(new Set(refs).size, refs.length, `${label} t${t + 1}: duplicate refs in one turn`);
@@ -346,7 +398,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/messages",
         buildBody: (items) => ({
             model: "claude-test", max_tokens: 1024, stream: true, system: SYS,
-            messages: items.flatMap((it) => "pair" in it
+            messages: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "assistant", content: [{ type: "tool_use", id: it.pair.id, name: "compress", input: it.pair.args }] },
                     { role: "user", content: [{ type: "tool_result", tool_use_id: it.pair.id, content: it.pair.result }] },
@@ -367,7 +419,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/chat/completions",
         buildBody: (items) => ({
             model: "gpt-test", stream: true,
-            messages: items.flatMap((it) => "pair" in it
+            messages: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "assistant", content: null, tool_calls: [{ id: it.pair.id, type: "function", function: { name: "compress", arguments: JSON.stringify(it.pair.args) } }] },
                     { role: "tool", tool_call_id: it.pair.id, content: it.pair.result },
@@ -385,7 +437,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/responses",
         buildBody: (items) => ({
             model: "gpt-test", stream: true,
-            input: items.flatMap((it) => "pair" in it
+            input: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { type: "function_call", name: "compress", call_id: it.pair.id, arguments: JSON.stringify(it.pair.args) },
                     { type: "function_call_output", call_id: it.pair.id, output: it.pair.result },
@@ -406,7 +458,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         model: "gemini-test",
         path: "/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
         buildBody: (items) => ({
-            contents: items.flatMap((it) => "pair" in it
+            contents: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "model", parts: [{ functionCall: { name: "compress", args: it.pair.args } }] },
                     { role: "user", parts: [{ functionResponse: { name: "compress", response: { result: it.pair.result } } }] },
@@ -421,11 +473,27 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
     },
 };
 
-interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string; dropPair?: string }
+interface Step {
+    send?: CItem[];
+    fold?: FoldSpec;
+    pairId?: string;
+    dropPair?: string;
+    // P6 native-compaction scenario: the host (dsh) replaces its ENTIRE
+    // history with [checkpoint framing, retained tail] — the compacted view
+    // after a native compaction landing. Processed before `send` appends.
+    compact?: CItem[];
+}
 
-async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
+interface DriveOpts {
+    // Override the x-bili-plugin identity ("dsh" drives the dsh lane gates).
+    pluginAgent?: string;
+    // Deterministic conversation id (default: generated per run).
+    conv?: string;
+}
+
+async function driveWire(wire: Wire, steps: Step[], opts?: DriveOpts): Promise<Canon[]> {
     const adapter = adapters[wire];
-    const conv = `cfp-${wire}-${Date.now().toString(36)}`;
+    const conv = opts?.conv ?? `cfp-${wire}-${Date.now().toString(36)}`;
     const captured: string[] = [];
 
     const upstream = http.createServer((req, res) => {
@@ -459,6 +527,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
         sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -467,7 +536,11 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
     const hist: CItem[] = [];
     try {
         for (const step of steps) {
-            for (const it of step.send) hist.push(it);
+            if (step.compact) {
+                hist.length = 0;
+                hist.push(...step.compact);
+            }
+            for (const it of step.send ?? []) hist.push(it);
             if (step.fold) {
                 const r = await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/tool`, {
                     method: "POST", headers: { "content-type": "application/json" },
@@ -487,7 +560,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
             }
             const resp = await fetch(base, {
                 method: "POST",
-                headers: { "content-type": "application/json", "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-conversation": conv },
+                headers: { "content-type": "application/json", "x-bili-plugin": opts?.pluginAgent ?? "pi-plugin/0.0.1", "x-bili-plugin-conversation": conv },
                 body: JSON.stringify(adapter.buildBody(hist)),
             });
             if (resp.status !== 200) {
@@ -498,8 +571,10 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
@@ -527,8 +602,12 @@ const MAIN_STEPS: Step[] = [
 
 function countOcc(raw: string, needle: string): number { return raw.split(needle).length - 1; }
 
+// node:test (v22) silently ignores an options object passed AFTER the fn argument, but its
+// overloads reject that call shape — bind a precise alias so the existing calls typecheck unchanged.
+const testCompat = test as (name: string, fn: () => void | Promise<void>, opts?: { timeout?: number }) => Promise<void>;
+
 for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
-    test(`cache-friendly plugin matrix: ${wire}`, async () => {
+    testCompat(`cache-friendly plugin matrix: ${wire}`, async () => {
         const cans = await driveWire(wire, MAIN_STEPS);
         assert.equal(cans.length, 8, "expected 8 outbound bodies");
         const L = (i: number) => `cfp/${wire} t${i + 1}`;
@@ -541,34 +620,38 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
 
         assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
         assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
-        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
-        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], [], L(5)); // anchor stripped (#1567)
-        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q7", "a7"]);
+        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // session-head boundary survives; span consumed, no anchor — pair A rides as carrier (#1567/#3769)
+        // #3159 (google lane only): the riding pair's functionCall/
+        // functionResponse split swallows the turn's leading text part into
+        // the sanctioned shift, so only the model reply lands in `added`
+        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), wire === "google" ? ["a5"] : ["q5", "a5"], wire === "google");
+        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], [], L(5)); // mid-history span consumed whole; no anchor — pair B rides (#1567/#3769)
+        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), wire === "google" ? ["a7"] : ["q7", "a7"], wire === "google");
         assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 
         for (let i = 3; i < cans.length; i++) {
             const raw = cans[i]!.raw;
-            // #1567 (fixed): the in-place carrier is stripped per-block while
-            // the client's re-sent pair rides inbound — only the two pair
-            // quotes (tool_call args + tool result) keep the summary text.
-            const expA = 2;
-            const expB = i < 5 ? 0 : 2;
-            assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: in-place carrier must be stripped while the client's pair rides inbound (got ${countOcc(raw, SUM_MARKER)})`);
-            assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA} (pair quotes only, #1567)`);
-            assert.equal(countOcc(raw, SUM_B), expB, `${L(i)}: SUM_B occurrences ${countOcc(raw, SUM_B)} != ${expB} (pair quotes only, #1567)`);
-            // google part-shapes carry no call id; pin pair presence through
-            // the fold topic embedded in the re-sent functionCall args
-            const pairA = wire === "google" ? "CFP-TOPIC-A" : "\"cfp_a\"";
-            const pairB = wire === "google" ? "CFP-TOPIC-B" : "\"cfp_b\"";
-            assert.ok(raw.includes(pairA), `${L(i)}: pairA lost from re-sent history`);
-            if (i >= 5) assert.ok(raw.includes(pairB), `${L(i)}: pairB lost from re-sent history`);
+            // Carrier regime (#1567/#3769/KDD#7): each fold's echoed pair
+            // rides from its fold turn on and IS the summary carrier — the
+            // kernel anchor stays stripped for the pair's life, and the
+            // summary text appears exactly twice per riding pair (call args
+            // + result receipt).
+            assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while their pairs ride (#1567)`);
+            assert.equal(countOcc(raw, SUM_A), 2, `${L(i)}: SUM_A rides pair A args+receipt (got ${countOcc(raw, SUM_A)})`);
+            assert.equal(countOcc(raw, SUM_B), i < 5 ? 0 : 2, `${L(i)}: SUM_B rides pair B from its fold turn on (got ${countOcc(raw, SUM_B)})`);
+            // pin pair PRESENCE — the carriers; google part-shapes carry no
+            // call id, so pin through the fold-spec refs in the re-sent
+            // functionCall args
+            const pairA = wire === "google" ? "\"startId\":\"m00001\"" : "\"cfp_a\"";
+            const pairB = wire === "google" ? "\"startId\":\"m00003\"" : "\"cfp_b\"";
+            assert.ok(raw.includes(pairA), `${L(i)}: pair A rides as its fold's carrier (#1567)`);
+            assert.equal(raw.includes(pairB), i >= 5, `${L(i)}: pair B rides from t6 on`);
         }
 
     }, { timeout: 120_000 });
 }
 
-test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", async () => {
+testCompat("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", async () => {
     const FOLD_WIDE: FoldSpec = { startId: "m00001", endId: "m00004", topic: "CFP-TOPIC-WIDE", summary: "Cache-friendly plugin fold summary covering m00001..m00004 wide" };
     const FOLD_E: FoldSpec = { startId: "m00005", endId: "m00007", topic: "CFP-TOPIC-E", summary: "Cache-friendly plugin fold summary covering m00005..m00007 gamma" };
     const steps: Step[] = [
@@ -593,53 +676,60 @@ test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", 
 
     assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
     assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
+    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // session-head boundary survives; no anchor — geo_a rides as carrier (#1567/#3769)
     assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
 
     const wide = FOLD_WIDE.summary;
     const gamma = FOLD_E.summary;
+    // The wide fold (m00001..m00004) swallows the alpha fold's range: the
+    // alpha summary merges into the wide fold, and the geo_a pair — whose
+    // block died — loses carrier status and is swept at the swallow
+    // boundary (#3769). geo_wide rides as the merged region's carrier.
+    // FOLD_E's tail sits in the protected zone, so only its first message
+    // folds; geo_e rides alongside.
     for (const i of [5, 6, 7]) {
         const raw = cans[i]!.raw;
-        // carrier is superseded on every turn; the two head/tail quotes ride
-        // the re-sent geo_a tool result until that pair is pruned at t7
-        const expA = i === 5 ? 2 : 0;
-        assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA}`);
-        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carriers must be stripped while their pairs ride inbound (got ${countOcc(raw, SUM_MARKER)})`);
         assert.ok(!raw.includes("q2-marker"), `${L(i)}: swallowed content q2 must stay hidden`);
         assert.ok(!raw.includes("a2-marker"), `${L(i)}: swallowed content a2 must stay hidden`);
+        assert.ok(!raw.includes("\"geo_a\""), `${L(i)}: dead-block pair swept at the swallow boundary (#3769)`);
     }
-    const surviveKeys = new Set(["q1", "a1", "q2", "a2", "SA"]);
-    const keepT5 = cans[4]!.core.filter((u) => !surviveKeys.has(keyOf(u)));
+    assert.equal(countOcc(cans[5]!.raw, SUM_A), 0, `${L(5)}: alpha summary absorbed into the wide fold`);
+    assert.equal(countOcc(cans[5]!.raw, wide), 2, `${L(5)}: wide summary rides geo_wide args+receipt`);
+    assert.equal(countOcc(cans[5]!.raw, gamma), 0, `${L(5)}: E not folded yet`);
+    assert.equal(countOcc(cans[5]!.raw, SUM_MARKER), 0, `${L(5)}: anchors stripped while their pairs ride`);
+    assert.equal(countOcc(cans[6]!.raw, wide), 2, `${L(6)}: wide carrier persists`);
+    assert.equal(countOcc(cans[6]!.raw, gamma), 2, `${L(6)}: gamma rides geo_e from its fold turn on`);
+    assert.equal(countOcc(cans[6]!.raw, SUM_MARKER), 0, `${L(6)}: anchors stripped while their pairs ride`);
+    assert.equal(countOcc(cans[7]!.raw, wide), 2, `${L(7)}: wide carrier persists`);
+    assert.equal(countOcc(cans[7]!.raw, gamma), 2, `${L(7)}: gamma carrier persists`);
+    assert.equal(countOcc(cans[7]!.raw, SUM_MARKER), 0, `${L(7)}: carriers stable across quiet turns`);
+    // t5→t6 rewrite: the wide span (minus the session-head boundary) is
+    // consumed and the dead-block pair swept — everything else keeps order
+    const goneT6 = new Set(["a1", "q2", "a2", "TU:geo_a", "TR:geo_a"]);
+    const keptT5 = cans[4]!.core.filter((u) => !goneT6.has(keyOf(u)));
     let cursor = -1;
-    for (const u of keepT5) {
+    for (const u of keptT5) {
         const found = cans[5]!.core.findIndex((v, j) => j > cursor && eqUnit(u, v));
         assert.ok(found > cursor, `cfp-geo t6: unit ${JSON.stringify(keyOf(u))} lost or reordered by the wide fold`);
         cursor = found;
     }
-    assert.equal(countOcc(cans[5]!.raw, wide), 2, `${L(5)}: wide fold turn occurrences (pair quotes; anchor stripped)`);
-    assert.equal(countOcc(cans[6]!.raw, gamma), 2, `${L(6)}: gamma fold turn occurrences (pair quotes; anchor stripped)`);
-    assert.equal(countOcc(cans[7]!.raw, wide), 2, `${L(7)}: resent wide quotes must survive`);
-    assert.equal(countOcc(cans[7]!.raw, gamma), 2, `${L(7)}: resent gamma quotes must survive`);
-    for (const i of [6, 7]) {
-        const raw = cans[i]!.raw;
-        assert.ok(raw.includes("\"geo_wide\"") && raw.includes("\"geo_e\""), `${L(i)}: latest two pairs must stay visible`);
-        assert.ok(!raw.includes("\"geo_a\""), `${L(i)}: oldest pair must be pruned (KEEP_LAST_ORPHANED=2)`);
+    assertFoldTransition(cans[5]!.core, cans[6]!.core, ["q3"], [], L(6)); // protected-zone carve: only E's first message folds; no anchor — geo_e rides
+    // #1567: while the pairs ride, their summaries live in TOOL units only —
+    // never a text-unit anchor
+    for (const idx of [5, 6, 7]) {
+        const textCarriers = cans[idx]!.core.filter((u) => u.k === "text" && (u.x.includes(wide) || u.x.includes(gamma)));
+        assert.equal(textCarriers.length, 0, `${L(idx)}: no text-unit anchor while the riding pairs carry the summaries (#1567)`);
     }
-    // #1567 (fixed): no text unit carries the wide summary anymore (stripped
-    // anchor); the quotes ride structured tool units, not text
-    const wideT6 = cans[6]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
-    const wideT7 = cans[7]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
-    assert.equal(wideT6.length, 0, `${L(6)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
-    assert.equal(wideT7.length, 0, `${L(7)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
     assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 }, { timeout: 120_000 });
 
-// #1567 hardening scenario A: a contract-violating (or pruning) client stops
-// re-sending an older compress pair. While pairA rides, its anchor is
-// stripped (P2b); the moment the pair vanishes the anchor MUST re-carry the
-// summary (zero-carrier fail-safe) and the body must stay append-stable on
-// later turns (no flapping).
-test(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries (#1567 hardening)`, async () => {
+// #1567 hardening scenario A, re-pinned under #3769: a contract-violating
+// (or pruning) client stops re-sending an older compress pair at t7. While
+// the pairs ride they ARE the carriers (anchors stripped); the moment pairA
+// stops riding, its anchor re-carries the summary exactly once at the
+// covered span — then the body stays append-stable (no flapping). PairB
+// still rides, so anchor B never surfaces.
+testCompat(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries once, no flapping (#1567/#3769)`, async () => {
     const steps: Step[] = [
         { send: [T(1), A(1), T(2), A(2)] },
         { send: [T(3), A(3)] },
@@ -658,32 +748,43 @@ test(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → 
         assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
     }
     assertTagPolicy(cans, "cfp-drop");
-    // t4..t6: both pairs ride → both anchors stripped
+    // t4..t6: both pairs ride as carriers — anchors stripped
     for (const i of [3, 4, 5]) {
         const raw = cans[i]!.raw;
-        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carrier must be stripped while pair rides`);
-        assert.ok(raw.includes('"cfp_a"'), `${L(i)}: pairA still re-sent here`);
+        assert.ok(raw.includes('"cfp_a"'), `${L(i)}: pair A rides as its fold's carrier (#1567)`);
+        assert.ok(i >= 5 || !raw.includes('"cfp_b"') , `${L(i)}: pair B rides from t6 on`);
+        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while their pairs ride`);
+        assert.equal(countOcc(raw, SUM_A), 2, `${L(i)}: SUM_A rides pair A args+receipt`);
+        assert.equal(countOcc(raw, SUM_B), i < 5 ? 0 : 2, `${L(i)}: SUM_B rides pair B from its fold turn on`);
     }
-    assert.ok(cans[5]!.raw.includes('"cfp_b"'), `${L(5)}: pairB rides`);
-    // t7/t8: pairA gone → anchor A is the ONLY carrier again
-    for (const i of [6, 7]) {
-        const raw = cans[i]!.raw;
-        assert.ok(!raw.includes('"cfp_a"'), `${L(i)}: client no longer re-sends pairA`);
-        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(i)}: anchor A must re-carry (exactly one carrier)`);
-        assert.equal(countOcc(raw, SUM_A), 1, `${L(i)}: SUM_A = carrier only (pair quotes gone with the pair)`);
-        assert.equal(countOcc(raw, SUM_B), 2, `${L(i)}: SUM_B quotes only, anchor B still stripped (pairB rides)`);
-        assert.ok(raw.includes('"cfp_b"'), `${L(i)}: pairB rides`);
+    // t7: pairA dropped → its anchor re-carries exactly once at the covered
+    // span; pairB still rides so anchor B stays stripped (#1567 fail-safe)
+    {
+        const raw = cans[6]!.raw;
+        assert.ok(!raw.includes('"cfp_a"'), `${L(6)}: dropped pair stays dropped`);
+        assert.ok(raw.includes('"cfp_b"'), `${L(6)}: pair B unaffected by A's drop`);
+        assert.equal(countOcc(raw, SUM_A), 1, `${L(6)}: anchor A re-carries the sole copy`);
+        assert.equal(countOcc(raw, SUM_B), 2, `${L(6)}: pair B still rides`);
+        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(6)}: exactly one anchor rendered (A's)`);
+        assert.ok(raw.includes("q7-marker"), `${L(6)}: new turn visible`);
     }
-    assert.ok(cans[6]!.raw.includes("q7-marker"), `${L(6)}: new turn visible`);
-    // once re-carried, the body stays append-stable (no flapping)
+    // t8: once re-carried, the body stays append-stable (no flapping)
+    {
+        const raw = cans[7]!.raw;
+        assert.equal(countOcc(raw, SUM_A), 1, `${L(7)}: anchor A stable`);
+        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(7)}: no flapping after the drop`);
+    }
     assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 }, { timeout: 120_000 });
 
-// #1567 hardening scenario B: three concurrent ACTIVE folds. The kernel hides
-// consumed compress pairs beyond the newest KEEP_LAST_ORPHANED=2, so the
-// oldest pair leaves the wire while its block is still active — the strip
-// guard must see it gone and KEEP that anchor (kernel-side fail-safe).
-test(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest pair → oldest anchor kept (#1567 hardening)`, async () => {
+// #3769 contract pin (plugin lane): three back-to-back folds, each with a
+// client-visible compress pair. The old KEEP_LAST_ORPHANED=2 rotation hid
+// the oldest pair on EVERY turn — a mid-history rewrite with no fold behind
+// it, exactly #3769's cache seam. Under the carrier regime every pair rides
+// as its fold's summary carrier for good: no per-turn hiding, no churn,
+// anchors stay stripped while the pairs ride, and quiet turns stay
+// append-stable.
+testCompat(`cache-friendly plugin matrix: anthropic — 3 concurrent folds: every pair rides as its carrier, quiet turns append-stable (#3769)`, async () => {
     const SUM_P1 = "Prune-safe fold one summary covering m00001..m00002";
     const SUM_P2 = "Prune-safe fold two summary covering m00003..m00004";
     const SUM_P3 = "Prune-safe fold three summary covering m00005..m00006";
@@ -707,24 +808,98 @@ test(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest pair �
         assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
     }
     assertTagPolicy(cans, "cfp-prune");
-    // t3/t4: pairs ride (≤ 2) → anchors stripped. From t5 on, three pairs
-    // coexist and the kernel hides the oldest (KEEP_LAST_ORPHANED=2) — the
-    // guard sees it gone and keeps that anchor (kernel-side fail-safe)
-    for (const i of [2, 3]) {
-        assert.equal(countOcc(cans[i]!.raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while pairs ride`);
-    }
-    assert.ok(cans[3]!.raw.includes('"fs1"') && cans[3]!.raw.includes('"fs2"'), `${L(3)}: both pairs visible`);
-    // t5..t7: fs1 hidden by KEEP_LAST_ORPHANED → anchor F1 re-carries;
-    // F2/F3 anchors stay stripped while their pairs ride
-    for (const i of [4, 5, 6]) {
+    // t3..t5: each fold's pair rides from its fold turn on (args+receipt =
+    // 2 occurrences); anchors stay stripped for the life of the pairs
+    for (const i of [2, 3, 4]) {
         const raw = cans[i]!.raw;
-        assert.ok(!raw.includes('"fs1"'), `${L(i)}: oldest pair pruned (KEEP_LAST_ORPHANED=2)`);
-        assert.ok(raw.includes('"fs2"') && raw.includes('"fs3"'), `${L(i)}: newest two pairs stay visible`);
-        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(i)}: exactly one carrier (F1 anchor re-carried)`);
-        assert.equal(countOcc(raw, SUM_P1), 1, `${L(i)}: SUM_P1 = carrier only (its pair quotes pruned with the pair)`);
-        assert.equal(countOcc(raw, SUM_P2), 2, `${L(i)}: SUM_P2 quotes only`);
-        assert.equal(countOcc(raw, SUM_P3), 2, `${L(i)}: SUM_P3 quotes only`);
+        assert.ok(raw.includes('"fs1"'), `${L(i)}: pair 1 rides as its fold's carrier (#1567)`);
+        assert.ok(i >= 3 || !raw.includes('"fs2"'), `${L(i)}: pair 2 rides from t4 on`);
+        assert.ok(i >= 4 || !raw.includes('"fs3"'), `${L(i)}: pair 3 rides from t5 on`);
+        assert.equal(countOcc(raw, SUM_P1), 2, `${L(i)}: P1 rides pair-1 args+receipt`);
+        assert.equal(countOcc(raw, SUM_P2), i < 3 ? 0 : 2, `${L(i)}: P2 rides from its fold turn on`);
+        assert.equal(countOcc(raw, SUM_P3), i < 4 ? 0 : 2, `${L(i)}: P3 rides from its fold turn on`);
+        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while the pairs ride`);
     }
-    // once the oldest anchor re-carries, later turns are append-stable
+    // t6/t7: all three pairs persist, stable across quiet turns
+    for (const i of [5, 6]) {
+        const raw = cans[i]!.raw;
+        assert.equal(countOcc(raw, SUM_P1), 2, `${L(i)}: P1 carrier persists`);
+        assert.equal(countOcc(raw, SUM_P2), 2, `${L(i)}: P2 carrier persists`);
+        assert.equal(countOcc(raw, SUM_P3), 2, `${L(i)}: P3 carrier persists`);
+        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: three riding pairs, zero anchors, stable`);
+    }
+    // mid-history never mutates between quiet turns
     assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q8", "a8"]);
 }, { timeout: 120_000 });
+
+// P6 (#2596/#2658): the dsh native-compaction rebase lane, per wire. After a
+// live fold the dsh host replaces its ENTIRE history with [checkpoint
+// framing, retained tail] — exactly the landing that, when a lane misses the
+// rebase (#2658 shipped it on openai/responses only), left the ACP state
+// permanently unrebased and the prefix cache dead (#2596 main complaint).
+// Byte-level contract, all four wires:
+//   - the dual-signal gate rebases in the SAME turn (state: boundary
+//     recorded, no active block survives);
+//   - the rebase-turn body carries exactly the compacted view (framing + the
+//     retained tail markers) and NONE of the dead fold's artifacts (no
+//     summary carrier, no pair quotes, no compress pair id/topic);
+//   - every later turn is APPEND-stable from the compacted base (the cache
+//     recovers instead of flapping) — the marker→ref map splits into eras at
+//     the sanctioned boundary and stays constant within each era.
+for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
+    testCompat(`cache-friendly plugin matrix: ${wire} — dsh native-compaction rebase keeps the wire clean and append-stable (#2596/#2658)`, async () => {
+        const NATIVE_SUM = "Native-compaction fold summary covering m00001..m00009 nuance";
+        const NATIVE_FOLD: FoldSpec = { startId: "m00001", endId: "m00009", topic: "CFP-TOPIC-NATIVE", summary: NATIVE_SUM };
+        const checkpoint: CItem = {
+            role: "user",
+            text: `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation so far, as context for continuing. The work established the harness, drove one fold, and then dsh compacted natively. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## Primary Request and Intent\n- drive a fold, then replay the compacted view`,
+        };
+        const steps: Step[] = [
+            { send: [T(1), A(1), T(2), A(2), T(3), A(3)] },
+            { send: [T(4), A(4), T(5), A(5), T(6), A(6)] },
+            { send: [T(7), A(7)] },
+            { send: [], fold: NATIVE_FOLD, pairId: "nc_pair" },
+            { compact: [checkpoint, T(7), A(7)] },
+            { send: [T(8), A(8)] },
+            { send: [T(9), A(9)] },
+        ];
+        const conv = `cfp-native-${wire}`;
+        const cans = await driveWire(wire, steps, { pluginAgent: "dsh", conv });
+        assert.equal(cans.length, 7, "expected 7 outbound bodies");
+        const L = (i: number) => `cfp-native/${wire} t${i + 1}`;
+
+        // The rebase landed in the SAME turn: boundary recorded, no active
+        // fold survives, refs re-seeded onto the compacted view.
+        const s = getSession(conv)!;
+        assert.ok(s, "session exists under the conversation key");
+        const boundary = s.metadata["nativeCompactionBoundary"] as { pendingRebase?: boolean } | undefined;
+        assert.ok(boundary, "native-compaction boundary recorded");
+        assert.equal(boundary?.pendingRebase, false, "rebase consumed within the rebase turn");
+        assert.equal((s.state.blocks ?? []).filter((b) => b.active).length, 0, "no active fold survives the rebase");
+
+        for (let i = 0; i < cans.length; i++) {
+            assertSlotsTail(cans[i]!, L(i));
+            assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
+        }
+        // eraBreak = 4: the compacted replay (t5) opens era B; refs re-issued
+        // across the boundary are sanctioned, within each era the map is law.
+        assertTagPolicy(cans, `cfp-native/${wire}`, 4);
+
+        // t4 (fold turn): pair rides inbound, anchor stripped (#1567)
+        assert.equal(countOcc(cans[3]!.raw, SUM_MARKER), 0, `${L(3)}: carrier stripped while the pair rides`);
+        assert.equal(countOcc(cans[3]!.raw, NATIVE_SUM), 2, `${L(3)}: pair quotes only`);
+
+        // t5 (rebase turn): exactly the compacted view on the wire
+        const rebase = cans[4]!.raw;
+        assert.ok(rebase.includes(DSH_CHECKPOINT_OPEN_TAG), `${L(4)}: checkpoint framing forwarded upstream`);
+        assert.ok(rebase.includes("q7-marker") && rebase.includes("a7-marker"), `${L(4)}: retained tail forwarded upstream`);
+        assert.equal(countOcc(rebase, SUM_MARKER), 0, `${L(4)}: no summary carrier may linger after the rebase`);
+        assert.equal(countOcc(rebase, NATIVE_SUM), 0, `${L(4)}: the dead fold's summary must not re-enter the wire`);
+        const pairIdOnWire = wire === "google" ? "CFP-TOPIC-NATIVE" : '"nc_pair"';
+        assert.ok(!rebase.includes(pairIdOnWire), `${L(4)}: the dead fold's compress pair must be gone with the compacted history`);
+
+        // t6/t7: growth resumes APPEND-stable from the compacted base
+        assertPrefix(cans[4]!.core, cans[5]!.core, L(5), ["q8", "a8"]);
+        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q9", "a9"]);
+    }, { timeout: 120_000 });
+}

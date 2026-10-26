@@ -3,7 +3,8 @@
  *  reaches the output unescaped), then transform structure only. Supports the
  *  subset kernel renderHandoff actually emits: headings, paragraphs, fenced
  *  code, inline code, bold/italic, lists, blockquotes, links (sanitized),
- *  horizontal rules. No external dependency — dist/index.js stays dep-free. */
+ *  horizontal rules, pipe tables and image refs (http(s)/panel asset routes
+ *  only). No external dependency — dist/index.js stays dep-free. */
 
 function escapeHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -12,6 +13,14 @@ function escapeHtml(s: string): string {
 function inlineMd(s: string): string {
     let out = escapeHtml(s);
     out = out.replace(/`([^`]+)`/g, (_m, code: string) => `<code>${code}</code>`);
+    // ![alt](url) — must run before the link rule so the image syntax is consumed
+    // whole. Only published image sources survive: http(s), or the panel's own
+    // bundled-asset route (/__bili/blog-assets/*, see web/blogfeed.ts). Quotes are
+    // already escaped by escapeHtml, so attribute injection is impossible.
+    out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, alt: string, url: string) => {
+        if (/^(?:https?:\/\/|\/__bili\/blog-assets\/)/i.test(url)) return `<img class="md-img" src="${url}" alt="${alt}" />`;
+        return "";
+    });
     out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     // [text](url) — only http/https/relative URLs survive; anything else
@@ -48,6 +57,19 @@ export function markdownToHtml(md: string): string {
             continue;
         }
         if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) { html.push("<hr/>"); i += 1; continue; }
+        // Pipe tables (header + dash separator row + body rows). The kernel
+        // handoff never emits these; bundled articles do. Rendered with the
+        // panel's own .data table classes so they match every other table.
+        if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+            const cells = (row: string): string[] => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => inlineMd(c.trim()));
+            const head = cells(line);
+            i += 2;
+            const rows: string[][] = [];
+            while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { rows.push(cells(lines[i])); i += 1; }
+            html.push(`<table class="data"><thead><tr>${head.map((c) => `<th>${c}</th>`).join("")}</tr></thead>` +
+                `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+            continue;
+        }
         // Indented runs (machine-emitted tool arguments, nested lists) stay verbatim in
         // <pre> instead of being merged into one run-on paragraph by space-joining.
         if (/^\s{2,}\S/.test(line)) {

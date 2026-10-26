@@ -9,6 +9,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 const EFFECTIVE_RULES_KEY = "effectiveRules";
 
@@ -58,7 +59,7 @@ export type RuleExecCtx = {
 // human review. Validation failures are normal outcomes returned verbatim (no
 // FAILED marker) — they tell the model how to fix the input, they are not
 // proxy errors.
-export function executeRule(args: Record<string, unknown>, ctx: RuleExecCtx): string {
+export function executeRule(args: Record<string, unknown>, ctx: RuleExecCtx): ProxyToolResult {
     const log = ctx.log ?? ((msg: string) => loggerLog("info", msg));
     const state = ctx.session.state;
     const rawDelete = args.delete;
@@ -68,31 +69,31 @@ export function executeRule(args: Record<string, unknown>, ctx: RuleExecCtx): st
     const rule = typeof raw === "string" ? raw.trim() : "";
     const ops = [delId.length > 0, wantsClear, rule.length > 0].filter(Boolean).length;
     if (ops > 1) {
-        return "Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).";
+        return toolFail("Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).");
     }
     if (wantsClear) {
         const result = clearRules(state);
         log(`[acp-rule] cleared ${result.count} rule(s)`);
-        return result.count === 0 ? "No rules to clear." : `Cleared ${result.count} rule(s).`;
+        return toolOk(result.count === 0 ? "No rules to clear." : `Cleared ${result.count} rule(s).`);
     }
     if (delId.length > 0) {
         const result = removeRule(state, delId);
         if (!result.ok) {
             log(`[acp-rule] ${result.error}`);
-            return result.error;
+            return toolFail(result.error);
         }
         log(`[acp-rule] removed ${result.rule.id}: ${result.rule.text}`);
-        return `Removed ${result.rule.id}: ${result.rule.text}`;
+        return toolOk(`Removed ${result.rule.id}: ${result.rule.text}`);
     }
     if (rule.length === 0) {
         const rules = listRules(state);
-        return rules.length === 0 ? "No rules recorded." : formatRulesList(rules);
+        return toolOk(rules.length === 0 ? "No rules recorded." : formatRulesList(rules));
     }
     const result = addRule(state, rule, resolveRuleLimits(ctx.config));
     if (!result.ok) {
         log(`[acp-rule] ${result.error}`);
-        return result.error;
+        return toolFail(result.error);
     }
     log(`[acp-rule] added ${result.rule.id}: ${result.rule.text}`);
-    return `Recorded ${result.rule.id}: ${result.rule.text}`;
+    return toolOk(`Recorded ${result.rule.id}: ${result.rule.text}`);
 }

@@ -94,7 +94,7 @@ test("responses: text patch preserves images, ids, status, opaque items and orde
     assert.equal(patched[2], input[2]);
     assert.equal(patched[1].id, "m1");
     assert.equal(patched[1].status, "completed");
-    assert.deepEqual((patched[1].content as Array<Record<string, unknown>>)[1], input[1].content[1]);
+    assert.deepEqual((patched[1].content as Array<Record<string, unknown>>)[1], (input[1] as { content: Array<Record<string, unknown>> }).content[1]);
     assert.equal((patched[1].content as Array<Record<string, unknown>>)[0].text, "tagged hello");
 });
 

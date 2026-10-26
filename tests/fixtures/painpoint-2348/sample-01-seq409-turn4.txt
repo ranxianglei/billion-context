@@ -1,0 +1,2 @@
+<acp tokens="21" string="true">m00189</acp>
+工作区干净（`git status` 空输出）。仓里已有档案惯例，看 `CHANGELOG.md` 和 `DSH环境事实.md` 的写法，我照同一形状写。

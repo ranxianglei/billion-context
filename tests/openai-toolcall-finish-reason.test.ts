@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { createOpenaiAdapter, runCompressLoop } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { ParsedStreamEvent } from "../src/loop/core.ts";
+import type { WireProtocol } from "../src/util.ts";
 
 const enc = new TextEncoder();
 const sseChunk = (delta: Record<string, unknown>, finishReason?: string) =>
@@ -41,6 +42,7 @@ function makeLoopCtx(): {
     messages: CoreMessage[];
     session: Session;
     log: (message: string) => void;
+    protocol?: WireProtocol;
 } {
     return {
         core: createCore(),
@@ -49,7 +51,8 @@ function makeLoopCtx(): {
         session: {
             id: "openai-in-band-error-loop",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            pendingRetrievals: [],
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),

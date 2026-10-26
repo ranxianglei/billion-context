@@ -24,7 +24,6 @@ import {
     BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_SEARCH_CONTEXT_TOOL_OPENAI,
     BILI_SEARCH_CONTEXT_TOOL_RESPONSES,
-    IMAGE_FULL_TOOL_GOOGLE,
     RULE_TOOL,
     RULE_TOOL_GOOGLE,
     RULE_TOOL_OPENAI,
@@ -36,7 +35,7 @@ export function canonicalize(value: unknown): string {
     return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-export interface GoldenSpec {
+interface GoldenSpec {
     readonly name: string;
     readonly layer: string;
     build(): unknown;
@@ -76,12 +75,32 @@ function buildKernelGolden(): Record<string, unknown> {
             ABSORB_TOOL: K.ABSORB_TOOL,
             ABSORB_TOOL_OPENAI: K.ABSORB_TOOL_OPENAI,
             ABSORB_TOOL_GOOGLE: K.ABSORB_TOOL_GOOGLE,
-            IMAGE_FULL_TOOL: K.IMAGE_FULL_TOOL,
-            IMAGE_FULL_TOOL_OPENAI: K.IMAGE_FULL_TOOL_OPENAI,
-            IMAGE_FULL_TOOL_RESPONSES: K.IMAGE_FULL_TOOL_RESPONSES,
             RETRIEVE_TOOL: K.RETRIEVE_TOOL,
             RETRIEVE_TOOL_OPENAI: K.RETRIEVE_TOOL_OPENAI,
             RETRIEVE_TOOL_RESPONSES: K.RETRIEVE_TOOL_RESPONSES,
+        },
+        // Behavior constants (#2092 kernel boundary): the defaults, prompts,
+        // names, and wire markers that host behavior silently depends on.
+        behavior: {
+            defaultConfig100k: defaultConfig(100_000),
+            defaultPrompts: K.defaultPrompts,
+            toolNames: {
+                ACP_TOOL_NAMES: K.ACP_TOOL_NAMES,
+                COMPRESS_TOOL_NAME: K.COMPRESS_TOOL_NAME,
+                DECOMPRESS_TOOL_NAME: K.DECOMPRESS_TOOL_NAME,
+                SEARCH_CONTEXT_TOOL_NAME: K.SEARCH_CONTEXT_TOOL_NAME,
+                ACP_STATUS_TOOL_NAME: K.ACP_STATUS_TOOL_NAME,
+                ACP_CACHE_TOOL_NAME: K.ACP_CACHE_TOOL_NAME,
+                ABSORB_TOOL_NAME: K.ABSORB_TOOL_NAME,
+                RETRIEVE_TOOL_NAME: K.RETRIEVE_TOOL_NAME,
+                RULE_TOOL_NAME: K.RULE_TOOL_NAME,
+            },
+            markers: {
+                ACP_TEXT_OPEN: K.ACP_TEXT_OPEN,
+                ACP_TEXT_CLOSE: K.ACP_TEXT_CLOSE,
+                ABSORB_PROMPT_MARKER: K.ABSORB_PROMPT_MARKER,
+                DEFAULT_STEERING_SENTINEL: K.DEFAULT_STEERING_SENTINEL,
+            },
         },
     };
 }
@@ -112,7 +131,6 @@ function buildBiliGolden(): Record<string, unknown> {
             ruleResponses: RULE_TOOL_RESPONSES,
             ruleGoogle: RULE_TOOL_GOOGLE,
             retrieveAcpRetrieve: retrieveToolsFor("acp_retrieve"),
-            imageFullGoogle: IMAGE_FULL_TOOL_GOOGLE,
         },
     };
 }
@@ -126,8 +144,10 @@ function captureManifest(config: Parameters<typeof handlePluginManifest>[1]): Re
     handlePluginManifest(res, config);
     const doc = JSON.parse(String(raw)) as Record<string, unknown>;
     // package.json version changes on every release commit; pin it so the
-    // golden only tracks schema content, not the release counter.
+    // golden only tracks schema content, not the release counter. Same for
+    // the build commit (per-checkout, "unknown" in exotic envs).
     doc.version = "<VERSION>";
+    if (typeof doc.commit === "string") doc.commit = "<COMMIT>";
     return doc;
 }
 

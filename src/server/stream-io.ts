@@ -1,5 +1,6 @@
 import http from "node:http";
 import { logDumpFailure } from "./observability.js";
+import { gcDumpDirIfConfigured } from "../state-gc.js";
 
 /** Read a (small) fetch Response body stream fully into a Buffer. Used for the
  *  non-2xx error path, where we inspect the body for a context-overflow before
@@ -41,7 +42,7 @@ export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
 
 /** Minimal writable surface {@link awaitDrain} needs — satisfied by
  *  http.ServerResponse and by test recording sinks alike. */
-export interface DrainableResponse {
+interface DrainableResponse {
     destroyed?: boolean;
     writableEnded?: boolean;
     once(event: string, cb: () => void): unknown;
@@ -104,7 +105,7 @@ export async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: 
             }
         } finally {
             reader.releaseLock();
-            ws.end();
+            ws.end(() => gcDumpDirIfConfigured(dir));
         }
     } catch (err) {
         logDumpFailure("SSE stream dump", err);

@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig, type NudgeDecision } from "acp-kernel";
-import { startServer, type ProxyOptions, clampOutputBudget, estimateInputTokens, emergencyNudge } from "../src/server.ts";
+import { startServer, clampOutputBudget, estimateInputTokens, emergencyNudge } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -56,8 +57,8 @@ test("estimateInputTokens: counts system + tools on turn 1 (lastInputTokens=0)",
     assert.ok(withSystem > 900, "a 4000-char system contributes ~1000 tokens");
 });
 
-function mkNudge(over: Partial<Pick<NudgeDecision, "shouldInject" | "contextUsage" | "compressibleRanges">> = {}): NudgeDecision {
-    const breakdown = { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0 };
+function mkNudge(over: Partial<Pick<NudgeDecision, "shouldInject" | "contextUsage" | "compressibleRanges" | "breakdown">> = {}): NudgeDecision {
+    const breakdown = { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0 };
     return { shouldInject: false, reason: "test", compressibleRanges: [], contextUsage: 0, tier: null, breakdown, ...over };
 }
 
@@ -78,6 +79,89 @@ test("emergencyNudge: respects a custom escalation line and empty ranges", () =>
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99 })), false, "empty ranges = nothing to offer, no override");
     assert.equal(emergencyNudge(null), false);
     assert.equal(emergencyNudge(undefined), false);
+});
+
+// #2104: the kernel suppresses a nudge while compressibleRanges still carries
+// the raw list (all ranges below minCompressRange — reason "max compressible <
+// threshold" / "max pending < min benefit"). The override must NOT read
+// "list non-empty" as "worth advertising": with the loop config's
+// minCompressRange passed (default kernel value 5000), the escalation line may
+// only fire when at least one offered range passes the submit gate compress
+// applies — same expression as postCompressTail / handleAcpStatus (#847).
+const subThreshold = [{ startRef: "a", endRef: "b", count: 1, tokens: 100, chars: 900, toolPct: 0, textPct: 0 }];
+const executable = [{ startRef: "a", endRef: "b", count: 1, tokens: 2000, chars: 9200, toolPct: 0, textPct: 0 }];
+
+// 9.2K chars is exactly the #2104 window shape ("m00057–m00069 9.2K"): above
+// VIABLE_RANGE_MIN_TOKENS (viable) but — if below minCompressRange — still
+// rejected by the submit gate.
+test("emergencyNudge: #2104 — sub-threshold leftovers no longer trigger the override once the gate is passed", () => {
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold }), undefined, 5000), false, "every range below minCompressRange: compress would reject — no override");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: [...subThreshold, ...executable] }), undefined, 5000), true, "at least one executable range: override stays (#453 intent)");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.6, compressibleRanges: executable }), undefined, 5000), false, "below the escalation line: still no override");
+});
+
+test("emergencyNudge: gate falls back to tokens*4 for hand-built ranges without chars", () => {
+    // 1500 tokens * 4 = 6000 chars >= 5000: executable via the historical estimate.
+    const noChars = [{ startRef: "a", endRef: "b", count: 1, tokens: 1500, toolPct: 0, textPct: 0 }];
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: noChars }), undefined, 5000), true);
+    const tiny = [{ startRef: "a", endRef: "b", count: 1, tokens: 100, toolPct: 0, textPct: 0 }];
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: tiny }), undefined, 5000), false, "400 chars < 5000 via tokens*4 fallback");
+    // chars is authoritative when present: a range whose chars is below the
+    // gate must not pass on an inflated tokens*4 estimate.
+    const charsWins = [{ startRef: "a", endRef: "b", count: 1, tokens: 1500, chars: 900, toolPct: 0, textPct: 0 }];
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: charsWins }), undefined, 5000), false, "chars wins over tokens*4 when set");
+});
+
+test("emergencyNudge: minCompressRange 0 (default) keeps the legacy any-non-empty-list semantics", () => {
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold })), true, "no third arg = old behavior");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold }), undefined, 0), true, "explicit 0 = old behavior");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99 })), false, "empty list still never overrides");
+});
+
+// #3006: the escalation line sits INSIDE the kernel's non-pressure band (below
+// its 75% over-limit line), where the kernel's refusal grounds are cadence/mass,
+// not benefit. The override must additionally honor the kernel's own
+// minimum-benefit floor (breakdown.maxPending vs breakdown.minPressureBenefit —
+// the pair its pressure branch compares, #198): otherwise near-boundary
+// sessions fold in zero-yield loops, each sub-benefit fold rewriting the prefix
+// (cache miss) while reclaiming almost nothing. Fixtures mirror the issue's
+// suggested regression cases.
+function bd(over: Record<string, number> = {}): NudgeDecision["breakdown"] {
+    return { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 50000, growthFloor: 22500, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0, ...over };
+}
+
+test("emergencyNudge: #3006 case 1 — hovering at 70–74% with sub-benefit mass never forces a fold", () => {
+    // the confirmed event shape: usage 80651/114688 (70%), one executable
+    // range, maxPending 4760 below the default floor max(5000, 1% of window).
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.703, compressibleRanges: executable, breakdown: bd({ maxPending: 4760, minPressureBenefit: 5000 }) }), undefined, 5000), false);
+});
+
+test("emergencyNudge: #3006 case 2 — over-limit min-benefit suppression is never overridden either", () => {
+    // usage past the kernel's 75% pressure line; the kernel refused there with
+    // "max pending 4941 < min benefit 5000". The host line must not resurrect
+    // the very fold the kernel's strongest band declined.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.76, compressibleRanges: executable, breakdown: bd({ maxPending: 4941, minPressureBenefit: 5000 }) }), undefined, 5000), false);
+});
+
+test("emergencyNudge: #3006 case 3 — repeated boundary hover stays silent until real mass accumulates", () => {
+    const hover = mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 4200, minPressureBenefit: 5000 }) });
+    for (let i = 0; i < 5; i++) assert.equal(emergencyNudge(hover, undefined, 5000), false, `hover turn ${i}: sub-benefit mass, no injection`);
+    // once the largest executable range crosses the benefit floor the rescue fires again:
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 5000, minPressureBenefit: 5000 }) }), undefined, 5000), true, "at the floor (kernel uses >=)");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 6000, minPressureBenefit: 5000 }) }), undefined, 5000), true, "above the floor");
+});
+
+test("emergencyNudge: #3006 case 4 — genuine near-window protection stays intact", () => {
+    // 99% usage with real foldable mass: the override still forces the nudge.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 20000, minPressureBenefit: 5000 }) }), undefined, 5000), true);
+    // scaled floor on a big window (max(5000, 1% x limit)): 1M window => 10k.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 8000, minPressureBenefit: 10000 }) }), undefined, 5000), false, "below the scaled floor");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 10000, minPressureBenefit: 10000 }) }), undefined, 5000), true);
+});
+
+test("emergencyNudge: #3006 — hand-built decisions without breakdown fields keep the pre-fix semantics", () => {
+    // mkNudge's default breakdown lacks minPressureBenefit: legacy fallback.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: executable })), true);
 });
 
 // ---- integration: real proxy + upstream -------------------------------------
@@ -124,6 +208,7 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     const pPort = (proxy.address() as { port: number }).port;
@@ -142,8 +227,10 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
         return { turn2Body, turn2MessageCount: ((turn2Body.messages ?? []) as unknown[]).length };
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

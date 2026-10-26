@@ -124,28 +124,28 @@ test("extractPlanState: bounded to the last 40 messages", () => {
 
 test("byte-identical output when plan state is absent or the pool fits the limit", () => {
     const f = foldBlocks(true);
-    const base = executeSearchContext({ query: "token" }, f.core, f.session.state);
-    const emptyPlan = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, { messages: [], session: f.session, log: () => {} });
+    const base = executeSearchContext({ query: "token" }, f.core, f.session.state).text;
+    const emptyPlan = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, { messages: [], session: f.session, log: () => {} }).text;
     assert.equal(emptyPlan, base, "no plan state in context → identical output");
-    const wide = executeSearchContext({ query: "token", limit: 100 }, f.core, f.session.state);
-    const widePlan = executeSearchContext({ query: "token", limit: 100 }, f.core, f.session.state, undefined, planOpts(f, []));
+    const wide = executeSearchContext({ query: "token", limit: 100 }, f.core, f.session.state).text;
+    const widePlan = executeSearchContext({ query: "token", limit: 100 }, f.core, f.session.state, undefined, planOpts(f, [])).text;
     assert.equal(widePlan, wide, "pool fits the limit → identical output even with plan state");
 });
 
 test("plan-aware re-ranking lifts the plan-relevant block to the top (deterministic)", () => {
     const f = foldBlocks(true);
-    const plain = executeSearchContext({ query: "token" }, f.core, f.session.state);
+    const plain = executeSearchContext({ query: "token" }, f.core, f.session.state).text;
     assert.match(plain, /Found 5 block\(s\) for "token"/);
     assert.ok(plain.indexOf('"token auth history"') < plain.indexOf('"token ratelimit"'), "lexical order without plan state");
     const logs: string[] = [];
-    const aware = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, logs));
+    const aware = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, logs)).text;
     assert.notEqual(aware, plain, "re-ranking changed the output");
     assert.match(aware, /Found 5 block\(s\) for "token"/);
     assert.ok(aware.indexOf('"token ratelimit"') < aware.indexOf('"token auth history"'), "plan-relevant block ranked first");
     assert.ok(!aware.includes('"token metrics"'), "lowest-ranked block cut by the limit");
     assert.equal(logs.length, 1, "one inspectable scoring breakdown logged");
     assert.match(logs[0]!, /^\[acp-search-plan\] "token": \d+\/6 candidates plan-relevant → /);
-    const again = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, []));
+    const again = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, [])).text;
     assert.equal(again, aware, "fully deterministic across calls");
 });
 
@@ -153,13 +153,13 @@ test("steering output: top fetch targets first, repeat-retrieve hint only with h
     const f = foldBlocks(true);
     const b5 = blockByTopic(f, "token ratelimit");
     const b1 = blockByTopic(f, "token auth history");
-    const aware = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, []));
+    const aware = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, [])).text;
     assert.match(aware, /\n\n\[plan-aware\] top fetch targets: /);
     assert.match(aware, new RegExp(`top fetch targets: ${b5.blockId} \\[m00021\u2013m00025 · 5 msgs\\]`), "boosted block span listed first");
     assert.ok(!aware.includes("retrieved "), "no repeat hint without retrieve history");
     recordRetrieveHit(f.session, "m00003");
     recordRetrieveHit(f.session, "m00003");
-    const aware2 = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, []));
+    const aware2 = executeSearchContext({ query: "token" }, f.core, f.session.state, undefined, planOpts(f, [])).text;
     assert.match(aware2, new RegExp(`m00003 retrieved 2 times this session \u2014 decompress\\(\\{blockId:"${b1.blockId}",startId:"m00003",endId:"m00003"}\\)`));
 });
 
@@ -169,7 +169,7 @@ test("whole-block restore stats feed the RETRIEVAL QUALITY line", () => {
     resolveDecompress({ blockId: b.blockId }, ctxOf(f));
     assert.equal(f.session.stats.wholeBlockRestores, 1);
     assert.equal(f.session.stats.wholeBlockRestoresPreciseAvailable, 1, "precise path existed (CCR armed + span recorded)");
-    const status = handleAcpStatus({}, ctxOf(f));
+    const status = handleAcpStatus({}, ctxOf(f)).text;
     assert.match(status, /RETRIEVAL QUALITY — whole-block restores: 1 total, 1 had a cheaper precise path available \(100%\)/);
 });
 
@@ -192,10 +192,10 @@ test("recordRetrieveHit: per-ref counts with a bounded map", () => {
 test("own-session target entry point: flag off → plain; flag on → re-ranked", () => {
     const f = foldBlocks(true);
     storeEffectiveSearchPlanAware(f.session, false);
-    const off = executeSearchContextTarget({ query: "token" }, f.core, f.session.id, f.session.state, { messages: planMessages(), config: f.config, session: f.session, log: () => {} });
-    assert.equal(off, executeSearchContext({ query: "token" }, f.core, f.session.state), "unflagged ctx → plain output");
+    const off = executeSearchContextTarget({ query: "token" }, f.core, f.session.id, f.session.state, { messages: planMessages(), config: f.config, session: f.session, log: () => {} }).text;
+    assert.equal(off, executeSearchContext({ query: "token" }, f.core, f.session.state).text, "unflagged ctx → plain output");
     storeEffectiveSearchPlanAware(f.session, true);
-    const on = executeSearchContextTarget({ query: "token" }, f.core, f.session.id, f.session.state, { messages: planMessages(), config: f.config, session: f.session, log: () => {} });
+    const on = executeSearchContextTarget({ query: "token" }, f.core, f.session.id, f.session.state, { messages: planMessages(), config: f.config, session: f.session, log: () => {} }).text;
     assert.notEqual(on, off, "flagged ctx → re-ranked output");
     assert.equal(effectiveSearchPlanAware(f.session), true);
 });
@@ -209,8 +209,8 @@ test("foreign-session search stays read-only lexical (no plan state, no steering
     const fturn = fcore.processTurn({ messages: makeMsgs(40), state: foreign.state, config: fconfig, tokenCount: 9999, renderTags: "text-only" });
     foreign.state = fturn.state;
     applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00007", summary: "Foreign early history about tokens.", topic: "token foreign history" }] }), { core: fcore, config: fconfig, messages: fturn.messages, session: foreign, log: () => {} });
-    const plain = executeSearchContext({ query: "token" }, fcore, foreign.state, foreign.id);
-    const viaTarget = executeSearchContextTarget({ query: "token", conversation_id: foreign.id }, a.core, a.session.id, a.session.state, { messages: planMessages(), config: a.config, session: a.session, log: () => {} });
+    const plain = executeSearchContext({ query: "token" }, fcore, foreign.state, foreign.id).text;
+    const viaTarget = executeSearchContextTarget({ query: "token", conversation_id: foreign.id }, a.core, a.session.id, a.session.state, { messages: planMessages(), config: a.config, session: a.session, log: () => {} }).text;
     assert.equal(viaTarget, plain, "foreign result byte-identical to a direct foreign search");
     assert.ok(!viaTarget.includes("[plan-aware]"), "no steering on foreign lookups");
 });
@@ -241,9 +241,9 @@ function anthropicTextSse(res: http.ServerResponse, id: string, text: string): v
     res.end();
 }
 
-function listen(server: http.Server | ReturnType<typeof startServer> extends Promise<infer R> ? Awaited<R> : never): Promise<void> {
-    if ((server as { listening?: boolean }).listening) return Promise.resolve();
-    return once(server as http.Server, "listening").then(() => undefined);
+function listen(server: http.Server): Promise<void> {
+    if (server.listening) return Promise.resolve();
+    return once(server, "listening").then(() => undefined);
 }
 
 function close(server: http.Server): Promise<void> {
@@ -303,13 +303,20 @@ async function startPlanProxy(captured: string[], planAware: boolean): Promise<{
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true }, search: planAware ? { planAware: true } : undefined },
+        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true }, search: planAware ? { planAware: true } : undefined },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

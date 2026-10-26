@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
@@ -100,7 +100,47 @@ test("installViaTarball: clean tarball installs and removes the backup", { timeo
         assert.equal(r.ok, true, r.error);
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "2.0.0");
         assert.equal(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), "export const loaded = '2.0.0';\n");
-        assert.equal(existsSync(path.join(fx.cacheDir, "billion-context", ".update-backup-2.0.0")), false, "backup must be removed on success");
+        // Stronger than the old exact-name check: NO update temp artifact of
+        // any kind may survive a successful install in the cache dir.
+        const leftovers = readdirSync(path.join(fx.cacheDir, "billion-context")).filter((n) => n.startsWith(".update-"));
+        assert.deepEqual(leftovers, [], "no update temp artifacts may remain after a successful install");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        rmrf(fx.root);
+    }
+});
+
+test("installViaTarball: foreign in-flight temp artifacts from another process are left untouched (#2106)", { timeout: 30_000 }, async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    try {
+        const bcCache = path.join(fx.cacheDir, "billion-context");
+        // Simulate a concurrent process mid-install at the SAME version: its
+        // staging dir partially extracted, plus its syntax-check temp file.
+        const foreignStaging = path.join(bcCache, ".update-staging-2.0.0");
+        mkdirSync(path.join(foreignStaging, "dist"), { recursive: true });
+        writeFileSync(path.join(foreignStaging, "package.json"), pkgJson("2.0.0"));
+        writeFileSync(path.join(foreignStaging, "dist", "index.js"), "export const loaded = 'foreign in-flight';\n");
+        const foreignCheck = path.join(bcCache, ".update-syntax-check.mjs");
+        writeFileSync(foreignCheck, "// foreign sentinel\n");
+
+        const { tgz, integrity } = fx.makeTarball({
+            "package.json": pkgJson("2.0.0"),
+            "dist/index.js": "export const loaded = '2.0.0';\n",
+        });
+        const r = await withTarballFetch(
+            tgz,
+            () => installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.installDir, integrity),
+        );
+        assert.equal(r.ok, true, r.error);
+        assert.equal(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), "export const loaded = '2.0.0';\n");
+        // The other process's temps must survive byte-identical — the old
+        // version-keyed fixed names let us rm/overwrite them mid-install.
+        assert.equal(readFileSync(path.join(foreignStaging, "dist", "index.js"), "utf-8"), "export const loaded = 'foreign in-flight';\n", "a concurrent process's staging dir must not be disturbed");
+        assert.equal(readFileSync(foreignCheck, "utf-8"), "// foreign sentinel\n", "a concurrent process's syntax-check temp must not be deleted");
+        // ...while our own temp space is fully cleaned up on success:
+        const ours = readdirSync(bcCache).filter((n) => n.startsWith(".update-wip-") || n.startsWith(".update-syntax-check-"));
+        assert.deepEqual(ours, [], "our temp artifacts must be removed after success");
     } finally {
         delete process.env.XDG_CACHE_HOME;
         rmrf(fx.root);

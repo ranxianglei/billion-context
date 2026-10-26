@@ -1,0 +1,60 @@
+{
+	"name": "billion-context-pi-subagents",
+	"version": "0.2.2",
+	"description": "acp_delegate sub-agent tools for the Pi coding agent — split out of billion-context-pi (#612); vendored in-repo (#2384).",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"sideEffects": false,
+	"homepage": "https://github.com/ranxianglei/billion-context/tree/master/pi-subagents",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ranxianglei/billion-context.git"
+	},
+	"bugs": {
+		"url": "https://github.com/ranxianglei/billion-context/issues"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"test": "node --import tsx --test tests/*.test.ts",
+		"typecheck": "tsc --noEmit",
+		"build": "tsup && tsc --emitDeclarationOnly"
+	},
+	"keywords": [
+		"pi",
+		"acp",
+		"sub-agents",
+		"delegation",
+		"context-management",
+		"llm",
+		"pi-package"
+	],
+	"author": "ranxianglei",
+	"license": "MIT",
+	"type": "module",
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@earendil-works/pi-tui": "0.83.0",
+		"@types/node": "^22.0.0",
+		"tsup": "^8.0.0",
+		"tsx": "^4.0.0",
+		"typebox": "^1.3.34",
+		"typescript": "^5.5.0"
+	}
+}

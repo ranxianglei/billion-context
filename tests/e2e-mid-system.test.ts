@@ -59,7 +59,8 @@ function parseMessageRefIds(sent: { messages: Array<{ role: string; content?: un
     const ids: string[] = [];
     const re = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>/g;
     for (let i = 1; i < sent.messages.length; i++) {
-        const c = typeof sent.messages[i]!.content === "string" ? sent.messages[i]!.content : JSON.stringify(sent.messages[i]!.content ?? "");
+        const msg = sent.messages[i]!;
+        const c = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
         re.lastIndex = 0;
         let m: RegExpExecArray | null;
         while ((m = re.exec(c)) !== null) ids.push(m[1]!);
@@ -152,7 +153,14 @@ test("e2e #355: multi-segment compress never puts a system message mid-conversat
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

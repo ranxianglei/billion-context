@@ -95,9 +95,9 @@ function asArr(v: unknown): unknown[] {
 function openaiToolArgs(events: Record<string, unknown>[]): string {
     let out = "";
     for (const ev of events) {
-        for (const ch of asArr(ev["choices"])) {
+        for (const ch of asArr(ev["choices"]) as Array<Record<string, unknown>>) {
             const d = asObj(ch["delta"]);
-            for (const tc of asArr(d["tool_calls"])) {
+            for (const tc of asArr(d["tool_calls"]) as Array<Record<string, unknown>>) {
                 out += asString(asObj(tc["function"])["arguments"]);
             }
         }
@@ -108,7 +108,7 @@ function openaiToolArgs(events: Record<string, unknown>[]): string {
 function openaiContents(events: Record<string, unknown>[]): string {
     let out = "";
     for (const ev of events) {
-        for (const ch of asArr(ev["choices"])) {
+        for (const ch of asArr(ev["choices"]) as Array<Record<string, unknown>>) {
             out += asString(asObj(ch["delta"])["content"]);
         }
     }
@@ -238,7 +238,7 @@ test("#1039 responses: function_call_arguments deltas and done payloads pass thr
     const completed = parsed.find((e) => e["type"] === "response.completed") ?? {};
     const outItem = asObj(asArr(asObj(completed["response"])["output"])[0]);
     assert.equal(asString(outItem["arguments"]), dirtyArgs, "response.completed arguments untouched");
-    assert.ok(!text.includes("m00009"), "reasoning summary tag ref still stripped");
+    assert.ok(text.includes("m00009"), "unified invariant: reasoning summary rides verbatim (#2267)");
 });
 
 test("#1039 non-streaming: pipePluginJson leaves tool-call argument payloads verbatim, strips prose tags", async () => {

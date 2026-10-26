@@ -1,4 +1,5 @@
 import type { AnthropicRequestBody } from "acp-kernel/wire";
+import { noCacheControl as knobNoCacheControl } from "../knobs.js";
 
 /**
  * #1637: Anthropic prompt caching is EXPLICIT — content blocks must carry
@@ -27,12 +28,12 @@ import type { AnthropicRequestBody } from "acp-kernel/wire";
  * from the client's messages, present on system blocks, or on tools entries —
  * the 4-breakpoint budget counts all three) suppresses our stamps entirely
  * (pass no marks / return the system unchanged).
- * BILI_NO_CACHE_CONTROL=1 disables everything.
+ * BILI_NO_CACHE_CONTROL / compat.noCacheControl disables everything.
  */
 
 const MESSAGE_MARK_CAP = 3;
 
-export type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
+type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
 
 export function computeAnthropicMessageMarks(
     processed: { id?: string }[],
@@ -40,7 +41,7 @@ export function computeAnthropicMessageMarks(
     session: { metadata: Record<string, unknown> },
 ): AnthropicCacheMarks {
     const marks = new Map<string, { type: "ephemeral" }>();
-    if (process.env.BILI_NO_CACHE_CONTROL) {
+    if (knobNoCacheControl()) {
         session.metadata["anthropicCacheMarkIds"] = [];
         return marks;
     }
@@ -70,7 +71,7 @@ export function anthropicToolsCarryCacheControl(tools: unknown): boolean {
 }
 
 export function stampAnthropicSystemCacheControl(systemOut: AnthropicRequestBody["system"], ours = true): AnthropicRequestBody["system"] {
-    if (process.env.BILI_NO_CACHE_CONTROL) return systemOut;
+    if (knobNoCacheControl()) return systemOut;
     if (!ours) return systemOut;
     if (typeof systemOut === "string" && systemOut.length > 0) {
         // Deterministic string→block conversion (semantically identical for
@@ -82,6 +83,10 @@ export function stampAnthropicSystemCacheControl(systemOut: AnthropicRequestBody
     for (const block of systemOut) {
         if ((block as { cache_control?: unknown }).cache_control) return systemOut;
     }
-    (systemOut[systemOut.length - 1] as { cache_control?: unknown }).cache_control = { type: "ephemeral" };
+    // Stamp by replacement, never in place: the array may share block
+    // references with the frozen client head (parsed.system), which must stay
+    // unmarked (#1085).
+    const last = systemOut.length - 1;
+    systemOut[last] = { ...systemOut[last], cache_control: { type: "ephemeral" } };
     return systemOut;
 }

@@ -14,7 +14,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { log, closeLogger } from "../src/logger.ts";
@@ -59,6 +60,7 @@ test("e2e: session requests are log-tagged; /__bili/logs serves ctx + win views"
         host: "127.0.0.1",
         upstream: `http://127.0.0.1:${upstreamPort}`,
         routes: {},
+        modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
         compress: { injectTool: true, injectNudge: true, modelContextLimit: 200_000 },
         promptCache: { routing: "auto" },
@@ -66,8 +68,15 @@ test("e2e: session requests are log-tagged; /__bili/logs serves ctx + win views"
         log: true,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         chainContentDetection: false,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
         logFile,
     } as ProxyOptions);

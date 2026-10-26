@@ -24,7 +24,7 @@ function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -32,6 +32,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -139,7 +140,7 @@ test("#1075 e2e openai-wire: 1-message side request neither wipes ref maps nor i
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -151,15 +152,23 @@ test("#1075 e2e openai-wire: 1-message side request neither wipes ref maps nor i
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW, { preserveRecentMessages: 2, preserveRecentTokens: 2000, compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 } }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/chat/completions`;
     const post = (model: string, messages: Array<{ role: string; content: string }>): Promise<{ status: number; body: string }> =>
         fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SID }, body: JSON.stringify({ model, max_tokens: 1024, stream: true, messages }) }).then(async (r) => ({ status: r.status, body: await r.text() }));
@@ -202,8 +211,10 @@ test("#1075 e2e openai-wire: 1-message side request neither wipes ref maps nor i
         assert.ok(fwd3.raw.includes("MORE_99_payload"), "new tail survives in the payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

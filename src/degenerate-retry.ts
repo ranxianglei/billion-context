@@ -16,8 +16,12 @@ import { appendTrailingUserText } from "./wire-body.js";
 // Bounded to one attempt per turn; the body mutation never touches session
 // state, so the nudge is neither persisted nor replayed on the client's next
 // request.
+// Wording covers BOTH retry shapes: the empty-turn shape (#732/#821) and the
+// draft-tail shape (#2303, visible prose ending in a compression-draft closing
+// tag) — both are "ended without a tool call", and both need the same push:
+// issue the pending action or state the final answer explicitly.
 export const DEGENERATE_RETRY_NUDGE =
-    "[billion-context] Your previous response ended with no visible text and no tool call. Continue now: take your next concrete action.";
+    "[billion-context] Your previous response ended without a tool call. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly.";
 
 /** The retry body: the forwarded body with the continuation nudge appended as a
  *  trailing user turn. Null when the body cannot carry one. */
@@ -25,7 +29,7 @@ export function injectContinuationNudge(protocol: WireProtocol, body: string | B
     return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE);
 }
 
-export interface ContinuationRetryOpts {
+interface ContinuationRetryOpts {
     protocol: WireProtocol;
     /** The body that was forwarded upstream (the agent's own, in plugin mode). */
     body: string | Buffer;
@@ -37,6 +41,13 @@ export interface ContinuationRetryOpts {
     log: (level: string, msg: string) => void;
     /** Log prefix, normally the session id. */
     label: string;
+    /** #1884: re-sign the retry body before it hits the wire (armed re-sign
+     *  lane only; undefined on unsigned traffic). The retry body carries an
+     *  injected continuation nudge, so the previous signature is stale. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** #3280: v1internal egress re-wrap — `body` above is the INNER request
+     *  (the nudge needs top-level contents), so the retry goes out enveloped. */
+    wrapBody?: (body: string | Buffer) => string | Buffer;
 }
 
 /** Build the re-request used when a turn ends with no visible output. Returns a
@@ -68,13 +79,15 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
             return null;
         }
+        const wireRetryBody = opts.wrapBody ? opts.wrapBody(retryBody) : retryBody;
         try {
+            opts.resign?.(opts.reqHeaders, wireRetryBody);
             const r = await fetchWithTimeout(
                 opts.upstreamUrl,
                 {
                     method: "POST",
                     headers: opts.reqHeaders,
-                    body: retryBody,
+                    body: wireRetryBody,
                     ...(opts.dispatcher ? { dispatcher: opts.dispatcher } : opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                 },
                 undefined,

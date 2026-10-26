@@ -5,7 +5,7 @@
 // trapped item is hoisted just before the earliest call it sits between. No-op on
 // healthy input, so well-formed sessions stay byte-stable for the prefix cache.
 
-export interface ToolPairItem {
+interface ToolPairItem {
     type?: string;
     call_id?: string;
 }

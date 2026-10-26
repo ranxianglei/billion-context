@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { fetchWithTimeout } from "../src/fetch-util.ts";
+import { fetchWithTimeout, _setIdleTimerDelayForTest, _idleRearmCountForTest, _resetIdleTimerSeamsForTest } from "../src/fetch-util.ts";
 
 function listen(server: http.Server, port: number = 0): Promise<void> {
     server.listen(port, "127.0.0.1");
@@ -26,8 +26,14 @@ async function readAll(body: ReadableStream<Uint8Array>): Promise<Uint8Array[]> 
 
 test("idle timeout: a healthy stream longer than the timeout is NOT aborted (#437)", async () => {
     // 8 chunks at 100ms intervals = ~800ms total, which EXCEEDS the 500ms
-    // timeout. A total timer would abort at 500ms (mid-stream); the idle timer
-    // re-arms on each chunk (100ms << 500ms) so the full stream completes.
+    // logical timeout. A total timer would abort at 500ms (mid-stream); the
+    // idle timer re-arms on each chunk (100ms << 500ms) so the full stream
+    // completes. The timer's WALL-CLOCK delay is stretched via the #1770
+    // test seam: asserting survival against real-timer scheduling is
+    // nondeterministic under host load (the pacing tick and the expired
+    // timer share one event loop — see _setIdleTimerDelayForTest). The
+    // logical budget stays 500ms, so the stream still genuinely outlives it.
+    _resetIdleTimerSeamsForTest();
     const timeoutMs = 500;
     const intervalMs = 100;
     const totalChunks = 8;
@@ -48,6 +54,7 @@ test("idle timeout: a healthy stream longer than the timeout is NOT aborted (#43
     await listen(upstream);
     const port = (upstream.address() as { port: number }).port;
     try {
+        _setIdleTimerDelayForTest(30_000);
         const started = Date.now();
         const result = await fetchWithTimeout(`http://127.0.0.1:${port}/stream`, {}, timeoutMs);
         const chunks = await readAll(result.response.body as ReadableStream<Uint8Array>);
@@ -59,7 +66,9 @@ test("idle timeout: a healthy stream longer than the timeout is NOT aborted (#43
             "chunk-1\nchunk-2\nchunk-3\nchunk-4\nchunk-5\nchunk-6\nchunk-7\nchunk-8\n",
         );
         assert.ok(elapsed >= timeoutMs, `expected the stream to outlive the timeout (>= ${timeoutMs}ms), got ${elapsed}ms`);
+        assert.ok(_idleRearmCountForTest() >= 1, "expected the idle timer to be re-armed by streamed chunks");
     } finally {
+        _resetIdleTimerSeamsForTest();
         upstream.closeAllConnections();
         await close(upstream);
     }
@@ -70,8 +79,11 @@ test("idle timeout: a stuck stream (no further chunks) IS still aborted (#437)",
     // re-arms on that single chunk and, with no further chunks, fires at the
     // timeout → abort. Because the server never ends, the only way the read
     // loop terminates is via that abort, so we read-until-error and assert it
-    // threw (and that a chunk actually arrived before the stall).
-    const timeoutMs = 300;
+    // threw (and that a chunk actually arrived before the stall). The budget
+    // doubles as the time-to-first-byte bound, so it stays generous: under
+    // host load a loopback TTFB slower than the budget would fail this test
+    // before any stream exists (#1770).
+    const timeoutMs = 1500;
     const upstream = http.createServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.flushHeaders();

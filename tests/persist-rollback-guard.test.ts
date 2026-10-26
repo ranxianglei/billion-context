@@ -12,7 +12,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://upstream" },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -20,6 +20,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -118,4 +119,61 @@ await withTempStore("debounced scheduleSave also guards against rollback", async
     const reloaded = store.loadSync("sched-1", { protocol: "openai", upstreamOrigin: "http://upstream" });
     assert.ok(reloaded);
     assert.equal(reloaded.stats.requests, 7, "debounced write does not roll back");
+});
+
+await withTempStore("stale writeNow converges the in-memory session to the newer disk record (#2401)", async (store) => {
+    const s = makeSession("sess-converge");
+    s.stats.requests = 5;
+    s.state.nextBlockId = 3;
+    s.blockContents.set("b2", { one: null, full: { text: "block two", count: 2 } });
+    await store.writeNow(s);
+    // Divergence: another instance advanced disk (5 requests / 3 blocks) while
+    // this resident's in-memory copy lags (older generation, never refreshed).
+    s.stats.requests = 4;
+    s.state.nextBlockId = 2;
+    s.blockContents.clear();
+    await store.writeNow(s);
+    const reloaded = store.loadSync("sess-converge", { protocol: "openai", upstreamOrigin: "http://upstream" });
+    assert.ok(reloaded);
+    assert.equal(reloaded.stats.requests, 5, "disk keeps the newer counter — no rollback");
+    assert.equal(s.stats.requests, 5, "in-memory stats converged to disk");
+    assert.equal(s.state.nextBlockId, 3, "in-memory fold cursor converged to disk");
+    assert.equal(s.blockContents.size, 1, "in-memory block originals converged to disk");
+    assert.deepEqual(s.blockContents.get("b2")?.full, { text: "block two", count: 2 }, "converged block content restored");
+});
+
+await withTempStore("fresher incoming snapshot is NOT converged (passthrough keeps the live state object)", async (store) => {
+    const s = makeSession("sess-nocv");
+    s.stats.requests = 5;
+    s.state.nextBlockId = 3;
+    await store.writeNow(s);
+    s.stats.requests = 6;
+    s.state.nextBlockId = 4;
+    const stateBefore = s.state;
+    await store.writeNow(s);
+    assert.equal(s.state, stateBefore, "no replacement on a legitimate fresher write");
+    assert.equal(s.state.nextBlockId, 4);
+});
+
+await withTempStore("debounced scheduleSave converges in-memory state when disk is newer (#2401)", async (store) => {
+    const s = makeSession("sched-converge");
+    s.stats.requests = 7;
+    s.state.nextBlockId = 4;
+    await store.writeNow(s);
+    s.stats.requests = 6;
+    s.state.nextBlockId = 3;
+    store.scheduleSave(s);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(s.state.nextBlockId, 4, "memory converged after the debounced write fired");
+    assert.equal(s.stats.requests, 7);
+});
+
+await withTempStore("convergence drops queued retrievals referencing the replaced lineage (#2401/#1343)", async (store) => {
+    const s = makeSession("sess-retr");
+    s.stats.requests = 5;
+    s.pendingRetrievals.push({ ref: "m00010", tokens: 2100, chars: 63000, queuedAt: Date.now(), ccr: true, injection: { id: "acp_retrieved_m00010", role: "user", contentType: "text", text: "queued frame" } });
+    await store.writeNow(s);
+    s.stats.requests = 4;
+    await store.writeNow(s);
+    assert.equal(s.pendingRetrievals.length, 0, "queued injections dropped with the replaced lineage");
 });

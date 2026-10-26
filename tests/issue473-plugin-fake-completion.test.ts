@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -41,7 +42,7 @@ function anthropicSse(event: string, data: unknown): string {
     return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-type Proto = "openai" | "anthropic";
+type Proto = "openai" | "anthropic" | "responses";
 
 interface Rig {
     proxyPort: number;
@@ -68,6 +69,19 @@ function upstreamResponse(proto: Proto, fake: boolean, res: http.ServerResponse)
         res.end();
         return;
     }
+    if (proto === "responses") {
+        if (fake) {
+            res.write(openaiSse({ type: "response.output_item.added", output_index: 0, item: { id: "m473f", type: "message", status: "in_progress", role: "assistant", content: [] } }));
+            res.write(openaiSse({ type: "response.output_text.delta", item_id: "m473f", output_index: 0, content_index: 0, delta: `${FAKE_MARK} ${FAKE_XML}` }));
+            res.write(openaiSse({ type: "response.completed", response: { id: "r473f", status: "completed" } }));
+        } else {
+            res.write(openaiSse({ type: "response.output_item.added", output_index: 0, item: { id: "fc473", type: "function_call", status: "in_progress", name: "real_tool_ok", arguments: "" } }));
+            res.write(openaiSse({ type: "response.function_call_arguments.done", item_id: "fc473", output_index: 0, arguments: "{}" }));
+            res.write(openaiSse({ type: "response.completed", response: { id: "r473r", status: "completed" } }));
+        }
+        res.end();
+        return;
+    }
     res.write(anthropicSse("message_start", { type: "message_start", message: { id: "m473", role: "assistant", usage: { input_tokens: 77 } } }));
     if (fake) {
         res.write(anthropicSse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
@@ -82,7 +96,7 @@ function upstreamResponse(proto: Proto, fake: boolean, res: http.ServerResponse)
     res.end();
 }
 
-async function startRig(proto: Proto): Promise<Rig> {
+async function startRig(proto: Proto, extra?: Partial<ProxyOptions>): Promise<Rig> {
     const requests: { body: string }[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -117,11 +131,19 @@ async function startRig(proto: Proto): Promise<Rig> {
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        ...extra,
     };
     const proxy = await startServer(opts);
     await listen(proxy);
     const proxyPort = (proxy.address() as { port: number }).port;
-    const path = proto === "openai" ? "/v1/chat/completions" : "/v1/messages";
+    const path = proto === "openai" ? "/v1/chat/completions" : proto === "responses" ? "/v1/responses" : "/v1/messages";
     return {
         proxyPort,
         proxyUrl: (p) => `http://127.0.0.1:${proxyPort}${p}`,
@@ -138,7 +160,7 @@ async function register(rig: Rig, conversationId: string): Promise<void> {
     const res = await fetch(rig.proxyUrl("/__bili/plugin/register"), {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent: "mcp" }),
+        body: JSON.stringify({ conversationId, agent: "pi" }),
     });
     assert.equal(res.status, 200, "register accepted");
 }
@@ -212,6 +234,41 @@ test("#473 plugin anthropic: fake completion retried with the hint merged; recov
         // as an appended {type:"text"} block
         assert.ok(JSON.stringify(last.content).includes(HINT_MARK), "hint merged into the last anthropic user message");
         assert.ok(text.includes("real_tool_ok"), "client received the recovered tool_use block");
+        assert.ok(!text.includes(FAKE_MARK), "fake completion never reached the client");
+    } finally {
+        delete process.env.BILI_FAKE_COMPLETION_RETRIES;
+        await rig.closeAll();
+    }
+});
+
+test("#1900 plugin responses: hinted retry derives from wire bytes — compat role rewrite survives into the retry", async () => {
+    process.env.BILI_FAKE_COMPLETION_RETRIES = "1";
+    const rig = await startRig("responses", { compat: { roles: { developer: "system" } } });
+    try {
+        await register(rig, "i1900-responses");
+        const res = await fetch(rig.modelUrl(), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                model: "i473-model",
+                stream: true,
+                input: [
+                    { type: "message", role: "developer", content: [{ type: "input_text", text: "you are terse" }] },
+                    { type: "message", role: "user", content: [{ type: "input_text", text: "call the weather tool" }] },
+                ],
+            }),
+        });
+        assert.equal(res.status, 200);
+        const text = await readAll(res);
+        assert.equal(rig.requests.length, 2, `expected original + retry, got ${rig.requests.length}`);
+        const main = JSON.parse(rig.requests[0].body) as Record<string, unknown>;
+        assert.ok(!JSON.stringify(main).includes('"name":"compress"'), "plugin mode suppressed compress-tool injection on the main send");
+        assert.ok(JSON.stringify(main.input).includes('"role":"system"'), "compat.roles applied developer→system on the main send");
+        assert.ok(!JSON.stringify(main.input).includes('"role":"developer"'), "main attempt carries the rewritten role");
+        const retryBody = JSON.parse(rig.requests[1].body) as Record<string, unknown>;
+        assert.ok(!JSON.stringify(retryBody.input).includes('"role":"developer"'), "#1900: plugin-lane hinted retry must NOT re-send the pre-rewrite role");
+        assert.ok(rig.requests[1].body.includes(HINT_MARK), "hint present in the retry");
+        assert.ok(text.includes("real_tool_ok"), "client received the recovered function_call");
         assert.ok(!text.includes(FAKE_MARK), "fake completion never reached the client");
     } finally {
         delete process.env.BILI_FAKE_COMPLETION_RETRIES;

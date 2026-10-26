@@ -52,11 +52,16 @@ import { test } from "node:test";
 import { assertPortDead } from "../port-race.js";
 
 const DSH_BIN = process.env.E2E_DSH_BIN ?? "dsh";
+const DSH_SCRIPT = DSH_BIN.endsWith(".js") || DSH_BIN.endsWith(".mjs") || DSH_BIN.endsWith(".cjs");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const DSH_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/dsh-native.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO = Number(process.env.E2E_TMO ?? 150_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
+const EXTERNAL_ATTACH = (process.env.E2E_DSH_ATTACH_ORIGIN ?? "").trim();
+const UPSTREAM_HOST = (process.env.E2E_UPSTREAM_HOST ?? "127.0.0.1").trim();
+const UPSTREAM_URL_HOST =
+  (process.env.E2E_UPSTREAM_URL_HOST ?? (UPSTREAM_HOST === "0.0.0.0" ? "host.docker.internal" : UPSTREAM_HOST)).trim();
 // dsh walks up from cwd looking for workspace markers — keep the client cwd
 // OUTSIDE the repo so this project's own tree never leaks into the run.
 const CWD_ROOT = path.join(os.tmpdir(), "billion-context-e2e-dsh-native");
@@ -70,7 +75,9 @@ const ACP_TOOLS = [
 
 function dshAvailable(): boolean {
   try {
-    return spawnSync(DSH_BIN, ["--version"], { timeout: 15_000 }).status === 0;
+    const command = DSH_SCRIPT ? process.execPath : DSH_BIN;
+    const args = DSH_SCRIPT ? [DSH_BIN, "--version"] : ["--version"];
+    return spawnSync(command, args, { timeout: 15_000 }).status === 0;
   } catch {
     return false;
   }
@@ -111,6 +118,12 @@ const TASK = [
   "然后再请调用acp_status确认一次。",
   "第三次请调用acp_status。",
   "然后请调用compress折叠最旧的消息。",
+  "最后只回复:收到#done",
+].join("\n");
+const TASK_EXTERNAL_ATTACH = [
+  filler(400),
+  "资料读完,请调用acp_status查看上下文状态。",
+  "再请调用acp_status确认一次。",
   "最后只回复:收到#done",
 ].join("\n");
 
@@ -256,7 +269,7 @@ async function startCtx(): Promise<Ctx> {
       HOME: ctx.homeDir,
       TMPDIR: ctx.tmpDir,
       FAKE_PORT: String(ctx.fakePort),
-      FAKE_HOST: "127.0.0.1",
+      FAKE_HOST: UPSTREAM_HOST,
       FAKE_REQLOG: ctx.reqLog,
     },
     stdio: ["ignore", "ignore", "ignore"],
@@ -324,7 +337,7 @@ function wireProfile(ctx: Ctx): void {
       "        displayName: Fake Upstream",
       "        apiKeyEnv: E2E_FAKE_KEY",
       "        api: openai-completions",
-      `        baseURL: http://127.0.0.1:${ctx.fakePort}/v1`,
+      `        baseURL: http://${UPSTREAM_URL_HOST}:${ctx.fakePort}/v1`,
       "        models:",
       "          - id: fake-model",
       "            name: Fake Model",
@@ -424,7 +437,7 @@ function dshRun(
   task: string,
   onFirstStamped?: (conv: string) => Promise<void>,
 ): Promise<RunResult> {
-  const child = spawn(DSH_BIN, ["--profile", "headless", task], {
+  const child = spawn(DSH_SCRIPT ? process.execPath : DSH_BIN, DSH_SCRIPT ? [DSH_BIN, "--profile", "headless", task] : ["--profile", "headless", task], {
     cwd: ctx.dshCwd,
     env: {
       ...cleanEnv(),
@@ -438,6 +451,7 @@ function dshRun(
       E2E_FAKE_KEY: "e2e-fake-key",
       DSH_TELEMETRY_MODE: "DISABLED",
       LANG: "C.UTF-8",
+      ...(EXTERNAL_ATTACH.length > 0 ? { BILLION_CONTEXT_ATTACH: EXTERNAL_ATTACH } : {}),
       // #1158/#1187 coexistence: activate the non-direct dispatcher policy
       // path with dead loopback targets (LOOPBACK_NO_PROXY keeps fixture
       // traffic direct — see file header).
@@ -550,6 +564,21 @@ function sessionFiles(ctx: Ctx): { file: string; parsed: SessionFile }[] {
     /* no sessions dir */
   }
   return out;
+}
+
+async function waitForPersistedSession(ctx: Ctx, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const sessions = sessionFiles(ctx);
+    if (sessions.length >= 1) return;
+    if (Date.now() - started > timeoutMs) {
+      assert.fail(
+        `proxy must persist the session within ${timeoutMs}ms\n` +
+          `bili.log tail:\n${biliLog(ctx).split("\n").slice(-30).join("\n") || "(empty)"}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 // Acceptance #2: the /acp command's backend endpoint, probed WHILE the run is
@@ -723,7 +752,11 @@ if (checkOnly) {
       );
 
       // Plugin-mode binding on the proxy side, not just on the wire. Sessions
-      // persist lazily — flush rides graceful shutdown.
+      // persist lazily: dsh can exit before the debounce window, after which
+      // the proxy's parent-gone watcher performs the graceful flush. Poll for
+      // that postcondition before stopping the proxy; a fixed post-exit sleep
+      // races the watcher on Windows (#3269).
+      await waitForPersistedSession(ctx, 20_000);
       await stopProxiesGracefully(ctx);
       const sessions = sessionFiles(ctx);
       assert.ok(sessions.length >= 1, "proxy must persist the session");
@@ -743,6 +776,54 @@ if (checkOnly) {
         withBlocks.length >= 1,
         `at least one persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
       );
+    },
+  );
+
+  test(
+    "native dsh attach: real client reaches an external Docker bili and executes acp_status",
+    {
+      skip:
+        suiteSkipReason ??
+        (EXTERNAL_ATTACH.length === 0
+          ? "set E2E_DSH_ATTACH_ORIGIN=http://127.0.0.1:18799 to exercise a running Docker proxy"
+          : undefined),
+      timeout: 300_000,
+    },
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+
+      const health = await fetch(`${EXTERNAL_ATTACH}/__bili/health`);
+      assert.equal(health.status, 200, "Docker bili admin bridge must answer health");
+
+      const r = await dshRun(ctx, TASK_EXTERNAL_ATTACH);
+      assert.equal(r.code, 0, `dsh headless failed (code=${r.code}); stderr:\n${r.stderr}`);
+      assert.match(r.stdout, /收到#done/, `dsh should finish the scripted loop; stdout:\n${r.stdout}`);
+
+      const oracle = readOracle(ctx.reqLog);
+      assert.ok(oracle.length >= 3, `expected >=3 upstream requests, got ${oracle.length}`);
+      const convs = new Set<string>();
+      for (const o of oracle) {
+        assert.equal(o.plugin, "dsh", `request must be plugin-stamped, got ${o.plugin}`);
+        assert.ok(o.conv && /^session-/.test(o.conv), `request must carry a native conversation id, got ${o.conv}`);
+        convs.add(o.conv!);
+      }
+      assert.equal(convs.size, 1, `every hop must share one conversation, got ${[...convs].join(", ")}`);
+
+      const withAcp = oracle.filter((o) => ACP_TOOLS.every((name) => o.tools.includes(name)));
+      assert.ok(withAcp.length >= 1, "Docker bili must expose the registered ACP tools");
+      const status = oracle.find((o) => o.toolResults.some((tr) => tr.name === "acp_status"));
+      assert.ok(status, "acp_status must have been called and its result re-sent through Docker bili");
+      const statusResult = status.toolResults.find((tr) => tr.name === "acp_status");
+      assert.match(
+        statusResult?.content ?? "",
+        /ACTIVE SURFACE[\s\S]*CONTEXT BREAKDOWN/,
+        "acp_status result must be the live status report",
+      );
+
+      const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+      const localInstances = fs.existsSync(instancesDir) ? fs.readdirSync(instancesDir) : [];
+      assert.deepEqual(localInstances, [], "attach mode must not spawn a second local proxy");
     },
   );
 }

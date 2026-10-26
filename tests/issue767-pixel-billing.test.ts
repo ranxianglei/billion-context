@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import { parseImageTokenCap, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -151,7 +152,7 @@ test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", (
     assert.equal(pixelTileEstimate(1000, 200), 765, "double scale: up short side, then cap long side");
 });
 
-test("#767 unit: resolveImageBilling — explicit wins, auto classifies first-party hosts", () => {
+test("#767 unit: resolveImageBilling — explicit bytes wins, everything else resolves to pixels (#1843)", () => {
     assert.equal(resolveImageBilling("pixels", undefined), "pixels");
     assert.equal(resolveImageBilling("bytes", "https://api.openai.com/v1"), "bytes");
     assert.equal(resolveImageBilling(undefined, "https://api.openai.com/v1"), "pixels");
@@ -159,10 +160,12 @@ test("#767 unit: resolveImageBilling — explicit wins, auto classifies first-pa
     assert.equal(resolveImageBilling("auto", "mitm://chatgpt.com/backend-api/codex/responses"), "pixels");
     assert.equal(resolveImageBilling("auto", "https://api.anthropic.com/v1/messages"), "pixels");
     assert.equal(resolveImageBilling("auto", "https://westus2.openai.azure.com/openai/v1"), "pixels");
-    assert.equal(resolveImageBilling("auto", "https://open.bigmodel.cn/api/paas/v4"), "bytes");
-    assert.equal(resolveImageBilling("auto", "https://evil-openai.com/v1"), "bytes", "suffix match must not hit lookalike hosts");
-    assert.equal(resolveImageBilling("auto", undefined), "bytes");
-    assert.equal(resolveImageBilling("auto", "not-a-url"), "bytes");
+    // #1843 L2: the host whitelist is gone — unknown hosts used to fall back to
+    // base64/4 (the #1800 incident's 15× poison); they now get the pixel prior.
+    assert.equal(resolveImageBilling("auto", "https://open.bigmodel.cn/api/paas/v4"), "pixels");
+    assert.equal(resolveImageBilling("auto", "https://evil-openai.com/v1"), "pixels");
+    assert.equal(resolveImageBilling("auto", undefined), "pixels");
+    assert.equal(resolveImageBilling("auto", "not-a-url"), "pixels");
 });
 
 test("#767 unit: parsed-body costs — pixels vs bytes, fallback, remote URLs, cap", () => {
@@ -186,9 +189,25 @@ test("#767 unit: parsed-body costs — pixels vs bytes, fallback, remote URLs, c
     try {
         assert.equal(imageTokensInParsedBody("responses", body, "pixels"), 500, "cap clamps pixels mode too");
         assert.equal(imageTokensInParsedBody("responses", body, "bytes"), 500);
+        assert.equal(imageTokensInParsedBody("responses", body, "pixels", 300), 500, "#1843 L3: env cap takes precedence over the config cap (any value)");
     } finally {
         delete process.env.BILI_IMAGE_TOKEN_CAP;
     }
+    // #1843 L3: the config-level cap (route/global imageTokenCap) threads through
+    // the same seam and applies with no env set.
+    assert.equal(imageTokensInParsedBody("responses", body, "pixels", 500), 500, "config cap clamps pixels mode");
+    assert.equal(imageTokensInParsedBody("responses", body, "bytes", 200), 200, "config cap clamps bytes mode");
+    assert.equal(imageTokensInParsedBody("responses", body, "pixels", 0), 85 + 170 * 12, "cap of 0 means no cap (unset)");
+});
+
+test("#1843 unit: parseImageTokenCap — positive integer only, lenient", () => {
+    assert.equal(parseImageTokenCap(500), 500);
+    assert.equal(parseImageTokenCap(0), undefined);
+    assert.equal(parseImageTokenCap(-5), undefined);
+    assert.equal(parseImageTokenCap(1.5), undefined);
+    assert.equal(parseImageTokenCap("500"), undefined);
+    assert.equal(parseImageTokenCap(null), undefined);
+    assert.equal(parseImageTokenCap(undefined), undefined);
 });
 
 test("#767 unit: raw-body probe honors the billing mode", () => {
@@ -248,6 +267,13 @@ async function startProxy(upstreamPort: number, routeExtra: Record<string, unkno
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     return { proxy, port: (proxy.address() as { port: number }).port };
@@ -301,15 +327,19 @@ test("e2e #767: pixels billing recovers a stale-baseline session the bytes estim
         assert.equal(stats.imagesSeen, 4);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("e2e #767 control: default (auto→bytes on unknown host) still fails fast — relay protection intact", async () => {
+// #1843: auto no longer resolves to bytes on unknown hosts, so the relay-
+// protection control pins the explicit opt-in mode that still carries it.
+test("e2e #767 control: explicit bytes route still fails fast — relay protection intact", async () => {
     const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
-    const { proxy, port: proxyPort } = await startProxy(upstreamPort);
+    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "bytes" });
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
         const headers = { "content-type": "application/json" };
@@ -327,7 +357,8 @@ test("e2e #767 control: default (auto→bytes on unknown host) still fails fast 
         s!.stats.lastInputTokens = STALE_BASELINE;
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-byt-sess") });
-        assert.equal(r2.status, 502, "byte-billed over-window images stay blocked locally");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "byte-billed over-window images stay blocked locally");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string; message?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.ok(err2.error?.message?.includes("Images alone account for"), "fail-fast carries the image remedy wording");
@@ -335,15 +366,59 @@ test("e2e #767 control: default (auto→bytes on unknown host) still fails fast 
         assert.equal(stats.imagesSeen, 0, "over-window images never reached the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("e2e #767: learned-limit-only variant also closes forward-once (bytes mode)", async () => {
+// #1843 L2: the DEFAULT route (no imageBilling configured) now resolves to the
+// pixel prior on unknown hosts. The same stale-baseline scenario that the
+// explicit-bytes control above still blocks must now forward: two 600k-base64
+// screenshots bill 2 × 1,445 = 2,890 tokens (not 300,002), so the payload fits
+// the window and the session recovers to real usage instead of 502-looping.
+test("e2e #1843: default route (auto→pixels) forwards an image-heavy payload the bytes estimate would brick", async () => {
     const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
     const { proxy, port: proxyPort } = await startProxy(upstreamPort);
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+        const headers = { "content-type": "application/json" };
+
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: "gpt-astra", stream: true, store: false, session_id: "img-auto-sess", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "hello there" }], max_output_tokens: 1024 }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+
+        const s = listSessions().find((x) => x.meta.label === "img-auto-sess");
+        assert.ok(s, "session established");
+        s!.stats.lastInputTokens = STALE_BASELINE;
+
+        const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-auto-sess") });
+        assert.equal(r2.status, 200, "default-route image payload fits on the pixel prior and forwards (#1843 de-poisoning)");
+        await r2.text();
+        assert.equal(stats.streamingForwards, 2, "both turns were forwarded");
+        assert.equal(stats.imagesSeen, 2, "both screenshots reached the upstream verbatim");
+
+        const after = listSessions().find((x) => x.meta.label === "img-auto-sess")!;
+        assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #767: learned-limit-only variant also closes forward-once (explicit bytes route)", async () => {
+    const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
+    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "bytes" });
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
         const headers = { "content-type": "application/json" };
@@ -365,15 +440,18 @@ test("e2e #767: learned-limit-only variant also closes forward-once (bytes mode)
         (s!.stats as { lastInputTokensSource: string }).lastInputTokensSource = "usage";
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-lrn-sess") });
-        assert.equal(r2.status, 502, "overflow evidence (learned limit) closes #496 forward-once even with a fresh baseline");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "overflow evidence (learned limit) closes #496 forward-once even with a fresh baseline");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.equal(stats.streamingForwards, 1, "image-bearing turn was never forwarded");
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -404,15 +482,18 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         } finally {
             delete process.env.BILI_IMAGE_BILLING;
         }
-        assert.equal(r2.status, 502, "env override downgrades the pixels route back to conservative byte billing");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "env override downgrades the pixels route back to conservative byte billing");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.equal(stats.streamingForwards, 1);
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -449,8 +530,10 @@ test("e2e #767: per-route imageBilling applies under a path-qualified provider k
         assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

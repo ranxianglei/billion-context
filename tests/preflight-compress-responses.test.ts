@@ -6,7 +6,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -42,7 +42,10 @@ function fcEvents(callId: string, args: string): string {
 function longInput() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        // #3298: repeat(235) keeps ~700 est-tokens of margin under the 10k window
+        // after the preflight fold — repeat(250) was knife-edge against the
+        // injected system-prompt size and flipped the #330 soft-zone relaxation.
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
     }
     return input;
 }
@@ -89,7 +92,7 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -107,10 +110,17 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
+    });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
 
     // Seven ~4.6k-char messages (~1140 tokens each, ~8k total < the 10k window,
@@ -140,7 +150,7 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.ok((sA!.state.blocks ?? []).some((b) => b.active), "session A compressed once");
 
         // --- Session B: the rebind/restore — a FRESH session (lastInputTokens=0)
-        // receives the full raw history (~13k tokens > the 10k window). Preflight
+        // receives the full raw history (~12k tokens > the 10k window). Preflight
         // must compress it before forward; the raw history must never be replayed
         // verbatim. ---
         const rB = await fetch(url, {
@@ -168,8 +178,10 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.equal(sB!.stats.lastInputTokens, 1000, "the real usage report lands after the recovered forward");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

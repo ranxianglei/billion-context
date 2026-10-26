@@ -10,7 +10,8 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -118,6 +119,13 @@ async function startProxy(upstreamPort: number, imageBilling: "pixels"): Promise
         kernelConfig: defaultConfig(WINDOW),
         imageBilling,
         compress: { injectTool: true, injectNudge: true },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -127,7 +135,7 @@ async function startProxy(upstreamPort: number, imageBilling: "pixels"): Promise
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxy, port: proxy.address().port };
+    return { proxy, port: (proxy.address() as { port: number }).port };
 }
 
 function assertArmedBelowBand(relay: ReturnType<typeof makeRelay>, sessionId: string | undefined, label: string): void {
@@ -154,7 +162,7 @@ test("#1493: network-level failure arms at the outbound payload (fits) → below
     const relay = makeRelay({ destroyFirst: true });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort, "pixels");
 
     try {
@@ -178,8 +186,10 @@ test("#1493: network-level failure arms at the outbound payload (fits) → below
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -188,7 +198,7 @@ test("#1493: relay 5xx arms at the outbound payload (fits) → below the emergen
     const relay = makeRelay({ failFirstStreamingWith: 500 });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort, "pixels");
 
     try {
@@ -210,8 +220,10 @@ test("#1493: relay 5xx arms at the outbound payload (fits) → below the emergen
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -225,7 +237,7 @@ test("#1498-F2: transform-failure fallback arms at the RAW view, not wire overhe
     const relay = makeRelay({ failFirstStreamingWith: 500, failStreamingCall: 2 });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort, "pixels");
 
     const TEXT_CHARS = 60_000;
@@ -257,8 +269,10 @@ test("#1498-F2: transform-failure fallback arms at the RAW view, not wire overhe
         );
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });

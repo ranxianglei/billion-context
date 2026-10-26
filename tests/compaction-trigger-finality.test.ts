@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -59,7 +60,7 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -69,18 +70,31 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
         modelContextLimit: 15_000,
-        kernelConfig: defaultConfig(15_000),
+        // #3006: the escalation override now honors the kernel's minimum-benefit
+        // floor, which this sub-floor fixture (4400-char ranges < 5000-char
+        // minCompressRange) trips — no nudge would fire at all anymore. Pin this
+        // fixture to legacy any-pending semantics (explicit 0 restores them on
+        // BOTH layers, kernel pressure branch and host override) so it keeps
+        // testing trigger finality / injection machinery, not the benefit floor.
+        kernelConfig: { ...defaultConfig(15_000), nudge: { ...defaultConfig(15_000).nudge, minPressureBenefitTokens: 0 } },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
 
     const post = (input: unknown, session = "trig-sess") => fetch(url, {
@@ -123,8 +137,10 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         assert.ok(bodies[bodies.length - 1].includes("Context limit reached"), "nudge still injected on a normal request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

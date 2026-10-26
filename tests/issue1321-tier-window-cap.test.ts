@@ -6,10 +6,10 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import { tierGatedStandardWindow, type ProxyOptions } from "../src/config.ts";
 import { capRegistryWindowByStandard, expandedContextSuffixWindow } from "../src/server.ts";
 import { MAX_ANTHROPIC_BETA_WINDOW } from "../src/server/context-window.ts";
-import { tierGatedStandardWindow } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -83,7 +83,7 @@ async function startRig(): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     // models.dev advertises the MAX tier: the loopback host is not in
@@ -107,10 +107,17 @@ async function startRig(): Promise<Rig> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     return { proxyPort, upstreamPort, forwards, proxy, upstream };
 }
 
@@ -126,8 +133,10 @@ function hasEmergencyNudge(body: string): boolean {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 

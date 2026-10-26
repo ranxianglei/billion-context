@@ -24,7 +24,7 @@ function makeCtx(): Ctx {
         session: {
             id: "fix-1124-receipt",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -32,6 +32,7 @@ function makeCtx(): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,
@@ -39,7 +40,7 @@ function makeCtx(): Ctx {
 }
 
 function seedTurn(ctx: Ctx, turns: Array<[string, string]>): void {
-    const msgs: CoreMessage[] = turns.map(([role, text], i) => ({ id: `raw${i}`, role: role as "user" | "assistant", text }));
+    const msgs: CoreMessage[] = turns.map(([role, text], i) => ({ id: `raw${i}`, role: role as "user" | "assistant", text })) as unknown as CoreMessage[];
     ctx.messages = msgs;
     ctx.session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
 }
@@ -50,7 +51,7 @@ test("#1124: sub-floor conversation gets a conclusive verdict, not retry advice"
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi there"]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes("Total compressible content too small"), `kernel reason preserved: ${out}`);
     assert.ok(out.includes("do not retry compress or call acp_status/search_context"), `conclusive verdict present: ${out}`);
@@ -60,7 +61,7 @@ test("#1124: verdict only when NO range can succeed; a viable larger range keeps
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi"], ["user", "x".repeat(6000)]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes("Combine more messages"), `generic advice kept: ${out}`);
     assert.ok(!out.includes("do not retry compress"), `no conclusive verdict while a range could succeed: ${out}`);
@@ -71,7 +72,7 @@ test("#1124: minCompressRange 0 keeps legacy behavior (tiny compress is not size
     const ctx = makeCtx();
     ctx.config.compress.minCompressRange = 0;
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi there"]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(!out.includes("Total compressible content too small"), out);
     assert.ok(!out.includes("do not retry compress"), out);
 });

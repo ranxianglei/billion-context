@@ -47,13 +47,14 @@ test("peekRegistryPriceProfile prices w from cache_write when the provider charg
 
 test("peekRegistryPriceProfile rejects rows without a usable input price", () => {
     _resetForTest();
-    _setForTest({}, {
+    const badRows = {
         "a/empty": {},
         "b/zero": { input: 0, output: 5 },
         "c/null": { input: null, output: 5 },
         "d/string": { input: "3", output: 5 },
         "e/negative": { input: -1, output: 5 },
-    });
+    };
+    _setForTest({}, badRows as unknown as Parameters<typeof _setForTest>[1]);
     assert.equal(peekRegistryPriceProfile("empty"), undefined);
     assert.equal(peekRegistryPriceProfile("zero"), undefined);
     assert.equal(peekRegistryPriceProfile("null"), undefined);
@@ -94,13 +95,27 @@ test("unlisted model yields undefined (stamp site then keeps kernel defaults)", 
     assert.equal(peekRegistryPriceProfile("totally-unlisted-model-xyz"), undefined);
 });
 
+test("price lookup is case-insensitive like the window lookup (same mechanism, #2074)", () => {
+    _resetForTest();
+    _setForTest({}, {
+        "minimax/MiniMax-M3": { input: 3, output: 12 },
+        "tencent/HY3": { input: 0.4, output: 1.6 },
+    });
+    // Exact-key branch (known-provider host): probe case differs from the roster key.
+    assert.deepEqual(peekRegistryPriceProfile("minimax-m3", "api.minimax.chat"), { w: 3, r: 0.3, q: 12 });
+    // Relay scan branch: same folding.
+    assert.deepEqual(peekRegistryPriceProfile("hy3"), { w: 0.4, r: 0.04, q: 1.6 });
+    // Byte-exact keys still resolve identically (no precedence shift).
+    assert.deepEqual(peekRegistryPriceProfile("MiniMax-M3", "api.minimax.chat"), { w: 3, r: 0.3, q: 12 });
+});
+
 test("bundled snapshot ships cost rows so the offline floor exercises pricing", () => {
     const snap = bundledSnapshot as { count?: unknown; models?: Record<string, unknown>; costs?: Record<string, { input?: unknown; output?: unknown }> };
     assert.ok(snap.costs && Object.keys(snap.costs).length > 0, "snapshot carries a costs map");
     const anthropicKeys = Object.keys(snap.costs).filter((k) => k.startsWith("anthropic/"));
     assert.ok(anthropicKeys.length >= 1, "an anthropic model carries pricing in the offline floor");
     for (const key of anthropicKeys.slice(0, 5)) {
-        const row = snap.costs[key];
+        const row = snap.costs[key] as { input?: unknown; output?: unknown };
         assert.equal(typeof row.input, "number");
         assert.ok((row.input as number) > 0, `${key} has a usable input price`);
     }

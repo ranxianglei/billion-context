@@ -44,9 +44,11 @@ test("portableHookCommand: an argument with whitespace is quoted (safe in bash, 
 });
 
 test("portableHookCommand: a command path with whitespace falls back to the & call operator", () => {
-    // No spelling covers a spaced command path in all three shells. `&` is what
-    // PowerShell needs, and PowerShell is what runs Claude Code's hooks on
-    // Windows (see the probe test below).
+    // No spelling covers a spaced command path in all three shells, and the
+    // client's shell varies by Claude Code version (cmd on 2.1.284, #1902;
+    // PowerShell probe-verified on 2.1.282, #1376) — so no SHIPPED hook emits
+    // this form anymore: claude and kimi both pass a bare `node` head. The
+    // branch stays pinned for hypothetical spaced-head callers.
     assert.equal(
         portableHookCommand("C:\\Program Files\\nodejs\\node.exe", [JS]),
         '& "C:/Program Files/nodejs/node.exe" C:/Users/u/AppData/Local/Temp/bili/claude-native-bootstrap.js',

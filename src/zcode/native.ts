@@ -30,7 +30,7 @@ import {
 const SIGNING_BLOCK_MESSAGE =
     'zcode v3.14+ client signing (#1621) rejects the http://127.0.0.1 /bili/ origin at model creation ("Client signing handshake requires HTTPS.") — skipping native routing; provider store left untouched. For compression on this build use the GUI cert-MITM setup (Settings → Network: HTTP proxy + root CA path).';
 
-export type ZcodeNativePlan =
+type ZcodeNativePlan =
     | { readonly mode: "off" }
     | { readonly mode: "attach"; readonly attachOrigin: string }
     | { readonly mode: "spawn" };
@@ -124,7 +124,7 @@ export interface ZcodeRouteApplied {
     readonly wrapped: ZcodeWrappedEntry[];
 }
 
-export interface RouteZcodeOptions {
+interface RouteZcodeOptions {
     readonly origin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
@@ -185,6 +185,47 @@ export function zcodePolicyFromEnv(env: NodeJS.ProcessEnv): ZcodeRoutePolicy {
     return { route, directPrefixes: zcodeDirectPrefixes(env), assumeSigningFixed: signRaw === "1" || signRaw === "true" };
 }
 
+// Read-only diagnostic for the zero-wrapped case (#1892). An empty personal
+// store is NOT "no provider": this build sources active providers from the
+// built-in/account layer, not the legacy file — so name that basis instead of
+// pointing at the legacy file as a routing target. Never writes.
+function logNoRouteNextSteps(opts: {
+    kind: ZcodeStoreKind;
+    dataDir: string;
+    env: NodeJS.ProcessEnv;
+    origin: string;
+    policy: ZcodeRoutePolicy;
+    skipped: ReadonlyArray<{ id: string; reason: string }>;
+    log: (msg: string) => void;
+}): void {
+    const { kind, dataDir, env, origin, policy, skipped, log } = opts;
+    if (skipped.length > 0 && skipped.every((s) => s.reason.includes("#1621"))) {
+        log("every provider rule you defined is a v3.14+ client-signing coding-plan account (#1621); native URL-rewriting cannot compress them — use the cert-MITM path (Settings → Network: HTTP proxy + root CA path), the documented #1621 workaround (confirm it on your build/account).");
+        return;
+    }
+    if (skipped.length === 0) {
+        let msg = "no explicit provider rule in the personal store to wrap. This ZCode build resolves its active providers from the built-in/account layer, not from a config file — so an empty personal store does not mean 'nothing to route', only that there is nothing for native routing to intercept here.";
+        if (kind === "new") {
+            const legacyFile = zcodeStoreCandidates(dataDir, "legacy", env)[0];
+            let legacyRecords = 0;
+            try {
+                const applied = applyZcodeRouting(fs.readFileSync(legacyFile, "utf8"), "legacy", origin, policy);
+                legacyRecords = applied.wrapped.length + applied.skipped.length;
+            } catch {
+                legacyRecords = 0;
+            }
+            if (legacyRecords > 0) {
+                msg += ` (The legacy file ${legacyFile} still holds ${legacyRecords} provider record(s) from before the migration; this build does not read it as a provider source, so they are not routing candidates.)`;
+            }
+        }
+        msg += " Coding-plan accounts are signing-protected (#1621) and need the cert-MITM path (Settings → Network); a custom non-signing provider can be added to the personal store to route natively.";
+        log(msg);
+        return;
+    }
+    // else: mixed/other skips (loopback #809, direct exemption, no usable base
+    // URL) — the per-entry skip list logged by the caller already names each.
+}
+
 /** Rewrite the detected provider store so the coding-plan traffic flows
  *  through `origin` (idempotent, re-wraps across sessions with different
  *  ports), snapshotting per #1002 before each mutation. Returns what was
@@ -220,6 +261,7 @@ export async function routeZcodeConfig(opts: RouteZcodeOptions): Promise<ZcodeRo
         if (applied.skipped.length > 0) {
             log(`skipped ${applied.skipped.length} entr${applied.skipped.length === 1 ? "y" : "ies"}: ${applied.skipped.map((s) => `${s.id} (${s.reason})`).join("; ")}`);
         }
+        logNoRouteNextSteps({ kind, dataDir, env, origin: opts.origin, policy, skipped: applied.skipped, log });
         return undefined;
     }
     await withConfigLock(dataDir, () => {
@@ -291,7 +333,7 @@ export function unrouteZcode(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; 
     }
 }
 
-export interface RestoreZcodeBackupResult {
+interface RestoreZcodeBackupResult {
     readonly restored: boolean;
 }
 
@@ -323,13 +365,73 @@ export function defaultLog(msg: string): void {
 
 export type BootstrapMode =
     | { readonly mode: "off" }
+    | { readonly mode: "degraded"; readonly reason: ZcodeDegradedReason }
     | {
         readonly mode: "active";
         readonly attached: boolean;
+        /** #1821: true ONLY for an explicit user pin (attach posture) — a
+         *  proxy this session does not own, which the MCP watchdog must
+         *  never respawn. attached=true alone can also mean "a lane-owned
+         *  proxy happened to be alive at bootstrap" — that one IS bili-
+         *  managed and gets watchdog recovery. */
+        readonly externallyOwned: boolean;
         readonly routed: ZcodeRouteApplied | undefined;
     };
 
-export interface BootstrapZcodeOptions {
+/** Why a session degraded instead of routing (#1892). "off" (kill-switch,
+ * BILI_ZCODE_ROUTE=none) is a DECISION; "degraded" is the environment having
+ * nothing natively routable — the MCP entry still serves (idle) so the
+ * client handshake completes instead of the process dying before
+ * initialize (the "Connection closed" zcode reports). */
+type ZcodeDegradedReason = "no-store" | "signing" | "no-file" | "empty-rules";
+
+type ZcodeRoutePlan = { readonly routable: true } | { readonly routable: false; readonly reason: ZcodeDegradedReason };
+
+/** Read-only routing viability check (#1892): everything routeZcodeConfig
+ *  decides BEFORE it needs an origin to write — store presence, the #1621
+ *  signing wall, file readability, and a pure applyZcodeRouting dry-run to
+ *  count wrappable entries. Never writes, never spawns. Logging mirrors
+ *  routeZcodeConfig's no-route branches (incl. #1896 next-step hints) so the
+ *  degraded path keeps the full diagnostic trail. */
+export function planZcodeRouting(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; log?: (msg: string) => void; policy?: ZcodeRoutePolicy } = {}): ZcodeRoutePlan {
+    const env = opts.env ?? process.env;
+    const log = opts.log ?? (() => {});
+    const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
+    const v2Dir = path.join(dataDir, "v2");
+    const hasStore = fs.existsSync(v2Dir) || zcodeStoreCandidates(dataDir, "new", env).some((f) => fs.existsSync(f));
+    if (!hasStore) {
+        log(`no ${v2Dir} — nothing to route`);
+        return { routable: false, reason: "no-store" };
+    }
+    const { kind, file } = detectZcodeStore(dataDir, env);
+    const policy = opts.policy ?? zcodePolicyFromEnv(env);
+    if (zcodeSigningBlocksRouting(kind, policy)) {
+        log(SIGNING_BLOCK_MESSAGE);
+        return { routable: false, reason: "signing" };
+    }
+    let text: string;
+    try {
+        text = fs.readFileSync(file, "utf8");
+    } catch {
+        log(`no ${file} — nothing to route`);
+        return { routable: false, reason: "no-file" };
+    }
+    // Dry-run origin is a placeholder: it only lands in the (discarded)
+    // rewrite text, never on disk — the wrapped count and skip reasons are
+    // origin-independent.
+    const applied = applyZcodeRouting(text, kind, "http://127.0.0.1:1", policy);
+    if (applied.wrapped.length === 0) {
+        log("no routable provider entry found — leaving the config untouched");
+        if (applied.skipped.length > 0) {
+            log(`skipped ${applied.skipped.length} entr${applied.skipped.length === 1 ? "y" : "ies"}: ${applied.skipped.map((s) => `${s.id} (${s.reason})`).join("; ")}`);
+        }
+        logNoRouteNextSteps({ kind, dataDir, env, origin: "http://127.0.0.1:1", policy, skipped: applied.skipped, log });
+        return { routable: false, reason: "empty-rules" };
+    }
+    return { routable: true };
+}
+
+interface BootstrapZcodeOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
     readonly log?: (msg: string) => void;
@@ -353,12 +455,15 @@ export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Pr
         return { mode: "off" };
     }
 
-    // #1621: degrade BEFORE any proxy bring-up; the caller's off-path runs
-    // unrouteZcode, which also strips wrappers left by older bili versions.
+    // #1621 + #1892: settle routing viability with the PURE dry-run BEFORE
+    // any proxy bring-up. A degraded session (empty personal store, signing
+    // wall, missing store) must not spawn a proxy it can never route
+    // through; the caller serves idle instead of exiting pre-handshake
+    // (which the zcode client reports as "Connection closed").
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
-    if (zcodeSigningBlocksRouting(detectZcodeStore(dataDir, env).kind, policy)) {
-        log(SIGNING_BLOCK_MESSAGE);
-        return { mode: "off" };
+    const routePlan = planZcodeRouting({ env, dataDir, log, policy });
+    if (!routePlan.routable) {
+        return { mode: "degraded", reason: routePlan.reason };
     }
 
     let origin: string;
@@ -378,7 +483,7 @@ export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Pr
 
     const routed = await routeZcodeConfig({ origin, env, dataDir, log, policy });
     if (routed) log(`routed ${routed.wrapped.map((w) => w.id).join(", ")} via ${origin} → ${routed.upstream}`);
-    return { mode: "active", attached, routed };
+    return { mode: "active", attached, externallyOwned: plan.mode === "attach", routed };
 }
 
 async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean }> {
@@ -408,7 +513,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
 // repairs a dead pointer left by ANYONE (including hard-killed processes whose
 // JS exit handlers never run).
 
-export type StoreDriftOutcome =
+type StoreDriftOutcome =
     | "unmanaged"
     | "self"
     | "foreign-live"
@@ -416,7 +521,7 @@ export type StoreDriftOutcome =
     | "repointed-replacement"
     | "reverted-direct";
 
-export interface StoreDriftOptions {
+interface StoreDriftOptions {
     readonly selfOrigin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
@@ -472,9 +577,9 @@ export async function repairSharedStoreDrift(opts: StoreDriftOptions): Promise<S
     return "reverted-direct";
 }
 
-export type ExitHandoffOutcome = "not-ours" | "handed-off" | "reverted-direct";
+type ExitHandoffOutcome = "not-ours" | "handed-off" | "reverted-direct";
 
-export interface ExitHandoffOptions {
+interface ExitHandoffOptions {
     readonly ownOrigin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;

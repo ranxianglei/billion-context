@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import test from "node:test";
+import test, { after } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
+const originalHome = process.env.CODEX_HOME;
+const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-align-"));
+process.env.CODEX_HOME = codexHome;
+after(() => {
+    if (originalHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalHome;
+    fs.rmSync(codexHome, { recursive: true, force: true });
+});
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -45,7 +57,7 @@ async function startRig(): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -53,7 +65,7 @@ async function startRig(): Promise<Rig> {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-6.1-sol": { context: 1_050_000 } } } },
         modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
         compress: { injectTool: true, injectNudge: true },
@@ -62,11 +74,12 @@ async function startRig(): Promise<Rig> {
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     return { proxyPort, upstreamPort, proxy, upstream };
 }
 
@@ -74,26 +87,29 @@ function url(rig: Rig): string {
     return `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
 }
 
-async function post(rig: Rig, session: string, model: string, codex: boolean): Promise<number> {
+async function post(rig: Rig, session: string, model: string, codex: boolean, clientWindow?: number): Promise<number> {
     const headers: Record<string, string> = {
         "content-type": "application/json",
         "x-acp-session": session,
         "x-bili-plugin": "test-agent",
     };
     if (codex) headers["user-agent"] = CODEX_UA;
+    if (clientWindow !== undefined) headers["x-bili-plugin-context-window"] = String(clientWindow);
     const r = await fetch(url(rig), { method: "POST", headers, body: JSON.stringify({ model, max_tokens: 1024, stream: false, messages: [{ role: "user", content: "hi" }] }) });
     await r.text();
     return r.status;
 }
 
 function effectiveLimit(session: string): number | undefined {
-    return listSessions().find((s) => s.meta.label === session)?.metadata.effectiveContextLimit;
+    return listSessions().find((s) => s.meta.label === session)?.metadata.effectiveContextLimit as number | undefined;
 }
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -154,6 +170,35 @@ test("e2e: per-request resolution — UA disappears, window reverts", async () =
         assert.equal(effectiveLimit("cw-perreq"), 272_000, "with codex UA → clamped");
         assert.equal(await post(rig, "cw-perreq", "gpt-5.5", false), 200);
         assert.equal(effectiveLimit("cw-perreq"), 400_000, "same session, UA gone → 400K again");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: live Codex model and capped config override replace the stale 272K fallback", async () => {
+    fs.writeFileSync(path.join(codexHome, "models_cache.json"), JSON.stringify({ models: [{ slug: "gpt-6.1-sol", context_window: 373_000, max_context_window: 872_000 }] }));
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "model_context_window = 1048576\n");
+    const rig = await startRig();
+    try {
+        assert.equal(await post(rig, "cw-live", "gpt-6.1-sol", true), 200);
+        assert.equal(effectiveLimit("cw-live"), 828_400);
+        fs.writeFileSync(path.join(codexHome, "config.toml"), "model_context_window = 100000\n");
+        assert.equal(await post(rig, "cw-live", "gpt-6.1-sol", true), 200);
+        assert.equal(effectiveLimit("cw-live"), 95_000, "配置降低后，下一次请求必须立即跟随");
+    } finally {
+        await closeRig(rig);
+        fs.rmSync(path.join(codexHome, "models_cache.json"), { force: true });
+        fs.rmSync(path.join(codexHome, "config.toml"), { force: true });
+    }
+});
+
+test("e2e: request-declared Codex window outranks the bundled table in both directions", async () => {
+    const rig = await startRig();
+    try {
+        assert.equal(await post(rig, "cw-declared", "gpt-5.5", true, 800_000), 200);
+        assert.equal(effectiveLimit("cw-declared"), 800_000);
+        assert.equal(await post(rig, "cw-declared", "gpt-5.5", true, 100_000), 200);
+        assert.equal(effectiveLimit("cw-declared"), 100_000);
     } finally {
         await closeRig(rig);
     }

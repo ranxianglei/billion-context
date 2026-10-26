@@ -2,7 +2,15 @@ name: PR Build Artifact
 
 on:
     pull_request:
-        branches: [master]
+        branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
+
+# #2637: same-ref supersede-cancel (pattern of merged #2635) — a rapid re-push
+# must not queue a second build+publish behind its own predecessor. The temp
+# version is monotonic per run_number (#1385), so a cancelled mid-publish run
+# leaves no residue: its version string is simply never published.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
 
 permissions:
     contents: read
@@ -39,8 +47,9 @@ jobs:
                   # prerelease suffix keeps it unresolvable by any semver range —
                   # builds are addressed by their full version string. run_number is
                   # unique+monotonic per workflow (gaps OK) and this workflow is the
-                  # sole 0.0.x publisher; -a<attempt> makes a
-                  # rerun of one run publish a fresh version instead of E409.
+                  # sole 0.0.x-pr publisher (the master lane owns 0.0.x-master,
+                  # #2049); -a<attempt> makes a rerun of one run publish a fresh
+                  # version instead of E409.
                   PR_VERSION="0.0.${RUN_NUMBER}-pr.${PR_NUMBER}.${GITHUB_SHA:0:7}"
                   if [ "$RUN_ATTEMPT" != "1" ]; then
                       PR_VERSION="${PR_VERSION}-a${RUN_ATTEMPT}"
@@ -78,69 +87,117 @@ jobs:
               with:
                   script: |
                       const prNumber = context.payload.pull_request.number;
-                      const sha = context.payload.pull_request.head.sha.slice(0, 7);
+                      const shortSha = context.payload.pull_request.head.sha.slice(0, 7);
                       const branch = context.payload.pull_request.head.ref;
                       const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
                       const isFork = context.payload.pull_request.head.repo.full_name !== context.payload.repository.full_name;
                       const publishedVersion = process.env.PUBLISHED_VERSION || '';
-                      const showNpmOption = !isFork && publishedVersion !== '';
 
-                      const body = [
+                      // #3692: surface a bounded per-commit build ledger (newest first) on the PR
+                      // page so any recent commit maps to its npm version without digging through
+                      // Actions logs. History persists inside the bot comment itself as hidden
+                      // marker lines; each run parses prior entries back out, prepends itself,
+                      // dedupes by sha, and caps the list.
+                      const MAX_LEDGER_ROWS = 10;
+                      const MARKER_PREFIX = '<!--bili-build|';
+                      const MARKER_SUFFIX = '|-->';
+
+                      function parseLedger(commentBody) {
+                          const entries = [];
+                          for (const rawLine of String(commentBody || '').split('\n')) {
+                              const line = rawLine.trim();
+                              if (!line.startsWith(MARKER_PREFIX) || !line.endsWith(MARKER_SUFFIX)) continue;
+                              const parts = line.slice(MARKER_PREFIX.length, line.length - MARKER_SUFFIX.length).split('|');
+                              if (parts.length >= 2 && parts[0] && parts[1]) {
+                                  entries.push({ sha: parts[0], version: parts[1], runUrl: parts[2] || '' });
+                              }
+                          }
+                          return entries;
+                      }
+
+                      let ledger = [];
+                      let existingComment = null;
+                      if (!isFork) {
+                          const comments = await github.rest.issues.listComments({
+                              ...context.repo,
+                              issue_number: prNumber,
+                          });
+                          existingComment = comments.data.find(c =>
+                              c.user.type === 'Bot' && c.body.includes('📦 Built Package Artifact')
+                          ) || null;
+
+                          const merged = [];
+                          if (publishedVersion) merged.push({ sha: shortSha, version: publishedVersion, runUrl });
+                          for (const entry of parseLedger(existingComment ? existingComment.body : '')) merged.push(entry);
+
+                          const seen = new Set();
+                          for (const entry of merged) {
+                              if (!entry.sha || seen.has(entry.sha)) continue;
+                              seen.add(entry.sha);
+                              ledger.push(entry);
+                              if (ledger.length >= MAX_LEDGER_ROWS) break;
+                          }
+                      }
+
+                      const blocks = [];
+                      blocks.push([
                           '## 📦 Built Package Artifact',
-                          '',
-                          `**Branch:** \`${branch}\` (${sha})`,
-                          '',
-                          ...(isFork ? [
-                              '> Fork PR: the npm publish is skipped (repository secrets are not shared with fork workflows).',
-                              '',
-                          ] : []),
-                          ...(showNpmOption ? [
-                          '### Option A — Install this exact build (recommended)',
-                          '',
-                          '```bash',
-                          'npm install -g billion-context@' + publishedVersion,
-                          '```',
-                          '',
-                          'This exact version is immutable and reproducible. The rolling `pr` tag tracks the newest test build across all PRs.',
-                          '',
-                          ] : []),
-                          ...(isFork ? ['### Install from artifact'] : ['### Option B — Download artifact']),
-                          '',
+                          `**Branch:** \`${branch}\` (\`${shortSha}\`)`,
+                      ].join('\n'));
+
+                      if (isFork) {
+                          blocks.push('> Fork PR: the npm publish is skipped (repository secrets are not shared with fork workflows).');
+                      } else if (publishedVersion) {
+                          blocks.push([
+                              '### Latest build — install this exact version',
+                              '```bash',
+                              'npm install -g billion-context@' + publishedVersion,
+                              '```',
+                              'This exact version is immutable and reproducible. The rolling `pr` tag tracks the newest test build across all PRs.',
+                          ].join('\n'));
+                      }
+
+                      if (ledger.length > 0) {
+                          const rows = ledger.map(e =>
+                              `| \`${e.sha}\` | \`billion-context@${e.version}\` | ${e.runUrl ? `[build](${e.runUrl})` : '—'} |`
+                          );
+                          blocks.push([
+                              '### Recent builds (commit → version)',
+                              '| commit | version | build |',
+                              '|---|---|---|',
+                              ...rows,
+                          ].join('\n'));
+                      }
+
+                      blocks.push([
+                          isFork ? '### Install from artifact' : '### Download artifact',
                           `1. Download the artifact from the [Actions run](${runUrl})`,
                           '2. Extract the tarball and install:',
-                          '',
                           '```bash',
                           'tar xzf billion-context-pr' + prNumber + '.tgz',
                           'npm install -g package',
                           '```',
-                          '',
-                          '---',
-                          '*Install instructions are refreshed on each push.*',
-                      ].join('\n');
+                      ].join('\n'));
 
-                      await core.summary.addRaw(body).write();
+                      blocks.push('---\n*Install instructions are refreshed on each push.*');
+
+                      const summaryBody = blocks.join('\n\n');
+                      const markers = ledger.map(e => `${MARKER_PREFIX}${e.sha}|${e.version}|${e.runUrl}${MARKER_SUFFIX}`).join('\n');
+                      const commentBody = markers ? summaryBody + '\n\n' + markers : summaryBody;
+
+                      await core.summary.addRaw(summaryBody).write();
                       if (isFork) return;
 
-                      // Find and update existing comment, or create new one
-                      const comments = await github.rest.issues.listComments({
-                          ...context.repo,
-                          issue_number: prNumber,
-                      });
-
-                      const existing = comments.data.find(c =>
-                          c.user.type === 'Bot' && c.body.includes('📦 Built Package Artifact')
-                      );
-
-                      if (existing) {
+                      if (existingComment) {
                           await github.rest.issues.updateComment({
                               ...context.repo,
-                              comment_id: existing.id,
-                              body,
+                              comment_id: existingComment.id,
+                              body: commentBody,
                           });
                       } else {
                           await github.rest.issues.createComment({
                               ...context.repo,
                               issue_number: prNumber,
-                              body,
+                              body: commentBody,
                           });
                       }

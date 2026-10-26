@@ -1,12 +1,14 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
-import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput } from "../responses-tool-output.js";
+import { keepResponseId as knobKeepResponseId } from "../knobs.js";
+import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
-import { hashId } from "../util.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { hashId, strippedResponseIdWarning } from "../util.js";
+import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import type {
@@ -27,15 +29,24 @@ interface FunctionCallBuffer {
 // proxy-synthesized ids stay well below this cap (#242).
 const RESPONSES_ITEM_ID_MAX = 64;
 
-/**
- * Heal client rollouts already poisoned with over-long Bili-generated ids
- * (they 400 every request otherwise). Only the msg-proxy-* namespace bili
- * owns is rewritten — in place and deterministically, so repeated requests
- * keep referencing the same replacement id (#242). Provider-issued opaque
- * ids (reasoning rs_*, function_call fc_*, ...) validate against their
- * owner's shape rules and carry replay correspondence, so they must reach
- * the upstream byte-identical (#1474).
- */
+// Client-visible message ids bili mints. The upstream requires message item
+// ids to begin with "msg" (WC-015), so every message item — visibility
+// markers included — is minted under this one prefix.
+const PROXY_MESSAGE_ID_PREFIX = "msg-proxy-";
+// Minted for visibility markers by releases before WC-015. Recognized only so
+// rollouts those versions already poisoned heal at ingress instead of 400ing
+// on every subsequent request.
+const LEGACY_MARKER_MESSAGE_ID_PREFIX = "marker-";
+
+function proxyMessageItemId(outputIndex: number): string {
+    return `${PROXY_MESSAGE_ID_PREFIX}${Date.now()}-${outputIndex}`;
+}
+
+function isBiliMessageId(id: unknown): id is string {
+    return typeof id === "string"
+        && (id.startsWith(PROXY_MESSAGE_ID_PREFIX) || id.startsWith(LEGACY_MARKER_MESSAGE_ID_PREFIX));
+}
+
 export function normalizeResponsesMessageItems(input: unknown): number {
     if (!Array.isArray(input)) return 0;
     let typed = 0;
@@ -56,18 +67,27 @@ export function normalizeResponsesMessageItems(input: unknown): number {
     return typed;
 }
 
+/**
+ * Heal client rollouts already poisoned with Bili-generated ids (they 400
+ * every request otherwise). Only the namespaces bili owns are touched — in
+ * place and deterministically, so repeated requests keep referencing the same
+ * replacement id (#242). Provider-issued opaque ids (reasoning rs_*,
+ * function_call fc_*, ...) validate against their owner's shape rules and
+ * carry replay correspondence, so they must reach the upstream byte-identical
+ * (#1474).
+ */
 export function sanitizeResponsesInputIds(input: unknown): void {
     if (!Array.isArray(input)) return;
     for (const item of input) {
         const rec = item as Record<string, unknown>;
         // Client-visible proxy ids are not upstream item identities; replay the full message instead.
         if (rec?.type === "message" && rec.role === "assistant"
-            && typeof rec.id === "string" && rec.id.startsWith("msg-proxy-")
+            && isBiliMessageId(rec.id)
             && (typeof rec.content === "string" || Array.isArray(rec.content))) {
             delete rec.id;
             continue;
         }
-        if (typeof rec?.id === "string" && rec.id.startsWith("msg-proxy-")
+        if (typeof rec?.id === "string" && rec.id.startsWith(PROXY_MESSAGE_ID_PREFIX)
             && rec.id.length > RESPONSES_ITEM_ID_MAX) {
             rec.id = `msg-fix-${hashId(rec.id)}`;
         }
@@ -170,13 +190,20 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
             }
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            buf = buf.replace(/\r\n|\r/g, "\n");
+            buf = normalizeSseLineEndings(buf);
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
                 const raw = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
                 if (raw.trim().length > 0) yield raw;
             }
+        }
+        buf = finalizeSseLineEndings(buf);
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+            const raw = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (raw.trim().length > 0) yield raw;
         }
         if (buf.trim().length > 0) yield buf;
     } finally {
@@ -272,6 +299,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
     // crashes strict clients (codex) — same class as the anthropic gap (#413).
     let createdForwarded = false;
     let createdRespId: string | null = null;
+    // m00885: the client request bytes as shipped (user messages included,
+    // kernel prompt section excluded) — buildRequest runs before parseStream,
+    // so the filters below can echo-check an emission-shaped span against it.
+    let shippedRequestText: string | undefined;
     const ensureCreated = (): Buffer | null => {
         if (createdForwarded) return null;
         createdForwarded = true;
@@ -284,6 +315,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
     return {
         buildRequest(coreMessages, systemPrompt, requestBody) {
+            shippedRequestText = JSON.stringify(requestBody);
             const customToolCallIds = new Set<string>();
             for (const m of coreMessages) {
                 const bm = m as BiliMessage;
@@ -302,7 +334,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             } else {
                 inputItems = coreToResponses(coreMessages, customToolCallIds);
             }
-            inputItems = hoistTrappedToolItems(inputItems);
+            inputItems = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
@@ -311,7 +343,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
             const rebuilt: Record<string, unknown> = { ...requestBody, input: finalInput };
-            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+            // #1954: same as the HTTP path — warn when we strip a non-empty
+            // chain ref, since a delta continuation then loses its history silently.
+            if (!knobKeepResponseId()) {
+                const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
+                if (chainWarn) loggerLog("warn", `[acp-responses] ${chainWarn}`);
+                delete rebuilt.previous_response_id;
+            }
             delete rebuilt.instructions;
             return rebuilt;
         },
@@ -332,12 +370,22 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const remapped = new Map<string, MappedItem>();
             // #206: render-tag echo filter — deltas stream through the filter;
             // full-text events (.done / output_item.done / completed response)
-            // are stripped wholesale via stripResponsesText.
-            const tagFilter = composeStreamFilters(
+            // are stripped wholesale via stripResponsesText. #1881: reasoning
+            // summaries stream through their own per-summary filters — the old
+            // generic raw passthrough leaked model-emitted tags on this wire.
+            // m00885: whole-field absorb-emission drop is armed only when this
+            // request instructed the model about absorb (server-side provenance
+            // — the absorb section exists on this request's wire iff absorbName
+            // was resolved for it).
+            const absorbArmedLocal = absorbName !== undefined;
+            const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
                         loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                    }),
+                    }, (snippet) => {
+                        // #2190: residue audit — log-only, see plugin.ts twins.
+                        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }, absorbArmedLocal, shippedRequestText),
                     createMarkerLineFilter((snippet) => {
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
@@ -346,6 +394,11 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
+            const tagFilter = makeFilter();
+            // Unified ACP invariant: reasoning summaries are the thinking channel —
+            // identity filters, byte-verbatim (never rewritten; matches the
+            // openai adapter's reasoning_filter and #1960/KDD#10).
+            const reasoningFilters = new Map<string, { filter: TagEchoFilter; ref: { itemId: string; outputIndex: number; summaryIndex: number } }>();
             let lastTextRef: { itemId: string; outputIndex: number } | null = null;
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
@@ -355,17 +408,45 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         : undefined;
                     yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
                 }
+                for (const entry of reasoningFilters.values()) {
+                    const rtail = entry.filter.flush();
+                    if (rtail.length > 0) {
+                        yield {
+                            kind: "meta",
+                            chunk: rebuildResponsesEvent("response.reasoning_summary_text.delta", {
+                                type: "response.reasoning_summary_text.delta",
+                                item_id: entry.ref.itemId,
+                                output_index: entry.ref.outputIndex,
+                                summary_index: entry.ref.summaryIndex,
+                                delta: rtail,
+                            }),
+                            firstRoundOnly: true,
+                        } as ParsedStreamEvent;
+                    }
+                }
             };
             let sawReasoning = false;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
                 if (degenerateWarned) return;
+                // #1881: the gate reads the TEXT channel only — reasoning
+                // presence reaches it via sawReasoning, and counting reasoning
+                // chars as visible output would silence a tag-echo-only turn.
                 const msg = degenerateTurnWarning({ reason, terminalReason: "completed", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "responses" });
                 if (msg) {
                     degenerateWarned = true;
                     loggerLog("warn", msg);
                 }
+            };
+            // #2405(c): per-response strip total — see plugin.ts twin. n==1 is
+            // covered by its one-shot detail line, so stay silent there.
+            let stripSummarized = false;
+            const maybeSummarizeStrips = () => {
+                if (stripSummarized) return;
+                stripSummarized = true;
+                const total = tagFilter.stats().dropCount;
+                if (total > 1) loggerLog("warn", `[tag-echo] stripped ${total} occurrence(s) total in this response`);
             };
             for await (const eventStr of iterSseEvents(upstream)) {
                 const explicitType = extractEventType(eventStr);
@@ -420,11 +501,16 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
-                        const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
+                        const mapped = { id: `${PROXY_MESSAGE_ID_PREFIX}${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        // #1881: reasoning items carry whole-text summaries in
+                        // this fallthrough — strip on detection like the message
+                        // branches above (stripResponsesText never touches tool
+                        // argument fields).
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
                     type === "response.content_part.added" ||
@@ -435,7 +521,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     if (mapped) {
                         yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (!suppressTextLifecycle) {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                         yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
@@ -477,6 +563,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         if (nf && args) { nf.argsLen = args.length; nf.frags++; }
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     }
+                } else if (type === "response.custom_tool_call_input.delta" || type === "response.custom_tool_call_input.done") {
+                    // #1864: forward every round like the function_call_arguments siblings (the catch-all drops them in re-request rounds).
+                    yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -513,6 +602,20 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                        // #1862: a completed custom tool call IS executable output — count it
+                        // like function_call so the degenerate-retry gate (calls.length === 0)
+                        // does not treat a reasoning+custom-tool turn as an empty turn and
+                        // re-issue the request (duplicating the action). Passthrough: the wire
+                        // bytes already reached the client verbatim above, so the loop must not
+                        // re-emit it via emitToolCall. `input` is the custom-tool argument field.
+                        toolCallsEmitted++;
+                        yield {
+                            kind: "tool_call",
+                            name: typeof item.name === "string" ? item.name : "",
+                            callId: typeof item.call_id === "string" ? item.call_id : "",
+                            arguments: typeof item.input === "string" ? item.input : "",
+                            passthrough: true,
+                        } as ParsedStreamEvent;
                     } else if (item?.type === "message") {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = remapped.get(origId);
@@ -520,16 +623,21 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             remapped.delete(origId);
                             yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                         } else if (!suppressTextLifecycle) {
-                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        // #1881: reasoning items carry whole-text summaries in
+                        // this fallthrough — strip on detection like the message
+                        // branches above (stripResponsesText never touches tool
+                        // argument fields).
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
                     yield* flushFilter();
                     yield* settleNamelessDiag();
-                    responseObj = stripResponsesText((obj.response as Record<string, unknown>) ?? null);
+                    responseObj = stripResponsesText((obj.response as Record<string, unknown>) ?? null, absorbArmedLocal, shippedRequestText);
                     terminalKind = "completed";
                     terminalRaw = null;
                     const respUsage = (responseObj as Record<string, unknown> | null)?.usage as
@@ -543,12 +651,20 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
                     maybeWarnDegenerate("completed");
+                    maybeSummarizeStrips();
                     yield { kind: "done", finishReason: "completed", thinking: sawReasoning } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
                     yield* flushFilter();
                     yield* settleNamelessDiag();
                     terminalKind = "incomplete";
                     terminalRaw = rawBuf;
+                    // #2904: a max-output truncation that left nothing visible is
+                    // degenerate too (budget spent on reasoning before any
+                    // prose/tool call). The completed branch already warns; the
+                    // incomplete one did not — that gap is why #2904's
+                    // reasoning-only length turns logged no degenerate signal.
+                    const incDetails = (obj.response as Record<string, unknown> | undefined)?.incomplete_details as Record<string, unknown> | undefined;
+                    maybeWarnDegenerate(typeof incDetails?.reason === "string" ? incDetails.reason : "incomplete");
                     yield { kind: "done", finishReason: "incomplete" } as ParsedStreamEvent;
                 } else if (type === "response.failed" || type === "response.error") {
                     yield* flushFilter();
@@ -556,6 +672,37 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                } else if (type.startsWith("response.reasoning")) {
+                    // #1881: reasoning prose (summaries) streams through its own
+                    // per-summary filter instead of the raw passthrough this
+                    // used to fall into. firstRoundOnly keeps multi-round
+                    // forwarding semantics unchanged — only the bytes are cleaned.
+                    const rsDelta = typeof obj.delta === "string" ? obj.delta : "";
+                    if (rsDelta.length > 0) {
+                        const key = `${typeof obj.item_id === "string" ? obj.item_id : ""}:${typeof obj.summary_index === "number" ? obj.summary_index : 0}`;
+                        let entry = reasoningFilters.get(key);
+                        if (!entry) {
+                            entry = {
+                                filter: createIdentityStreamFilter(),
+                                ref: {
+                                    itemId: typeof obj.item_id === "string" ? obj.item_id : "",
+                                    outputIndex: typeof obj.output_index === "number" ? obj.output_index : 0,
+                                    summaryIndex: typeof obj.summary_index === "number" ? obj.summary_index : 0,
+                                },
+                            };
+                            reasoningFilters.set(key, entry);
+                        }
+                        const clean = entry.filter.push(rsDelta);
+                        if (clean.length > 0) {
+                            const chunk = clean === rsDelta ? rawBuf : rebuildResponsesEvent(type, { ...obj, delta: clean });
+                            yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        }
+                    } else {
+                        // Unified ACP invariant: non-delta reasoning-summary
+                        // events (.done with whole text) are thinking channel —
+                        // byte-verbatim, no strip pass.
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    }
                 } else {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
@@ -567,7 +714,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         },
 
         emitText(delta) {
-            return buildMessageItemSequence(`msg-proxy-${Date.now()}-${outputIndex}`, outputIndex++, delta);
+            return buildMessageItemSequence(proxyMessageItemId(outputIndex), outputIndex++, delta);
         },
 
         emitToolCall(call) {
@@ -578,7 +725,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
         emitMarker(toolName, result) {
             return buildMessageItemSequence(
-                `marker-${Date.now()}-${outputIndex}`,
+                proxyMessageItemId(outputIndex),
                 outputIndex++,
                 buildVisibilityMarker(toolName, result),
             );

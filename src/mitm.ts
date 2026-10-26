@@ -6,22 +6,23 @@ import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
 import { maskHostForLog, maskHostInText, maskHostPortForLog } from "./log-mask.js";
+import { mitmHandshakeTimeoutMs as knobMitmHandshakeTimeoutMs } from "./knobs.js";
+import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
 
-// Domains we transparently MITM. These are ONLY the model-inference endpoints
-// hardcoded in client BINARIES with no config file to discover from
-// (Claude=api.anthropic.com, codex-login=api.openai.com/chatgpt.com).
-// Everything else is auto-discovered at runtime from each client's config
-// (see discoverMitmDomains). Expanding this list expands the set of hosts
-// whose TLS we terminate — the security boundary.
-export const DEFAULT_MITM_DOMAINS = [
-    "api.anthropic.com",
-    "api.openai.com",
-    "chatgpt.com",
-];
+// Re-exported so existing importers (launcher.ts) keep their path; the const
+// itself lives in the leaf module so config.ts can use it without importing
+// this one (#3632 import-cycle constraint).
+export { DEFAULT_MITM_DOMAINS };
 
 /** Socket marker: when we MITM a CONNECT tunnel, we stash the original
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
+
+/** Socket marker: the raw TCP socket backing a MITM TLS leg. The connection
+ *  ledger (#1982) pairs the two records so the raw leg's close — which Node's
+ *  TLSWrap.close() structurally turns into destroy() even on fully graceful
+ *  TLS closes — can be classified with knowledge of how its TLS leg closed. */
+export const MITM_RAW_SOCKET_KEY = "__biliMitmRawSocket";
 
 // A client that rejects our MITM cert (root CA not trusted) can flood the log
 // with hundreds of identical handshake failures. Warn once, with the fix.
@@ -55,7 +56,7 @@ export function liveBlindTunnels(): number {
     return blindTunnelLive;
 }
 
-export interface BlindTunnelStats {
+interface BlindTunnelStats {
     total: number;
     hosts: Record<string, number>;
 }
@@ -66,7 +67,7 @@ export function recordBlindTunnel(host: string, log?: Logger): void {
     blindTunnelCounts.set(host, (blindTunnelCounts.get(host) ?? 0) + 1);
     if (!warnedBlindTunnels.has(host)) {
         warnedBlindTunnels.add(host);
-        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: GET /__bili/stats → blindTunnels (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
+        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: the blindTunnels field of GET /__bili/stats (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
     }
 }
 
@@ -90,10 +91,8 @@ export function _resetBlindTunnelStatsForTest(): void {
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
  *  opens the tunnel but never sends/trickle-feeds its ClientHello).
  *  Env-overridable so tests can exercise the timeout path quickly. */
-const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 function mitmHandshakeTimeoutMs(): number {
-    const v = Number.parseInt(process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+    return knobMitmHandshakeTimeoutMs();
 }
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a
@@ -102,9 +101,7 @@ function mitmHandshakeTimeoutMs(): number {
  *  binary-hardcoded DEFAULT_MITM_DOMAINS + caller-supplied extras + domains
  *  auto-discovered from client config files (see discoverMitmDomains). */
 export function isMitmHost(host: string, extraDomains: string[] = []): boolean {
-    const h = host.toLowerCase();
-    const all = [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()].map((d) => d.toLowerCase());
-    return all.some((d) => h === d || h.endsWith("." + d));
+    return matchesAnyMitmDomain(host, [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()]);
 }
 
 type Logger = (msg: string) => void;
@@ -272,8 +269,11 @@ function doMitm(
     }
     // Mark the socket so resolveUpstream() can recover the real origin. handle()
     // sees the decrypted request as a plain POST /api/anthropic/v1/messages —
-    // with this marker it routes to https://<host> instead of the default.
-    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}`;
+    // with this marker it routes to https://<host>[:port] instead of the default.
+    // The port must be preserved: dropping it silently misroutes every
+    // non-443 CONNECT to :443 (connect-refused for local gateways).
+    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}${port === 443 ? "" : `:${port}`}`;
+    (tlsSocket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] = clientSocket;
     // A TLS handshake error (client rejects our cert, abrupt disconnect,
     // reset) emits "error" on the TLSSocket. Without a listener Node treats
     // it as an uncaught exception and crashes the whole proxy. Destroy the

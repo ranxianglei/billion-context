@@ -97,7 +97,7 @@ test("plugin chat passthrough strips tags split across deltas and flushes tail b
     assert.ok(flushIdx !== -1 && doneIdx !== -1 && flushIdx < doneIdx, "flushed tail delta must precede [DONE]");
 });
 
-test("plugin chat passthrough strips echo from reasoning_content too", async () => {
+test("unified invariant: plugin chat passthrough leaves reasoning_content VERBATIM", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -107,8 +107,9 @@ test("plugin chat passthrough strips echo from reasoning_content too", async () 
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
-    assert.ok(!text.includes("m00007"), "reasoning echo stripped");
-    assert.ok(text.includes("think  done"), "reasoning prose survives");
+    // Thinking channel: byte-verbatim — echo-shaped reasoning rides as-is.
+    assert.ok(text.includes("m00007"), "reasoning rides verbatim (thinking channel)");
+    assert.ok(text.includes("think "), "reasoning prose rides verbatim");
 });
 
 test("plugin chat passthrough drops a chunk whose delta stripped to empty", async () => {
@@ -141,11 +142,13 @@ test("plugin chat passthrough keeps sibling text when one field is a pure tag ec
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
-    assert.ok(!text.includes("m00044"), "echo-only sibling field stripped");
+    // Unified invariant: reasoning_content is verbatim (thinking channel);
+    // only the visible content channel is managed.
+    assert.ok(text.includes("m00044"), "echo-only reasoning sibling rides verbatim (thinking channel)");
     assert.ok(text.includes("real answer"), "sibling field with real content must survive");
 });
 
-test("plugin chat passthrough still drops a chunk where every managed field is a pure tag echo (#463)", async () => {
+test("unified invariant: all-echo content + verbatim reasoning keeps the chunk (reasoning alone no longer drops it)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -155,9 +158,12 @@ test("plugin chat passthrough still drops a chunk where every managed field is a
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
-    assert.ok(!text.includes("m00123") && !text.includes("m00124"), "echoes stripped");
+    // Unified invariant: content is managed (pure echo -> stripped), reasoning
+    // is verbatim — so the chunk survives carrying the reasoning field alone.
+    assert.ok(!text.includes("m00123"), "content echo still stripped");
+    assert.ok(text.includes("m00124"), "reasoning echo rides verbatim (thinking channel)");
     const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
-    assert.equal(dataLines.length, 0, "all-echo chunk dropped");
+    assert.equal(dataLines.length, 1, "chunk survives carrying the verbatim reasoning field");
 });
 
 test("plugin chat passthrough keeps tool_calls deltas byte-identical", async () => {
@@ -233,7 +239,7 @@ test("plugin chat passthrough resolves held tail at stream end without [DONE]", 
     assert.ok(!text.includes("m0"), "unclosed tag content dropped at stream end");
 });
 
-test("plugin anthropic passthrough strips render tags from text_delta and thinking_delta", async () => {
+test("plugin anthropic passthrough strips render tags from text_delta but keeps signed thinking_delta byte-for-byte (#1960)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -246,7 +252,10 @@ test("plugin anthropic passthrough strips render tags from text_delta and thinki
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "anthropic", session);
     const text = out.join("");
-    assert.ok(!text.includes("m00009") && !text.includes("m00010"), "render tags stripped from both delta types");
+    // #1960/KDD#10: signed thinking rides byte-for-byte — rewriting it desyncs
+    // its signature and bricks replay. Only the text channel is stripped.
+    assert.ok(text.includes("m00009"), "signed thinking_delta stays byte-for-byte (#1960)");
+    assert.ok(!text.includes("m00010"), "render tags stripped from the text channel");
     assert.ok(text.includes("hi  bye"), "text prose survives");
     assert.ok(text.includes("hmm "), "thinking prose survives");
     assert.equal((session.stats as Record<string, unknown>)["lastInputTokens"], 42, "usage sampled from message_start");

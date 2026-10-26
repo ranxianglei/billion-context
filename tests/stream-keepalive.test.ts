@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, beginStreamKeepalive, type ProxyOptions } from "../src/server.ts";
+import { startServer, beginStreamKeepalive } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -61,7 +62,7 @@ async function startUpstream(mode: "slow" | "fast", silenceMs: number): Promise<
     });
     srv.listen(0, "127.0.0.1");
     await once(srv, "listening");
-    return { port: srv.address().port, server: srv };
+    return { port: (srv.address() as { port: number }).port, server: srv };
 }
 
 async function startHarness(upstreamPort: number): Promise<Harness> {
@@ -81,13 +82,21 @@ async function startHarness(upstreamPort: number): Promise<Harness> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
     return {
-        proxyPort: proxy.address().port,
+        proxyPort: (proxy.address() as { port: number }).port,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
         },
     };
@@ -103,7 +112,7 @@ async function readStream(url: string, sessionId: string): Promise<{ status: num
         body: JSON.stringify({ model: "gpt-test", max_tokens: 4096, stream: true, messages: [{ role: "user", content: "hello" }] }),
     });
     let raw = "";
-    for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+    for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
     return { status: resp.status, raw };
 }
 
@@ -130,6 +139,7 @@ test("#1647 slow prefill: keep-alive comments hold the client through ping-only 
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }
@@ -149,6 +159,7 @@ test("#1647 fast stream: no spurious keep-alive injection", async () => {
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }
@@ -167,6 +178,7 @@ test("#1647 BILI_STREAM_KEEPALIVE_MS=0 disables the hold", async () => {
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }

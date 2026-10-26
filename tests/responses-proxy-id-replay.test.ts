@@ -32,7 +32,7 @@ test("native ids, references, non-assistant items and incomplete messages remain
     const input: unknown[] = [
         null, undefined, 0, "text", false,
         { type: "message", role: "assistant", id: "msg_native", content: "answer" },
-        { type: "message", role: "assistant", id: "marker-123-0", content: "answer" },
+        { type: "message", role: "assistant", id: "msg_native_2", content: "answer" },
         ...["user", "system", "developer"].map(role => ({ type: "message", role, id: proxyId, content: "text" })),
         ...[undefined, null, {}].map(content => ({ type: "message", role: "assistant", id: proxyId, content })),
         { type: "message", role: "assistant", id: 123, content: "answer" },

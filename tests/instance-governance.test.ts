@@ -15,6 +15,7 @@ import {
     readStartingMarker,
     registerInstanceAndWarn,
     removeStartingMarker,
+    warnOnNewPeers,
     startingMarkerPath,
     unregisterInstance,
     type ProxyInstanceFile,
@@ -249,6 +250,70 @@ test("instance registry: #394 warning is lane-aware — cross-lane silent, same-
             (msg) => warnings.push(msg),
         );
         assert.equal(warnings.length, 4, "no-lane (wildcard) overlaps every live instance, incl. legacy markers");
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
+test("instance registry: resident warns once per newly-appearing live peer, remembers them (#2401)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        registerInstanceAndWarn(
+            { instanceId: "a", pid: process.pid, port: 1, origin: "http://127.0.0.1:1", startedAt: 1 },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 0);
+        // A peer registers AFTER "a" — the resident's rescan must see it.
+        registerInstanceAndWarn(
+            { instanceId: "b", pid: process.pid, port: 2, origin: "http://127.0.0.1:2", startedAt: 2 },
+            () => {},
+        );
+        const seen = new Set<string>();
+        const fresh = warnOnNewPeers({ instanceId: "a" }, seen, (msg) => warnings.push(msg));
+        assert.deepEqual(fresh, ["b"], "newly-seen live peer reported");
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /appeared while this process was already running/);
+        seen.add("b");
+        assert.deepEqual(warnOnNewPeers({ instanceId: "a" }, seen, (msg) => warnings.push(msg)), [], "already-warned peer not repeated");
+        assert.equal(warnings.length, 1);
+        // Dead peers never warn; own id never warns.
+        fs.writeFileSync(
+            path.join(st.dir, "billion-context", "instances", "c.json"),
+            JSON.stringify({ instanceId: "c", pid: deadPid(), port: 3, origin: "http://127.0.0.1:3", startedAt: 3 }),
+        );
+        assert.deepEqual(warnOnNewPeers({ instanceId: "a" }, seen, (msg) => warnings.push(msg)), []);
+        unregisterInstance("b");
+        assert.deepEqual(warnOnNewPeers({ instanceId: "a" }, new Set<string>(), (msg) => warnings.push(msg)), [], "unregistered peer gone");
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
+test("instance registry: peer rescan is lane-aware like the startup warning (#2401/#1232)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        registerInstanceAndWarn(
+            { instanceId: "a", pid: process.pid, port: 1, origin: "http://127.0.0.1:1", startedAt: 1, lane: "pi" },
+            () => {},
+        );
+        registerInstanceAndWarn(
+            { instanceId: "b", pid: process.pid, port: 2, origin: "http://127.0.0.1:2", startedAt: 2, lane: "codex" },
+            () => {},
+        );
+        assert.deepEqual(warnOnNewPeers({ instanceId: "a", lane: "pi" }, new Set<string>(), (m) => warnings.push(m)), [], "different lanes are legitimate concurrent use");
+        registerInstanceAndWarn(
+            { instanceId: "c", pid: process.pid, port: 3, origin: "http://127.0.0.1:3", startedAt: 3, lane: "pi" },
+            () => {},
+        );
+        const fresh = warnOnNewPeers({ instanceId: "a", lane: "pi" }, new Set<string>(), (m) => warnings.push(m));
+        assert.deepEqual(fresh, ["c"], "same-lane late peer warned");
+        assert.match(warnings[0], /lane "pi"/);
     } finally {
         setLogCapture(null);
         st.restore();

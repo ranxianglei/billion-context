@@ -1,5 +1,10 @@
 export const WEB_STYLES = String.raw`
 :root {
+    /* #2473: bind the document canvas to the SAME signal that drives the
+       palette (prefers-color-scheme). Without this the canvas stays white no
+       matter the scheme, so the embed face (--bg: transparent) painted its
+       light-scheme text on a white ground in dark mode → unreadable stats. */
+    color-scheme: light dark;
     --bg: #ffffff;
     --bg-elev: #f6f8fa;
     --bg-muted: #f0f2f5;
@@ -21,8 +26,14 @@ export const WEB_STYLES = String.raw`
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
+/* #2559: an embedding host can pin the face explicitly (?theme=light|dark →
+   <html data-theme=…>) because a host APP-level theme is invisible to the
+   framed document's prefers-color-scheme. An explicit pin outranks the OS
+   signal, so the media query below is narrowed to documents WITHOUT one;
+   the pinned palette repeats the same list (CSS cannot share declarations
+   across media boundaries — keep the two lists in sync). */
 @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme]) {
         --bg: #0d1117;
         --bg-elev: #161b22;
         --bg-muted: #1c2129;
@@ -42,6 +53,30 @@ export const WEB_STYLES = String.raw`
         --purple: #a371f7;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     }
+}
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-muted: #1c2129;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-faint: #6e7681;
+    --accent: #4493f8;
+    --accent-soft: rgba(68, 147, 248, 0.14);
+    --green: #3fb950;
+    --green-soft: rgba(63, 185, 80, 0.14);
+    --red: #f85149;
+    --red-soft: rgba(248, 81, 73, 0.12);
+    --amber: #d29922;
+    --amber-soft: rgba(210, 153, 34, 0.14);
+    --purple: #a371f7;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+:root[data-theme="light"] {
+    color-scheme: light;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
@@ -90,8 +125,10 @@ body {
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
-.banner .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
-.banner .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.banner .banner-upgrade-now { display: block; margin-top: 8px; padding: 4px 12px; border: 1px solid currentColor; border-radius: var(--radius); background: transparent; color: inherit; font-size: 12.5px; cursor: pointer; }
+.banner .banner-upgrade-now:disabled { opacity: 0.55; cursor: default; }
+.banner .alert-row, .card .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.banner .alert-row > span, .card .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -145,6 +182,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .badge.live { background: var(--green-soft); color: var(--green); border-color: var(--green); }
 .badge.disk { background: var(--bg-muted); color: var(--text-muted); border-color: var(--border); }
 .badge.proto { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
+.badge.ext { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
 .badge.warn { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .badge.ok { background: var(--green-soft); color: var(--green); border-color: var(--green); }
 
@@ -181,8 +219,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .section-label { font-size: 12px; font-weight: 650; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 18px 0 8px; }
 .section-label:first-child { margin-top: 0; }
 
-.chart-wrap { width: 100%; overflow-x: auto; }
+.chart-wrap { width: 100%; overflow-x: auto; position: relative; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
+#traj-chart { cursor: crosshair; user-select: none; }
+.chart-status { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.chart-status[hidden] { display: none; }
+.chart-brush { position: absolute; background: rgba(9, 105, 218, 0.15); border-left: 1px solid #0969da; border-right: 1px solid #0969da; pointer-events: none; }
 .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-muted); margin-top: 8px; flex-wrap: wrap; }
 .chart-legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 
@@ -198,6 +240,37 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body { padding: 0 16px 12px 78px; font-size: 12.5px; color: var(--text-muted); white-space: pre-wrap; }
 .block-item .body.md { white-space: normal; }
 .block-item .body.md p { margin: 6px 0; }
+
+/* Changelog section (#3719): collapsible releases inside the overview card */
+.cl-card summary { list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.cl-card summary::-webkit-details-marker { display: none; }
+.cl-card summary::before { content: "\25B8"; color: var(--text-muted); font-size: 11px; transition: transform .12s; }
+.cl-card[open] summary::before { transform: rotate(90deg); }
+.cl-card summary:hover { background: var(--bg-muted); }
+.cl-item { border-bottom: 1px solid var(--border-soft); }
+.cl-item:last-of-type { border-bottom: none; }
+.cl-item summary { list-style: none; cursor: pointer; padding: 8px 16px; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.cl-item summary::-webkit-details-marker { display: none; }
+/* #3719 phase 2: 更新/Updates tab — pushed-notice rows + tier badges */
+.ntc-item { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+.ntc-item:last-child { border-bottom: none; padding-bottom: 0; }
+.badge.ntc-critical { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.badge.ntc-recommended { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+.cl-item summary:hover { background: var(--bg-muted); }
+.cl-item > div { white-space: normal; overflow-wrap: anywhere; }
+.cl-item .cl-tag { font-weight: 700; }
+.badge.cl-latest { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.cl-body { padding: 12px 16px 4px 32px; font-size: 12.5px; line-height: 1.65; color: var(--text-soft, var(--text-muted)); }
+.cl-body .cl-h { font-size: 13px; font-weight: 700; color: var(--text); margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border-soft); }
+.cl-body .cl-p { margin: 5px 0; }
+.cl-body .cl-li { margin: 3px 0; padding-left: 15px; position: relative; }
+.cl-body .cl-li::before { content: "\2022"; position: absolute; left: 3px; color: var(--text-muted); font-weight: 700; }
+.cl-foot { margin: 10px 0 2px; }
+.cl-cat { display: flex; gap: 8px; align-items: baseline; margin: 12px 0 3px; padding-top: 8px; border-top: 1px solid var(--border-soft); font-weight: 700; font-size: 12.5px; color: var(--text); }
+.cl-body .cl-cat:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+.cl-cat .dim { font-weight: 400; font-size: 11.5px; }
+.cl-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-soft); transition: background .4s ease-out; }
 .block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
 .block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
 .block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }
@@ -208,6 +281,71 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body.md blockquote { margin: 6px 0; padding: 5px 10px; border-left: 3px solid var(--border); background: var(--bg-muted); border-radius: 0 8px 8px 0; }
 .block-item .body.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
 .block-item .body.md strong { color: var(--text); }
+
+/* #3917: detail-page panes + compression tree */
+.det-tabs { display: flex; gap: 4px; margin: 16px 0 0; border-bottom: 1px solid var(--border); }
+.det-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--text-muted); cursor: pointer; }
+.det-tab:hover { color: var(--text); }
+.det-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.det-tab .hint { font-weight: 400; }
+.det-pane { margin-top: 16px; }
+.tree-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 2px 0 10px; color: var(--text-muted); }
+.tree-actions { display: flex; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
+.block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
+/* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
+   (layered block boxes on a light canvas, tier-tinted borders). */
+.tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
+.tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
+.tree-mode { color: var(--text-muted); }
+.tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
+.g-svg { display: block; max-width: 100%; height: auto; }
+/* #4173 review: the live map flows WITH the page — no inner scroll box, so a
+   long session reads as one continuous document (drawing on top, list below).
+   The drawing keeps full-size fonts unless it is the compact map. */
+.tm-view { position: relative; }
+.tm-svg { display: block; width: 100%; height: 100%; }
+.tm-svg .g-id { font-size: 10px; }
+.tm-svg .g-meta { font-size: 9px; }
+/* zoom resizes .tm-inner; the browser scales the svg uniformly to fill it. */
+.tm-inner { position: relative; margin: 0 auto; }
+.g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
+.g-node { cursor: pointer; }
+.g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
+.g-node.tier-1 rect { stroke: var(--accent); fill: #f2f7ff; }
+.g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
+.g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
+.g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
+.g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
+.g-node.inactive text { opacity: .5; }
+.g-node:hover rect { stroke-width: 2.4; }
+.g-id { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
+.g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
+.blk-sum.clamp { display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.blk-sum-toggle { margin-top: 6px; }
+.block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+.block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
+.block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }
+.block-node summary .blk-copy { margin-left: auto; flex: none; }
+.block-node summary .meta { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.block-node .topic { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.block-node .body { padding: 0 16px 10px 70px; }
+.block-node .blk-content-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px 8px 70px; }
+.block-node .blk-content { margin: 0 16px 12px 70px; }
+.blk-content-meta { color: var(--text-muted); margin-bottom: 6px; }
+.blk-msgs { list-style: none; margin: 0 16px 10px 70px; padding: 0; border-left: 1px dashed var(--border-soft); }
+.blk-msgs li { margin: 0; }
+.msg-row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; border-radius: 6px; padding: 4px 6px; cursor: pointer; color: var(--text-muted); font: inherit; }
+.msg-row:hover { background: var(--bg-muted); color: var(--text); }
+.msg-row.missing { cursor: default; opacity: .65; }
+.msg-row.missing:hover { background: none; color: var(--text-muted); }
+.msg-row .mref { color: var(--text); font-size: 12px; flex: none; }
+.msg-row .mprev { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12px; }
+.msg-row .badge { flex: none; }
+.blk-msgs .msg-body { margin: 0 6px 8px 8px; }
+.blk-msgs .msg-body .blk-content-pre { max-height: 320px; }
+.blk-content-pre { background: var(--bg-muted); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word; }
+.tier-1 summary .bid { color: var(--accent); }
+.warn-text { color: #bf8700; }
 
 .handoff { font-size: 13.5px; line-height: 1.65; }
 .handoff h1, .handoff h2, .handoff h3, .handoff h4 { margin: 18px 0 8px; line-height: 1.3; }
@@ -245,7 +383,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 720px) {
+    .topbar { flex-wrap: wrap; height: auto; min-height: 52px; padding: 10px 12px; gap: 10px; }
+    .topbar .actions { margin-left: auto; }
+    .fork-link { display: none; }
+    .nav { order: 3; flex: 1 1 100%; min-width: 0; }
     table.data th:nth-child(n + 6), table.data td:nth-child(n + 6) { display: none; }
+    /* hiding TDs frees nothing under table-layout: fixed — the <col> tracks of
+       the hidden columns still claim their px, so the SESSION column (the only
+       auto track) collapses to a sliver and its nowrap title overflows onto the
+       adjacent cells (double-exposed rows). Zero the hidden tracks so the freed
+       space lands on the title column again. */
+    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
     main { padding: 12px; }
     .kv { grid-template-columns: 1fr; row-gap: 3px; }
     .kv .k { margin-top: 6px; }
@@ -254,6 +402,18 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 [hidden] { display: none !important; }
 .search { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 13px; max-width: 280px; outline: none; }
 .search:focus { border-color: var(--accent); }
+.ses-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.ses-filter { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 8px; padding: 6px 8px; font-size: 12.5px; max-width: 190px; outline: none; }
+.ses-filter:focus { border-color: var(--accent); }
+.ses-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -6px 0 10px; }
+.ses-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 10px; }
+.ses-pager #ses-page-label { min-width: 110px; text-align: center; font-variant-numeric: tabular-nums; }
+.ses-pager button:disabled { opacity: 0.45; cursor: default; }
+@media (max-width: 720px) {
+    .ses-toolbar { justify-content: flex-start; }
+    .ses-toolbar .search { flex: 1 1 220px; max-width: none; }
+    .ses-filter { flex: 1 1 140px; max-width: none; }
+}
 .route-block { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .route-block:last-child { border-bottom: none; padding-bottom: 0; }
 .route-key { font-weight: 600; font-size: 13px; margin-bottom: 6px; word-break: break-all; }
@@ -313,6 +473,8 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .twide table.data { min-width: 940px; table-layout: fixed; }
 .hitc { font-size: 11px; letter-spacing: -0.2px; }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-cell { min-width: 0; }
+.w-client { display: inline-block; max-width: 100%; vertical-align: bottom; }
 .w-title { display: inline-block; max-width: 230px; vertical-align: bottom; }
 .w-up { display: inline-block; max-width: 128px; vertical-align: bottom; }
 .copy-btn.copied, .btn.copied { border-color: var(--green); color: var(--green); background: var(--green-soft); }
@@ -332,4 +494,66 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 /* Log view rows (filtered mode): actual hits vs context / time-window lines. */
 .lm-ctx { opacity: 0.55; }
 .lm-hit { background: rgba(94, 164, 255, 0.14); border-radius: 3px; }
+#summary-settings { margin-top: 16px; }
+.summary-target { min-width: 0; margin: 14px 0; padding: 12px; border: 1px solid var(--border); border-radius: 4px; }
+.summary-target legend { max-width: 100%; overflow-wrap: anywhere; font-size: 13px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin-bottom: 12px; }
+.summary-grid label { display: grid; gap: 5px; min-width: 0; font-size: 12px; }
+#summary-settings .field-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.summary-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.summary-creds { margin: 14px 0; }
+.summary-creds h4 { margin: 0 0 8px; font-size: 13px; }
+.summary-actions label:has(input[type="password"]) { display: grid; gap: 5px; flex: 1 1 200px; min-width: 0; font-size: 12px; }
+.summary-actions .btn { min-height: 32px; }
+
+/* #2321: embeddable face (?embed=1) — framed inside a host settings page
+   (dsh). The host draws its own chrome and tab bar, so ours hides; tokens
+   flatten toward dsh-like values: transparent ground, translucent gray
+   borders, no shadow, 8px radius. Text colors keep following the scheme. */
+.embed .topbar { display: none; }
+.embed {
+    --shadow: none;
+    --radius: 8px;
+    --bg: transparent;
+    --bg-elev: rgba(127, 127, 127, 0.05);
+    --bg-muted: rgba(127, 127, 127, 0.09);
+    --border: rgba(127, 127, 127, 0.4);
+    --border-soft: rgba(127, 127, 127, 0.22);
+}
+/* #2448: the embed face lives in a NARROW host panel (a dsh settings
+   column), never a full browser tab — reuse the phone-compact column set
+   (cols 6+ hidden, same as the ≤720px rule) at ANY width and drop the
+   standalone-page min-widths so the tables fit the panel instead of
+   scrolling sideways. */
+.embed .tproc table.data { min-width: 0; }
+.embed .twide table.data { min-width: 0; }
+.embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }
+/* same fixed-layout trap as the ≤720px rule above — the hidden
+   columns' <col> tracks must release their widths or the title column
+   collapses and rows render double-exposed. */
+.embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+.embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
+/* #2560: the frame hugs its edges hard at narrow panel widths — give the
+   embed face a little breathing room instead of zero gutter. */
+.embed main { max-width: none; padding: 8px 10px 16px; }
+.embed .banner { margin: 8px 0 0; }
+
+/* #4587: panel-embedded blog & article view (#/blog index + #/blog/<slug> pages) */
+.bl-row { display: flex; align-items: baseline; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border-soft); text-decoration: none; color: inherit; }
+.bl-row:last-child { border-bottom: none; }
+.bl-row:hover .bl-title { color: var(--accent); }
+.bl-date { color: var(--text-faint); font-size: 12px; }
+.bl-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bl-title-alt { color: var(--text-faint); font-weight: 400; }
+.bl-arrow { color: var(--text-faint); font-size: 12px; }
+.bl-back { color: var(--accent); text-decoration: none; font-size: 12px; }
+.bl-back:hover { text-decoration: underline; }
+.bl-h { margin: 10px 0 0; font-size: 20px; line-height: 1.35; }
+.post-body p { line-height: 1.7; }
+.post-body pre { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.post-body code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-elev); padding: 1px 5px; border-radius: 4px; }
+.post-body pre code { background: none; padding: 0; }
+.post-body blockquote { border-left: 3px solid var(--accent); margin: 12px 0; padding: 4px 14px; color: var(--text-muted); background: var(--bg-elev); border-radius: 0 8px 8px 0; }
+.post-body h2 { margin-top: 22px; }
+.post-body .md-img { max-width: 100%; border-radius: 8px; border: 1px solid var(--border-soft); }
 `;

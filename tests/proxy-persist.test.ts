@@ -1,4 +1,8 @@
 import { test } from "node:test";
+// #4004/#4242: this file pins the LEGACY envelope layer (guard semantics,
+// directory shape). Full mode adds index.db to the dir and serves
+// unified-first — both would make these assertions nondeterministic.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -31,7 +35,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -39,6 +43,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -386,10 +391,15 @@ await withTempStore("one-time migration re-keys legacy hash-id sessions to their
     b.stats.requests = 1;
     await store.writeNow(b);
 
-    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === legacyB)!;
-    const envB = JSON.parse(readFileSync(fileB, "utf8"));
-    envB.savedAt -= 1000; // A is newer → A wins the same-label collision
-    writeFileSync(fileB, JSON.stringify(envB));
+    // Explicit, well-separated savedAt pins so the same-label winner is
+    // deterministic regardless of wall-clock jitter between the writes (#4140 instance 4).
+    const base = Date.now();
+    for (const [id, savedAt] of [[legacyA, base + 2 * 60_000], [legacyB, base + 60_000]] as const) {
+        const f = jsonFilesUnder(dir).find((x) => JSON.parse(readFileSync(x, "utf8")).id === id)!;
+        const env = JSON.parse(readFileSync(f, "utf8"));
+        env.savedAt = savedAt;
+        writeFileSync(f, JSON.stringify(env));
+    }
 
     // A fresh store mirrors a new process: no discovered-file cache.
     const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
@@ -464,10 +474,12 @@ test("SessionStore routes write failures through the EPERM detector (no false al
         store.scheduleSave(makeSession("wire-1"));
         // acp-kernel 0.0.53 retries the whole write cycle on transient
         // ENOTDIR (~1.5s ladder) before the failure line is logged — poll
-        // with headroom instead of a fixed settle().
+        // with headroom instead of a fixed settle(). The ladder stretches past
+        // its nominal duration on loaded machines (observed >5s), so the
+        // window leaves wide margin rather than racing the retry schedule.
         await waitFor(
             () => captured.find((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for ")) ?? null,
-            5000,
+            15000,
             "kernel write-failure line to reach the wrapped log",
         );
         const failLines = captured.filter((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for "));

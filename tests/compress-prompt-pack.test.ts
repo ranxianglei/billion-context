@@ -101,3 +101,19 @@ test("resolveCompressSurfaceDetailed: file pack reports the requested name and i
         rmrf(dir);
     }
 });
+
+test("#2335: lean surface now carries the condensed system-prompt contract (pack promptSections reach the proxy builders)", () => {
+    // Before the kernel fix the lean surface only swapped tool descriptions and
+    // every lane silently assembled the FULL default system prompt (10.9KB).
+    const surface = resolveCompressSurface({ promptPack: "lean" });
+    assert.ok(surface.promptSections, "lean exposes top-level promptSections");
+    const prompt = buildCompressSystemPrompt(defaultPrompts, surface.promptSections);
+    assert.ok(prompt.includes("Your summary is the ONLY record"), "condensed lean contract is delivered");
+    assert.ok(prompt.includes("Recall on demand only"), "recall discipline is delivered");
+    assert.ok(prompt.includes("read that file"), "file-pointer discipline is delivered");
+    assert.ok(!prompt.includes("Compression Philosophy: All compression serves the primary task"), "verbose default philosophy is gone");
+    // default lane stays byte-stable: no pack → the same default assembly as ever
+    const plain = buildCompressSystemPrompt(defaultPrompts, undefined);
+    assert.ok(plain.startsWith("Compression Philosophy:\n- All compression serves the primary task"));
+    assert.ok(!plain.includes("Your summary is the ONLY record"));
+});

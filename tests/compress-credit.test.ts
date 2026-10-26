@@ -20,7 +20,7 @@ function makeCtx(messages: CoreMessage[]): {
         session: {
             id: "compress-credit-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -28,6 +28,7 @@ function makeCtx(messages: CoreMessage[]): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -119,14 +120,17 @@ test("#252: failed compress accrues no credit", async () => {
     const ctx = makeCompressibleCtx();
     // Sub-viability range (kernel minCompressRange) → compress FAILS.
     const badArgs = JSON.stringify({ content: [{ startId: "m00007", endId: "m00007", summary: "s" }] });
+    // Usage rides the round-1 completion: the failed-only breaker (#156/#4186)
+    // ends the turn before any re-request, so this is the only usage report of
+    // the turn — it must still land raw (no credit netting).
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", badArgs),
-        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [] } }),
+        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 50000, output_tokens: 5 } } }),
     ].join("");
-    const refetch = sse("response.completed", { response: { id: "resp_refetch", status: "completed", output: [], usage: { input_tokens: 50000 } } });
+    let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(refetch, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(sse("response.completed", { response: { id: "resp_none", status: "completed", output: [] } }), { status: 200, headers: { "content-type": "text/event-stream" } }); }) as typeof fetch;
     try {
         await drain(
             new Response(round1, { status: 200 }).body!,
@@ -134,6 +138,7 @@ test("#252: failed compress accrues no credit", async () => {
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
+        assert.equal(fetchCalls, 0, "failed-only round breaks before any re-request (#4186)");
         assert.equal(ctx.session.stats.compressCreditTokens, 0, "no credit on failed compress");
         assert.equal(ctx.session.stats.lastInputTokens, 50000, "usage lands raw when nothing was compressed");
     } finally {

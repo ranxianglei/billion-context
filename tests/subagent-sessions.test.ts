@@ -24,7 +24,8 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
         session: {
             id: "subagent-sessions-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            pendingRetrievals: [],
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -59,7 +60,7 @@ function seedDispatch(idCall: string, idResult: string, sessionId: string): Core
 }
 
 function runApply(ctx: Ctx, args: unknown): string {
-    return applyRanges(parseCompressInput(args), ctx);
+    return applyRanges(parseCompressInput(args), ctx).text;
 }
 
 function opencode(ctx: Ctx): Ctx {
@@ -130,7 +131,7 @@ test("sync is gated on opencode and prunes dead blocks; empty re-capture keeps t
         state: { blocks: [{ blockId: "b1", active: true }] },
     };
     syncSubagentSessions(gate, [{ blockId: "b1", effectiveMessageIds: [], directBlockIds: [] }], []);
-    assert.equal((gate.metadata.subagentSessions as unknown), undefined);
+    assert.equal((gate.metadata?.subagentSessions as unknown), undefined);
 
     const session = {
         metadata: { pluginAgent: "opencode", subagentSessions: { b1: ["ses_old"], bDead: ["ses_dead"] } },

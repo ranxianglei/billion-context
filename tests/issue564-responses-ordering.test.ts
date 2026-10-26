@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap, refForRaw } from "acp-kernel";
-import { responsesToCore, coreToResponses, type ResponsesProjection, type BiliMessage } from "acp-kernel/wire";
+import { responsesToCore, coreToResponses, type ResponsesProjection, type BiliMessage, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -20,7 +20,8 @@ function makeSession(): Session {
     return {
         id: "issue564-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0,         rangeRestores: 0 },
+        pendingRetrievals: [],
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -120,7 +121,7 @@ function twoTurnBody(): Record<string, unknown> {
 
 const userMsg = (id: string, text: string): CoreMessage => ({ id, role: "user", contentType: "text", text });
 const asstMsg = (id: string, text: string): CoreMessage => ({ id, role: "assistant", contentType: "text", text });
-const reasoningMsg = (id: string, enc: string): CoreMessage => ({ id, role: "assistant", contentType: "reasoning", text: id, rawResponsesItem: { type: "reasoning", id, encrypted_content: enc, summary: [] } });
+const reasoningMsg = (id: string, enc: string): CoreMessage & { rawResponsesItem: Record<string, unknown> } => ({ id, role: "assistant", contentType: "reasoning", text: id, rawResponsesItem: { type: "reasoning", id, encrypted_content: enc, summary: [] } });
 const toolCall = (id: string, callId: string, name: string, args: string): CoreMessage => ({ id, role: "assistant", contentType: "tool-call", toolCallId: callId, toolName: name, text: args });
 const toolResult = (id: string, callId: string, out: string): CoreMessage => ({ id, role: "tool", contentType: "tool-result", toolCallId: callId, text: out });
 
@@ -132,11 +133,11 @@ test("#564 path 2: compress re-request keeps Responses assistant run ordering va
     const session = makeSession();
     const core = createCore();
     const config = defaultConfig(200000, {
-        compress: { minCompressRange: 0, minSummaryLength: 0 },
+        compress: { minCompressRange: 0, minSummaryLength: 0, maxSummaryLength: 20000 },
         preserveRecentMessages: 4,
         preserveRecentTokens: 0,
     });
-    const projection = responsesToCore(twoTurnBody());
+    const projection = responsesToCore(twoTurnBody() as ResponsesRequestBody);
     const original = projection.msgs;
     const prepTurn = core.processTurn({ messages: original, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
     session.state = prepTurn.state;

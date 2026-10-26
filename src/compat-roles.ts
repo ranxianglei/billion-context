@@ -125,6 +125,63 @@ export function detectSystemPlacementError(status: number, bodyText: string): bo
     return PLACEMENT_MARKERS.some((re) => re.test(norm));
 }
 
+/** #1996 — Responses item types that materialize as chat messages upstream
+ *  (vLLM maps function_call/custom_tool_call→assistant, *_output→tool,
+ *  reasoning→assistant), so a system item placed after any of them is
+ *  off-head for the model's chat template. */
+const ROLE_PRODUCING_TYPES = new Set([
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "reasoning",
+]);
+
+/**
+ * #1996 — does this wire body carry the shape placement-strict backends
+ * reject? A literal role:"system" message that is not the first chat-producing
+ * item (or a second system anywhere) trips Qwen-family Jinja chat templates
+ * served by vLLM/SGLang: "System message must be at the beginning." Bili never
+ * emits such items itself (front block/anchors ride as developer,
+ * nudges/separators as user, top-level instructions stripped), so offenders
+ * are client-origin mid-history system items forwarded verbatim by the
+ * plugin-mode position-preserving pass-through (#1638). Eligibility mirrors
+ * applyCompatRolesJson exactly; on the Responses wire a non-empty top-level
+ * `instructions` string becomes a leading system upstream, so with it present
+ * ANY input[] system is off-head.
+ */
+export function hasOffHeadSystem(body: string, protocol: "openai" | "responses"): boolean {
+    let parsed: Record<string, unknown>;
+    try {
+        parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+        return false;
+    }
+    const items = protocol === "openai" ? parsed.messages : parsed.input;
+    if (!Array.isArray(items)) return false;
+    const virtualLeading =
+        protocol === "responses" && typeof parsed.instructions === "string" && parsed.instructions.length > 0;
+    let systems = 0;
+    let firstSlotIdx = -1;
+    let firstSystemIdx = -1;
+    items.forEach((item, i) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return;
+        const msg = item as Record<string, unknown>;
+        const t = msg.type;
+        const isMessage = t === undefined || t === "message";
+        if (protocol === "responses" && !isMessage && !ROLE_PRODUCING_TYPES.has(t as string)) return;
+        if (firstSlotIdx < 0) firstSlotIdx = i;
+        if (isMessage && msg.role === "system") {
+            systems++;
+            if (firstSystemIdx < 0) firstSystemIdx = i;
+        }
+    });
+    if (systems === 0) return false;
+    if (systems > 1) return true;
+    if (virtualLeading) return true;
+    return firstSystemIdx !== firstSlotIdx;
+}
+
 export function applyCompatRoles(
     body: string,
     protocol: "openai" | "responses",

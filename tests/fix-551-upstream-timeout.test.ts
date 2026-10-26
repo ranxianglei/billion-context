@@ -70,7 +70,7 @@ test("#551: body silence longer than the configured budget is cut at the budget"
         const result = await fetchWithTimeout(`http://127.0.0.1:${port}/silent`, {});
         let threw = false;
         try {
-            const reader = result.response.body.getReader();
+            const reader = result.response.body!.getReader();
             await reader.read();
         } catch {
             threw = true;

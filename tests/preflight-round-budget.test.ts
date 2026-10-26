@@ -19,7 +19,10 @@ import { MAX_PREFLIGHT_ROUNDS, MAX_SUMMARY_CALLS_PER_PREFLIGHT } from "../src/pr
 // that) needs a deep fold, and the per-invocation budget of 8 left a live
 // 1.39M-token Gemini session ~8k tokens short of fitting: it reported "the
 // compress budget was exhausted after 8 rounds" and dropped the turn even
-// though every fold it attempted had succeeded.
+// though every fold it attempted had succeeded. #1933 made the depth dynamic:
+// base MAX_PREFLIGHT_ROUNDS scales with the entry overshoot (payload vs window),
+// capped at 2x the base — an ~11x overshoot like the second fixture below gets
+// the full raised budget of 32 rounds / 32 summary calls.
 
 const WINDOW = 30_000;
 const MESSAGES = 60;
@@ -86,13 +89,21 @@ function proxyOptions(upstreamPort: number): ProxyOptions {
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
         }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
-    } as ProxyOptions;
+    };
 }
 
 test("e2e preflight: a payload that needs more folds than one round allows is still brought under the window", async () => {
@@ -129,8 +140,10 @@ test("e2e preflight: a payload that needs more folds than one round allows is st
         assert.ok(markers < MESSAGES * FILLER_REPEATS, `the fold must drop raw range text, still carried ${markers}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -148,9 +161,11 @@ test("e2e preflight: beyond the round budget the fail-fast reports the post-fold
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // 400 small turns (~340k tokens vs a 30k window): each fold removes
-        // far less than the chunk budget, so even 16 successful rounds leave
-        // the payload well over the window — the walk stops at the round cap.
+        // 400 small turns (~384k tokens vs a 30k window, ~11x overshoot): each
+        // fold removes far less than the chunk budget, so even the raised
+        // #1933 budget of 32 successful rounds (base 16 scaled by overshoot,
+        // capped at 2x) leaves the payload well over the window — the walk
+        // stops at the raised round cap.
         const COUNT = 400;
         const REPEATS = 200;
         assert.ok(materialiseTokens(COUNT, REPEATS) > WINDOW * 3, `fixture must start well over the window (${materialiseTokens(COUNT, REPEATS)} vs ${WINDOW})`);
@@ -164,17 +179,19 @@ test("e2e preflight: beyond the round budget the fail-fast reports the post-fold
         assert.equal(resp.status, 502, `beyond the round budget the turn must be refused: HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.match(json.error?.message ?? "", new RegExp(`exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds`, "i"), `names the round budget (got: ${json.error?.message})`);
+        assert.match(json.error?.message ?? "", new RegExp(`exhausted after ${MAX_PREFLIGHT_ROUNDS * 2} rounds`, "i"), `names the raised round budget (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /down from ~\d+ before preflight/, `quotes the post-fold size, not only the original (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
 
         const summaries = CALLS.filter((c) => c.summary);
-        assert.equal(summaries.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT, `one fold per round, one call each (got ${summaries.length})`);
+        assert.equal(summaries.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, `one fold per round, one call each, raised #1933 budget (got ${summaries.length})`);
         assert.equal(CALLS.filter((c) => c.raw.includes('"stream":true')).length, 0, "the over-window payload was NOT forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

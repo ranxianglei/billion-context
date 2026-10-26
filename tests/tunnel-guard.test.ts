@@ -102,6 +102,61 @@ test("checkTunnelDestination: link-local/metadata always denied, incl. via DNS n
     assert.equal(byName.code, "linkLocal");
 });
 
+test("checkTunnelDestination: mixed link-local + routable hostname drops the fe80, keeps the rest (#2143)", async () => {
+    // The issue's exact shape: an mDNS name answering [fe80::…, 192.168.x.x].
+    const base = { selfPort: 8787, localIps };
+    const mdns = { "lanbox.local": ["fe80::abcd:ef01:2345:6789", "192.168.1.50"] };
+    const local = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: true, allowlist: [], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(local.ok, true, "a coexisting routable A record must not be vetoed by an unusable fe80");
+    const remote = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: false, allowlist: [], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(remote.ok, false);
+    assert.equal(remote.code, "privateRemote", "after dropping fe80 the surviving private answer takes its normal layer");
+    const allowed = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: false, allowlist: ["lanbox.local"], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(allowed.ok, true, "BILI_TUNNEL_ALLOWED_HOSTS applies to the surviving private record");
+    // fe80 + PUBLIC: the public record passes for any client (was wrongly denied before).
+    for (const clientLoopback of [true, false]) {
+        const pub = await checkTunnelDestination("https://box.example.com/v1", {
+            selfPort: 8787, clientLoopback, allowlist: [], localIps,
+            resolveHost: stubResolve({ "box.example.com": ["fe80::1", "93.184.216.34"] }),
+        });
+        assert.equal(pub.ok, true, "a public record coexisting with fe80 is reachable");
+    }
+});
+
+test("checkTunnelDestination: pure / metadata link-local answers stay hard-denied (#2143 guard intact)", async () => {
+    const singleFe80 = await checkTunnelDestination("http://v6only.local:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "v6only.local": ["fe80::abcd:ef01:2345:6789"] }),
+    });
+    assert.equal(singleFe80.ok, false, "a bare fe80 has no zone scope and is unreachable — keep the deny");
+    assert.equal(singleFe80.code, "linkLocal");
+    const allFe80 = await checkTunnelDestination("http://v6only.local:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "v6only.local": ["fe80::1", "fe80::2"] }),
+    });
+    assert.equal(allFe80.ok, false);
+    assert.equal(allFe80.code, "linkLocal", "an all-link-local answer has nothing routable coexisting");
+    // fe80 + cloud metadata: dropping the fe80 leaves 169.254.169.254 → still linkLocal.
+    const metaMix = await checkTunnelDestination("http://meta-mix.internal/latest/meta-data/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "meta-mix.internal": ["fe80::1", "169.254.169.254"] }),
+    });
+    assert.equal(metaMix.ok, false);
+    assert.equal(metaMix.code, "linkLocal", "metadata survives the fe80 drop and stays blocked");
+    // IP-literal fe80 never reaches the hostname-only filter → still linkLocal.
+    const lit = await checkTunnelDestination("http://[fe80::1]:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+    });
+    assert.equal(lit.ok, false);
+    assert.equal(lit.code, "linkLocal", "IP literals are untouched by the hostname-only filter");
+});
+
 test("checkTunnelDestination: private destinations — local allow, remote needs allowlist", async () => {
     const local = await checkTunnelDestination("http://127.0.0.1:8199/v1", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
     assert.equal(local.ok, true);
@@ -203,6 +258,57 @@ test("checkTunnelDestination: default ports by scheme", async () => {
     assert.equal(httpsNoPort.code, "linkLocal", "scheme-default 443 still classified");
 });
 
+// #2124: proxied egress delegates hostname classification to the upstream proxy —
+// the destination is resolved REMOTELY via CONNECT, so a polluted/unreachable
+// local resolver must not hard-deny valid public names. IP literals and
+// direct-egress hostnames keep full local classification (unchanged).
+
+test("checkTunnelDestination: proxied egress delegates an unresolvable hostname to the proxy (#2124)", async () => {
+    const dead: ResolveHost = async () => { throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }); };
+    for (const clientLoopback of [true, false]) {
+        const v = await checkTunnelDestination("https://chatgpt.com/backend-api/codex/models", {
+            selfPort: 8787, clientLoopback, allowlist: [], localIps, resolveHost: dead, egressProxied: true,
+        });
+        assert.equal(v.ok, true, "a dead local resolver must not veto a proxied destination");
+    }
+});
+
+test("checkTunnelDestination: proxied egress skips local classification even for a private-resolving name (#2124)", async () => {
+    // Direct mode would deny this for a remote client (privateRemote); in proxied
+    // mode the PROXY decides where the name lands, so bili must not classify it
+    // against its own (possibly polluted) resolver.
+    const v = await checkTunnelDestination("https://relay.example/v1", {
+        selfPort: 8787, clientLoopback: false, allowlist: [], localIps,
+        resolveHost: stubResolve({ "relay.example": ["10.9.9.9"] }), egressProxied: true,
+    });
+    assert.equal(v.ok, true, "hostname classification is delegated, not done locally");
+});
+
+test("checkTunnelDestination: proxied egress STILL enforces IP-literal self/metadata/private (#2124)", async () => {
+    // Literals need no DNS; these layers are unaffected by egressProxied.
+    const selfV = await checkTunnelDestination("http://127.0.0.1:8787/__bili/config", { selfPort: 8787, clientLoopback: false, allowlist: [], localIps, egressProxied: true });
+    assert.equal(selfV.ok, false);
+    assert.equal(selfV.code, "self", "self check holds for literals even in proxied mode");
+    const metaV = await checkTunnelDestination("http://169.254.169.254/latest/meta-data/", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps, egressProxied: true });
+    assert.equal(metaV.ok, false);
+    assert.equal(metaV.code, "linkLocal", "metadata check holds for literals even in proxied mode");
+    const privV = await checkTunnelDestination("http://192.168.1.9:9000/v1", { selfPort: 8787, clientLoopback: false, allowlist: [], localIps, egressProxied: true });
+    assert.equal(privV.ok, false);
+    assert.equal(privV.code, "privateRemote", "literal private stays denied for remote clients even in proxied mode");
+});
+
+test("checkTunnelDestination: unresolvable surfaces the raw resolver code + remediation hint (#2124)", async () => {
+    const v = await checkTunnelDestination("https://no-such-host.invalid/v1", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        resolveHost: async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "unresolvable");
+    assert.match(v.message, /\(EAI_AGAIN\)/, "raw resolver error code is surfaced");
+    assert.match(v.message, /local name resolution failed/, "diagnostic hint points at a poisoned/unreachable resolver");
+    assert.match(v.message, /upstream proxy/, "hint offers the proxy remediation");
+});
+
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {
     assert.deepEqual(tunnelAllowlistFromEnv({ BILI_TUNNEL_ALLOWED_HOSTS: "127.0.0.1:8199, LANRELAY.EXAMPLE , ,10.0.0.5" }), ["127.0.0.1:8199", "lanrelay.example", "10.0.0.5"]);
     assert.deepEqual(tunnelAllowlistFromEnv({}), []);
@@ -253,8 +359,11 @@ test("integration: tunnel cannot reach the proxy's own management plane (#409 Po
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
@@ -316,8 +425,11 @@ test("integration: metadata destination never contacted (403 before any socket);
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
@@ -365,8 +477,11 @@ test("integration: unresolvable /bili/ destination answers 502 transport-class, 
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");

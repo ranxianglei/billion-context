@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
@@ -130,7 +131,7 @@ const imgPart = (): Record<string, unknown> => ({
     source: { type: "base64", media_type: "image/png", data: IMG_B64 },
 });
 
-async function runCase(opts: { inputTokens: number | null; sessionId?: string; turns?: TurnMsg[][]; window?: number }): Promise<Record<string, unknown>> {
+async function runCase(opts: { inputTokens: number | null; sessionId?: string; turns?: TurnMsg[][]; window?: number }): Promise<{ statuses: number[]; streamed: string[]; nonStream: number }> {
     const streamed: string[] = [];
     let nonStream = 0;
     const upstream = http.createServer((req, res) => {
@@ -163,7 +164,7 @@ async function runCase(opts: { inputTokens: number | null; sessionId?: string; t
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
@@ -183,9 +184,10 @@ async function runCase(opts: { inputTokens: number | null; sessionId?: string; t
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const post = async (messages: TurnMsg[]): Promise<number> => {

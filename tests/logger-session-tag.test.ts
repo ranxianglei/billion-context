@@ -15,14 +15,28 @@ function fileLines(p: string): string[] {
 }
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** Poll until pred(lines) holds or timeoutMs elapses (#1971): the logger's
+ *  file stream is buffered/async, so a fixed sleep raced loaded CI runners.
+ *  ENOENT = open still in flight. On timeout returns what landed, so the
+ *  caller's assert fails with evidence instead of a silent timing artifact. */
+async function waitForLogLines(p: string, pred: (lines: string[]) => boolean, timeoutMs = 5000): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    let lines: string[] = [];
+    for (;;) {
+        try { lines = fileLines(p); } catch { lines = []; }
+        if (pred(lines)) return lines;
+        if (Date.now() >= deadline) return lines;
+        await sleep(20);
+    }
+}
+
 test("logger: no session tag outside a bound flow", async () => {
     const p = tmpLog();
     configureLogger(p);
     try {
         assert.equal(currentSessionContext(), undefined);
         log("info", "untagged-baseline");
-        await sleep(60); // let the stream drain to disk
-        const lines = fileLines(p);
+        const lines = await waitForLogLines(p, (ls) => ls.some((x) => x.endsWith("untagged-baseline")));
         const l = lines.find((x) => x.endsWith("untagged-baseline"));
         assert.ok(l, `baseline line missing: ${JSON.stringify(lines)}`);
         assert.match(l!, /^\S+ \[info\] \[v=[^\]]+\] untagged-baseline$/);
@@ -34,6 +48,7 @@ test("logger: enterSessionContext tags sync, microtask and timer descendants", a
     const p = tmpLog();
     configureLogger(p);
     try {
+        const tags = ["sync-tagged", "microtask-tagged", "timer-descendant-tagged"];
         enterSessionContext("127.0.0.1_deadbeefcafe0001");
         assert.equal(currentSessionContext(), "127.0.0.1_deadbeefcafe0001");
         log("info", "sync-tagged");
@@ -41,11 +56,10 @@ test("logger: enterSessionContext tags sync, microtask and timer descendants", a
         log("info", "microtask-tagged");
         await new Promise<void>((r) => setTimeout(r, 20));
         log("info", "timer-descendant-tagged");
-        await sleep(60);
-        const lines = fileLines(p);
-        for (const tag of ["sync-tagged", "microtask-tagged", "timer-descendant-tagged"]) {
+        const lines = await waitForLogLines(p, (ls) => tags.every((t) => ls.some((x) => x.endsWith(t))));
+        for (const tag of tags) {
             const l = lines.find((x) => x.endsWith(tag));
-            assert.ok(l, `missing line ${tag}`);
+            assert.ok(l, `missing line ${tag}: ${JSON.stringify(lines)}`);
             assert.match(l!, /^\S+ \[info\] \[sess=127\.0\.0\.1_deadbeefcafe0001\] \[v=[^\]]+\] .*$/);
         }
     } finally { closeLogger(); }
@@ -57,8 +71,9 @@ test("logger: multi-line payloads are prefixed per physical line", async () => {
     try {
         enterSessionContext("sess-multi");
         log("warn", "frame-one\nframe-two\nframe-three");
-        await sleep(60);
-        const frames = fileLines(p).filter((l) => /frame-(one|two|three)$/.test(l));
+        const frameRe = /frame-(one|two|three)$/;
+        const lines = await waitForLogLines(p, (ls) => ls.filter((l) => frameRe.test(l)).length === 3);
+        const frames = lines.filter((l) => frameRe.test(l));
         assert.equal(frames.length, 3, JSON.stringify(frames));
         for (const f of frames) {
             assert.match(f, /^\S+ \[warn\] \[sess=sess-multi\] \[v=[^\]]+\] frame-(one|two|three)$/);
@@ -72,16 +87,17 @@ test("logger: tags are sanitized (whitespace/brackets/control chars, length cap)
     try {
         enterSessionContext("bad id [x] \ny");
         log("info", "sanitized-line");
-        await sleep(40);
-        let l = fileLines(p).find((x) => x.endsWith("sanitized-line"));
-        assert.ok(l, "sanitized line missing");
+        let lines = await waitForLogLines(p, (ls) => ls.some((x) => x.endsWith("sanitized-line")));
+        let l = lines.find((x) => x.endsWith("sanitized-line"));
+        assert.ok(l, `sanitized line missing: ${JSON.stringify(lines)}`);
         assert.ok(l!.includes("[sess=bad_id_x_y]"), l);
         assert.doesNotMatch(l!, /\[sess=[^\]]*[\\\s]/);
 
         enterSessionContext("A".repeat(300));
         log("info", "truncated-line");
-        await sleep(40);
-        l = fileLines(p).find((x) => x.endsWith("truncated-line"));
+        lines = await waitForLogLines(p, (ls) => ls.some((x) => x.endsWith("truncated-line")));
+        l = lines.find((x) => x.endsWith("truncated-line"));
+        assert.ok(l, `truncated line missing: ${JSON.stringify(lines)}`);
         const m = /\[sess=(A+)\]/.exec(l!);
         assert.ok(m, l);
         assert.ok(m![1].length > 0 && m![1].length <= 160);

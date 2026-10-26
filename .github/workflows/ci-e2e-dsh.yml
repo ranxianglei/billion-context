@@ -1,0 +1,110 @@
+name: e2e-dsh-plugin-lane
+
+# #2170 measure 3: the dsh plugin lane (anthropic wire, x-bili-plugin:dsh
+# headers, fork/title-gen side traffic) is the surface where the #2156/#2157/
+# #2164 regression chain lived. This lane runs every dsh/fork/side-shaped
+# suite in one named place so a lane regression is visible on the PR as its
+# own red check, not buried in the general test matrix. Zero tokens: all
+# upstreams are in-process mocks.
+on:
+  # #2637 plan #3: nightly full regression on master — daily backstop for
+  # the path filter below (schedule ignores paths).
+  schedule:
+    - cron: '5/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "src/server.ts"
+      - "src/server/**"
+      - "src/session.ts"
+      - "src/plugin.ts"
+      - "tests/*fork*.test.ts"
+      - "tests/*side*.test.ts"
+      - "tests/*dsh*.test.ts"
+      - ".github/workflows/ci-e2e-dsh.yml"
+  workflow_dispatch:
+
+concurrency:
+  # #2637 plan #3: 'nightly' keeps scheduled runs out of the per-ref cancel scope.
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: e2e-dsh-plugin-lane-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-e2e-dsh.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+  e2e-dsh-plugin-lane:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    name: dsh plugin lane (fork adoption + side-request isolation + lane truth tables)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # tsx resolves `acp-kernel` to its built dist (kernel/ is a workspace
+      # package) — same prerequisite as the main test matrix.
+      - name: Build kernel
+        run: npm --prefix kernel run build
+
+      - name: Run dsh plugin lane suites (sequential — concurrent runs flake on shared XDG dirs)
+        run: |
+          set -euo pipefail
+          for f in \
+            side-lane-truth-table \
+            side-lane-invariants \
+            fork-side-request-lane \
+            side-request-isolation \
+            fix-1075-side-request \
+            dsh-persona-fingerprint \
+            plugin-fork \
+            fork-adoption \
+            fork-ccr-adoption \
+            fork-nudge-trigger \
+            truncation-fork \
+            preflight-fork-estimate; do
+            echo "=== tests/$f.test.ts ==="
+            node --import tsx --test "tests/$f.test.ts"
+          done

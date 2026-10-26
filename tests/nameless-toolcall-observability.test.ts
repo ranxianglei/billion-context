@@ -23,6 +23,7 @@ function makeSession(): Session {
         requests: 0,
         lastInputTokens: 0,
         stats: {},
+        metadata: {},
         dirty: false,
     } as unknown as Session;
 }

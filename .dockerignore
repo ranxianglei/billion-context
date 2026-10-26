@@ -1,0 +1,4 @@
+# The Dockerfile installs from npm at build time and COPYs nothing from the
+# context — keep the context minimal when building from the repo root.
+*
+!Dockerfile

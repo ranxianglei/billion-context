@@ -72,6 +72,7 @@ test("resolveProxyDecision: default mode + ALL_PROXY fallback -> uses ALL_PROXY"
 test("resolveProxyDecision: default mode, no env set -> still direct", () => {
     const decision = resolveProxyDecision({}, "", HTTPS_UPSTREAM, {
         explicitDirect: false,
+        systemProxy: { enabled: false },
     });
     assert.equal(decision.source, "direct");
     assert.equal(decision.proxy, undefined);

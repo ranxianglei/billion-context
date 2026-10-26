@@ -1,0 +1,189 @@
+# Config reference seed — provider route table fields (#2107 single source of truth).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: providers
+entries:
+  - key: models
+    type: "record name → { context?, output?, compress?, benefit? }"
+    default: "{}"
+    group: providers
+    id: cr.models
+    render: route-row
+    desc_en: "Per-model declarations: context window, output ceiling, per-model compression overrides; not a traffic filter."
+    desc_zh: "逐模型声明：上下文窗口、输出上限、逐模型压缩覆盖；不是流量过滤器。"
+    site_en: "Record of model name → <span class='mech'>{context?, output?, compress?, benefit?}</span>: declares each model's context window, output ceiling, and per-model compression overrides (benefit marks free-quota billing). Not a traffic filter."
+    site_zh: "模型名 → <span class='mech'>{context?, output?, compress?, benefit?}</span> 的记录：声明每个模型的上下文窗口、输出上限与逐模型压缩覆盖（benefit 标记免费额度计费）。不是流量过滤器。"
+  - key: models.context
+    type: number
+    default: "unset (model registry)"
+    group: providers
+    desc_en: "Context window tokens declared for this model name."
+    desc_zh: "为该模型名声明的上下文窗口 token 数。"
+  - key: models.output
+    type: number
+    default: "unset"
+    group: providers
+    desc_en: "Output token ceiling declared for this model name."
+    desc_zh: "为该模型名声明的输出 token 上限。"
+  - key: models.compress
+    type: object
+    default: "unset"
+    group: providers
+    desc_en: "Level-3 compression overrides for this model (deepest in the global→provider→model merge)."
+    desc_zh: "该模型的第 3 级压缩覆盖（全局→provider→模型合并中最深）。"
+  - key: models.benefit
+    type: boolean
+    default: "false"
+    group: providers
+    desc_en: "Marks free-quota billing for this model in the economics ledger."
+    desc_zh: "在经济学账本中标记该模型为免费额度计费。"
+  - key: proxy
+    type: "string (\"\" = explicit direct)"
+    default: "unset"
+    group: providers
+    id: cr.proxy
+    render: route-row
+    desc_en: "Per-route outbound proxy URL."
+    desc_zh: "本路由出站代理地址。"
+    site_en: "Per-route outbound proxy URL; empty string = explicitly direct."
+    site_zh: "本路由出站代理地址；空字符串 = 显式直连。"
+  - key: compressProtocol
+    type: "\"tools\" (default) | \"marker\""
+    default: "\"tools\""
+    group: providers
+    id: cr.cp
+    render: route-row
+    desc_en: "Which ACP injection surface this lane speaks."
+    desc_zh: "本通道的 ACP 注入面。"
+    site_en: "Which ACP injection surface this lane speaks: native tools (default) or prompt markers."
+    site_zh: "本通道的 ACP 注入面：原生工具（默认）或提示词标记。"
+  - key: protocol
+    type: "\"anthropic\" | \"openai\" | \"responses\" | \"google\""
+    default: "inferred from the URL marker"
+    group: providers
+    id: cr.proto
+    render: route-row
+    desc_en: "Declare this lane's wire protocol; a client-side /bili/<protocol>/ URL marker outranks the declaration."
+    desc_zh: "声明本通道的线上协议；客户端侧 /bili/<protocol>/ URL 标记优先级更高。"
+    site_en: "Declare this lane's wire protocol. A client-side /bili/&lt;protocol&gt;/ URL marker outranks the declaration; unparseable bodies relay verbatim."
+    site_zh: "声明本通道的线上协议。客户端侧 /bili/&lt;protocol&gt;/ URL 标记优先级更高；不可解析的请求体原样转发。"
+  - key: compress
+    type: "object (level 2)"
+    default: "unset"
+    group: providers
+    id: cr.compress
+    render: route-row
+    desc_en: "Any compress field can be overridden here — level 2 of the global→provider→model merge."
+    desc_zh: "任意 compress 字段可在此覆盖——全局→provider→模型三级合并的第 2 级。"
+    site_en: "Any compress field can be overridden here — level 2 of the global→provider→model merge (per-field, deepest wins)."
+    site_zh: "任意 compress 字段可在此覆盖——全局→provider→模型三级合并的第 2 级（逐字段、最深层胜出）。"
+  - key: compat
+    type: "{ roles?, dropFields? }"
+    default: "{}"
+    group: providers
+    id: cr.compat
+    render: route-row
+    desc_en: "Per-route wire-compat overrides; provider entries beat the global block per key; dropFields union additively."
+    desc_zh: "逐路由线上兼容覆盖；provider 条目按键级覆盖全局；dropFields 加法并集。"
+    site_en: "{ roles?, dropFields? } — remap roles the upstream rejects (e.g. developer→system); provider entries beat the global block per key; dropFields strips fields strict schemas reject (additive union)."
+    site_zh: "{ roles?, dropFields? } —— 重写上游拒收的角色（如 developer→system）；provider 条目按键级覆盖全局；dropFields 剔除严格 schema 拒收的字段（加法并集）。"
+  - key: direct
+    type: boolean
+    default: "false"
+    group: providers
+    id: cr.direct
+    render: route-row
+    desc_en: "Client-side exemption: traffic for this upstream is never pointed at bili at all."
+    desc_zh: "客户端侧豁免：该上游流量完全不指向 bili。"
+    site_en: "Client-side exemption: traffic for this upstream is never pointed at bili at all — unlike passthrough, it does not even terminate there."
+    site_zh: "客户端侧豁免：该上游流量完全不指向 bili——与 passthrough 不同，连终结都不经过它。"
+  - key: passthrough
+    type: boolean
+    default: "false"
+    group: providers
+    id: cr.pt
+    render: route-row
+    desc_en: "Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams."
+    desc_zh: "路由级逐字节透传、无会话状态——面向反作弊上游。"
+    site_en: "Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams."
+    site_zh: "路由级逐字节透传、无会话状态——面向反作弊上游。"
+  - key: imageBilling
+    type: "\"auto\" | \"pixels\" | \"bytes\""
+    default: "auto (→ pixels)"
+    group: providers
+    id: cr.ib
+    render: route-row
+    desc_en: "Image-token counting basis for this route; bytes is an explicit opt-in for byte relays."
+    desc_zh: "本路由图片 token 计费口径；bytes 为字节中继的显式指定。"
+    site_en: "Image-token counting basis for this route: auto (→ pixels), pixels, or bytes (explicit opt-in for byte relays)."
+    site_zh: "本路由图片 token 计费口径：auto（默认→pixels）、pixels 或 bytes（字节中继需显式指定）。"
+  - key: imageTokenCap
+    type: number
+    default: "unset (uncapped)"
+    group: providers
+    id: cr.itc
+    render: route-row
+    desc_en: "Per-image token cost cap for this route."
+    desc_zh: "本路由单张图片 token 成本上限。"
+    site_en: "Per-image token cost cap for this route; unset = uncapped."
+    site_zh: "本路由单张图片 token 成本上限；未设置 = 不限制。"
+  - key: resign
+    type: "scheme → { enabled?, passthrough?, credentialRef? }"
+    default: "{} (global map applies)"
+    group: providers
+    id: cr.resign
+    render: route-row
+    desc_en: "Per-route overrides of the global resign map (level 2, deepest wins)."
+    desc_zh: "按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。"
+    site_en: "Per-route overrides of the global resign map (level 2, deepest wins)."
+    site_zh: "按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。"
+  - key: bind
+    type: "string (named entries only)"
+    default: "unset"
+    group: providers
+    id: cr.bind
+    render: route-row
+    desc_en: "Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert."
+    desc_zh: "把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。"
+    site_en: "Named (non-URL) entry: deep-merged onto the bound URL lane at config load as an alias. Without bind a named entry stays routing-inert."
+    site_zh: "具名（非 URL）条目：加载配置时深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。"
+  - key: apiKeyEnv
+    type: "string (env var name)"
+    default: "unset"
+    group: providers
+    id: cr.lanekey
+    render: route-row
+    desc_en: "Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref)."
+    desc_zh: "通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。"
+    site_en: "Lane credential override (#2336): requests forwarded through this lane carry this env variable's value instead of the client's own credential — x-api-key / x-goog-api-key replaced outright, Bearer authorization replaced, injected when absent. Exactly one of apiKeyEnv / credentialRef per entry."
+    site_zh: "通道凭据覆盖（#2336）：经该通道转发的请求使用此环境变量的值取代客户端自带凭据——x-api-key / x-goog-api-key 直接替换、Bearer authorization 替换、缺失时注入。每个条目与 credentialRef 二选一。"
+  - key: credentialRef
+    type: "string (store name)"
+    default: "unset"
+    group: providers
+    id: cr.lanecred
+    render: route-row
+    desc_en: "Lane credential override via the private summary-credential store (secret:NAME semantics)."
+    desc_zh: "经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。"
+    site_en: "Lane credential override via the private summary-credential store (`secret:NAME` semantics); exactly one of apiKeyEnv / credentialRef per entry."
+    site_zh: "经私有摘要凭据存储的通道凭据覆盖（`secret:NAME` 语义）；每个条目与 apiKeyEnv 二选一。"
+  - key: calibration
+    type: "{ disabled?: boolean, max?: number }"
+    default: "unset (learned k̂ applies)"
+    group: providers
+    id: cr.calib
+    render: route-row
+    desc_en: "Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy)."
+    desc_zh: "按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。"
+    site_en: "Per-route k̂ calibration policy (#3211): `disabled` suppresses the learned factor on this route; `max` clamps it (0 < max ≤ 4). Applied at publication time — the learned ring stays raw."
+    site_zh: "按路由的 k̂ 校准策略（#3211）：`disabled` 在该线路禁用学习系数；`max` 钳制学习系数（0 < max ≤ 4）。作用于发布环节——学习环保持原始值。"
+  - key: compactionOptIn
+    type: boolean
+    default: "false"
+    env: BILI_NON_HTTP_PROVIDERS
+    group: providers
+    id: cr.optin
+    render: route-row
+    desc_en: "Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS."
+    desc_zh: "仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。"
+    site_en: "Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS."
+    site_zh: "仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。"

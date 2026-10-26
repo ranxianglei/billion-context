@@ -1,0 +1,32 @@
+name: Deploy website to GitHub Pages
+
+on:
+  # Push trigger suspended (#4598): the repo has no GitHub Pages site, so every
+  # website push red-lined the deploy job. Manual dispatch stays until the
+  # publishing direction is decided.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      # No build step — publish the folder contents as-is, so the site root is website/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website
+      - id: deployment
+        uses: actions/deploy-pages@v4

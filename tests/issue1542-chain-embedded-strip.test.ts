@@ -166,9 +166,15 @@ function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptio
         log: true,
         debug: false,
         passthrough: false,
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         autoUpdate: false,
         logFile: "off",
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         ...overrides,
     };
 }

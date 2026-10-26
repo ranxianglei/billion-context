@@ -18,6 +18,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
+// #4482: body dumps now open with this plaintext-warning line (src/dump-banner.ts).
+const PLAINTEXT_BANNER = "PLAINTEXT DUMP — full conversation body, may contain credentials; scrub before sharing";
+
 const args = process.argv.slice(2);
 const dir = args[0] || join(homedir(), ".local", "state", "billion-context", "dumps");
 const sid = args[1];
@@ -46,7 +49,10 @@ for (const f of files) {
 }
 
 function load(f) {
-    return JSON.parse(readFileSync(join(dir, f), "utf8"));
+    let text = readFileSync(join(dir, f), "utf8");
+    const nl = text.indexOf("\n");
+    if (nl > 0 && text.slice(0, nl).replace(/\r$/, "") === PLAINTEXT_BANNER) text = text.slice(nl + 1);
+    return JSON.parse(text);
 }
 
 function msgKey(body) {

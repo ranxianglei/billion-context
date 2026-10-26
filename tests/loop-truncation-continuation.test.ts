@@ -33,7 +33,7 @@ function makeCtx(id: string) {
             persisted: false,
         } as unknown as Session,
         log: () => {},
-        protocol: "openai",
+        protocol: "openai" as const,
     };
 }
 

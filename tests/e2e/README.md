@@ -1,5 +1,24 @@
 # E2E: real codex client through bili against a real upstream
 
+## OpenCode V2 Responses WebSocket regression
+
+`e2e-opencode-responses-ws.test.ts` runs the real OpenCode V2 binary against
+its own loopback Responses WebSocket upstream. It verifies native socket
+interception, ACP status execution, real compression, full-history chain reset
+after a fold, and usage accounting. Primary requests must remain WebSocket;
+HTTP title-generation requests are allowed. Configuration, credentials, state
+and working directory are isolated; no real model tokens are consumed.
+
+```bash
+npm run build
+ACP_TEST_E2E_OC_WS=1 node --import tsx --test tests/e2e/e2e-opencode-responses-ws.test.ts
+```
+
+`E2E_OC_BIN` selects the OpenCode binary. The suite skips by default and requires
+a V2 binary. Evidence is retained in its reported temporary directory.
+The native OpenCode CI workflow runs it in a separate job pinned to V2.0.20;
+the existing V2.0.3 Chat Completions coverage remains unchanged.
+
 This suite runs the **real `codex` CLI** against a **real Responses-compatible
 upstream** through the bili proxy, and asserts the full context-management
 lifecycle end-to-end:
@@ -89,6 +108,31 @@ resolve → tarball download → sha512 verify → staged extract → in-place i
 instance the suite **brings itself**. Loopback only; zero external network,
 zero secrets, zero tokens (#1153).
 
+`e2e-advisory-rollback.test.ts` (same gate, same fixture infra) proves the
+rollback-form advisory contract (#1588 / PR #1596) against a **live, resident
+`bili start`**: it publishes synthetic `START` (installed, affected),
+`LATEST` (registry latest, also affected) and `TARGET` (older, clean)
+versions plus a `billion-context-advisories` package whose document matches
+the affected range, then asserts the four-behavior contract —
+
+1. **control**: before the advisory exists, the normal self-update loop
+   advances `START → LATEST` (the loop is alive);
+2. **forced rollback**: once the advisory is published, the watcher
+   force-installs the older `TARGET` onto disk and keeps a persistent
+   restart banner (the running process is still affected) —
+   `runAdvisoryCheck` re-evaluates against the *running* version and surfaces
+   `pendingRestart` + `installedVersion` on `/__bili/status`;
+3. **no ping-pong (#1588-A, pre-restart)**: across ≥3 check cycles the disk
+   stays at `TARGET`; the update loop logs `deferring to the advisory loop`
+   and never re-installs `LATEST`;
+4. **candidate gate (#1588-A, post-restart)**: after restarting the proxy on
+   the clean `TARGET`, the update check **refuses** to pull the affected
+   `LATEST` back in (`skipping … covered by a critical-bug advisory's
+   affected range (#1588)`) and `/__bili/status.advisory` clears.
+
+The cycle interval is accelerated via `BILI_UPDATE_CHECK_INTERVAL_MS=2500`
+(the documented #1153 seam; default unchanged).
+
 ## Running
 
 ```bash
@@ -105,6 +149,7 @@ free (the `npm test` glob doesn't cover `tests/e2e/` anyway).
 |---|---|---|
 | `ACP_TEST_REGISTRY` | – | `1` enables the suite |
 | `BILI_UPDATE_REGISTRY` | `https://registry.npmjs.org` | set by the suite per child process to the local registry URL |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `180000` | accelerated to 2500 ms by the advisory-rollback suite only |
 
 ## Mechanics
 
@@ -251,3 +296,64 @@ same four #1239 guarantees on the opencode surface:
 on `workflow_dispatch` with `@opencode/cli@2.0.3` pinned (V2 lane), same
 discipline as the pi/codex pins (#815). The V1 lane (1.x) is exercised by the
 same suite via `E2E_OC_BIN`.
+
+## Native-lane suite (`e2e-pi-codex-ws.test.ts`) — real `pi` Codex Responses WebSocket lane vs deterministic mock
+
+Real `pi` (pinned `pi-stable`, see CI) with a custom `openai-codex-responses`
+provider pointed at a local mock that speaks BOTH legs — POST/SSE and a
+WebSocket upgrade on one port — through the real built proxy. Zero tokens.
+
+Gated: `ACP_TEST_E2E_PI_WS=1` (skip-by-default like the other real-client
+lanes); needs the built `dist/agent/pi-native.js`. Override the binary with
+`E2E_PI_BIN`.
+
+```bash
+ACP_TEST_E2E_PI_WS=1 E2E_PI_BIN=pi node --import tsx --test tests/e2e/e2e-pi-codex-ws.test.ts
+```
+
+### Mechanics
+
+Scenarios: **A** explicit `websocket` — intercept, `/bili/` rewrite,
+upgrade-header stamps (`x-bili-plugin*`, `session-id` == conversation id),
+compress/decompress round trip reflected in subsequent requests; **B**
+`auto` — WS used when the handshake succeeds, `previous_response_id`
+incremental continuation frames observed and expanded by the proxy; **C**
+`auto` against a WS-refusing upstream — clean mid-stream failure (the
+client-side handshake now targets the local proxy, which always succeeds),
+then an explicit-`sse` ctx proves that lane is unaffected; **D** explicit
+`sse` regression guard — full fold cycle over plain HTTP, zero WS
+connections; **E** two subagent-style sessions sharing one proxy (attach
+mode) interleave with identical tool args and never cross state.
+
+### CI
+
+`.github/workflows/ci-e2e-pi-ws.yml` (pull_request + workflow_dispatch),
+mirrors `ci-e2e-native.yml`: pins `pi-stable@0.83.6`, symlinks the canonical
+`pi` bin, collects `tmp/e2e-pi-codex-ws-*` artifacts on failure.
+
+## Release canary (`e2e-release-canary.test.ts`) — automated no-op self-update drill
+
+`ACP_TEST_CANARY=1` runs the #1811 release-receive drill: the BUILT tree is
+packed twice with identical content at versions N-1 and N (patch ≥ 2 required;
+prerelease/dev tags skip loudly), both published to the hermetic loopback
+registry. A live proxy boots from the N-1 install with
+`BILI_UPDATE_REGISTRY` pointed at the fixture (1s check interval) and must:
+
+- converge a stale dsh profile copy (N-2) via the up-to-date branch alone
+  (#1804 path, driven through a fake `BILI_DSH_BIN` shim that logs its calls),
+- flip its own disk in place when N is published ("installed N-1 → N.
+  Restart to finish.") while still serving traffic on the old in-memory code,
+- refresh (case-3) and then converge post-flip-stale profiles and go silent,
+- restart from the updated tree and pass the ACP smoke: model turn → plugin
+  `compress` fold → post-fold turn, plus a `plugin install opencode` entry.
+
+On failure the whole work dir (`tmp/e2e-canary-*`, incl. proxy output in
+`diagnostics.txt`) is kept for artifacts; on success it is cleaned.
+
+### CI
+
+`.github/workflows/ci-release-canary.yml` — fires ONLY on `release:
+published` (plus `workflow_dispatch` for backfilling any tag). Because
+release events read the workflow from the tag's tree, the lane takes effect
+from the first release AFTER this workflow lands; earlier tags can be
+drilled manually via dispatch.

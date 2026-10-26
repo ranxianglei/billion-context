@@ -141,14 +141,14 @@ describe("#1685 handlePluginTool routing ladder", () => {
         assert.ok(!logs.join("\n").includes(b.id));
     });
 
-    it("witness wins over a disagreeing body id", async () => {
+    it("a disagreeing witness fails closed without overriding the body id", async () => {
         const a = getSession(`t-1685-xa-${Math.random().toString(36).slice(2)}`);
         const b = getSession(`t-1685-xb-${Math.random().toString(36).slice(2)}`);
         recordToolWitness(a.id, "acp_status", "{}");
         const r = await post({ conversationId: b.id, tool: "acp_status", args: {} });
-        assert.equal(r.status, 200);
-        assert.deepEqual(executedOn(), [a.id]);
-        assert.match(logs.join("\n"), /differs and was ignored \(#1685\)/);
+        assert.equal(r.status, 409);
+        assert.equal(r.json.code, "TOOL_CONVERSATION_CONFLICT");
+        assert.deepEqual(executedOn(), []);
     });
 
     it("collision without a body id is a loud 400 with the count", async () => {

@@ -1,0 +1,149 @@
+name: zcode-real
+
+# Real-zcode-client canary for the zcode integration (#1892 hardening).
+# Downloads the pinned ZCode AppImage, extracts the real CLI bundle
+# (resources/glm/zcode.cjs) and runs tests/zcode-real-cli.test.ts against it:
+# version boot, config-path/store-schema canary, and the spawn contract for
+# our mcp-entry. A headless real turn needs an OAuth-logged-in model, so the
+# handshake-level proof stays in the normal matrix (zcode-mcp-degraded) —
+# this lane proves the REAL client binary still plugs into our entry.
+#
+# The version + checksum are pinned; bump BOTH together and re-audit
+# src/zcode/json-edit.ts assumptions when a new zcode release lands (the
+# schema-canary test below fails loudly if upstream renames anything).
+
+on:
+  # #2637 plan #3 → #3295 three-layer CI: master regression backstop — the
+  # 30-min smart cron below runs whenever master moved since the last green
+  # scheduled run (schedule ignores paths; ZCODE_VERSION falls back to its
+  # '3.14.4' default when no dispatch input is present). pull_request feeds
+  # the ci:full label gate + the paths filter only; NO push trigger by design
+  # — master's signal is ci.yml core runs + these gated scheduled runs.
+  schedule:
+    - cron: '14/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  workflow_dispatch:
+    inputs:
+      zcode_version:
+        description: "ZCode AppImage version to test against"
+        required: false
+        default: "3.14.4"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - .github/workflows/ci-zcode-real.yml
+      - src/zcode/**
+      - tests/zcode-*.test.ts
+      - src/mcp.ts
+  # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
+concurrency:
+  # #2637 plan #3: 'nightly' keeps scheduled runs out of the per-ref cancel scope.
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: zcode-real-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
+
+env:
+  ZCODE_VERSION: ${{ github.event.inputs.zcode_version || '3.14.4' }}
+  ZCODE_SHA256: 4b4631987172fd975aa1f85fa0dc1f55ac1c756b26bd8ab18d68592ed9391182
+
+jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-zcode-real.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+  zcode-real:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # actions/cache restores at the start of its OWN step, so it must run
+      # BEFORE the download — otherwise the "unless cached" guard below never
+      # matches on a fresh runner and every run re-downloads the full AppImage.
+      - name: Cache zcode AppImage
+        uses: actions/cache@v4
+        with:
+          path: zcode-real/ZCode.AppImage
+          key: zcode-${{ env.ZCODE_VERSION }}-${{ env.ZCODE_SHA256 }}
+
+      - name: Download zcode AppImage (unless cached)
+        run: |
+          mkdir -p zcode-real
+          cd zcode-real
+          if [ -f ZCode.AppImage ]; then
+            echo "using cached AppImage"
+          else
+            curl -fL --retry 3 -o ZCode.AppImage \
+              "https://cdn-zcode.z.ai/zcode/electron/releases/${ZCODE_VERSION}/linux-x64/ZCode-${ZCODE_VERSION}-linux-x64.AppImage"
+          fi
+          actual=$(sha256sum ZCode.AppImage | cut -d' ' -f1)
+          if [ "$actual" != "${ZCODE_SHA256}" ]; then
+            echo "::error::zcode AppImage checksum mismatch: expected ${ZCODE_SHA256}, got ${actual}"
+            exit 1
+          fi
+
+      - name: Extract CLI bundle
+        run: |
+          cd zcode-real
+          chmod +x ZCode.AppImage
+          # The CLI looks for the bundled provider registry at
+          # resources/glm/provider/zcode-builtin.json; the image ships it at
+          # resources/config/provider/ — extract both and bridge the gap.
+          ./ZCode.AppImage --appimage-extract resources/glm >/dev/null
+          ./ZCode.AppImage --appimage-extract resources/config >/dev/null
+          mkdir -p squashfs-root/resources/glm/provider
+          cp squashfs-root/resources/config/provider/zcode-builtin.json \
+             squashfs-root/resources/glm/provider/zcode-builtin.json
+          test -f squashfs-root/resources/glm/zcode.cjs
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Real-client canary
+        env:
+          ACP_TEST_ZCODE_CLI: ${{ github.workspace }}/zcode-real/squashfs-root/resources/glm/zcode.cjs
+        run: node --import tsx --test tests/zcode-real-cli.test.ts

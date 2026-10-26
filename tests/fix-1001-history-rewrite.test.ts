@@ -26,7 +26,7 @@ function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -34,6 +34,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -66,7 +67,7 @@ test("#1001 detectUnannouncedHistoryRewrite: rewritten history (majority of raws
     // incoming = last 8 old + 16 brand-new (opencode kept a tail and appended fresh content)
     const tail: CoreMessage[] = [
         ...all.slice(16),
-        ...Array.from({ length: 16 }, (_, k) => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
+        ...Array.from({ length: 16 }, (_, k): CoreMessage => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
     ];
     const det = detectUnannouncedHistoryRewrite(session, knownBefore, tail.map((m) => m.id));
     assert.equal(det.detected, true, `expected detection (${JSON.stringify(det)})`);
@@ -80,7 +81,7 @@ test("#1001 detectUnannouncedHistoryRewrite: append-only growth is NOT detected"
     const knownBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
     const tail: CoreMessage[] = [
         ...all,
-        ...Array.from({ length: 4 }, (_, k) => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
+        ...Array.from({ length: 4 }, (_, k): CoreMessage => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
     ];
     const det = detectUnannouncedHistoryRewrite(session, knownBefore, tail.map((m) => m.id));
     assert.equal(det.detected, false, `append-only must not trip the detector (${JSON.stringify(det)})`);
@@ -154,7 +155,7 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -166,15 +167,23 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW, { preserveRecentMessages: 2, preserveRecentTokens: 2000, compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 } }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/chat/completions`;
     const post = (model: string, messages: Array<{ role: string; content: string }>): Promise<{ status: number; body: string }> =>
         fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SID }, body: JSON.stringify({ model, max_tokens: 1024, stream: true, messages }) }).then(async (r) => ({ status: r.status, body: await r.text() }));
@@ -226,8 +235,135 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
         assert.equal(new Set(refVals3).size, refVals3.length, "still no duplicate refs after the prune");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+});
+
+// #2598: the same silent-rewrite failure domain on the Google wire. The detector
+// is protocol-agnostic and the consumer side (applyCompactionArchive) was already
+// wired into prepare-google.ts — this pins the producer trio (pre-turn snapshot +
+// detect + markCompactionBoundary) on the Gemini lane end-to-end.
+test("#1001/#2598 e2e google-wire: silent client history rewrite → boundary marked, blocks archived, refs pruned", async () => {
+    const WINDOW = 10_000;
+    const SID = "rewrite-e2e-google";
+    const SUMMARY_TEXT =
+        "PREFLIGHT SUMMARY of the folded segment: multi-step debugging work on the billing pipeline. " +
+        "Key decisions: chose retry with backoff over fail-fast because upstream flakiness was intermittent. " +
+        "Files touched: src/a.ts:10, src/b.ts:20. Outcome: verified green.";
+    const USAGE = { promptTokenCount: 1000, cachedContentTokenCount: 0, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 1050 };
+
+    function msg(i: number, tag: string): { role: string; parts: { text: string }[] } {
+        return { role: i % 2 === 0 ? "user" : "model", parts: [{ text: `${tag}_${i}_payload_`.repeat(180) }] };
+    }
+    const orig = Array.from({ length: 24 }, (_, i) => msg(i, "FILLER"));
+
+    const calls: Array<{ raw: string }> = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            calls.push({ raw });
+            const summaryRequest = /TASK: The conversation segment below/.test(raw);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                candidates: [{ content: { role: "model", parts: [{ text: summaryRequest ? SUMMARY_TEXT : "ok" }] }, finishReason: "STOP", index: 0 }],
+                usageMetadata: USAGE,
+                modelVersion: "gemini-test",
+            }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gemini-test": { context: WINDOW } } } } as ProxyOptions["routes"],
+        modelContextLimit: WINDOW,
+        kernelConfig: defaultConfig(WINDOW, { preserveRecentMessages: 2, preserveRecentTokens: 2000, compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:generateContent`;
+    const post = (contents: Array<{ role: string; parts: { text: string }[] }>): Promise<{ status: number; body: string }> =>
+        fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SID }, body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }) }).then(async (r) => ({ status: r.status, body: await r.text() }));
+
+    try {
+        // Turn 1 (A-era under the hood): ~18k-token estimate vs 10k window → preflight
+        // folds the oldest FILLER messages into a REAL proxy-created block.
+        const r1 = await post(orig);
+        assert.equal(r1.status, 200);
+        let sess = listSessions().find((s) => s.id === SID);
+        assert.ok(sess, "session exists");
+        assert.equal(sess!.meta.protocol, "google", "the request was recognized as the Google wire");
+        assert.equal(Object.keys(sess!.state.messageRefs.byRaw).length, 24, "all 24 messages got refs");
+        assert.ok(sess!.state.blocks.some((b) => b.active), "turn 1 preflight created an active block");
+
+        // The client silently rewrites its history mid-session (native compaction):
+        // keeps the last 8 originals, appends 16 fresh ones.
+        const rewritten = [...orig.slice(16), ...Array.from({ length: 16 }, (_, k) => msg(k, "NEWMSG"))];
+        const r2 = await post(rewritten);
+        assert.equal(r2.status, 200);
+
+        sess = listSessions().find((s) => s.id === SID)!;
+        const bound = sess.metadata.compactionBoundary as Record<string, unknown> | undefined;
+        assert.ok(bound, "a compaction boundary was marked for the unannounced rewrite (#2598 gap)");
+        assert.equal(bound.pending, false, "boundary consumed by applyCompactionArchive");
+        const archivedIds = bound.archivedBlocks as string[];
+        assert.ok(Array.isArray(archivedIds) && archivedIds.length >= 1, "turn-1 block(s) recorded in archivedBlocks");
+        const archive = preCompactionArchiveOf(sess);
+        for (const id of archivedIds) {
+            assert.match(archive[id]!.reason, /native compaction/, "archive entry carries the reason");
+        }
+        assert.equal(Object.keys(sess.state.messageRefs.byRaw).length, 24, "byRaw pruned to live ids (no additive leak: 16 new raws replaced 16 dead ones)");
+        const refVals = Object.values(sess.state.messageRefs.byRef);
+        assert.equal(new Set(refVals).size, refVals.length, "ref numbers never duplicated after the prune");
+        assert.ok(!sess.state.blocks.some((b) => b.active && archivedIds.includes(b.blockId)), "archived blocks are not rendered as active");
+
+        const forwards = calls.filter((c) => !/TASK: The conversation segment below/.test(c.raw));
+        const fwd2 = forwards[forwards.length - 1]!;
+        assert.ok(fwd2.raw.includes(SUMMARY_TEXT), "rebuilt payload carries the preflight summary");
+        assert.ok(fwd2.raw.includes("NEWMSG_15_payload"), "recent tail survives in the payload");
+        assert.ok(!fwd2.raw.includes("FILLER_0_payload"), "folded head is out of the payload");
+        assert.ok(Buffer.byteLength(fwd2.raw) < Buffer.byteLength(JSON.stringify(rewritten)) * 1.5, "forwarded payload is smaller than the raw history");
+
+        // Turn 3: normal append-only continuation after the rewrite — refs continue, no dupes.
+        const r3 = await post([...rewritten, msg(98, "MORE")]);
+        assert.equal(r3.status, 200);
+        sess = listSessions().find((s) => s.id === SID)!;
+        assert.equal(Object.keys(sess.state.messageRefs.byRaw).length, 25, "byRaw tracks exactly the live ids after append");
+        const refVals3 = Object.values(sess.state.messageRefs.byRef);
+        assert.equal(new Set(refVals3).size, refVals3.length, "still no duplicate refs after the prune");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -250,7 +386,7 @@ test("#1001 问题3: split-element line form compresses instead of failing (kern
     const out = applyRanges(
         parseCompressInput({ content: ["m00001\u2013m00012 前期调试与决策", "## TASK AS OF THIS BLOCK\n- goal\n- decisions with reasons"] }),
         { core, config, messages: turn.messages, session, log: (m: string) => logs.push(m) },
-    );
+    ).text;
     assert.ok(!out.startsWith("[Compression FAILED"), `split line form must parse: ${out}`);
     assert.ok(session.state.blocks.length > 0, "one block created from the coalesced range");
     assert.match(logs.join("\n"), /compress requested 1 range\(s\): m00001\u2013m00012/, "range reached the compress funnel");

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>billion-context — month-long coding sessions on a 100K window</title>
+  <meta name="description" content="billion-context is a context-compression proxy for AI coding agents: small context windows are enough, 5x fewer tokens, month-long single sessions, and a token-level ledger for every request.">
+  <link rel="canonical" href="https://ranxianglei.github.io/billion-context/">
+  <meta property="og:title" content="billion-context — context compression for AI coding agents">
+  <meta property="og:description" content="Small context windows are enough. 5x fewer tokens. Month-long single sessions. Every token accounted for.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ranxianglei.github.io/billion-context/">
+  <meta property="og:image" content="og.png"> <!-- TODO: generate 1200x630 og image -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f172a'/%3E%3Cpath d='M18 32c0-5 3.5-9 8-9s8 4 8 9-3.5 9-8 9-8-4-8-9zm12 0c0-5 3.5-9 8-9s8 4 8 9-3.5 9-8 9-8-4-8-9z' fill='none' stroke='%2338bdf8' stroke-width='6'/%3E%3C/svg%3E">
+  <script>document.documentElement.classList.add('js')</script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav" id="top">
+    <div class="container nav-inner">
+      <a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">&#8734;</span> billion-context</a>
+      <nav class="nav-links" aria-label="Main">
+        <a href="#how" data-i18n="nav.how">How it works</a>
+        <a href="#agents" data-i18n="nav.agents">Agents</a>
+        <a href="#install" data-i18n="nav.install">Install</a>
+        <a href="#paper" data-i18n="nav.paper">Paper</a>
+        <a href="docs/" data-i18n="nav.docs">Docs</a>
+        <a href="blog/" data-i18n="nav.blog">Blog</a>
+      </nav>
+      <div class="nav-right">
+        <button id="lang-toggle" class="ghost-btn" type="button" aria-label="Switch language">中文</button>
+        <a class="btn btn-dark" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">GitHub &#8599;</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============ HERO ============ -->
+    <section class="hero">
+      <div class="container hero-inner">
+        <div class="hero-copy" data-reveal>
+          <p class="hero-kicker">
+            <span class="chip mono">npm i -g billion-context</span>
+            <span class="chip">MIT</span>
+            <span class="chip" data-i18n="hero.kicker_live">runs on your machine, sees nothing else</span>
+          </p>
+          <h1><span data-i18n="hero.t1">Month-long sessions</span><br>
+              <span class="grad" data-i18n="hero.t2">on a 100K window.</span></h1>
+          <p class="lede" data-i18n-html="hero.lede">
+            <strong>billion-context</strong> is a local context-compression proxy for AI coding agents —
+            <em>billion-context is all you need.</em> Small context windows are enough: it keeps a 100K-window
+            model working for days at a time, cuts token spend by up to 5&times;, and accounts for every
+            token it moves.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="#install" data-i18n="hero.cta1">Get started</a>
+            <a class="btn btn-outline" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="hero.cta2">Read the code</a>
+          </div>
+          <ul class="bullets">
+            <li data-i18n="bullet1">Prompt-cache-aware compaction — rewrites cost almost nothing</li>
+            <li data-i18n="bullet2">A per-request ledger: new content vs. repay cost, visible in-terminal</li>
+            <li data-i18n="bullet3">Works as a transparent proxy — no agent source changes required</li>
+          </ul>
+        </div>
+
+        <div class="term" data-reveal data-delay="120" aria-hidden="true">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">zsh</span></div>
+          <div class="term-body mono">
+            <p><span class="t-dim">$</span> npm install -g billion-context --prefix=~/.local</p>
+            <p class="t-ok">&#10003; added 1 package in 3s</p>
+            <p><span class="t-dim">$</span> bili pi</p>
+            <p class="t-ok">&#10003; bili listening on http://127.0.0.1:18787</p>
+            <p class="t-dim"># prompt-cache aware · ledger armed · passthrough ready</p>
+            <p><span class="t-accent">&#9656;</span> your agent starts, talks upstream through bili…</p>
+            <p class="t-dim"># day 4 of the same session · context held at 31K of 213K</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ STATS ============ -->
+    <section class="stats" aria-label="Measured results">
+      <div class="container stats-grid">
+        <div class="stat" data-reveal>
+          <p class="stat-n">&times;5</p>
+          <p class="stat-l" data-i18n="stat1">fewer tokens per task</p>
+        </div>
+        <div class="stat" data-reveal data-delay="60">
+          <p class="stat-n">174,327</p>
+          <p class="stat-l" data-i18n="stat2">model calls in the longitudinal study</p>
+        </div>
+        <div class="stat" data-reveal data-delay="120">
+          <p class="stat-n">18.8B</p>
+          <p class="stat-l" data-i18n="stat3">cumulative input tokens compressed</p>
+        </div>
+        <div class="stat" data-reveal data-delay="180">
+          <p class="stat-n">0</p>
+          <p class="stat-l" data-i18n="stat4">window violations on 204,800-token models</p>
+        </div>
+      </div>
+      <p class="stats-src container" data-i18n="stats.src">Figures from the open-sourced study (4.5 months, 3 hosts, marathon sessions of 8,584–12,049 calls) — see the paper below.</p>
+    </section>
+
+    <!-- ============ ICON WALL ============ -->
+    <section class="wall" id="agents">
+      <div class="container">
+        <p class="wall-label" data-i18n="wall.label">Works with the agents you already run</p>
+        <div class="wall-grid" data-reveal>
+          <a href="https://claude.com/product/claude-code" title="Claude Code"><img src="https://cdn.simpleicons.org/claude/D97757" height="28" alt="Claude Code"></a>
+          <a href="https://github.com/openai/codex" title="Codex"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/openai.svg?color=white"><img src="https://api.iconify.design/simple-icons/openai.svg" height="28" alt="Codex"></picture></a>
+          <a href="https://opencode.ai" title="OpenCode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/opencode/FFFFFF"><img src="https://cdn.simpleicons.org/opencode/000000" height="28" alt="OpenCode"></picture></a>
+          <a href="https://pi.dev" title="pi"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/pi/FFFFFF"><img src="https://cdn.simpleicons.org/pi/000000" height="28" alt="pi"></picture></a>
+          <a href="https://github.com/google-gemini/gemini-cli" title="Gemini CLI"><img src="https://cdn.simpleicons.org/googlegemini/8E75B2" height="28" alt="Gemini CLI"></a>
+          <a href="https://www.kimi.com" title="Kimi"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/kimi/FFFFFF"><img src="https://cdn.simpleicons.org/kimi/000000" height="28" alt="Kimi"></picture></a>
+          <a href="https://github.com/QwenLM/qwen-code" title="Qwen Code"><img src="https://cdn.simpleicons.org/qwen/6950EF" height="28" alt="Qwen Code"></a>
+          <a href="https://github.com/github/copilot-cli" title="GitHub Copilot CLI"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/githubcopilot/FFFFFF"><img src="https://cdn.simpleicons.org/githubcopilot/000000" height="28" alt="GitHub Copilot CLI"></picture></a>
+          <a href="https://www.trae.ai" title="TRAE"><img src="https://cdn.simpleicons.org/trae/32F08C" height="28" alt="TRAE"></a>
+          <a href="https://www.codebuddy.cn" title="CodeBuddy"><img src="https://cdn.simpleicons.org/codebuddy/6C4DFF" height="28" alt="CodeBuddy"></a>
+          <a href="https://qoder.com" title="Qoder"><img src="https://icons.duckduckgo.com/ip3/qoder.com.ico" height="28" alt="Qoder"></a>
+          <a href="https://iflow.cn" title="iFlow CLI"><img src="https://img.alicdn.com/imgextra/i4/O1CN01yBfg3x1iNi4YggwIt_!!6000000004401-2-tps-72-72.png" height="28" alt="iFlow CLI"></a>
+          <a href="https://www.minimax.io" title="MiniMax Code (mcode)"><img src="https://cdn.simpleicons.org/minimax/E73562" height="28" alt="MiniMax Code"></a>
+          <a href="https://www.deepseek.com" title="deepseek-harness (dsh)"><img src="https://cdn.simpleicons.org/deepseek/5786FE" height="28" alt="deepseek-harness"></a>
+          <a href="https://ampcode.com" title="Amp"><img src="https://icons.duckduckgo.com/ip3/ampcode.com.ico" height="28" alt="Amp"></a>
+          <a href="https://aider.chat" title="aider"><img src="https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/assets/icons/favicon-32x32.png" height="28" alt="aider"></a>
+          <a href="https://github.com/aaif-goose/goose" title="goose"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_dark.png"><img src="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_light.png" height="28" alt="goose"></picture></a>
+          <a href="https://github.com/NousResearch/hermes-agent" title="hermes"><img src="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/apps/bootstrap-installer/src-tauri/icons/128x128.png" height="28" alt="hermes"></a>
+          <a href="https://z.ai" title="zcode (Z.ai)"><img src="https://z-cdn.chatglm.cn/z-ai/static/logo.svg" height="28" alt="zcode"></a>
+          <a href="https://omp.sh" title="omp (oh-my-pi, Stencil Labs)"><img src="https://omp.sh/favicon.svg" height="28" alt="omp"></a>
+          <a href="https://github.com/1jehuang/jcode" title="jcode"><img src="https://github.com/1jehuang.png" height="28" alt="jcode"></a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ HOW IT WORKS ============ -->
+    <section class="how" id="how">
+      <div class="container">
+        <h2 data-i18n="how.title">How it works</h2>
+        <p class="how-sub" data-i18n="how.sub">Not a bigger window — a better layout. Four mechanisms keep months of work inside an ordinary context limit:</p>
+        <div class="cards" data-reveal>
+          <article class="card">
+            <p class="card-icon" aria-hidden="true">&#8863;</p>
+            <h3 data-i18n="m1.t">Folded, not rewritten</h3>
+            <p data-i18n="m1.b">When history outgrows its budget, only the newly consumed slice is folded into a compact summary block — once per block, ever. The window oscillates in a bounded band instead of growing without limit; production sessions ran months at ten-thousand-plus calls. Any block decompresses back to full text when you need the detail.</p>
+          </article>
+          <article class="card">
+            <p class="card-icon grad" aria-hidden="true">&#9840;</p>
+            <h3 data-i18n="m2.t">The provider's cache stays warm</h3>
+            <p data-i18n="m2.b">A fold deactivates old ranges without touching the front of the conversation, so the prompt-cache prefix survives turn after turn — 94.2% of active input was served from cache in the study. Rewrite-style compaction invalidates the whole prefix and re-bills it. This does not.</p>
+          </article>
+          <article class="card">
+            <p class="card-icon" aria-hidden="true">&#9672;</p>
+            <h3 data-i18n="m3.t">The model decides what to forget</h3>
+            <p data-i18n="m3.b">A versioned compression doctrine lives in the system prompt; a growth-gated nudge says when folding pays off. The agent judges what the task still needs, may refuse, and compresses between steps — never mid-step.</p>
+          </article>
+          <article class="card">
+            <p class="card-icon" aria-hidden="true">&#8721;</p>
+            <h3 data-i18n="m4.t">Every token is accounted</h3>
+            <p data-i18n-html="m4.b">Each request is sampled into a per-session ledger — new content, cache reads, compression repay, TTL expiry — plotted in percentage points on a trajectory chart. Audit real savings with <code>/acp</code> in the terminal or the built-in web UI at <code>/__bili/</code>.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ INSTALL ============ -->
+    <section class="install" id="install">
+      <div class="container install-inner">
+        <div class="install-copy" data-reveal>
+          <h2 data-i18n="install.title">Up and running in under a minute</h2>
+          <p class="install-intro" data-i18n-html="install.intro"><strong>One npm package, Node 22+.</strong> Then pick your connection style:</p>
+          <div class="methods">
+            <article class="method"><span class="m-n" aria-hidden="true">1</span><div>
+              <h3 data-i18n="im1.t">Native plugin — recommended</h3>
+              <p data-i18n-html="im1.b">Installs straight into your client for the deepest integration: <code>bili plugin install pi</code>. Covers pi · omp · claude · codex · opencode · dsh · kimi · hermes · zcode.</p>
+            </div></article>
+            <article class="method"><span class="m-n" aria-hidden="true">2</span><div>
+              <h3 data-i18n="im2.t">Launcher — works for any agent</h3>
+              <p data-i18n-html="im2.b">Wraps your client's command and injects bili automatically, zero config edits: <code>bili pi</code>, <code>bili codex</code>, <code>bili claude</code> — about twenty agents.</p>
+            </div></article>
+            <article class="method"><span class="m-n" aria-hidden="true">3</span><div>
+              <h3 data-i18n="im3.t">Generic proxy</h3>
+              <p data-i18n-html="im3.b">Any client that accepts a custom endpoint works out of the box: point its base URL at <code>http://localhost:8787/bili/&lt;your upstream&gt;</code>.</p>
+            </div></article>
+          </div>
+        </div>
+        <div class="codebox" data-reveal data-delay="100">
+          <div class="codebox-head"><span class="mono" data-i18n="codebox.file">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context --prefix=~/.local&#10;bili pi" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>npm install -g billion-context --prefix=~/.local
+bili pi          # or: bili codex / claude / omp / opencode …</code></pre>
+        </div>
+      </div>
+      <p class="install-after container" data-i18n-html="install.after">Connected? Type <code>/acp</code> in your agent for the live panel and <code>/acp-cache</code> for the token economics. Per-agent details, MITM mode and troubleshooting: <a href="docs/#connect">the connect guide</a>.</p>
+    </section>
+
+    <!-- ============ PAPER ============ -->
+    <section class="paper" id="paper">
+      <div class="container paper-inner" data-reveal>
+        <div>
+          <p class="kicker" data-i18n="paper.kicker">Peer-reviewable by anyone</p>
+          <h2 data-i18n-html="paper.t">Model-driven incremental hierarchical compression: training-free multi-generational context management for long-lived coding agents</h2>
+          <p data-i18n="paper.b">The method behind the product, open-sourced under MIT inside the repository and updated as a living document. A 4.5-month production study across three hosts: 174,327 model calls, 18.76B cumulative input tokens, zero window violations.</p>
+        </div>
+        <a class="btn btn-outline" href="https://github.com/ranxianglei/billion-context/blob/master/paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md" target="_blank" rel="noopener" data-i18n="paper.cta">Read the preprint</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="container foot-inner">
+      <div class="foot-brand"><span class="brand-mark" aria-hidden="true">&#8734;</span> billion-context</div>
+      <p class="foot-note" data-i18n="foot.note">MIT-licensed plus one attribution term: products built on it say so publicly. Built with open source; runs entirely on your machine.</p>
+      <nav class="foot-links" aria-label="Footer">
+        <a href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">billion-context</a>
+        <a href="https://github.com/ranxianglei/acp-kernel" target="_blank" rel="noopener">acp-kernel</a>
+        <a href="https://www.npmjs.com/package/billion-context" target="_blank" rel="noopener">npm</a>
+        <span class="foot-q">QQ: 1056132097 / 1108730198</span>
+      </nav>
+      <p class="foot-copy">© 2026 ranxianglei</p>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

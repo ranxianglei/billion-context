@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
+const originalHome = process.env.CODEX_HOME;
+const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-snapshot-"));
+process.env.CODEX_HOME = codexHome;
+after(() => {
+    if (originalHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalHome;
+    fs.rmSync(codexHome, { recursive: true, force: true });
+});
 
 import {
     CODEX_FALLBACK_CONTEXT_WINDOW,
@@ -10,6 +21,7 @@ import {
     codexAlignedWindow,
     codexWindowForModel,
     isCodexClient,
+    type CodexModelEntry,
 } from "../src/codex-models.ts";
 
 // #321 PR-E1: codex carries its own window perception (bundled model table +
@@ -77,9 +89,44 @@ test("codexAlignedWindow: min() semantics per acceptance (in-table / not-in-tabl
 });
 
 test("test hooks: table replacement + reset", () => {
-    _setCodexTableForTest([{ slug: "test-model", contextWindow: 12_345 }]);
-    assert.equal(codexWindowForModel("test-model"), 12_345);
-    assert.equal(codexWindowForModel("test-model-x"), 12_345);
-    _resetCodexTableForTest();
-    assert.equal(codexWindowForModel("gpt-5.5"), 272_000);
+    try {
+        _setCodexTableForTest([{ slug: "test-model", contextWindow: 12_345 }]);
+        assert.equal(codexWindowForModel("test-model"), 12_345);
+        assert.equal(codexWindowForModel("test-model-x"), 12_345);
+        _resetCodexTableForTest();
+        assert.equal(codexWindowForModel("gpt-5.5"), 272_000);
+    } finally {
+        _resetCodexTableForTest();
+    }
+});
+
+// #1953: reset must restore the SHIPPED snapshot. gpt-daybreak-red-latest
+// (372K) differs from the 272K fallback, so a broken reset cannot hide behind
+// the fallback value (the old assertion above used gpt-5.5 = fallback: masked).
+test("test hooks: reset restores the shipped snapshot, second reset idempotent (#1953)", () => {
+    const model = "gpt-daybreak-red-latest";
+    const before = codexWindowForModel(model);
+    assert.equal(before, 372_000, "shipped window differs from the 272K fallback");
+    try {
+        _setCodexTableForTest([{ slug: "audit-model", contextWindow: 12_345 }]);
+        assert.equal(codexWindowForModel("audit-model"), 12_345);
+        _resetCodexTableForTest();
+        assert.equal(codexWindowForModel(model), before, "reset must restore the shipped model snapshot");
+        assert.equal(codexWindowForModel("audit-model"), CODEX_FALLBACK_CONTEXT_WINDOW, "replaced table gone after reset");
+        _resetCodexTableForTest();
+        assert.equal(codexWindowForModel(model), before, "second reset is idempotent");
+    } finally {
+        _resetCodexTableForTest();
+    }
+});
+
+test("test hooks: caller mutation after set does not leak into the table (#1953)", () => {
+    try {
+        const entry: CodexModelEntry = { slug: "caller-model", contextWindow: 12_345 };
+        _setCodexTableForTest([entry]);
+        entry.contextWindow = 999;
+        assert.equal(codexWindowForModel("caller-model"), 12_345, "table holds its own copies of entries");
+    } finally {
+        _resetCodexTableForTest();
+    }
 });

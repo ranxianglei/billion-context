@@ -38,7 +38,7 @@ function sseBlock(type: string, data: Record<string, unknown>): string {
 
 function anthropicSse(res: http.ServerResponse): void {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-    const ev = (t: string, d: Record<string, unknown>): void => res.write(sseBlock(t, { type: t, ...d }));
+    const ev = (t: string, d: Record<string, unknown>) => res.write(sseBlock(t, { type: t, ...d }));
     ev("message_start", { message: { id: "msg_d", usage: { input_tokens: 10 } } });
     ev("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
     ev("content_block_delta", { index: 0, delta: { type: "text_delta", text: "ok" } });
@@ -123,7 +123,14 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
     await listen(proxy);

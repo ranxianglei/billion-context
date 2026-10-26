@@ -1,0 +1,86 @@
+name: Theorem Lane
+
+# Machine-checked cache-stability theorems (#2149). Runs Z3 over proof/spec
+# plus the grounding tests in tests/cache-theorem.test.ts. Ubuntu-only: the
+# pinned z3-solver wheel targets linux x86_64; windows legs of ci.yml run the
+# same test file with solver subtests skipped by design.
+on:
+  # three-layer CI (#3295): pull_request feeds the ci:full label gate + this
+  # paths filter only — a plain PR never runs the lane. NO push trigger by
+  # design: master's signal is ci.yml core runs + the gated 30-min cron below
+  # (the pre-#3295 push trigger was deliberately dropped, not lost).
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
+    paths:
+      - "proof/**"
+      - "tests/cache-theorem.test.ts"
+      - "src/loop/**"
+      - "src/wire-body.ts"
+      - "src/system-anchor.ts"
+      - "src/chain-checkpoint.ts"
+      - "src/image-note.ts"
+      - "src/server.ts"
+      - "src/session.ts"
+      - "src/fake-completion.ts"
+      - "src/degenerate-retry.ts"
+      - "kernel/src/rebuild.ts"
+      - "kernel/src/render-refs.ts"
+      - "kernel/src/refs.ts"
+      - "kernel/src/segment.ts"
+      - "kernel/src/block-map.ts"
+      - "kernel/src/ccr.ts"
+      - ".github/workflows/ci-theorem.yml"
+  # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
+  schedule:
+    - cron: '16/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  workflow_dispatch:
+jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-theorem.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+  theorem:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # pin the solver so local iteration and CI verdicts match
+      - name: Install pinned z3
+        run: python3 -m pip install --quiet "z3-solver==4.9.1.0"
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-fund --no-audit
+      - name: Run theorem lane
+        run: node --import tsx --test tests/cache-theorem.test.ts

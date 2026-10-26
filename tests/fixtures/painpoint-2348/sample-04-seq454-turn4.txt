@@ -1,0 +1,3 @@
+<acp tokens="69" string="true">m00213</apc>
+<acp tokens="97" string="true">m00214</acp>
+被 `.gitignore` 挡住了 —— 这正是 `cache-layout` §7 说的那个坑（`.gitignore` 第 2 行 `*` 反向挡住，`git status` 永不报警）。看规则再决定，不擅自 `-f`。

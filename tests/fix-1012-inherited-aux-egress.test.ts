@@ -9,8 +9,8 @@ import {
     ensureProxyRunning,
     type SpawnChild,
     type SpawnFn,
-    type ProxyInstanceFile,
 } from "../src/launcher.ts";
+import type { ProxyInstanceFile } from "../src/instance.ts";
 import { loadOptions } from "../src/config.ts";
 import { resolveProxyDecision } from "../src/upstream-proxy.ts";
 

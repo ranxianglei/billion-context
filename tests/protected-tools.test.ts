@@ -93,7 +93,7 @@ test("protectedTools: explicit compress range cannot fold ANY skill load", () =>
     }
     const spanEnd = msgs.find((m) => m.contentType === "text" && m.text?.startsWith("tail message 20"))!;
     const endRef = refOf(spanEnd);
-    assert.ok(/^m\d+$/.test(endRef ?? ""), `range end ref resolved, got ${endRef}`);
+    assert.ok(endRef !== null && /^m\d+$/.test(endRef), `range end ref resolved, got ${endRef}`);
 
     // An explicit range spanning everything up to AND INCLUDING all three
     // skill pairs — the hard exclusion must carve every instance out.
@@ -137,4 +137,43 @@ test("without protectedTools every skill load is foldable (default stays off)", 
     assert.ok(!res.result.warnings.some((w) => /protected/.test(w)), "no protection carve by default");
     const turn2 = core.processTurn({ messages: msgs, state: res.state, config, tokenCount: 9999, renderTags: "text-only" });
     assert.equal(skillsIn(turn2.messages).length, 0, "all skill loads foldable when not configured");
+});
+
+// --- #1725: case-insensitive matching (acp-kernel #484, needs kernel >= 0.0.100) ---
+// opencode spells the tool "read" while the Claude-style config lists "Read" —
+// pre-0.0.100 kernels compared exactly and the lowercase pair silently folded.
+
+test("protectedTools matching is case-insensitive: \"Read\" pattern protects opencode's \"read\" pair (#1725)", () => {
+    const body: AnthropicRequestBody = { model: "claude-test", messages: [] };
+    body.messages.push({ role: "user", content: "start of session with an opencode file read" as never });
+    body.messages.push({ role: "assistant", content: [{ type: "tool_use", id: "rd-1", name: "read", input: { path: "src/a.ts" } }] as never });
+    body.messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "rd-1", content: `file body ${"z".repeat(600)}` }] as never });
+    for (let i = 0; i < 30; i++) {
+        body.messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: `tail message ${i} ${"x".repeat(500)}` as never });
+    }
+    const core = createCore();
+    const state = createInitialState();
+    const config = { ...defaultConfig(200000), protectedTools: ["Read"], preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const { msgs } = anthropicToCore(body);
+
+    const turn = core.processTurn({ messages: msgs, state, config, tokenCount: 9999, renderTags: "text-only" });
+    const refOf = (m: CoreMessage): string | null => refForRaw(turn.state.messageRefs, m.id);
+    const call = msgs.find((m) => m.contentType === "tool-call" && m.toolCallId === "rd-1")!;
+    const result = msgs.find((m) => m.contentType === "tool-result" && m.toolCallId === "rd-1")!;
+    assert.equal(refOf(call), "BLOCKED", "opencode 'read' call is BLOCKED by the Claude-cased 'Read' pattern");
+    assert.equal(refOf(result), "BLOCKED", "opencode 'read' result is BLOCKED by the Claude-cased 'Read' pattern");
+
+    const spanEnd = msgs.find((m) => m.contentType === "text" && m.text?.startsWith("tail message 20"))!;
+    const res = core.applyCompression({
+        ranges: [{ startRef: "m00001", endRef: refOf(spanEnd)!, summary: "fold the early history including the file read".repeat(3) }],
+        state: turn.state,
+        config,
+        messages: turn.messages,
+    });
+    assert.equal(res.result.errors.length, 0, `no errors: ${res.result.errors.join("; ")}`);
+    const covered = coveredMessageIds(res.state);
+    assert.ok(!covered.has(call.id) && !covered.has(result.id), "the case-mismatched read pair is NOT covered");
+
+    const turn2 = core.processTurn({ messages: msgs, state: res.state, config, tokenCount: 9999, renderTags: "text-only" });
+    assert.equal(turn2.messages.filter((m) => m.contentType === "tool-call" && m.toolName === "read").length, 1, "the read pair survives the fold");
 });

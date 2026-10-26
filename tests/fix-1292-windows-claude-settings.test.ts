@@ -52,6 +52,38 @@ function makeFakeChild(pid: number): SpawnChild {
 
 const MANAGED_BASE_URL = "http://127.0.0.1:8788/bili/https://api.anthropic.com";
 
+// Vertex port, phase 1 (decisions 4/7): the native-install override carries BOTH
+// variables, since the managed block's static ANTHROPIC_BASE_URL is dead when
+// CLAUDE_CODE_USE_VERTEX=1. The payload shape is the only thing that changes; the
+// win32 temp-file mechanism is untouched.
+const MANAGED_VERTEX_BASE_URL = "http://127.0.0.1:8788/bili/anthropic/https://aiplatform.googleapis.com/v1";
+
+test("#1292 buildClaudeSettingsArg: extra Vertex override rides the inline payload (POSIX)", () => {
+    const r = buildClaudeSettingsArg("linux", MANAGED_BASE_URL, { ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL });
+    assert.equal(r.tmpFile, undefined);
+    assert.deepEqual(r.clientArgs, [
+        "--settings",
+        JSON.stringify({ env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL, ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL } }),
+    ]);
+});
+
+test("#1292 buildClaudeSettingsArg: extra Vertex override rides the temp file on win32", () => {
+    const r = buildClaudeSettingsArg("win32", MANAGED_BASE_URL, { ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL });
+    try {
+        assert.ok(r.tmpFile !== undefined);
+        assert.deepEqual(JSON.parse(fs.readFileSync(r.tmpFile!, "utf8")), {
+            env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL, ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL },
+        });
+    } finally {
+        if (r.tmpFile) rmrf(r.tmpFile);
+    }
+});
+
+test("#1292 buildClaudeSettingsArg: no extra env → payload identical to the pre-port shape", () => {
+    const r = buildClaudeSettingsArg("linux", MANAGED_BASE_URL, undefined);
+    assert.deepEqual(r.clientArgs, ["--settings", JSON.stringify({ env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL } })]);
+});
+
 test("#1292 buildClaudeSettingsArg: non-win32 keeps the inline JSON (pre-fix behavior preserved)", () => {
     for (const platform of ["linux", "darwin", "freebsd"] as const) {
         const r = buildClaudeSettingsArg(platform, MANAGED_BASE_URL);
@@ -95,6 +127,8 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-1292-home-"));
     const prevHome = process.env.HOME;
     const prevUserProfile = process.env.USERPROFILE;
+    const prevClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevComspec = process.env.COMSPEC;
     const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
     const prevExit = process.exit;
@@ -103,7 +137,8 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
     const fakeClaude = path.join(home, "fake-claude.cmd");
     fs.writeFileSync(fakeClaude, "");
     process.env.HOME = home;
-    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.USERPROFILE = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, ".claude");
     process.env.BILI_CLIENT_BIN = fakeClaude;
     process.env.COMSPEC = "C:\\Windows\\System32\\cmd.exe";
     process.env.BILI_LAUNCHER_PLUGIN = "0";
@@ -160,10 +195,14 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
+        if (prevClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = prevClaudeConfigDir;
         if (prevComspec === undefined) delete process.env.COMSPEC;
         else process.env.COMSPEC = prevComspec;
         if (prevPlugin === undefined) delete process.env.BILI_LAUNCHER_PLUGIN;
         else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
         if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdgState;
         rmrf(home);
@@ -174,6 +213,8 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-1292-posix-"));
     const prevHome = process.env.HOME;
     const prevUserProfile = process.env.USERPROFILE;
+    const prevClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
     const prevExit = process.exit;
 
@@ -181,7 +222,8 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
     const fakeClaude = path.join(home, "fake-claude");
     fs.writeFileSync(fakeClaude, "");
     process.env.HOME = home;
-    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.USERPROFILE = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, ".claude");
     process.env.BILI_CLIENT_BIN = fakeClaude;
     process.env.BILI_LAUNCHER_PLUGIN = "0";
     process.exit = (() => undefined) as typeof process.exit;
@@ -224,8 +266,12 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
+        if (prevClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = prevClaudeConfigDir;
         if (prevPlugin === undefined) delete process.env.BILI_LAUNCHER_PLUGIN;
         else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
         if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdgState;
         rmrf(home);

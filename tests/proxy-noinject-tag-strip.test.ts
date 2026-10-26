@@ -1,12 +1,14 @@
 import assert from "node:assert";
 import http from "node:http";
 import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -47,7 +49,7 @@ async function startHarness(compress: { injectTool: boolean; injectNudge: boolea
     upstream.listen(0, "127.0.0.1");
     return (async () => {
         await once(upstream, "listening");
-        const upstreamPort = upstream.address().port;
+        const upstreamPort = (upstream.address() as AddressInfo).port;
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
         const proxy = await startServer({
@@ -64,17 +66,26 @@ async function startHarness(compress: { injectTool: boolean; injectNudge: boolea
             debug: false,
             passthrough: false,
             autoUpdate: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
             mitm: { enabled: false, domains: [] },
         } as ProxyOptions);
         await once(proxy, "listening");
-        const proxyPort = proxy.address().port;
+        const proxyPort = (proxy.address() as AddressInfo).port;
         return {
             proxyPort,
             upstreamPort,
             close: async () => {
                 proxy.close();
+                proxy.closeIdleConnections?.();
                 await once(proxy, "close");
                 upstream.close();
+                upstream.closeIdleConnections?.();
                 await once(upstream, "close");
             },
         };
@@ -132,7 +143,7 @@ function cleanOpenAiContent(raw: string): string {
 }
 
 test("#460: non-injected anthropic SSE — echoed render tags stripped, prose intact", async () => {
-    const h = await startHarness({ injectTool: false, injectNudge: false }, [tagEchoAnthropicScript()]);
+    const h = await startHarness({ injectTool: false, injectNudge: false }, [tagEchoAnthropicScript()], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
             method: "POST",
@@ -141,7 +152,7 @@ test("#460: non-injected anthropic SSE — echoed render tags stripped, prose in
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "client stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "client stream leaked a render close tag");
         assert.ok(cleanAnthropicText(raw).endsWith("好的，总结如下 另外 5 « 6 成立完毕"), `unexpected client text: ${JSON.stringify(cleanAnthropicText(raw))}`);
@@ -161,7 +172,7 @@ test("#460: non-injected anthropic SSE without tags — byte-identical passthrou
         anthropicSse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 2 } }),
         anthropicSse("message_stop", { type: "message_stop" }),
     ];
-    const h = await startHarness({ injectTool: false, injectNudge: false }, [script]);
+    const h = await startHarness({ injectTool: false, injectNudge: false }, [script], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
             method: "POST",
@@ -170,7 +181,7 @@ test("#460: non-injected anthropic SSE without tags — byte-identical passthrou
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw, script.join(""), "tag-free stream must pass through byte-identical");
     } finally {
         await h.close();
@@ -178,7 +189,7 @@ test("#460: non-injected anthropic SSE without tags — byte-identical passthrou
 });
 
 test("#460: openai title-gen (max_tokens<=200) SSE — echoed render tags stripped, [DONE] intact", async () => {
-    const h = await startHarness({ injectTool: true, injectNudge: true }, [tagEchoOpenAiScript()]);
+    const h = await startHarness({ injectTool: true, injectNudge: true }, [tagEchoOpenAiScript()], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
             method: "POST",
@@ -187,7 +198,7 @@ test("#460: openai title-gen (max_tokens<=200) SSE — echoed render tags stripp
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "client stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "client stream leaked a render close tag");
         assert.equal(cleanOpenAiContent(raw), "title: summary ok", `unexpected content: ${JSON.stringify(cleanOpenAiContent(raw))}`);
@@ -250,7 +261,7 @@ function cleanResponsesScript(): string[] {
 }
 
 test("#460 residual: native Responses compaction (resetAfterSuccess) SSE — echoed render tags stripped, response.completed intact", async () => {
-    const h = await startHarness({ injectTool: true, injectNudge: true }, [tagEchoResponsesScript()]);
+    const h = await startHarness({ injectTool: true, injectNudge: true }, [tagEchoResponsesScript()], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/responses`, {
             method: "POST",
@@ -259,7 +270,7 @@ test("#460 residual: native Responses compaction (resetAfterSuccess) SSE — ech
         });
         assert.equal(resp.status, 200, "native compact request must still forward to upstream");
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "client stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "client stream leaked a render close tag");
         assert.equal(cleanResponsesDeltaText(raw), "压缩前 后 5 « 6 成立", `unexpected client text: ${JSON.stringify(cleanResponsesDeltaText(raw))}`);
@@ -270,7 +281,7 @@ test("#460 residual: native Responses compaction (resetAfterSuccess) SSE — ech
 });
 
 test("#460 residual: tag-free Responses compaction SSE — byte-identical passthrough", async () => {
-    const h = await startHarness({ injectTool: true, injectNudge: true }, [cleanResponsesScript()]);
+    const h = await startHarness({ injectTool: true, injectNudge: true }, [cleanResponsesScript()], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/responses`, {
             method: "POST",
@@ -279,7 +290,7 @@ test("#460 residual: tag-free Responses compaction SSE — byte-identical passth
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw, cleanResponsesScript().join(""), "tag-free compact stream must pass through byte-identical");
     } finally {
         await h.close();
@@ -298,7 +309,7 @@ test("#460 residual: non-injected NON-STREAMING openai JSON — echoed render ta
         });
         assert.equal(resp.status, 200);
         let bodyText = "";
-        for await (const chunk of resp.body) bodyText += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) bodyText += Buffer.from(chunk).toString("utf8");
         try {
             const parsed = JSON.parse(bodyText) as { choices?: Array<{ message?: { content?: string } }> };
             assert.equal(parsed.choices?.[0]?.message?.content, "title: summary ok", `unexpected content: ${JSON.stringify(bodyText)}`);
@@ -324,7 +335,7 @@ test("#460 residual: non-injected NON-STREAMING responses JSON — echoed render
         });
         assert.equal(resp.status, 200);
         let bodyText = "";
-        for await (const chunk of resp.body) bodyText += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) bodyText += Buffer.from(chunk).toString("utf8");
         assert.equal(bodyText.includes(OPEN_MARK), false, "client body leaked a render open tag");
         let text: string | undefined;
         try {
@@ -348,7 +359,7 @@ test("#460 residual: tag-free NON-STREAMING JSON — byte-identical passthrough"
         });
         assert.equal(resp.status, 200);
         let bodyText = "";
-        for await (const chunk of resp.body) bodyText += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) bodyText += Buffer.from(chunk).toString("utf8");
         assert.equal(bodyText, JSON.stringify(completion), "tag-free JSON body must pass through byte-identical");
     } finally {
         await h.close();
@@ -368,7 +379,7 @@ function tagEchoOpenAiSplitScript(): string[] {
 }
 
 test("#468: openai SSE with the render OPEN tag split across chunks — stripped, not echoed", async () => {
-    const h = await startHarness({ injectTool: false, injectNudge: false }, [tagEchoOpenAiSplitScript()]);
+    const h = await startHarness({ injectTool: false, injectNudge: false }, [tagEchoOpenAiSplitScript()], false);
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
             method: "POST",
@@ -377,7 +388,7 @@ test("#468: openai SSE with the render OPEN tag split across chunks — stripped
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "client stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "client stream leaked a render close tag");
         assert.equal(cleanOpenAiContent(raw), "title: summary ok", `unexpected content: ${JSON.stringify(cleanOpenAiContent(raw))}`);
@@ -406,7 +417,7 @@ test("#475 G3: fake-completion buffering + streaming request answered with JSON 
         });
         assert.equal(resp.status, 200);
         let bodyText = "";
-        for await (const chunk of resp.body) bodyText += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) bodyText += Buffer.from(chunk).toString("utf8");
         const parsed = JSON.parse(bodyText) as { choices?: Array<{ message?: { content?: string } }> };
         assert.equal(parsed.choices?.[0]?.message?.content, "title: summary ok", `unexpected body: ${JSON.stringify(bodyText)}`);
         assert.equal(bodyText.includes(OPEN_MARK), false, "client body leaked a render open tag");

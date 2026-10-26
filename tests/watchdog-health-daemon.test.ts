@@ -7,7 +7,20 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import type { ProxyOptions } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
+
+// #2941: registration now completes AFTER the bind (post-bind ownership
+// check), so "listening" no longer implies health-readiness — poll for it.
+async function waitReady(port: number): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+        try {
+            if ((await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(500) })).status === 200) return;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`proxy on port ${port} did not become ready`);
+}
 
 /** #1322 counterpart of watchdog-health.test.ts: a proxy started WITHOUT
  *  BILI_PARENT_PID is a daemon — its health must say `armed:false` and it must
@@ -58,7 +71,7 @@ test("health exposes an unarmed watchdog on a daemon proxy; registration stays r
     ]);
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const opts = {
+    const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1:1",
@@ -74,12 +87,20 @@ test("health exposes an unarmed watchdog on a daemon proxy; registration stays r
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
     const port = (proxy.address() as AddressInfo).port;
+    await waitReady(port);
     try {
         const h = await getJson(port, "/__bili/health");
         assert.equal(h.status, 200);

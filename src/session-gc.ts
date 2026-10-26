@@ -6,6 +6,9 @@ import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
 import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
+import { stateDir } from "./paths.js";
+import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
+import { gcSettings as knobGcSettings } from "./knobs.js";
 
 /**
  * Session-file garbage collection (#1082). OPT-IN: disabled unless
@@ -64,38 +67,22 @@ import { dropSessionForGc, peekSession } from "./session.js";
  *     guess at unreadable files).
  */
 
-export interface GcConfig {
+interface GcConfig {
     enabled: boolean;
     maxAgeMs: number;
     maxTokens: number;
     intervalMs: number;
 }
 
-const DEFAULT_MAX_AGE_DAYS = 7;
 // Owner decision (#1082): aggressive by design — a cold rebuild (client re-sends
 // full history, proxy folds via preflight) is acceptable even for large idle
-// sessions, so the size gate rarely bites; the age gate does the work.
-const DEFAULT_MAX_TOKENS = 1_000_000;
-const DEFAULT_INTERVAL_MS = 3_600_000;
+// sessions, so the size gate rarely bites; the age gate does the work. Defaults
+// live in knobs.gcSettings (config `sessions.gc.*`, env BILI_SESSION_GC* win).
 const DAY_MS = 86_400_000;
 
+/** Opt-in only (owner requirement #1082): unset means disabled. */
 export function gcConfigFromEnv(): GcConfig {
-    // Opt-in only (owner requirement #1082): unset means disabled.
-    const env = process.env.BILI_SESSION_GC?.toLowerCase();
-    const enabled = env === "1" || env === "true" || env === "on";
-    return {
-        enabled,
-        maxAgeMs: intEnv("BILI_SESSION_GC_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS) * DAY_MS,
-        maxTokens: intEnv("BILI_SESSION_GC_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        intervalMs: intEnv("BILI_SESSION_GC_INTERVAL_MS", DEFAULT_INTERVAL_MS),
-    };
-}
-
-function intEnv(name: string, fallback: number): number {
-    const v = process.env[name];
-    if (!v) return fallback;
-    const n = Number.parseInt(v, 10);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
+    return knobGcSettings();
 }
 
 interface FileView {
@@ -184,17 +171,19 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
     return out;
 }
 
-export interface GcResult {
+interface GcResult {
     removed: number;
     kept: number;
     unreadable: number;
     bytesFreed: number;
     /** #1180: content-store companion files removed (co-deletions + orphan sweeps) */
     companionsRemoved: number;
+    /** #1995: image-spill directories removed (co-deletions + stale-mtime sweep) */
+    imgDirsRemoved: number;
 }
 
-export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number }): Promise<GcResult> {
-    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0 };
+export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number; imgRoot?: string }): Promise<GcResult> {
+    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0, imgDirsRemoved: 0 };
     const cfg = gcConfigFromEnv();
     if (!cfg.enabled) return result;
     const store = opts?.store ?? getStore();
@@ -286,6 +275,22 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         result.removed++;
         result.bytesFreed += st.size;
         deletedSessions.add(file);
+        // #1995 review ②: the image-restore spill tree
+        // (<state>/retrieve/img/<sessionId>/) shares this session's lifecycle —
+        // refs are per-session, so once the file is gone the spills are
+        // unreachable. Co-delete; anything this deterministic path misses (null
+        // id, a pre-salt dir name from an older build) is collected by the
+        // stale-mtime pass below.
+        if (view.id !== null) {
+            try {
+                const imgDir = opts?.imgRoot !== undefined
+                    ? path.join(opts.imgRoot, restoreExportDirName(view.id))
+                    : restoreExportDir(view.id);
+                await rm(imgDir, { recursive: true, force: true });
+                loggerLog("info", `[gc] removed image spills for session ${view.id}: ${path.relative(stateDir(), imgDir)}`);
+                result.imgDirsRemoved++;
+            } catch { /* mtime pass retries next sweep */ }
+        }
         if (compSt) {
             // Co-delete the companion so the sweep never leaves orphans. On
             // failure it surfaces as an orphan on the very next pass below.
@@ -380,9 +385,36 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         const parent = path.dirname(companion);
         if (parent !== dir) await rmdir(parent).catch(() => {});
     }
-    if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0) {
+    // #1995 review ②+③: image-spill directories orphaned by anything but the
+    // co-delete above (crash between file rm and dir rm, unreadable ids, dir
+    // names from before the collision-salt). mtime = last spill write; spills
+    // are a pure cache — the next request re-spills whatever it needs — so an
+    // age-eligible dir is safe to drop even if its session survives (expiry
+    // self-heals by re-spill). Same age gate as every other artifact here.
+    const imgRoot = opts?.imgRoot ?? path.join(stateDir(), "retrieve", "img");
+    try {
+        for (const e of await readdir(imgRoot, { withFileTypes: true })) {
+            if (!e.isDirectory()) continue;
+            const full = path.join(imgRoot, e.name);
+            let ist;
+            try {
+                ist = await stat(full);
+            } catch {
+                continue;
+            }
+            if (!ist.isDirectory() || now - ist.mtimeMs < cfg.maxAgeMs) continue;
+            try {
+                await rm(full, { recursive: true, force: true });
+            } catch {
+                continue;
+            }
+            loggerLog("info", `[gc] removed stale image spill dir ${path.relative(stateDir(), full)}`);
+            result.imgDirsRemoved++;
+        }
+    } catch { /* no spill tree yet — nothing to sweep */ }
+    if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0 || result.imgDirsRemoved > 0) {
         loggerLog(result.unreadable > 0 ? "warn" : "info",
-            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
+            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""}${result.imgDirsRemoved > 0 ? ` + ${result.imgDirsRemoved} image spill dir(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
     }
     return result;
 }

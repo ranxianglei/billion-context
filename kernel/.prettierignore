@@ -1,0 +1,12 @@
+# Build output (prettier would reformat bundled/minified artifacts)
+dist/
+
+# npm-generated lockfile: npm rewrites it with its own formatting on
+# dependency changes, so formatting it here causes permanent churn.
+package-lock.json
+
+# Local scratch directory (never present in CI)
+.tmp/
+
+# Ignored by prettier by default; listed for clarity
+node_modules/

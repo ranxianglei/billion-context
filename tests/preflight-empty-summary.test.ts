@@ -6,11 +6,14 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so the stream-learn path exercises immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
-// Short dead-end cooldown so the expiry leg of the #726 test stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
+// Zero backoff so #1767's transient-retry legs (truncation is now retried) run instantly.
+process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+// #3274/#4079: the #726 dead-end cooldown this file pinned is REMOVED —
+// retries now re-run a bounded walk with no cached diagnosis and no marker.
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -20,9 +23,9 @@ import { diagnoseEmptySummary } from "../src/preflight.ts";
 // summarization call can return HTTP 200 SSE carrying NO summary text (an
 // in-stream error event / truncated stream). The proxy must (a) surface WHAT
 // the body said instead of a bare "summary too short", (b) retry the failing
-// chunk at smaller sizes before giving up on the range, and (c) stop client
-// auto-retries from re-burning upstream quota on the identical doomed walk
-// (per-session dead-end cooldown).
+// chunk at smaller sizes before giving up on the range. (#4079: the #726
+// cooldown that used to stop client auto-retries is removed — the bounded
+// walk itself plus retryable:false is the whole contract now.)
 
 const SUMMARY_TEXT =
     "EMPTY-SUMMARY TEST SUMMARY: the segment held a deterministic load-growth payload across several turns; every raw marker is derivable from the seed, so the folded view loses nothing of value.";
@@ -153,7 +156,14 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 
@@ -165,7 +175,7 @@ async function driveResponses(proxyPort: number, upstreamPort: number, session: 
     });
 }
 
-test("changed over-window content bypasses a previous dead-end cooldown", async () => {
+test("(#4079) no dead-end cooldown: retries — identical or changed — re-run the walk, no marker persists", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0);
     upstream.listen(0, "127.0.0.1");
@@ -180,18 +190,26 @@ test("changed over-window content bypasses a previous dead-end cooldown", async 
         assert.equal(first.status, 502);
         await first.text();
         const session = listSessions().find((s) => s.id.includes("changed-cooldown"));
-        const marker = session?.metadata.preflightDeadEnd as Record<string, unknown>;
-        assert.ok(marker);
-        marker.until = Date.now() + 60_000;
+        // The old cooldown's body-hash keying is gone with the mechanism: the
+        // retry below is byte-identical and must still re-run preflight —
+        // freezing identical retries for minutes was #3974's uninstall event.
+        assert.equal(session?.metadata?.preflightDeadEnd, undefined, "no dead-end marker may persist (#4079)");
         const callsBefore = calls.length;
+        const identical = await driveResponses(proxyPort, upstreamPort, "changed-cooldown", "gpt-7-sol", input);
+        assert.equal(identical.status, 502);
+        await identical.text();
+        assert.ok(calls.length > callsBefore, "an identical retry re-runs the bounded walk (no cooldown freeze)");
+        const callsBeforeChange = calls.length;
         input[8].content = input[8].content.replace("Message", "Updated");
         const changed = await driveResponses(proxyPort, upstreamPort, "changed-cooldown", "gpt-7-sol", input);
         assert.equal(changed.status, 502);
         await changed.text();
-        assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
+        assert.ok(calls.length > callsBeforeChange, "changed content retries preflight too");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -228,7 +246,9 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -267,14 +287,16 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
     }
 });
 
-test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown blocks retries, expiry re-runs", async () => {
+test("#726 systemic empty summary: diagnosis surfaced, bounded calls, retries re-run a bounded walk with no marker", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0);
     upstream.listen(0, "127.0.0.1");
@@ -294,42 +316,44 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
             j1.error?.message?.includes("the upstream stream ended with a failed response (context_length_exceeded)"),
             `fail-fast message must carry the upstream diagnosis, got: ${j1.error?.message}`,
         );
+        // (#4079) the cooldown recovery hint is gone with the mechanism.
         assert.ok(
-            j1.error?.message?.includes("Change the request or wait for the cooldown before retrying"),
-            `fail-fast message must carry the recovery hint, got: ${j1.error?.message}`,
+            !j1.error?.message?.includes("cooldown"),
+            `fail-fast message must not reference a removed cooldown, got: ${j1.error?.message}`,
         );
         const summaries1 = calls.filter((c) => c.summary);
         assert.ok(summaries1.length >= 2 && summaries1.length <= 9, `summary calls must be bounded, got ${summaries1.length}: ${JSON.stringify(summaries1)}`);
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s726-deadend"));
-        const marker = sess?.metadata?.preflightDeadEnd as Record<string, unknown> | undefined;
-        assert.ok(marker && typeof marker === "object", "zero-progress failure must arm the dead-end marker");
-        assert.match(String(marker?.key), /^gpt-7-sol\u000010000\u0000[0-9a-f]{64}$/, "marker scoped to model, window and request body");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker may persist");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
+        assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
         const j2 = (await r2.json()) as { error?: { code?: string; message?: string } };
         assert.equal(j2.error?.code, "preflight_compress_failed");
-        assert.equal(j2.error?.message, j1.error?.message, "cooldown replays the cached diagnosis");
-        assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+        assert.ok(
+            j2.error?.message?.includes("context_length_exceeded"),
+            `the regenerated diagnosis carries the same core, got: ${j2.error?.message}`,
+        );
+        const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
+        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 9, `the re-run walk is itself bounded (#4079 trade), got ${retrySummaries.length}`);
 
-        await new Promise((resolve) => setTimeout(resolve, 450));
-        const callsBeforeExpire = calls.length;
-        const r3 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r3.status, 502, `post-expiry retry must fail again, got ${r3.status}`);
-        assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
+        // #3274 expiry leg removed with the cooldown (#4079): every retry
+        // already re-runs the walk — there is no marker to expire.
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
     }
 });
 
-test("#726 dead-end cooldown must not block safe-forwards: fitting payload under a warm marker still goes out", async () => {
+test("#300 regression (was #726 cooldown side-pin): fitting payload under a stale-high baseline still goes out", async () => {
     const calls: Call[] = [];
     // failAboveChars=0 → every summary call fails; forwardInputTokens=15_000 lets
     // a successful turn seed a stale-high usage baseline above the 10_000 window (#300 shape).
@@ -351,18 +375,21 @@ test("#726 dead-end cooldown must not block safe-forwards: fitting payload under
         const r1 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(12));
         assert.equal(r1.status, 502, `systemic failure must fail-fast, got ${r1.status}`);
         sess = listSessions().find((s) => s.id.includes("s726-stale"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists");
 
         // Same session, smaller payload: its own estimate fits the window; only
-        // the stale baseline trips the trigger. The cooldown suppresses the
-        // doomed walk — it must not convert this safe forward into a false 502.
+        // the stale baseline trips the trigger — the #300 safe-forward path
+        // must let it through (the old cooldown once risked converting this
+        // into a false 502; that hazard is now structurally impossible).
         const callsBeforeSmall = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", [{ type: "message", role: "user", content: "small follow-up" }]);
         assert.equal(r2.status, 200, `fitting payload under a warm marker must still forward, got ${r2.status}`);
         assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -408,19 +435,25 @@ test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", (
         id: "chatcmpl-1789806312367", object: "chat.completion", model: "muse-spark-1.3-contributor",
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
     });
+    // #2832: the diagnosis now carries the block-level fingerprint — the
+    // text_chars/text_blocks parts are what separate a thinking-only answer
+    // from a relay that stripped the text.
     assert.match(
         diagnoseEmptySummary(openai, JSON.parse(openai)),
-        /plain-JSON completion with empty content \(finish_reason=stop, answered as model=muse-spark-1\.3-contributor\)/,
+        /plain-JSON completion with empty content \(finish_reason=stop, text_chars=0, answered as model=muse-spark-1\.3-contributor\)/,
     );
     const anthropic = JSON.stringify({ id: "msg_1", model: "claude-x", content: [], stop_reason: "max_tokens" });
     assert.match(
         diagnoseEmptySummary(anthropic, JSON.parse(anthropic)),
-        /plain-JSON completion with empty content \(stop_reason=max_tokens, answered as model=claude-x\)/,
+        /plain-JSON completion with empty content \(stop_reason=max_tokens, text_blocks=0, answered as model=claude-x\)/,
     );
+    // #2309: an explicit Responses terminal state now gets its own precise
+    // diagnosis (the old string claimed "empty content", which is false when
+    // partial text rides the body).
     const responses = JSON.stringify({ id: "resp_1", status: "incomplete", output: [] });
     assert.match(
         diagnoseEmptySummary(responses, JSON.parse(responses)),
-        /plain-JSON completion with empty content \(status=incomplete\)/,
+        /incomplete Responses summary \(status=incomplete\)/,
     );
     // Unrecognized JSON keeps the generic diagnosis (shape guard).
     assert.match(
@@ -429,7 +462,7 @@ test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", (
     );
 });
 
-test("#780 truncated summary stream is unusable: diagnosis names truncation, bounded calls, cooldown arms, nothing forwarded", async () => {
+test("#780 truncated summary stream is unusable: diagnosis names truncation, bounded calls, retries re-run bounded, nothing forwarded", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 800, true);
     upstream.listen(0, "127.0.0.1");
@@ -450,19 +483,24 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
             `fail-fast message must carry the truncation diagnosis, got: ${j.error?.message}`,
         );
         const summaries = calls.filter((c) => c.summary);
-        assert.ok(summaries.length >= 2 && summaries.length <= 9, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
+        // #1767: truncation is now transient-classified, so each span gets up to
+        // two extra same-span draws; the ceiling is 2 protection regimes x 16.
+        assert.ok(summaries.length >= 2 && summaries.length <= 32, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s780-trunc"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
-        assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+        assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
+        const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
+        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 32, `the re-run walk is itself bounded, got ${retrySummaries.length}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

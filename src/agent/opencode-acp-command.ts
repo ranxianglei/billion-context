@@ -9,7 +9,7 @@
 // module load and serves it verbatim.
 
 import { wrapCacheReport } from "../acp-panel.js";
-import { armedIdleNotice, fetchProxyVersion, forwardTool, noSessionWarning } from "./shared.js";
+import { armedIdleNotice, fetchProxyVersion, fetchStaleNotice, forwardTool, noSessionWarning } from "./shared.js";
 
 export interface OpencodeCommandConfig {
     template: string;
@@ -99,8 +99,8 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
             } else if (input.command === "acp-cache") {
                 const toolArgs = /(^|\s)(--)?full(\s|$)/.test(input.arguments ?? "") ? { detail: "full" as const } : {};
                 try {
-                    const report = await forwardTool(proxyBase, sid, "acp_cache", toolArgs);
-                    await showAcpText(ctx, sid, wrapCacheReport(report));
+                    const report = await forwardTool(proxyBase, sid, "acp_cache", toolArgs, undefined, true);
+                    await showAcpText(ctx, sid, wrapCacheReport(report.text));
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
                     text = msg.includes("no model request has arrived")
@@ -123,13 +123,15 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                         } catch {
                             version = undefined;
                         }
-                        text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
+                        text = version !== undefined ? armedIdleNotice(version, proxyBase) : noSessionWarning();
                     } else {
                         text = "bili: proxy returned no status panel";
                     }
                 } catch (err) {
                     text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                 }
+                const staleNotice = await fetchStaleNotice(proxyBase).catch(() => undefined);
+                if (staleNotice !== undefined) text += `\n\n${staleNotice}`;
             }
             await showAcpText(ctx, sid, text);
             throw new Error("__BILI_ACP_HANDLED__");

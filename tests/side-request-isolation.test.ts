@@ -3,15 +3,18 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard } from "../src/server.ts";
+import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
+import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { getSession, _resetSessionsForTest } from "../src/session.ts";
+import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #388: side requests (title-gen / small utility calls) share the main session
@@ -56,6 +59,15 @@ test("isSideRequest: host-declared side-request agent outranks the token-budget 
     assert.equal(isSideRequest({ max_tokens: 100 }, "unknown-persona"), true, "unknown persona still honors a tiny budget");
 });
 
+test("isSideRequest: explicit main intent vetoes side heuristics", () => {
+    for (const body of [{ max_tokens: 100 }, { max_completion_tokens: 100 }, { max_output_tokens: 100 }, { generationConfig: { maxOutputTokens: 100 } }]) {
+        assert.equal(isSideRequest(body, "main"), false, "main intent outranks a tiny budget even without tools");
+        assert.equal(isSideRequest(body, "title"), true, "title intent remains side");
+        assert.equal(isSideRequest(body, "other"), true, "unknown intent keeps the budget heuristic");
+        assert.equal(isSideRequest(body), true, "missing intent keeps the budget heuristic");
+    }
+});
+
 const noopLog = (): void => {};
 
 function metaSession(id: string): { id: string; metadata: Record<string, unknown> } {
@@ -81,28 +93,32 @@ test("restoreOutputBudget: high-water learning + starved-budget restore (#546)",
     const starved = { max_tokens: 16, tools: [{ name: "compress" }] } as { max_tokens: number; tools: unknown[] };
     restoreOutputBudget(starved, s, noopLog);
     assert.equal(starved.max_tokens, 32768, "starved budget restored to high-water");
-    // No high-water yet + starved + tools → nothing to restore to, untouched.
+    // No high-water yet + starved + tools + NO ceiling → #3071 absolute floor: a
+    // born-starved / fork-inherited rattle is never forwarded verbatim.
     const fresh = metaSession("fresh");
     const noWater = { max_tokens: 16, tools: [{ name: "compress" }] };
     restoreOutputBudget(noWater, fresh, noopLog);
-    assert.equal(noWater.max_tokens, 16);
+    assert.equal(noWater.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "born-starved floored to the absolute minimum (#3071)");
     // Side request (tiny budget, NO tools) → never touched, stays a side req.
     const side = { max_tokens: 100 };
     restoreOutputBudget(side, s, noopLog);
     assert.equal(side.max_tokens, 100, "side request budget must not be restored");
     assert.equal(isSideRequest(side), true);
-    // High-water re-learns downward on a new healthy budget (config change).
+    // A non-starved value is always trusted and recorded verbatim as the
+    // high-water (even below the absolute floor) — only a STARVE consults it.
     restoreOutputBudget({ max_tokens: 8000 }, s, noopLog);
-    assert.equal(s.metadata.outputBudgetHighWater, 8000, "last non-starved value wins");
+    assert.equal(s.metadata.outputBudgetHighWater, 8000, "non-starved value recorded verbatim as high-water");
     const starved2 = { max_tokens: 200, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved2, s, noopLog);
-    assert.equal(starved2.max_tokens, 8000, "boundary 200 restored too (isSideRequest would misfire without tools)");
+    assert.equal(starved2.max_tokens, 8000, "boundary 200 starve restored to the session's own high-water, never raised to the floor above it (#3406)");
+    restoreOutputBudget({ max_tokens: 32768 }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetHighWater, 32768, "a later healthy value wins as high-water");
     // Field-name fidelity: restore writes the SAME field the client used.
     const s2 = metaSession("hw2");
-    restoreOutputBudget({ max_output_tokens: 32689 }, s2, noopLog);
+    restoreOutputBudget({ max_output_tokens: 49152 }, s2, noopLog);
     const responsesStarved = { max_output_tokens: 1, tools: [{ type: "function" }] } as { max_output_tokens: number };
     restoreOutputBudget(responsesStarved, s2, noopLog);
-    assert.equal(responsesStarved.max_output_tokens, 32689, "responses field restored on the same field");
+    assert.equal(responsesStarved.max_output_tokens, 49152, "responses field restored on the same field");
 });
 
 test("restoreOutputBudget: configured-output-limit floor for poisoned or missing high-water (#1665)", () => {
@@ -112,36 +128,391 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     restoreOutputBudget({ max_tokens: 384000 }, s, noopLog);
     restoreOutputBudget({ max_tokens: 680 }, s, noopLog);
     restoreOutputBudget({ max_tokens: 234 }, s, noopLog);
-    assert.equal(s.metadata.outputBudgetHighWater, 234, "last non-starved value wins (decay tracked)");
+    assert.equal(s.metadata.outputBudgetHighWater, 234, "last non-starved value wins (decay tracked verbatim)");
     const starved = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved, s, noopLog, 384000);
     assert.equal(starved.max_tokens, 384000, "death-rattle water mark floored by the configured output limit");
-    // A healthy water mark above the floor keeps winning (client intent beats declaration).
+    // #3833: a healthy water mark ABOVE the declared ceiling is clamped DOWN to the
+    // ceiling (never restored verbatim) — the ceiling is the hard upstream bound
+    // (strict providers 400 above it), so a water above it is either a stale
+    // cross-model artifact or an over-conservative declaration. The over-bound
+    // water is corrected in place so later turns stop replaying it.
     const s2 = metaSession("healthy");
     restoreOutputBudget({ max_tokens: 500000 }, s2, noopLog);
     const starved2 = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved2, s2, noopLog, 384000);
-    assert.equal(starved2.max_tokens, 500000, "water mark above the floor untouched");
+    assert.equal(starved2.max_tokens, 384000, "water mark above the ceiling clamped down to it (#3833)");
+    assert.equal(s2.metadata.outputBudgetHighWater, 384000, "the over-bound high-water is corrected in place (#3833)");
     // Born-dead session: the first request bili ever sees is already starved.
     const s3 = metaSession("borndead");
     const bornDead = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(bornDead, s3, noopLog, 32768);
     assert.equal(bornDead.max_tokens, 32768, "missing water mark falls back to the configured limit");
-    // No configured limit → old behavior: nothing to restore to.
+    // No configured limit → no ceiling → the #3071 absolute floor applies (the
+    // starved budget is never forwarded verbatim).
     const s4 = metaSession("nofloor");
     const noFloor = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(noFloor, s4, noopLog);
-    assert.equal(noFloor.max_tokens, 1, "undefined configured limit leaves the request untouched");
-    // A limit at/below the side threshold is not a usable floor.
+    assert.equal(noFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "no ceiling → absolute floor, not verbatim (#3071)");
+    // A limit at/below the side threshold is not a usable ceiling — the absolute
+    // floor still applies.
     const s5 = metaSession("tinyfloor");
     restoreOutputBudget({ max_tokens: 234 }, s5, noopLog);
     const tinyFloor = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(tinyFloor, s5, noopLog, 200);
-    assert.equal(tinyFloor.max_tokens, 234, "limit <= 200 cannot floor");
+    assert.equal(tinyFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "limit <= 200 is not a usable ceiling; rattle high-water 234 is below the trust line — absolute floor applies (#3071/#3406)");
     // Side requests (no tools) never receive the floor.
     const side = { max_tokens: 100 } as { max_tokens: number };
     restoreOutputBudget(side, s3, noopLog, 32768);
     assert.equal(side.max_tokens, 100, "side request untouched even with a floor available");
+});
+
+test("restoreOutputBudget: no-ceiling restore never exceeds the session's proven high-water (#3406 hard-cap providers)", () => {
+    // A provider hard-caps maxOutputTokens at 8192 — below the 32K absolute
+    // floor — and bili has NO ceiling source for it (no runtime-info, no
+    // launcher, no config, no registry row). The session ran HEALTHY at 8000
+    // (the provider accepted that exact value at full size), then the client's
+    // budget starved. Raising to the 32K floor would hard-reject the request;
+    // the restore must return the session's own proven budget instead.
+    const s = metaSession("hardcap");
+    restoreOutputBudget({ max_tokens: 8000 }, s, noopLog);
+    const starved = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(starved, s, noopLog);
+    assert.equal(starved.max_tokens, 8000, "restored to the proven high-water, never raised above it (#3406)");
+    // A high-water ABOVE the floor keeps passing untouched (unchanged).
+    const s2 = metaSession("hardcap2");
+    restoreOutputBudget({ max_tokens: 49152 }, s2, noopLog);
+    const starved2 = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(starved2, s2, noopLog);
+    assert.equal(starved2.max_tokens, 49152, "high-water above the floor is still restored as-is");
+    // Without ANY high-water the #3071 floor still guarantees a lower bound
+    // (born-starved / fork-inherited rattle — nothing was ever proven legal).
+    const s3 = metaSession("hardcap3");
+    const born = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(born, s3, noopLog);
+    assert.equal(born.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "born-starved keeps the absolute floor (#3071)");
+    // A rattle high-water BELOW the trust line still gets the floor — the
+    // #3071 death spiral must stay fixed (decay chains end in exactly this
+    // state, and a few hundred tokens cannot emit a compress call).
+    const s4 = metaSession("hardcap4");
+    restoreOutputBudget({ max_tokens: 2061 }, s4, noopLog);
+    const rattle = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(rattle, s4, noopLog);
+    assert.equal(rattle.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "high-water below the trust line (2061) is overridden by the floor (#3071)");
+    // Boundary: exactly at the trust line the high-water is a proven bound.
+    const s5 = metaSession("hardcap5");
+    restoreOutputBudget({ max_tokens: 4096 }, s5, noopLog);
+    const atLine = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(atLine, s5, noopLog);
+    assert.equal(atLine.max_tokens, 4096, "high-water at the trust line (4096) is restored as-is, not raised (#3406)");
+});
+
+test("restoreOutputBudget: warns once per SESSION+model when no output ceiling backs the restore (#1840/#3071)", () => {
+    _resetNoOutputCeilingWarningsForTest();
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ name: "t" }];
+    const A = "stepfun/step-5-preview";
+    // Decaying client, NO ceiling from any source. The non-starved value is
+    // trusted verbatim (recorded as high-water, silently); the STARVE is what
+    // gets floored to the absolute minimum — and that is where the warn fires.
+    const s = metaSession("nocap");
+    restoreOutputBudget({ max_tokens: 583, model: A }, s, log);
+    assert.equal(s.metadata.outputBudgetHighWater, 583, "non-starved learning is silent and tracked verbatim");
+    const starved = { max_tokens: 1, tools, model: A } as { max_tokens: number };
+    restoreOutputBudget(starved, s, log);
+    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "ceiling-less starve with a rattle high-water (583 < trust line) floored to the absolute minimum (#3071)");
+    let warns = lines.filter((l) => l.includes("NO known output ceiling"));
+    assert.equal(warns.length, 1, "one warn per session+model (on the starve, not the silent learning)");
+    assert.match(warns[0] ?? "", /model=stepfun\/step-5-preview/, "names the model");
+    assert.match(warns[0] ?? "", /raised 1 -> 32768/, "states what was actually raised");
+    assert.match(warns[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
+    // Same session + model again → deduped (no second warn).
+    restoreOutputBudget({ max_tokens: 1, tools, model: A }, s, log);
+    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 1, "deduped per session+model");
+    // A DIFFERENT session on the SAME ceiling-less model gets its OWN warn
+    // (#3071 path 2a: the old once-per-model dedup left the second session silent).
+    const sOther = metaSession("other");
+    restoreOutputBudget({ max_tokens: 1, tools, model: A }, sOther, log);
+    warns = lines.filter((l) => l.includes("NO known output ceiling"));
+    assert.equal(warns.length, 2, "per-session, not per-model (#3071)");
+    assert.match(warns[1] ?? "", /\[other\]/, "names the affected session");
+    assert.equal(sOther.metadata.outputBudgetHighWater, undefined, "the starved branch does not seed a high-water");
+    // With a usable ceiling → no warn at all (the floor note rides on the info line).
+    _resetNoOutputCeilingWarningsForTest();
+    lines.length = 0;
+    const s2 = metaSession("capped");
+    restoreOutputBudget({ max_tokens: 583, model: "capped/model" }, s2, log, 32768);
+    const capped = { max_tokens: 1, tools, model: "capped/model" } as { max_tokens: number };
+    restoreOutputBudget(capped, s2, log, 32768);
+    assert.equal(capped.max_tokens, 32768, "ceiling lifts the death rattle");
+    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 0, "a usable ceiling suppresses the warn");
+    assert.ok(lines.some((l) => l.includes("high-water 583 below known output ceiling — floored (#1665/#1840)")), "floored info note present");
+});
+
+test("restoreOutputBudget: tracks the no-ceiling degraded state for the user-visible surfaces (#2904/#3071)", () => {
+    const tools = [{ name: "t" }];
+    // A non-starved value is trusted verbatim and sets NO marker; a STARVE is
+    // what records the no-ceiling degraded state (floored to the absolute minimum).
+    const s = metaSession("deg");
+    restoreOutputBudget({ max_tokens: 249, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetHighWater, 249, "non-starved learning tracked verbatim");
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "healthy-value learning sets no marker");
+    const starved = { max_tokens: 16, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
+    restoreOutputBudget(starved, s, noopLog);
+    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "starved 16 restored to the absolute floor (#3071)");
+    const deg = s.metadata.outputBudgetDegraded as { model: string; value: number; ts: number } | undefined;
+    assert.ok(deg !== undefined, "ceiling-less starved restore records the degraded state");
+    assert.equal(deg!.model, "prov/deepseek-flash");
+    assert.equal(deg!.value, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "records what was actually forwarded (the restored target)");
+    assert.equal(typeof deg!.ts, "number");
+    // A usable ceiling appearing CLEARS the marker (the pin is resolved).
+    const capped = { max_tokens: 1, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
+    restoreOutputBudget(capped, s, noopLog, 65536);
+    assert.equal(capped.max_tokens, 65536, "ceiling lifts the death rattle");
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "a known ceiling clears the marker");
+    // Re-starve ceiling-less → the marker returns.
+    restoreOutputBudget({ max_tokens: 1, tools, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.ok(s.metadata.outputBudgetDegraded !== undefined, "marker re-set on a fresh ceiling-less starve");
+    // A healthy (non-starved) budget for the SAME model clears it again.
+    restoreOutputBudget({ max_tokens: 32768, model: "prov/deepseek-flash" }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "a recovered client estimate clears the marker");
+    // Single slot: the last ceiling-less starved model wins (no per-model map).
+    const sB = metaSession("degB");
+    restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-a" }, sB, noopLog);
+    restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-b" }, sB, noopLog);
+    assert.equal((sB.metadata.outputBudgetDegraded as { model?: string })?.model, "prov/model-b", "last starved model wins the single slot");
+    // Born-starved (no high-water yet, no ceiling): floored to the absolute minimum —
+    // never recorded as a verbatim-forwarded rattle (#3071 path 2b).
+    const sC = metaSession("bornDead");
+    restoreOutputBudget({ max_tokens: 16, tools, model: "prov/cold" }, sC, noopLog);
+    assert.equal((sC.metadata.outputBudgetDegraded as { value?: number })?.value, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "no high-water + no ceiling → records the floored value");
+});
+
+test("restoreOutputBudget: #3071 absolute floor stops the ceiling-less death spiral end-to-end", () => {
+    const tools = [{ name: "t" }];
+    const s = metaSession("spiral");
+    // The observed decay (v0.1.195, model ark-code-latest, no declared output
+    // ceiling): each NON-starved turn the client's raw-history estimate shrinks
+    // further. Those are trusted verbatim and drive the high-water down to a
+    // death rattle — exactly the poisoned state the old restore target pinned on.
+    for (const v of [41753, 3071, 2061, 252]) {
+        const body = { max_tokens: v, tools, model: "ark-code-latest" };
+        restoreOutputBudget(body, s, noopLog);
+        assert.equal(body.max_tokens, v, `non-starved ${v} is trusted verbatim`);
+    }
+    assert.equal(s.metadata.outputBudgetHighWater, 252, "high-water decayed to the poison (last non-starved wins)");
+    // Once fully starved (<=200), every restore must hit the absolute minimum —
+    // NOT the poisoned high-water of 252 that pinned the old behavior.
+    for (let i = 0; i < 8; i += 1) {
+        const body = { max_tokens: 1, tools, model: "ark-code-latest" };
+        restoreOutputBudget(body, s, noopLog);
+        assert.equal(body.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, `starved turn ${i} floored to the absolute minimum, not 252`);
+    }
+});
+
+test("restoreOutputBudget: #3071 fork-inherited rattle is floored; a healthy value still wins", () => {
+    const tools = [{ name: "t" }];
+    // Path 2b: a fresh fork child inherits the parent's starved budget with no
+    // high-water of its own and no known ceiling — the old code forwarded it
+    // verbatim (max_tokens=1 out the door). It is now always floored.
+    const child = metaSession("fork-child");
+    const inherited = { max_tokens: 1, tools, model: "ark-code-latest" };
+    restoreOutputBudget(inherited, child, noopLog);
+    assert.equal(inherited.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "fork-inherited starved budget is floored, not forwarded verbatim (#3071 path 2b)");
+    // The floor is a LOWER bound only — a genuinely-healthy value above it is not
+    // over-floored and sets no degraded marker.
+    const healthy = metaSession("healthy");
+    const big = { max_tokens: 32768, model: "ark-code-latest" };
+    restoreOutputBudget(big, healthy, noopLog);
+    assert.equal(big.max_tokens, 32768, "a value above the floor passes through untouched");
+    assert.equal(healthy.metadata.outputBudgetDegraded, undefined, "a healthy value sets no degraded marker");
+});
+
+test("restoreOutputBudget: #3071 leaves the ceiling-known behavior unchanged (regression guard)", () => {
+    const tools = [{ name: "t" }];
+    // With a usable ceiling the client's small NON-starved value is trusted (not
+    // raised by the absolute minimum) — only the starved branch consults it.
+    const s = metaSession("ceiling-guard");
+    const small = { max_tokens: 252, model: "capped/model" };
+    restoreOutputBudget(small, s, noopLog, 131072);
+    assert.equal(small.max_tokens, 252, "ceiling-known: a small non-starved value is trusted, not floored (#3071 scope)");
+    assert.equal(s.metadata.outputBudgetHighWater, 252, "high-water tracks the client's own value when a ceiling exists");
+    const starved = { max_tokens: 1, tools, model: "capped/model" };
+    restoreOutputBudget(starved, s, noopLog, 131072);
+    assert.equal(starved.max_tokens, 131072, "ceiling-known starve still restores to the ceiling");
+    // A known ceiling BELOW the absolute minimum must win un-raised — the floor
+    // bounds only a CEILING-LESS restore, never overrides a smaller declared cap.
+    const sCap = metaSession("small-cap");
+    const cappedSmall = { max_tokens: 1, tools, model: "small/cap" };
+    restoreOutputBudget(cappedSmall, sCap, noopLog, 4096);
+    assert.equal(cappedSmall.max_tokens, 4096, "known ceiling below the absolute floor is honored, not over-floored (#3071 scope)");
+});
+
+test("restoreOutputBudget: dsh-lane mid-band collapse is rescued when a ceiling is known (#3438)", () => {
+    _resetDshMidBandWarningsForTest();
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ type: "function", function: { name: "bash" } }];
+    const M = "cn:deepseek-v4.1-flash";
+    const CEIL = 393_216;
+    // Incident replay (v0.1.197, DSH desktop, responses wire): the session ran
+    // healthy at the declared cap, then the client's raw-history estimate decayed
+    // THROUGH the mid-band toward zero. Before #3438 every >200 value passed
+    // verbatim AND re-seeded the high-water; the <=200 trigger was the only
+    // rescue entry and all three observed collapses (2260/872/204) slipped past it.
+    const s = metaSession("dsh-incident");
+    const healthy = { max_output_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(healthy, s, noopLog, CEIL, true);
+    assert.equal(healthy.max_output_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the healthy value seeds the high-water");
+    for (const v of [2260, 872, 204]) {
+        const body = { max_output_tokens: v, tools, model: M };
+        restoreOutputBudget(body, s, log, CEIL, true);
+        assert.equal(body.max_output_tokens, CEIL, `${v} restored to the known ceiling (#3438)`);
+        assert.equal(s.metadata.outputBudgetHighWater, CEIL, "a collapsed value must NOT re-seed the high-water");
+    }
+    assert.ok(lines.some((l) => l.includes("output budget restored 2260 -> 393216")), "the restore is logged");
+    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band origin names itself in the log");
+    // A mid-band value far above the starve gate is the same signature.
+    const deep = { max_output_tokens: 25_484, tools, model: M };
+    restoreOutputBudget(deep, s, log, CEIL, true);
+    assert.equal(deep.max_output_tokens, CEIL, "25484 (< ceiling) is a collapse too, not a healthy small budget");
+    // The over-restoration surface is deliberate on this lane: even a plausible
+    // deliberate-looking 32K budget is raised to the declared cap — on the dsh
+    // contract the client's number is always its estimator, never intent.
+    const mid = { max_output_tokens: 32_768, tools, model: M };
+    restoreOutputBudget(mid, s, log, CEIL, true);
+    assert.equal(mid.max_output_tokens, CEIL, "32768 < 393216 is still below the declared cap -> raised");
+    // A side request (no tools) on the same lane is NEVER touched — restoring it
+    // would break its side status — and it must not seed the high-water either.
+    const side = { max_output_tokens: 1024, model: M };
+    restoreOutputBudget(side, s, log, CEIL, true);
+    assert.equal(side.max_output_tokens, 1024, "tool-less mid-band passes verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the side request did not poison the high-water");
+    // Below the starve gate the pre-existing rescue entry point still applies.
+    const starved = { max_output_tokens: 150, tools, model: M };
+    restoreOutputBudget(starved, s, log, CEIL, true);
+    assert.equal(starved.max_output_tokens, CEIL, "the <=200 entry point still rescues on the dsh lane");
+});
+
+test("restoreOutputBudget: non-dsh lanes keep trusting a below-ceiling budget (#3438 scope guard)", () => {
+    const tools = [{ name: "t" }];
+    const s = metaSession("non-dsh");
+    const body = { max_tokens: 8000, tools, model: "prov/model" };
+    restoreOutputBudget(body, s, noopLog, 393_216);
+    assert.equal(body.max_tokens, 8000, "no lane flag: a below-ceiling value is intent, forwarded verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, 8000, "recorded as the session's own proven budget");
+    const explicit = { max_tokens: 4096, tools, model: "prov/model" };
+    restoreOutputBudget(explicit, s, noopLog, 393_216, false);
+    assert.equal(explicit.max_tokens, 4096, "an explicit false behaves like absent");
+    // The <=200 starve restores to the ceiling regardless of the lane flag.
+    const starved = { max_tokens: 16, tools, model: "prov/model" };
+    restoreOutputBudget(starved, s, noopLog, 393_216, true);
+    assert.equal(starved.max_tokens, 393_216, "starve target logic is untouched by the lane flag");
+});
+
+test("restoreOutputBudget: dsh-lane mid-band WITHOUT a ceiling forwards verbatim and warns once per session+model (#3438)", () => {
+    _resetDshMidBandWarningsForTest();
+    const warns: string[] = [];
+    const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
+    const tools = [{ name: "t" }];
+    const A = "prov/unknown-model";
+    const s = metaSession("dsh-nocap");
+    const body = { max_tokens: 2260, tools, model: A };
+    restoreOutputBudget(body, s, log, undefined, true);
+    assert.equal(body.max_tokens, 2260, "no ceiling: bili cannot judge collapse from intent, forwards verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, 2260, "no-ceiling learning is unchanged (trusted verbatim)");
+    let hits = warns.filter((l) => l.includes("cannot tell a raw-history collapse from deliberate intent"));
+    assert.equal(hits.length, 1, "one warn for the unrescuable mid-band");
+    assert.match(hits[0] ?? "", /model=prov\/unknown-model/, "names the model");
+    assert.match(hits[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
+    // Deduped per session+model.
+    restoreOutputBudget({ max_tokens: 872, tools, model: A }, s, log, undefined, true);
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 1, "deduped per session+model");
+    // A different model in the same session warns of its own.
+    restoreOutputBudget({ max_tokens: 872, tools, model: "prov/other" }, s, log, undefined, true);
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "per session+model, not per session");
+    // Tool-less mid-band: not a main turn, stays silent.
+    const side = { max_tokens: 1024, model: A };
+    restoreOutputBudget(side, s, log, undefined, true);
+    assert.equal(side.max_tokens, 1024, "side request passes verbatim");
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "the side request stays silent");
+    // Non-dsh lane: silent passthrough, no new warn.
+    const other = { max_tokens: 2260, tools, model: A };
+    restoreOutputBudget(other, metaSession("plain"), log);
+    assert.equal(other.max_tokens, 2260, "no lane flag: plain passthrough");
+    assert.equal(warns.filter((l) => l.includes("deliberate intent")).length, 2, "no lane flag -> no new warn");
+});
+
+test("restoreOutputBudget: the <=200 starve log keeps its original wording, the mid-band names #3438", () => {
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ name: "t" }];
+    const s = metaSession("wording");
+    const starved = { max_tokens: 16, tools, model: "m/x" };
+    restoreOutputBudget(starved, s, log, 32_768, true);
+    assert.ok(lines.some((l) => l.includes("#546: client shrank it from its raw-history estimate")), "the starve wording is byte-identical to before");
+    const mid = { max_tokens: 872, tools, model: "m/x" };
+    restoreOutputBudget(mid, s, log, 32_768, true);
+    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band restore names itself");
+});
+
+test("restoreOutputBudget: a KNOWN ceiling with value >= ceiling is healthy — no spurious 'NO known output ceiling' warn (#4501)", () => {
+    _resetDshMidBandWarningsForTest();
+    const warns: string[] = [];
+    const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
+    const tools = [{ name: "t" }];
+    const M = "prov/capped-model";
+    const CEIL = 131_072;
+    const midBandWarns = (): number => warns.filter((w) => w.includes("NO known output ceiling")).length;
+    // Pre-#4501 the mid-band warn fired on any dsh-lane tool-carrying budget in
+    // the healthy branch — including when a ceiling WAS known (value >= ceiling) —
+    // spamming operators who had declared one. A known ceiling makes it healthy.
+    const s = metaSession("dsh-cap-known");
+    const atCap = { max_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(atCap, s, log, CEIL, true);
+    assert.equal(atCap.max_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(midBandWarns(), 0, "a KNOWN ceiling suppresses the mid-band warn");
+    const over = { max_tokens: CEIL + 1, tools, model: M };
+    restoreOutputBudget(over, s, log, CEIL, true);
+    assert.equal(over.max_tokens, CEIL + 1, "above-ceiling passes verbatim (not a collapse)");
+    assert.equal(midBandWarns(), 0, "above-ceiling is also not a missing-ceiling gap");
+    const s2 = metaSession("dsh-cap-none");
+    restoreOutputBudget({ max_tokens: CEIL, tools, model: M }, s2, log, undefined, true);
+    assert.equal(midBandWarns(), 1, "no ceiling -> the warn still fires exactly once");
+});
+
+test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
+    _resetPluginStateForTest();
+    setRegistryForTest({ "stepfun/step-5-preview": { limit: { context: 1_000_000, output: 1_000_000 } } });
+    try {
+        const routes = { "https://api.stepfun.com": { models: { "stepfun/step-5-preview": { output: 4096 } } } };
+        const url = "https://api.stepfun.com/step_plan/v1/chat/completions";
+        const parsed = { model: "stepfun/step-5-preview" };
+        // Registry alone (no headers, no routes): last-resort source. The host is
+        // not a known models.dev provider, so the cross-provider suffix scan finds it.
+        assert.equal(resolveKnownOutputCeiling({}, parsed, {}, url), 1_000_000, "registry ceiling is the last resort");
+        // Operator-declared outranks the registry data (#924 rank).
+        assert.equal(resolveKnownOutputCeiling({}, parsed, routes, url), 4096, "declared output outranks registry data");
+        // Agent-scoped runtime-info outranks the declaration (#955 rank): what the
+        // client is configured to ask beats operator guesswork.
+        recordPluginRuntimeInfo({ agent: "dsh", model: "stepfun/step-5-preview", maxOutput: 256_000, source: "client-config", ts: Date.now() });
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin": "dsh" }, parsed, routes, url), 256_000, "runtime-info table outranks declared");
+        // Per-request header outranks the table (same gate as the window chain).
+        recordPluginRuntimeInfo({ agent: "dsh", model: "stepfun/step-5-preview", maxOutput: 8_000, source: "client-config", ts: Date.now() });
+        const hdrs = { "x-bili-plugin": "dsh", "x-bili-plugin-model": "step-5-preview", "x-bili-plugin-max-output": "131072" };
+        assert.equal(resolveKnownOutputCeiling(hdrs, parsed, routes, url), 131_072, "per-request header outranks the runtime table");
+        // Stale entry: a report for one model never sizes another.
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin": "dsh" }, { model: "other/model" }, routes, url), undefined, "stale entry never sizes another model");
+        // Unannounced max-output header (no x-bili-plugin) is inert by design.
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin-max-output": "999999" }, parsed, routes, url), 4096, "unannounced header ignored, falls through to declared");
+        // No model on the body → nothing to resolve.
+        assert.equal(resolveKnownOutputCeiling({}, {}, routes, url), undefined);
+    } finally {
+        setRegistryForTest({});
+        _resetPluginStateForTest();
+    }
 });
 
 const MODEL = "claude-sonnet-4-5";
@@ -198,35 +569,45 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
     const est = estimateRawBodyTokens(body);
     assert.ok(est > 0);
-    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, 1).blocked, false, "unknown window → forward as before");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1).blocked, false, "fits");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
-    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
-    // OpenAI wire: the output budget counts against the window → headroom reserved.
+    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1).blocked, false, "fits");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
+    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
+    // OpenAI wire: the output budget counts against the window → headroom
+    // reserved. #4205: the reservation policy is passed from the call site —
+    // these rows pin the reserving direction explicitly.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
     const oaEst = estimateRawBodyTokens(oa);
     const oaLimit = Math.floor(oaEst / 1.15);
-    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, 1);
+    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1, 0, undefined, true);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
     assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
-    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, 1).blocked, false);
+    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, undefined, 1, 0, undefined, true).blocked, false);
+    // #4205: wrapper providers on the anthropic wire reserve too — same
+    // mechanics, policy decided by the caller (route + model evidence).
+    // The rows above with default (false) pin the non-reserving real-Claude
+    // route; these pin the reserving wrapper route (#3617 both directions).
+    const gw = sideRequestGuard(body, "anthropic", Math.floor(est / 1.15) + 100, undefined, undefined, 1, 0, undefined, true);
+    assert.equal(gw.limit, Math.floor(est / 1.15), "anthropic wrapper route: limit reduced by max_tokens");
+    assert.equal(gw.blocked, true, "anthropic wrapper route: boundary after reservation blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 101, undefined, undefined, 1, 0, undefined, true).blocked, false, "anthropic wrapper route: within tolerance after reservation forwards");
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
         { type: "text", text: "z".repeat(4000) },
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
     const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
-    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, 1).blocked, true, "image cost included at boundary");
+    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, undefined, 1).blocked, true, "image cost included at boundary");
     // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
     // so a CJK-heavy payload estimated at ~110% of the window must forward —
     // the upstream's real overflow 400 arms the evidence that blocks re-sends.
     const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
     const cjkEst = estimateRawBodyTokens(cjkBody);
     assert.ok(cjkEst >= 4000, "CJK counted per-char");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
 });
 
 function okSse(inputTokens: number): string {
@@ -297,13 +678,16 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(opts?.store ?? new SessionStore({ enabled: false }));
     setRegistryForTest({});
     _resetSessionsForTest();
     const proxy = await startServer({
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: opts?.routeModels ? { models: opts.routeModels } : {} },
@@ -316,18 +700,27 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port as number;
+    const proxyPort = (proxy.address() as { port: number }).port;
     rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = proxyPort; rig.upstreamPort = upstreamPort;
     return rig;
 }
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -395,7 +788,7 @@ test("e2e: side request response still gets render-tag stripping (#460 contract)
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "Generate a short title." }] }) });
         assert.equal(r2.status, 200);
         let raw = "";
-        for await (const chunk of r2.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of r2.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "side-request stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "side-request stream leaked a render close tag");
         assert.equal(JSON.stringify(getSession(SESSION).state), stateAfterMain, "tag-strip pipe must not touch kernel state (session stays off)");
@@ -462,12 +855,14 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         const tools = [{ name: "compress", description: "compress", input_schema: { type: "object", properties: {} } }];
 
         // Healthy main turn WITH tools: teaches the session its output budget.
-        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, tools, messages: mainConversation(8) }) });
+        // Above OUTPUT_RESTORE_ABSOLUTE_FLOOR so this exercises the high-water
+        // path, not the #3071 ceiling-less floor.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 49152, stream: true, tools, messages: mainConversation(8) }) });
         assert.equal(r1.status, 200);
         await r1.text();
         const s1 = getSession(SESSION);
         const requestsAfterMain1 = s1.stats.requests;
-        assert.equal(s1.metadata.outputBudgetHighWater, 1024, "high-water learned from the healthy main turn");
+        assert.equal(s1.metadata.outputBudgetHighWater, 49152, "high-water learned from the healthy main turn");
 
         // Death-spiral turn: the client shrank the budget to 16 tokens off its
         // raw-history estimate. The request still carries tools → it is a MAIN
@@ -478,7 +873,7 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         await r2.text();
         const s2 = getSession(SESSION);
         assert.ok(s2.stats.requests > requestsAfterMain1, "starved main turn must go through the pipeline, not side passthrough");
-        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 1024, "upstream received the restored budget (#546)");
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 49152, "upstream received the restored budget (#546)");
 
         // A real side request (no tools, tiny budget) on the same session stays
         // a pure passthrough: budget NOT restored, kernel untouched.
@@ -517,6 +912,98 @@ test("e2e: starved main request with a poisoned high-water is floored by the con
         assert.equal(r2.status, 200);
         await r2.text();
         assert.equal(rig.lastBody && rig.lastBody.max_tokens, 4096, "configured output limit floors the poisoned restore (#1665)");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: poisoned high-water is floored by the known output ceiling when no route output is declared (#1840)", async () => {
+    // NO routeModels: nothing operator-declared on this route — exactly the
+    // stepfun scenario where the bili config stayed empty and only the registry
+    // (or the client itself) knows the model's output ceiling.
+    const rig = await startRig();
+    try {
+        setRegistryForTest({ [MODEL]: { limit: { output: 8192 } } });
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+        const tools = [{ name: "compress", description: "compress", input_schema: { type: "object", properties: {} } }];
+
+        // First request bili sees is already mid-death-spiral (budget decayed to
+        // 234) — seeds the poisoned water mark exactly like #1665.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 234, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(getSession(SESSION).metadata.outputBudgetHighWater, 234, "poisoned water mark seeded");
+
+        // Fully starved, nothing declared anywhere but the registry knows the
+        // ceiling → the registry floor must lift the restore out of the rattle.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(9) }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 8192, "registry ceiling floors the poisoned restore when nothing is declared (#1840)");
+
+        // Born-starved session (fresh id, first request already <=200): the floor
+        // applies even though no high-water was ever learned.
+        const r3 = await fetch(url, { method: "POST", headers: { ...headers, "x-acp-session": SESSION + "-born" }, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 8192, "never-seeded session restored to the known ceiling (#1840)");
+
+        // Per-request runtime-info header (what dsh stamps from its own profile)
+        // outranks the registry listing — the client's configured budget wins.
+        const r4 = await fetch(url, { method: "POST", headers: { ...headers, "x-bili-plugin": "dsh", "x-bili-plugin-model": MODEL, "x-bili-plugin-max-output": "16384" }, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(10) }) });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 16384, "client-reported max output outranks the registry listing (#1840)");
+    } finally {
+        setRegistryForTest({});
+        await closeRig(rig);
+    }
+});
+
+test("e2e: dsh-lane mid-band budget is restored to the declared output ceiling on the wire (#3438)", async () => {
+    // Server-level wiring proof for the incident: a dsh plugin-stamped main turn
+    // whose raw-history estimate decayed into the mid-band (above the <=200 starve
+    // gate, below the declared ceiling) must leave the proxy at the ceiling.
+    // 16K stays well inside the default 200K rig window so the downstream clamp
+    // cannot touch the restored value.
+    const CEIL = 16_384;
+    const rig = await startRig({ routeModels: { [MODEL]: { output: CEIL } } });
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = {
+            "content-type": "application/json",
+            "x-acp-session": SESSION,
+            "x-bili-plugin": "dsh",
+            "x-bili-plugin-conversation": SESSION,
+        };
+        // Host-shaped tool names: a tool literally named "compress" is a LEAKED
+        // bili tool on this lane — #1897 strips it and demotes the request to
+        // side passthrough BEFORE restoreOutputBudget ever runs (#1897 gate).
+        const tools = [
+            { name: "bash", description: "run a command", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+            { name: "read", description: "read a file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+        ];
+        // Healthy turn at the declared cap first (seeds the water mark, like the
+        // incident session before its estimate decayed).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: CEIL, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, CEIL, "at-ceiling value forwarded untouched");
+        // The incident's three collapses, one by one through the real pipeline.
+        for (const v of [2260, 872, 204]) {
+            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: v, stream: true, tools, messages: mainConversation(9) }) });
+            assert.equal(r.status, 200);
+            await r.text();
+            assert.equal(rig.lastBody && rig.lastBody.max_tokens, CEIL, `${v} restored to the declared ceiling on the wire (#3438)`);
+            assert.equal(getSession(SESSION).metadata.outputBudgetHighWater, CEIL, "the collapsed value did not re-seed the high-water");
+        }
+        // A non-dsh client on the SAME route keeps the old behavior: below-ceiling
+        // is intent there and forwards verbatim (the lane flag is the whole scope).
+        const rPlain = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SESSION + "-plain" }, body: JSON.stringify({ model: MODEL, max_tokens: 2260, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(rPlain.status, 200);
+        await rPlain.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 2260, "non-dsh lane: below-ceiling trusted verbatim (#3438 scope guard)");
     } finally {
         await closeRig(rig);
     }
@@ -741,5 +1228,82 @@ test("e2e: the overflow arm survives a restart round-trip; usage after reload re
         store.cancelAll();
         store2?.cancelAll();
         rmrf(dir);
+    }
+});
+
+// #2730: the google lane honors the SAME side-request exclusion as the other
+// wires — a dsh title-gen on the gemini wire (tiny generationConfig.maxOutputTokens)
+// must ride the #388 verbatim passthrough (raw conversation key, no kernel state,
+// no persona fork) instead of being treated as a main turn or forked onto |sub:<fp>.
+test("e2e: google-lane dsh side request resolves verbatim — no kernel state, no persona fork (#2730)", async () => {
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }], modelVersion: "gemini-test", usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetSessionsForTest();
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const CONV = "dsh-side-google";
+    const SIDE_SYSTEM = "You are a title generator. Write one short title for the conversation.";
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:generateContent`;
+    const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+    const fork = `${CONV}|sub:${createHash("sha256").update(SIDE_SYSTEM, "utf8").digest("hex").slice(0, 16)}`;
+    try {
+        // A dsh title-gen on the gemini wire: tiny output budget → a side request
+        // by the token-budget heuristic (generationConfig.maxOutputTokens <= 200).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Summarize this conversation in one short title." }] }], systemInstruction: { parts: [{ text: SIDE_SYSTEM }] }, generationConfig: { maxOutputTokens: 100 } }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s = peekSession(CONV);
+        assert.ok(s, "the side request resolved onto the RAW conversation key");
+        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 0, "side passthrough touches no kernel state");
+        assert.equal(s.stats.requests, 0, "side passthrough counts no requests");
+        assert.equal(peekSession(fork), undefined, "no junk |sub:<fp(side)> forked session on the google lane");
+
+        // A later MAIN turn keeps the raw key (the side request never stole the anchor).
+        const mainContents = Array.from({ length: 4 }, (_, i): { role: string; parts: { text: string }[] } => ({ role: i % 2 === 0 ? "user" : "model", parts: [{ text: `main-${i + 1}-` + "z".repeat(2000) }] }));
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: mainContents, systemInstruction: { parts: [{ text: "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp." }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.ok(Object.keys(peekSession(CONV)!.state.messageRefs.byRaw).length >= 4, "main turn assigned refs under the bare id (anchor not stolen by the earlier side request)");
+        assert.equal(peekSession(fork), undefined, "still no forked session after the main turn");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
     }
 });

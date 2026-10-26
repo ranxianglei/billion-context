@@ -64,6 +64,11 @@ async function startProxy(upstream: http.Server): Promise<Harness> {
         passthrough: false,
         passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        streamErrorShape: "protocol",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

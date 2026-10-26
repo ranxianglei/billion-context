@@ -1,6 +1,7 @@
 import type { WireProtocol } from "./util.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { appendTrailingUserText } from "./wire-body.js";
+import { fakeCompletionRetries as knobFakeCompletionRetries, fakeBufCapBytes as knobFakeBufCapBytes } from "./knobs.js";
 
 // #371 (root-cause follow-up to #361): a small model can WRITE a tool call as
 // plain text (echoing the tool-call XML template from the context) instead of
@@ -21,17 +22,16 @@ export const FAKE_COMPLETION_HINT =
 // the client sees it (a fake completion is only knowable at end-of-stream),
 // which defeats incremental streaming. That cost is only worth paying for the
 // low-frequency fake-completion case (small models via gateways), so it is
-// opt-in: set BILI_FAKE_COMPLETION_RETRIES=2 to enable. 0 = pre-#371 passthrough.
+// opt-in: set BILI_FAKE_COMPLETION_RETRIES=2 / fakeCompletion.retries=2 to
+// enable. 0 = pre-#371 passthrough.
 export function maxFakeCompletionRetries(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_COMPLETION_RETRIES ?? "0", 10);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
+    return knobFakeCompletionRetries();
 }
 
 // OOM guard for a pathological upstream; LLM responses are bounded by max_tokens
 // and normally well under 1 MiB.
 export function fakeBufCap(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_BUF_CAP ?? String(16 * 1024 * 1024), 10);
-    return Number.isFinite(n) && n > 0 ? n : 16 * 1024 * 1024;
+    return knobFakeBufCapBytes();
 }
 
 // "Does this raw response (full SSE stream or JSON body) carry a REAL tool
@@ -69,18 +69,31 @@ const TOOL_OPEN =
 const TOOL_CLOSE_GLOBAL =
     /\x3c\/(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b|\\u003c\/(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b/gi;
 
+// #2348: scale gate — a runaway enumeration (a model stuck looping thousands of
+// tool-XML closer pairs; instance B measured 3 openers / 8745 closers in one
+// response) used to read as "structurally complete" through BOTH branches below.
+// A genuine fake-completion echo is a handful of calls written as prose; past
+// this total-closer budget the shape is enumeration, not structure, so it must
+// not be retried as a fake completion (buffering the flood + hinting "use the
+// tool mechanism" only feeds the loop). Internal constant on purpose: no config
+// surface for a detector threshold (#2030 discipline).
+const TOOL_CLOSE_SCALE_CAP = 32;
+
 // Structural guard on top of containsToolCallXmlFragment: require an opening
 // tool tag OR 2+ distinct closing tags. A LONE closing tag in prose (a model
 // discussing tool-call code) does not qualify — that is the false positive the
 // plain fragment detector would otherwise trigger on.
 export function hasToolCallStructure(text: string): boolean {
     if (!containsToolCallXmlFragment(text)) return false;
-    if (TOOL_OPEN.test(text)) return true;
     const closes = new Set<string>();
+    let closeCount = 0;
     for (const m of text.matchAll(TOOL_CLOSE_GLOBAL)) {
+        closeCount++;
         const name = m[1] ?? m[2];
         if (name) closes.add(name.toLowerCase());
     }
+    if (closeCount > TOOL_CLOSE_SCALE_CAP) return false;
+    if (TOOL_OPEN.test(text)) return true;
     return closes.size >= 2;
 }
 

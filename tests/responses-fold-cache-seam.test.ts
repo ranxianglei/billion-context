@@ -144,8 +144,15 @@ test("#1548: post-fold re-request keeps the in-place summary; next-turn prefix s
             log: true,
             debug: false,
             passthrough: false,
-            autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");

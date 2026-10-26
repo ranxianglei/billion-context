@@ -21,7 +21,7 @@
 //    renderer output the way we can for the two panels above.
 //  - wrapRuleReport (#1251, /acp-rule): same marker scheme around the
 //    executeRule output (a numbered list or a one-line add/list result).
-import { MARKER_LINE, stripMarkerLines } from "./loop/tag-echo-filter.js";
+import { MARKER_HEAD, MARKER_LINE } from "./loop/tag-echo-filter.js";
 
 const PANEL_BOX_TOP = "\u256d";
 const PANEL_BOX_TITLE = "ACP Context Analysis";
@@ -32,6 +32,13 @@ export const CACHE_REPORT_OPEN = "[acp-cache]";
 export const CACHE_REPORT_CLOSE = "[/acp-cache]";
 export const RULE_REPORT_OPEN = "[acp-rule]";
 export const RULE_REPORT_CLOSE = "[/acp-rule]";
+// #2789: the acp_status visibility marker is multi-line BY DESIGN (head line +
+// the full status report). A line-granular strip left the report body behind
+// in replayed history, so the emitter wraps the body in this pair (same
+// scheme as the two reports above) and the incoming-history path strips the
+// whole unit.
+export const STATUS_REPORT_OPEN = "[acp-status]";
+export const STATUS_REPORT_CLOSE = "[/acp-status]";
 
 /** Wrap a cache report for persistent transcript display (see above). */
 export function wrapCacheReport(report: string): string {
@@ -117,6 +124,13 @@ export function stripAcpPanelMessages(messages: unknown): number {
 // tag-echo filter). Messages are NEVER deleted — a marker-only assistant
 // message may still carry tool_calls whose tool results must not be orphaned;
 // such text degrades to a single space instead.
+// #2789: the acp_status marker is a BLOCK, not a line — head plus the whole
+// status report. Newer releases wrap the report in the STATUS_REPORT_OPEN /
+// CLOSE pair (stripped exactly); pre-#2789 history carries the same body
+// WITHOUT the pair, so after its stripped head we also consume the contiguous
+// legacy report lines below (grammar allow-list; stops at the first line that
+// reads like ordinary prose — conservative by design: when in doubt a line is
+// kept, so at worst stale report residue survives, never user/model prose).
 export function stripAcpStatusMarkers(messages: unknown): number {
     if (!Array.isArray(messages)) return 0;
     let stripped = 0;
@@ -126,7 +140,7 @@ export function stripAcpStatusMarkers(messages: unknown): number {
         if (m.role !== "user" && m.role !== "assistant") continue;
         const content = m.content;
         if (typeof content === "string") {
-            const out = stripMarkerLines(content);
+            const out = stripAcpStatusBlocks(content);
             if (out !== content) {
                 m.content = out.trim().length > 0 ? out : " ";
                 stripped += countMarkerLines(content);
@@ -137,7 +151,7 @@ export function stripAcpStatusMarkers(messages: unknown): number {
                 const p = part as Record<string, unknown>;
                 const text = p.text;
                 if (typeof text !== "string") continue;
-                const out = stripMarkerLines(text);
+                const out = stripAcpStatusBlocks(text);
                 if (out !== text) {
                     p.text = out.trim().length > 0 ? out : " ";
                     stripped += countMarkerLines(text);
@@ -152,6 +166,94 @@ function countMarkerLines(text: string): number {
     let n = 0;
     for (const _ of text.matchAll(MARKER_LINE)) n++;
     return n;
+}
+
+const STATUS_MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\] acp_status result:/u;
+
+/** Column-0 section starts of the status report body — kernel
+ *  buildStatusReport (all scopes) plus the handleAcpStatus extras. The list
+ *  mirrors bili/kernel fixed strings; if a kernel format change adds new
+ *  column-0 sections, this pass degrades to leaving their tail behind (the
+ *  sentinel pair above keeps stripping exactly regardless). */
+const LEGACY_STATUS_SECTION_STARTS = [
+    "ACTIVE SURFACE:",
+    "CONTEXT BREAKDOWN",
+    "COMPRESSED BLOCKS",
+    "COMPRESSED — ",
+    "UNCOMPRESSED — ",
+    "Sorted by ",
+    "Tip: buildStatusReport(",
+    "BILLED INPUT",
+    "NOTE: ",
+    "Nudge: ",
+    "PRESSURE NOTE: ",
+    "Compressible ranges (",
+    "[No specific ranges detected",
+    "DEAD REFS — ",
+    "COMPRESS CIRCUIT BREAKER: ARMED",
+    "Last failures were attributed to substrate-destruction",
+    "The Compressible-ranges list above was re-derived",
+    "FOLD BASE GENERATION MISMATCH — ",
+    "FOLD SUBSTRATE INVALID — ",
+    "STORE (CCR) — ",
+    "RETRIEVAL QUALITY — ",
+    "BLOCK SPANS — ",
+    "STORAGE — ",
+    "PRE-COMPACTION ARCHIVE — ",
+    "COMPRESSION CONFLICTS — ",
+    "Every event above names bili's OWN sibling extension",
+    "Keep exactly ONE compressor per conversation",
+    "The confirmed event(s) above are older than 7 days",
+    "The events above point at the client's OWN native compaction landing",
+    "Every event above is [suspected]",
+    "All events above are UNCONFIRMED signals older than 7 days",
+    "Every event above is an UNCONFIRMED signal",
+    "Fix (",
+    "Fix: ",
+    "CONFIGURATION.md →",
+    "CRITICAL ADVISORY (instance-level): ",
+    "CRITICAL UPDATE READY (instance-level): ",
+    "CRITICAL UPDATE AVAILABLE (instance-level): ",
+    "Live state: GET /__bili/status",
+    "UNDECRYPTED TRAFFIC (instance-level): ",
+    "UNRECOGNIZED PATHS (instance-level): ",
+];
+const LEGACY_STATUS_SHOWN_FOOTER = /^\d+ of \d+ shown\.$/u;
+
+function isLegacyStatusReportLine(line: string): boolean {
+    if (line.length === 0) return true;
+    if (/^\s/.test(line)) return true;
+    if (LEGACY_STATUS_SHOWN_FOOTER.test(line)) return true;
+    return LEGACY_STATUS_SECTION_STARTS.some((prefix) => line.startsWith(prefix));
+}
+
+/** Strip ACP status markers from one text field. Every non-acp_status marker
+ *  is single-line by construction (head only). The acp_status head opens a
+ *  block: with the #2789 sentinel pair the body runs to its close (a missing
+ *  close means the persisted message was cut mid-report — consume to the end
+ *  rather than guess a terminator); without the pair (pre-#2789 history) the
+ *  contiguous legacy report grammar below is consumed instead. */
+export function stripAcpStatusBlocks(text: string): string {
+    const lines = text.split("\n");
+    const kept: string[] = [];
+    let i = 0;
+    while (i < lines.length) {
+        const line = lines[i]!;
+        if (!MARKER_HEAD.test(line)) {
+            kept.push(line);
+            i += 1;
+            continue;
+        }
+        i += 1; // drop the head line itself
+        if (!STATUS_MARKER_HEAD.test(line)) continue;
+        if (lines[i] === STATUS_REPORT_OPEN) {
+            const close = lines.indexOf(STATUS_REPORT_CLOSE, i);
+            i = close === -1 ? lines.length : close + 1;
+            continue;
+        }
+        while (i < lines.length && isLegacyStatusReportLine(lines[i]!)) i += 1;
+    }
+    return kept.join("\n");
 }
 
 // Strip ACP panel user messages from a Responses input array (in place);

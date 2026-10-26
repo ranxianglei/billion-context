@@ -84,10 +84,12 @@ test("#535/#562: absolute-form request URLs route as forward-proxy targets", () 
         tunnel: true,
     });
     // A target pointing back at the proxy's own listen endpoint is still marked
-    // a tunnel here — the client Host header cannot distinguish it from a real
-    // upstream in a forward proxy. It is rejected downstream by
-    // checkTunnelDestination's self-layer (bound port + local IP) before any
-    // forwarding; see the forward-absolute-url self-target integration test.
+    // a tunnel HERE — resolveUpstream cannot see the bound port. In the live
+    // pipeline handle() rewrites such self-addressed requests to origin form
+    // BEFORE this resolves (#1073/#3245), so they are served locally like direct
+    // connections; the marking keeps any self destination that DOES reach
+    // admission 403'd by checkTunnelDestination's self-layer; see the
+    // forward-absolute-url integration tests.
     assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
         upstream: "http://127.0.0.1:8787",
         rewrittenUrl: "http://127.0.0.1:8787/v1/chat/completions",
@@ -144,7 +146,14 @@ test("/bili/ integration preserves query, subscription, account and thread heade
         debug: false,
         passthrough: true,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const bili = await startServer(opts);
     if (!bili.listening) await once(bili, "listening");
@@ -203,6 +212,39 @@ test("proxy precedence, NO_PROXY, HTTPS proxies and self-loop detection are dete
     assert.equal(parseHttpProxy("https://proxy.example:9443")?.protocol, "https:");
 });
 
+test("Windows ProxyOverride mid-token wildcards bypass the system proxy (#2502)", () => {
+    const clashDefault = "localhost;127.*;192.168.*;10.*;172.16.*;172.31.*;<local>";
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://192.168.1.5:11434"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://10.0.0.9"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://172.31.9.9"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://localhost:8893"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://myhost:80"), clashDefault, { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("http://api.openai.com/v1"), clashDefault, { windowsBypass: true }), false);
+    // literal-dot boundary: 127.* requires the actual dot (127abc.example must not match)
+    assert.equal(matchesNoProxy(new URL("http://127abc.example/"), clashDefault, { windowsBypass: true }), false);
+    // existing grammar stays intact under the flag: *.suffix (incl. apex), <local>, exact
+    assert.equal(matchesNoProxy(new URL("https://sub.example.com"), "*.example.com", { windowsBypass: true }), true);
+    assert.equal(matchesNoProxy(new URL("https://example.com"), "*.example.com", { windowsBypass: true }), true);
+    // NO_PROXY grammar unchanged: a mid-token * is not a wildcard there
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), "127.*"), false);
+    assert.equal(matchesNoProxy(new URL("http://127.0.0.1:8893"), "127.*", {}), false);
+    // decision level: loopback upstream with Clash's default list goes windows-bypass,
+    // public upstream still rides the system proxy
+    assert.deepEqual(resolveProxyDecision({}, undefined, "http://127.0.0.1:8893/v1", {
+        systemProxy: { enabled: true, http: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { source: "windows-bypass" });
+    assert.deepEqual(resolveProxyDecision({}, undefined, "http://192.168.1.5:11434/api", {
+        systemProxy: { enabled: true, http: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { source: "windows-bypass" });
+    assert.deepEqual(resolveProxyDecision({}, undefined, "https://api.openai.com/v1", {
+        systemProxy: { enabled: true, https: "http://127.0.0.1:7897", bypass: clashDefault },
+        biliPort: 8787,
+    }), { proxy: "http://127.0.0.1:7897/", source: "windows-system" });
+});
+
 test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", () => {
     const opts = loadOptions({
         ACP_PORT: "9100",
@@ -213,6 +255,8 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
     });
     assert.equal(opts.proxy, "https://explicit.example:9443");
     assert.equal(opts.proxySource, "bili-env");
+    // #2809: proxyFallback gained defaultDirect (false here — an explicit
+    // BILI_UPSTREAM_PROXY is set, so the unset-mode diagnostic peek is off).
     assert.deepEqual(opts.proxyFallback, {
         httpsProxy: "http://fallback.example:8080",
         allProxy: "http://all.example:8080",
@@ -220,6 +264,7 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
         biliPort: 9100,
         globalSource: "bili-env",
         explicitDirect: false,
+        defaultDirect: false,
     });
 });
 
@@ -236,9 +281,14 @@ test("default (unset mode) is direct, not env auto-detect (#346)", () => {
         });
         assert.equal(opts.proxy, "");
         assert.equal(opts.proxySource, "direct");
-        assert.equal(opts.proxyFallback.explicitDirect, true);
+        assert.equal(opts.proxyFallback!.explicitDirect, true);
+        // #346 egress pin stands (source stays "direct"); #2809 adds the
+        // diagnostic-only skippedProxy naming the env proxy that was skipped.
         const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
-        assert.deepEqual(decision, { source: "direct" });
+        assert.deepEqual(decision, {
+            source: "direct",
+            skippedProxy: { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" },
+        });
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfig;
@@ -255,7 +305,7 @@ test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
             HTTPS_PROXY: "http://fallback.example:8080",
         });
         assert.equal(opts.proxySource, "auto");
-        assert.equal(opts.proxyFallback.explicitDirect, false);
+        assert.equal(opts.proxyFallback!.explicitDirect, false);
         const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
         assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" });
     } finally {
@@ -282,9 +332,9 @@ test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
             clientSocket.pipe(socket);
             socket.pipe(clientSocket);
         });
-        tunnels.add(clientSocket);
+        tunnels.add(clientSocket as net.Socket);
         tunnels.add(socket);
-        clientSocket.once("close", () => tunnels.delete(clientSocket));
+        clientSocket.once("close", () => tunnels.delete(clientSocket as net.Socket));
         socket.once("close", () => tunnels.delete(socket));
     });
     await listen(proxy);

@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCacheReport, type CacheSample, type FoldEvent, type CompressionBlock } from "acp-kernel";
-import { buildSessionCacheReport, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample } from "../src/cache-ledger.ts";
+import { buildSessionCacheReport, canonicalSysFpForSettle, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
+import { METADATA_CANONICAL_SYS_FP } from "../src/fold-reconcile.ts";
 import type { Session } from "../src/session.ts";
 
 let seq = 0;
@@ -42,7 +43,8 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     const session = makeSession();
     withView20(session);
 
-    // t=1000: cold start, 10% miss → all residual.
+    // t=1000: cold start, 10% miss — no baseline, so the whole residual is
+    // initial content (#1891), not a prefix re-pay.
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     // t=1500: fold b1 removes 5000 tok, summary 2048 tok, diverges at m00010 (X=4500).
     recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 5000, 8192, "m00010")], { V: 10000, Vp: 5000 });
@@ -68,20 +70,35 @@ test("incremental ledger closes the same identity as kernel batch", () => {
 
     const inc = buildSessionCacheReport(session);
     const batch = buildCacheReport(rawSamples, rawFolds);
+    // Parity with kernel batch holds for every bucket EXCEPT the single
+    // intentional #1891 divergence: the no-baseline opener's residual is
+    // rebooked ttlRepay → newContent in the incremental ledger (the kernel
+    // batch path still books it as ttlRepay; bili never renders that path).
     assert.equal(inc.totals.input, batch.totals.input);
     assert.equal(inc.totals.cached, batch.totals.cached);
-    assert.equal(inc.totals.newContent, batch.totals.newContent);
     assert.equal(inc.totals.compRepay, batch.totals.compRepay);
-    assert.equal(inc.totals.ttlRepay, batch.totals.ttlRepay);
     assert.equal(inc.totals.residual, 0);
     assert.equal(inc.totals.balanced, true);
+    assert.equal(inc.totals.newContent, batch.totals.newContent + 1000, "opener residual moved into new content");
+    assert.equal(inc.totals.ttlRepay, batch.totals.ttlRepay - 1000, "opener residual removed from ttl re-pay");
 
     // Hand-computed expectations.
+    // #2929: the @3000 sample (28.6% — cold) is now fold b1's SECOND claim
+    // under the cold-tail window, so its structural excess (7000 − 4500 −
+    // 1000 growth = 1500) moves from the unattributed ttl bucket into
+    // compRepay; the batch path claims it identically.
     assert.equal(inc.totals.input, 30500);
     assert.equal(inc.totals.cached, 19000);
-    assert.equal(inc.totals.newContent, 1500);
-    assert.equal(inc.totals.compRepay, 1500);
-    assert.equal(inc.totals.ttlRepay, 8500);
+    assert.equal(inc.totals.newContent, 2500);
+    assert.equal(inc.totals.compRepay, 3000);
+    assert.equal(inc.totals.ttlRepay, 6000);
+    // Line-level: the opener is no-baseline initial content. The nb flag lives
+    // on the raw ledger line — report lines follow the kernel line shape.
+    const rawOpener = getCacheLedger(session).lines[0]!;
+    assert.equal(rawOpener.nb, 1);
+    const opener = inc.lines.find((l) => l.seq === 1)!;
+    assert.equal(opener.newContent, 1000);
+    assert.equal(opener.ttlRepay, 0);
     // Line-level: the cliff request splits into comp 1500 (= input − X) / ttl 3500.
     const cliff = inc.lines.find((l) => l.seq === 2)!;
     assert.equal(cliff.missed, 5000);
@@ -89,9 +106,16 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     assert.equal(cliff.compRepay, 1500);
     assert.equal(cliff.ttlRepay, 3500);
     assert.equal(cliff.foldSeq, 1);
+    // #2929: the cold @3000 sample is b1's continuation claim — comp absorbs
+    // the structural excess instead of leaking into the unattributed bucket.
+    const cont = inc.lines.find((l) => l.seq === 3)!;
+    assert.equal(cont.newContent, 1000);
+    assert.equal(cont.compRepay, 1500);
+    assert.equal(cont.ttlRepay, 2500);
+    assert.equal(cont.foldSeq, 1);
     // Fold economics carry the measured values.
     const f1 = inc.folds.find((f) => f.seq === 1)!;
-    assert.equal(f1.T, 1500);
+    assert.equal(f1.T, 3000);
     assert.equal(f1.hPct, 16.7);
     assert.equal(f1.S, 5000);
     assert.equal(f1.sigma, 2048);
@@ -127,7 +151,7 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     for (let i = 0; i < inc.folds.length; i++) {
         const a = inc.folds[i]!;
         const b = batch.folds[i]!;
-        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack"] as const) {
+        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack", "cadenceOk"] as const) {
             assert.deepEqual(a[key], b[key], `fold ${i} ${key}: incremental ${String(a[key])} !== batch ${String(b[key])}`);
         }
     }
@@ -145,25 +169,37 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     assert.equal(f1.T, 0);
     assert.ok(Math.abs(f1.breakevenTurns! - 2.5008976660682225) < 1e-9);
     assert.equal(f1.paidBack, true);
+    assert.equal(f1.cadenceOk, true);
     assert.equal(f1.savedSoFar, (12140 - 1000) * 3);
     const f2 = inc.folds.find((f) => f.seq === 2)!;
     assert.equal(f2.turnsToNextFold, null);
-    assert.equal(f2.paidBack, null);
+    // #2044: the last fold is now evaluable on the full post-fold window —
+    // zero post-fold requests against a positive n* is NOT PAID BACK (yet),
+    // no longer unobserved; cadenceOk stays null with no next fold.
+    assert.equal(f2.paidBack, false);
+    assert.equal(f2.cadenceOk, null);
     assert.equal(f2.requestsAfter, 0);
     assert.equal(inc.totals.balanced, true);
 });
 
-test("cold-start miss lands in the ttl bucket; pure append is new content", () => {
+test("cold-start miss lands in the new-content bucket (no baseline, #1891); pure append is new content", () => {
     const session = makeSession();
     recordCacheSample(session, { at: T0 + 1000, input: 1000, cached: 0 });
     recordCacheSample(session, { at: T0 + 2000, input: 2000, cached: 1000 });
     const r = buildSessionCacheReport(session);
     const l1 = r.lines.find((l) => l.seq === 1)!;
-    assert.equal(l1.ttlRepay, 1000);
+    // #1891: no prior bill means nothing could have expired — the opener's
+    // uncached input is initial content, not a prefix re-pay. (nb lives on the
+    // raw ledger line — report lines follow the kernel line shape.)
+    assert.equal(getCacheLedger(session).lines[0]!.nb, 1);
+    assert.equal(l1.newContent, 1000);
+    assert.equal(l1.ttlRepay, 0);
     assert.equal(l1.compRepay, 0);
     const l2 = r.lines.find((l) => l.seq === 2)!;
     assert.equal(l2.newContent, 1000);
     assert.equal(l2.ttlRepay, 0);
+    assert.equal(r.initialBills.samples, 1);
+    assert.equal(r.initialBills.inputTokens, 1000);
     assert.equal(r.totals.balanced, true);
 });
 
@@ -260,7 +296,7 @@ test("handleAcpCache full detail windows the text view past 512 lines (#1489)", 
     for (let i = 0; i < 600; i++) {
         recordCacheSample(session, { at: T0 + 1000 * i, input: 100000, cached: 99000 });
     }
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /LINE ITEMS \(last 512 of 600\):/);
     const rows = full.split("\n").filter((l) => /\s+99\.0%\s/.test(l));
     assert.equal(rows.length, 512);
@@ -284,7 +320,7 @@ test("legacy-trimmed sessions keep their historical deficit honest through the w
     const r = buildSessionCacheReport(session);
     assert.equal(r.lines.length, 612);
     assert.equal(r.linesOmitted, 88);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /LINE ITEMS \(last 512 of 700\):/);
 });
 
@@ -294,7 +330,7 @@ test("handleAcpCache renders the grand ledger with a closing identity", () => {
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 5000, 8192, "m00010")], { V: 10000, Vp: 5000 });
     recordCacheSample(session, { at: T0 + 2000, input: 6000, cached: 1000 });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /ACP CACHE REPORT \(cl-\d+\)/);
     assert.match(text, /GRAND LEDGER/);
     assert.match(text, /identity check\s+OK/);
@@ -307,7 +343,7 @@ test("empty session reports zero balanced totals", () => {
     const r = buildSessionCacheReport(session);
     assert.equal(r.totals.requests, 0);
     assert.equal(r.totals.balanced, true);
-    assert.match(handleAcpCache(session), /identity check\s+OK/);
+    assert.match(handleAcpCache(session).text, /identity check\s+OK/);
 });
 
 test("handleAcpCache defaults to summary; detail full restores the per-line listing", () => {
@@ -320,10 +356,10 @@ test("handleAcpCache defaults to summary; detail full restores the per-line list
     for (let i = 0; i < 12; i++) {
         recordCacheSample(session, { at: T0 + 13000 + 1000 * i, input: 100000, cached: 99000 });
     }
-    const summary = handleAcpCache(session);
+    const summary = handleAcpCache(session).text;
     assert.match(summary, /\[summary — detail:"full" for every fold & line\]/);
     assert.match(summary, /no anomalies \(24 requests, median hit 99\.0%\)/);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.ok(!full.includes("[summary"));
     const rows = full.split("\n").filter((l) => /\s+99\.0%\s/.test(l));
     assert.equal(rows.length, 24);
@@ -333,7 +369,7 @@ test("handleAcpCache rejects non-full detail values back to summary", () => {
     const session = makeSession();
     withView20(session);
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
-    assert.match(handleAcpCache(session, { detail: "everything" }), /\[summary/);
+    assert.match(handleAcpCache(session, { detail: "everything" }).text, /\[summary/);
 });
 
 /** Two-fold session with ONE fully-cached sample between the folds (T stays 0,
@@ -380,7 +416,7 @@ test("stamped priceProfile re-prices fold economics end to end (#1279)", () => {
     assert.equal(fd.breakevenTurns, 2.5);
     assert.equal(fb.paidBack, false);
     assert.equal(fd.paidBack, false);
-    assert.match(handleAcpCache(ds), /FOLD ECONOMICS \(2 folds @ w=1 r=0\.1 q=1\.5\)/);
+    assert.match(handleAcpCache(ds).text, /FOLD ECONOMICS \(2 folds @ w=1 r=0\.1 q=1\.5\)/);
 
     const batch = buildCacheReport(
         [
@@ -535,15 +571,15 @@ test("handleAcpCache renders the model-switch section in both modes (#1535)", ()
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     session.metadata.lastModel = "claude-opus-4-6";
     recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /MODEL SWITCHES/);
     assert.match(text, /1 switch\(es\)/);
     assert.match(text, /gpt-5 → claude-opus-4-6/);
     assert.match(text, /attributed 10\.0K/);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /MODEL SWITCHES/);
     const none = makeSession();
-    assert.match(handleAcpCache(none), /MODEL SWITCHES\n  none observed/);
+    assert.match(handleAcpCache(none).text, /MODEL SWITCHES\n  none observed/);
 });
 
 test("unknown-cache sample is quarantined out of the closure, not booked as a miss (#1536)", () => {
@@ -639,10 +675,163 @@ test("handleAcpCache renders the CACHE INVALIDATION breakdown incl. unmeasured (
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic", upstream: "https://api.openai.com" });
     recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
     recordCacheSample(session, { at: T0 + 3000, input: 11500, cached: null });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /CACHE INVALIDATION/);
     assert.match(text, /wire switch:/);
     assert.match(text, /upstream switch:/);
     assert.match(text, /restart\/refork:/);
     assert.match(text, /unmeasured .*excluded from hit rate/);
+});
+
+test("handleAcpCache renders per-line WIRE/UPSTREAM SWITCHES with timestamps like MODEL/KEY (#3307)", () => {
+    // wire-only flip (mirrors the #1536 wire fixture) — wire wins its own partition
+    const wireSession = makeSession();
+    wireSession.metadata.lastModel = "gpt-5";
+    recordCacheSample(wireSession, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic" });
+    recordCacheSample(wireSession, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai" });
+    const wireText = handleAcpCache(wireSession).text;
+    assert.match(wireText, /WIRE SWITCHES/);
+    assert.match(wireText, /anthropic → openai/);
+    // upstream-only flip (mirrors the #1536 upstream fixture) — upstream wins its own partition
+    const upSession = makeSession();
+    upSession.metadata.lastModel = "gpt-5";
+    recordCacheSample(upSession, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "openai", upstream: "https://api.openai.com" });
+    recordCacheSample(upSession, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
+    const upText = handleAcpCache(upSession).text;
+    assert.match(upText, /UPSTREAM SWITCHES/);
+    assert.match(upText, /https:\/\/api\.openai\.com → https:\/\/relay\.example\.com/);
+});
+
+test("handleAcpCache renders a per-line RESTART/REFORK section with its event (#3307)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    (session.metadata["cacheLedger"] as Record<string, unknown>).lastBoot = "previous-boot";
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
+    const text = handleAcpCache(session).text;
+    assert.match(text, /RESTART\/REFORK/);
+    assert.match(text, /→ \(restart\)/);
+});
+
+test("per-cause buckets partition a multi-flag sample's residual (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000, protocol: "anthropic", upstream: "https://a.example" });
+    // one request where model AND wire AND upstream all change at once, cold prefix
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 0, protocol: "openai", upstream: "https://b.example" });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.totals.ttlRepay, 10000);
+    // charged exactly ONCE, to the highest-priority dimension (model > wire > upstream)
+    assert.equal(r.invalidation.model, 10000);
+    assert.equal(r.invalidation.wire, 0);
+    assert.equal(r.invalidation.upstream, 0);
+    assert.equal(r.invalidation.restart, 0);
+    const named = r.invalidation.model + r.invalidation.wire + r.invalidation.upstream + r.invalidation.restart;
+    assert.equal(named, r.totals.ttlRepay, "buckets are a partition: named + remaining closes exactly");
+    assert.equal(r.invalidation.remaining, 0);
+    // #2784: the counters follow the partition too — only the winning dimension (model)
+    // narrates the line; the wire/upstream flips stay visible on the line itself (flags + values).
+    assert.equal(r.modelSwitches.count, 1);
+    assert.equal(r.wireSwitches.count, 0);
+    assert.equal(r.upstreamSwitches.count, 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("switch is detected across an unmeasured boundary line (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000 });
+    // client switches model but this request reports NO cache tokens (unmeasurable)
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10500, cached: null });
+    // next MEASURED request on the new model: cold prefix re-bill
+    recordCacheSample(session, { at: T0 + 3000, input: 11000, cached: 0 });
+    const r = buildSessionCacheReport(session);
+    assert.ok(r.modelSwitches.count >= 1, "the switch is observed");
+    assert.ok(r.invalidation.model > 0, "cold tail after an unmeasured switch is charged to the switch");
+    assert.ok(r.invalidation.remaining < r.totals.ttlRepay, "not everything is left unattributed");
+});
+
+test("post-switch cold rounds are attributed within a bounded window and stopped by a warm round (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000 });   // warm baseline
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 0 });        // switch, cold
+    recordCacheSample(session, { at: T0 + 3000, input: 10000, cached: 0 });        // still cold (continuation)
+    recordCacheSample(session, { at: T0 + 4000, input: 10000, cached: 10000 });    // warm -> retires the window
+    recordCacheSample(session, { at: T0 + 5000, input: 10000, cached: 0 });        // later TTL miss, NOT the switch
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.invalidation.model, 20000, "switch line + exactly one continuation round");
+    assert.equal(r.invalidation.remaining, 10000, "the post-warm miss stays provider-side");
+    assert.equal(r.totals.balanced, true);
+});
+
+test("unmeasured lines store a null hit rate, not a falsifiable 0% (#1847)", () => {
+    const session = makeSession();
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: null });
+    const led = (session.metadata as Record<string, { lines: Array<{ unk?: number; hitPct: number | null }> }> & object)["cacheLedger"]!;
+    const unkLine = led.lines.find((l) => l.unk === 1)!;
+    assert.equal(unkLine.hitPct, null, "unmeasured hit rate is null, not 0");
+    const r = buildSessionCacheReport(session);
+    assert.ok(!r.lines.some((l) => l.seq === 2), "still quarantined out of the rendered set");
+});
+
+test("a large never-caused unattributed residual gets an explicit provider-side hint, not silence (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    for (let i = 0; i < 5; i++) {
+        recordCacheSample(session, { at: T0 + 1000 * (i + 1), input: 100000, cached: 90000 });
+    }
+    const text = handleAcpCache(session).text;
+    assert.match(text, /CACHE INVALIDATION/);
+    assert.match(text, /no observable cause|no cause observed/i);
+    assert.match(text, /NOT a bili bug|not a bili bug/i);
+});
+
+test("post-switch cold-tail rounds stay attributed, not flagged as seam suspects (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    settleUsageReport(session, { total: 40000, reportedCached: 40000 });   // warm baseline
+    session.metadata.lastModel = "claude-opus";
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // the switch itself (flagged)
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // cold-tail continuation
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.seam.suspects, 0, "a cause-attributed cold-tail round is not a seam candidate");
+    assert.equal(r.invalidation.model, 80000, "both cold rounds stay charged to the switch");
+});
+
+test("pre-#1847 ledger lines keep their historical per-event attribution (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 40000, cached: 40000 });
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 40000, cached: 0 });
+    // Emulate a ledger persisted before #1847: drop the new per-line `cause` field.
+    const meta = (session.metadata as Record<string, { lines: Array<{ cause?: string }> }> & object)["cacheLedger"]!;
+    delete meta.lines[1].cause;
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.events.length, 1);
+    assert.equal(r.modelSwitches.events[0].attributed, 40000, "legacy sw line keeps its historical charge display");
+    assert.doesNotMatch(handleAcpCache(session).text, /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
+});
+
+test("canonicalSysFpForSettle is gated to the responses wire only (#2973)", () => {
+    // A session that ran on responses then switched lanes still holds the last
+    // responses request's fp in the persisted metadata slot — that stale value
+    // must NOT leak into non-responses settles (#2973 / #2867 attribution).
+    const session = makeSession();
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp: "deadbeefcafe1234", size: 12 };
+    assert.equal(canonicalSysFpForSettle(session, "responses"), "deadbeefcafe1234");
+    assert.equal(canonicalSysFpForSettle(session, "anthropic"), undefined, "anthropic settle must not carry the stale responses fp");
+    assert.equal(canonicalSysFpForSettle(session, "openai"), undefined);
+    assert.equal(canonicalSysFpForSettle(session, "google"), undefined);
+    assert.equal(canonicalSysFpForSettle(session, undefined), undefined);
+    // Empty/absent slot yields nothing even on responses.
+    const empty = makeSession();
+    empty.metadata[METADATA_CANONICAL_SYS_FP] = { fp: "", size: 0 };
+    assert.equal(canonicalSysFpForSettle(empty, "responses"), undefined);
+    assert.equal(canonicalSysFpForSettle(makeSession(), "responses"), undefined);
 });

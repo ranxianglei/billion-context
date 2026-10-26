@@ -44,6 +44,13 @@ function makeOpts(port: number, upstream: string): ProxyOptions {
         passthrough: false,
         autoUpdate: false,
         logFile: "off",
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
         mitm: { enabled: false, domains: [] },
     };
 }

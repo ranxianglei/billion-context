@@ -1,0 +1,106 @@
+{
+  "name": "billion-context-release-notes",
+  "version": "0.0.0",
+  "description": "Tiered, model-written release notes for billion-context. Read-only companion payload consumed by the proxy's #1870 visibility watcher; version number is bumped by CI on every publish (the field itself is meaningless).",
+  "private": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
+  "billionContextReleaseNotes": {
+    "schema": 1,
+    "updated": "2026-10-21",
+    "releases": [
+      {
+        "version": "0.1.203",
+        "date": "2026-10-21",
+        "tier": "critical",
+        "summary": "修复电脑休眠/会话重启/网络波动后重试请求 400:此前 dsh 重试不带会话身份,压缩状态丢失、整段历史裸发上游拒绝(#4082/#4101/#4094/#4116);修复上下文爆满/token 暴涨:超窗保险丝+超限请求不再裸发(#4090);修复 skill 目录保护失效导致的缓存 miss(#3799)。本版共 119 项变更,另修复 70+ 缺陷、新增 10+ 功能,完整清单见 https://github.com/ranxianglei/billion-context/releases/tag/v0.1.203 。升级到 ≥0.1.203 并重启一次 dsh。"
+      },
+      {
+        "version": "0.1.193",
+        "date": "2026-10-12",
+        "tier": "critical",
+        "summary": "修复 dsh 等切换模型/协议导致会话 fork、压缩状态失效、上下文暴涨问题(#2791);修复 dsh、codex 等自动压缩拦截失效问题(#2763);修复 codex 等压缩后缓存泄露、token 大量浪费问题(#2733);支持新的统一存储(默认关,实验中)(#2671)。升级后重启一次 dsh。"
+      },
+      {
+        "version": "0.1.192",
+        "date": "2026-10-10",
+        "tier": "critical",
+        "summary": "DSH desktop: a native-compaction checkpoint on the anthropic/google lanes left the prefix cache unrecoverable — persistent misses, heavy token waste (#2658, #2596); 0.1.189 added the rebase fallback to openai/responses only, this release extends it (#2664). Restart dsh. 丨 桌面版:原生压缩 checkpoint 落到 anthropic/google 线后前缀缓存无法恢复、token 大量浪费(#2658、#2596);0.1.189 只补了 openai/responses,本版补齐(#2664)。升级后重启 dsh。"
+      },
+      {
+        "version": "0.1.191",
+        "date": "2026-10-10",
+        "tier": "recommended",
+        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
+      },
+      {
+        "version": "0.1.186",
+        "date": "2026-10-06",
+        "tier": "critical",
+        "summary": "修复codex 启动器模式启动失败问题,修复claude code账号版本无法使用的问题,修复dsh重试不再泄漏挂死的代理子进程（#2187）。"
+      },
+      {
+        "version": "0.1.185",
+        "date": "2026-10-05",
+        "tier": "critical",
+        "summary": "dsh: compression could silently stop — a background helper (e.g. title generation) hijacked the chat's memory anchor, so it never compressed again, eating context and tokens (#2156, #2160). Helpers are now isolated (#2157); Windows self-update no longer kills bili (#2095). 丨 修复 dsh 静默压缩失效:后台小任务(如生成标题)抢走「记忆锚点」,该会话从此无法压缩、上下文和 token 悄悄暴涨(#2156、#2160);现已隔离(#2157);Windows 自更新后不再退出(#2095)。重启一次 dsh。"
+      },
+      {
+        "version": "0.1.184",
+        "date": "2026-10-04",
+        "tier": "critical",
+        "summary": "Desktop (dsh): after 0.1.179, an update could make bili tools vanish until restart (#2082) — now self-healing, broken desktop updates roll back; re-activating the plugin after a healthy boot also re-registers its tools (#2101); also fixes tool-call misrouting (#2072). Restart dsh once. 丨 桌面版修复:0.1.179 后升级会使 bili 工具消失(#2082),现已自愈;损坏的桌面更新自动回滚;健康运行后重激活插件也会重新注册工具(#2101);另修 #2072 调用错路由。升级后重启一次 dsh。"
+      },
+      {
+        "version": "0.1.183",
+        "date": "2026-10-04",
+        "tier": "routine",
+        "summary": "Update visibility is silent by default (#1977): routine/recommended releases no longer nag on the /acp panel or acp_status — only critical-tier entries surface (CRITICAL UPDATE READY/AVAILABLE). Staleness cues for an installed-but-not-restarted release: web UI banner, /acp one-line warning (#1603, OpenCode hosts today — pi/dsh tracked in #2084), GET /__bili/status."
+      },
+      {
+        "version": "0.1.182",
+        "date": "2026-10-04",
+        "tier": "recommended",
+        "summary": "Emergency carve-out: the output-budget clamp now floors to an integer, so max_tokens / max_completion_tokens / max_output_tokens are always whole numbers. Strict OpenAI-compatible upstreams no longer reject requests with 'max_tokens: Input should be a valid integer' (400) or 'Endpoint is unavailable' (422) — which killed whole agent turns (#2011). Only this fix, on top of v0.1.181."
+      },
+      {
+        "version": "0.1.181",
+        "date": "2026-10-03",
+        "tier": "routine",
+        "summary": "Window & preflight accuracy wave: dsh context windows resolve again after every resolveModelInfo call failed on a detached receiver (#1943); preflight no longer fires at 59–63% real usage — local estimates are now calibrated against provider-reported usage (#1940, #1933); pi virtual-model selections no longer double-compress (#1962); re-signed SDK-HMAC-SHA256 egress on armed tunnels (#1884)."
+      },
+      {
+        "version": "0.1.180",
+        "date": "2026-10-02",
+        "tier": "routine",
+        "summary": "OpenCode WebSocket traffic is intercepted again — compression and usage stats no longer silently no-op on OpenCode ≥ 2.0.20 (#1844)."
+      },
+      {
+        "version": "0.1.179",
+        "date": "2026-10-01",
+        "tier": "routine",
+        "summary": "Compression is now inherited across agent restart / resume / new-branch forks (#1834): folded summaries survive instead of silently re-expanding on the wire (claude-code and openai-chat wires; codex/gemini in #1853 follow-up)."
+      },
+      {
+        "version": "0.1.178",
+        "date": "2026-10-01",
+        "tier": "routine",
+        "summary": "dsh installs self-heal: profile bundles now converge to the global version automatically (#1803/#1804) — fixes the one-time 'invalid plugin' boot crash after a new bili publish."
+      },
+      {
+        "version": "0.1.177",
+        "date": "2026-10-01",
+        "tier": "routine",
+        "summary": "dsh: stale landing page after restart fixed (#1787); no-op for other hosts."
+      },
+      {
+        "version": "0.1.176",
+        "date": "2026-10-01",
+        "tier": "routine",
+        "summary": "Stability wave: zero-injection session identity keeps the prefix cache hot across fork/resume (#1692/#1611); launcher port hardening (#1756); ACP tag-echo strip no longer eats prose (#1722); responses degenerate-output guard and transport replay retry."
+      }
+    ]
+  }
+}

@@ -247,7 +247,7 @@ function startUpstream(wire: Wire, captured: string[], trigger: ReturnType<typeo
             switch (wire) {
                 case "responses": {
                     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                    const blk = (type: string, data: Record<string, unknown>): void => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+                    const blk = (type: string, data: Record<string, unknown>): void => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
                     if (compressArgs !== undefined) {
                         blk("response.created", { response: { id: `resp_${idx}`, status: "in_progress" } });
                         blk("response.output_item.added", { output_index: 0, item: { type: "function_call", id: `fc_${idx}`, call_id: `call_cmp_${idx}`, name: "compress", arguments: "", status: "in_progress" } });
@@ -268,7 +268,7 @@ function startUpstream(wire: Wire, captured: string[], trigger: ReturnType<typeo
                 }
                 case "chat": {
                     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                    const line = (o: unknown): void => res.write(`data: ${JSON.stringify(o)}\n\n`);
+                    const line = (o: unknown): void => { res.write(`data: ${JSON.stringify(o)}\n\n`); };
                     if (compressArgs !== undefined) {
                         line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_cmp_${idx}`, type: "function", function: { name: "compress", arguments: compressArgs } }] } }] });
                         line({ id: `c_${idx}`, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100, completion_tokens: 2 } });
@@ -282,7 +282,7 @@ function startUpstream(wire: Wire, captured: string[], trigger: ReturnType<typeo
                 }
                 case "anthropic": {
                     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                    const ev = (event: string, data: unknown): void => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                    const ev = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
                     ev("message_start", { type: "message_start", message: { id: `msg_a_${idx}`, role: "assistant", usage: { input_tokens: 100 } } });
                     if (compressArgs !== undefined) {
                         ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_cmp_${idx}`, name: "compress", input: {} } });
@@ -337,7 +337,14 @@ function proxyOptions(upstreamPort: number, model: string, ctx: number): ProxyOp
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
 }

@@ -6,9 +6,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
+import { vertexEnabled } from "./vertex.js";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
+    /** Vertex AI is the lane's provider (Claude Code's own
+     *  `CLAUDE_CODE_USE_VERTEX=1`). When it is set, Claude Code ignores
+     *  `ANTHROPIC_BASE_URL` and posts to `ANTHROPIC_VERTEX_BASE_URL` — a
+     *  launcher that rewrites only the former routes nothing. */
+    vertexEnabled?: boolean;
+    /** `ANTHROPIC_VERTEX_BASE_URL` — an explicit Vertex endpoint (may carry a
+     *  path, may be a private endpoint or a relay). */
+    vertexBaseUrl?: string;
+    /** `CLOUD_ML_REGION` — the client builds `/locations/{region}/…` from this
+     *  value, so the host the launcher derives must come from the same one or
+     *  host and path disagree and Vertex 404s. */
+    vertexRegion?: string;
+    /** `ANTHROPIC_VERTEX_PROJECT_ID` — diagnostic only: the client builds its
+     *  own `/projects/{id}/…` path and nothing derives from it. */
+    vertexProjectId?: string;
     /** Model claude runs: settings `env.ANTHROPIC_MODEL` ?? top-level `model`. */
     model?: string;
     /** The user's explicit auto-compact window (settings `autoCompactWindow`
@@ -17,7 +33,7 @@ export interface ClaudeSettings {
     autoCompactWindow?: number;
 }
 
-export interface ModelWindow {
+interface ModelWindow {
     id: string;
     contextWindow: number;
     /** Configured max output for the model (#971), when the client's own
@@ -76,7 +92,9 @@ export interface OmpProvider {
 }
 
 export interface OmpConfig {
-    providers: Record<string, OmpProvider>;
+    /** Discovery tolerates a lane with no discovered providers (`?? {}` at
+     *  every read site) — optional here matches that (#1991 item 5). */
+    providers?: Record<string, OmpProvider>;
 }
 
 export interface OpencodeProvider {
@@ -86,7 +104,9 @@ export interface OpencodeProvider {
 }
 
 export interface OpencodeConfig {
-    providers: Record<string, OpencodeProvider>;
+    /** Discovery tolerates a lane with no discovered providers (`?? {}` at
+     *  every read site) — optional here matches that (#1991 item 5). */
+    providers?: Record<string, OpencodeProvider>;
 }
 
 /** opencode's built-in "zen" gateway (`opencode auth login`): the baseURL
@@ -104,7 +124,7 @@ export interface HermesConfig {
     providers: Record<string, HermesProvider>;
 }
 
-export interface DshConfig {
+interface DshConfig {
     baseUrls: string[];
 }
 
@@ -164,20 +184,27 @@ export interface KimiConfig {
     defaultModel?: string;
 }
 
-export interface GeminiConfig {
+interface GeminiConfig {
     /** The user's pre-existing `GOOGLE_GEMINI_BASE_URL` env — when set,
      *  gemini-cli already routes model traffic to this relay, so the launcher
      *  wraps IT via /bili/ instead of the stock Google endpoint. */
     baseUrl?: string;
 }
 
-export interface IflowConfig {
+interface IflowConfig {
     /** The user's pre-existing iFlow base-URL env (`IFLOW_BASE_URL` /
      *  `IFLOW_baseUrl`) — relay-wrap semantics, same as GeminiConfig.baseUrl. */
     baseUrl?: string;
 }
 
-export interface McodeProvider {
+interface AntigravityConfig {
+    /** The user's pre-existing `CLOUD_CODE_URL` env (undocumented override
+     *  verified against the v2.19.1 language_server binary, #2115) — relay-wrap
+     *  semantics, same as GeminiConfig.baseUrl. */
+    baseUrl?: string;
+}
+
+interface McodeProvider {
     baseUrl?: string;
 }
 
@@ -215,6 +242,30 @@ export interface GooseConfig {
     customProviders: Record<string, string>;
 }
 
+/** crush.json discovery result — kept module-local: nobody imports the type
+ *  by name (the unused-export gate would flag it), only readCrushConfig's
+ *  return value and ClientConfig.crush carry it. */
+interface CrushConfig {
+    /** Custom provider base URLs discovered from crush.json
+     *  (`providers.<id>.base_url`, https only). Read-only discovery — crush
+     *  has no in-process plugin seam, so the launcher cert-MITMs these hosts
+     *  on top of the built-in provider defaults (#2340). */
+    baseUrls?: string[];
+}
+
+/** settings.json discovery result for Zed — kept module-local like
+ *  CrushConfig: only readZedConfig's return value and ClientConfig.zed
+ *  carry it (the unused-export gate would flag the named type). */
+interface ZedConfig {
+    /** Custom provider api_urls discovered from Zed's settings.json
+ *      (`language_models.openai_compatible.<id>.api_url` and
+ *      `language_models.anthropic_compatible.<id>.api_url`, https only).
+ *      Read-only discovery — Zed has no in-process plugin seam, so the
+ *      launcher cert-MITMs these hosts on top of the built-in provider
+ *      defaults (#2340). */
+    baseUrls?: string[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -230,9 +281,12 @@ export interface ClientConfig {
     kimi?: KimiConfig;
     gemini?: GeminiConfig;
     iflow?: IflowConfig;
+    antigravity?: AntigravityConfig;
     mcode?: McodeConfig;
     aider?: AiderConfig;
     goose?: GooseConfig;
+    crush?: CrushConfig;
+    zed?: ZedConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -313,7 +367,7 @@ export function nonEmpty(s: unknown): s is string {
     return typeof s === "string" && s.trim().length > 0;
 }
 
-export function readJsonObject(filePath: string): Record<string, unknown> | null {
+function readJsonObject(filePath: string): Record<string, unknown> | null {
     try {
         const txt = fs.readFileSync(filePath, "utf8");
         const parsed: unknown = JSON.parse(txt);
@@ -565,6 +619,10 @@ export function readIflowEnvConfig(env: NodeJS.ProcessEnv): IflowConfig {
     return { baseUrl: raw };
 }
 
+export function readAntigravityEnvConfig(env: NodeJS.ProcessEnv): AntigravityConfig {
+    return { baseUrl: nonEmpty(env.CLOUD_CODE_URL) ? env.CLOUD_CODE_URL : undefined };
+}
+
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
     const files = [
         path.join(homeDir, ".claude", "settings.json"),
@@ -573,6 +631,13 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
     let anthropicBaseUrl: string | undefined;
     let model: string | undefined;
     let autoCompactWindow: number | undefined;
+    // Vertex (Claude Code's third-party convention, same precedence as the base
+    // URL above): the settings env block is where a user configures Vertex, so
+    // it cannot be shell-only — but the shell is honored as the fallback.
+    let vertexFlagRaw: string | undefined;
+    let vertexBaseUrl: string | undefined;
+    let vertexRegion: string | undefined;
+    let vertexProjectId: string | undefined;
     for (const f of files) {
         const obj = readJsonObject(f);
         const settingsEnv = obj?.env;
@@ -586,6 +651,14 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
             if (nonEmpty(m)) model = String(m);
             const acw = Number(e.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
             if (Number.isFinite(acw) && acw > 0) autoCompactWindow = acw;
+            const vf = e.CLAUDE_CODE_USE_VERTEX;
+            if (vf !== undefined) vertexFlagRaw = String(vf);
+            const vbu = e.ANTHROPIC_VERTEX_BASE_URL;
+            if (nonEmpty(vbu)) vertexBaseUrl = String(vbu);
+            const vreg = e.CLOUD_ML_REGION;
+            if (nonEmpty(vreg)) vertexRegion = String(vreg);
+            const vpid = e.ANTHROPIC_VERTEX_PROJECT_ID;
+            if (nonEmpty(vpid)) vertexProjectId = String(vpid);
         }
         const tm = obj?.model;
         if (nonEmpty(tm) && model === undefined) model = String(tm);
@@ -595,8 +668,20 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
     // Honor a shell-exported ANTHROPIC_BASE_URL (claude's native override) so
     // the launcher wraps the relay the user actually uses, not the default.
     if (!anthropicBaseUrl && nonEmpty(env.ANTHROPIC_BASE_URL)) anthropicBaseUrl = env.ANTHROPIC_BASE_URL;
+    if (vertexFlagRaw === undefined && env.CLAUDE_CODE_USE_VERTEX !== undefined) vertexFlagRaw = env.CLAUDE_CODE_USE_VERTEX;
+    if (!vertexBaseUrl && nonEmpty(env.ANTHROPIC_VERTEX_BASE_URL)) vertexBaseUrl = env.ANTHROPIC_VERTEX_BASE_URL;
+    if (!vertexRegion && nonEmpty(env.CLOUD_ML_REGION)) vertexRegion = env.CLOUD_ML_REGION;
+    if (!vertexProjectId && nonEmpty(env.ANTHROPIC_VERTEX_PROJECT_ID)) vertexProjectId = env.ANTHROPIC_VERTEX_PROJECT_ID;
+    // A settings-file value beats the shell here: the env block is applied by
+    // claude itself, so an explicit `=0` in settings must not be overridden by
+    // a stale export in the launching shell.
+    const vertexOn = vertexEnabled({ CLAUDE_CODE_USE_VERTEX: vertexFlagRaw });
     return {
         ...(anthropicBaseUrl ? { anthropicBaseUrl } : {}),
+        ...(vertexOn ? { vertexEnabled: true } : {}),
+        ...(vertexBaseUrl ? { vertexBaseUrl } : {}),
+        ...(vertexRegion ? { vertexRegion } : {}),
+        ...(vertexProjectId ? { vertexProjectId } : {}),
         ...(model ? { model } : {}),
         ...(autoCompactWindow ? { autoCompactWindow } : {}),
     };
@@ -665,6 +750,268 @@ export function readCodexConfig(codexHome: string): CodexConfig {
         return { providers: {} };
     }
     return parseCodexToml(text);
+}
+
+/** #2197: the effective codex config view for ONE launch — base `config.toml`,
+ *  then the `-p/--profile <name>` file overlay (`$CODEX_HOME/<name>.config.toml`),
+ *  then CLI `-c/--config key=value` / `-m/--model` overrides: codex's own
+ *  precedence (verified against codex-cli 0.147.0 with marker upstreams —
+ *  profile-only providers take over all model traffic; a later -c beats both
+ *  profile and base; repeated -c on one key: last wins; 0.160.0's --help
+ *  confirms the same overlay semantics). Every launcher routing/budget decision
+ *  must use this view — discovery reading only the base file is exactly the
+ *  bypass this interface removes. */
+interface CodexEffectiveView {
+    config: CodexConfig;
+    /** The selected profile name (-p/--profile), for diagnostics. */
+    profile?: string;
+    /** -p named a profile whose file does not exist — codex itself continues
+     *  on the base config alone (verified 0.147), so the view is base-only and
+     *  the caller surfaces a visible notice instead of guessing. */
+    profileMissing?: boolean;
+    /** Fatal problem (invalid profile name / malformed profile TOML): codex
+     *  itself refuses to start in that state, so the caller must fail loudly
+     *  before spawning anything. */
+    fatal?: string;
+}
+
+/** Strip one pair of matching surrounding quotes from a TOML-ish value. */
+function unquoteTomlValue(raw: string): string {
+    const t = raw.trim();
+    if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+        return t.slice(1, -1);
+    }
+    return t;
+}
+
+/** Extract the profile selected by -p/--profile from raw client args (last
+ *  occurrence wins). A value starting with "-" is a flag, not a name — ignored. */
+export function extractCodexProfile(args: readonly string[]): string | undefined {
+    let profile: string | undefined;
+    for (let i = 0; i < args.length; i += 1) {
+        const a = args[i]!;
+        if (a === "-p" || a === "--profile") {
+            const v = args[i + 1];
+            if (v !== undefined && !v.startsWith("-")) { profile = v; i += 1; }
+        } else if (a.startsWith("--profile=")) {
+            const v = a.slice("--profile=".length);
+            if (v.length > 0 && !v.startsWith("-")) profile = v;
+        }
+    }
+    return profile;
+}
+
+/** Apply codex CLI overrides onto a fresh view. Only the keys bili needs for
+ *  routing/budget decisions are recognized; arbitrary other dotted keys are
+ *  ignored (codex accepts any of them). Repeated occurrences apply left to
+ *  right — last wins (codex's verified behavior). A `-c`/`--config` token is
+ *  only consumed when its next arg actually looks like `key=value`, so a
+ *  positional prompt word is never swallowed. */
+export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
+    const out: CodexConfig = { providers: {} };
+    let model: string | undefined;
+    let provider: string | undefined;
+    let openaiBaseUrl: string | undefined;
+    let contextWindow: number | undefined;
+    let autoCompactLimit: number | undefined;
+    let maxOutput: number | undefined;
+    const asNumber = (raw: string): number | undefined => {
+        const n = Number(unquoteTomlValue(raw));
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    const applyKv = (kv: string | undefined): void => {
+        if (!kv) return;
+        const eq = kv.indexOf("=");
+        if (eq <= 0) return;
+        const key = kv.slice(0, eq).trim();
+        const val = unquoteTomlValue(kv.slice(eq + 1));
+        if (key === "model") model = val;
+        else if (key === "model_provider") provider = val;
+        else if (key === "openai_base_url") openaiBaseUrl = val;
+        else if (key === "model_context_window") contextWindow = asNumber(val);
+        else if (key === "model_auto_compact_token_limit") autoCompactLimit = asNumber(val);
+        else if (key === "model_max_output_tokens") maxOutput = asNumber(val);
+        else {
+            const mp = /^model_providers\.(.+)\.base_url$/.exec(key);
+            if (mp) {
+                const id = unquoteTomlValue(mp[1]!);
+                out.providers[id] = { ...(out.providers[id] ?? {}), baseUrl: val };
+            }
+        }
+    };
+    for (let i = 0; i < args.length; i += 1) {
+        const a = args[i]!;
+        if (a === "-m" || a === "--model") {
+            const v = args[i + 1];
+            if (v !== undefined && !v.startsWith("-")) { model = unquoteTomlValue(v); i += 1; }
+        } else if (a.startsWith("--model=")) {
+            model = unquoteTomlValue(a.slice("--model=".length));
+        } else if (a === "-c" || a === "--config") {
+            const v = args[i + 1];
+            if (v !== undefined && v.includes("=") && !v.startsWith("-")) { applyKv(v); i += 1; }
+        } else if (a.startsWith("--config=")) {
+            applyKv(a.slice("--config=".length));
+        }
+    }
+    if (model !== undefined) out.model = model;
+    if (provider !== undefined) out.modelProvider = provider;
+    if (openaiBaseUrl !== undefined) out.openaiBaseUrl = openaiBaseUrl;
+    if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (autoCompactLimit !== undefined) out.autoCompactLimit = autoCompactLimit;
+    if (maxOutput !== undefined) out.maxOutput = maxOutput;
+    return out;
+}
+
+/** Merge two codex views: overlay wins per key (scalar override; providers
+ *  merge by name, overlay baseUrl beating base). modelWindows is rebuilt from
+ *  the merged model/window/maxOutput pair so budget alignment sees the final
+ *  values (#321 semantics preserved across layers). */
+export function mergeCodexViews(base: CodexConfig, overlay: CodexConfig): CodexConfig {
+    const providers: Record<string, CodexProvider> = {};
+    for (const [name, prov] of Object.entries(base.providers ?? {})) providers[name] = { ...prov };
+    for (const [name, prov] of Object.entries(overlay.providers ?? {})) {
+        providers[name] = { ...(providers[name] ?? {}), ...prov };
+    }
+    const model = overlay.model ?? base.model;
+    const contextWindow = overlay.contextWindow ?? base.contextWindow;
+    const maxOutput = overlay.maxOutput ?? base.maxOutput;
+    const out: CodexConfig = { providers };
+    if (overlay.modelProvider !== undefined || base.modelProvider !== undefined) out.modelProvider = overlay.modelProvider ?? base.modelProvider;
+    if (overlay.openaiBaseUrl !== undefined || base.openaiBaseUrl !== undefined) out.openaiBaseUrl = overlay.openaiBaseUrl ?? base.openaiBaseUrl;
+    if (model !== undefined) out.model = model;
+    if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (overlay.autoCompactLimit !== undefined || base.autoCompactLimit !== undefined) out.autoCompactLimit = overlay.autoCompactLimit ?? base.autoCompactLimit;
+    if (maxOutput !== undefined) out.maxOutput = maxOutput;
+    const win = toModelWindow(model, contextWindow, maxOutput);
+    if (win) out.modelWindows = [win];
+    return out;
+}
+
+// #2260(E): one TOML key part — bare ([A-Za-z0-9_-]+), basic string with
+// escapes ("my key", "ключ"), or literal string ('a-b'). The pre-fix regex
+// only accepted \w runs inside quotes, so VALID quoted keys with spaces or
+// non-ASCII false-positived as broken and bili refused the whole launch
+// (exit 2) where codex itself parses the profile fine.
+const TOML_KEY_PART_RE = new RegExp(String.raw`^(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'(?:[^'\n])*')(?:\.(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'(?:[^'\n])*'))*$`);
+
+/** One pass over a TOML line outside a multi-line string: net
+ *  array/inline-table bracket delta plus the key-side text (everything up to
+ *  the first `=` at depth 0, trimmed; the whole line when there is no `=`).
+ *  Quote-aware (basic-string escapes, literal strings) and comment-aware
+ *  (`#` outside strings ends the active line) so brackets in values, strings
+ *  or comments never skew the depth count. */
+function scanTomlLine(line: string): { delta: number; key: string } {
+    let delta = 0;
+    let dq = false;
+    let sq = false;
+    let escaped = false;
+    let pastEq = false;
+    let key = "";
+    for (const ch of line) {
+        if (escaped) {
+            escaped = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (dq) {
+            if (ch === "\\") escaped = true;
+            else if (ch === "\"") dq = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (sq) {
+            if (ch === "'") sq = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (ch === "#") break;
+        if (ch === "\"") { dq = true; if (!pastEq) key += ch; continue; }
+        if (ch === "'") { sq = true; if (!pastEq) key += ch; continue; }
+        if (ch === "=" && !pastEq) { pastEq = true; continue; }
+        if (ch === "[" || ch === "{") delta += 1;
+        else if (ch === "]" || ch === "}") delta -= 1;
+        if (!pastEq) key += ch;
+    }
+    return { delta, key: key.trim() };
+}
+
+/** Structural sanity check for a codex TOML file (base or profile): every
+ *  non-blank non-comment line must be a table header, an array-of-tables
+ *  header, or `key = …` with a TOML-legal key side. Multi-line strings
+ *  ("""…""" / '''…''') and bracket-opened values (arrays / inline tables
+ *  spanning lines) are tracked so their bodies do not false-positive. Returns
+ *  a human-readable problem or null. Deliberately NOT a full TOML parser — it
+ *  only distinguishes "structurally broken" (where codex itself hard-fails,
+ *  verified 0.147) from "valid TOML without fields bili reads" (which must
+ *  pass silently). */
+export function codexTomlProblem(text: string): string | null {
+    let multiline: string | null = null;
+    let depth = 0;
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i]!.trim();
+        if (multiline) {
+            if (line.includes(multiline)) multiline = null;
+            continue;
+        }
+        if (!line || line.startsWith("#")) continue;
+        let opened: string | null = null;
+        for (const d of ['"""', "'''"]) {
+            let count = 0;
+            let idx = line.indexOf(d);
+            while (idx !== -1) { count += 1; idx = line.indexOf(d, idx + d.length); }
+            if (count % 2 === 1) { opened = d; break; }
+        }
+        if (opened) { multiline = opened; continue; }
+        const scan = scanTomlLine(line);
+        if (depth > 0) {
+            // Inside an array/inline table opened on an earlier line: the body
+            // is value context, not key context.
+            depth += scan.delta;
+            continue;
+        }
+        if (/^\[[^\[\]]+\]$/.test(line) || /^\[\[[^\[\]]+\]\]$/.test(line)) continue;
+        if (TOML_KEY_PART_RE.test(scan.key)) {
+            depth = Math.max(0, scan.delta);
+            continue;
+        }
+        return `line ${i + 1}: unrecognized structure (${line.slice(0, 60)})`;
+    }
+    if (depth > 0) return `line ${lines.length}: array/inline table opened above is never closed`;
+    return null;
+}
+
+/** Build the effective view for one launch (see CodexEffectiveView). Reads
+ *  only — the user's config.toml / profile files are never modified. */
+export function resolveCodexEffectiveView(codexHome: string, base: CodexConfig, clientArgs: readonly string[]): CodexEffectiveView {
+    const profile = extractCodexProfile(clientArgs);
+    const view: CodexEffectiveView = { config: base };
+    if (profile !== undefined) {
+        view.profile = profile;
+        // A profile is a FILE STEM under CODEX_HOME — reject anything with
+        // separators/dots-runs before it can escape the home dir.
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(profile)) {
+            view.fatal = `invalid codex profile name "${profile}" — -p takes a plain file stem under $CODEX_HOME (<name>.config.toml)`;
+            return view;
+        }
+        const file = path.join(codexHome, `${profile}.config.toml`);
+        let text: string | undefined;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            view.profileMissing = true;
+        }
+        if (text !== undefined) {
+            const problem = codexTomlProblem(text);
+            if (problem) {
+                view.fatal = `codex profile "${profile}" (${file}) is not structurally valid TOML — ${problem}; codex itself refuses to start with a malformed profile`;
+                return view;
+            }
+            view.config = mergeCodexViews(view.config, parseCodexToml(text));
+        }
+    }
+    view.config = mergeCodexViews(view.config, parseCodexCliOverrides(clientArgs));
+    return view;
 }
 
 /** Built-in managed (OAuth-logged-in) model API hosts — absent from
@@ -884,6 +1231,94 @@ export const COPILOT_DEFAULT_MODEL_HOSTS = [
  *  model leg and the control plane (/api/internal, /api/telemetry). */
 export const AMP_DEFAULT_MODEL_HOSTS = ["ampcode.com"];
 
+/** Crush (charmbracelet) built-in provider hosts, cert-MITM'd so
+ *  `bili crush` compresses the model traffic. Open-source Go binary —
+ *  net/http honors HTTPS_PROXY and trusts the CA via SSL_CERT_FILE (#2340).
+ *  Custom provider base_urls from crush.json are discovered on top
+ *  (readCrushConfig); exotic relays ride --mitm-domain. */
+export const CRUSH_DEFAULT_MODEL_HOSTS = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "openrouter.ai",
+];
+
+/** #2340: read crush.json ($CRUSH_CONFIG, else $XDG_CONFIG_HOME|~/.config
+ *  /crush/crush.json) and collect providers.<id>.base_url values — https
+ *  only (http legs cannot be cert-MITM'd and stay direct). Soft-fails on
+ *  any unreadable/corrupt file: discovery must never block the launcher. */
+export function readCrushConfig(env: NodeJS.ProcessEnv = process.env): CrushConfig {
+    const home = os.homedir();
+    const file = nonEmpty(env.CRUSH_CONFIG)
+        ? env.CRUSH_CONFIG!
+        : path.join(nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME! : path.join(home, ".config"), "crush", "crush.json");
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+            providers?: Record<string, { base_url?: unknown }>;
+        };
+        const baseUrls: string[] = [];
+        for (const provider of Object.values(parsed.providers ?? {})) {
+            const raw = provider?.base_url;
+            if (typeof raw !== "string" || raw.trim() === "") continue;
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+            } catch {
+                continue;
+            }
+            if (!baseUrls.includes(raw)) baseUrls.push(raw);
+        }
+        return baseUrls.length > 0 ? { baseUrls } : {};
+    } catch {
+        return {};
+    }
+}
+
+/** Zed's built-in model provider hosts (settings → language_models).
+ *  Custom provider api_urls from settings.json are discovered on top
+ *  (readZedConfig); exotic relays ride --mitm-domain. Loopback providers
+ *  (ollama, lmstudio) never appear here — they stay direct via NO_PROXY. */
+export const ZED_DEFAULT_MODEL_HOSTS = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "api.deepseek.com",
+    "api.x.ai",
+    "api.mistral.ai",
+    "openrouter.ai",
+];
+
+/** #2340: read Zed's settings.json ($XDG_CONFIG_HOME|~/.config
+ *  /zed/settings.json) and collect
+ *  language_models.{openai_compatible,anthropic_compatible}.<id>.api_url
+ *  values — https only (http legs cannot be cert-MITM'd and stay direct).
+ *  Soft-fails on any unreadable/corrupt file: discovery must never block
+ *  the launcher. */
+export function readZedConfig(env: NodeJS.ProcessEnv = process.env): ZedConfig {
+    const home = os.homedir();
+    const file = path.join(nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME! : path.join(home, ".config"), "zed", "settings.json");
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+            language_models?: Record<string, Record<string, { api_url?: unknown }> | undefined>;
+        };
+        const baseUrls: string[] = [];
+        for (const family of ["openai_compatible", "anthropic_compatible"]) {
+            const providers = parsed.language_models?.[family] ?? {};
+            for (const provider of Object.values(providers)) {
+                const raw = provider?.api_url;
+                if (typeof raw !== "string" || raw.trim() === "") continue;
+                try {
+                    if (new URL(raw).protocol !== "https:") continue;
+                } catch {
+                    continue;
+                }
+                if (!baseUrls.includes(raw)) baseUrls.push(raw);
+            }
+        }
+        return baseUrls.length > 0 ? { baseUrls } : {};
+    } catch {
+        return {};
+    }
+}
+
 /** goose directory layout (mirrors its paths.rs): GOOSE_PATH_ROOT (absolute)
  *  holds config/, data/, state/, .agents/; without it the home scatters across
  *  XDG dirs under author "Block" (state falls back to data when
@@ -1037,7 +1472,7 @@ export function readPiConfig(piHome: string): PiConfig {
  * so it tolerates the file's base indent.
  */
 export function parseOmpYaml(text: string): OmpConfig {
-    const result: OmpConfig = { providers: {} };
+    const providers: Record<string, OmpProvider> = {};
     let providersIndent = -1;
     let providerIndent = -1;
     let currentProvider: string | null = null;
@@ -1050,7 +1485,7 @@ export function parseOmpYaml(text: string): OmpConfig {
         if (pending === undefined || currentProvider === null) { pending = undefined; return; }
         const win = toModelWindow(pending.id, pending.contextWindow, pending.maxOutput);
         if (win) {
-            const prov = result.providers[currentProvider]!;
+            const prov = providers[currentProvider]!;
             prov.models = [...(prov.models ?? []), win];
         }
         pending = undefined;
@@ -1072,7 +1507,7 @@ export function parseOmpYaml(text: string): OmpConfig {
             const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
             if (m) {
                 currentProvider = m[1];
-                if (!result.providers[currentProvider]) result.providers[currentProvider] = {};
+                if (!providers[currentProvider]) providers[currentProvider] = {};
             } else {
                 currentProvider = null;
             }
@@ -1093,12 +1528,12 @@ export function parseOmpYaml(text: string): OmpConfig {
                 flushPending();
             } else if (modelsIndent < 0 || indent <= modelsIndent) {
                 const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
-                if (m) result.providers[currentProvider]!.baseUrl = m[1];
+                if (m) providers[currentProvider]!.baseUrl = m[1];
             }
         }
     }
     flushPending();
-    return result;
+    return { providers };
 }
 
 export function readOmpConfig(ompHome: string): OmpConfig {
@@ -1351,7 +1786,7 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
     return parseOpencodeProviders(readConfigFileRoot(file));
 }
 
-export interface OpencodeProjectProviderView {
+interface OpencodeProjectProviderView {
     baseURL?: string;
     file: string;
 }
@@ -1489,7 +1924,7 @@ export function zcodePersonalConfigFiles(zcodeHome: string, env: NodeJS.ProcessE
     return [...new Set([zcodeStoreFileFor(env, "new"), path.join(zcodeHome, "v2", "provider_config.json")])];
 }
 
-export function zcodeLegacyConfigFiles(zcodeHome: string, env: NodeJS.ProcessEnv): string[] {
+function zcodeLegacyConfigFiles(zcodeHome: string, env: NodeJS.ProcessEnv): string[] {
     return [...new Set([zcodeStoreFileFor(env, "legacy"), path.join(zcodeHome, "v2", "config.json")])];
 }
 
@@ -1526,9 +1961,12 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.kimi = readKimiConfig(resolveKimiHome(env), env);
     config.gemini = readGeminiEnvConfig(env);
     config.iflow = readIflowEnvConfig(env);
+    config.antigravity = readAntigravityEnvConfig(env);
     config.mcode = readMcodeConfig(env);
     config.aider = readAiderConfig(env, cwd);
     config.goose = readGooseConfig(resolveGooseDirs(env), env);
+    config.crush = readCrushConfig(env);
+    config.zed = readZedConfig(env);
     return config;
 }
 
@@ -1653,7 +2091,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

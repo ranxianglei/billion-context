@@ -9,7 +9,7 @@ import { defaultConfig, ACP_TOOLS_OPENAI, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_RESPONS
 import { startServer } from "../src/server.ts";
 import { resolveCompressSurface } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import type { CompressSettings, ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -41,7 +41,7 @@ function listen(server: http.Server): Promise<void> {
     return once(server, "listening").then(() => undefined);
 }
 
-async function startHarness(routeCompress: ProxyOptions["routes"][string]): Promise<Harness> {
+async function startHarness(routeCompress: CompressSettings): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
 
@@ -76,6 +76,7 @@ async function startHarness(routeCompress: ProxyOptions["routes"][string]): Prom
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     const proxy = await startServer(opts);
     await listen(proxy);
@@ -107,13 +108,13 @@ test("#747: openai wire — lean pack toolPrompts applied to injected ACP tools"
             const tool = tools.find((t) => t.function?.name === name);
             assert.ok(tool, `${name} injected`);
             if (overrides.description !== undefined) {
-                assert.equal(tool.function.description, overrides.description, `${name} description from lean pack`);
+                assert.equal(tool.function!.description, overrides.description, `${name} description from lean pack`);
             }
         }
         const compress = tools.find((t) => t.function?.name === "compress")!;
         const defaultDesc = ACP_TOOLS_OPENAI.find((t) => t.function.name === "compress")!.function.description;
-        assert.notEqual(compress.function.description, defaultDesc, "not the kernel default");
-        assert.equal(compress.function.parameters?.properties?.content?.description, tp.compress.paramDescriptions?.content, "paramDescriptions applied");
+        assert.notEqual(compress.function!.description, defaultDesc, "not the kernel default");
+        assert.equal(compress.function!.parameters?.properties?.content?.description, tp.compress.paramDescriptions?.content, "paramDescriptions applied");
     } finally {
         await h.close();
     }

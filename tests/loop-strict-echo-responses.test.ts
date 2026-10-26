@@ -16,7 +16,7 @@ import { rmrf } from "./tmp-rm.ts";
 // Responses-wire request whose assistant run lost its reasoning item across a compress
 // fold was rejected by strict-echo gateways (reasoning_content_missing). Full arc driven
 // here: main-path 400 learns the flag → the next main-path forward and the loop
-// re-request (whose compress ack pair forms its own orphan run) both carry a blank
+// re-request (whose proxy-tool ack pair forms its own orphan run) both carry a blank
 // reasoning item at each orphan run start.
 
 interface Captured {
@@ -32,6 +32,16 @@ function close(server: http.Server): Promise<void> {
 
 const ERROR_BODY = JSON.stringify({
     error: { message: "The 'reasoning_content' in the thinking mode must be passed back to the API" },
+});
+
+// #2169: DeepSeek's actual Responses-wire wording (spells it reasoning_text).
+const DEEPSEEK_ERROR_BODY = JSON.stringify({
+    error: {
+        message: "The `reasoning_text` in the thinking mode must be passed back to the API.",
+        type: "invalid_request_error",
+        param: null,
+        code: "invalid_request_error",
+    },
 });
 
 const INPUT_ITEMS = [
@@ -68,6 +78,9 @@ async function startHarnessLoop(handler: (bodyText: string, res: http.ServerResp
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         port: 0,
         host: "127.0.0.1",
         upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -82,6 +95,7 @@ async function startHarnessLoop(handler: (bodyText: string, res: http.ServerResp
         log: true,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -91,13 +105,25 @@ async function startHarnessLoop(handler: (bodyText: string, res: http.ServerResp
     return { proxy, upstream, proxyPort, upstreamPort };
 }
 
-async function postStreamResponses(proxyPort: number, upstreamPort: number): Promise<Response> {
+// #2169: same shape as INPUT_ITEMS but rs-1 carries the client-history blank
+// content shape (whitespace-only reasoning_text) instead of a summary text.
+const INPUT_ITEMS_2169 = [
+    { type: "message", role: "user", content: "what is the weather" },
+    { type: "reasoning", id: "rs-blank", content: [{ type: "reasoning_text", text: " " }], summary: [{ type: "summary_text", text: "" }] },
+    { type: "message", role: "assistant", content: "let me check" },
+    { type: "message", role: "user", content: "and tomorrow?" },
+    { type: "function_call", call_id: "call-c1", name: "get_weather", arguments: "{}" },
+    { type: "function_call_output", call_id: "call-c1", output: "sunny" },
+    { type: "message", role: "assistant", content: "sunny tomorrow too" },
+];
+
+async function postStreamResponses(proxyPort: number, upstreamPort: number, session = "reloop-resp-1", items: Item[] = INPUT_ITEMS): Promise<Response> {
     return fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-acp-session": "reloop-resp-1" },
+        headers: { "content-type": "application/json", "x-acp-session": session },
         body: JSON.stringify({
             model: "gpt-test",
-            input: INPUT_ITEMS,
+            input: items,
             stream: true,
         }),
     });
@@ -157,11 +183,15 @@ test("#1479: responses-wire main path and loop re-request carry the blank strict
         }
         res.writeHead(200, { "content-type": "text/event-stream" });
         if (n === 2) {
+            // acp_status vehicle: the point is the re-request carrying the
+            // blanked echo, not compression. A failing compress ends the turn
+            // before any re-request (#4186) and would silently un-test the
+            // loop-path repair this file exists for.
             res.write(sse("response.created", { type: "response.created", response: { id: "resp-r1", status: "in_progress", output: [] } }));
-            res.write(sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "compress", arguments: "" } }));
-            res.write(sse("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: "fc-loop", delta: "{\"content\":[]}" }));
-            res.write(sse("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: "fc-loop", arguments: "{\"content\":[]}" }));
-            res.write(sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "compress", arguments: "{\"content\":[]}" } }));
+            res.write(sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "acp_status", arguments: "" } }));
+            res.write(sse("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: "fc-loop", delta: "{}" }));
+            res.write(sse("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: "fc-loop", arguments: "{}" }));
+            res.write(sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "acp_status", arguments: "{}" } }));
             res.write(sse("response.completed", { type: "response.completed", response: { id: "resp-r1", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5 } } }));
         } else {
             res.write(sse("response.created", { type: "response.created", response: { id: "resp-r2", status: "in_progress", output: [] } }));
@@ -193,19 +223,95 @@ test("#1479: responses-wire main path and loop re-request carry the blank strict
 
         const reRequest = JSON.parse(seenBodies[2]!) as { model: string; input: Item[] };
         assert.equal(reRequest.model, "gpt-test");
-        const loopFcIdx = reRequest.input.findIndex((it) => it.type === "function_call" && it.name === "compress");
-        assert.ok(loopFcIdx > 0, "loop re-request carries the compress ack pair");
+        const loopFcIdx = reRequest.input.findIndex((it) => it.type === "function_call" && it.name === "acp_status");
+        assert.ok(loopFcIdx > 0, "loop re-request carries the acp_status ack pair");
         let runStart = loopFcIdx;
         while (runStart > 0 && isRunItem(reRequest.input[runStart - 1])) runStart--;
         assert.ok(
             reRequest.input.slice(runStart, loopFcIdx + 1).some(isBlankReasoning),
-            "loop re-request injected the blank echo into the run carrying the compress pair",
+            "loop re-request injected the blank echo into the run carrying the proxy-tool pair",
         );
         assert.equal(orphanRunCount(reRequest.input), 0, "loop re-request carries no orphan runs");
         assert.ok(
             captured.some((l) => l.msg.includes("[acp-loop]") && l.msg.includes("strict-echo-responses: injected")),
             "loop-path normalization must log its repair",
         );
+        assert.equal(
+            captured.filter((l) => l.msg.includes("reasoning-pair-violated")).length,
+            1,
+            "sentinel fires exactly once (pre-repair only)",
+        );
+    } finally {
+        await close(proxy);
+        await close(upstream);
+        setLogCapture(null);
+        rmrf(stateDir);
+    }
+});
+
+function hasWhitespaceReasoningContent(it: Item): boolean {
+    if (it.type !== "reasoning") return false;
+    const content = it.content;
+    if (!Array.isArray(content) || content.length === 0) return false;
+    let sawTextPart = false;
+    for (const part of content as { type?: unknown; text?: unknown }[]) {
+        if (!part || typeof part !== "object" || part.type !== "reasoning_text" || typeof part.text !== "string") return false;
+        sawTextPart = true;
+        if (part.text.trim().length > 0) return false;
+    }
+    return sawTextPart;
+}
+
+test("#2169: blank reasoning content from client history is cleared at the outbound gate; DeepSeek's reasoning_text wording arms the learner", async () => {
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-reloop-resp-2169-"));
+    process.env.XDG_STATE_HOME = stateDir;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const seenBodies: string[] = [];
+    let n = 0;
+    const { proxy, upstream, proxyPort, upstreamPort } = await startHarnessLoop((bodyText, res) => {
+        n += 1;
+        seenBodies.push(bodyText);
+        if (n === 1) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(DEEPSEEK_ERROR_BODY);
+            return;
+        }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(sse("response.created", { type: "response.created", response: { id: "resp-r2169", status: "in_progress", output: [] } }));
+        res.write(messageItemEvents("msg-final", 0, "done"));
+        res.write(sse("response.completed", { type: "response.completed", response: { id: "resp-r2169", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 3 } } }));
+        res.end();
+    });
+    try {
+        const resp1 = await postStreamResponses(proxyPort, upstreamPort, "reloop-resp-2169", INPUT_ITEMS_2169);
+        assert.equal(resp1.status, 400);
+        await resp1.text();
+        assert.ok(captured.some((l) => l.msg.includes("learned strictReasoningEcho")), "main-path learner must arm on DeepSeek's reasoning_text wording");
+
+        const in1 = (JSON.parse(seenBodies[0]!) as { input: Item[] }).input;
+        const rs1 = in1.find((it) => it.id === "rs-blank");
+        assert.ok(rs1 && "content" in rs1, "gate not armed yet: request 1 forwards the blank content byte-exact");
+        assert.equal(orphanRunCount(in1), 1, "request 1 shipped the orphan run (the rejection)");
+
+        const resp2 = await postStreamResponses(proxyPort, upstreamPort, "reloop-resp-2169", INPUT_ITEMS_2169);
+        assert.equal(resp2.status, 200);
+        assert.match(resp2.headers.get("content-type") ?? "", /text\/event-stream/);
+        const sseText = await resp2.text();
+        assert.ok(sseText.includes("response.completed"), "client must receive the completed stream");
+
+        const in2 = (JSON.parse(seenBodies[1]!) as { input: Item[] }).input;
+        const rs2 = in2.find((it) => it.id === "rs-blank");
+        assert.ok(rs2, "sanitized item keeps its id");
+        assert.equal("content" in rs2!, false, "whitespace-only content cleared from the client-history item");
+        assert.deepEqual(rs2!.summary, [{ type: "summary_text", text: "" }], "summary preserved");
+        assert.ok(!in2.some(hasWhitespaceReasoningContent), "no outbound reasoning item carries whitespace-only content");
+        const c1Idx = in2.findIndex((it) => it.type === "function_call" && it.call_id === "call-c1");
+        assert.ok(c1Idx > 0, "main-path body keeps the orphaned function_call");
+        assert.ok(isBlankReasoning(in2[c1Idx - 1]), "#1479 blank echo still injected at the orphan run start");
+        assert.equal(orphanRunCount(in2), 0, "main-path body carries no orphan runs");
+        assert.ok(captured.some((l) => l.msg.includes("cleared whitespace-only reasoning content on 1 item(s)")), "sanitize repair logged");
         assert.equal(
             captured.filter((l) => l.msg.includes("reasoning-pair-violated")).length,
             1,

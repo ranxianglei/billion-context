@@ -17,6 +17,7 @@ import {
     extractBiliUpstream,
     kimiProxiedBaseUrl,
     resolveKimiRoute,
+    scanKimiModelWindows,
     stampKimiPluginHeader,
     stripKimiManagedBlock,
     unrouteKimiConfig,
@@ -25,6 +26,7 @@ import {
 import {
     activateKimiPluginMode,
     bootstrapKimiNative,
+    kimiConfigModelWindows,
     planNativeKimi,
     probeProxyHealth,
     unrouteKimi,
@@ -206,6 +208,160 @@ test("kimiProxiedBaseUrl / extractBiliUpstream round-trip (#963)", () => {
     assert.equal(extractBiliUpstream("https://api.kimi.com/coding/v1"), undefined);
 });
 
+const THINKING_CONFIG = [
+    'default_model = "deepseek-r1"',
+    "",
+    '[providers."managed:kimi-code"]',
+    'type = "kimi"',
+    'base_url = "https://api.kimi.com/coding/v1"',
+    'api_key = "sk-fake"',
+    "",
+    "[models.deepseek-r1]",
+    'provider = "managed:kimi-code"',
+    'model = "deepseek-r1"',
+    "max_context_size = 65536",
+    "max_output_size = 8192",
+    'capabilities = ["thinking", "always_thinking"]',
+    'support_efforts = ["low", "high"]',
+    'default_effort = "high"',
+].join("\n") + "\n";
+
+function stateOf(res: Extract<ReturnType<typeof resolveKimiRoute>, { ok: true }>): KimiRouteState {
+    return {
+        port: 9999,
+        upstream: res.upstream,
+        modelId: res.modelId,
+        contextWindow: res.contextWindow,
+        maxOutput: res.maxOutput,
+        authLines: res.authLines,
+        extraLines: res.extraLines,
+    };
+}
+
+function aliasSection(text: string): string {
+    const begin = text.indexOf(`[models.${KIMI_ALIAS}]`);
+    const end = text.indexOf("# bili end");
+    assert.ok(begin >= 0 && end > begin, "managed alias section present");
+    return text.slice(begin, end);
+}
+
+test("resolveKimiRoute inherits capability metadata from the source model (#2954)", () => {
+    const res = okOf(resolveKimiRoute(THINKING_CONFIG, {}));
+    assert.equal(res.modelId, "deepseek-r1");
+    assert.deepEqual(res.extraLines, [
+        'capabilities = ["thinking", "always_thinking"]',
+        'support_efforts = ["low", "high"]',
+        'default_effort = "high"',
+    ]);
+});
+
+test("applyKimiManagedConfig clones capability metadata into the alias and stays idempotent (#2954)", () => {
+    const res = okOf(resolveKimiRoute(THINKING_CONFIG, {}));
+    const applied = applyKimiManagedConfig(THINKING_CONFIG, stateOf(res));
+    const section = aliasSection(applied);
+    assert.ok(section.includes('capabilities = ["thinking", "always_thinking"]'));
+    assert.ok(section.includes('support_efforts = ["low", "high"]'));
+    assert.ok(section.includes('default_effort = "high"'));
+    assert.equal(count(applied, 'capabilities = ["thinking", "always_thinking"]'), 2, "user's own section keeps its copy untouched");
+    // Re-bootstrap reads the fields back from our own block — no drift, no duplication.
+    const again = applyKimiManagedConfig(applied, stateOf(res));
+    assert.equal(again, applied);
+    assert.deepEqual(okOf(resolveKimiRoute(again, {})).extraLines, res.extraLines);
+});
+
+test("multi-line capability arrays are captured whole; an unbalanced capture is dropped (#2954)", () => {
+    const multiline = THINKING_CONFIG.replace(
+        'capabilities = ["thinking", "always_thinking"]\n',
+        'capabilities = [\n  "thinking",\n  "always_thinking",\n]\n',
+    );
+    assert.deepEqual(okOf(resolveKimiRoute(multiline, {})).extraLines, [
+        "capabilities = [",
+        '"thinking",',
+        '"always_thinking",',
+        "]",
+        'support_efforts = ["low", "high"]',
+        'default_effort = "high"',
+    ]);
+    const unbalanced = [
+        'default_model = "deepseek-r1"',
+        "",
+        "[providers.p]",
+        'type = "kimi"',
+        'base_url = "https://x.example/v1"',
+        'api_key = "k"',
+        "",
+        "[models.deepseek-r1]",
+        'provider = "p"',
+        'model = "m"',
+        "capabilities = [",
+        '  "thinking",',
+    ].join("\n") + "\n";
+    const res = resolveKimiRoute(unbalanced, {});
+    assert.ok(res.ok, "routing itself must not fail because of the malformed array");
+    if (!res.ok) throw new Error("unreachable");
+    assert.equal(res.extraLines, undefined, "a truncated array is dropped wholesale, never emitted half-written");
+    const applied = applyKimiManagedConfig(unbalanced, stateOf(res));
+    assert.ok(!aliasSection(applied).includes("capabilities"), "no partial array leaks into the managed block");
+});
+
+test("a comment bracket cannot close a capability array early (#2954)", () => {
+    const commented = THINKING_CONFIG.replace(
+        'capabilities = ["thinking", "always_thinking"]\n',
+        'capabilities = [\n  "thinking",\n  "always_thinking" # ] not a closer\n]\n',
+    );
+    assert.deepEqual(okOf(resolveKimiRoute(commented, {})).extraLines, [
+        "capabilities = [",
+        '"thinking",',
+        '"always_thinking" # ] not a closer',
+        "]",
+        'support_efforts = ["low", "high"]',
+        'default_effort = "high"',
+    ]);
+});
+
+test("routing fields are never passed through into the alias (#2954)", () => {
+    const cfg = [
+        'default_model = "m1"',
+        "",
+        "[providers.p]",
+        'type = "kimi"',
+        'base_url = "https://x.example/v1"',
+        'api_key = "k"',
+        "",
+        "[models.m1]",
+        'provider = "p"',
+        'model = "real-model"',
+        'base_url = "https://override.example/v1"',
+        "max_context_size = 4096",
+        'capabilities = ["thinking"]',
+    ].join("\n") + "\n";
+    const res = okOf(resolveKimiRoute(cfg, {}));
+    assert.deepEqual(res.extraLines, ['capabilities = ["thinking"]'], "only whitelisted capability keys ride along");
+    const section = aliasSection(applyKimiManagedConfig(cfg, stateOf(res)));
+    assert.ok(!section.includes("override.example"), "the model's base_url override must not leak into the alias");
+});
+
+test("scanKimiModelWindows keys windows by model id across all sections (#2954)", () => {
+    assert.deepEqual(scanKimiModelWindows(THINKING_CONFIG), { "deepseek-r1": 65536 });
+    const two = 'default_model = "a"\n\n[models.a]\nmodel = "alpha"\nmax_context_size = 100000\n\n[models.b]\nmax_context_size = 200000\n';
+    assert.deepEqual(scanKimiModelWindows(two), { alpha: 100000, b: 200000 }, "sections without a model field key by name");
+    assert.deepEqual(scanKimiModelWindows(SAMPLE_CONFIG), {}, "no windows declared → empty map, nothing to feed");
+});
+
+test("kimiConfigModelWindows hands both kimi proxy paths ONE windows source (#3436/#3557)", () => {
+    const home = path.join(tmpdir(), `bili-kimi-win-${process.pid}-${Date.now()}`);
+    mkdirSync(home, { recursive: true });
+    try {
+        writeFileSync(path.join(home, "config.toml"), THINKING_CONFIG);
+        assert.deepEqual(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: home }), { "deepseek-r1": 65536 });
+        writeFileSync(path.join(home, "config.toml"), SAMPLE_CONFIG);
+        assert.equal(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: home }), undefined, "no windows → undefined, caller omits the field");
+        assert.equal(kimiConfigModelWindows({ ...process.env, KIMI_CODE_HOME: path.join(home, "missing") }), undefined, "no file → undefined, never throws");
+    } finally {
+        rmrf(home);
+    }
+});
+
 interface FakeHome { home: string; cleanup: () => void }
 
 /** Deterministic fake $KIMI_CODE_HOME: PATH is REPLACED (not prepended) with
@@ -334,7 +490,14 @@ test("bootstrapKimiNative routes config.toml through a live proxy, stamps, repor
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

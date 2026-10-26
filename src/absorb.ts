@@ -11,12 +11,12 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { PROXY_TOOL_NAMES, RULE_TOOL_NAME } from "./compress-tool.js";
+import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesEnabled } from "./rules-feature.js";
-import { IMAGE_FULL_TOOL_NAME, imageCompressionEnabled } from "./image-compress.js";
 import { ccrEnabled, retrieveToolName } from "./store.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 const EFFECTIVE_ABSORB_KEY = "effectiveAbsorb";
 
@@ -48,10 +48,13 @@ export function storeEffectiveAbsorb(session: Session, config: Config): void {
 
 export function isProxyToolFor(name: string, session: Session | undefined, config: Config): boolean {
     if (PROXY_TOOL_NAMES.has(name)) return true;
+    // #3400: acp_read_original_image executes server-side on EVERY lane — even
+    // where it is not registered in the manifest (codex) a hallucinated call
+    // must never reach the client as an unsupported tool.
+    if (name === READ_ORIGINAL_IMAGE_TOOL_NAME) return true;
     const absorb = effectiveAbsorbConfig(session, config);
     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
     if (ccrEnabled(session) && name === retrieveToolName(session)) return true;
-    if (imageCompressionEnabled(session) && name === IMAGE_FULL_TOOL_NAME) return true;
     return effectiveRulesEnabled(session, config) && name === RULE_TOOL_NAME;
 }
 
@@ -68,7 +71,7 @@ export function applyAbsorbView(messages: CoreMessage[], state: CompressionState
     return prompted.messages;
 }
 
-export type AbsorbExecCtx = {
+type AbsorbExecCtx = {
     config: Config;
     messages: CoreMessage[];
     session: Session;
@@ -79,11 +82,11 @@ export type AbsorbExecCtx = {
 // and the plugin tool API share this). Returns model-facing result text;
 // failures carry FAILED so visibility markers render ❌ and the loop's
 // repeat-failure guard reasons about them uniformly with compress failures.
-export function executeAbsorb(args: unknown, callId: string | undefined, absorb: AbsorbConfig, ctx: AbsorbExecCtx): string {
+export function executeAbsorb(args: unknown, callId: string | undefined, absorb: AbsorbConfig, ctx: AbsorbExecCtx): ProxyToolResult {
     const log = ctx.log ?? ((msg: string) => loggerLog("info", msg));
     const parsed = parseAbsorbInput(args, callId, (w) => log(`[acp-absorb] ${w}`));
     if (!parsed) {
-        return '[absorb FAILED: invalid input — expected { ref: "mNNNNN", summary: "..." }]';
+        return toolFail('[absorb FAILED: invalid input — expected { ref: "mNNNNN", summary: "..." }]');
     }
     const before = ctx.session.state.absorbed?.length ?? 0;
     let outcome: AbsorbOutcome;
@@ -98,12 +101,12 @@ export function executeAbsorb(args: unknown, callId: string | undefined, absorb:
         });
     } catch (err) {
         log(`[acp-absorb] error: ${String(err)}`);
-        return `[absorb FAILED: ${String(err)}]`;
+        return toolFail(`[absorb FAILED: ${String(err)}]`);
     }
     ctx.session.state = outcome.state;
     if (!outcome.ok) {
         log(`[acp-absorb] ${outcome.resultText}`);
-        return `[absorb FAILED: ${outcome.resultText}]`;
+        return toolFail(`[absorb FAILED: ${outcome.resultText}]`);
     }
     // ok=true also covers the no-op re-absorb ("already absorbed"); detect a
     // real absorption by the appended record so credits net exactly once.
@@ -119,5 +122,5 @@ export function executeAbsorb(args: unknown, callId: string | undefined, absorb:
     } else {
         log(`[acp-absorb] ${outcome.resultText}`);
     }
-    return outcome.resultText;
+    return toolOk(outcome.resultText);
 }

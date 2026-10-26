@@ -7,40 +7,56 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
-import { selfAdminProbePath, startServer } from "../src/server.ts";
+import { selfAddressedLocalPath, startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-/** #1073: forward-proxy-style (absolute-form) management probes addressed to
- *  bili instances must return real health state instead of being tunneled and
- *  403'd by the target's own admin gate — while every #409 security property
- *  (self-layer denial, remote-peer marker, hostname marker) stays intact. */
+// #2941: registration now completes AFTER the bind (post-bind ownership
+// check), so "listening" no longer implies health-readiness — poll for it.
+async function waitReady(port: number): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+        try {
+            if ((await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(500) })).status === 200) return;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`proxy on port ${port} did not become ready`);
+}
 
-test("selfAdminProbePath: self-addressed management probes only", () => {
+/** #1073/#3245: forward-proxy-style (absolute-form) requests addressed to a
+ *  bili instance's own listener are fetches of that instance, served locally
+ *  like direct origin-form requests — while every #409 security property
+ *  (self-layer denial of explicit wrappers, remote-peer marker, hostname
+ *  marker) stays intact. */
+
+test("selfAddressedLocalPath: self-addressed absolute-form requests only", () => {
     const P = 8787;
     // Self shapes qualify (IP literals, v6, hex-mapped, unspecified, localhost).
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P}/__bili/health`, P), "/__bili/health");
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P}/__bili/config?x=1`, P), "/__bili/config?x=1", "query preserved");
-    assert.equal(selfAdminProbePath(`http://localhost:${P}/__acp/status`, P), "/__acp/status");
-    assert.equal(selfAdminProbePath(`http://[::1]:${P}/__bili/`, P), "/__bili/");
-    assert.equal(selfAdminProbePath(`http://[::ffff:127.0.0.1]:${P}/__bili/health`, P), "/__bili/health", "hex-mapped loopback folds to 127.0.0.1");
-    assert.equal(selfAdminProbePath(`http://0.0.0.0:${P}/__bili/health`, P), "/__bili/health");
-    assert.equal(selfAdminProbePath(`http://[::]:${P}/__acp/x`, P), "/__acp/x", "v6 unspecified in brackets");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/__bili/health`, P), "/__bili/health");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/__bili/config?x=1`, P), "/__bili/config?x=1", "query preserved");
+    assert.equal(selfAddressedLocalPath(`http://localhost:${P}/__acp/status`, P), "/__acp/status");
+    assert.equal(selfAddressedLocalPath(`http://[::1]:${P}/__bili/`, P), "/__bili/");
+    assert.equal(selfAddressedLocalPath(`http://[::ffff:127.0.0.1]:${P}/__bili/health`, P), "/__bili/health", "hex-mapped loopback folds to 127.0.0.1");
+    assert.equal(selfAddressedLocalPath(`http://0.0.0.0:${P}/__bili/health`, P), "/__bili/health");
+    assert.equal(selfAddressedLocalPath(`http://[::]:${P}/__acp/x`, P), "/__acp/x", "v6 unspecified in brackets");
+    // #3245: ANY path qualifies — model-style paths and the /bili/ zero-config
+    // entry are served locally exactly as a direct connection would send them.
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/v1/chat/completions`, P), "/v1/chat/completions");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/__notadmin/`, P), "/__notadmin/");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/bili/https://up.example/v1/messages`, P), "/bili/https://up.example/v1/messages");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/`, P), "/", "root path");
     // Not self: different port (the cross-instance shape) or non-local host.
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P + 1}/__bili/health`, P), undefined, "different port is not self");
-    assert.equal(selfAdminProbePath(`http://8.8.8.8:${P}/__bili/health`, P), undefined, "public IP is not self");
-    assert.equal(selfAdminProbePath(`http://otherhost.invalid:${P}/__bili/health`, P), undefined, "foreign names stay conservative");
-    // Self host but non-management path keeps the loud self-layer 403 (#562).
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P}/v1/chat/completions`, P), undefined);
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P}/__notadmin/`, P), undefined);
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P + 1}/__bili/health`, P), undefined, "different port is not self");
+    assert.equal(selfAddressedLocalPath(`http://8.8.8.8:${P}/__bili/health`, P), undefined, "public IP is not self");
+    assert.equal(selfAddressedLocalPath(`http://otherhost.invalid:${P}/__bili/health`, P), undefined, "foreign names stay conservative");
     // Not absolute-form at all.
-    assert.equal(selfAdminProbePath("/__bili/health", P), undefined);
+    assert.equal(selfAddressedLocalPath("/__bili/health", P), undefined);
     // Malformed input never throws.
-    assert.equal(selfAdminProbePath("http://[::1:", P), undefined);
-    assert.equal(selfAdminProbePath("http://127.0.0.1:/__bili/", P), undefined);
-    assert.equal(selfAdminProbePath(`http://127.0.0.1:${P}/__bili/health`, undefined), undefined, "no local port — cannot decide");
+    assert.equal(selfAddressedLocalPath("http://[::1:", P), undefined);
+    assert.equal(selfAddressedLocalPath("http://127.0.0.1:/__bili/", P), undefined);
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/__bili/health`, undefined), undefined, "no local port — cannot decide");
 });
 
 // ---------------------------------------------------------------------------
@@ -115,7 +131,14 @@ async function makeBili(): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
@@ -137,6 +160,8 @@ test("integration: absolute-form management probes answer with real health state
     const port1 = (p1.address() as { port: number }).port;
     const port2 = (p2.address() as { port: number }).port;
     try {
+        await waitReady(port1);
+        await waitReady(port2);
         const health1 = await get(port1, "/__bili/health");
         const health2 = await get(port2, "/__bili/health");
         assert.equal(health1.status, 200);

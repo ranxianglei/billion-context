@@ -19,7 +19,7 @@
 
 import type { Session } from "./session.js";
 
-export type SystemSurface = "anthropic" | "openai" | "google" | "responses";
+type SystemSurface = "anthropic" | "openai" | "google" | "responses";
 
 interface SurfaceState {
     anchor: string;
@@ -27,7 +27,7 @@ interface SurfaceState {
     notes: string[];
 }
 
-export interface AnchorOutcome {
+interface AnchorOutcome {
     outbound: string;
     notes: string[];
     changed: boolean;
@@ -42,7 +42,7 @@ export const ANCHOR_MAX_NOTES = 8;
  *  must be shared between the previous and the new head for the change to be
  *  treated as a file-content edit worth annotating. Below it, the change is
  *  structural and gets the deliberate-miss treatment instead. */
-export const DIFF_MIN_SHARED = 0.7;
+const DIFF_MIN_SHARED = 0.7;
 
 /** Above this many lines on either side we do not even compute a diff —
  *  huge heads are presumed structural. Keeps the O(n·m) LCS bounded. */

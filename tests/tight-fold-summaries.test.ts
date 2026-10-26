@@ -123,7 +123,7 @@ function startUpstreamAnthropic(captured: string[], trigger: ProbeTrigger): http
             const msgRefs = parseRefIds(JSON.stringify(asArr(parsedBody.messages)));
             const compressArgs = trigger.should(body, msgRefs) ? trigger.args(msgRefs) : undefined;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const ev = (event: string, data: unknown): void => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            const ev = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
             ev("message_start", { type: "message_start", message: { id: `msg_a_${idx}`, role: "assistant", usage: { input_tokens: 100 } } });
             if (compressArgs !== undefined) {
                 ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_cmp_${idx}`, name: "compress", input: {} } });
@@ -158,7 +158,14 @@ function proxyOptions(upstreamPort: number, model: string, ctx: number): ProxyOp
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
 }
 

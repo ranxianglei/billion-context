@@ -23,15 +23,15 @@ export const WIRE_EXITS = [
     "plugin-json",
 ] as const;
 
-export type WireExitId = (typeof WIRE_EXITS)[number];
+type WireExitId = (typeof WIRE_EXITS)[number];
 
-export interface ExitCell {
+interface ExitCell {
     readonly implementer: readonly unknown[];
     readonly contract: string;
     readonly coveredBy: readonly string[];
 }
 
-export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
+const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
         contract: "mid-stream upstream failure → top-level `error` frame + [DONE] (default #1455; legacy inline error delta + finish via compat.streamErrorShape=completion); late (early-committed) preflight failure → top-level error object + [DONE] in-band",
@@ -54,13 +54,13 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     },
     "plugin-chat-sse": {
         implementer: [pipePluginChatWithStrip],
-        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; upstream cut without terminal event → synthesized terminal byte when a finish reason was delivered, else protocol-native in-band error event (#721); client abort → clean end",
-        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts"],
+        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; upstream cut without terminal event → synthesized terminal byte when a finish reason was delivered, else raw clean end for permitlist hosts owning truncation handling (pi, #2563), else protocol-native in-band error event (#721); client abort → clean end",
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts", "tests/issue2563-transparent-truncation.test.ts"],
     },
     "plugin-responses-sse": {
         implementer: [pipePluginResponsesWithStrip],
         contract: "same as plugin-chat-sse, responses wire",
-        coveredBy: ["tests/issue411-abort-usage.test.ts"],
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/issue2563-transparent-truncation.test.ts"],
     },
     "plugin-json": {
         implementer: [pipePluginJson],
@@ -69,7 +69,7 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     },
 };
 
-export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
+const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [startServer],
         contract: "client disconnects mid-stream → the in-flight upstream request is destroyed (no orphaned summarization/forward), session lock released",
@@ -107,7 +107,7 @@ export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     },
 };
 
-export const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
+const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [startServer],
         contract: "provider-measured (post-fold) usage credited to the internal ledger and forwarded to the host verbatim — no baseline backfill (#660)",

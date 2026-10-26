@@ -1,13 +1,15 @@
 {
   "name": "billion-context",
-  "version": "0.1.175",
-  "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
+  "version": "0.1.207",
+  "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/agent/dsh-native.js",
     "./server": "./dist/agent/opencode-native.js",
     "./dsh": "./dist/agent/dsh-native.js",
+    "./dsh-compaction-gate": "./dist/agent/dsh-compaction-gate.js",
+    "./package.json": "./package.json",
     "./dsh/package.json": "./package.json",
     "./client": "./dist/agent/dsh-native-client.js"
   },
@@ -16,14 +18,22 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsup && node scripts/check-dist-import-annotations.mjs",
+    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs && node scripts/check-dist-external.mjs",
+    "prepare": "node scripts/check-dist-ready.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
-    "typecheck": "tsc --noEmit --project tsconfig.build.json",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "pretypecheck": "npm --prefix kernel run build && npm --prefix pi-subagents run build",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "check:unused-exports": "node scripts/check-unused-exports.mjs",
+    "check:test-import-graph": "node scripts/check-test-import-graph.mjs",
+    "check:dist-thin": "node scripts/check-dist-thin-install.mjs",
+    "pretest": "node scripts/test-suite-lock.mjs gate && node scripts/ci-pretest-cache.mjs",
+    "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",
     "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
-    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts"
+    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
+    "test:e2e:image": "node --import tsx --test tests/e2e/e2e-image-billing.test.ts",
+    "gate:local": "node scripts/release-gate-local.mjs"
   },
   "keywords": [
     "context",
@@ -51,23 +61,36 @@
     "url": "https://github.com/ranxianglei/billion-context/issues"
   },
   "dependencies": {
+    "mysql2": "^3.15.3",
     "zod": "4.1.8"
   },
+  "optionalDependencies": {
+    "jimp": "1.6.1"
+  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
     "@types/semver": "^7.7.1",
-    "acp-kernel": "0.0.99",
+    "@types/ws": "8.18.2",
+    "acp-kernel": "file:./kernel",
+    "billion-context-pi-subagents": "file:./pi-subagents",
+    "esbuild": "^0.27.0",
     "fzstd": "0.1.1",
     "jsonc-parser": "^3.3.1",
     "node-forge": "^1.4.0",
+    "prettier": "^3.3.0",
     "semver": "7.8.5",
     "tar": "^7.5.22",
     "tsup": "^8.0.0",
     "tsx": "^4.0.0",
+    "typebox": "^1.3.34",
     "typescript": "^5.5.0",
     "undici": "^7.29.0",
-    "verdaccio": "^6.10.4"
+    "verdaccio": "^6.10.4",
+    "ws": "8.22.0",
+    "z3-solver": "^5.3.1"
   },
   "engines": {
     "node": ">=20"
@@ -75,9 +98,15 @@
   "files": [
     "LICENSE",
     "README.md",
+    "CONFIGURATION.md",
+    "CONFIGURATION.zh-CN.md",
     "dist",
     "dsh.bundle.patch.yml",
-    "hermes-plugin"
+    "hermes-plugin",
+    "paper/*.md",
+    "paper/figures/*.png",
+    "website/articles.json",
+    "website/blog/posts"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
@@ -96,8 +125,5 @@
     "client": {
       "platform": "web"
     }
-  },
-  "optionalDependencies": {
-    "sharp": "^0.35.4"
   }
 }

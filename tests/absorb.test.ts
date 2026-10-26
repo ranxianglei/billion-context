@@ -41,7 +41,9 @@ function freshMsgs(): CoreMessage[] {
 function makeTurn() {
     const core = createCore();
     const msgs = freshMsgs();
-    const config: Config = { ...defaultConfig(200000), absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100 } };
+    // mediaOnly off: these host-plumbing tests exercise the credit/view
+    // mechanism over a TEXT result; the #3402 media-scope gate is covered separately.
+    const config: Config = { ...defaultConfig(200000), absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100, mediaOnly: false } };
     const turn = core.processTurn({ messages: msgs, state: createInitialState(), config, tokenCount: 0, renderTags: "text-only" });
     const byRef = Object.entries(turn.state.messageRefs.byRef ?? {});
     const refFor = (rawId: string): string => byRef.find(([, raw]) => raw === rawId)?.[0] ?? "";
@@ -109,7 +111,7 @@ test("executeAbsorb: success records absorption, credits net exactly once", () =
         config,
         messages: turn.messages,
         session,
-    });
+    }).text;
     assert.ok(!result.includes("FAILED"), result);
     assert.match(result, /^absorbed m\d+/);
     assert.equal(session.state.absorbed?.length, 1);
@@ -120,7 +122,7 @@ test("executeAbsorb: success records absorption, credits net exactly once", () =
     assert.equal(session.stats.lastInputTokens, 100_000 - record.tokensReclaimed);
 
     // Re-absorbing the same ref is an ok=true no-op and must NOT credit again.
-    const again = executeAbsorb({ ref, summary: "retry" }, "call_y", config.absorb!, { config, messages: turn.messages, session });
+    const again = executeAbsorb({ ref, summary: "retry" }, "call_y", config.absorb!, { config, messages: turn.messages, session }).text;
     assert.ok(!again.includes("FAILED"), again);
     assert.match(again, /already absorbed/);
     assert.equal(session.state.absorbed?.length, 1);
@@ -131,9 +133,9 @@ test("executeAbsorb: bad ref and invalid input fail with FAILED marker", () => {
     const { turn, config } = makeTurn();
     const session = makeSession();
     session.state = turn.state;
-    const badRef = executeAbsorb({ ref: "m99999", summary: "x" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const badRef = executeAbsorb({ ref: "m99999", summary: "x" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badRef, /\[absorb FAILED: absorb failed: ref m99999/);
-    const badInput = executeAbsorb({ summary: "no ref" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const badInput = executeAbsorb({ summary: "no ref" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badInput, /\[absorb FAILED: invalid input/);
     assert.equal((session.state.absorbed ?? []).length, 0);
 });
@@ -148,16 +150,19 @@ test("kernel gating: prompts honor minToolTokens/contextThresholdPct at processT
         const turn = core.processTurn({ messages: freshMsgs(), state: createInitialState(), config: cfg, tokenCount, renderTags: "text-only" });
         return turn.messages.some((m) => (m.text ?? "").includes("[ACP absorb]"));
     };
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100 }), true, "large eligible result is prompted");
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100_000 }), false, "minToolTokens gate");
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100, contextThresholdPct: 0.8 }), false, "below context threshold (50% usage)");
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100, contextThresholdPct: 0.8 }, 180_000), true, "above context threshold (90% usage)");
+    // mediaOnly pinned off: these scenarios isolate the token/context gates;
+    // the #3402 media-scope gate is covered separately in the kernel suite.
+    const A = { ...DEFAULT_ABSORB_CONFIG, mediaOnly: false };
+    assert.equal(run({ ...A, enabled: true, minToolTokens: 100 }), true, "large eligible result is prompted");
+    assert.equal(run({ ...A, enabled: true, minToolTokens: 100_000 }), false, "minToolTokens gate");
+    assert.equal(run({ ...A, enabled: true, minToolTokens: 100, contextThresholdPct: 0.8 }), false, "below context threshold (50% usage)");
+    assert.equal(run({ ...A, enabled: true, minToolTokens: 100, contextThresholdPct: 0.8 }, 180_000), true, "above context threshold (90% usage)");
     // excludeTools is a known no-op on tool RESULTS: the wire projections build
     // result CoreMessages without toolName, so isAbsorbCandidate's name guard
     // never fires (ranxianglei/acp-kernel#213). Asserting current behavior so a
     // kernel fix flips this line red instead of silently changing semantics.
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: true, minToolTokens: 100, excludeTools: ["bash"] }), true, "excluded tool name (kernel limitation)");
-    assert.equal(run({ ...DEFAULT_ABSORB_CONFIG, enabled: false, minToolTokens: 100 }), false, "feature disabled");
+    assert.equal(run({ ...A, enabled: true, minToolTokens: 100, excludeTools: ["bash"] }), true, "excluded tool name (kernel limitation)");
+    assert.equal(run({ ...A, enabled: false, minToolTokens: 100 }), false, "feature disabled");
 });
 
 test("applyAbsorbView: hides recorded pairs even after the feature is disabled", () => {
@@ -165,7 +170,7 @@ test("applyAbsorbView: hides recorded pairs even after the feature is disabled",
     const session = makeSession();
     session.state = turn.state;
     const ref = refFor("t-res");
-    const result = executeAbsorb({ ref, summary: "short" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const result = executeAbsorb({ ref, summary: "short" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.ok(!result.includes("FAILED"), result);
     const hidden = applyAbsorbView(turn.messages, session.state, defaultConfig(200000), 100_000);
     assert.deepEqual(hidden.map((m) => m.id), ["u1"], "both halves of the absorbed pair are hidden");
@@ -193,6 +198,7 @@ test("applyCompressSettings: maps settings absorb onto kernel AbsorbConfig with 
         minToolTokens: 4000,
         contextThresholdPct: 0.8,
         excludeTools: [],
+        mediaOnly: true,
     });
     const numeric = applyCompressSettings(base, 200_000, { absorb: { enabled: false, minToolTokens: 250, contextThresholdPct: 0.5 } });
     assert.equal(numeric.absorb?.enabled, false);
@@ -210,6 +216,8 @@ test("parseCompressSettings: validates absorb sub-object field-by-field, rejects
     assert.equal(parseCompressSettings({ absorb: { contextThresholdPct: "abc" } }), undefined);
     assert.equal(parseCompressSettings({ absorb: { excludeTools: "bash" } }), undefined);
     assert.equal(parseCompressSettings({ absorb: { toolName: "" } }), undefined);
+    assert.equal(parseCompressSettings({ absorb: { mediaOnly: false } })?.absorb?.mediaOnly, false);
+    assert.equal(parseCompressSettings({ absorb: { mediaOnly: "yes" } }), undefined);
     assert.equal(parseCompressSettings({ absorb: [] }), undefined);
     // A bad absorb field rejects sibling fields too (whole-block convention).
     assert.equal(parseCompressSettings({ tiers: false, absorb: { enabled: 1 } }), undefined);
@@ -232,7 +240,7 @@ test("handlePluginManifest: absorb advertised on all three wires only when enabl
     assert.ok(!d.tools.openai.some((t) => t.function?.name === "absorb"));
     assert.ok(!d.tools.responses.some((t) => t.name === "absorb"));
 
-    handlePluginManifest(res, { ...defaultConfig(200_000), absorb: { enabled: true } });
+    handlePluginManifest(res, { ...defaultConfig(200_000), absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true } });
     d = data();
     assert.ok(d.toolNames.includes("absorb"));
     const anthro = d.tools.anthropic.find((t) => t.name === "absorb");

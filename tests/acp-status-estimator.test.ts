@@ -8,7 +8,7 @@ function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -16,6 +16,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -43,7 +44,7 @@ function cjkToolSession(): { session: Session; messages: CoreMessage[] } {
 test("acp_status reports CJK at 1:1 scale (defaultCountTokens, not chars/4) (#386)", () => {
     const { session, messages } = cjkToolSession();
     const ctx = { core: createCore(), config: defaultConfig(200000), messages, session, log: (_msg: string) => {} };
-    const out = executeProxyTool("acp_status", {}, ctx);
+    const out = executeProxyTool("acp_status", {}, ctx).text;
     const line = out.split("\n").find((l) => l.includes(" tool (") && l.includes(" text ("));
     assert.ok(line, `no breakdown line in:\n${out}`);
     assert.ok(line.includes("6.0K tool"), `tool bucket should be ~6000 CJK tokens (1:1), not chars/4: ${line}`);
@@ -54,7 +55,7 @@ test("acp_status reports CJK at 1:1 scale (defaultCountTokens, not chars/4) (#38
 test("acp_status attributes CJK tool-results to their calling tools (#386)", () => {
     const { session, messages } = cjkToolSession();
     const ctx = { core: createCore(), config: defaultConfig(200000), messages, session, log: (_msg: string) => {} };
-    const out = executeProxyTool("acp_status", {}, ctx);
+    const out = executeProxyTool("acp_status", {}, ctx).text;
     const top = out.split("\n").find((l) => l.startsWith("  Top tools:"));
     assert.ok(top, `no Top tools line in:\n${out}`);
     assert.ok(top.includes("bash"), `bash missing: ${top}`);

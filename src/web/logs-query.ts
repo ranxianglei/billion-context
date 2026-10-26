@@ -16,7 +16,7 @@
  *   neither    — exact hits only (historical behaviour, kept for parity).
  * An empty query returns the raw tail, unchanged from before.
  */
-export interface LogQueryOptions {
+interface LogQueryOptions {
     /** Per-hit context lines (0 disables). Clamp before calling. */
     ctx: number;
     /** Window seconds around [firstHit, lastHit] (0 disables). Clamp before calling. */
@@ -25,7 +25,7 @@ export interface LogQueryOptions {
     n: number;
 }
 
-export interface LogQueryResult {
+interface LogQueryResult {
     /** Match count for a filtered query, else the whole-file line count. */
     total: number;
     /** lines.length */

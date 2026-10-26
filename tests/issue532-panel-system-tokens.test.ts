@@ -7,7 +7,8 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState, defaultConfig, defaultCountTokens, type NudgeDecision } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
-import { startServer, countSystemAndToolsTokens, type ProxyOptions } from "../src/server.ts";
+import { startServer, countSystemAndToolsTokens } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -26,8 +27,8 @@ function makeNudge(bd: { system: number; tool: number; summaries: number; code: 
         tier: null,
         breakdown: {
             usage: 0.5, growth: 0, growthReference: 0, effectiveThreshold: 0,
-            nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: false,
-            overLimit: false, emergencyOverride: false, pendingT1: 0, pendingT2: 0, pendingT3: 0,
+            nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0,
+            overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0,
         },
         contextBreakdown: { ...bd, total, growth: 0 },
     };
@@ -141,7 +142,7 @@ async function startHarness(): Promise<Harness> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -160,18 +161,27 @@ async function startHarness(): Promise<Harness> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     return {
         proxyPort,
         upstreamPort,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -209,7 +219,7 @@ test("#532 anthropic plugin session: panel counts outbound system+tools (SysProm
             }),
         });
         assert.equal(resp.status, 200);
-        for await (const _chunk of resp.body) { /* drain */ }
+        for await (const _chunk of resp.body!) { /* drain */ }
 
         const panel = await fetchPanel(h, conv);
         const rows = parseRows(panel);
@@ -252,7 +262,7 @@ test("#532 openai plugin session: panel counts injected system+tools (SysPrompt 
             }),
         });
         assert.equal(resp.status, 200);
-        for await (const _chunk of resp.body) { /* drain */ }
+        for await (const _chunk of resp.body!) { /* drain */ }
 
         const panel = await fetchPanel(h, conv);
         const rows = parseRows(panel);

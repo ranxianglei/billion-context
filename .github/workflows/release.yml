@@ -10,6 +10,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,6 +34,51 @@ jobs:
             echo "is_release=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check plugin manifest versions (#4449)
+        # Codex/Claude plugin marketplaces detect updates by the declared
+        # manifest version vs the installed cache version, so the four
+        # manifests (.agents/plugins, .claude-plugin x2, plugins/codex) must
+        # match package.json. The release branch carries the synced manifests
+        # as their own commit (reference/release.md step 3.5); drift here
+        # means the branch was prepared without that step — fail fast, before
+        # any CI dispatch, tag, or publish.
+        if: steps.check.outputs.is_release == 'true'
+        run: node scripts/sync-codex-plugin-version.mjs --check
+
+      - name: Full CI dispatch (missing lanes, publish sha)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. This merge already ran all lanes as a PR — dispatch only
+        # whatever has no run here (idempotent); the Full CI gate step before
+        # Create tag blocks publish until all lanes are green. EXTRA_MATCH_SHAS
+        # reuses the PR-head green runs (HEAD^2), so a normal PR release pays
+        # zero extra CI — same semantics as branch-protection required checks.
+        if: steps.check.outputs.is_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          EXTRA_MATCH_SHAS="$(git rev-parse HEAD^2 2>/dev/null || true)"
+          export GITHUB_SHA EXTRA_MATCH_SHAS
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Probe full-suite reuse (#3539)
+        # One-shot, non-blocking: is the full suite ALREADY proven green at
+        # the PR head (every required lane has a green run there)? Together
+        # with "master did not move since", that lets Build-and-test skip its
+        # local full pass — the one-click fallback chain then pays for the
+        # full suite exactly once. Any doubt falls back to running it.
+        if: steps.check.outputs.is_release == 'true'
+        id: reuse
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          EXTRA_MATCH_SHAS="$(git rev-parse HEAD^2 2>/dev/null || true)"
+          export GITHUB_SHA EXTRA_MATCH_SHAS
+          node scripts/release-ci-gate.mjs --probe-reuse
+
       - name: Setup
         if: steps.check.outputs.is_release == 'true'
         run: npm ci
@@ -44,7 +90,18 @@ jobs:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
           npm run typecheck
-          npm test
+          # #3539: skip the local full pass only when it is provably redundant —
+          # every required lane already green at the PR head (reuse probe above)
+          # AND master did not move since (HEAD^2..HEAD empty), i.e. the PR-head
+          # tree IS this tree. Human-cut release PRs (core lanes only) never
+          # skip: their e2e lanes are absent at the PR head, so this runs
+          # exactly as before. The Full CI gate below still blocks publish.
+          MASTER_ONLY="$(git rev-list --count HEAD^2..HEAD 2>/dev/null || echo 1)"
+          if [ "${{ steps.reuse.outputs.allLanesReused }}" = "yes" ] && [ "$MASTER_ONLY" -eq 0 ]; then
+            echo "full suite already green at the PR head and master did not move since — skipping the local full pass (#3539)"
+          else
+            npm test
+          fi
           npm run build
 
       - name: Read version
@@ -71,6 +128,38 @@ jobs:
             echo "tag=latest" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Verify release-notes entry (#1870)
+        # Policy (2026-10-04 revision of #1870): entries are OPT-IN severity
+        # declarations — only severe releases need one; ordinary releases ship
+        # silently with NO entry. Missing entry => notice + pass; present
+        # entry => validated and logged.
+        if: steps.check.outputs.is_release == 'true' && steps.pre.outputs.prerelease == 'false'
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          node -e "
+            const notes = require('./release-notes/package.json').billionContextReleaseNotes;
+            const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
+            if (!entry) {
+              console.log('::notice::release ' + process.argv[1] + ' has no release-notes entry — shipping silently (entries are opt-in; only severe releases need one). See release-notes/README.md (#1870).');
+              process.exit(0);
+            }
+            console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
+          " "$VER"
+
+      - name: Full CI gate (all lanes green at this sha)
+        # Hard precondition for publish: every required lane green at the
+        # publish sha (or reused green PR-head run). Any red lane or timeout
+        # ⇒ release fails, nothing is published.
+        if: steps.check.outputs.is_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          EXTRA_MATCH_SHAS="$(git rev-parse HEAD^2 2>/dev/null || true)"
+          export GITHUB_SHA EXTRA_MATCH_SHAS
+          node scripts/release-ci-gate.mjs --wait
 
       - name: Create tag
         if: steps.check.outputs.is_release == 'true'

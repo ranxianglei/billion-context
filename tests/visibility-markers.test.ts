@@ -43,7 +43,7 @@ function makeCtx(): {
         session: {
             id: "vm-marker-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -51,6 +51,7 @@ function makeCtx(): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -60,10 +61,13 @@ function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-const FC_COMPRESS = [
-    sse("response.output_item.added", { item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress" }, output_index: 0 }),
-    sse("response.function_call_arguments.delta", { item_id: "fc_c", delta: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] }) }),
-    sse("response.output_item.done", { item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress", arguments: "{}" }, output_index: 0 }),
+// acp_status vehicle: these tests pin marker visibility/suppression across execute
+// + re-request. A failing compress ends the turn before any re-request (#4186),
+// which would silently un-test the continuation path.
+const FC_STATUS = [
+    sse("response.output_item.added", { item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status" }, output_index: 0 }),
+    sse("response.function_call_arguments.delta", { item_id: "fc_s", delta: "{}" }),
+    sse("response.output_item.done", { item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status", arguments: "{}" }, output_index: 0 }),
 ].join("");
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
@@ -77,7 +81,7 @@ async function drainRound(ctx: Parameters<typeof runCompressLoop>[1]): Promise<{
     }) as typeof fetch;
     try {
         const chunks: Buffer[] = [];
-        const stream = new Response(FC_COMPRESS + COMPLETED, { status: 200 }).body!;
+        const stream = new Response(FC_STATUS + COMPLETED, { status: 200 }).body!;
         for await (const chunk of runCompressLoop(stream, ctx, { model: "gpt-4o", input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) {
             chunks.push(chunk);
         }
@@ -91,6 +95,18 @@ test("loop: explicit visibilityMarkers=true keeps the marker (default parity)", 
     const { out, fetchCalls } = await drainRound({ ...makeCtx(), visibilityMarkers: true });
     assert.ok(out.includes("[ACP]"), "marker shown when explicitly enabled");
     assert.ok(fetchCalls >= 1, "re-request still fires");
+});
+
+test("loop: visibility marker message item carries an upstream-legal msg id (WC-015)", async () => {
+    const { out } = await drainRound({ ...makeCtx(), visibilityMarkers: true });
+    assert.ok(out.includes("[ACP]"), "marker emitted in this round");
+    const messageItems = [...out.matchAll(/event: (response\.output_item\.(?:added|done))\ndata: ([^\n]+)\n\n/g)]
+        .map((m) => JSON.parse(m[2]) as { item?: { type?: string; id?: unknown } })
+        .map((e) => e.item)
+        .filter((item): item is { type?: string; id?: unknown } => item?.type === "message");
+    assert.ok(messageItems.length > 0, "marker rode a message item");
+    for (const item of messageItems)
+        assert.ok(typeof item.id === "string" && item.id.startsWith("msg"), `message item id must begin with 'msg'; got ${JSON.stringify(item.id)}`);
 });
 
 test("loop: visibilityMarkers=false suppresses the marker but executes + re-requests", async () => {

@@ -20,7 +20,9 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
  * session must inherit the parent's ref assignments — including refs outside
  * the folded block (stale model citations resolve to their ORIGINAL messages
  * instead of mis-hitting renumbered ones) — its fully-present blocks
- * (forkAdoption-gated), and the derivedFrom lineage, with fresh messages
+ * (#1834: adopted together with this inheritance — losing them meant the
+ * folded originals came back on the wire; forkAdoption only gates anonymous
+ * forks), and the derivedFrom lineage, with fresh messages
  * numbering above the parent's ref space and the parent left untouched.
  * With resumeInheritance disabled the resume keeps the old behavior: no
  * lineage, no adoption, independent numbering.
@@ -48,7 +50,7 @@ function sseLine(obj: unknown): string {
 function parseRefIds(body: string): string[] {
     const ids: string[] = [];
     const re = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>/g;
-    let m: RegExp.ExecArray | null = null;
+    let m: RegExpExecArray | null = null;
     while ((m = re.exec(body)) !== null) ids.push(m[1]!);
     return ids;
 }
@@ -160,6 +162,7 @@ function proxyOpts(relayUrl: string, flags: { forkAdoption: boolean; resumeInher
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
         }),
         compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
         forkAdoption: flags.forkAdoption,
         resumeInheritance: flags.resumeInheritance,
         sessionHeader: "x-acp-session",
@@ -167,6 +170,13 @@ function proxyOpts(relayUrl: string, flags: { forkAdoption: boolean; resumeInher
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
 }
@@ -295,6 +305,27 @@ test("identified resume inherits the parent's refs, blocks and lineage (#1486)",
     assert.ok(adopted.length >= 1, `resumed session must adopt the parent's block(s) (parent=${JSON.stringify(r.parentBlockIds)} child=${JSON.stringify(r.childBlockIds)})`);
     assert.ok(r.parentUntouched, "parent session must stay untouched (copy-on-resume)");
     assert.ok(r.freshAboveParent, `fresh refs in the resumed session must number above the parent's ref space (parentMax=${r.parentMaxRef} childMax=${r.childMaxRef})`);
+});
+
+test("identified resume adopts the parent's blocks BY DEFAULT (#1834)", async () => {
+    // The production shape of #1834: Claude Code --resume / a new branch
+    // replays the full transcript under a FRESH session id with DEFAULT
+    // options (forkAdoption off, resumeInheritance on). Before #1834 the
+    // resumed session inherited refs+lineage but NOT the compression
+    // blocks, so every folded original came back on the wire and the
+    // upstream request ballooned (+25% in the live repro) — compression was
+    // silently lost on every branch/resume. Blocks now ride along with the
+    // inheritance itself; forkAdoption only gates ANONYMOUS forks (#629).
+    const r = await runResumeScenario({ forkAdoption: false, resumeInheritance: true });
+
+    for (const [raw, ref] of Object.entries(r.parentRefs)) {
+        assert.equal(r.childRefs[raw], ref, `ref ${ref} for a shared message must be preserved across the resume`);
+    }
+    assert.equal(r.lineage, r.parentId, "lineage must link to the parent with default options");
+    const adopted = r.parentBlockIds.filter((id) => r.childBlockIds.includes(id));
+    assert.ok(adopted.length >= 1, `default-option resume must adopt the parent's block(s) — losing them regresses #1834 (parent=${JSON.stringify(r.parentBlockIds)} child=${JSON.stringify(r.childBlockIds)})`);
+    assert.ok(r.parentUntouched, "parent session must stay untouched (copy-on-resume)");
+    assert.ok(r.freshAboveParent, "fresh refs in the resumed session must number above the parent's ref space");
 });
 
 test("resumeInheritance disabled keeps the old behavior: no lineage, no adoption (#1486)", async () => {

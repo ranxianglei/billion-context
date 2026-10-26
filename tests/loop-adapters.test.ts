@@ -7,7 +7,7 @@ import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createRes
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { responsesToCore } from "acp-kernel/wire";
-import type { ResponsesRequestBody } from "acp-kernel/wire";
+import type { ResponsesRequestBody, AnthropicTextBlock } from "acp-kernel/wire";
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -25,7 +25,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
         session: {
             id,
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 , compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -33,6 +33,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -327,9 +328,9 @@ test("anthropic adapter (#1310): forwarded message_start is usage-neutral — th
 // #1310 companion: a NON-stitched turn keeps its final usage identical — the
 // zeroed start loses nothing because the terminal already carried the same
 // numbers the start frame had.
-test("anthropic adapter (#1310): non-stitched turn — zeroed start, identical final usage via terminal", async () => {
+test("anthropic adapter (#1310/#4072): non-stitched turn — zeroed start, identical final usage via terminal", async () => {
     const single = [
-        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 165132, cache_creation_input_tokens: 618 } } })}\n\n`,
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 165132, cache_creation_input_tokens: 618, cache_creation: { ephemeral_5m_input_tokens: 618 } } } })}\n\n`,
         `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
         `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
@@ -353,6 +354,96 @@ test("anthropic adapter (#1310): non-stitched turn — zeroed start, identical f
     assert.equal(terminalUsage.input_tokens, 4, "terminal carries the numbers the start frame had");
     assert.equal(terminalUsage.cache_read_input_tokens, 165132);
     assert.equal(terminalUsage.cache_creation_input_tokens, 618);
+    // #4072: the cache_creation breakdown (ephemeral_5m/1h) lives ONLY in the
+    // upstream message_start — forwarded usage-neutral above — so the terminal
+    // must re-carry it verbatim or hosts deriving their prompt-cache TTL from
+    // it (Claude Code VS Code countdown icon) lose it.
+    assert.deepEqual(terminalUsage.cache_creation, { ephemeral_5m_input_tokens: 618 }, "#4072: terminal carries the start frame's breakdown verbatim");
+    assert.equal(startUsage.cache_creation, undefined, "#4072: forwarded start stays neutral — no breakdown for a host to double-read");
+});
+
+test("anthropic adapter (#4072): stitched turn — terminal carries the FINAL round's cache_creation breakdown", async () => {
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 166610, cache_creation_input_tokens: 618, cache_creation: { ephemeral_5m_input_tokens: 618 } } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_s", name: "acp_status", input: {} } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const round2 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_2", usage: { input_tokens: 94720, cache_read_input_tokens: 93000, cache_creation_input_tokens: 120, cache_creation: { ephemeral_5m_input_tokens: 120 } } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const ctx = { ...makeCtx("anthropic-4072-stitched"), protocol: "anthropic" };
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            createAnthropicAdapter({ model: "claude" }),
+            { model: "claude", messages: [], stream: true, max_tokens: 10 },
+        );
+        assert.equal(fetchCalls, 1, "re-request after proxy tool");
+        const frames = out.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
+        const usageFrames = frames.filter((f) => (f.usage ?? undefined) !== undefined && Object.keys(f.usage as Record<string, unknown>).length > 0);
+        assert.equal(usageFrames.length, 1, "the synthetic terminal is the ONLY usage-bearing frame");
+        const terminalUsage = usageFrames[0]!.usage as Record<string, unknown>;
+        assert.deepEqual(terminalUsage.cache_creation, { ephemeral_5m_input_tokens: 120 }, "#4072: final round's breakdown wins — same rule as the totals; round 1's pre-fold value must not leak");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("anthropic adapter (#4072): no breakdown upstream — terminal gains no cache_creation key (never synthesized)", async () => {
+    const single = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 165132, cache_creation_input_tokens: 618 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-4072-absent"), protocol: "anthropic" };
+    const out = await drain(
+        new Response(single, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    const frames = out.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
+    const usageFrames = frames.filter((f) => (f.usage ?? undefined) !== undefined && Object.keys(f.usage as Record<string, unknown>).length > 0);
+    const terminalUsage = usageFrames[0]!.usage as Record<string, unknown>;
+    assert.equal(terminalUsage.cache_creation, undefined, "#4072: absent upstream means absent downstream — bili never invents a 5m/1h split");
+});
+
+test("anthropic adapter (#4072): incomplete delta echoing an all-zero breakdown does not clobber the start-frame values", async () => {
+    const single = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 165132, cache_creation_input_tokens: 618, cache_creation: { ephemeral_5m_input_tokens: 618 } } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3, input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 } } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-4072-zerorelay"), protocol: "anthropic" };
+    const out = await drain(
+        new Response(single, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    const frames = out.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
+    const usageFrames = frames.filter((f) => (f.usage ?? undefined) !== undefined && Object.keys(f.usage as Record<string, unknown>).length > 0);
+    const terminalUsage = usageFrames[0]!.usage as Record<string, unknown>;
+    assert.deepEqual(terminalUsage.cache_creation, { ephemeral_5m_input_tokens: 618 }, "#4072: schema-shaped zero echo (same relay class as #660's input_tokens:0) is not an update");
+    assert.equal(terminalUsage.input_tokens, 4, "numerics' > 0 adoption rule still holds beside the breakdown gate");
 });
 
 test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
@@ -731,7 +822,7 @@ test("F6: responses buildRequest preserves instructions + additional_tools prefi
 });
 
 test("F7: anthropic buildRequest preserves client system + cache_control + merges compress prompt (prefix-cache fix)", () => {
-    const clientSystem = [{ type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } }];
+    const clientSystem: AnthropicTextBlock[] = [{ type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } }];
     const systemPrompt = buildCompressSystemPrompt();
     const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
     const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
@@ -744,6 +835,24 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     assert.ok(text.includes(systemPrompt), "compress prompt merged into system");
     const hasCc = Array.isArray(system) && (system as Array<Record<string, unknown>>).some((b) => b.cache_control);
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
+});
+
+test("F7b (#1876): anthropic buildRequest keeps client system blocks byte-exact, appends prompt as trailing unmarked block", () => {
+    const clientSystem: AnthropicTextBlock[] = [
+        { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
+        { type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "EXTRA_CONTEXT_BLOCK" },
+    ];
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
+    const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
+    const system = rebuilt.system;
+    assert.ok(Array.isArray(system), "system stays a structured array");
+    const blocks = system as Array<Record<string, unknown>>;
+    assert.equal(blocks.length, 4, "3 client blocks + 1 appended prompt block — no merge into one block");
+    assert.deepEqual(blocks.slice(0, 3), clientSystem, "client blocks byte-exact in order, cache_control stays on its own (non-first) block");
+    assert.equal(blocks[3]?.text, systemPrompt, "appended block carries the compress prompt verbatim (no '---' separator)");
+    assert.equal(blocks[3]?.cache_control, undefined, "appended block carries no breakpoint (client-managed caching wins)");
 });
 
 function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {

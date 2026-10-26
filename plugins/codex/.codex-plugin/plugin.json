@@ -1,0 +1,34 @@
+{
+  "name": "billion-context",
+  "version": "0.1.205",
+  "description": "Context-compression plugin for Codex — small context windows (100K is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and high compression quality.",
+  "author": {
+    "name": "ranxianglei"
+  },
+  "homepage": "https://github.com/ranxianglei/billion-context",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "compression",
+    "long-context",
+    "token-saving",
+    "acp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "billion-context",
+    "shortDescription": "上下文压缩：100K 窗口跑出十亿 token 的长会话",
+    "longDescription": "把 Codex 的对话历史做增量分层压缩：模型自己决定何时压缩、压缩什么，被折叠的区段保持摘要、可随时解压还原，前缀缓存不失效。一个上下文窗口连跑数天、累计数十亿 token 而不爆窗。插件注入四个上下文管理工具（compress / decompress / search_context / acp_status），模型会在上下文变长时自行调用。",
+    "developerName": "ranxianglei",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "查看当前会话的上下文压缩状态",
+      "把最近的一段对话压缩掉"
+    ],
+    "brandColor": "#10a37f"
+  }
+}

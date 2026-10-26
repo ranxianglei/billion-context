@@ -5,7 +5,7 @@
 // without waiting for the per-session spawn path. Fails open: always exits 0.
 
 import { resolveProxyOrigin } from "../mcp.js";
-import { reportRuntimeInfo } from "../agent/shared.js";
+import { reportRuntimeInfo, runSessionStartHook } from "../agent/shared.js";
 import { planNativeZcode, routeZcodeConfig, waitForProxyHealthy, zcodePolicyFromEnv } from "./native.js";
 
 const HOOK_HEALTH_DEADLINE_MS = 4000;
@@ -53,5 +53,5 @@ export async function main(): Promise<void> {
 }
 
 if (process.argv[1] && /(?:^|[\\/])bootstrap-hook\.(?:ts|js)$/.test(process.argv[1])) {
-    void main().finally(() => process.exit(0));
+    runSessionStartHook(main);
 }

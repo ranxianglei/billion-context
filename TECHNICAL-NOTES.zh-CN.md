@@ -14,10 +14,10 @@ README 三种使用方式背后的机制级说明。README 里每种方式只保
 |---|---|---|
 | 本会话拉起的代理 | ✅ | 出生即 armed |
 | 其他会话的 armed 共享代理(watcher 集,#1186) | ✅ | 共享本就是设计 |
-| 手工 `bili start` 常驻守护进程(用户主权区,#1660) | ✅ 默认附着 | **用户主权区**实例(无 lane、无 launch token):用户刻意维护 —— 其寿命与版本由你自己负责;仅当 `BILI_NATIVE_ATTACH_EXTERNAL=0/false` 显式关门时才拒绝 |
+| 手工 `bili start` 常驻守护进程(用户主权区,#1660) | 🔶 视情况 | **用户主权区**实例(无 lane、无 launch token):一台**已武装**的(受管共享代理,#1225)会被任何兼容 client lane 搭车;一台**未武装**的手动守护在默认(`attachPolicy: own-lane`,#2877)下**不会**被 lane 型 hook 搭车 —— 它自行派生。仅在 `attachPolicy: global-fallback`(pre-#2877)或 `attachExternal=1` 下被搭。无论哪种,寿命与版本由你自己负责 |
 | 未武装的 **lane 型**代理(崩溃会话孤儿;pre-#1330 不可验证) | ❌ 大声拒绝 | 生命周期漂移症状(#1335):搭乘等于静默复用无人管理的代理 |
 
-hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 watcher(现状不变);**用户主权区**候选无论看门狗状态默认附着(#1660)—— 用户刻意维护该守护进程;未武装的 **lane 型**候选(崩溃会话孤儿,或 pre-#1330 构建根本不报 `watchdog` 字段 —— 不可验证,按 unarmed 处理)被**大声拒绝**,本会话在自管端口区自拉起代理(基准口 `18787` 或该 lane 粘性漂移记录;出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。版本偏斜仍被修住:代码指纹检查先行,重建/更新后的安装即使经用户主权区豁免也永不搭乘陈旧守护进程。代价:无可附着实例时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 配置文件 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1` 把附着扩展到 *lane 型*监听者(无论看门狗状态,含 pre-#1330 构建)—— 那些守护进程的寿命与版本由你自己负责;`0`/`false` 对所有人关门,包括用户主权区守护进程,强制各 lane 自拉新代理。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
+hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 watcher(现状不变);一台**已武装的用户主权区**候选无论 lane 亲和策略都附着(受管共享代理,#1225);一台**未武装的用户主权区**(手动)候选仅在 `attachPolicy: global-fallback`(pre-#2877)或 `attachExternal=1` 下附着 —— 默认(`own-lane`)lane 型 hook 自行派生(#2877);未武装的 **lane 型**候选(崩溃会话孤儿,或 pre-#1330 构建根本不报 `watchdog` 字段 —— 不可验证,按 unarmed 处理)被**大声拒绝**,本会话在自管端口区自拉起代理(基准口 `18787` 或该 lane 粘性漂移记录;出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。版本偏斜仍被修住:代码指纹检查先行,重建/更新后的安装即使经用户主权区豁免也永不搭乘陈旧守护进程。代价:无可附着实例时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 配置文件 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1` 把附着扩展到 *lane 型*监听者(无论看门狗状态,含 pre-#1330 构建)—— 那些守护进程的寿命与版本由你自己负责;`attachExternal` 只管辖 **lane 型**守护的*生命周期门禁*(它并不开/关对 user-zone 的附着 —— 那个轴是 `attachPolicy`);`attachUrl`(env `BILI_MCP_PROXY` / `--origin`)钉住显式目标 origin。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
 
 附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例(用户主权区守护进程)在 lane 轴上通配,且门禁默认豁免(#1660)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
 
@@ -39,7 +39,9 @@ hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 w
 | 逐请求头(门控在 `x-bili-plugin`) | 每次模型请求 | `x-bili-plugin-context-window`、`x-bili-plugin-max-output`、`x-bili-plugin-model` |
 | `POST /__bili/plugin/runtime-info`(回环地址) | 插件自举 + 任一上报字段变更 | `{agent, model, contextWindow?, maxOutput?, baseURL?, conversationId?, source}` |
 
-窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。runtime-info 这一步:带 `x-bili-plugin` 头的请求读**按 agent 的条目**(agent+model 必须匹配);不带该头的请求解析以 `conversationId` 记录的**会话级条目**,键与会话绑定的同一会话信号一致(客户端会话头、自定义 session 头或请求体的 `prompt_cache_key`)—— 无论哪种,model 都必须匹配(#1531:omp 打 `prompt_cache_key` 但不打 plugin 头,且主/子代理会话共用 agent 名却跑不同模型)。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)、`hermes-plugin/__init__.py`(Python 插件:经 `llm_request` 中间件打逐请求头,`pre_api_request` hook 捕获最大输出)—— 其他客户端接入请遵循同一协议。
+窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。runtime-info 这一步:带 `x-bili-plugin` 头的请求读**按 agent 的条目**(agent+model 必须匹配);不带该头的请求解析以 `conversationId` 记录的**会话级条目**,键与会话绑定的同一会话信号一致(客户端会话头、自定义 session 头或请求体的 `prompt_cache_key`)—— 无论哪种,model 都必须匹配(#1531:omp 打 `prompt_cache_key` 但不打 plugin 头,且主/子代理会话共用 agent 名却跑不同模型)。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)、`hermes-plugin/__init__.py`(Python 插件:经 `llm_request` 中间件打逐请求头,`pre_api_request` hook 捕获最大输出与宿主 per-model 上下文窗口 —— 窗口读自 hermes 自己的 `HERMES_HOME/context_length_cache.yaml`,任何缺失/歧义 fail-open(#3261))—— 其他客户端接入请遵循同一协议。
+
+**omp:当 OMP 的 Cowork 传输接管出口时,不打 `prompt_cache_key`(#2583/#3556)。**native omp 模式下,打上的 `prompt_cache_key` 是唯一的逐请求会话信号,其唯一消费者是 bili 自己的 fetch 层拦截器(把模型 URL 改写成 `<proxy>/bili/<url>` 并在转发前剥掉该字段)。较新的 OMP 构建带有 "Cowork 传输"(2026-07-30 引入,can1357/oh-my-pi `642892ae`;代理处理 `e22a5ff2`):默认 `anthropic`/`anthropic-messages` 请求经 node:https **直发** —— 除非显式代理环境变量(`PI_PROXY` / `PI_PROXY_ANTHROPIC`)把它们推回 Bun 的 fetch,否则根本不经过 `globalThis.fetch`。自 #3556 起,`bili omp` 启动器自行关闭了这一缺口:除非用户已设置 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,否则它会导出 `PI_PROXY_ANTHROPIC=<proxy origin>`,因此在默认启动器通道上,Cowork 走可压缩通道(打上的 key 由代理消费并剥离),而非直发。打戳放弃同时门控 cert-MITM 通道 —— #3556 把它提到了目的地路由检查之上,嵌套放置会完全跳过它。在那条路径上打戳会让字段原样进入 Anthropic 严格 schema(HTTP 400 `prompt_cache_key: Extra inputs are not permitted`)。打戳闸门(`src/agent/pi.ts` 的 `stampPromptCacheKey` → `ompCoworkTransportBypassesFetch`)镜像 OMP 自己的按模型出口选择:证明直发时不打戳,并每进程每模型警告一次。后果:这些直发请求不经压缩、对代理匿名(身份/面板/账单退化 —— 与 #1403 同一取舍);其余 lane(launcher `/bili/` 改写、MITM 白名单、其他 provider/api、配置了代理的宿主)不受影响。已知残留:`NO_PROXY`/`no_proxy` 规则命中模型 host 时,即使设置了 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,OMP 的代理处理也会被静默 —— 请求直发但已打戳(同类 400);这类 host 应从 `NO_PROXY` 中移除而非依赖打戳闸门。反向不对称是 fail-safe 的:OMP 的按形状 fetch 回退(Request 对象入参、非 record headers、不支持的 body)即使没有任何代理环境变量也会走回 `globalThis.fetch`,那里放弃打戳只退化身份、不会硬失败。完整覆盖需要宿主侧变更(Cowork 出口改走 `globalThis.fetch`)—— 作为边界注记记录在 #2583。
 
 launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <client>` 启动时读客户端自己的模型配置(codex 的 `model_context_window` / `model_max_output_tokens`,pi / omp 的 `contextWindow` / `maxTokens`,opencode 的 `limit.context` / `limit.output`,codebuddy 的 `maxInputTokens` / `maxOutputTokens`),经 `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` 交给代理(#971)。插件上报 —— 若存在 —— 永远优先于它。
 
@@ -95,3 +97,36 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 | **hermes** | `~/.hermes/plugins/billion-context/`(拷贝文件 + 指向全局 dist 的 `bili.json` sidecar) | **`bili plugin update hermes`** 重新拷文件;sidecar 跟随全局安装 |
 
 这在代码里强制,不只是约定:自更新器(`src/update.ts` → `hostManagedInstall`)识别 pnpm 虚拟 store(`.pnpm`)或宿主 agent 树(pi / opencode / dsh / kimi / omp home)下的安装目录并**跳过**它们;`installViaTarball` 从结构上拒绝它们,直接调用方也无法损坏 store。混用*命令*没问题(`dsh plugin add` ≡ `bili plugin install dsh` —— 同一通道、同一记录);混用*写者*才是守卫禁止的事。`bili plugin update [client]` 是唯一能驱动每条 lane 走各自 owner 的命令,并打印逐 lane 更新路径(`bili plugin list` 显示同样的逐 lane 通道)。
+
+## 会话卡死自愈 —— 检测常量与补救(#2155)
+
+三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
+
+- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
+- **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除——或者在 `SELF_HEAL_SUPPRESS_CAP_MS`(10 分钟)内两者皆无时,抑制到时自解并重新武装(#3004/#3008:上下文单调增长时永远产生不了恢复证据,纯证据式解除曾把建议通道锁死一个多小时而用量停在 ~75%)。重新武装是有界的:再空转完整一个 `SELF_HEAL_WINDOW`(5 轮)才会再次抑制;决策梯的 fallback 逃逸在抑制期间仍可打出一次性 legacy 建议(`consumeFallback` 重置计数)。
+- **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
+
+可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。
+
+## ACP 标签回声统一整治 —— 四条不变量(#2023/#2066/#2190/#2248)
+
+一个 PR 把三条整治腿合并(refs-run 残留 #2023、退化闭名剥离+出口审计网 #2190、emission 整段丢弃+签名思考 verbatim #2066),并统一受四条硬规则约束 —— 覆盖**所有**文本改写面(loop 适配器、插件直通、JSON strip 函数、出口审计):
+
+1. **思考通道逐字节不动。** Anthropic `thinking`、Google `thought`、OpenAI `reasoning_content`/`reasoning`、Responses reasoning summaries 原样透传 —— 哪怕长得像标签回声。理由:reasoning 回放(DeepSeek 式)与签名校验验证的就是这些字节,任何改写都会让它们失步并卡死会话(#1960/KDD#10)。适配器侧走 `createIdentityStreamFilter`,strip 函数(`stripOpenaiChatText`、`stripResponsesText`)同样不动它们(纵深防御)。**注意:这翻转了 #1881 时代的 reasoning 回声剥离 —— 思考通道不再清洗。**
+2. **模型的正文输出可以治理。** 渲染标签回声、marker 行、bili 内部文本、退化开/闭名残骸,以及(absorb 受指令时)整段工具调用 emission,只在可见文本通道剥离。
+3. **模型写入文件的内容逐字节不变(#1039)。** 工具调用 arguments 无论携带什么字节都不进任何过滤器。
+4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
+
+出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。
+
+## OpenAI 聊天线路的 `prompt_cache_key`:默认处处打戳,严格上游用受控 A/B 保护(#2218/#2645/#3556)
+
+dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求体的 `prompt_cache_key`(会话头 `x-bili-plugin-conversation` 是 bili 内部头、不会以原名转发;读头的中转拿的是 `x-session-id`)。两个相互冲突的群体在这里相遇:严格的直连 API 会对未知 body 字段回 400 —— 而且严格性是**同源按模型**的(#2645:同一个 NVIDIA 网关下,一个模型收这个 key,它的兄弟模型拒收);而号池(包括**远端**中转池)把这个 key 当前缀缓存路由来读,在哪里丢它都会无声地拉低那些会话的缓存命中(#1403 类的反面)。目的地形状的门控裁决不了这件事:只给回环盖章(#2649 的尝试)治好了严格 API,却让两类最大的池子群体(docker 网桥/局域网/VPS/域名池)失去亲和。最终设计 = **默认全盖章 + 实证自愈(probe-and-remember)**,在 #2649 评审中由 owner 定案:
+
+- **打戳**(`resolveRelayAffinityPck`,`src/session-id.ts`)—— 插件道对**一切**目的地默认盖 `prompt_cache_key=<会话 id>`;客户端自带的 key 在其配对被 A/B 证实前原样透传。零配置面:无新配置字段、无环境变量、无 CLI 旗标。
+- **探测**(`src/server/relay.ts`,与 #552 兼容阶梯同一 buffered-body 缝)—— 出口体带着该 key 的**第一个** 400 触发:把同一 payload 去掉 `prompt_cache_key` 后重发一次。重试成功 ⇒ 因果坐实:采用该响应,把 `origin(+model)` 记入进程内存(`src/pck-probe.ts` —— **仅内存**,重启重新探测)。重试也失败 ⇒ 不是这字段的锅:丢弃重试,把原始 400 原样转发,什么都不学 —— key 保留,下一轮再探(400 成因很多;只有 A/B 判词可以停用)。每请求至多探一次;无循环。
+- **记忆效应** —— 被停用的配对在后续轮次同时停掉 bili 自己的戳和客户端自带的 key(否则每轮都要重付一次 400 往返)。粒度是 origin+model:共享池源上一个严格模型不影响兄弟模型。解析不了的 origin 一律 fail-open(保持盖章)。
+- **可见性** —— 首次停用打 WARN 日志,写明 origin/model、受影响会话、以及号池提示(该目的地可能是你的中转/号池,前缀缓存亲和可能下降);`acp_status` 段与网页面板横幅(中英)展示当前停用列表与会话;脚本可经 `GET /__bili/status` 的 `pckSuppressions` 字段读取。全程进程级状态,重启即清空并重新探测。
+- **双模式推理** —— 只有插件道(注册 agent / dsh 插件,内部会话头在场)会打戳;纯代理模式双向都是原样透传,逐字节不变。
+
+pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。

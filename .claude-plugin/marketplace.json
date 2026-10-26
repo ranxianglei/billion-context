@@ -1,0 +1,29 @@
+{
+  "name": "billion-context",
+  "owner": {
+    "name": "ranxianglei"
+  },
+  "metadata": {
+    "description": "billion-context — month-long single sessions (billions of tokens) · high compression quality even in small context windows (100K is enough) · 5× fewer tokens",
+    "version": "1"
+  },
+  "plugins": [
+    {
+      "name": "billion-context",
+      "source": "./",
+      "description": "Context-compression plugin for Claude Code · month-long single sessions (billions of tokens) · high compression quality even in small context windows (100K is enough) · 5× fewer tokens",
+      "version": "0.1.205",
+      "author": {
+        "name": "ranxianglei"
+      },
+      "homepage": "https://github.com/ranxianglei/billion-context",
+      "license": "MIT",
+      "keywords": [
+        "context",
+        "compression",
+        "long-context",
+        "token-saving"
+      ]
+    }
+  ]
+}

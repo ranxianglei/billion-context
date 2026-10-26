@@ -85,7 +85,7 @@ test("protectedLatestTools: explicit compress range cannot fold the latest todo 
     // SPANS the latest snapshot — the hard exclusion must carve it out.
     const spanEnd = msgs.find((m) => m.contentType === "text" && m.text?.startsWith("tail message 20"))!;
     const endRef = refOf(spanEnd);
-    assert.ok(/^m\d+$/.test(endRef ?? ""), `range end ref resolved, got ${endRef}`);
+    assert.ok(endRef !== null && /^m\d+$/.test(endRef), `range end ref resolved, got ${endRef}`);
     // The latest protected pair is UNADDRESSABLE: its refs render as the
     // literal "BLOCKED" marker, so no range (model-issued or explicit) can
     // ever cite the live snapshot into a compress range.

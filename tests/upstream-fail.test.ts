@@ -48,6 +48,14 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(netError("EAI_AGAIN", "getaddrinfo EAI_AGAIN relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("ENOTFOUND", "getaddrinfo ENOTFOUND relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("EPROTO", "protocol error")), "tls");
+    // #1987: OpenSSL certificate-TRUST codes are TLS failures (CA remediation), not unknown
+    assert.equal(classifyUpstreamFailure(netError("DEPTH_ZERO_SELF_SIGNED_CERT", "self-signed certificate")), "tls");
+    assert.equal(classifyUpstreamFailure(netError("DEPTH_ZERO_UNTRUSTED_ROOT", "self-signed certificate in certificate chain")), "tls");
+    assert.equal(classifyUpstreamFailure(netError("SELF_SIGNED_CERT_IN_CHAIN", "self-signed certificate in certificate chain")), "tls");
+    assert.equal(classifyUpstreamFailure(netError("UNABLE_TO_VERIFY_LEAF_SIGNATURE", "unable to verify the first certificate")), "tls");
+    assert.equal(classifyUpstreamFailure(netError("UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "unable to get local issuer certificate")), "tls");
+    const wrappedTrust = new TypeError("fetch failed", { cause: netError("DEPTH_ZERO_SELF_SIGNED_CERT", "self-signed certificate") });
+    assert.equal(classifyUpstreamFailure(wrappedTrust, { viaProxy: true }), "tls");
     assert.equal(classifyUpstreamFailure(new Error("weird")), "unknown");
     assert.equal(classifyUpstreamFailure(undefined), "unknown");
 });

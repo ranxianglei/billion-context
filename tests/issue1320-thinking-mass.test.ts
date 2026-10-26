@@ -7,7 +7,8 @@ process.env.NODE_ENV = "test";
 
 import { createCore, createInitialState, defaultConfig, defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { anthropicToCore, coreToAnthropic, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
-import { startServer, countSystemAndToolsTokens, projectThinkingMass, type ProxyOptions } from "../src/server.ts";
+import { startServer, countSystemAndToolsTokens, projectThinkingMass } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { estimateCoreMessages } from "../src/preflight.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -221,7 +222,7 @@ async function startHarness(): Promise<Harness> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -241,17 +242,26 @@ async function startHarness(): Promise<Harness> {
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     return {
         proxyPort,
         upstreamPort,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -299,7 +309,7 @@ test("#1320 pipeline: provider-measured thinking mass reaches the context gauge"
                 body: JSON.stringify(body),
             });
             assert.equal(resp.status, 200);
-            for await (const _chunk of resp.body) { /* drain */ }
+            for await (const _chunk of resp.body!) { /* drain */ }
         };
 
         await post({ model: "claude-test", max_tokens: 1024, stream: true, system, messages: [{ role: "user", content: "hello" }], tools });

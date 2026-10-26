@@ -6,9 +6,13 @@ import {
 import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
-import { drainPendingRetrievals } from "./store.js";
-import { executeProxyTool, buildVisibilityMarker } from "./loop/core.js";
-import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
+import { drainPendingRetrievals, imageRescaleToolArmed } from "./store.js";
+import { imageRescaleMaxDim } from "./knobs.js";
+import { applyImageRescaleItems } from "./image-rescale.js";
+import { executeProxyToolAsync, buildVisibilityMarker } from "./loop/core.js";
+import { hoistTrappedToolItems } from "./tool-pair-order.js";
+import { mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
+import { type ResponseInputItem } from "acp-kernel/wire";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
@@ -16,6 +20,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 interface CompressLoopResponsesCtx {
+    signal?: AbortSignal;
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
@@ -35,6 +40,10 @@ interface RequestOptions {
     /** Final-stage wire transform (compat.roles, #552) — same contract as the
      *  unified loop's RequestOptions.wireTransform. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #1884: re-sign hook for the armed tunnel — same contract as the unified
+     *  loop's RequestOptions.resign (loop/core.ts): invoked with the outgoing
+     *  headers and the final round body right before egress. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 interface FunctionCallAccumulator {
@@ -108,9 +117,10 @@ async function surfaceProxyJson(
         }
         let result: string;
         try {
-            result = mutating
-                ? await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs))
-                : executeProxyTool(call.name, args, ctx, call.callId, rawArgs);
+            const toolResult = mutating
+                ? await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal))
+                : await executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal);
+            result = toolResult.text;
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
@@ -160,7 +170,18 @@ export async function compressLoopResponsesJson(
             }
             return current;
         }
-        const inputItems = Array.isArray(requestBody.input) ? [...(requestBody.input as unknown[])] : [];
+        let inputItems: ResponseInputItem[] = Array.isArray(requestBody.input) ? [...requestBody.input] : [];
+        // #3400: the loop re-request resends the client's RAW input items (big
+        // images intact) — run the same egress pass the steady path applies so
+        // the upstream keeps seeing the identical downscaled bytes (the shared
+        // encode cache makes this byte-stable across rounds).
+        inputItems = (await applyImageRescaleItems(inputItems, {
+            session: ctx.session,
+            sessionId: ctx.session.id,
+            log: (lvl, msg) => ctx.log(`[${lvl}] ${msg}`),
+            maxDim: imageRescaleMaxDim(),
+            toolArmed: imageRescaleToolArmed(ctx.session),
+        })) as ResponseInputItem[];
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }
@@ -174,20 +195,30 @@ export async function compressLoopResponsesJson(
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
                 rawArgs = call.arguments;
             }
-            const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs));
-            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
+                const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
+            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
+            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
         }
         // #1097: retrieval injections ride the re-request after their ack —
-        // coreToResponses re-voices system as developer, so mirror that here.
+        // as user items (bili's own artifacts take the #377-sanctioned user
+        // voice from birth; input_text is the user-side part convention).
         for (const injection of drainPendingRetrievals(ctx.session)) {
-            inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
+            inputItems.push({ type: "message", role: "user", content: [{ type: "input_text", text: injection.text }] });
         }
-        requestBody.input = hoistTrappedToolItems(inputItems as ToolPairItem[]);
+        // #4166: no blanket re-voicing on this path. Everything bili pushes
+        // above is born user; the resent client items keep their own voices —
+        // client-origin mid system/developer is conversation data now (it
+        // re-rides verbatim exactly as the client sent it; a strict backend's
+        // rejection of it is the client's own shape, honestly forwarded). The
+        // #1999 carrier concern does not apply here: this re-request is built
+        // from the RAW client input, which never contains kernel carriers.
+        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
+        const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        requestOptions.resign?.(requestOptions.headers, roundBody);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
-            body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody),
+            body: roundBody,
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
             // #189: correlate the rejection with the rewrite that preceded it.

@@ -38,7 +38,7 @@ test("resolveDecompress: default (full:false) returns one-level view, not nested
     const { ctx, session } = compressARange();
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId;
     assert.ok(blockId, "a block was created");
-    const out = resolveDecompress({ blockId }, ctx);
+    const out = resolveDecompress({ blockId }, ctx).text;
     assert.match(out, /Block b\d+ content/);
     // one-level view: count reflects direct messages + nested child summaries
     // (for a fresh leaf block there are no nested children, so count == direct msgs)
@@ -48,7 +48,7 @@ test("resolveDecompress: default (full:false) returns one-level view, not nested
 test("resolveDecompress: full:true returns all original messages", () => {
     const { ctx, session } = compressARange();
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
-    const oneOut = resolveDecompress({ blockId }, ctx);
+    const oneOut = resolveDecompress({ blockId }, ctx).text;
     const { session: s2 } = compressARange();
     const blockId2 = [...s2.state.blocks].slice(-1)[0]?.blockId!;
     const ctx2 = { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [] as CoreMessage[], session: s2, log: () => {} };
@@ -59,7 +59,7 @@ test("resolveDecompress: full:true returns all original messages", () => {
     // content that a one-level view of a leaf block also has, but for blocks
     // WITH nested children, full includes child originals while one has child
     // summaries. Here we assert the full flag propagates to the cached view.
-    const fullOut = resolveDecompress({ blockId: blockId2, full: true }, { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: s2, log: () => {} });
+    const fullOut = resolveDecompress({ blockId: blockId2, full: true }, { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: s2, log: () => {} }).text;
     assert.match(fullOut, /full/);
 });
 
@@ -67,11 +67,11 @@ test("resolveDecompress: cache kept, block stays active, repeat is idempotent (i
     const { ctx, session } = compressARange();
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
     assert.ok(session.blockContents.has(blockId), "cache populated at compress time");
-    const out1 = resolveDecompress({ blockId }, ctx);
+    const out1 = resolveDecompress({ blockId }, ctx).text;
     assert.ok(session.blockContents.has(blockId), "cache retained after decompress");
     const block = session.state.blocks.find((b) => b.blockId === blockId);
     assert.equal(block?.active, true, "block NOT deactivated — the only state change on the inline path is the restoredInline flag (see tests/refold-wiring.test.ts)");
-    const out2 = resolveDecompress({ blockId }, ctx);
+    const out2 = resolveDecompress({ blockId }, ctx).text;
     assert.equal(out1, out2, "repeat decompress returns identical content");
 });
 
@@ -82,7 +82,7 @@ test("resolveDecompress: cache miss falls back to originals via compressMessages
     // Loop paths hand the folded view as `messages` and the original history
     // as `compressMessages`; the fallback must scan the latter, not the former.
     const foldedCtx = { core, config, messages: [] as CoreMessage[], compressMessages: msgs, session, log: () => {} };
-    const out = resolveDecompress({ blockId }, foldedCtx as never);
+    const out = resolveDecompress({ blockId }, foldedCtx as never).text;
     assert.match(out, /Historical detail 0\./, "originals recovered from the unfolded view");
     const block = session.state.blocks.find((b) => b.blockId === blockId);
     assert.equal(block?.active, true, "block stays active after fallback retrieval");
@@ -96,7 +96,7 @@ test("resolveDecompress: missing cache + folded messages returns summary, keeps 
     const emptyCtx = { core, config, messages: [] as CoreMessage[], session, log: () => {} };
     const blockBefore = session.state.blocks.find((b) => b.blockId === blockId);
     assert.ok(blockBefore?.active, "block active before decompress");
-    const out = resolveDecompress({ blockId }, emptyCtx);
+    const out = resolveDecompress({ blockId }, emptyCtx).text;
     // Falls back to summary (count 0 → summary used); block stays active.
     assert.match(out, /Block b\d+ content/);
     const blockAfter = session.state.blocks.find((b) => b.blockId === blockId);

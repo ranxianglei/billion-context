@@ -7,10 +7,12 @@ import { once } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 interface Harness {
     proxyPort: number;
@@ -32,7 +34,7 @@ async function startHarness(): Promise<Harness> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -45,24 +47,30 @@ async function startHarness(): Promise<Harness> {
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     return {
         proxyPort,
         upstreamPort,
         captured,
         close: async () => {
-            proxy.close();
-            upstream.close();
-            await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            await closeServers([proxy, upstream], "plugin-bypass harness");
         },
     };
 }
@@ -78,7 +86,7 @@ afterEach(async () => {
 });
 
 describe("plugin bypass header (#920)", () => {
-    it("bypassed requests are forwarded verbatim — no tool injection, no nudge", async () => {
+    it("bypassed requests are forwarded verbatim — no tool injection, no nudge", { timeout: 60_000 }, async () => {
         const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "hello legacy session" }] };
         const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
             method: "POST",
@@ -93,7 +101,7 @@ describe("plugin bypass header (#920)", () => {
         assert.equal(h!.captured[0]!.headers["x-bili-plugin-bypass"], "1");
     });
 
-    it("without the header the same request gets the plugin pipeline (tools injected)", async () => {
+    it("without the header the same request gets the plugin pipeline (tools injected)", { timeout: 60_000 }, async () => {
         const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "hello new session" }] };
         const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
             method: "POST",

@@ -340,14 +340,14 @@ test("extractHttpsHosts: opencode provider baseURL + omp provider baseUrl discov
 });
 
 test("extractHttpsHosts: partial opencode/omp configs are safe — seed present once #1405 lands (#1411)", () => {
-    assert.deepEqual(extractHttpsHosts({ opencode: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
-    assert.deepEqual(extractHttpsHosts({ omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ opencode: { providers: {} } }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ omp: { providers: {} } }), OPENCODE_DEFAULT_MODEL_HOSTS);
 });
 
 test("extractHttpsHosts: opencode/omp → zen gateway default host, coexists with other lanes (#1405)", () => {
-    assert.deepEqual(extractHttpsHosts({ opencode: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
-    assert.deepEqual(extractHttpsHosts({ omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
-    assert.deepEqual(extractHttpsHosts({ opencode: {}, omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ opencode: { providers: {} } }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ omp: { providers: {} } }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ opencode: { providers: {} }, omp: { providers: {} } }), OPENCODE_DEFAULT_MODEL_HOSTS);
     const mixed = extractHttpsHosts({
         opencode: { providers: { custom: { baseURL: "https://custom.example.com/v1" } } },
         claude: { anthropicBaseUrl: "https://relay.example.com" },

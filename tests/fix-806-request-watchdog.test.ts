@@ -7,7 +7,13 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
-import { startServer, requestWatchdogBudgetMs } from "../src/server.ts";
+import {
+    startServer,
+    requestWatchdogBudgetMs,
+    _setRequestWatchdogDelayForTest,
+    _requestWatchdogRearmCountForTest,
+    _resetRequestWatchdogSeamsForTest,
+} from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -47,6 +53,11 @@ async function startProxy(upstream: http.Server | net.Server, passthrough: boole
         compress: { injectTool: false, injectNudge: false },
         promptCache: { routing: "auto" },
         compat: { roles: {} },
+        streamErrorShape: "protocol",
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
@@ -136,9 +147,21 @@ test("silent upstream: accepted request ends in 504 instead of hanging forever (
 });
 
 test("healthy long stream survives the watchdog — idle semantics, not total time (#806)", async () => {
-    // 8 chunks at 400ms = ~3.2s total, which EXCEEDS the 1.5s budget. A
-    // total-time deadline would cut the stream at 1.5s; the idle watchdog
-    // re-arms on every byte written toward the client, so it completes.
+    // 8 chunks at 400ms = ~3.2s total, which EXCEEDS the 1.5s logical idle
+    // budget. A total-time deadline would cut the stream at 1.5s; the idle
+    // watchdog re-arms on every byte written toward the client, so it completes.
+    //
+    // #3091: asserting SURVIVAL against real-timer scheduling is nondeterministic
+    // under host load — the fake upstream's pacing tick, the proxy's forward
+    // writes and the expired watchdog timer share ONE event loop, and under CPU
+    // starvation (observed on windows/node-24 CI) the timer phase can fire before
+    // the next byte reaches the client, cutting a healthy stream no matter how
+    // wide the nominal margin. Stretch the watchdog's WALL-CLOCK fire delay via
+    // the #1770-style test seam so the logical budget stays 1.5s (the stream
+    // genuinely outlives it) while firing is decoupled from host load. Idle-vs-
+    // total is then pinned by the re-arm observation below, not by wall-clock
+    // survival — mirroring tests/fix-437-idle-timeout.test.ts.
+    const budgetMs = 1500;
     const intervalMs = 400;
     const totalChunks = 8;
     const streaming = http.createServer((req, res) => {
@@ -157,9 +180,12 @@ test("healthy long stream survives the watchdog — idle semantics, not total ti
     });
     await new Promise<void>((r) => streaming.listen(0, "127.0.0.1", () => r()));
     const prev = process.env.BILI_REQUEST_WATCHDOG_MS;
-    process.env.BILI_REQUEST_WATCHDOG_MS = "1500";
+    process.env.BILI_REQUEST_WATCHDOG_MS = String(budgetMs);
+    _resetRequestWatchdogSeamsForTest();
+    _setRequestWatchdogDelayForTest(30_000);
     const harness = await startProxy(streaming, true);
     try {
+        const started = Date.now();
         const res = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -169,7 +195,11 @@ test("healthy long stream survives the watchdog — idle semantics, not total ti
         const text = await res.text();
         const expected = Array.from({ length: totalChunks }, (_, i) => `chunk-${i + 1}\n`).join("");
         assert.equal(text, expected, "full stream must reach the client despite outliving the idle budget");
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed >= budgetMs, `expected the stream to outlive the logical idle budget (${budgetMs}ms), got ${elapsed}ms`);
+        assert.ok(_requestWatchdogRearmCountForTest() >= 1, "the idle watchdog must be re-armed by streamed writes — that re-arm is what makes it idle, not total-time");
     } finally {
+        _resetRequestWatchdogSeamsForTest();
         if (prev === undefined) delete process.env.BILI_REQUEST_WATCHDOG_MS; else process.env.BILI_REQUEST_WATCHDOG_MS = prev;
         await harness.stop();
         harness.cleanup();

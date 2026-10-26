@@ -87,7 +87,7 @@ test("prefix-affinity: short crafted window cannot adopt an unrelated stored ses
     const crafted = [chain[2]!, chain[3]!, chain[4]!];
     const b = r.resolve(crafted);
     assert.ok(b);
-    assert.notEqual(b.sessionId, a.sessionId, "sub-8 leading run must not adopt the stored session");
+    assert.notEqual(b.sessionId, a!.sessionId, "sub-8 leading run must not adopt the stored session");
     assert.equal(b.matchedDepth, 0);
 });
 
@@ -269,6 +269,67 @@ test("prefix-affinity: equal-depth replay under a different id is NOT a resume (
     const fp = r.chainFingerprint(transcript)!;
     r.note("sess-one", fp.depth, fp.tailHash, fp.itemHashes);
     assert.equal(r.findResumeParent(transcript, "sess-two"), null, "a byte-exact replay at the SAME depth under another id is a duplicate conversation, not a resume — linking it would adopt foreign blocks");
+});
+
+test("prefix-affinity: identity hash is invariant to cache_control placement (#2188)", () => {
+    const r = new PrefixAffinityResolver();
+    const base = [
+        { role: "user", content: [{ type: "text", text: "hello there friend" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi, how can I help" }] },
+    ];
+    const stamped = (where: number) => base.map((m, i) => ({
+        ...m,
+        content: m.content.map((b, j) => (i === where && j === 0 ? { ...b, cache_control: { type: "ephemeral" } } : { ...b })),
+    }));
+    const f1 = r.chainFingerprint(stamped(1))!;
+    const f2 = r.chainFingerprint(stamped(0))!;
+    assert.equal(f1.tailHash, f2.tailHash, "moving a cache_control breakpoint must not change the identity chain");
+    assert.deepEqual(f1.itemHashes, f2.itemHashes, "per-item hashes must ignore cache_control too");
+});
+
+test("prefix-affinity: resume-fork survives a cache_control breakpoint shift (#2188)", () => {
+    const r = new PrefixAffinityResolver();
+    const mk = (role: "user" | "assistant", text: string, cc?: boolean) => ({
+        role,
+        content: [{ type: "text", text, ...(cc ? { cache_control: { type: "ephemeral" } } : {}) }],
+    });
+    // Parent's final LIVE request: 10 messages; Claude Code stamps cache_control
+    // on its trailing pair (last assistant message + last message).
+    const parentLive = [
+        mk("user", "parent turn 0 substance"),
+        mk("assistant", "parent reply 1"),
+        mk("user", "parent turn 2 substance"),
+        mk("assistant", "parent reply 3"),
+        mk("user", "parent turn 4 substance"),
+        mk("assistant", "parent reply 5"),
+        mk("user", "parent turn 6 substance"),
+        mk("assistant", "parent reply 7"),
+        mk("assistant", "parent reply 8", true),
+        mk("user", "parent turn 9 live prompt", true),
+    ];
+    const fp = r.chainFingerprint(parentLive)!;
+    r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes, true);
+    // Resume/fork replay of the SAME ten messages, but the breakpoints have
+    // moved past them (they are mid-history now, so they no longer carry
+    // cache_control); two fresh messages extend the tail, new breakpoint on it.
+    const stripCc = (m: ReturnType<typeof mk>) => ({
+        ...m,
+        content: m.content.map((b) => { const c = { ...b }; delete c.cache_control; return c; }),
+    });
+    const childReplay = [
+        ...parentLive.map(stripCc),
+        mk("assistant", "child reply after resume"),
+        mk("user", "child question after resume", true),
+    ];
+    assert.deepEqual(
+        r.findResumeParent(childReplay, "sess-child"),
+        // #2791: depth counts WIRE-NEUTRAL turns now — the parent's ten
+        //  messages are nine turns (msgs 7–8 are consecutive assistants,
+        //  which anthropic splits and openai joins; the projection merges
+        //  them so both wires hash alike).
+        { sessionId: "sess-parent", sharedDepth: 9 },
+        "a resume/fork differing from the parent ONLY by cache_control placement must still inherit",
+    );
 });
 
 test("prefix-affinity: anonymous resolution never adopts an identified chain (#1486 #309)", () => {

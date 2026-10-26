@@ -501,6 +501,48 @@ function sessionFiles(ctx: Ctx): { file: string; parsed: SessionFile }[] {
   return out;
 }
 
+/** Whether one persisted session file carries at least one compressed block. */
+function hasPersistedBlocks(s: { parsed: SessionFile }): boolean {
+  const blocks = s.parsed.payload?.state?.blocks;
+  return (
+    blocks !== undefined &&
+    blocks !== null &&
+    Object.keys(blocks as Record<string, unknown>).length >= 1
+  );
+}
+
+/**
+ * #3269: bounded wait for the fold's blocks to land on disk. Per-turn saves
+ * are debounced (~500ms) and the client exits before that window elapses, so
+ * the final state lands during the proxy's graceful-shutdown flush — whose
+ * duration is unbounded under CI load (signal delivery, connection drain,
+ * fsync). A fixed post-SIGTERM sleep raced exactly this (same commit
+ * red→green on rerun). Poll for the on-disk postcondition instead; proxy
+ * death alone is NOT success — a crashed proxy dies unflushed and must fail
+ * loudly with diagnostics.
+ */
+async function waitForPersistedBlocks(ctx: Ctx, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const sessions = sessionFiles(ctx);
+    if (sessions.some(hasPersistedBlocks)) return;
+    if (Date.now() - started > timeoutMs) {
+      const livePids = instanceRecords(ctx)
+        .map((rec) => rec.pid)
+        .filter((pid): pid is number => typeof pid === "number" && pid > 0 && pidAlive(pid));
+      assert.fail(
+        `no persisted session carried compressed blocks after ${timeoutMs}ms ` +
+          `(got ${sessions.length} session file(s), live proxy pids: [${livePids.join(",")}])\n` +
+          `sessions:\n${
+            sessions.map((s) => `${path.basename(s.file)}: ${JSON.stringify(s.parsed).slice(0, 240)}`).join("\n") || "(none)"
+          }\n` +
+          `bili.log tail:\n${biliLog(ctx).split("\n").slice(-30).join("\n") || "(empty)"}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 test(
   "preflight: opencode binary + built dist + fake upstream (E2E_CHECK)",
   { skip: skipReason },
@@ -724,15 +766,10 @@ if (checkOnly) {
       );
 
       await stopProxiesGracefully(ctx);
-      const sessions = sessionFiles(ctx);
-      const withBlocks = sessions.filter((s) => {
-        const blocks = s.parsed.payload?.state?.blocks;
-        return blocks !== undefined && blocks !== null && Object.keys(blocks as Record<string, unknown>).length >= 1;
-      });
-      assert.ok(
-        withBlocks.length >= 1,
-        `at least one persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
-      );
+      // The fold's blocks land on disk during the proxy's graceful-shutdown
+      // flush; wait for that postcondition instead of assuming a fixed sleep
+      // (#3269: same commit red→green on rerun).
+      await waitForPersistedBlocks(ctx, 20_000);
     },
   );
 

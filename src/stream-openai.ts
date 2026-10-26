@@ -1,10 +1,20 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
-import { applyRanges, type RewriteCtx } from "./stream.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { applyRanges, runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
+import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { effectiveAbsorbConfig } from "./absorb.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
+    return runJsonRewrite(rewriteOpenaiJsonSteps(body, ctx), (call) => applyRanges(parseCompressInput(call.args, call.id), ctx).text);
+}
+
+export async function rewriteOpenaiJsonResponseAsync(body: unknown, ctx: RewriteCtx, signal?: AbortSignal): Promise<unknown> {
+    return runJsonRewriteAsync(rewriteOpenaiJsonSteps(body, ctx), async (call) => (await applyConfiguredCompression(call.args, ctx, call.id, signal)).text);
+}
+
+function* rewriteOpenaiJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCall, unknown, string> {
     if (!body || typeof body !== "object") return body;
     const b = body as {
         choices?: Array<{ message?: Record<string, unknown>; finish_reason?: string }>;
@@ -17,12 +27,12 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
     const noteParts: string[] = [];
     const keepToolCalls: unknown[] = [];
     let existingText = typeof msg.content === "string" ? msg.content : "";
-    const toolCalls = msg.tool_calls as Array<{ function?: { name?: string; arguments?: string } }> | undefined;
+    const toolCalls = msg.tool_calls as Array<{ id?: string; function?: { name?: string; arguments?: string } }> | undefined;
     if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
             if (tc.function?.name === COMPRESS_TOOL_NAME) {
                 converted = true;
-                noteParts.push(applyRanges(parseCompressInput(tc.function?.arguments ?? ""), ctx));
+                noteParts.push(yield { name: COMPRESS_TOOL_NAME, args: tc.function?.arguments ?? "", id: tc.id });
             } else {
                 sawReal = true;
                 keepToolCalls.push(tc);
@@ -41,9 +51,14 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             ctx.log(`[warn: nameless tool call] non-stream openai response carries ${namelessToolCallIdx.length} nameless tool_call(s) at index ${namelessToolCallIdx.join(",")} — forwarded verbatim (#1501 observe-only)`);
         }
     }
-    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText))) {
-        ctx.log(`[warn: tag echo] non-stream openai output contains ACP echo (render tags/markers/internal artifacts), stripped: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
-        existingText = stripAcpTags(existingText);
+    // Absorb signature in whole text (m00885): drop only when the request
+    // actually instructed the model about absorb — the shape check alone
+    // cannot tell an emission from a user-quoted fragment.
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
+    const requestText = JSON.stringify(ctx.messages);
+    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText) || (absorbArmed && containsToolCallEmissionText(existingText)))) {
+        ctx.log(`[tag-echo] stripped: non-stream openai output ACP echo (render tags/markers/internal artifacts): ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
+        existingText = stripAcpTags(existingText, absorbArmed, requestText);
         msg.content = existingText;
     }
     if (!converted) return body;

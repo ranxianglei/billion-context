@@ -8,7 +8,8 @@ import { createHash } from "node:crypto";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -90,6 +91,7 @@ async function startRig(): Promise<Rig> {
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     const proxy = await startServer(opts);
     await listen(proxy);
@@ -130,7 +132,8 @@ async function statusOf(rig: Rig, conversationId: string): Promise<{ ok?: boolea
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
     const t0 = Date.now();
     while (!cond()) {
-        if (Date.now() - t0 > 5000) throw new Error(`timeout waiting for ${what}`);
+        // windows-latest load can delay the event loop past 5s (#4161); the assertion semantics are unchanged — still waits for the same responses, just tolerates runner jitter
+        if (Date.now() - t0 > 15000) throw new Error(`timeout waiting for ${what}`);
         await new Promise((r) => setTimeout(r, 25));
     }
 }

@@ -37,7 +37,7 @@
 ### Build & Test Commands
 
 ```sh
-npm run typecheck      # tsc --noEmit --project tsconfig.build.json
+npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
 npm test               # node --import tsx --test tests/*.test.ts
 npm run build          # tsup
 ```

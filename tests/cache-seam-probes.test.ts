@@ -55,13 +55,14 @@ function listen(srv: http.Server): Promise<void> {
 }
 async function closeServer(srv: http.Server): Promise<void> {
     srv.close();
+    srv.closeIdleConnections?.();
     await Promise.race([once(srv, "close"), new Promise((r) => setTimeout(r, 2000))]);
 }
 
 /** Chat-wire fake upstream. Deliberately reports NO usage field so the session
  *  stays estimate-grade — the regime where token-count source disagreements
  *  surface. Demands a compress call once the body exceeds the threshold. */
-function startUpstream(captured: string[], plan: number[]): http.Server {
+function startUpstream(captured: string[], plan: Array<number | undefined>): http.Server {
     let calls = 0;
     let firstViewRefs: string[] | undefined;
     return http.createServer((req, res) => {
@@ -96,7 +97,7 @@ function startUpstream(captured: string[], plan: number[]): http.Server {
                 return JSON.stringify({ content: [{ startId: start, endId: end, topic: "seam probe", summary: `Seam-probe fold covering ${start}..${end}: exercised the pipeline, verified shapes, recorded deltas.` }] });
             })();
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const sse = (obj: unknown): void => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+            const sse = (obj: unknown): void => { res.write(`data: ${JSON.stringify(obj)}\n\n`); };
             if (compressArgs !== undefined) {
                 sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_cmp_${calls}`, type: "function", function: { name: "compress", arguments: "" } }] } }] });
                 for (let i = 0; i < compressArgs.length; i += 64) sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: compressArgs.slice(i, i + 64) } }] } }] });
@@ -150,7 +151,14 @@ async function driveChat(sessionId: string, opts: RigOpts): Promise<string[]> {
             log: false,
             debug: false,
             passthrough: false,
+            passthroughSource: null,
             autoUpdate: false,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
             mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(options);
@@ -189,8 +197,9 @@ async function driveChat(sessionId: string, opts: RigOpts): Promise<string[]> {
             }
         }
         if (process.env.SEAM_DUMP) {
-            fs.mkdirSync(process.env.SEAM_DUMP, { recursive: true });
-            captured.forEach((b, i) => fs.writeFileSync(path.join(process.env.SEAM_DUMP, `${String(i).padStart(3, "0")}.json`), b));
+            const dumpDir = process.env.SEAM_DUMP;
+            fs.mkdirSync(dumpDir, { recursive: true });
+            captured.forEach((b, i) => fs.writeFileSync(path.join(dumpDir, `${String(i).padStart(3, "0")}.json`), b));
         }
         return captured;
     } finally {
@@ -202,7 +211,7 @@ async function driveChat(sessionId: string, opts: RigOpts): Promise<string[]> {
     }
 }
 
-const isRound2 = (p: Item): boolean => msgsOf(p).some((mm) => asArr((mm as Msg).tool_calls).some((tc) => (tc as Msg).function?.name === "compress"));
+const isRound2 = (p: Item): boolean => msgsOf(p).some((mm) => asArr((mm as Msg).tool_calls).some((tc) => (tc as { function?: { name?: string } }).function?.name === "compress"));
 
 /** Consecutive-pair walker: every pair must share a byte-identical prefix of
  *  message elements except (a) elements carrying a fold summary that is new

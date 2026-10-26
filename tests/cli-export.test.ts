@@ -14,11 +14,12 @@ function makeSession(id: string, title: string, label: string | undefined): Sess
     return {
         id,
         meta: { protocol: "responses", upstreamOrigin: "https://api.openai.com/v1", title, ...(label ? { label } : {}) },
-        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000 },
+        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),
         state: createInitialState(),
+        pendingRetrievals: [],
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
@@ -33,7 +34,7 @@ test("bili export lists sessions and renders a handoff doc with summaries and or
         blockId: "b0", runId: "r0", tier: 1, topic: "auth debug",
         summary: "Debugged the auth flow; root cause was a stale token in config.ts:12.",
         directMessageIds: ["m1", "m2"], effectiveMessageIds: ["m1", "m2"], directBlockIds: [],
-        compressedTokens: 4200, createdAt: Date.now(), survivedCount: 2, generation: 1, active: true,
+        compressedTokens: 4200, createdAt: Date.now(), survivedCount: 2, generation: "young", active: true,
     });
     cacheBlockContent(s, "b0", {
         one: { text: "summary text", count: 1 },
@@ -88,4 +89,9 @@ test("parseArgs recognizes bili export forms", () => {
     assert.equal(c.exportOutput, "/tmp/h.md");
     const d = parseArgs(["--port", "9000"]);
     assert.equal(d.command, "start");
+    const e = parseArgs(["export", "abc123", "--jsonl"]);
+    assert.equal(e.command, "export");
+    assert.equal(e.exportSelector, "abc123");
+    assert.equal(e.exportJsonl, true);
+    assert.equal(e.exportFull, false);
 });

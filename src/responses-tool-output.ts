@@ -1,5 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, patchResponsesInput, responsesToCore, type BiliMessage, type ResponseContentPart, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
+import { isRenderedSummaryMessage } from "acp-kernel";
+import { systemToUser } from "./util.js";
 
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
     if (typeof item !== "object" || item === null) return undefined;
@@ -52,22 +54,75 @@ function rebuildToolImages(message: CoreMessage): ResponseInputItem | undefined 
     return { ...raw, call_id: message.toolCallId ?? raw.call_id, output };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function foldConfigurationFields(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(overlay)) {
+        if (isPlainRecord(out[key]) && isPlainRecord(value)) out[key] = foldConfigurationFields(out[key], value);
+        else out[key] = value;
+    }
+    return out;
+}
+
+// #1733 — upstream rejects consecutive configuration_update items (HTTP 400
+// unsupported_value). History compression prunes the messages that separated
+// them (untracked layout slots survive verbatim) and hoistTrappedToolItems can
+// batch them together too. Fold each adjacent run into one item with
+// sequential-assignment semantics: later updates win at the leaf, distinct
+// fields from both survive. No-op (byte-stable) when nothing is adjacent.
+export function mergeAdjacentConfigurationUpdates(items: readonly ResponseInputItem[]): ResponseInputItem[] {
+    const out: ResponseInputItem[] = [];
+    for (const item of items) {
+        const prev = out[out.length - 1];
+        if (item.type === "configuration_update" && prev !== undefined && prev.type === "configuration_update") {
+            const base: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(prev)) base[key] = value;
+            out[out.length - 1] = foldConfigurationFields(base, item) as ResponseInputItem;
+        } else {
+            out.push(item);
+        }
+    }
+    return out;
+}
+
+// #1999 (same bug class as #377/#428 on the chat wire): the kernel renders each
+// compressed block's summary as role:"system" anchored mid-history, and
+// coreToResponses projects that to a `developer` item AT ITS POSITION — strict
+// single-system backends (Qwen3-family "system-first" chat templates) 400 the
+// whole session after any fold. Re-voice surviving summary-carrier core
+// messages as user BEFORE the codec so they ride mid-history exactly like the
+// chat wire's systemToUser does; the head system prompt is untouched (it rides
+// instructions / the injected leading developer item, never this path). No-op
+// (same array) when nothing needs converting. Covers BOTH compression modes: in
+// plugin mode stripKernelSummaries removes the anchor when the compress pair
+// rides inbound history, but pruned or line-form echoes leave it behind — this
+// re-voicing is what keeps the wire legal then.
+// #4166: the re-voicing is narrowed to bili's OWN carriers
+// (isRenderedSummaryMessage) — client-origin mid system/developer cores are
+// conversation data and re-emit verbatim through their rawResponsesItem
+// sidecar; they are NOT rewritten here.
 export function patchResponsesInputWithToolImages(projection: ResponsesProjection, messages: CoreMessage[]): string | ResponseInputItem[] {
-    const input = patchResponsesInput(projection, messages);
+    const voiced = systemToUser(messages, (m) => isRenderedSummaryMessage(m));
+    const input = patchResponsesInput(projection, voiced);
     if (typeof input === "string") return input;
     const byOriginal = new Map<unknown, ResponseInputItem>();
     const byCall = new Map<string, ResponseInputItem>();
-    for (const message of messages) {
+    for (const message of voiced) {
         const rebuilt = rebuildToolImages(message);
         if (!rebuilt) continue;
         byOriginal.set((message as BiliMessage).rawResponsesItem, rebuilt);
         byCall.set(`${rebuilt.type}:${message.toolCallId ?? ""}`, rebuilt);
     }
-    return input.map((item) => byOriginal.get(item) ?? byCall.get(`${item.type}:${item.call_id ?? ""}`) ?? item);
+    return mergeAdjacentConfigurationUpdates(input.map((item) => byOriginal.get(item) ?? byCall.get(`${item.type}:${item.call_id ?? ""}`) ?? item));
 }
 
+// #1999: same pre-codec re-voicing as patchResponsesInputWithToolImages above.
+// #4166: carriers only — client-origin mid system/developer stays verbatim.
 export function coreToResponsesWithToolImages(messages: CoreMessage[], customToolCallIds: Set<string> = new Set()): ResponseInputItem[] {
-    return messages.flatMap((message) => {
+    return systemToUser(messages, (m) => isRenderedSummaryMessage(m)).flatMap((message) => {
         const rebuilt = rebuildToolImages(message);
         return rebuilt ? [rebuilt] : coreToResponses([message], customToolCallIds);
     });

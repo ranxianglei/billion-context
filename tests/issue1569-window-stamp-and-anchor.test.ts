@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -24,7 +27,8 @@ process.env.NODE_ENV = "test";
 
 import { createOpencodeV2Setup } from "../src/agent/opencode-v2.ts";
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
@@ -210,14 +214,16 @@ test("#1569 A4: legacy catalog.model.list seam still works (build parity)", asyn
     }
 });
 
-test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn", async () => {
+test("#1569 A5: every seam empty → header unstamped + exactly ONE degradation line in bili.log", async () => {
     const proxy = await startMiniProxy();
     globalThis.__miniOrigin = proxy.origin;
-    const warnings: string[] = [];
+    // #2831: this degradation line moved from console.warn to bili.log (host-safe channel).
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-1569a5-state-"));
+    const termLines: string[] = [];
     const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    console.warn = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
     try {
-        await withEnv1569({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        await withEnv1569({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined, XDG_STATE_HOME: stateHome }, async () => {
             const fake = makeMinimalCtx({
                 model: { list: async () => ({ data: [] }) },
                 catalog: {
@@ -231,9 +237,17 @@ test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn
                 const r2 = await fake.fire({ providerID: "prov", id: "missing" });
                 await new Promise((r) => setTimeout(r, 50));
                 assert.equal(r2["x-bili-plugin-context-window"], undefined, "no window header when no seam yields a limit");
-                const mine = warnings.filter((w) => w.includes("x-bili-plugin-context-window goes unstamped"));
-                assert.equal(mine.length, 1, `exactly one degradation warning, got: ${JSON.stringify(warnings)}`);
+                const logFile = path.join(stateHome, "billion-context", "bili.log");
+                const mine = (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+                    .split("\n")
+                    .filter((l) => l.length > 0 && l.includes("x-bili-plugin-context-window goes unstamped"));
+                assert.equal(mine.length, 1, `exactly one degradation warning, got: ${JSON.stringify(mine)}`);
                 assert.match(mine[0], /opencode\.json limit\.context is NOT reaching the proxy/);
+                assert.equal(
+                    termLines.filter((w) => w.includes("x-bili-plugin-context-window goes unstamped")).length,
+                    0,
+                    "#2831: must not reach the terminal surface",
+                );
             } finally {
                 cleanup();
             }
@@ -241,6 +255,7 @@ test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn
     } finally {
         console.warn = origWarn;
         await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 
@@ -367,7 +382,7 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
     const relay = makeRelay(reportUsage);
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -384,11 +399,18 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
     try {
-        const url = `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+        const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
         const headers = { "content-type": "application/json", "x-acp-session": sessionId };
         const base = baseConversation();
 
@@ -431,20 +453,26 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }
 
-test("#1569 B1: with a real-usage anchor, estimate-grade turns size on the calibrated view", async () => {
+test("#1569 B1 / #1839: with a real-usage anchor, estimate-grade turns size on the last usage report", async () => {
     const { streamed, nonStream, logs, anchorAfterTurn1 } = await runAnchorCase("issue1569-anchor-sess", true);
     assert.equal(anchorAfterTurn1, 5000, "turn 1's real usage report sets the calibration anchor");
     assert.equal(nonStream, 0, "preflight must stay silent (payload fits the window)");
     assert.equal(streamed.length, 2, "two streaming forwards (one per turn)");
     const sized = lastNudgeSized(logs, "issue1569-anchor-sess");
     assert.ok(sized >= 0, "turn 2 emitted a nudge diagnostic");
-    assert.ok(sized < 25_000, `anchored sizing must use the calibrated estimate (~11k for this payload), not the ~44k char-count upper bound (got ${sized})`);
+    // #1839: pre-fix this asserted < 25_000 against the calibrated estimate of
+    // the FULL INBOUND history (~11k here) — still a re-derivation, and the
+    // same branch amplified a poisoned baseline 4× in the field. The fix pins
+    // the denominator to the last REAL usage report itself.
+    assert.equal(sized, 5000, `anchored sizing must use the last usage report exactly, not any re-derived view (got ${sized})`);
     assert.ok(!streamed[1].includes(NUDGE_MARKER), "no spurious nudge injection on the anchored turn");
 });
 

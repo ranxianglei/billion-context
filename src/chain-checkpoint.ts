@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { WireProtocol } from "./util.js";
+import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 // #1357/#1395/#1421 — Chain Checkpoint (first-processor-wins idempotent interop).
 // A request-level checkpoint marks a request that already passed through a
@@ -54,8 +55,8 @@ import type { WireProtocol } from "./util.js";
 //                    beyond skew only, or unknown version only → never trusted,
 //                    process normally
 //   none             no checkpoint signal at all
-export const CHAIN_TAG = "bili-chain";
-export const SUPPORTED_CHECKPOINT_VERSION = 1;
+const CHAIN_TAG = "bili-chain";
+const SUPPORTED_CHECKPOINT_VERSION = 1;
 export const DEFAULT_MAX_FUTURE_SKEW_MS = 2 * 60 * 1000;
 export const DEFAULT_RECENT_CHECKPOINT_WINDOW_MS = 10 * 60 * 1000;
 // Generous parser ceiling: the generator emits ≤~200 chars (design target
@@ -75,7 +76,7 @@ export interface ChainCheckpoint {
 
 export type ChainVerdict = "none" | "valid" | "recent-mismatch" | "stale" | "invalid";
 
-export interface ChainCheckpointContext {
+interface ChainCheckpointContext {
     candidates: ChainCheckpoint[];
     malformed: number;
     selected?: ChainCheckpoint;
@@ -219,7 +220,7 @@ function trailingUserHitsGoogle(body: Record<string, unknown>): CarrierHit[] {
     return out.reverse();
 }
 
-export interface ChainExtraction {
+interface ChainExtraction {
     candidates: ChainCheckpoint[];
     malformed: number;
     /** The body with every recognized carrier removed — whole-slot for
@@ -542,15 +543,17 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
         const role = typeof c.role === "string" ? c.role : "user";
         if (role !== "model") {
             const parts = Array.isArray(c.parts) ? (c.parts as unknown[]) : [];
+            // #3159: plain text after a functionResponse part 400s on Vertex —
+            // normalize whichever way the carrier lands (replace-in-place or append).
             const pi = parts.length - 1;
             const pp = parts[pi];
             if (pp && typeof pp === "object" && !Array.isArray(pp)) {
                 const ppo = pp as Record<string, unknown>;
                 if (Object.keys(ppo).length === 1 && typeof ppo.text === "string" && parseChainCheckpoint(ppo.text)) {
-                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: [...parts.slice(0, pi), { text: tag }] }] };
+                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts.slice(0, pi), { text: tag }] as GooglePart[]) }] };
                 }
             }
-            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: [...parts, { text: tag }] }] };
+            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts, { text: tag }] as GooglePart[]) }] };
         }
     }
     return { ...body, contents: [...contents, { role: "user", parts: [{ text: tag }] }] };
@@ -582,7 +585,7 @@ export function computeCheckpointDigest(parsed: unknown, wire: WireProtocol, fie
     return sha256Of(jcsStringify(stripped));
 }
 
-export interface ChainEvaluationOptions {
+interface ChainEvaluationOptions {
     nowMs?: number;
     maxFutureSkewMs?: number;
     recentWindowMs?: number;

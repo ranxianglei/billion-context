@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.js";
-import type { CompressSettings } from "../src/compress-settings.js";
+import type { CompressSettings } from "../src/config.js";
 
 // acp-kernel#379 / billion-context#1249: block COUNT is not a need signal.
 // Count-triggered tier distillation defaults OFF (tier2Trigger 1000 /

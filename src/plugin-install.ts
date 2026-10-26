@@ -36,11 +36,13 @@ import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
+import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort } from "./instance.js";
+import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
-import { fetchRegistryVersion } from "./update.js";
+import { piNpmCopyRoot } from "./pi-channel.js";
+import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
@@ -65,12 +67,16 @@ import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
  *     argument after it the whole command dies at parse time, and alone it
  *     exits 0 having run nothing — a silent no-op, worse than an error.
  *
- *     No spelling covers a spaced command path in all three, so the only
- *     question is which shell to keep working. Claude Code runs hooks through
- *     PowerShell on Windows (probe-verified: a cmd-only builtin writes nothing,
- *     a PowerShell-only one writes its file), so `&` is what keeps the real
- *     path alive. cmd never sees a spaced command here — the kimi hook resolves
- *     a bare `node` through PATH, so it is never quoted. Exported for tests. */
+ *     No spelling covers a spaced command path in all three, and the client's
+ *     shell is not stable across versions anyway: #1376 probe-verified
+ *     PowerShell on Claude Code 2.1.282, while #1902 measured cmd.exe on
+ *     2.1.284 (`& was unexpected at this time.` — the lane silently never
+ *     started). So shipped hooks must never emit a spaced COMMAND token at
+ *     all: claude and kimi both pass a bare `node`, which every shell resolves
+ *     through PATH — and claude cannot run without `node` on PATH in the first
+ *     place (its npm shim invokes bare `node` itself, in the very environment
+ *     the hook later inherits). The `&` fallback below stays for hypothetical
+ *     spaced-head callers, but no shipped hook uses it. Exported for tests. */
 export function portableHookCommand(exe: string, args: string[] = []): string {
     const fwd = (p: string): string => p.replaceAll("\\", "/");
     const quoteArg = (p: string): string => (/\s/.test(p) ? `"${p}"` : p);
@@ -208,15 +214,29 @@ export function piEntryFor(root: string): string {
     return isNpmInstallForm(root) ? PI_NPM_ENTRY : root;
 }
 
+// #3131: pi's packages[] legally mixes string specs ("npm:x", package paths)
+// with object entries ({source: "…"}). Only STRING entries can identify a
+// bili install, so every matcher works on strings alone. The old code ran
+// the whole array through String() and wrote it back — each object became
+// "[object Object]" and users' local packages were silently destroyed.
+export function piPackageStrings(packages: unknown): string[] {
+    return Array.isArray(packages) ? packages.filter((p): p is string => typeof p === "string") : [];
+}
+
+function isBiliPiString(p: unknown, root: string): boolean {
+    return typeof p === "string" && isPiEntry(p, root);
+}
+
 function piInstall(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
     const settings = readJson(file);
-    const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
+    const rawPackages = Array.isArray(settings.packages) ? (settings.packages as unknown[]) : [];
+    const strings = piPackageStrings(settings.packages);
     const entry = piEntryFor(root);
-    if (packages.some((p) => p === entry)) return `pi: already installed (${file})`;
-    const removed = packages.filter((p) => isPiEntry(p, root));
-    const kept = packages.filter((p) => !isPiEntry(p, root));
+    if (strings.includes(entry)) return `pi: already installed (${file})`;
+    const removed = strings.filter((p) => isPiEntry(p, root));
+    const kept = rawPackages.filter((p) => !isBiliPiString(p, root));
     kept.push(entry);
     settings.packages = kept;
     writeJson(file, settings);
@@ -229,7 +249,7 @@ function piInstall(): string {
         ? `\npi: replaced existing entries: ${removed.join(", ")}`
           + "\npi: also check <project>/.pi/settings.json — a project-scope billion-context-pi entry (pi install -l) lives there, not in this global settings"
         : "";
-    const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs/updates it; `pi update` upgrades)" : "";
+    const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs it; the proxy self-refreshes it via `pi update --extension npm:billion-context`, or run that manually)" : "";
     return `pi: installed -> ${file} packages += ${entry}${form}${note}`;
 }
 
@@ -237,10 +257,10 @@ function piRemove(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
     const settings = readJson(file);
-    const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
-    const removed = packages.filter((p) => isPiEntry(p, root));
+    const rawPackages = Array.isArray(settings.packages) ? (settings.packages as unknown[]) : [];
+    const removed = piPackageStrings(settings.packages).filter((p) => isPiEntry(p, root));
     if (removed.length === 0) return `pi: not installed (${file})`;
-    settings.packages = packages.filter((p) => !isPiEntry(p, root));
+    settings.packages = rawPackages.filter((p) => !isBiliPiString(p, root));
     writeJson(file, settings);
     // #788: same visibility rule as install — removed entries are reported.
     return `pi: removed from ${file}\npi: removed entries: ${removed.join(", ")}`;
@@ -248,8 +268,7 @@ function piRemove(): string {
 
 function piStatus(): string {
     const root = selfPackageRoot();
-    const packages = readJson(piSettingsFile()).packages;
-    const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+    const list = piPackageStrings(readJson(piSettingsFile()).packages);
     // Any entry that loads THIS package's plugin counts (npm: form or abs
     // root); the legacy billion-context-pi package deliberately does not.
     return list.some((p) => isBiliPiEntry(p, root) || p === piEntryFor(root)) ? "installed" : "not installed";
@@ -473,17 +492,79 @@ export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env):
     return path.join(path.dirname(claudeSettingsFile(env)), "commands", "acp-cache.md");
 }
 
-/** True for an ANTHROPIC_BASE_URL value written by a bili managed block:
- *  loopback /bili/-wrapped upstream. Any port matches — an older install's
- *  port differs from the current one, and both are ours to rewrite. */
+/** True for a base-URL value written by a bili managed block: loopback
+ *  /bili/-wrapped upstream. Any port matches — an older install's port differs
+ *  from the current one, and both are ours to rewrite. The optional
+ *  `<protocol>/` segment covers the Vertex form (/bili/anthropic/<url>). */
 export function isBiliClaudeBaseUrl(value: unknown): boolean {
     if (typeof value !== "string") return false;
-    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/https?:\/\//.test(value);
+    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
+}
+
+/** Disk evidence that the Claude Desktop app is installed — the host whose
+ *  Code tab overrides ANTHROPIC_BASE_URL for its embedded Claude Code
+ *  (#2290), silently voiding the managed block's routing while its
+ *  DISABLE_AUTO_COMPACT still applies. Conservative by design: well-known
+ *  install locations only (portable installs exist), so callers treat a hit
+ *  as an advisory input and a miss as absence-of-evidence, never an error.
+ *  Injectable for tests. */
+export function claudeDesktopPresent(opts: { platform?: string; localAppData?: string; home?: string; appRoots?: string[] } = {}): boolean {
+    const platform = opts.platform ?? process.platform;
+    const home = opts.home ?? os.homedir();
+    if (platform === "win32") {
+        const lad = opts.localAppData ?? process.env.LOCALAPPDATA;
+        if (lad === undefined || lad.length === 0) return false;
+        return fs.existsSync(path.join(lad, "Programs", "Claude"));
+    }
+    if (platform === "darwin") {
+        const roots = opts.appRoots ?? ["/Applications"];
+        return [...roots, path.join(home, "Applications")].some((r) => fs.existsSync(path.join(r, "Claude.app")));
+    }
+    return false;
+}
+
+/** The loopback origin a managed block bakes in: the explicit native port when
+ *  set (#964), else the current zone preference. Exported so the Vertex and the
+ *  plain variable are always written for the SAME port. */
+export function claudeNativeOrigin(env: NodeJS.ProcessEnv = process.env): string {
+    return `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
 }
 
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
-    return claudeNativeBaseUrlForOrigin(origin, undefined, env);
+    return claudeNativeBaseUrlForOrigin(claudeNativeOrigin(env), undefined, env);
+}
+
+/** Vertex (Claude Code's third-party lane): the managed block has to pin
+ *  ANTHROPIC_VERTEX_BASE_URL too, because with CLAUDE_CODE_USE_VERTEX=1 the
+ *  client ignores the ANTHROPIC_BASE_URL the block bakes in — a native install
+ *  without this key calls Google directly and never touches bili.
+ *
+ *  Resolved the way the client itself resolves it: settings.json env block
+ *  first, then process env (readClaudeSettings). Returns undefined when the lane
+ *  is not on Vertex or no host is derivable, in which case the block leaves the
+ *  key alone.
+ *
+ *  The URL is protocol-qualified (/bili/anthropic/<url>) in mirror of
+ *  launcher.ts's wrapUpstream(origin, upstream, "anthropic") — copied rather than
+ *  imported because launcher.ts already imports this module.
+ *
+ *  Idempotent by construction: an existing value may be OUR OWN managed URL
+ *  (install, then the SessionStart repin, then every launch after that), so it is
+ *  unwrapped before being treated as an endpoint. Without that, each repin nests
+ *  another /bili/anthropic/ layer, and the nested hop targets the proxy's own port
+ *  — denied as a self-tunnel (403 detail:"self"). */
+export function claudeNativeVertexBaseUrl(origin: string, env: NodeJS.ProcessEnv = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): string | undefined {
+    let settings;
+    try {
+        settings = readClaudeSettings(homeDir, cwd, env);
+    } catch {
+        return undefined;
+    }
+    if (settings.vertexEnabled !== true) return undefined;
+    const configured = typeof settings.vertexBaseUrl === "string" ? settings.vertexBaseUrl.trim() : "";
+    const upstream = vertexBaseUrlForLocation(settings.vertexRegion, configured.length > 0 ? stripBiliWrappers(configured) : undefined);
+    if (upstream === null) return undefined;
+    return origin.replace(/\/+$/, "") + "/bili/anthropic/" + upstream.replace(/\/+$/, "");
 }
 
 /** #1660: the wrapped base URL for an arbitrary live origin — the
@@ -523,17 +604,31 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const settings = readJson(file);
     const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
-    const hookCommand = portableHookCommand(process.execPath, [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
-    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
+    // Drift repair covers the Vertex variable too: the block's port drifts the same
+    // way, and under CLAUDE_CODE_USE_VERTEX=1 that is the variable the client reads.
+    const vertexBaseUrl = claudeNativeVertexBaseUrl(origin, env);
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, ...(vertexBaseUrl !== undefined ? { vertexBaseUrl } : {}) });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
+}
+
+/** #1821: the live origin of the managed block — the port the last SessionStart
+ *  hook repinned, i.e. what a RUNNING claude session dials. Undefined when the
+ *  settings file holds no bili-managed ANTHROPIC_BASE_URL (foreign or absent). */
+export function readClaudeManagedBaseUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const cur = (readJson(claudeSettingsFile(env)).env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
+    if (typeof cur !== "string" || !isBiliClaudeBaseUrl(cur)) return undefined;
+    const i = cur.indexOf("/bili/");
+    return i > 0 ? cur.slice(0, i) : undefined;
 }
 
 /** Pure merge of the #964 managed block into parsed settings (install path).
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
  *  mutated copy plus human notes. Exported for tests. */
-export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string }): { data: Record<string, unknown>; notes: string[] } {
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; vertexBaseUrl?: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(settings);
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
@@ -545,6 +640,19 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         }
     } else {
         notes.push(`env.ANTHROPIC_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_CLAUDE_UPSTREAM, then reinstall)`);
+    }
+    // Vertex AI: same rules, second variable. Pinned only when the caller resolved
+    // one (the lane is on Vertex); a foreign value is reported, never clobbered.
+    if (opts.vertexBaseUrl !== undefined) {
+        const curVertex = env.ANTHROPIC_VERTEX_BASE_URL;
+        if (curVertex === undefined || curVertex === null || isBiliClaudeBaseUrl(curVertex)) {
+            if (curVertex !== opts.vertexBaseUrl) {
+                env.ANTHROPIC_VERTEX_BASE_URL = opts.vertexBaseUrl;
+                notes.push("env.ANTHROPIC_VERTEX_BASE_URL pinned to the bili proxy (Vertex AI lane)");
+            }
+        } else {
+            notes.push(`env.ANTHROPIC_VERTEX_BASE_URL left untouched (foreign value ${JSON.stringify(curVertex)} — Vertex traffic will bypass bili; unset it and reinstall to route it)`);
+        }
     }
     const dac = env.DISABLE_AUTO_COMPACT;
     if (dac === undefined || dac === null || dac === "1") {
@@ -623,6 +731,14 @@ export function stripClaudeManagedBlock(settings: Record<string, unknown>): { da
             delete env.DISABLE_AUTO_COMPACT;
             removed.push("env.DISABLE_AUTO_COMPACT");
         }
+        // Vertex (phase 1, decision 4): the managed block pins this key too, so
+        // removal has to take it back — otherwise `bili plugin remove claude`
+        // leaves the client pointed at a /bili/ URL that no longer serves it. A
+        // foreign endpoint is the user's and stays, same rule as install.
+        if (isBiliClaudeBaseUrl(env.ANTHROPIC_VERTEX_BASE_URL)) {
+            delete env.ANTHROPIC_VERTEX_BASE_URL;
+            removed.push("env.ANTHROPIC_VERTEX_BASE_URL");
+        }
         if (Object.keys(env).length === 0) delete data.env;
     }
     const hooks = (data.hooks !== null && typeof data.hooks === "object" && !Array.isArray(data.hooks) ? data.hooks : undefined) as Record<string, unknown> | undefined;
@@ -671,14 +787,44 @@ function runClaudeCli(claude: string, args: string[]): void {
  *  would ENOENT before runClaudeCli ever sees the .cmd. Uses where.exe; on
  *  failure or non-Windows the input is returned untouched (the original
  *  ENOENT error stays truthful). The resolver is injectable so tests never
- *  depend on a real where.exe spawn finishing in time (#1445). */
-export function resolveClaudeCli(claude: string, where?: (name: string) => { stdout: string | null }): string {
+ *  depend on a real where.exe spawn finishing in time (#1445).
+ *
+ *  #1902: npm's global dir ships three shims side by side — the extensionless
+ *  POSIX script FIRST, then .cmd, then .ps1 — and Node cannot spawn the
+ *  extensionless one (ENOENT), so taking the raw first hit breaks MCP
+ *  registration. Hits are now ranked the way cmd.exe itself resolves them:
+ *  PATH order first, PATHEXT order within each directory. When nothing
+ *  carries a PATHEXT extension the old first-hit behavior stands. */
+export function resolveClaudeCli(
+    claude: string,
+    where?: (name: string) => { stdout: string | null },
+    pathext?: string,
+): string {
     if (/[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
     const run = where ?? (process.platform === "win32" ? defaultWhereRunner : undefined);
     if (!run) return claude;
     try {
-        const first = (run(claude).stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
-        return first && first.length > 0 ? first : claude;
+        const hits = (run(claude).stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+        if (hits.length === 0) return claude;
+        const exts = (pathext ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+            .split(";")
+            .map((e) => e.trim().toLowerCase())
+            .filter((e) => e.startsWith("."));
+        const dirs = new Map<string, string[]>();
+        for (const hit of hits) {
+            const base = /[^\\/]+$/.exec(hit)?.[0] ?? hit;
+            const dir = hit.slice(0, hit.length - base.length);
+            const list = dirs.get(dir) ?? [];
+            list.push(hit);
+            dirs.set(dir, list);
+        }
+        for (const perDir of dirs.values()) {
+            for (const ext of exts) {
+                const hit = perDir.find((h) => h.toLowerCase().endsWith(ext));
+                if (hit) return hit;
+            }
+        }
+        return hits[0];
     } catch {
         return claude;
     }
@@ -689,14 +835,43 @@ function defaultWhereRunner(name: string): { stdout: string | null } {
     return { stdout: r.stdout ?? null };
 }
 
+// #1821: what to do about an existing "bili" MCP registration when installing.
+// Ownership is content-based, exactly like every other managed block here:
+// only a node-run command whose script is our entry (basename match — dev
+// checkouts and pnpm stores rename the package dir) counts as ours; anything
+// else keeps the name and is never touched. An unreadable .claude.json falls
+// back to the legacy behavior (plain add; the CLI owns its own file errors).
+function claudeMcpFaceAction(entryJs: string, stableOrigin: string):
+    { kind: "current" } | { kind: "fresh" } | { kind: "replace"; reason: string } | { kind: "foreign" } {
+    let data: Record<string, unknown>;
+    try {
+        data = readJson(claudeMcpJson());
+    } catch {
+        return { kind: "fresh" };
+    }
+    const servers = typeof data.mcpServers === "object" && data.mcpServers !== null ? (data.mcpServers as Record<string, unknown>) : {};
+    const bili = servers.bili;
+    if (typeof bili !== "object" || bili === null) return { kind: "fresh" };
+    const entry = bili as { command?: unknown; args?: unknown; env?: unknown };
+    const isNodeCommand = typeof entry.command === "string" && /node(?:\.(?:exe|cmd))?$/i.test(path.basename(entry.command));
+    const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+    const ours = isNodeCommand && args.some((a) => /dist[\\/]claude-mcp-entry\.(?:js|mjs)$/.test(a));
+    const legacy = isNodeCommand && args.some((a) => /dist[\\/]mcp\.(?:js|mjs)$/.test(a));
+    if (!ours && !legacy) return { kind: "foreign" };
+    if (!ours) return { kind: "replace", reason: "migrated from dist/mcp.js" };
+    const pin = typeof entry.env === "object" && entry.env !== null ? (entry.env as Record<string, unknown>).BILI_MCP_PROXY : undefined;
+    if (pin === stableOrigin && args.includes(entryJs)) return { kind: "current" };
+    return { kind: "replace", reason: "re-pinned" };
+}
+
 function claudeInstall(): string {
     if (process.env.BILI_NATIVE_CLAUDE === "0") {
         throw new Error("claude: install refused — BILI_NATIVE_CLAUDE=0 is set (clear it to install the native posture)");
     }
     const root = selfPackageRoot();
-    const mcpJs = path.join(root, "dist", "mcp.js");
+    const mcpEntryJs = path.join(root, "dist", "claude-mcp-entry.js");
     const bootstrapJs = path.join(root, "dist", "claude-native-bootstrap.js");
-    requireDistFile(mcpJs);
+    requireDistFile(mcpEntryJs);
     requireDistFile(bootstrapJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
@@ -710,20 +885,48 @@ function claudeInstall(): string {
     const nativePort = resolveClaudeNativePort() ?? lanePreferredPort("claude");
     const file = claudeSettingsFile();
     const settings = readJson(file);
-    const hookCommand = portableHookCommand(process.execPath, [bootstrapJs]);
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    const hookCommand = portableHookCommand("node", [bootstrapJs]);
+    // Both variables are baked for the SAME origin; the Vertex one only exists
+    // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
+    const managedOrigin = claudeNativeOrigin();
+    const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrl(),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
         hookCommand,
+        ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
     });
     writeJson(file, data);
 
-    // MCP face: same registration path as before, but pinned to the STABLE
-    // port the hook brings up — never proxyOriginForInstall() (an ephemeral
-    // launcher proxy would go stale in this static config).
+    // MCP face: pinned to the STABLE port the hook brings up — never
+    // proxyOriginForInstall() (an ephemeral launcher proxy would go stale in
+    // this static config). #1821: the entry now carries the mid-session
+    // watchdog that respawns the lane proxy when it dies; pre-watchdog
+    // installs registered plain dist/mcp.js and are swapped in place below so
+    // an upgrade lands the self-heal without a manual reinstall dance.
     const stableOrigin = `http://127.0.0.1:${nativePort}`;
     const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
+    const mcpAdd = ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpEntryJs];
+    let mcpNote: string;
     try {
-        runClaudeCli(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs]);
+        const action = claudeMcpFaceAction(mcpEntryJs, stableOrigin);
+        switch (action.kind) {
+            case "current":
+                mcpNote = `MCP face current (${claudeMcpJson()}, pinned ${stableOrigin})`;
+                break;
+            case "fresh":
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin})`;
+                break;
+            case "replace":
+                runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}, ${action.reason})`;
+                break;
+            case "foreign":
+                mcpNote = `MCP face left untouched (foreign bili server at ${claudeMcpJson()})`;
+                break;
+        }
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
         throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
@@ -743,7 +946,7 @@ function claudeInstall(): string {
     } catch (err) {
         throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate`;
 }
 
 function claudeRemove(): string {
@@ -946,7 +1149,7 @@ function pluginEntries(data: Record<string, unknown>, key: string): string[] {
 // config.json -> opencode.json -> opencode.jsonc, later wins), else create
 // opencode.json. Never spawn a second file next to an existing config — that
 // splits one logical config across files (#927).
-export function opencodeTargetFile(): string {
+function opencodeTargetFile(): string {
     const raw = process.env.OPENCODE_CONFIG?.trim();
     if (raw && raw.length > 0) return raw;
     const xdg = process.env.XDG_CONFIG_HOME?.trim();
@@ -1444,7 +1647,7 @@ interface KimiInstalledRecord {
 /** installed.json is machine-managed (kimi's own store writes it too) but is
  *  not user-authored prose — a corrupt registry is surfaced loudly instead of
  *  being silently re-created (§7.3). */
-export function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
+function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
     let text: string;
     try {
         text = fs.readFileSync(file, "utf8");
@@ -1460,7 +1663,15 @@ export function readKimiInstalledRegistry(file: string): { version: number; plug
 function writeJsonAtomic(file: string, data: unknown): void {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    // fsync before rename: a crash between write and rename otherwise leaves a
+    // size-correct, VDL=0 zero file (#3157).
+    const fd = fs.openSync(tmp, "w");
+    try {
+        fs.writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
     fs.renameSync(tmp, file);
 }
 
@@ -1468,7 +1679,7 @@ function writeJsonAtomic(file: string, data: unknown): void {
  *  with the bundled-node fallback) requires the v2 engine. A missing binary or
  *  an old one throws with launcher-mode guidance rather than writing a dead
  *  manifest. */
-export function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
+function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
     const candidates: Array<{ cmd: string; viaShell: boolean }> = process.platform === "win32"
         ? [{ cmd: "kimi --version", viaShell: true }]
         : [{ cmd: "kimi", viaShell: false }, { cmd: path.join(resolveKimiHome(env), "bin", "kimi"), viaShell: false }];
@@ -1661,13 +1872,13 @@ function zcodeArgsMatch(args: unknown, re: RegExp): boolean {
     return Array.isArray(args) && args.some((a) => typeof a === "string" && re.test(a));
 }
 
-export function isOursZcodeHookEntry(entry: unknown): boolean {
+function isOursZcodeHookEntry(entry: unknown): boolean {
     const hooks = zcodeAsPlain(entry)?.hooks;
     if (!Array.isArray(hooks)) return false;
     return hooks.some((h) => zcodeArgsMatch(zcodeAsPlain(h)?.args, ZCODE_HOOK_ENTRY_RE));
 }
 
-export function isOursZcodeMcpServer(server: unknown): boolean {
+function isOursZcodeMcpServer(server: unknown): boolean {
     const s = zcodeAsPlain(server);
     return !!s && s.type === "stdio" && zcodeArgsMatch(s.args, ZCODE_MCP_ENTRY_RE);
 }
@@ -1676,7 +1887,7 @@ export function isOursZcodeMcpServer(server: unknown): boolean {
  *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
  *  mcp.servers.bili when it already points at our dist — a user's own "bili"
  *  server throws instead of being clobbered (§7.3). */
-export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
+function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(doc);
     const notes: string[] = [];
     const hooks = zcodeAsPlain(data.hooks) ?? {};
@@ -1703,7 +1914,7 @@ export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { ho
     return { data, notes };
 }
 
-export function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
     const data = structuredClone(doc);
     const removed: string[] = [];
     const hooks = zcodeAsPlain(data.hooks);
@@ -1797,7 +2008,7 @@ function zcodeStatus(): string {
  *  resolvable. Read-only. Multi-face probes degrade to partial info on
  *  malformed config; single-source probes (pi/opencode/zcode) propagate the
  *  parse error so doctor reports a broken probe instead of a false "absent". */
-export interface LanePresence {
+interface LanePresence {
     installed: boolean;
     pointers: string[];
     targets: string[];
@@ -1824,15 +2035,85 @@ function rootFromDistFile(file: string): string {
     return path.dirname(path.dirname(path.dirname(file)));
 }
 
+// #2260(F): cache spec slots are `billion-context@<spec>`; for registry
+// installs <spec> is a dotted version, which lexicographic sort mis-orders
+// ("0.1.9" > "0.1.186" because '9' > '1'). Compare all-numeric specs per
+// segment; anything non-numeric ("latest", file: specs) falls back to plain
+// string order — same relative position as before.
+function compareSpecSlots(a: string, b: string): number {
+    const SPEC_PREFIX = "billion-context@";
+    const av = a.startsWith(SPEC_PREFIX) ? a.slice(SPEC_PREFIX.length) : a;
+    const bv = b.startsWith(SPEC_PREFIX) ? b.slice(SPEC_PREFIX.length) : b;
+    const segments = (s: string): number[] | null => {
+        const parts = s.split(".");
+        if (parts.length === 0) return null;
+        const out: number[] = [];
+        for (const p of parts) {
+            if (!/^\d+$/.test(p)) return null;
+            out.push(Number(p));
+        }
+        return out;
+    };
+    const an = segments(av);
+    const bn = segments(bv);
+    if (an !== null && bn !== null) {
+        const len = Math.max(an.length, bn.length);
+        for (let i = 0; i < len; i++) {
+            const d = (an[i] ?? 0) - (bn[i] ?? 0);
+            if (d !== 0) return d;
+        }
+        return 0;
+    }
+    return av.localeCompare(bv);
+}
+
+/** #1234/#2199: on-disk root of the OpenCode v2 cache copy of billion-context —
+ *  $XDG_CACHE_HOME/opencode/npm/billion-context@<spec>/<ts>/node_modules/billion-
+ *  context (newest spec slot, newest timestamp wins). Read-only; undefined when
+ *  no cache copy exists. Lets doctor / `plugin update` report the ACTUAL load
+ *  path + disk version instead of guessing or claiming "not resolvable". Bili
+ *  reads/updates this INNER copy only — it never edits opencode's outer
+ *  package.json/package-lock.json nor deletes its cache, so drift between the
+ *  outer lockfile and the inner package version is expected and left alone. */
+export function opencodeCacheCopyRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const xdgCache = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.trim().length > 0 ? env.XDG_CACHE_HOME : path.join(os.homedir(), ".cache");
+    const npm = path.join(xdgCache, "opencode", "npm");
+    let slots: string[];
+    try {
+        slots = fs.readdirSync(npm);
+    } catch {
+        return undefined;
+    }
+    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort(compareSpecSlots).reverse()) {
+        let stamps: string[];
+        try {
+            stamps = fs.readdirSync(path.join(npm, slot));
+        } catch {
+            continue;
+        }
+        for (const stamp of stamps.sort().reverse()) {
+            const root = path.join(npm, slot, stamp, "node_modules", DSH_PACKAGE);
+            try {
+                fs.accessSync(root);
+                return root;
+            } catch {}
+        }
+    }
+    return undefined;
+}
+
 export function inspectLanePresence(agent: PluginAgent): LanePresence {
     if (agent === "pi") {
         const root = selfPackageRoot();
-        const packages = readJson(piSettingsFile()).packages;
-        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const list = piPackageStrings(readJson(piSettingsFile()).packages);
         const entries = list.filter((p) => isBiliPiEntry(p, root) || p === piEntryFor(root));
         if (entries.length === 0) return laneAbsent();
-        if (entries.includes(PI_NPM_ENTRY)) {
-            const store = path.join(resolvePiHome(process.env), "agent", "npm", "node_modules", PI_NPM_ENTRY.slice("npm:".length));
+        // #2850: every npm spec form (plain / @pinned / @latest) resolves to
+        // the SAME pi-managed copy directory — the spec suffix never changes
+        // the folder name — so match the form, not just the exact unpinned
+        // string, and probe the real materialization path (piNpmCopyRoot).
+        if (entries.some((p) => /^npm:billion-context(@|$)/.test(p))) {
+            const store = piNpmCopyRoot(process.env);
             return {
                 installed: true,
                 pointers: entries,
@@ -1950,6 +2231,14 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         if (hasMcp) out.pointers.push("mcp.bili");
         if (listed.includes(OPENCODE_NPM_ENTRY)) {
             out.form = "npm";
+            // #1234/#2199: the bare npm entry is materialized into opencode's
+            // cache — surface the actual copy root + disk version so doctor can
+            // report staleness honestly instead of "version not resolvable".
+            const cacheRoot = opencodeCacheCopyRoot();
+            if (cacheRoot !== undefined) {
+                out.targets.push(cacheRoot);
+                out.copyVersion = pkgVersionAt(cacheRoot);
+            }
         } else if (listed.includes(dir)) {
             out.form = "local-path";
             out.targets.push(path.join(dir, "index.js"));
@@ -2066,7 +2355,57 @@ export function pluginRemove(agent: PluginAgent): string {
     return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
 }
 
-export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
+/** #2155 uninstall guardrail (advisory half): `bili plugin remove <agent>`
+ * should tell the user that already-open client windows keep talking to the
+ * proxy as zombie plugin sessions (their MCP subprocess died with the remove,
+ * but the session binding is sticky). The proxy side self-heals those sessions
+ * (degrade to proxy mode); this note closes the loop for the human. Best-effort:
+ * any failure (no proxy, endpoint down, odd shape) stays silent. */
+export async function warnActivePluginSessions(agent: PluginAgent): Promise<string> {
+    try {
+        const inst = readProxyInstanceFile();
+        if (inst === undefined) return "";
+        const res = await fetch(inst.origin.replace(/\/$/, "") + "/__bili/sessions", { signal: AbortSignal.timeout(2500), headers: { accept: "application/json" } });
+        if (!res.ok) return "";
+        const data = (await res.json()) as { sessions?: Array<Record<string, unknown>> };
+        const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        let live = 0;
+        for (const s of sessions) {
+            const hint = typeof s["clientHint"] === "string" ? s["clientHint"] : "";
+            const seen = typeof s["lastSeen"] === "string" ? Date.parse(s["lastSeen"]) : Number.NaN;
+            if (hint === agent && Number.isFinite(seen) && seen >= cutoff) live += 1;
+        }
+        if (live === 0) return "";
+        return `note: ${live} active ${agent} session(s) seen in the last 10 minutes — already-open client windows keep running; their plugin lane is gone and the proxy self-heals them to proxy mode (#2155). Reload/restart the client to fully detach.`;
+    } catch {
+        return "";
+    }
+}
+
+export interface PluginStatusRow {
+    agent: string;
+    status: string;
+    channel: string;
+    /** On-disk version of the billion-context copy this lane loads (#2325);
+     *  undefined when not resolvable from disk. */
+    copyVersion?: string;
+}
+
+/** The billion-context version(s) a lane's on-disk copy actually loads
+ *  (#2325). Single-face lanes → that copy's version; dsh (one row, N profiles)
+ *  → the distinct per-profile versions joined with "," so cross-profile drift
+ *  stays visible. undefined when nothing is resolvable. */
+function laneCopyVersion(presence: LanePresence): string | undefined {
+    if (!presence.installed) return undefined;
+    if (presence.profiles !== undefined) {
+        const set = [...new Set(presence.profiles.map((p) => p.copyVersion).filter((v): v is string => v !== undefined))];
+        return set.length > 0 ? set.join(",") : undefined;
+    }
+    return presence.copyVersion;
+}
+
+export function pluginStatusAll(): PluginStatusRow[] {
     const checks: Array<[PluginAgent, () => string]> = [
         ["pi", piStatus],
         ["omp", ompStatus],
@@ -2079,32 +2418,75 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
         ["zcode", zcodeStatus],
     ];
     return checks.map(([agent, check]) => {
+        let copyVersion: string | undefined;
         try {
-            return { agent, status: check(), channel: UPDATE_CHANNEL[agent] };
+            copyVersion = laneCopyVersion(inspectLanePresence(agent));
+        } catch {
+            copyVersion = undefined;
+        }
+        try {
+            return { agent, status: check(), channel: UPDATE_CHANNEL[agent], copyVersion };
         } catch (err) {
-            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, channel: UPDATE_CHANNEL[agent] };
+            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, channel: UPDATE_CHANNEL[agent], copyVersion };
         }
     });
 }
 
 // #991 single-writer: every lane's update path, user-facing. Host-managed
-// copies (pi's npm entry, opencode's plugin dir) are only ever updated by
-// their host; dsh profile bundles track the global version; reference lanes
-// (omp/claude/codex/kimi/hermes/zcode) follow the global bili install itself —
-// hermes additionally re-copies its Python files via `bili plugin update hermes`.
+// copies (pi's npm entry, opencode's DATA-HOME plugin tree) are only ever updated
+// by their host; EXCEPT the opencode v2 CACHE copy (~/.cache/opencode/npm/...),
+// which is bili-owned IN PLACE and self-updates through its own proxy (#1234) — a
+// different tree from the data-home one. dsh profile bundles track the global
+// version; reference lanes (omp/claude/codex/kimi/hermes/zcode) follow the global
+// bili install itself — hermes additionally re-copies its Python files via
+// `bili plugin update hermes`.
 export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
-    pi: "pi update (pi owns the npm:billion-context copy)",
+    pi: "pi update --extension npm:billion-context (pi owns the npm copy; its proxy self-drives the refresh every check cycle, #1196)",
     omp: "the global bili install (entry points at it)",
     claude: "the global bili install (hook/MCP point at it)",
     codex: "the global bili install (the mcp launcher shells out to it)",
-    opencode: "opencode's own plugin manager (opencode owns the copy)",
+    opencode: "the cache copy self-updates in place via its own proxy (#1234); OpenCode v2 'plugin update' is an extra manual channel — reload/restart OpenCode after a disk update to activate",
     dsh: "the global bili self-update (profile bundles track it)",
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
     zcode: "the global bili install (hook/MCP point at its dist)",
 };
 
-export interface PluginUpdateOpts {
+/** Render `bili plugin list` as an aligned table with a version column (#2325).
+ *  Version cell = on-disk copy version this lane loads: "—" when not installed
+ *  / probe errored, "unknown" when installed but unresolvable from disk, else
+ *  the resolved version. It NEVER falls back to the running CLI version; the
+ *  on-disk copy may lag a still-running session until reload/restart. */
+export function renderPluginList(rows: PluginStatusRow[]): string {
+    const cells = rows.map((r) => {
+        const hidden = r.status === "not installed" || r.status.startsWith("error");
+        return {
+            agent: r.agent,
+            status: r.status,
+            version: hidden ? "—" : (r.copyVersion ?? "unknown"),
+            channel: hidden ? "" : r.channel,
+        };
+    });
+    const wAgent = Math.max("agent".length, ...cells.map((c) => c.agent.length));
+    const wVersion = Math.max("version".length, ...cells.map((c) => c.version.length));
+    // Status is unbounded free text (multi-profile summaries, probe errors that
+    // carry file paths) — cap the padded width so one long row cannot stretch
+    // every other row out; an over-long status simply overflows its own row
+    // rather than being truncated.
+    const STATUS_CAP = 52;
+    const wStatus = Math.min(STATUS_CAP, Math.max("status".length, ...cells.map((c) => c.status.length)));
+    const padTo = (s: string, w: number): string => s.padEnd(w);
+    const lines: string[] = [];
+    lines.push(`${padTo("agent", wAgent)}  ${padTo("status", wStatus)}  ${padTo("version", wVersion)}  updates via`);
+    for (const c of cells) {
+        const statusCell = c.status.length > wStatus ? c.status : padTo(c.status, wStatus);
+        const body = `${padTo(c.agent, wAgent)}  ${statusCell}  ${padTo(c.version, wVersion)}`;
+        lines.push((c.channel === "" ? body : `${body}  ${c.channel}`).replace(/\s+$/, ""));
+    }
+    return `${lines.join("\n")}\n`;
+}
+
+interface PluginUpdateOpts {
     packageName: string;
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;
@@ -2118,9 +2500,13 @@ export interface PluginUpdateOpts {
  *  date, each through its OWN owner (#991 single-writer):
  *  - reference lanes (omp/claude/codex/kimi) need nothing per-lane: they
  *    point at the global install, so only the global copy updates;
- *  - host-managed copies (pi npm entry, opencode plugin entry) are never
- *    overwritten by bili — the report says which host command upgrades
- *    them;
+ *  - host-managed copies (pi npm entry, opencode DATA-HOME plugin entry) are
+ *    never overwritten by bili — the report says which host command upgrades
+ *    them (the pi copy's own proxy also self-refreshes through pi's
+ *    update channel on its periodic check, #1196). The opencode v2 CACHE copy
+ *    is the exception (#1234): bili-owned in place, self-updated by its own
+ *    proxy — `plugin update opencode` does NOT run opencode's upgrade, it only
+ *    reports that the cache copy manages itself and needs a host reload to activate;
  *  - dsh profile bundles are re-resolved to the latest registry version
  *    through dsh's own plugin channel.
  *  Returns user-facing lines. Network is only touched when a dsh profile
@@ -2144,10 +2530,11 @@ export async function pluginUpdate(agents: readonly PluginAgent[] | undefined, o
 
 async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (level: "info" | "warn", msg: string) => void): Promise<string[]> {
     if (agent === "pi") {
-        const packages = readJson(piSettingsFile()).packages;
-        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const list = piPackageStrings(readJson(piSettingsFile()).packages);
         const root = selfPackageRoot();
-        if (list.some((p) => p === PI_NPM_ENTRY)) {
+        // #2850: versioned npm specs (@pinned/@latest) are the same pi-managed
+        // copy, not a checkout pointer — route them to the same message.
+        if (list.some((p) => /^npm:billion-context(@|$)/.test(p))) {
             return ["pi: the plugin copy is pi-managed (npm:billion-context) — `pi update` upgrades it; bili never overwrites it (#991)"];
         }
         if (list.some((p) => isPiEntry(p, root))) {
@@ -2160,7 +2547,11 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
-            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"];
+            const root = opencodeCacheCopyRoot();
+            const ver = root !== undefined ? pkgVersionAt(root) : undefined;
+            const where = root !== undefined ? ` (${root})` : "";
+            const v = ver !== undefined ? ` v${ver}` : "";
+            return [`opencode: the cache copy is bili-owned and self-updates in place through its own proxy${where}${v} (#1234) — this command does NOT run opencode's upgrade; OpenCode v2 'plugin update' is an extra manual channel, and reload/restart OpenCode after a disk update to activate it`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
@@ -2179,8 +2570,14 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const latest = await fetchRegistryVersion(opts, opts.packageName);
         if (!latest) return ["dsh: could not resolve the latest version from npm — leaving profile bundles alone"];
         const before = targets.length;
-        await refreshDshProfileBundles(latest, log);
-        return [`dsh: refreshing ${before} profile bundle(s) to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+        const { refreshed, failed } = await refreshDshProfileBundles(latest, log);
+        if (failed === 0) {
+            // #2192: a clean manual run is evidence the lane works — disarm
+            // its cooldown immediately instead of letting the automatic channel
+            // wait out the window (up to 6 h).
+            await clearOwnerLaneBackoff("dsh-profile", latest);
+        }
+        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel${failed > 0 ? ` (${failed} failed)` : ""} (see log for per-profile results)`];
     }
     if (agent === "hermes") {
         if (hermesStatus() !== "installed") return ["hermes: not installed — nothing to update"];

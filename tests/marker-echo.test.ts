@@ -33,7 +33,7 @@ function makeCtx(id: string): {
         session: {
             id,
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -41,6 +41,7 @@ function makeCtx(id: string): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -291,7 +292,7 @@ test("#913: withMarkerIntegrityNote drops the silence clause when markers are in
 });
 
 test("#888: withSummaryBudgetNote steers large/dense ranges into split multi-range calls", () => {
-    const out = withSummaryBudgetNote("Nudge: OVER-LIMIT T1");
+    const out = withSummaryBudgetNote("Nudge: OVER-LIMIT T1", false);
     assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"), "input preserved verbatim");
     assert.ok(out.includes("Per-summary length budget"));
     assert.ok(out.includes("fails the WHOLE compress call"));
@@ -302,8 +303,8 @@ test("#888: withSummaryBudgetNote steers large/dense ranges into split multi-ran
 });
 
 test("#888: withSummaryBudgetNote is a byte-stable constant (prefix-cache safe)", () => {
-    const a = withSummaryBudgetNote("AAA");
-    const b = withSummaryBudgetNote("BBB");
+    const a = withSummaryBudgetNote("AAA", false);
+    const b = withSummaryBudgetNote("BBB", false);
     // Same suffix regardless of input → no dynamic values leak into the anchor.
     assert.equal(a.slice(3), b.slice(3));
 });

@@ -33,7 +33,10 @@ function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-const COMPRESS_ARGS = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+// acp_status drives the re-request these tests need: a bare-session compress
+// fails kernel validation and ends the turn under the failed-only breaker
+// (#156/#4186) before any re-request happens.
+const STATUS_ARGS = "{}";
 
 function round1Thinking(withSignature: boolean): string {
     const events = [
@@ -46,8 +49,8 @@ function round1Thinking(withSignature: boolean): string {
     }
     events.push(
         sse("content_block_stop", { type: "content_block_stop", index: 0 }),
-        sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "compress", input: {} } }),
-        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: COMPRESS_ARGS } }),
+        sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "acp_status", input: {} } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: STATUS_ARGS } }),
         sse("content_block_stop", { type: "content_block_stop", index: 1 }),
         sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } }),
         sse("message_stop", { type: "message_stop" }),
@@ -121,7 +124,7 @@ test("issue #221: re-request rejected 400 → degraded retry without thinking re
         assert.equal(fetchCalls, 2, "first re-request 400s, degraded retry follows");
         assert.equal(assistantThinkingBlocks(captured[0].body).length, 1, "first re-request replays the signed thinking block");
         assert.equal(assistantThinkingBlocks(captured[1].body).length, 0, "degraded retry strips thinking blocks");
-        assert.ok(JSON.stringify(captured[1].body).includes('"compress"'), "degraded retry keeps the compress tool_use + tool_result continuation");
+        assert.ok(JSON.stringify(captured[1].body).includes('"acp_status"'), "degraded retry keeps the acp_status tool_use + tool_result continuation");
         assert.ok(out.includes("[ACP]"), "marker surfaced to client");
         assert.ok(out.includes("Continued after compression."), "round-2 text reaches the client");
         assert.ok(!out.includes("upstream error"), "no error surfaced to the client");
@@ -148,7 +151,7 @@ test("issue #221: signature-less thinking (relay never sent signature_delta) is 
         );
         assert.equal(fetchCalls, 1, "single re-request, accepted on first try");
         assert.equal(assistantThinkingBlocks(captured[0].body).length, 0, "signature-less thinking is never replayed (it 400s on Anthropic-protocol validation)");
-        assert.ok(JSON.stringify(captured[0].body).includes('"compress"'), "compress continuation intact");
+        assert.ok(JSON.stringify(captured[0].body).includes('"acp_status"'), "acp_status continuation intact");
         assert.ok(out.includes("[ACP]"), "marker surfaced to client");
         assert.ok(out.includes("Continued after compression."), "round-2 text reaches the client");
     } finally {

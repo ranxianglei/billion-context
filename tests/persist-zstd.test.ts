@@ -26,7 +26,7 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://upstream" },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 , compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: fill > 0 ? { fill: fillRandom ? randomBytes(fill).toString("hex") : "x".repeat(fill) } : {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -34,6 +34,7 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -158,7 +159,7 @@ withTempDir("store: large session shrinks vs the default plain-JSON baseline", a
     if (!NATIVE_ZSTD) return;
     process.env.BILI_PERSIST_ZSTD = "1";
     const big = makeSession("s-big", 20_000);
-    big.blockContents.set("b1", "acp-block-summary-content ".repeat(20_000));
+    big.blockContents.set("b1", { one: null, full: { text: "acp-block-summary-content ".repeat(20_000), count: 1 } });
     const first = newStore(h);
     await first.writeNow(big);
     first.cancelAll();

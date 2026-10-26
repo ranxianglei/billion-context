@@ -17,7 +17,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "responses", upstreamOrigin: "https://api.openai.com/v1", title: "auth debugging" },
-        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000 },
+        stats: { requests: 12, tokensSaved: 0, inputTokens: 100, cachedTokens: 0, outputTokens: 50, cacheSamples: 1, lastInputTokens: 100, contextTokens: 99000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),
@@ -25,6 +25,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: true,
+        pendingRetrievals: [],
     };
 }
 
@@ -33,7 +34,7 @@ function addBlock(s: Session, blockId: string, active: boolean): void {
         blockId, runId: "r0", tier: 1, topic: "auth bug hunt",
         summary: SUMMARY,
         directMessageIds: ["m1", "m2"], effectiveMessageIds: ["m1", "m2"], directBlockIds: [],
-        compressedTokens: 4200, createdAt: Date.now() - 5000, survivedCount: 2, generation: 1, active,
+        compressedTokens: 4200, createdAt: Date.now() - 5000, survivedCount: 2, generation: "young", active,
     });
     s.blockContents.set(blockId, {
         one: null,
@@ -118,4 +119,19 @@ test("section absent without active blocks; inactive blocks excluded", () => {
     inactive.lastMessagesFolded = true;
     inactive.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
     assert.doesNotMatch(renderHandoff(inactive, false), /## Compressed block summaries/);
+});
+
+test("host-named sessions export under the host name, not the derived title (#2322)", () => {
+    const named = makeSession("named1");
+    named.meta.hostTitle = "Fix login flow";
+    named.lastMessagesFolded = true;
+    named.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
+    const md = renderHandoff(named, false);
+    assert.match(md, /- title: Fix login flow/, "handoff prefers hostTitle over the derived title");
+    assert.doesNotMatch(md, /auth debugging/, "derived title must not replace it");
+
+    const plain = makeSession("plain1");
+    plain.lastMessagesFolded = true;
+    plain.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
+    assert.match(renderHandoff(plain, false), /- title: auth debugging/, "no hostTitle → derived title unchanged");
 });

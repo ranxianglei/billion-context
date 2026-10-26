@@ -128,7 +128,7 @@ const { _resetForTest } = await import("../src/agent/native-intercept.ts");
 
 const savedFetch = globalThis.fetch;
 let fake: ReturnType<typeof makeFakeCtx> | undefined;
-let cleanup: (() => Promise<void>) | undefined;
+let cleanup: (() => void | Promise<void>) | undefined;
 
 test.after(async () => {
     await cleanup?.();

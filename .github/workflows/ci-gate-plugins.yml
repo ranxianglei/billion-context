@@ -1,0 +1,66 @@
+name: Gate Plugins (manual)
+
+# 真模型 × 真宿主 CLI 的插件车道(scripts/gate/plugin-lanes.mjs,#3416)。
+# 需要本地/自建的 OpenAI 兼容端点和各宿主 CLI,所以默认不跑:
+# 仅 workflow_dispatch 手动触发,无任何 push/PR 触发器。
+# 本地跑法(推荐,产物在仓库外)见 scripts/gate/README.md。
+# NOTE(#3967/#3711): step 级 `if: ${{ secrets.* }}` 会让 GitHub 把本 workflow 的注册
+# 判为损坏(注册名退化为文件路径),每次 push 都产生 0-job 幻影失败 run;改用
+# guard step 写 GITHUB_ENV + env.* 判定,语义不变(未配端点时跳过后续步骤)。
+on:
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: "comma-separated lanes: dsh,pi,codex,opencode,claude (+ dsh matrix/proxy #3475: dsh-responses,dsh-anthropic,dsh-google,dsh-proxy)"
+        required: false
+        default: "dsh,pi,codex,opencode,claude"
+
+permissions:
+  contents: read
+
+jobs:
+  gate-plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Guard — model endpoint configured?
+        env:
+          MODEL1_BASE_URL: ${{ secrets.GATE_MODEL1_BASE_URL }}
+        run: |
+          if [ -z "$MODEL1_BASE_URL" ]; then
+            echo "::notice::GATE_MODEL1_BASE_URL secret not set — plugin lanes need a real model endpoint. Nothing to do; see scripts/gate/README.md for the local flow."
+            echo "ENDPOINT_SET=false" >> "$GITHUB_ENV"
+          else
+            echo "endpoint configured, continuing"
+            echo "ENDPOINT_SET=true" >> "$GITHUB_ENV"
+          fi
+      - if: env.ENDPOINT_SET == 'true'
+        name: Install host CLIs
+        run: |
+          set -e
+          npm i -g @openai/codex@0.147.0 opencode@1.14.47 2>/dev/null || \
+            npm i -g @openai/codex@0.147.0 opencode-ai@1.14.47
+          # dsh / pi / claude-code 按需在此安装;缺哪个,对应车道会明确报缺
+      - if: env.ENDPOINT_SET == 'true'
+        name: Pack candidate
+        run: |
+          set -e
+          npm ci || npm install
+          npm run build
+          npm pack
+      - if: env.ENDPOINT_SET == 'true'
+        name: Run plugin lanes
+        env:
+          MODEL1_BASE_URL: ${{ secrets.GATE_MODEL1_BASE_URL }}
+          MODEL1_MODEL: ${{ secrets.GATE_MODEL1_MODEL }}
+          MODEL1_API_KEY: ${{ secrets.GATE_MODEL1_API_KEY }}
+          GATE_AGENTS: ${{ github.event.inputs.agents }}
+          GATE_TURN_TIMEOUT_MS: "300000"
+        run: |
+          set -e
+          TGZ=$(ls -1 billion-context-*.tgz | head -1)
+          test -n "$TGZ" || { echo "no tarball found" >&2; exit 1; }
+          TGZ="$PWD/$TGZ" REPO="$GITHUB_WORKSPACE" node scripts/gate/plugin-lanes.mjs

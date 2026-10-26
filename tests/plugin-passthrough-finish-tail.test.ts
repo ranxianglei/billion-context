@@ -114,7 +114,7 @@ function assertNoContentAfterFinish(text: string): void {
             const d = c?.["delta"];
             if (d && typeof d === "object") {
                 for (const k of ["content", "reasoning_content", "reasoning"]) {
-                    const v = (d as Record<string, unknown>)[k];
+                    const v: unknown = (d as Record<string, unknown>)[k];
                     assert.equal(typeof v === "string" ? v : "", "", `no ${k} delta after finish_reason`);
                 }
             }

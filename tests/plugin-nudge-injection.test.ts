@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -48,7 +49,7 @@ function turn2Messages(): Record<string, unknown>[] {
     ];
 }
 
-async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<string, string>): Promise<number> {
+async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>): Promise<{ count: number; messages: Record<string, unknown>[] }> {
     const received: unknown[][] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -62,7 +63,7 @@ async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<stri
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -84,9 +85,10 @@ async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<stri
         chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
@@ -112,21 +114,49 @@ async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<stri
         await r2.text();
 
         assert.equal(received.length, 2, "both turns reached the upstream");
-        return (received[1] ?? []).length;
+        const msgs = (received[1] ?? []) as Record<string, unknown>[];
+        return { count: msgs.length, messages: msgs };
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }
 
 test("#451 control: nudge injected in PROXY mode when armed", async () => {
-    const len = await forwardedTurn2Length("nudge-ctrl", {});
-    assert.equal(len, 31, "proxy mode appends the nudge as a trailing user message at 78% of 64k");
+    const { count } = await forwardedTurn2("nudge-ctrl", {});
+    assert.equal(count, 31, "proxy mode appends the nudge as a trailing user message at 78% of 64k");
 });
 
 test("#451: nudge ALSO injected in PLUGIN mode when armed (regression)", async () => {
-    const len = await forwardedTurn2Length("nudge-plugin", { "x-bili-plugin": "omp" });
-    assert.equal(len, 31, "plugin mode must append the nudge too — before the fix the !pluginMode gate suppressed it and this would be 30");
+    const { count } = await forwardedTurn2("nudge-plugin", { "x-bili-plugin": "omp" });
+    assert.equal(count, 31, "plugin mode must append the nudge too — before the fix the !pluginMode gate suppressed it and this would be 30");
+});
+
+// #3177: DSH registers bili's ACP tools host-scope, invisible to its preset agent
+// (0 of 3939 request headers carried them), so model-driven compression is
+// structurally unreachable there. The proxy must drop the whole model-side compress
+// surface for DSH plugin sessions — otherwise the standing prompt + nudge tell the
+// model to call a tool it can never reach ("unknown tool \"compress\""). pi/omp keep
+// the surface (their extensions expose the tools visibly), so the differential below
+// pins the fix without touching their behavior.
+test("#3177: DSH plugin session drops the compress nudge (regression)", async () => {
+    const { count, messages } = await forwardedTurn2("dsh-nudge", { "x-bili-plugin": "dsh" });
+    assert.equal(count, 30, "DSH drops the nudge — an omp plugin session is 31, pre-fix DSH was 31 too");
+    const last = messages[messages.length - 1];
+    assert.ok(String(last?.["content"]).includes("now summarize"), "the client's own final turn is last — no nudge user message appended after it");
+});
+
+test("#3177: DSH plugin session also drops the standing compress system prompt (regression)", async () => {
+    const omp = await forwardedTurn2("dsh-sys-omp", { "x-bili-plugin": "omp" });
+    const dsh = await forwardedTurn2("dsh-sys-dsh", { "x-bili-plugin": "dsh" });
+    const ompSys = String((omp.messages[0] ?? {})["content"] ?? "");
+    const dshSys = String((dsh.messages[0] ?? {})["content"] ?? "");
+    assert.ok(ompSys.includes("ACP TAGS"), "control: omp keeps the standing compress prompt (carries the ACP tag guidance)");
+    // The full standing prompt (philosophy + how-to + tool surface) is far larger than
+    // the tags-only fallback DSH falls back to — so DSH's leading system block shrinks.
+    assert.ok(ompSys.length - dshSys.length > 300, `omp system ${ompSys.length}B vs dsh ${dshSys.length}B — DSH must drop the standing compress prompt`);
 });

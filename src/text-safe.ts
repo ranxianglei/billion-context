@@ -35,3 +35,68 @@ export function scrubLoneSurrogates(text: string): string {
         .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
         .replace(/(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
 }
+
+/** Escape-text counterpart for ALREADY-SERIALIZED JSON bodies. JSON.stringify
+ *  renders a lone half as the six-character escape `\uXXXX`, so by the time a
+ *  body is on the wire the half is ASCII escape text and scrubLoneSurrogates
+ *  above sees no code unit to fix. This walks backslash runs — an escape only
+ *  starts on an ODD-length run, so doubled `\\uXXXX` (literal prose, e.g. a
+ *  model quoting an encoded glyph out of tool output) stays untouched — keeps a
+ *  well-formed high+low pair intact, and rewrites an unpaired half to the
+ *  U+FFFD escape. Strict upstream parsers reject the ENTIRE body for one
+ *  unpaired escape (#1615 family: an ACP-status report re-decoded into a real
+ *  half, which then re-serialized unpaired on every later request). */
+export function scrubLoneSurrogateEscapes(text: string): string {
+    if (text.indexOf("\\u") === -1) return text;
+    const n = text.length;
+    // Copy each unchanged span whole (slice) and hop between backslashes via
+    // indexOf instead of walking char-by-char: per-char `out +=` builds a
+    // quadratic chain, so one stray `\u` forced the ENTIRE body through
+    // per-character allocation and blew a 2 GiB heap (#2957).
+    const parts: string[] = [];
+    let pos = 0; // last emitted index — start of the pending unchanged span
+    let i = 0;
+    while ((i = text.indexOf("\\", i)) !== -1) {
+        if (i > pos) parts.push(text.slice(pos, i));
+        let j = i;
+        while (j < n && text.charCodeAt(j) === 0x5c) j += 1;
+        const run = j - i;
+        parts.push(text.slice(i, j));
+        pos = j;
+        if (run % 2 === 0) { i = j; continue; } // even run: no escape starts here
+        if (text.charCodeAt(j) !== 0x75) { i = j; continue; } // \n, \t, \" ...
+        const hex = text.slice(j + 1, j + 5);
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) { i = j; continue; }
+        const cp = parseInt(hex, 16);
+        if (cp >= 0xdc00 && cp <= 0xdfff) {
+            parts.push("ufffd"); // lone low (the backslash is already emitted)
+            pos = j + 5; i = j + 5;
+            continue;
+        }
+        if (cp >= 0xd800 && cp <= 0xdbff) {
+            const nextHex = text.slice(j + 7, j + 11);
+            if (text.charCodeAt(j + 5) === 0x5c && text.charCodeAt(j + 6) === 0x75 && /^[0-9a-fA-F]{4}$/.test(nextHex)) {
+                const lo = parseInt(nextHex, 16);
+                if (lo >= 0xdc00 && lo <= 0xdfff) {
+                    parts.push(text.slice(j, j + 11)); // valid pair — keep verbatim
+                    pos = j + 11; i = j + 11;
+                    continue;
+                }
+            }
+            parts.push("ufffd"); // lone high
+            pos = j + 5; i = j + 5;
+            continue;
+        }
+        parts.push(text.slice(j, j + 5)); // non-surrogate escape — keep
+        pos = j + 5; i = j + 5;
+    }
+    if (pos < n) parts.push(text.slice(pos)); // trailing unchanged span
+    return parts.join("");
+}
+
+/** Wire-level scrub for a serialized request body: real lone halves AND
+ *  unpaired escape text both become U+FFFD. Use this at every upstream send
+ *  seam; use scrubLoneSurrogates alone when the text is not yet JSON-encoded. */
+export function scrubLoneSurrogatesOnWire(text: string): string {
+    return scrubLoneSurrogateEscapes(scrubLoneSurrogates(text));
+}

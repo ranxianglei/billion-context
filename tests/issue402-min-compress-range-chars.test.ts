@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, type Config } from "acp-kernel";
 import { applyCompressSettings, mergeCompress, resolveCompress } from "../src/compress-settings.ts";
 import { parseCompressSettings, type ProviderRoutes } from "../src/config.ts";
 import { _resetForTest, _setForTest, peekRegistryContext } from "../src/registry.ts";
@@ -22,9 +22,9 @@ test("mergeCompress: output is normalized — deprecated key never appears in th
 });
 
 test("applyCompressSettings: minCompressRangeChars maps onto kernel compress.minCompressRange; alias still accepted", () => {
-    const out = applyCompressSettings(defaultConfig(), 200000, { minCompressRangeChars: 20000 });
+    const out = applyCompressSettings((defaultConfig as (limit?: number) => Config)(), 200000, { minCompressRangeChars: 20000 });
     assert.equal(out.compress.minCompressRange, 20000);
-    const alias = applyCompressSettings(defaultConfig(), 200000, { minCompressRange: 7000 });
+    const alias = applyCompressSettings((defaultConfig as (limit?: number) => Config)(), 200000, { minCompressRange: 7000 });
     assert.equal(alias.compress.minCompressRange, 7000);
 });
 

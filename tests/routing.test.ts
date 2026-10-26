@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting, normalizeUrlKey } from "../src/config.ts";
+import type { ProviderRoutes } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -106,6 +107,23 @@ test("lookupContextLimit returns undefined for unknown models", () => {
     assert.equal(lookupContextLimit(undefined), undefined);
 });
 
+test("lookupContextLimit classifies by the model segment, not the provider prefix (#2074)", () => {
+    // A provider segment starting with a family keyword must not hijack the match.
+    assert.equal(lookupContextLimit("Kimi/glm-5"), 1_000_000);
+    assert.equal(lookupContextLimit("Qwen/DeepSeek-V4-Pro"), 1_000_000);
+    // Specific rules win over broad ones once the prefix is off the tested
+    // segment (deepseek/deepseek-r1 used to fall to ^deepseek → 1M).
+    assert.equal(lookupContextLimit("deepseek/deepseek-r1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v3"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v3.1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-ocr-2"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v4-flash"), 1_000_000);
+    // Non-family provider prefixes behave exactly as before (#736 baseline).
+    assert.equal(lookupContextLimit("traework/glm-5.3"), 1_000_000);
+    // The provider hint still rescues tails carrying no family signal of their own.
+    assert.equal(lookupContextLimit("qwen/qwq-32b"), 200_000);
+});
+
 // ── resolveContextLimit: longest-prefix matching on URL keys ──────────────
 // The key is the /bili/<this> string. A request matches when its embedded
 // upstream URL equals the key, or starts with key + "/". Longest key wins
@@ -202,7 +220,6 @@ test("no matching key and unknown model returns undefined", () => {
 // Trailing slashes on config keys are normalized away so they still match.
 // A user typing "https://open.bigmodel.cn/" (trailing slash) must still get
 // the override for requests to that host.
-import { normalizeUrlKey } from "../src/config.ts";
 test("normalizeUrlKey strips trailing slashes", () => {
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn/"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
@@ -211,7 +228,7 @@ test("normalizeUrlKey strips trailing slashes", () => {
 });
 
 test("resolveCompressProtocol: longest-prefix URL match, undefined = default tools", () => {
-    const routes = {
+    const routes: ProviderRoutes = {
         "https://chatgpt.com": { compressProtocol: "marker" },
         "https://ai.comfly.org": { models: { "gpt-5.6-sol": { context: 400000 } } },
     };

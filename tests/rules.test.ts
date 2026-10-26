@@ -87,45 +87,45 @@ test("effectiveRulesEnabled: opt-in — unset → off; explicit true enables fro
 
 test("executeRule: add records with trim, omitting rule lists", () => {
     const { session, ctx } = makeRuleCtx();
-    assert.equal(executeRule({ rule: "always run tests before committing" }, ctx), "Recorded rule1: always run tests before committing");
-    assert.equal(executeRule({ rule: "  trim input text  " }, ctx), "Recorded rule2: trim input text");
+    assert.equal(executeRule({ rule: "always run tests before committing" }, ctx).text, "Recorded rule1: always run tests before committing");
+    assert.equal(executeRule({ rule: "  trim input text  " }, ctx).text, "Recorded rule2: trim input text");
     const listing = "1. [rule1] always run tests before committing\n2. [rule2] trim input text";
-    assert.equal(executeRule({}, ctx), listing);
-    assert.equal(executeRule({ rule: "   " }, ctx), listing);
-    assert.equal(executeRule({ rule: 42 }, ctx), listing);
+    assert.equal(executeRule({}, ctx).text, listing);
+    assert.equal(executeRule({ rule: "   " }, ctx).text, listing);
+    assert.equal(executeRule({ rule: 42 }, ctx).text, listing);
     assert.equal(session.state.rules?.length, 2);
 });
 
 test("executeRule: validation failures return verbatim kernel errors, no state change", () => {
     const { session, ctx } = makeRuleCtx();
-    assert.equal(executeRule({ rule: "dup rule" }, ctx), "Recorded rule1: dup rule");
-    assert.equal(executeRule({ rule: "dup rule" }, ctx), "identical rule already exists (rule1) \u2014 no change.");
-    assert.match(executeRule({ rule: "x".repeat(301) }, ctx), /^301 chars exceeds the 300-char limit/);
+    assert.equal(executeRule({ rule: "dup rule" }, ctx).text, "Recorded rule1: dup rule");
+    assert.equal(executeRule({ rule: "dup rule" }, ctx).text, "identical rule already exists (rule1) \u2014 no change.");
+    assert.match(executeRule({ rule: "x".repeat(301) }, ctx).text, /^301 chars exceeds the 300-char limit/);
     assert.equal((session.state.rules ?? []).length, 1);
 });
 
 test("executeRule: maxRules cap from config limits", () => {
     const { ctx } = makeRuleCtx({ rules: { enabled: true, maxRules: 2 } });
-    assert.match(executeRule({ rule: "one" }, ctx), /^Recorded rule1: one$/);
-    assert.match(executeRule({ rule: "two" }, ctx), /^Recorded rule2: two$/);
-    assert.match(executeRule({ rule: "three" }, ctx), /^rule limit reached \(2\)/);
+    assert.match(executeRule({ rule: "one" }, ctx).text, /^Recorded rule1: one$/);
+    assert.match(executeRule({ rule: "two" }, ctx).text, /^Recorded rule2: two$/);
+    assert.match(executeRule({ rule: "three" }, ctx).text, /^rule limit reached \(2\)/);
 });
 
 test("executeRule: delete removes one rule by id and returns Removed with its text", () => {
     const { session, ctx } = makeRuleCtx();
-    assert.equal(executeRule({ rule: "keep me" }, ctx), "Recorded rule1: keep me");
-    assert.equal(executeRule({ rule: "drop me" }, ctx), "Recorded rule2: drop me");
-    assert.equal(executeRule({ delete: "rule2" }, ctx), "Removed rule2: drop me");
+    assert.equal(executeRule({ rule: "keep me" }, ctx).text, "Recorded rule1: keep me");
+    assert.equal(executeRule({ rule: "drop me" }, ctx).text, "Recorded rule2: drop me");
+    assert.equal(executeRule({ delete: "rule2" }, ctx).text, "Removed rule2: drop me");
     assert.deepEqual(session.state.rules, [{ id: "rule1", text: "keep me" }]);
-    assert.equal(executeRule({}, ctx), "1. [rule1] keep me");
+    assert.equal(executeRule({}, ctx).text, "1. [rule1] keep me");
 });
 
 test("executeRule: delete trims the id and passes unknown ids through verbatim", () => {
     const { session, ctx } = makeRuleCtx();
-    assert.equal(executeRule({ rule: "target" }, ctx), "Recorded rule1: target");
-    assert.equal(executeRule({ delete: "  rule9  " }, ctx), 'no rule with id "rule9" \u2014 list current rules first (omit the text argument).');
+    assert.equal(executeRule({ rule: "target" }, ctx).text, "Recorded rule1: target");
+    assert.equal(executeRule({ delete: "  rule9  " }, ctx).text, 'no rule with id "rule9" \u2014 list current rules first (omit the text argument).');
     assert.deepEqual(session.state.rules, [{ id: "rule1", text: "target" }], "failed delete must not mutate state");
-    assert.equal(executeRule({ delete: "  rule1 " }, ctx), "Removed rule1: target");
+    assert.equal(executeRule({ delete: "  rule1 " }, ctx).text, "Removed rule1: target");
     assert.equal(session.state.rules?.length, 0);
 });
 
@@ -133,23 +133,23 @@ test("executeRule: clear removes all rules and reports the count; empty clear is
     const { session, ctx } = makeRuleCtx();
     executeRule({ rule: "one" }, ctx);
     executeRule({ rule: "two" }, ctx);
-    assert.equal(executeRule({ clear: true }, ctx), "Cleared 2 rule(s).");
+    assert.equal(executeRule({ clear: true }, ctx).text, "Cleared 2 rule(s).");
     assert.deepEqual(session.state.rules, []);
-    assert.equal(executeRule({}, ctx), "No rules recorded.");
-    assert.equal(executeRule({ clear: true }, ctx), "No rules to clear.");
+    assert.equal(executeRule({}, ctx).text, "No rules recorded.");
+    assert.equal(executeRule({ clear: true }, ctx).text, "No rules to clear.");
 });
 
 test("executeRule: delete/clear are mutually exclusive with each other and with rule", () => {
     const { session, ctx } = makeRuleCtx();
     executeRule({ rule: "survivor" }, ctx);
     const conflict = "Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).";
-    assert.equal(executeRule({ delete: "rule1", clear: true }, ctx), conflict);
-    assert.equal(executeRule({ delete: "rule1", rule: "new" }, ctx), conflict);
-    assert.equal(executeRule({ clear: true, rule: "new" }, ctx), conflict);
+    assert.equal(executeRule({ delete: "rule1", clear: true }, ctx).text, conflict);
+    assert.equal(executeRule({ delete: "rule1", rule: "new" }, ctx).text, conflict);
+    assert.equal(executeRule({ clear: true, rule: "new" }, ctx).text, conflict);
     assert.deepEqual(session.state.rules, [{ id: "rule1", text: "survivor" }], "conflicting calls must not mutate state");
     // Non-string delete / non-true clear are ignored, same convention as non-string rule.
-    assert.equal(executeRule({ delete: true }, ctx), "1. [rule1] survivor");
-    assert.equal(executeRule({ clear: false }, ctx), "1. [rule1] survivor");
+    assert.equal(executeRule({ delete: true }, ctx).text, "1. [rule1] survivor");
+    assert.equal(executeRule({ clear: false }, ctx).text, "1. [rule1] survivor");
 });
 
 test("acp_rule schemas document rule/delete/clear on every wire shape", () => {
@@ -166,12 +166,12 @@ test("acp_rule schemas document rule/delete/clear on every wire shape", () => {
 test("executeProxyTool: routes acp_rule through executeRule when enabled, unknown tool otherwise", () => {
     const { session, ctx } = makeRuleCtx();
     const loopCtx: LoopCtx = { core: createCore(), config: ctx.config, messages: [], session, log: () => {} };
-    assert.equal(executeProxyTool(RULE_TOOL_NAME, { rule: "via loop" }, loopCtx), "Recorded rule1: via loop");
-    assert.equal(executeProxyTool(RULE_TOOL_NAME, { delete: "rule1" }, loopCtx), "Removed rule1: via loop");
+    assert.equal(executeProxyTool(RULE_TOOL_NAME, { rule: "via loop" }, loopCtx).text, "Recorded rule1: via loop");
+    assert.equal(executeProxyTool(RULE_TOOL_NAME, { delete: "rule1" }, loopCtx).text, "Removed rule1: via loop");
 
     const offSession = makeSession();
     const offCtx: LoopCtx = { core: createCore(), config: { ...defaultConfig(200000), rules: { enabled: false } }, messages: [], session: offSession, log: () => {} };
-    assert.equal(executeProxyTool(RULE_TOOL_NAME, {}, offCtx), `[Unknown proxy tool: ${RULE_TOOL_NAME}]`);
+    assert.equal(executeProxyTool(RULE_TOOL_NAME, {}, offCtx).text, `[Unknown proxy tool: ${RULE_TOOL_NAME}]`);
 });
 
 test("parseCompressSettings: validates rules boolean, rejects whole block on bad field", () => {

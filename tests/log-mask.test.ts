@@ -22,7 +22,10 @@ import {
     maskHostInText,
     maskHostPortForLog,
     maskIpsInText,
+    maskUrlForDiagnostics,
     maskUrlForLog,
+    maskUrlsForDiagnostics,
+    maskUrlsForPublish,
     maskUrlsInText,
     redactSecretsInText,
     setMaskHostsEnabled,
@@ -75,6 +78,66 @@ test("maskUrlsInText: masks URLs embedded in arbitrary strings", () => {
         "forward POST → https://api.openai.com/v1/chat/completions",
     );
     assert.equal(maskUrlsInText("no urls here"), "no urls here");
+});
+
+test("maskUrlsInText: non-http userinfo schemes are masked too (#4191)", () => {
+    assert.equal(maskUrlsInText(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsInText("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    assert.equal(maskUrlsInText("wss://a:b@host.example/x"), "wss://<private-host>/x");
+    assert.equal(maskUrlsInText("ftp://user:pass@ftp.example/pub"), "ftp://<private-host>/pub");
+    // userinfo/query/hash dropped, path kept; a pathless non-special scheme keeps no trailing "/"
+    assert.equal(maskUrlsInText("socks5h://x:y@r.internal/a/b?c=d#f"), "socks5h://<private-host>/a/b");
+    assert.equal(maskUrlsInText("socks5://10.0.0.1:1080"), "socks5://<private-host>:1080");
+    assert.equal(maskUrlsInText("junk http:// trailing stays"), "junk http:// trailing stays");
+    assert.equal(maskUrlsInText("mailto:x@y.com stays"), "mailto:x@y.com stays");
+});
+
+test("maskUrlsInText: word-char-glued URL stays masked — no leading \\b in the entry regex (#4191)", () => {
+    // A leading \b would skip these (word char → no boundary) and leak the host;
+    // over-masking is safe, under-masking is not. Pins the unbounded pattern.
+    assert.ok(!maskUrlsInText("_https://foo.com/bar underscore").includes("foo.com"));
+    assert.ok(!maskUrlsInText("xhttps://foo.com/bar glued").includes("foo.com"));
+});
+
+test("maskUrlsForDiagnostics: non-http userinfo schemes are masked too (#4191)", () => {
+    assert.equal(maskUrlsForDiagnostics(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsForDiagnostics("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    // loopback exemption applies per-scheme: bili's own local proxy stays verbatim
+    assert.equal(maskUrlsForDiagnostics("probe ws://127.0.0.1:9000/acp"), "probe ws://127.0.0.1:9000/acp");
+});
+
+test("maskUrlsForPublish: non-http userinfo schemes masked on the PUBLIC boundary (#4191)", () => {
+    // unlike the log/diagnostics paths, publish masks non-public hosts unconditionally (ignores BILI_LOG_MASK_HOSTS=0)
+    assert.equal(maskUrlsForPublish(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsForPublish("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    assert.equal(maskUrlsForPublish("ftp://user:pass@ftp.example/pub"), "ftp://<private-host>/pub");
+    assert.equal(maskUrlsForPublish("https://api.anthropic.com/v1/messages"), "https://api.anthropic.com/v1/messages");
+});
+
+test("maskUrlForDiagnostics: loopback exempt (identifies bili's own proxy), non-public still masked (#3651)", () => {
+    assert.equal(maskUrlForDiagnostics("http://127.0.0.1:18787/v1/messages"), "http://127.0.0.1:18787/v1/messages");
+    assert.equal(maskUrlForDiagnostics("http://localhost:9090/acp"), "http://localhost:9090/acp");
+    assert.equal(maskUrlForDiagnostics("http://[::1]:9090/acp"), "http://[::1]:9090/acp");
+    assert.equal(maskUrlForDiagnostics("https://relay.internal:8443/v1/chat/completions"), "https://<private-host>:8443/v1/chat/completions");
+    assert.equal(maskUrlForDiagnostics("https://api.anthropic.com/v1/messages"), "https://api.anthropic.com/v1/messages");
+    assert.equal(maskUrlForDiagnostics("not a url"), "<unparseable-url>");
+});
+
+test("maskUrlsForDiagnostics: text-level twin — loopback URLs kept, others masked, junk passes through (#3651)", () => {
+    assert.equal(
+        maskUrlsForDiagnostics("probe https://relay.internal.example/v1/chat/completions http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages"),
+        "probe https://<private-host>/v1/chat/completions http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages",
+    );
+    assert.equal(maskUrlsForDiagnostics("junk http:// trailing stays"), "junk http:// trailing stays");
 });
 
 test("maskHostPortForLog: CONNECT targets", () => {
@@ -207,6 +270,7 @@ test("proxy debug logs: no credentials, no non-public host in ANY log line (#255
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
+            proxy: "",
             routes: {
                 [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 400_000 } } },
             },
@@ -219,7 +283,15 @@ test("proxy debug logs: no credentials, no non-public host in ANY log line (#255
             debug: true,
             passthrough: false,
             autoUpdate: false,
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
             mitm: { enabled: false, domains: [] },
+            proxyFallback: { explicitDirect: true, globalSource: "direct" },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -270,6 +342,110 @@ test("proxy debug logs: no credentials, no non-public host in ANY log line (#255
     }
 });
 
+// #1933/#255: the mid-session route-change demotion line logs BOTH the baseline
+// origin and the current origin — the same non-public-host leak class as the
+// [usage-vs-est] diagnostic (#2570), so both must ride maskUrlForLog.
+test("proxy preflight route-change demotion log masks both origins (#1933/#255)", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-rt-"));
+    const prev = {
+        xdgState: process.env.XDG_STATE_HOME,
+        rawDump: process.env.ACP_RAW_DUMP_DIR,
+        dumpReq: process.env.ACP_DUMP_REQ,
+    };
+    process.env.XDG_STATE_HOME = tmpRoot;
+    process.env.ACP_RAW_DUMP_DIR = path.join(tmpRoot, "raw");
+    process.env.ACP_DUMP_REQ = "0";
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const completion = (id: string, usage?: Record<string, number>) =>
+        JSON.stringify({ id, object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], ...(usage ? { usage } : {}) });
+    // A bills a usage baseline; B receives the same session's next request.
+    const upstreamA = http.createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(completion("r1", { prompt_tokens: 5000, completion_tokens: 7 }));
+    });
+    const upstreamB = http.createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(completion("r2"));
+    });
+    let proxy: http.Server | undefined;
+    try {
+        upstreamA.listen(0, "127.0.0.1");
+        await once(upstreamA, "listening");
+        upstreamB.listen(0, "127.0.0.1");
+        await once(upstreamB, "listening");
+        const portA = (upstreamA.address() as { port: number }).port;
+        const portB = (upstreamB.address() as { port: number }).port;
+        const opts: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1",
+            proxy: "",
+            routes: {
+                [`http://127.0.0.1:${portA}`]: { models: { "gpt-test": { context: 400_000 } } },
+                [`http://127.0.0.1:${portB}`]: { models: { "gpt-test": { context: 400_000 } } },
+            },
+            modelContextLimit: 400_000,
+            kernelConfig: defaultConfig(400_000),
+            // injectTool must stay ON here: only compress-injected requests
+            // enter the rewriter path that settles upstream usage into the
+            // session baseline (non-injected turns pipe through with usage
+            // accounting off), and the demotion line needs a settled
+            // usage-grade baseline to fire.
+            compress: { injectTool: true, injectNudge: false },
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: true,
+            debug: true,
+            passthrough: false,
+            autoUpdate: false,
+            autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+            mitm: { enabled: false, domains: [] },
+            proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        };
+        proxy = await startServer(opts);
+        await once(proxy, "listening");
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const body = JSON.stringify({ model: "gpt-test", max_tokens: 8192, messages: [{ role: "user", content: "hi" }] });
+        const hdrs = { "content-type": "application/json", "x-acp-session": "log-mask-route-change" };
+        const r1 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${portA}/v1/chat/completions`, { method: "POST", headers: hdrs, body });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        captured.length = 0;
+        const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${portB}/v1/chat/completions`, { method: "POST", headers: hdrs, body });
+        assert.equal(r2.status, 200);
+        await r2.text();
+
+        const all = captured.map((c) => c.msg).join("\n");
+        assert.ok(!all.includes(`127.0.0.1:${portA}`), `baseline origin leaked into logs:\n${all}`);
+        assert.ok(!all.includes(`127.0.0.1:${portB}`), `current origin leaked into logs:\n${all}`);
+        const dem = captured.find((c) => c.msg.includes("preflight usage-baseline"));
+        assert.ok(dem, `route-change demotion line missing:\n${all}`);
+        assert.ok(dem.msg.includes("measured on http://<private-host>"), dem.msg);
+        assert.ok(dem.msg.includes("routes to http://<private-host>"), dem.msg);
+    } finally {
+        setLogCapture(null);
+        if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prev.xdgState;
+        if (prev.rawDump === undefined) delete process.env.ACP_RAW_DUMP_DIR;
+        else process.env.ACP_RAW_DUMP_DIR = prev.rawDump;
+        if (prev.dumpReq === undefined) delete process.env.ACP_DUMP_REQ;
+        else process.env.ACP_DUMP_REQ = prev.dumpReq;
+        await close(proxy!);
+        await close(upstreamA);
+        await close(upstreamB);
+        rmrf(tmpRoot);
+    }
+});
+
 test("proxy error log: connection failure to non-public upstream leaks nothing (#255)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-err-"));
     const prev = { xdgState: process.env.XDG_STATE_HOME };
@@ -280,12 +456,21 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
     setRegistryForTest({});
     let proxy: http.Server | undefined;
     try {
+        // #2889: grab a proven-free port instead of hardcoding 59999 — a
+        // squatter on a hardcoded port turns the expected refusal into a
+        // 403/200 (#1689 family) and false-reds this test.
+        const holder = http.createServer();
+        holder.listen(0, "127.0.0.1");
+        await once(holder, "listening");
+        const deadPort = (holder.address() as { port: number }).port;
+        await close(holder);
         const opts: ProxyOptions = {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
+            proxy: "",
             routes: {
-                "http://127.0.0.1:59999": { models: { "gpt-test": { context: 400_000 } } },
+                [`http://127.0.0.1:${deadPort}`]: { models: { "gpt-test": { context: 400_000 } } },
             },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),
@@ -296,12 +481,22 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
             debug: false,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
         const proxyPort = (proxy.address() as { port: number }).port;
-        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:59999/v1/chat/completions`, {
+        // #1689/#2889: prove the freed port is actually dead right before the
+        // dial — a squatter would turn the expected refusal into a 403/200.
+        await assertPortDead(deadPort);
+        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${deadPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "log-mask-err" },
             body: JSON.stringify({ model: "gpt-test", messages: [{ role: "user", content: "hi" }] }),
@@ -309,7 +504,7 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
         assert.equal(resp.status, 502);
         await resp.text();
         const all = captured.map((c) => c.msg).join("\n");
-        assert.ok(!all.includes("127.0.0.1:59999"), `non-public upstream origin leaked into error log:\n${all}`);
+        assert.ok(!all.includes(`127.0.0.1:${deadPort}`), `non-public upstream origin leaked into error log:\n${all}`);
         const errLine = captured.find((c) => c.msg.includes("upstream request failed"));
         assert.ok(errLine, `error log missing:\n${all}`);
         assert.ok(errLine.msg.includes("<private-host>"), errLine.msg);
@@ -344,6 +539,7 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
+            proxy: "",
             routes: {
                 "http://127.0.0.1:1": { models: { "gpt-test": { context: 400_000 } } },
             },
@@ -356,7 +552,16 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
             debug: false,
             passthrough: false,
             autoUpdate: false,
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
             mitm: { enabled: true, domains: [] },
+            proxyFallback: { explicitDirect: true, globalSource: "direct" },
+            auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -399,12 +604,21 @@ test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
     setRegistryForTest({});
     let proxy: http.Server | undefined;
     try {
+        // #2889: grab a proven-free port instead of hardcoding 59999 — a
+        // squatter on a hardcoded port turns the expected refusal into a
+        // 403/200 (#1689 family) and false-reds this test.
+        const holder = http.createServer();
+        holder.listen(0, "127.0.0.1");
+        await once(holder, "listening");
+        const deadPort = (holder.address() as { port: number }).port;
+        await close(holder);
         const opts: ProxyOptions = {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
+            proxy: "",
             routes: {
-                "http://127.0.0.1:59999": { models: { "gpt-test": { context: 400_000 } } },
+                [`http://127.0.0.1:${deadPort}`]: { models: { "gpt-test": { context: 400_000 } } },
             },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),
@@ -415,7 +629,14 @@ test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
             debug: false,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -522,6 +743,6 @@ test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async (
     } finally {
         configureLogger(undefined);
         setLogCapture(null);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

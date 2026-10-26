@@ -16,6 +16,7 @@ import {
     _resetUpstreamAlertsForTest,
     type UpstreamAlert,
 } from "../src/upstream-alerts.ts";
+import { assertPortDead } from "./port-race.ts";
 
 // #1682: web UI surfaces active upstream-connection failures as a global banner.
 // Three layers pinned here: the alert table itself (dedup / success-clear /
@@ -39,7 +40,7 @@ async function freePort(): Promise<number> {
 }
 
 function netError(code: string, message = code): Error & { code?: string } {
-    const e = new Error(message);
+    const e: Error & { code?: string } = new Error(message);
     e.code = code;
     return e;
 }
@@ -172,6 +173,7 @@ async function startProxyFor(upstreamPort: number, registerRoute: boolean): Prom
         port: 0,
         host: "127.0.0.1",
         upstream: `http://127.0.0.1:${upstreamPort}`,
+        proxy: "",
         routes: registerRoute ? { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 400_000 } } } } : {},
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
@@ -182,7 +184,15 @@ async function startProxyFor(upstreamPort: number, registerRoute: boolean): Prom
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
     };
     const proxy = await startServer(opts);
     await once(proxy, "listening");
@@ -211,6 +221,12 @@ test("#1682: transport failure appears in /__bili/overview and clears on recover
     const deadPort = await freePort();
     const { proxy, proxyPort } = await startProxyFor(deadPort, true);
     try {
+        // #2548/#1689: prove the freed port is actually dead right before the first
+        // request dials it — a squatter would turn the expected connect-refused into
+        // a live answer and drop the alert. A live "unhealthy" server can't stand in
+        // for a refused port (hang = connect-timeout, 500 = a real response), so this
+        // site uses assertPortDead rather than the zcode-native live-500 construction.
+        await assertPortDead(deadPort, { label: "#1682 transport-failure dead upstream" });
         // 1) first failure → 5xx + exactly one alert with kind/host/hint
         const r1 = await chatPost(proxyPort, deadPort, "ep-alerts-1");
         assert.ok(r1.status >= 500, `expected 5xx on dead upstream, got ${r1.status}: ${(await r1.text()).slice(0, 200)}`);

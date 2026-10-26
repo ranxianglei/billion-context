@@ -9,7 +9,8 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_PREFLIGHT_HOLD_MS = "300";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { EXIT_CONCERNS, WIRE_EXITS, type ExitConcernId } from "../src/exit-matrix.ts";
@@ -66,9 +67,10 @@ function bigResponsesInput(): Array<{ type: string; role: string; content: strin
 
 type UpstreamMode = "hang-openai" | "hang-anthropic" | "hang-responses" | "hang-json" | "slow-summary-fwd-429" | "slow-summary-429";
 
-function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port: number; socketsClosed: () => number; requests: () => number }> {
+function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port: number; socketsClosed: () => number; requests: () => number; summaryDoneMs: () => number }> {
     let closed = 0;
     let requests = 0;
+    let summaryDoneMs = 0;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -86,6 +88,7 @@ function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port:
                     // Fail the summarization itself AFTER the hold grace so the
                     // early 200 is already committed (→ emitPreflightError path).
                     setTimeout(() => {
+                        summaryDoneMs = Date.now();
                         res.writeHead(429, { "content-type": "application/json" });
                         res.end(JSON.stringify({ error: { message: "rate limited", type: "rate_limit_error" } }));
                     }, SLOW_MS);
@@ -93,6 +96,7 @@ function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port:
                 }
                 if (isSummary) {
                     setTimeout(() => {
+                        summaryDoneMs = Date.now();
                         res.writeHead(200, { "content-type": "application/json" });
                         res.end(JSON.stringify({ id: "sum", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }], usage: { prompt_tokens: 500, completion_tokens: 50, total_tokens: 550 } }));
                     }, SLOW_MS);
@@ -122,7 +126,7 @@ function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port:
     });
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
-            resolve({ server, port: server.address().port, socketsClosed: () => closed, requests: () => requests });
+            resolve({ server, port: (server.address() as { port: number }).port, socketsClosed: () => closed, requests: () => requests, summaryDoneMs: () => summaryDoneMs });
         });
     });
 }
@@ -144,7 +148,14 @@ function startProxy(upstreamPort: number): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 
@@ -201,13 +212,19 @@ test("abort x proxy-openai-sse: client abort mid-stream destroys the upstream re
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
         const outcome = await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-oai" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
         assert.ok(outcome === "first-byte" || outcome === "header");
-        await new Promise((r) => setTimeout(r, 300));
+        // Poll for the abort to propagate instead of a fixed 300ms sleep:
+        // slow runners (win/node24) destroy the upstream socket later.
+        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) must be destroyed after the client abort (closed=${up.socketsClosed()})`);
         assert.equal(up.requests(), 1, "exactly one upstream request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -220,12 +237,18 @@ test("abort x proxy-anthropic-sse: client abort mid-stream destroys the upstream
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/messages`;
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
-        await new Promise((r) => setTimeout(r, 300));
+        // Poll for the abort to propagate instead of a fixed 300ms sleep:
+        // slow runners (win/node24) destroy the upstream socket later.
+        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -238,12 +261,18 @@ test("abort x proxy-responses-sse: client abort mid-stream destroys the upstream
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/responses`;
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }));
-        await new Promise((r) => setTimeout(r, 300));
+        // Poll for the abort to propagate instead of a fixed 300ms sleep:
+        // slow runners (win/node24) destroy the upstream socket later.
+        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -256,12 +285,18 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }));
-        await new Promise((r) => setTimeout(r, 300));
+        // Poll for the abort to propagate instead of a fixed 300ms sleep:
+        // slow runners (win/node24) destroy the upstream socket later.
+        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -276,20 +311,26 @@ test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit
         // slow (outlives the 300ms hold grace) and the FORWARD after it hits
         // 429 — both after the early 200 commit, so the error must arrive
         // in-band on the openai wire.
-        const r = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; tHeaderMs: number; body: string }>((resolve, reject) => {
+        const r = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; t0: number; tHeaderMs: number; body: string }>((resolve, reject) => {
             const t0 = Date.now();
             const req = http.request(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "mx-inband-oai" } }, (res) => {
                 const tHeaderMs = Date.now() - t0;
                 const chunks: Buffer[] = [];
                 res.on("data", (c: Buffer) => chunks.push(c));
-                res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, tHeaderMs, body: Buffer.concat(chunks).toString("utf8") }));
+                res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, t0, tHeaderMs, body: Buffer.concat(chunks).toString("utf8") }));
             });
             req.on("error", reject);
             req.end(JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: bigConversation() }));
         });
         assert.equal(r.status, 200, "early commit owns the status line");
         assert.equal(String(r.headers["content-type"]), "text/event-stream");
-        assert.ok(r.tHeaderMs < SLOW_MS, `headers committed before the slow preflight finished (${r.tHeaderMs}ms)`);
+        // #3228: assert the RELATIVE invariant (headers before the mock's actual
+        // summarization completion), not an absolute wall-clock bound — a loaded
+        // runner stalls both timers equally and eats the fixed margin while the
+        // behavior stays correct (same fix as #3152-C in preflight-hold). If early
+        // commit regresses, headers land at stream end, i.e. AFTER summarization.
+        assert.ok(up.summaryDoneMs() > 0, "the slow summarization call completed");
+        assert.ok(r.tHeaderMs < up.summaryDoneMs() - r.t0, `headers committed before summarization finished (${r.tHeaderMs}ms vs ${up.summaryDoneMs() - r.t0}ms)`);
         assert.ok(r.body.includes(": bili-preflight"), "keep-alive comment present");
         // Post-commit upstream failure goes through emitStreamError: openai
         // shape = top-level error frame + [DONE]. #1455: the legacy
@@ -302,8 +343,10 @@ test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit
         assert.ok(!r.body.includes('"choices":[{"index":0,"message"'), "no fabricated model content after the failure");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -314,20 +357,24 @@ test("error-delivery x proxy-openai-sse: preflight failure after the early commi
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
-        const r = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; tHeaderMs: number; body: string }>((resolve, reject) => {
+        const r = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; t0: number; tHeaderMs: number; body: string }>((resolve, reject) => {
             const t0 = Date.now();
             const req = http.request(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "mx-inband-oai2" } }, (res) => {
                 const tHeaderMs = Date.now() - t0;
                 const chunks: Buffer[] = [];
                 res.on("data", (c: Buffer) => chunks.push(c));
-                res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, tHeaderMs, body: Buffer.concat(chunks).toString("utf8") }));
+                res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, t0, tHeaderMs, body: Buffer.concat(chunks).toString("utf8") }));
             });
             req.on("error", reject);
             req.end(JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: bigConversation() }));
         });
         assert.equal(r.status, 200, "early commit owns the status line");
         assert.equal(String(r.headers["content-type"]), "text/event-stream");
-        assert.ok(r.tHeaderMs < SLOW_MS, `headers committed before the slow summarization failed (${r.tHeaderMs}ms)`);
+        // #3228: RELATIVE invariant — see the sibling test above (#3152-C pattern).
+        // Early-commit regression lands headers at stream end, i.e. AFTER the
+        // slow summarization failed, so the order still catches it.
+        assert.ok(up.summaryDoneMs() > 0, "the slow summarization call completed");
+        assert.ok(r.tHeaderMs < up.summaryDoneMs() - r.t0, `headers committed before the slow summarization failed (${r.tHeaderMs}ms vs ${up.summaryDoneMs() - r.t0}ms)`);
         assert.ok(r.body.includes(": bili-preflight"), "keep-alive comment present");
         // Post-commit PREFLIGHT failure goes through emitPreflightError: openai
         // shape = top-level {error} object + [DONE] (no choices framing).
@@ -337,8 +384,10 @@ test("error-delivery x proxy-openai-sse: preflight failure after the early commi
         assert.equal(up.requests(), 1, "the failed preflight means no forward happened");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });

@@ -1,9 +1,9 @@
-import { test, beforeEach, after } from "node:test";
+import { test, beforeEach, after, before } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import os from "node:os";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.js";
@@ -16,6 +16,7 @@ import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
 import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { restoreExportDirName } from "../src/image-restore.js";
 
 const DAY = 86_400_000;
 
@@ -121,7 +122,21 @@ beforeEach(() => {
     _resetSessionsForTest();
 });
 
+// #1995: the GC's stale image-spill pass reads <stateDir>/retrieve/img when no
+// imgRoot is passed — isolate XDG_STATE_HOME for the whole file so sweeps under
+// test never touch (or delete) a developer machine's real spill tree.
+let gcStateRoot: string | undefined;
+let prevStateHome: string | undefined;
+before(() => {
+    prevStateHome = process.env.XDG_STATE_HOME;
+    gcStateRoot = mkdtempSync(path.join(os.tmpdir(), "bili-gc-state-"));
+    process.env.XDG_STATE_HOME = gcStateRoot;
+});
+
 after(() => {
+    if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prevStateHome;
+    if (gcStateRoot) rmSync(gcStateRoot, { recursive: true, force: true });
     _setStoreForTest(new SessionStore({ enabled: false }));
 });
 
@@ -523,6 +538,9 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
         const upstreamPort = (upstream.address() as { port: number }).port;
         const opts: ProxyOptions = {
             port: 0,
+            proxy: "",
+            proxyFallback: { explicitDirect: true, globalSource: "direct" },
+            auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 400_000 } } } },
@@ -539,6 +557,9 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             passthroughSource: null,
             autoRestartOnUpdate: false,
             updateTag: "latest",
+            streamErrorShape: "protocol",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
             mitm: { enabled: false, domains: [] },
         };
         const proxy = await startServer(opts);
@@ -586,5 +607,38 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             await closeServer(upstream);
             _setStoreForTest(new SessionStore({ enabled: false }));
         }
+    });
+});
+
+test("gcSessionFiles: session deletion co-deletes its image spill dir; stale spill dirs swept by mtime (#1995)", async () => {
+    const dir = tmpDir("bili-gc-img-");
+    const imgRoot = tmpDir("bili-gc-imgroot-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fDel = writeFile(dir, "anthropic/host_del.json", JSON.stringify(envelope("gc-img-1", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        // Spill dir for the deleted session, FRESH mtime — the deterministic
+        // co-delete (session id → dir name) must take it despite the age gate.
+        const spill = path.join(imgRoot, restoreExportDirName("gc-img-1"));
+        mkdirSync(spill, { recursive: true });
+        writeFileSync(path.join(spill, "m00002.png"), "x");
+        // Orphaned stale dir (no session at all), backdated past the age gate.
+        const orphan = path.join(imgRoot, "old-lane");
+        mkdirSync(orphan, { recursive: true });
+        writeFileSync(path.join(orphan, "m00001.png"), "x");
+        const old = new Date(Date.now() - 30 * DAY);
+        utimesSync(orphan, old, old);
+        // Fresh orphan (recent mtime) — kept; live sessions keep their spills.
+        const fresh = path.join(imgRoot, "fresh-lane");
+        mkdirSync(fresh, { recursive: true });
+        writeFileSync(path.join(fresh, "m00001.png"), "x");
+
+        const res = await gcSessionFiles({ dir, store, now: Date.now(), imgRoot });
+        assert.equal(res.removed, 1);
+        assert.equal(res.imgDirsRemoved, 2, `co-delete + stale orphan, got ${JSON.stringify(res)}`);
+        assert.ok(!existsSync(fDel));
+        assert.ok(!existsSync(spill), "spill dir co-deleted with its session despite fresh mtime");
+        assert.ok(!existsSync(orphan), "stale orphan swept");
+        assert.ok(existsSync(fresh), "fresh spill dir kept");
     });
 });

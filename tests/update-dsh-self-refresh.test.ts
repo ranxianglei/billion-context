@@ -12,17 +12,31 @@ import path from "node:path";
 import type { Logger } from "../src/logger.ts";
 import type { DshPlan } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { supportsDirectorySymlink } from "./platform-capabilities.ts";
 
 // LOCK_FILE is frozen at update.ts module load — redirect the cache tree
-// BEFORE importing it (same discipline as auto-restart.test.ts).
+// BEFORE importing it (same discipline as auto-restart.test.ts). #3619: this
+// suite pins dsh-channel mechanics, not rollout timing — legacy immediate
+// upgrades (stagger 0/0) + unroutable policy URL keep it hermetic.
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-selfrefresh-")));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
+// A developer machine's real bili config (e.g. update.registry pointing at a
+// local verdaccio) would leak into this suite and route the mocked registry
+// lookups elsewhere — isolate the config tree too (same as update-policy.test.ts).
+process.env.XDG_CONFIG_HOME = path.join(root, "config");
+process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
+process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
+process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
 const { refreshDshProfileCopy } = await import("../src/update.ts");
 const { isDshProfileCopy, _setDshRunnersForTest } = await import("../src/dsh-channel.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
+    delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
+    delete process.env.BILI_UPDATE_POLICY_URL;
     rmrf(root);
 });
 
@@ -50,7 +64,11 @@ test("isDshProfileCopy: dsh profile layouts yes, everything else no", () => {
     }
 });
 
-test("isDshProfileCopy: follows symlinked copies into the profiles tree", () => {
+test("isDshProfileCopy: follows symlinked copies into the profiles tree", (t) => {
+    if (!supportsDirectorySymlink()) {
+        t.skip("directory symlinks require Developer Mode or junction support on this Windows host");
+        return;
+    }
     const base = fs.mkdtempSync(path.join(root, "classify-sym-"));
     try {
         // a pnpm-style profile: node_modules/billion-context is a symlink to
@@ -59,7 +77,7 @@ test("isDshProfileCopy: follows symlinked copies into the profiles tree", () => 
         const real = path.join(dshHome, "profiles", "web", "node_modules", ".pnpm", "billion-context@0.1.139", "node_modules", "billion-context");
         const link = path.join(dshHome, "profiles", "web", "node_modules", "billion-context");
         fs.mkdirSync(real, { recursive: true });
-        fs.symlinkSync(real, link, "dir");
+        fs.symlinkSync(real, link, process.platform === "win32" ? "junction" : "dir");
         assert.equal(isDshProfileCopy(link, { DSH_HOME: dshHome }), true);
     } finally {
         rmrf(base);
@@ -106,7 +124,10 @@ function makeFixture(version: string): Fixture {
 async function withRegistry<T>(version: string | undefined, fn: (fetches: { count: number }) => Promise<T>): Promise<T> {
     const original = globalThis.fetch;
     const fetches = { count: 0 };
-    globalThis.fetch = (() => {
+    // Only registry traffic is counted/mocked; anything else (e.g. the #3619
+    // update-policy fetch) passes through to the real fetch untouched.
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).includes("registry.npmjs.org")) return original(input, init);
         fetches.count += 1;
         return version === undefined
             ? Promise.resolve(new Response("nope", { status: 500 }))

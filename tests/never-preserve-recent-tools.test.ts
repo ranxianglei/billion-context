@@ -9,7 +9,7 @@ import { createCore, createInitialState, defaultConfig, coveredMessageIds, valid
 // run. Once the pin reaches >= 0.0.93 these activate everywhere.
 const KERNEL_HAS_PRESERVE_RECENT = validateConfig({
     ...defaultConfig(100000),
-    preserveRecentTools: 42,
+    preserveRecentTools: 42 as unknown as string[],
 }).some((e) => e.includes("preserveRecentTools"));
 const SKIP_PRESCRIPTION = KERNEL_HAS_PRESERVE_RECENT ? false : "needs acp-kernel >= 0.0.93 (preserveRecentTools, acp-kernel#428)";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";

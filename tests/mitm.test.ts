@@ -145,13 +145,13 @@ await test("#535: MITM certs satisfy strict OpenSSL 3 chain verification (Python
         ensureRootCA();
         const forge = (await import("node-forge")).default;
         const root = forge.pki.certificateFromPem(fs.readFileSync(rootCaPath(), "utf8"));
-        const rootBc = root.getExtension("basicConstraints");
+        const rootBc = root.getExtension("basicConstraints") as { critical: boolean } | undefined;
         assert.ok(rootBc, "root has basicConstraints");
         assert.equal(rootBc.critical, true, "CA basicConstraints must be critical (python OpenSSL 3 rejects otherwise)");
         const rootSkiHex = root.generateSubjectKeyIdentifier().toHex();
         assert.match(rootSkiHex, /^[0-9a-f]{40}$/i, "root SKI is a sha1 key id");
         const leaf = forge.pki.certificateFromPem(mintHostCert("api.openai.com").certPem);
-        const aki = leaf.getExtension("authorityKeyIdentifier");
+        const aki = leaf.getExtension("authorityKeyIdentifier") as { value: string } | undefined;
         assert.ok(aki, "leaf has authorityKeyIdentifier (python OpenSSL 3 rejects without)");
         assert.ok(aki.value.includes(forge.util.hexToBytes(rootSkiHex)), "leaf AKI carries the root SKI (forge keeps parsed AKI as raw DER)");
         assert.ok(leaf.getExtension("subjectKeyIdentifier"), "leaf has subjectKeyIdentifier");
@@ -351,7 +351,7 @@ await test("setupMitm e2e: blind TCP tunnel to a non-whitelisted host passes byt
             server.close();
             server.closeAllConnections?.();
             upstream.close();
-            upstream.closeAllConnections?.();
+            (upstream as net.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
         }
     });
 });
@@ -423,7 +423,7 @@ await test("setupMitm e2e: blind tunnels are counted in getBlindTunnelStats and 
             server.close();
             server.closeAllConnections?.();
             upstream.close();
-            upstream.closeAllConnections?.();
+            (upstream as net.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
             _resetBlindTunnelStatsForTest();
         }
     });

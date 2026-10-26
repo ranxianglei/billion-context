@@ -2,21 +2,365 @@ name: CI
 
 on:
   push:
-    # Release branches also run CI on push: bot-authored auto-PRs can sit in
-    # `action_required` (manual approval gate), but check runs from the push
-    # event satisfy required-status-checks on the same sha → the auto-PR is
-    # mergeable without approving the PR-triggered runs (#772).
-    branches: [master, "*_release-v*"]
+    # Release branches also run CI on push: ref updates made with a real
+    # account token (agent/human-driven release branches) deliver the push
+    # event, and those check runs satisfy required-status-checks on the head
+    # sha even when the PR's own runs sit in `action_required` (bot-authored
+    # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
+    # within Actions deliver NO push events — for those, the one-click
+    # workflow compensates via workflow_dispatch below.
+    # Patch lanes (dual-lane release model): human pushes to a bugfix-v*
+    # lane or a bugfix-release/** carve-out get the CORE matrix directly;
+    # backport.yml's token pushes compensate by dispatching this workflow
+    # on the carry/lane ref.
+    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
   pull_request:
-    branches: [master]
+    # agent-relay: #3468 agent PRs target the relay branch.
+    # bugfix-v*: carry PRs INTO the current patch lane (backport/carry-N)
+    # run the CORE matrix; the full-suite gate at ship time is
+    # release-bugfix.yml's dispatch, not this trigger.
+    # bugfix-release/**: legacy one-off carve-out branches keep their old
+    # behaviour.
+    # bugfix: THE GATE branch (v3 release model). Ship PRs (tag lane ->
+    # bugfix) must run the FULL matrix BEFORE the merge can happen — the
+    # scope step below forces full for base=bugfix regardless of labels.
+    branches: [master, agent-relay, "bugfix-v*", "bugfix-release/**", bugfix]
+    # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
+    # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
+    # matrix without a re-push (other labels no-op in the plan job).
+    types: [opened, synchronize, reopened, labeled]
+  # Three-layer CI (#3295): PRs and master pushes pay for the CORE matrix
+  # only. Every 30 minutes this cron asks the plan job whether master moved
+  # since the last green scheduled run; only then does the FULL matrix run.
+  # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
+  # cron pattern on their own offsets.
+  schedule:
+    - cron: '3/30 * * * *'   # :03/:33 — a few seconds ahead of the lanes (:04+)
+  # One-click release fallback: GitHub suppresses push-event delivery for
+  # ref updates made with GITHUB_TOKEN, so the push trigger above never fires
+  # on one-click fallback branches (#1744). release-manual.yml compensates by
+  # explicitly dispatching this workflow on the fallback branch; the check
+  # runs land on the same head sha and make the auto-PR mergeable once green
+  # (#772, #1744).
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Run the FULL matrix (12 test legs + 4 static legs) instead of the CORE one"
+        type: boolean
+        default: false
+
+# Same-ref runs cancel superseded in-flight runs: a follow-up push to a
+# branch (bump -> merge master into a release branch, rapid PR pushes,
+# back-to-back master merges) no longer queues a full ~30-job matrix
+# behind its own predecessor. Groups are per workflow+event+ref, so different
+# branches, different workflows, and (crucially) the scheduled full-matrix
+# runs never cancel each other — a schedule tick landing mid-push-run waits
+# for its own group instead of killing the push signal (#3071 lesson:
+# cancelled master runs shipped red). Approved by owner 2026-10-10 after
+# the release-v0.1.191 CI queue piled up behind same-ref reruns.
+concurrency:
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its plan job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
+  # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
+  # legs. One cheap ubuntu job picks one of three scopes:
+   #   core — every PR (push) and master push: 11 test legs (ubuntu 22/24 at
+   #          /3, windows 22 at /5 — #4351 rebalance, then duration-weighted
+   #          re-shard below) + 2
+  #          static legs (ubuntu 24, windows 22 — #3406 item 8: the windows
+  #          static leg keeps typecheck/build + the kernel/pi-subagents
+  #          suites covered on windows for EVERY PR, not only ci:full/nightly).
+   #          The blocking layer. master's required-checks list still carries
+   #          the legacy 12 FULL-matrix leg names; core produces 11 of the 16
+   #          current names (windows node-24 legs appear only in FULL scope),
+   #          and the four NEW windows shard-4/5 names must be added to branch
+   #          protection before they gate merges, enforce_admins off.
+  #   full — `ci:full` label on a PR, a release PR (#3688: bot-authored
+  #          one-click fallback PRs, *_release-v* head branches, or a
+  #          "[PR] release…"/"release vN…" title — no label needed),
+  #          workflow_dispatch full=true, or the 30-min
+   #          cron when master moved since the last green scheduled run: the
+   #          full 16-leg test matrix + 4-leg static-gates.
+  #   skip — a `labeled` event for a label other than ci:full, or a cron tick
+  #          where master HEAD == the last green scheduled run's head: nothing
+  #          to do, every dependent job skips (run concludes success so the
+  #          tick records its head_sha — a quiet master costs ~20s per tick).
+  # Matrix entries carry shardTotal so a scope can run FEWER shards per combo
+  # (partitionAll in scripts/run-ci-tests.mjs is total for ANY i/N); the
+  # explicit job `name:` keeps check-run names identical to the legacy 12-leg
+  # names (branch protection keys off `test (os, node, shard)`).
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+      testMatrix: ${{ steps.scope.outputs.testMatrix }}
+      staticMatrix: ${{ steps.scope.outputs.staticMatrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          # #3688: release PRs (one-click fallback bot PRs, *_release-v* head
+          # branches, "[PR] release"/"release vN" titles) default to the FULL
+          # matrix without the manual ci:full label — kills the label/merge
+          # timing race where the matrix is cancelled mid-flight by the merge
+          # and release.yml cannot reuse it (#3539) so the full suite is paid
+          # twice. Empty on push/schedule/dispatch events; only read in the
+          # pull_request case below.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_SHA: ${{ github.sha }}
+          FULL_INPUT: ${{ inputs.full }}
+        run: |
+          set -euo pipefail
+          # #4351: the suite grew ~399 -> ~860 files in three weeks while the
+          # core shape stayed frozen at its ~650-file design point (#3295), so
+          # its heaviest legs became the wall-clock floor: the ubuntu-24
+          # single-leg whole suite measured ~21 min and the windows 2-shard
+           # halves ~13-17 min (up to ~35 min tails on flake re-runs). The
+           # combos now shard /3 on ubuntu and /5 on windows (duration-weighted
+           # re-balance: line-count LPT balanced bytes, not seconds — see
+           # scripts/ci-shard-partition.mjs): partitionAll stays total for any
+           # i/N, so union of shards == every file — zero coverage loss; wall
+           # drops to the slowest shard (~7 min windows target). The windows
+           # node-24 legs stay FULL-only.
+          CORE_TEST='{"include":[
+            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":4,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":5,"shardTotal":5}]}'
+          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24},{"os":"windows-latest","node-version":22}]}'
+          FULL_TEST='{"include":[
+            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":4,"shardTotal":5},
+            {"os":"windows-latest","node-version":22,"shard":5,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":1,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":2,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":3,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":4,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":5,"shardTotal":5}]}'
+          FULL_STATIC='{"include":[
+            {"os":"ubuntu-latest","node-version":22},
+            {"os":"ubuntu-latest","node-version":24},
+            {"os":"windows-latest","node-version":22},
+            {"os":"windows-latest","node-version":24}]}'
+          scope=core
+          case "$EVENT" in
+            pull_request)
+              # a `labeled` event fires for EVERY label; only ci:full itself
+              # may (re)run — otherwise a random label would shadow the last
+              # full-matrix result with a core one.
+              if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then
+                scope=skip
+              elif grep -qw ci:full <<<"$PR_LABELS"; then
+                scope=full
+              elif
+                # #3688: release PRs are born full-scope. The merge is the
+                # publish trigger, so the full matrix must exist at the PR
+                # head BEFORE the human merges — waiting on a manual label
+                # lost the race twice (v0.1.200: label 09:26, merge 09:36,
+                # matrix cancelled). bot author = the one-click fallback PR
+                # (app/github-actions); branch glob = the one-click naming
+                # scheme (2026-10-18_release-v0.1.200); titles cover manual
+                # release PRs. bugfix-release/* carve-out and bugfix-v*
+                # lane ship PRs are deliberately NOT glob-matched: their own
+                # workflow gates the full suite at the PR head tree already
+                # (lane ship PRs ride the bot-author rule above).
+                # v3 gate-branch model: a ship PR INTO `bugfix` is born
+                # full-scope — that merge IS the publish decision, so the FULL
+                # matrix must exist at the PR head before the human merges
+                # (same label/merge race lesson as #3688); no ci:full label
+                # needed on the ship PR itself.
+                [ "${PR_AUTHOR:-}" = "github-actions" ] \
+                || [ "${PR_AUTHOR:-}" = "app/github-actions" ] \
+                || [ "${PR_BASE_REF:-}" = "bugfix" ] \
+                || case "${PR_HEAD_REF:-}" in *_release-v*) true ;; *) false ;; esac \
+                || case "${PR_TITLE:-}" in "[PR] release"*|"release v"[0-9]*) true ;; *) false ;; esac
+              then
+                scope=full
+              fi
+              ;;
+            workflow_dispatch)
+              [ "$FULL_INPUT" = "true" ] && scope=full || true
+              ;;
+            schedule)
+              # Smart cron: pay for the full matrix only when master moved
+              # since the last green scheduled run of this workflow.
+              LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+              echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+              if [ "$LAST" = "$HEAD_SHA" ]; then scope=skip; else scope=full; fi
+              ;;
+            push)
+              ;;
+          esac
+          case "$scope" in
+            core)  TM="$CORE_TEST";  SM="$CORE_STATIC" ;;
+            full)  TM="$FULL_TEST";  SM="$FULL_STATIC" ;;
+            skip)  TM='{"include":[]}'; SM='{"include":[]}' ;;
+          esac
+          {
+            echo "scope=$scope"
+            printf 'testMatrix=%s\n' "$(printf '%s' "$TM" | jq -c .)"
+            printf 'staticMatrix=%s\n' "$(printf '%s' "$SM" | jq -c .)"
+          } >> "$GITHUB_OUTPUT"
+          echo "plan scope: $scope"
+
+  # #2637 plan #8 (owner-approved): fail-fast tiering — the ~0-1m guards gate
+  # the four platform legs so a broken commit stops in tier 1 instead of
+  # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
+  # skip on push/dispatch — and a SKIPPED need cascades the skip to dependents
+  # (the GitHub-documented behavior; the old comment here wrongly assumed
+  # "skipped needs count as satisfied" — the master-push run evidence
+  # (#3145/#3035/#3027 all slipped red to master with `test: skipped`)
+  # disproved it). The explicit `if` below tolerates skipped guards so:
+  #   - pull_request: guards run; guard failure -> failure() -> legs skip
+  #     (required checks show pending, merge blocked — #2637 semantics intact)
+  #   - push/dispatch: PR-only guards skip harmlessly, legs RUN — master gets
+  #     a real post-merge test signal (the missing master-push hole, #3197 era)
   test:
+    needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    name: test (${{ matrix.os }}, ${{ matrix.node-version }}, ${{ matrix.shard }})
+  # #3143: the suite outgrew one runner — ~656 top-level files (~190k LOC) now
+  # serialize through c=4 on a single 4-core leg for ~17-20 min (windows slowest;
+  # measured 1225s on the last full green run). Sharding spreads the SAME files
+  # across more legs: each runs a balanced slice (scripts/run-ci-tests.mjs partitions
+  # deterministically + totally, so union of shards == allFiles, nothing skipped,
+  # same tests/assertions/env, c=4 within each shard). Wall drops ~3x (~20 -> ~7min)
+  # with zero coverage loss. To go faster, add entries to the include list of
+  # the scope you want faster in the plan job above (each entry carries its own
+  # shardTotal, so the legacy "bump the /3" coupling is gone — any denominator
+  # works; #4351 used exactly this knob on CORE_TEST).
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node-version: [22, 24]
+      matrix: ${{ fromJSON(needs.plan.outputs.testMatrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      # #4360 lever 1: pretest dist content-hash cache. kernel/ and
+      # pi-subagents/ dist are pure functions of (src tree, build config,
+      # manifests, lockfiles); the pretest hook (scripts/ci-pretest-cache.mjs)
+      # stamps each dist with a marker of that hash and skips the rebuild on
+      # a byte-exact match, saving the ~5-6.5 min Windows build per leg.
+      # Correctness never trusts the cache: marker mismatch => real rebuild,
+      # so a dirty/stale restore at worst wastes one build, never runs wrong
+      # artifacts. Per-OS keys (never share dists across platforms); no
+      # restore-keys — a near-miss restore is worthless because the marker
+      # check rejects it anyway. The post step saves automatically (on the
+      # exact primary key, job success only) AFTER the pretest build inside
+      # run-ci-tests.mjs below. The hashFiles patterns MUST stay in sync with
+      # the input tables in scripts/ci-pretest-cache.mjs.
+      - name: Restore kernel dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: kernel/dist
+          key: pretest-dist-kernel-v1-${{ runner.os }}-${{ hashFiles('kernel/src/**', 'kernel/tsup.config.ts', 'kernel/tsconfig.json', 'kernel/package.json', 'kernel/package-lock.json', 'package-lock.json') }}
+      - name: Restore pi-subagents dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: pi-subagents/dist
+          key: pretest-dist-pisub-v1-${{ runner.os }}-${{ hashFiles('pi-subagents/src/**', 'pi-subagents/tsup.config.ts', 'pi-subagents/tsconfig.json', 'pi-subagents/package.json', 'package-lock.json') }}
+      - run: npm install --ignore-scripts --no-fund --no-audit
+      # #2816: explicit file concurrency=4 for the whole suite. Baseline logs
+      # show the old default (availableParallelism()-1) already ran several
+      # suites at once, and a measured two-phase prototype proved a serial
+      # "live" phase only idles the other cores for 3-4 min without buying
+      # stability — live/process suites have run mixed with the rest on these
+      # dedicated runners for months (#1248 gates loaded local sandboxes, not
+      # CI). The script keeps a LIVE_FILES self-check: any NEW
+      # process-spawning suite fails the job until registered there (#1248
+      # review). Same tests/assertions/env — scheduling only.
+      # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
+      # running here: the runner is dedicated, so their process/port
+      # observations are reliable.
+      - run: node scripts/run-ci-tests.mjs
+        env:
+          ACP_TEST_CLAUDE_NATIVE: "1"
+          CI_TEST_SHARD: "${{ matrix.shard }}/${{ matrix.shardTotal }}"   # denominator carried per-include by the plan job (#3295)
+
+  # #3388 step 2: the MySQL contract lane. The storage-backend contract
+  # suite runs against a real mysql:8.0 service (BILI_MYSQL_TEST_DSN) in
+  # addition to the always-on sqlite lane inside the main test job. Cheap
+  # (two files, ~1min) so it rides the core scope — every PR proves the
+  # mysql backend still satisfies the operation contract.
+  mysql-contract:
+    needs: [plan]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: bili-test-root
+          MYSQL_DATABASE: bili
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -uroot -pbili-test-root"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install --ignore-scripts --no-fund --no-audit
+      # #4336: the storage suites transitively import acp-kernel at runtime
+      # (store.ts -> runtime-status -> knobs -> config) since #4177 — tsx
+      # resolves it to the built dist. Same prerequisite as the main test
+      # matrix (run-ci-tests pretest parity) and ci-e2e-dsh.yml.
+      - run: npm --prefix kernel run build
+      - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
+        env:
+          BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
+
+  # #2816: typecheck + the in-repo component suites + the bundle build used
+  # to run sequentially in front of the test job (~90s of critical path per
+  # leg). They are independent of the proxy test suites, so they run as
+  # parallel legs on the same matrix — same commands, off the critical path.
+  static-gates:
+    needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    name: static-gates (${{ matrix.os }}, ${{ matrix.node-version }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.staticMatrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,14 +370,18 @@ jobs:
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
       - run: npm run typecheck
-      # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
-      # running here: the runner is dedicated, so their process/port
-      # observations are reliable (#1248 gates them off for loaded local
-      # sandboxes only).
-      - run: npm test
-        env:
-          ACP_TEST_CLAUDE_NATIVE: "1"
+      # Kernel boundary (#2092): the kernel's own unit suite against its TS
+      # source — both test layers must be green on every PR (AGENTS.md rule 5).
+      - run: npm --prefix kernel test
+      # Pi-subagents boundary (#2384): same two-layer rule for the in-repo
+      # pi-lane component — its own unit suite against its TS source.
+      - run: npm --prefix pi-subagents test
       - run: npm run build
+      # #3617-C: thin-install smoke — install ONLY the packed tarball into a
+      # scratch dir (no repo node_modules) and run it: catches ANY undeclared
+      # runtime dependency in the bundles at import time (the #3511 zod class;
+      # generalizes #3519's static-only check).
+      - run: node scripts/check-dist-thin-install.mjs
 
   version-guard:
     runs-on: ubuntu-latest
@@ -46,8 +394,12 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
-          # Release branches are allowed to bump version.
-          if [[ "$BRANCH" == *_release-v* ]]; then
+          # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
+          # v3 gate-branch model (#4660): tag lanes keep their ONE legal pre-bump commit (made at cut time); the
+          # auto-opened alignment PR (head=bugfix) carries that bump into master, and backport carry branches
+          # (backport/carry-N) inherit it from their lane base — all three head shapes must pass this guard or the
+          # cycle deadlocks at P3 (alignment never merges → next lane never auto-cuts).
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == bugfix-v* || "$BRANCH" == bugfix || "$BRANCH" == backport/carry-* ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi
@@ -58,3 +410,291 @@ jobs:
             exit 1
           fi
           echo "✓ version field untouched on non-release branch ($BRANCH)"
+
+  kernel-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify kernel boundary rules (#2092)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_HEAD_REF}"
+          # Kernel release branches bump kernel/package.json alone by design.
+          if [[ "$BRANCH" == *_release-kernel-v* ]]; then
+            echo "✓ kernel release branch ($BRANCH) — kernel version changes allowed"
+            exit 0
+          fi
+          # Rule 1: any PR touching kernel/** must declare 'kernel-change:' in its body.
+          if git diff --name-only origin/master...HEAD -- kernel/ | grep -q .; then
+            if ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
+              echo "::error::This PR modifies kernel/ but does not declare 'kernel-change: <reason>' in its body."
+              echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
+              exit 1
+            fi
+            echo "✓ kernel-change marker present"
+          fi
+          # Rule 2: version discipline — kernel source/build-config changes require a
+          # kernel/package.json version bump, and a bump requires source changes.
+          SRC_CHANGED=0
+          if git diff --name-only origin/master...HEAD -- kernel/src kernel/tsup.config.ts kernel/tsconfig.json | grep -q .; then
+            SRC_CHANGED=1
+          fi
+          BUMPED=0
+          if git diff origin/master...HEAD -- kernel/package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+            BUMPED=1
+          fi
+          if [[ "$SRC_CHANGED" == 1 && "$BUMPED" != 1 ]]; then
+            echo "::error::kernel/ source changed without bumping the version in kernel/package.json."
+            echo "Bump the kernel version so accumulated changes can ship as an independent acp-kernel release later."
+            exit 1
+          fi
+          if [[ "$BUMPED" == 1 && "$SRC_CHANGED" != 1 ]]; then
+            echo "::error::kernel/package.json version bumped without any kernel/ source change."
+            exit 1
+          fi
+          echo "✓ kernel version discipline OK"
+
+  # #2384: version discipline for the vendored pi-lane component — a commit IS
+  # the pin, so accumulated changes can later ship as an independent
+  # billion-context-pi-subagents release. Deliberately lighter than kernel-guard:
+  # no PR-body declaration / human gate (fast-moving extension surface, not
+  # load-bearing core compression).
+  pi-subagents-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify pi-subagents version discipline (#2384)
+        run: |
+          set -euo pipefail
+          SRC_CHANGED=0
+          if git diff --name-only origin/master...HEAD -- pi-subagents/src pi-subagents/tsup.config.ts pi-subagents/tsconfig.json | grep -q .; then
+            SRC_CHANGED=1
+          fi
+          BUMPED=0
+          if git diff origin/master...HEAD -- pi-subagents/package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+            BUMPED=1
+          fi
+          if [[ "$SRC_CHANGED" == 1 && "$BUMPED" != 1 ]]; then
+            echo "::error::pi-subagents/ source changed without bumping the version in pi-subagents/package.json."
+            echo "Bump the component version so accumulated changes can ship as an independent billion-context-pi-subagents release later."
+            exit 1
+          fi
+          if [[ "$BUMPED" == 1 && "$SRC_CHANGED" != 1 ]]; then
+            echo "::error::pi-subagents/package.json version bumped without any pi-subagents/ source change."
+            exit 1
+          fi
+          echo "✓ pi-subagents version discipline OK"
+
+  # #2107 drift guard A: the config docs are generated from
+  # website/config-reference/*.yaml (single source). Regenerate and fail when
+  # the committed artifacts differ — a schema edit without re-running the
+  # generator goes red here. Zero-dep script: no npm install needed.
+  docs-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/gen-config-docs.mjs generate
+      - name: Fail on artifact drift
+        run: git diff --exit-code -- CONFIGURATION.md CONFIGURATION.zh-CN.md website/main.js website/docs/index.html
+
+  # #2107 drift guard B: every BILI_*/ACP_* env var read in src/ and every
+  # FileConfig top-level key must have a seed entry — an undocumented param
+  # added to src goes red here with the missing names listed.
+  docs-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/gen-config-docs.mjs check-coverage
+
+  # #2643 config-surface guard: closes the two surfaces check-coverage above
+  # does not reach — nested config-file leaf fields (only top-level keys were
+  # enforced) and CLI --flags (never checked). An undocumented addition goes red
+  # here with the missing names listed. Zero-dep: plain node, no install step.
+  # Not gated to pull_request so master pushes are held to the same surface.
+  config-surface-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/config-surface-guard.mjs
+
+  # #3249 lifecycle ledger guard: every BILI_* env var read in src/ must be
+  # registered in LIFECYCLE.md (§1 transition ledger with release condition, or
+  # §2 permanent registry) — a new switch without a lifecycle entry goes red here.
+  # Stale entries (dynamic/unmerged/retired names) notice only. Zero-dep: plain
+  # node, no install step. Not gated to pull_request, same as the guards above.
+  lifecycle-ledger-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/lifecycle-ledger-guard.mjs
+
+  # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
+  # side-request.ts + the lane region of src/server/handle.ts, extracted from
+  # src/server.ts by #1440) is regression-critical
+  # (the #2156/#2157/#2164 chain). Changing it without touching its dedicated
+  # suites has silently shipped regressions before; this job makes the pairing
+  # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
+  lane-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Side-lane test discipline (#2170)
+        run: |
+          set -euo pipefail
+          LANE_SUITE_RE='tests/(fork-side-request-lane|side-lane-truth-table|side-lane-invariants|side-request-isolation)\.test\.ts'
+          # Lane logic = src/server/side-request.ts, or lane-symbol lines in
+          # src/server.ts / src/server/handle.ts (#1440 extraction moved the
+          # lane region into handle.ts — #2554 review closed that blind spot).
+          LANE_DIFF=""
+          LANE_SYMBOLS='demotedSide|sideIntent|sideRequestLike|demoteGate|resolveSideLane|SIDE_REQUEST_MAX_TOKENS|isSideRequest|isDshTitleRequest|DSH_TITLE_SYSTEM_PREFIX|stripLeakedBiliTools|side request|side passthrough|sidePassthrough|side-lane'
+          if git diff origin/master...HEAD -- src/server/side-request.ts | grep -qE '^[+-]'; then
+            LANE_DIFF="src/server/side-request.ts"
+          fi
+          if git diff origin/master...HEAD -- src/server.ts | grep -Eq "^[+-].*($LANE_SYMBOLS)"; then
+            LANE_DIFF="${LANE_DIFF:+$LANE_DIFF, }src/server.ts (lane symbols)"
+          fi
+          if git diff origin/master...HEAD -- src/server/handle.ts | grep -Eq "^[+-].*($LANE_SYMBOLS)"; then
+            LANE_DIFF="${LANE_DIFF:+$LANE_DIFF, }src/server/handle.ts (lane symbols)"
+          fi
+          if [[ -z "$LANE_DIFF" ]]; then
+            echo "✓ no side-lane logic changes"
+            exit 0
+          fi
+          echo "side-lane logic changed: $LANE_DIFF"
+          if git diff --name-only origin/master...HEAD | grep -Eq "$LANE_SUITE_RE"; then
+            echo "✓ side-lane suites updated alongside lane logic"
+            exit 0
+          fi
+          echo "::error::Side-lane logic changed without updating any dedicated side-lane suite ($LANE_SUITE_RE)."
+          echo "The lane gates are truth-table-pinned (tests/side-lane-truth-table.test.ts) and behavior-pinned (tests/side-lane-invariants.test.ts, fork-side-request-lane, side-request-isolation) — a gate edit must land with the suite edit. See #2170."
+          exit 1
+
+  # #1440 P6: mechanical defense against export bloat — fails when a non-entry
+  # source file exports a symbol nobody references outside its own file
+  # (DEAD = definition line only; INTERNAL_ONLY = own file only). Zero-dep:
+  # plain node, no install step.
+  unused-exports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-unused-exports.mjs
+
+  # #2989: test-import-graph gate — fails when a test file imports a src module
+  # absent from the production import graph (the tsup entries). A green suite
+  # over a retired module guarantees nothing about the wired path (#2988
+  # finding ① shipped while every persona-anchor pin stayed green). Intentional
+  # exceptions are explicit: the script's WHITELIST (test-only registries) or a
+  # "// retired-module pin: <module>" label in the importing test file.
+  # Zero-dep: plain node, no install step.
+  test-import-graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-test-import-graph.mjs
+
+  # #2704 drift guard: package-lock.json must track the version fields of the
+  # package.json files it records (root bili + the in-repo file: links
+  # kernel/, pi-subagents/). Bumping package.json does NOT regenerate the lock —
+  # only `npm install` does — so a bump that skips regen leaves it stale
+  # (#2704: root 0.1.190 vs 0.1.191, kernel 0.0.112 vs 0.0.114); regenerate and
+  # fail on any residual diff (idempotent when already synced). Deliberately NOT
+  # gated to pull_request (unlike version-guard/kernel-guard) so master pushes
+  # and release-branch bumps are held to it too — mechanical enforcement of
+  # AGENTS.md §4 rule 2 ("release commit changes ONLY version + lock if drifts").
+  lock-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
+      - name: Fail on lockfile version drift
+        run: git diff --exit-code -- package-lock.json
+      # #3782: kernel/ keeps its OWN package-lock.json (standalone acp-kernel
+      # identity, #2092) which the root regen above never touches — the bump
+      # chain 0.0.134→0.0.136 left it at 0.0.133 for three releases. Same
+      # idempotency check, same enforcement surface (master pushes included).
+      - name: Fail on kernel lockfile version drift
+        run: |
+          (cd kernel && npm install --package-lock-only --ignore-scripts --no-fund --no-audit)
+          git diff --exit-code -- kernel/package-lock.json
+
+  # Scheduled full-matrix red signal (#3295 follow-up, owner-approved
+  # 2026-10-16): a red scheduled run auto-opens a tracking issue; a later
+  # GREEN scheduled run auto-closes it. Owner opted out of email — the issue
+  # IS the notification. Title deliberately avoids "ci" because the triage
+  # bot does not auto-dispatch titles containing it.
+  red-signal:
+    needs: [test, static-gates]
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open or resolve the red tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+          TEST_RESULT: ${{ needs.test.result }}
+          STATIC_RESULT: ${{ needs.static-gates.result }}
+        run: |
+          set -euo pipefail
+          LABEL=scheduled-red
+          gh label create "$LABEL" --color b60205 --description "定时全量失败的自动跟踪" 2>/dev/null || true
+          RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          SHORT="${HEAD_SHA:0:8}"
+          if [ "$TEST_RESULT" = "failure" ] || [ "$STATIC_RESULT" = "failure" ]; then
+            FAILS=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '[.jobs[] | select(.conclusion=="failure") | .name] | unique | .[]' | sed 's/^/  - /')
+            TITLE="定时全量测试失败: ${SHORT}"
+            N=$(gh issue list -R "$REPO" --label "$LABEL" --state open --json number,title --jq '.[] | "\(.number)\t\(.title)"' | grep -F "定时全量测试失败: ${SHORT}" | cut -f1 | head -1 || true)
+            if [ -n "$N" ]; then
+              echo "open issue #$N already tracks this head — commenting instead"
+              gh issue comment "$N" -R "$REPO" --body "定时全量仍在 ${SHORT} 上红着: ${RUN_URL}"
+            else
+              printf '%s\n\n%s\n%s\n%s\n\n%s\n' \
+                "自动跟踪:定时全量矩阵在 ${SHORT} 上挂了(红灯每个定时 tick 会重试,直到转绿或被新提交取代)。" \
+                "失败的腿:" "$FAILS" \
+                "run: ${RUN_URL}" \
+                "此 issue 会在下一次定时全量转绿时自动关闭。" > /tmp/red-body.md
+              gh issue create -R "$REPO" --title "$TITLE" --body-file /tmp/red-body.md --label "$LABEL"
+            fi
+          elif [ "$TEST_RESULT" = "success" ] && [ "$STATIC_RESULT" = "success" ]; then
+            for N in $(gh issue list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number'); do
+              gh issue close "$N" -R "$REPO" --comment "定时全量已在 ${SHORT} 恢复绿: ${RUN_URL}"
+            done
+          else
+            echo "results: test=$TEST_RESULT static=$STATIC_RESULT — nothing to report"
+          fi

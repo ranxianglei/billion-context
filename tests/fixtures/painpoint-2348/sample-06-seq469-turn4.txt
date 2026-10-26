@@ -1,0 +1,4 @@
+<acp tokens="37" string="true">m00223</acp>
+好，撤回。档案不放 `.dsh` 仓——它本来就该待在 dsh-workspace。
+
+先把误建的从 `.dsh` 清掉（用 skill 规定的唯一入口）：

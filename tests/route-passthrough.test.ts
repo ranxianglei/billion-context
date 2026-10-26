@@ -5,8 +5,7 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { findRoute, parseRouteEntry } from "../src/config.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { findRoute, parseRouteEntry, ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 // #661: per-route `passthrough` — upstreams that fingerprint the request body
@@ -91,7 +90,14 @@ function makeOpts(routes: Record<string, { passthrough?: boolean }>, upstream: s
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
 }
 

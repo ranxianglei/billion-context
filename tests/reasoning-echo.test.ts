@@ -1,6 +1,8 @@
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { _resetReasoningViolationReportsForTest, isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
 import { modelIdOf, normalizeStrictEchoBody, normalizeStrictEchoResponsesInput } from "../src/strict-echo.js";
 import { dropCompressReasoning } from "../src/reasoning-drop.js";
 import type { Session } from "../src/session.js";
@@ -63,6 +65,8 @@ describe("#1027 modelIdOf", () => {
 });
 
 describe("#684 exit sentinels", () => {
+    beforeEach(() => _resetReasoningViolationReportsForTest());
+
     it("openai wire: split turn warns", () => {
         const c = collector();
         warnReasoningPairs([
@@ -341,7 +345,149 @@ describe("#1479 responses-wire strict-echo repair", () => {
     });
 });
 
+describe("#2169 responses-wire blank reasoning content sanitize", () => {
+    const BLANK_PARTS = [{ type: "reasoning_text", text: " " }];
+
+    it("enabled: clears whitespace-only content, keeps every other key, no mutation of the input item", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [{ type: "summary_text", text: "" }] };
+        const input = [
+            { type: "message", role: "user", content: "u" },
+            blank,
+            { type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" },
+        ];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal(out.length, input.length);
+        const r = out[1]!;
+        assert.notEqual(r, blank);
+        assert.equal(r.type, "reasoning");
+        assert.equal(r.id, "rs-blank");
+        assert.equal("content" in r, false);
+        assert.deepEqual(r.summary, [{ type: "summary_text", text: "" }]);
+        assert.equal("content" in blank, true, "input item must not be mutated in place");
+        assert.equal(out[0], input[0]);
+        assert.equal(out[2], input[2]);
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+        assert.match(c.lines[0]!, /\(#2169\)/);
+    });
+
+    it("enabled: multiple whitespace parts all blank → cleared once per item", () => {
+        const two = { type: "reasoning", id: "rs-2", content: [{ type: "reasoning_text", text: " " }, { type: "reasoning_text", text: "\t\n" }] };
+        const input = [two];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal("content" in out[0]!, false);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+    });
+
+    it("enabled: non-blank content stays byte-exact (same reference, no log)", () => {
+        const real = { type: "reasoning", id: "rs-1", content: [{ type: "reasoning_text", text: "encrypted blob" }], summary: [{ type: "summary_text", text: "s" }] };
+        const input = [real];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("enabled: mixed parts (one with real text) stay untouched", () => {
+        const mixed = { type: "reasoning", id: "rs-mix", content: [{ type: "reasoning_text", text: " " }, { type: "reasoning_text", text: "real" }] };
+        const input = [mixed];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("enabled: unknown part shapes stay untouched (empty array / missing text / non-string text / foreign part type / null)", () => {
+        for (const content of [
+            [],
+            [{ type: "reasoning_text" }],
+            [{ type: "reasoning_text", text: 42 }],
+            [{ type: "other_part", text: "x" }],
+            [null],
+        ]) {
+            const input = [{ type: "reasoning", id: "rs-x", content, summary: [] }];
+            const c = collector();
+            assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input, JSON.stringify(content));
+            assert.equal(c.lines.length, 0);
+        }
+    });
+
+    it("disabled: blank content passes through untouched", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS };
+        const input = [blank];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, false, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("combined: orphaned run (later turn) + blank-content item (earlier turn) → both repairs, both logs, order preserved", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [{ type: "summary_text", text: "" }] };
+        const input = [
+            { type: "message", role: "user", content: "u" },
+            blank,
+            { type: "message", role: "assistant", content: "a" },
+            { type: "message", role: "user", content: "u2" },
+            { type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" },
+        ];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.equal(out.length, input.length + 1);
+        assert.equal("content" in out[1]!, false, "blank item sanitized at its position");
+        const fcIdx = out.findIndex((it) => it.type === "function_call");
+        assert.deepEqual(out[fcIdx - 1], { type: "reasoning", summary: [{ type: "summary_text", text: "" }] });
+        assert.equal(c.lines.length, 2);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+        assert.match(c.lines[1]!, /injected 1 blank reasoning item\(s\)/);
+    });
+
+    it("normalizeStrictEchoBody: Responses body carrying a blank-content item is sanitized", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [] };
+        const body = { model: "m", input: [blank] };
+        const c = collector();
+        const out = normalizeStrictEchoBody(body, true, c.log, "s1");
+        assert.notEqual(out, body);
+        const outInput = out.input as Record<string, unknown>[];
+        assert.equal("content" in outInput[0]!, false);
+        assert.equal("content" in blank, true, "no mutation of the inbound body");
+    });
+
+    // Provenance: redacted real-world outbound body from #2169 (issue author's gist).
+    // All text except the 5 blank echoes below is length placeholders; order/types/call_ids unchanged.
+    it("redacted #2169 body (89 items): the 5 blank echoes are cleared, everything else stays byte-exact, no injection needed", () => {
+        const raw = readFileSync(fileURLToPath(new URL("./fixtures/responses-2169-redacted-input.json", import.meta.url)), "utf-8");
+        const input = JSON.parse(raw) as Record<string, unknown>[];
+        assert.equal(input.length, 89);
+        const BLANK_IDX = [30, 52, 64, 70, 86];
+        for (const i of BLANK_IDX) {
+            const content = (input[i]! as { content?: unknown }).content;
+            assert.ok(Array.isArray(content) && content.length > 0, `fixture item ${i} must start with whitespace content`);
+        }
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal(out.length, 89, "this body has no orphaned run → no #1479 injection");
+        for (const i of BLANK_IDX) {
+            const r = out[i]! as Record<string, unknown>;
+            assert.notEqual(r, input[i]!, `blank item ${i} replaced by a copy`);
+            assert.equal(r.type, "reasoning");
+            assert.equal("content" in r, false, `blank item ${i} content removed`);
+            assert.deepEqual(r.summary, [{ type: "summary_text", text: "" }]);
+            assert.equal("content" in (input[i]! as Record<string, unknown>), true, "inbound item unmutated");
+        }
+        for (let i = 0; i < input.length; i++) {
+            if (BLANK_IDX.includes(i)) continue;
+            assert.equal(out[i], input[i], `non-blank item ${i} stays the same reference`);
+        }
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 5 item\(s\)/);
+    });
+});
+
 describe("#762 sentinel precision: presence, not emptiness", () => {
+    beforeEach(() => _resetReasoningViolationReportsForTest());
+
     const tc = (id: string) => [{ id, type: "function" as const, function: { name: "f", arguments: "{}" } }];
 
     it("openai wire: blank reasoning_content counts as present — no chronic noise", () => {
@@ -478,6 +624,8 @@ describe("#762 strict-echo body normalization (loop re-request path)", () => {
 });
 
 describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant)", () => {
+    beforeEach(() => _resetReasoningViolationReportsForTest());
+
     const SIGNED = (text = "x".repeat(3000), id = "r"): BiliMessage => ({ id, role: "assistant", contentType: "reasoning", text, thinkingSignature: "sig_test_123" });
     const CALL = (toolName = "compress", toolCallId = "t1"): BiliMessage => ({ id: "c", role: "assistant", contentType: "tool-call", toolName, toolCallId, text: "{}" });
     const RESULT = (toolCallId = "t1"): BiliMessage => ({ id: "res", role: "user", contentType: "tool-result", toolName: "compress", toolCallId, text: "ok" });
@@ -491,7 +639,7 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
     });
 
     it("unsigned reasoning still drops (non-thinking claude sessions keep #651)", () => {
-        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
+        const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
         const c = collector();
         const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
         assert.equal(out.length, 3);
@@ -499,8 +647,37 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
         assert.equal(c.lines.length, 1);
     });
 
+    it("redacted_thinking in view disables the #651 drop (#1960)", () => {
+        // The redacted carrier must sit BEFORE the reasoning run: coreToAnthropic merges same-role messages into one assistant message, so dropping the run rewrites the message carrying the redacted block. Placed after the run it would break contiguity and the drop never fires at all (test would pass without the fix).
+        const redacted: BiliMessage = { id: "rd", role: "assistant", contentType: "text", text: "[redacted_thinking]", rawAnthropicBlock: { type: "redacted_thinking", data: "ZGF0YQ==" } };
+        const msgs: BiliMessage[] = [redacted, { id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
+        const c = collector();
+        assert.equal(withReasoningDrop(msgs, undefined, c.log, "s1", false), msgs);
+        assert.equal(c.lines.length, 0);
+    });
+
+    const reproInboundRedacted: AnthropicMessage[] = [
+        { role: "user", content: "q" },
+        { role: "assistant", content: [{ type: "redacted_thinking", data: "ZGF0YQ==" }, { type: "thinking", thinking: "x".repeat(3000) }, { type: "tool_use", id: "tu1", name: "compress", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] },
+        { role: "user", content: "next" },
+    ];
+
+    it("regression: unsigned thinking beside a redacted block no longer drops (#1960 wire shape)", () => {
+        const { msgs } = anthropicToCore({ model: "claude-opus-4-5", messages: reproInboundRedacted });
+        assert.ok(msgs.some((m) => m.rawAnthropicBlock !== undefined && (m.rawAnthropicBlock as { type?: string }).type === "redacted_thinking"));
+        const c = collector();
+        const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
+        assert.equal(out, msgs);
+        assert.equal(c.lines.length, 0);
+        const outbound = coreToAnthropic(out);
+        const assistantOut = outbound[1]!;
+        assert.ok(Array.isArray(assistantOut.content));
+        assert.equal(assistantOut.content.length, 3);
+    });
+
     it("empty-string signature does not arm the gate", () => {
-        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
+        const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
         const c = collector();
         const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
         assert.equal(out.length, 3);
@@ -533,5 +710,111 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
         warnAnthropicThinkingPairs(reproInbound, coreToAnthropic(manualDrop), c.log, "s1");
         assert.equal(c.lines.length, 1);
         assert.match(c.lines[0]!, /thinking-pair-violated/);
+    });
+});
+
+describe("#2864 sentinel dedup: per-identity episode reporting", () => {
+    beforeEach(() => _resetReasoningViolationReportsForTest());
+
+    const tc = (id: string) => ({ id, type: "function" as const, function: { name: "f", arguments: "{}" } });
+    const openaiHistory = (extraViolators: string[] = []) => [
+        { role: "assistant", content: "a1", reasoning_content: "think" },
+        { role: "assistant", content: "", tool_calls: [tc("c1")] },
+        ...extraViolators.map((id) => ({ role: "assistant", content: "", tool_calls: [tc(id)] })),
+    ];
+
+    it("the same persistent violation across 100 repeated requests warns exactly once", () => {
+        const c = collector();
+        for (let i = 0; i < 100; i++) warnReasoningPairs(openaiHistory(), c.log, "s-dedup");
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /reasoning-pair-violated/);
+        assert.match(c.lines[0]!, /first seen: c1/);
+    });
+
+    it("a newly appearing violator warns again, naming only the new identity, with the repeat count of the ongoing one", () => {
+        const c = collector();
+        warnReasoningPairs(openaiHistory(), c.log, "s-dedup");
+        warnReasoningPairs(openaiHistory(["c2"]), c.log, "s-dedup");
+        warnReasoningPairs(openaiHistory(["c2"]), c.log, "s-dedup");
+        assert.equal(c.lines.length, 2);
+        assert.match(c.lines[1]!, /first seen: c2/);
+        assert.doesNotMatch(c.lines[1]!, /first seen: c1/);
+        assert.match(c.lines[1]!, /; 1 already reported \(up to ×2 repeats\)/);
+        assert.match(c.lines[1]!, /\(window: since this proxy started\)/);
+    });
+
+    it("concurrent sessions do not suppress each other", () => {
+        const cA = collector();
+        const cB = collector();
+        warnReasoningPairs(openaiHistory(), cA.log, "sA");
+        warnReasoningPairs(openaiHistory(), cB.log, "sB");
+        warnReasoningPairs(openaiHistory(), cA.log, "sA");
+        warnReasoningPairs(openaiHistory(), cB.log, "sB");
+        assert.equal(cA.lines.length, 1);
+        assert.equal(cB.lines.length, 1);
+    });
+
+    it("wires are independent trackers even for the same session and ids", () => {
+        const cO = collector();
+        const cR = collector();
+        warnReasoningPairs(openaiHistory(), cO.log, "sX");
+        warnResponsesReasoningPairs([
+            { type: "reasoning", summary: [{ type: "summary_text", text: "r" }] },
+            { type: "message", role: "assistant", content: "a" },
+            { type: "message", role: "user", content: "u2" },
+            { type: "function_call", name: "f", arguments: "{}", call_id: "c1" },
+        ], cR.log, "sX");
+        assert.equal(cO.lines.length, 1);
+        assert.equal(cR.lines.length, 1);
+    });
+
+    it("a recovered message that violates again reports a new episode", () => {
+        const healed = [
+            { role: "assistant", content: "a1", reasoning_content: "think" },
+            { role: "assistant", content: "", tool_calls: [tc("c1")], reasoning_content: "" },
+        ];
+        const c = collector();
+        warnReasoningPairs(openaiHistory(), c.log, "s-dedup");
+        warnReasoningPairs(healed, c.log, "s-dedup");
+        warnReasoningPairs(healed, c.log, "s-dedup");
+        warnReasoningPairs(openaiHistory(), c.log, "s-dedup");
+        assert.equal(c.lines.length, 2);
+        assert.match(c.lines[1]!, /re-violating after recovery/);
+        assert.match(c.lines[1]!, /first seen: c1/);
+    });
+
+    it("anthropic wire: repeated loss of the same tool_use warns once; a new loss warns again", () => {
+        const inbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        const outbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        const c = collector();
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s-dedup");
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s-dedup");
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /thinking-pair-violated/);
+        assert.match(c.lines[0]!, /first seen: tu1/);
+
+        const inbound2 = [
+            ...inbound,
+            { role: "assistant", content: [{ type: "thinking", thinking: "t2" }, { type: "tool_use", id: "tu2", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu2", content: "r" }] },
+        ];
+        const outbound2 = [
+            ...outbound,
+            { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu2", content: "r" }] },
+        ];
+        warnAnthropicThinkingPairs(inbound2, outbound2, c.log, "s-dedup");
+        assert.equal(c.lines.length, 2);
+        assert.match(c.lines[1]!, /first seen: tu2/);
+        assert.doesNotMatch(c.lines[1]!, /first seen: tu1/);
+        assert.match(c.lines[1]!, /; 1 already reported \(up to ×3 repeats\)/);
     });
 });

@@ -2,13 +2,14 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findSameLanePredecessor, lanePreferredPort, portZoneFilePath, readZonePort, writeZonePort } from "../src/instance.ts";
 import type { ProxyInstanceFile, RegistryEntry } from "../src/instance.ts";
 import { ZONE_PORT_BASE, resolveZonePortBase } from "../src/config.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1660: the self-managed port zone. Every lane'd launch tries the lane's
 // sticky port first (a past +1-ladder drift it still points at), else the
@@ -37,7 +38,7 @@ test("readZonePort/writeZonePort: round-trip, per-lane isolation, preserves othe
         const shape = JSON.parse(readFileSync(file, "utf8")) as { lanes: Record<string, number> };
         assert.deepEqual(shape.lanes, { zcode: 18790, claude: 18789 });
     } finally {
-        rmSync(path.dirname(file), { recursive: true, force: true });
+        rmrf(path.dirname(file));
     }
 });
 
@@ -55,7 +56,7 @@ test("readZonePort: tolerates garbage — missing file, invalid JSON, out-of-ran
         writeFileSync(file, JSON.stringify({ lanes: { zcode: 18788 } }), "utf8");
         assert.equal(readZonePort("other", file), undefined, "lane without a record");
     } finally {
-        rmSync(path.dirname(file), { recursive: true, force: true });
+        rmrf(path.dirname(file));
     }
 });
 
@@ -69,7 +70,7 @@ test("writeZonePort: rejects invalid ports and never throws", () => {
         assert.equal(readZonePort("zcode", file), undefined, "nothing settled for invalid inputs");
         assert.doesNotThrow(() => writeZonePort("zcode", 18787, file));
     } finally {
-        rmSync(path.dirname(file), { recursive: true, force: true });
+        rmrf(path.dirname(file));
     }
 });
 
@@ -85,7 +86,7 @@ test("lanePreferredPort: sticky record beats the base; base honors BILI_ZONE_POR
         assert.equal(readZonePort("zcode", file), 18788, "sticky present in the temp zone file");
         assert.equal(lanePreferredPort("zcode", {}), ZONE_PORT_BASE, "default base without a sticky record (real state file untouched in tests)");
     } finally {
-        rmSync(path.dirname(file), { recursive: true, force: true });
+        rmrf(path.dirname(file));
     }
 });
 
@@ -254,7 +255,7 @@ test("zone sequence: settle → attach → drift → re-settle → attach follow
         assert.equal(h4.attached, true);
         assert.equal(h4.port, ZONE_PORT_BASE + 1, "later launches follow the drift");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -276,7 +277,7 @@ test("zone sequence: a second lane never attaches cross-lane and settles its own
         assert.equal(readZonePort("zcode", zoneFile), ZONE_PORT_BASE, "lane one's sticky record is untouched");
         assert.equal(readZonePort("kimi", zoneFile), ZONE_PORT_BASE + 1);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -296,7 +297,7 @@ test("zone sequence: an explicit strictPort pin is exact and stays out of the st
         assert.deepEqual(sim.settles, [], "explicit pins never settle a zone record");
         assert.equal(readZonePort("zcode", zoneFile), undefined);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -311,7 +312,7 @@ test("zone sequence: an unlane'd launch is ephemeral and never touches the zone 
         assert.deepEqual(sim.settles, [], "no lane → no sticky write");
         assert.equal(readZonePort("zcode", zoneFile), undefined, "the zone file stays empty");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

@@ -11,17 +11,33 @@ function escapeHtml(value: string): string {
         char === "&" ? "&amp;" : char === "<" ? "&lt;" : char === ">" ? "&gt;" : char === '"' ? "&quot;" : "&#39;");
 }
 
-export function renderPage(origin: string, version: string): string {
+// #2559: theme pins the face's palette explicitly for embedding hosts (?theme=
+// light|dark → <html data-theme=…>); see the #2559 note in styles.ts.
+export function renderPage(origin: string, version: string, embed = false, theme?: "light" | "dark"): string {
     const o = escapeHtml(origin);
     const caPath = rootCaPath();
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+    // #3536: declare an EMPTY icon so browsers (dsh desktop's Electron frame
+    // included) never fall back to probing /favicon.ico on the proxy origin —
+    // that request used to miss every admin route and get relayed onto the
+    // configured upstream (a wasted request + 403 noise in the log).
+    return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/blog" data-nav="blog" data-i18n="nav.blog">${zh("nav.blog")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
+<div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
+<div id="attribution-banner" class="banner warn" hidden></div>
+<div id="storage-degraded-banner" class="banner warn" hidden></div>
+<div id="snapshot-shadow-banner" class="banner warn" hidden></div>
+<div id="storage-second-process-banner" class="banner warn" hidden></div>
+<div id="split-brain-banner" class="banner err" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="update-policy-banner" class="banner warn" hidden></div>
+<div id="plugin-advisory-banner" class="banner warn" hidden></div>
+<div id="pck-banner" class="banner warn" hidden></div>
+<div id="host-plugin-banner" class="banner warn" hidden></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">
@@ -41,6 +57,7 @@ export function renderPage(origin: string, version: string): string {
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="sys.title">${zh("sys.title")}</span></div><div class="card-b"><dl class="kv">
 <div class="k" data-i18n="sys.version">${zh("sys.version")}</div><div class="v mono" id="sys-version"></div>
 <div class="k" data-i18n="sys.disk_version">${zh("sys.disk_version")}</div><div class="v mono" id="sys-disk-version"></div>
+<div class="k" data-i18n="sys.lane">${zh("sys.lane")}</div><div class="v mono" id="sys-lane"></div>
 <div class="k" data-i18n="sys.inflight">${zh("sys.inflight")}</div><div class="v mono" id="sys-inflight">0</div>
 <div class="k" data-i18n="sys.blind_tunnels">${zh("sys.blind_tunnels")}</div><div class="v mono" id="sys-blind">0</div>
 </dl></div></div>
@@ -52,20 +69,35 @@ export function renderPage(origin: string, version: string): string {
 <section id="page-sessions" class="page" hidden>
 <div id="sessions-list-view">
 <div class="page-head"><div><h1 data-i18n="ses.title">${zh("ses.title")}</h1><div class="sub" data-i18n="ses.sub">${zh("ses.sub")}</div></div>
-<div style="display:flex;gap:10px;align-items:center"><input id="ses-search" type="search" class="search" placeholder="${zh("ses.search_ph")}" data-i18n-ph="ses.search_ph"><span id="ses-count" class="dim small"></span><span id="ses-empty-hint" class="dim small" hidden></span></div></div>
+<div class="ses-toolbar"><input id="ses-search" type="search" class="search" placeholder="${zh("ses.search_ph")}" data-i18n-ph="ses.search_ph"><select id="ses-protocol" class="ses-filter" data-i18n-title="ses.filter_protocol_tip" title="${zh("ses.filter_protocol_tip")}"></select><select id="ses-client" class="ses-filter" data-i18n-title="ses.filter_client_tip" title="${zh("ses.filter_client_tip")}"></select><select id="ses-state" class="ses-filter" data-i18n-title="ses.filter_state_tip" title="${zh("ses.filter_state_tip")}"><option value="" data-i18n="ses.filter_state_all">${zh("ses.filter_state_all")}</option><option value="live" data-i18n="ses.filter_state_live">${zh("ses.filter_state_live")}</option><option value="history" data-i18n="ses.filter_state_history">${zh("ses.filter_state_history")}</option></select><button id="ses-reset-filters" class="btn sm" data-i18n="ses.reset_filters">${zh("ses.reset_filters")}</button><button id="ses-refresh" class="btn sm"><span data-i18n="ses.refresh">${zh("ses.refresh")}</span></button></div></div>
+<div class="ses-meta"><span id="ses-count" class="dim small"></span><span id="ses-empty-hint" class="dim small" hidden></span></div>
 <div class="card"><div class="card-b flush"><div class="twrap twide"><table class="data"><colgroup><col><col style="width:52px"><col style="width:84px"><col style="width:104px"><col style="width:48px"><col style="width:62px"><col style="width:62px"><col style="width:62px"><col style="width:190px"><col style="width:72px"><col style="width:48px"><col style="width:48px"><col style="width:56px"></colgroup><thead><tr>
 <th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_client">${zh("ses.th_client")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th data-i18n="ses.th_upstream">${zh("ses.th_upstream")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_input">${zh("ses.th_input")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" title="${zh("ses.th_switches_tip")}" data-i18n-title="ses.th_switches_tip" data-i18n="ses.th_switches">${zh("ses.th_switches")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th><th class="num" data-i18n="ses.th_blocks">${zh("ses.th_blocks")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
 </tr></thead><tbody id="sessions-body"></tbody></table></div></div></div>
+<div class="ses-pager"><button id="ses-prev" class="btn sm" data-i18n="ses.prev_page">${zh("ses.prev_page")}</button><span id="ses-page-label" class="dim small"></span><button id="ses-next" class="btn sm" data-i18n="ses.next_page">${zh("ses.next_page")}</button></div>
 </div>
 <section id="session-detail-view" hidden></section>
 </section>
 <section id="page-config" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div></div>
 <div id="cfg-parse-error" class="banner err" hidden></div>
-<div class="card"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
+<div class="card" id="card-quick"><div class="card-h"><span data-i18n="cfg.quick">${zh("cfg.quick")}</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px" data-i18n="cfg.quick_desc">${zh("cfg.quick_desc")}</p>
+<div id="quick-fields" style="display:flex;flex-direction:column;gap:12px"></div>
+<div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
+<div style="margin-top:14px"><button id="save-quick" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
+</div></div>
+<div class="card" id="summary-settings"><div class="card-h"><span data-i18n="summary.title">${zh("summary.title")}</span></div><div class="card-b">
+<div id="summary-fields"></div>
+<div class="cfg-dirty-note small" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
+<button id="save-summary" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button>
+</div></div>
+<div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>
 <textarea id="cfg-file-edit" class="editor mono codebox" spellcheck="false"></textarea>
+<div id="cfg-relay-warn" class="banner warn" style="margin-top:10px" hidden></div>
+<div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <div style="margin-top:10px"><button id="save-file" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
 <div class="grid cols-2" style="margin-top:16px">
@@ -84,6 +116,7 @@ export function renderPage(origin: string, version: string): string {
 </div>
 <div class="grid cols-2" style="margin-top:16px">
 <div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.passthrough_desc">${zh("cfg.passthrough_desc")}</p><div class="pt-row"><span id="pt-state" class="badge disk">—</span><span id="pt-source" class="dim small"></span></div><div style="margin-top:10px"><button id="clear-passthrough" class="btn sm" hidden><span data-i18n="cfg.pt_clear">${zh("cfg.pt_clear")}</span></button></div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.resign">${zh("cfg.resign")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.resign_desc">${zh("cfg.resign_desc")}</p><div id="resign-body" style="display:flex;flex-direction:column;gap:10px"><span class="dim small" data-i18n="cfg.resign_loading">${zh("cfg.resign_loading")}</span></div></div></div>
 </div>
 </section>
 <section id="page-logs" class="page" hidden>
@@ -102,6 +135,30 @@ export function renderPage(origin: string, version: string): string {
 </div></div>
 <div class="card" style="margin-top:16px"><div class="card-b flush"><pre id="log-body" class="logbox"></pre></div></div>
 </section>
+<section id="page-updates" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="up.title">${zh("up.title")}</h1><div class="sub" data-i18n="up.sub">${zh("up.sub")}</div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="up.version">${zh("up.version")}</span><button id="up-check" class="btn sm"><span data-i18n="up.check_now">${zh("up.check_now")}</span></button></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="up.running">${zh("up.running")}</div><div class="v mono" id="up-running">—</div>
+<div class="k" data-i18n="up.disk">${zh("up.disk")}</div><div class="v mono" id="up-disk">—</div>
+<div class="k" data-i18n="up.latest_known">${zh("up.latest_known")}</div><div class="v mono" id="up-latest">—</div>
+<div class="k" data-i18n="up.last_check">${zh("up.last_check")}</div><div class="v mono" id="up-last-check">—</div>
+</dl>
+<p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
+</div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.notices">${zh("up.notices")}</span></div><div class="card-b"><div id="up-notices" class="dim small">—</div></div></div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.install">${zh("up.install")}</span></div><div class="card-b">
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<button id="up-upgrade-now" class="btn"><span id="up-upgrade-now-label" data-i18n="up.upgrade_none">${zh("up.upgrade_none")}</span></button>
+<select id="up-select" class="ses-filter"></select>
+<button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
+</div>
+<p id="up-result" class="small" style="margin:0" hidden></p>
+</div></div>
+<!-- #3719 phase 2: changelog card moved here from the overview page — same
+rendering/linkify in client.js into #changelog-body (collapsed by default). -->
+<details class="card cl-card" open style="margin-top:16px"><summary class="cl-summary" data-i18n="sys.changelog">${zh("sys.changelog")}</summary><div id="changelog-body" class="card-b dim small"></div></details>
+</section>
 <section id="page-connect" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>
 <div class="section-label" data-i18n="con.method_plugin">${zh("con.method_plugin")}</div>
@@ -113,7 +170,7 @@ export function renderPage(origin: string, version: string): string {
 <div class="section-label" data-i18n="con.method_launcher">${zh("con.method_launcher")}</div>
 <p class="small dim" data-i18n="con.method_launcher_hint">${zh("con.method_launcher_hint")}</p>
 <div class="card"><div class="card-b"><div class="chips">
-<span class="chip mono copy-btn" data-copy="bili pi" data-launcher="pi">bili pi</span><span class="chip mono copy-btn" data-copy="bili codex" data-launcher="codex">bili codex</span><span class="chip mono copy-btn" data-copy="bili claude" data-launcher="claude">bili claude</span><span class="chip mono copy-btn" data-copy="bili omp" data-launcher="omp">bili omp</span><span class="chip mono copy-btn" data-copy="bili opencode" data-launcher="opencode">bili opencode</span><span class="chip mono copy-btn" data-copy="bili hermes" data-launcher="hermes">bili hermes</span><span class="chip mono copy-btn" data-copy="bili dsh" data-launcher="dsh">bili dsh</span><span class="chip mono copy-btn" data-copy="bili codebuddy" data-launcher="codebuddy">bili codebuddy</span><span class="chip mono copy-btn" data-copy="bili qoder" data-launcher="qoder">bili qoder</span><span class="chip mono copy-btn" data-copy="bili trae" data-launcher="trae">bili trae</span><span class="chip mono copy-btn" data-copy="bili jcode" data-launcher="jcode">bili jcode</span><span class="chip mono copy-btn" data-copy="bili kimi" data-launcher="kimi">bili kimi</span><span class="chip mono copy-btn" data-copy="bili gemini" data-launcher="gemini">bili gemini</span><span class="chip mono copy-btn" data-copy="bili iflow" data-launcher="iflow">bili iflow</span><span class="chip mono copy-btn" data-copy="bili qwen" data-launcher="qwen">bili qwen</span><span class="chip mono copy-btn" data-copy="bili mcode" data-launcher="mcode">bili mcode</span><span class="chip mono copy-btn" data-copy="bili aider" data-launcher="aider">bili aider</span><span class="chip mono copy-btn" data-copy="bili copilot" data-launcher="copilot">bili copilot</span><span class="chip mono copy-btn" data-copy="bili amp" data-launcher="amp">bili amp</span><span class="chip mono copy-btn" data-copy="bili goose" data-launcher="goose">bili goose</span>
+<span class="chip mono copy-btn" data-copy="bili pi" data-launcher="pi">bili pi</span><span class="chip mono copy-btn" data-copy="bili codex" data-launcher="codex">bili codex</span><span class="chip mono copy-btn" data-copy="bili claude" data-launcher="claude">bili claude</span><span class="chip mono copy-btn" data-copy="bili omp" data-launcher="omp">bili omp</span><span class="chip mono copy-btn" data-copy="bili opencode" data-launcher="opencode">bili opencode</span><span class="chip mono copy-btn" data-copy="bili hermes" data-launcher="hermes">bili hermes</span><span class="chip mono copy-btn" data-copy="bili dsh" data-launcher="dsh">bili dsh</span><span class="chip mono copy-btn" data-copy="bili codebuddy" data-launcher="codebuddy">bili codebuddy</span><span class="chip mono copy-btn" data-copy="bili qoder" data-launcher="qoder">bili qoder</span><span class="chip mono copy-btn" data-copy="bili trae" data-launcher="trae">bili trae</span><span class="chip mono copy-btn" data-copy="bili jcode" data-launcher="jcode">bili jcode</span><span class="chip mono copy-btn" data-copy="bili kimi" data-launcher="kimi">bili kimi</span><span class="chip mono copy-btn" data-copy="bili gemini" data-launcher="gemini">bili gemini</span><span class="chip mono copy-btn" data-copy="bili iflow" data-launcher="iflow">bili iflow</span><span class="chip mono copy-btn" data-copy="bili qwen" data-launcher="qwen">bili qwen</span><span class="chip mono copy-btn" data-copy="bili antigravity" data-launcher="antigravity">bili antigravity</span><span class="chip mono copy-btn" data-copy="bili mcode" data-launcher="mcode">bili mcode</span><span class="chip mono copy-btn" data-copy="bili aider" data-launcher="aider">bili aider</span><span class="chip mono copy-btn" data-copy="bili copilot" data-launcher="copilot">bili copilot</span><span class="chip mono copy-btn" data-copy="bili amp" data-launcher="amp">bili amp</span><span class="chip mono copy-btn" data-copy="bili crush" data-launcher="crush">bili crush</span><span class="chip mono copy-btn" data-copy="bili zed" data-launcher="zed">bili zed</span><span class="chip mono copy-btn" data-copy="bili goose" data-launcher="goose">bili goose</span>
 </div><p class="small dim" style="margin:10px 0 0"><span data-i18n="con.launcher_help_pre">${zh("con.launcher_help_pre")}</span> <span class="mono">bili --help</span></p><p class="small dim" style="margin:6px 0 0"><span data-i18n="con.launcher_mitm">${zh("con.launcher_mitm")}</span></p></div></div>
 <div class="section-label" data-i18n="con.method_a">${zh("con.method_a")}</div>
 <p class="small dim"><span data-i18n="con.method_a_hint">${zh("con.method_a_hint")}</span> <span class="mono">${o}/bili/</span></p>
@@ -171,6 +228,10 @@ export function renderPage(origin: string, version: string): string {
 <div class="copy-row" style="margin-top:8px"><pre class="codebox">${caPathEsc}</pre><button class="btn sm copy-btn" data-copy="${caPath}"><span data-i18n="copy.ca">${zh("copy.ca")}</span></button></div>
 <p class="small dim" style="margin-top:10px"><span data-i18n="zcode.hint_a">${zh("zcode.hint_a")}</span> <span class="mono">~</span> <span data-i18n="zcode.hint_b">${zh("zcode.hint_b")}</span> <span class="mono">~/...</span> <span data-i18n="zcode.hint_c">${zh("zcode.hint_c")}</span></p>
 </div></div>
+</section>
+<section id="page-blog" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="bl.title">${zh("bl.title")}</h1><div class="sub" data-i18n="bl.sub">${zh("bl.sub")}</div></div></div>
+<div id="bl-list"><div class="card"><div class="card-b" data-i18n="common.loading">${zh("common.loading")}</div></div></div>
 </section>
 </main>
 <div id="toast-host" class="toast-host"></div>

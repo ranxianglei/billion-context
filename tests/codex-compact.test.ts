@@ -13,6 +13,7 @@ import {
     stripBiliCompactionItems,
     replaceBiliCompactionItems,
     codexCompactGate,
+    codexCompactGatePre,
     buildTriggerForgeBody,
     renderForgedSummary,
     mergeForgedSummaries,
@@ -103,13 +104,13 @@ function block(active: boolean): CompressionBlock {
     };
 }
 
-function mockSession(lastInputTokens: number, blocks: CompressionBlock[]): Session {
+function mockSession(lastInputTokens: number, blocks: CompressionBlock[], opts: { source?: "usage" | "estimate" | "overflow-arm"; grade?: number } = {}): Session {
     const state = createInitialState();
     state.blocks = blocks;
     return {
         id: "test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens, lastInputTokensSource: opts.source, lastUsageGradeTokens: opts.grade, compressCreditTokens: 0, contextTokens: 0 , retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state,
         createdAt: 0,
@@ -117,6 +118,7 @@ function mockSession(lastInputTokens: number, blocks: CompressionBlock[]): Sessi
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -126,10 +128,18 @@ test("codexCompactGate: safety-valve matrix", () => {
     assert.equal(codexCompactGate(mockSession(1_000, [block(true)]), limit, false), false, "transform failed → pass through");
     assert.equal(codexCompactGate(mockSession(1_000, [block(false)]), limit, true), false, "no active block → pass through");
     assert.equal(codexCompactGate(mockSession(1_000, []), limit, true), false, "no blocks → pass through");
-    assert.equal(codexCompactGate(mockSession(9_000, [block(true)]), limit, true), false, "at 90% → ACP not keeping up → pass through");
-    assert.equal(codexCompactGate(mockSession(9_500, [block(true)]), limit, true), false, "above 90% → pass through");
-    assert.equal(codexCompactGate(mockSession(8_999, [block(true)]), limit, true), true, "just below 90% → forge");
+    assert.equal(codexCompactGate(mockSession(9_000, [block(true)], { source: "usage" }), limit, true), false, "at 90% (usage-grade) → ACP not keeping up → pass through");
+    assert.equal(codexCompactGate(mockSession(9_500, [block(true)], { source: "usage" }), limit, true), false, "above 90% (usage-grade) → pass through");
+    assert.equal(codexCompactGate(mockSession(8_999, [block(true)], { source: "usage" }), limit, true), true, "just below 90% (usage-grade) → forge");
     assert.equal(codexCompactGate(mockSession(1_000, [block(true)]), 0, true), false, "zero limit → pass through");
+});
+
+test("codexCompactGatePre: evidence-grade baseline only (#3008)", () => {
+    const limit = 10_000;
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "estimate", grade: 7_000 }), limit), true, "estimate-grade phantom 9500 + usage-grade anchor 7000 → forge (phantom must not self-disable the valve)");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "usage", grade: 9_500 }), limit), false, "usage-grade above 90% → pass through");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)], { source: "overflow-arm", grade: 4_000 }), limit), false, "overflow-arm above 90% → pass through");
+    assert.equal(codexCompactGatePre(mockSession(9_500, [block(true)]), limit), true, "no source, no usage anchor → baseline 0 → forge");
 });
 
 test("replaceBiliCompactionItems: echo becomes a summary handoff message in place", () => {
@@ -217,4 +227,61 @@ test("mergeForgedSummaries: append active, skip inactive, dedup, accumulate acro
     assert.equal(merged.length, 3, "second forge accumulates");
     assert.equal(merged[2], "[Compressed conversation section]\nSUMMARY-D");
     assert.deepEqual(mergeForgedSummaries(undefined, []), []);
+});
+
+// ---------------------------------------------------------------------------
+// #3008: prompt-form auto-compact detection + forge
+// ---------------------------------------------------------------------------
+
+import {
+    hasCompactionPrompt,
+    buildPromptForgeBody,
+    CODEX_COMPACT_PROMPT_ANCHOR,
+} from "../src/codex-compact.ts";
+
+const PROMPT_TEXT = `${CODEX_COMPACT_PROMPT_ANCHOR} Create a handoff summary for another LLM that will resume the task.`;
+
+test("hasCompactionPrompt: last user message opening with the built-in template (#3008)", () => {
+    const user = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+    assert.equal(hasCompactionPrompt([user("hi"), user(PROMPT_TEXT)]), true, "template as last user message");
+    assert.equal(hasCompactionPrompt([user(PROMPT_TEXT)]), true, "string content form");
+    assert.equal(hasCompactionPrompt([user("hi")]), false, "ordinary last user message");
+    assert.equal(hasCompactionPrompt([user(PROMPT_TEXT), { type: "message", role: "assistant", content: "x" }]), false, "assistant after the template disqualifies");
+    assert.equal(hasCompactionPrompt([user("hi"), user(`Before you start: ${PROMPT_TEXT}`)]), false, "anchor must open the message, not appear mid-text");
+    assert.equal(hasCompactionPrompt([user(PROMPT_TEXT), user("hi")]), false, "mid-history template (not last) is not the compaction turn");
+    assert.equal(hasCompactionPrompt([{ type: "compaction_trigger" }]), false, "trigger form is not the prompt form");
+    assert.equal(hasCompactionPrompt([]), false);
+    assert.equal(hasCompactionPrompt("a string"), false);
+    assert.equal(hasCompactionPrompt([{ type: "message", role: "user", content: [{ type: "input_text", text: "  " + PROMPT_TEXT }] }]), true, "leading whitespace tolerated");
+    // A user-overridden compact_prompt (config.compact_prompt in codex) no
+    // longer matches the built-in anchor → falls back to passthrough.
+    assert.equal(hasCompactionPrompt([user("My own custom compaction instructions.")]), false, "overridden template falls out of detection");
+});
+
+test("buildPromptForgeBody: one assistant message codex adopts as its summary (#3008)", () => {
+    const summary = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED";
+    const stream = buildPromptForgeBody(summary, { inputTokens: 725_892, outputTokens: 0, totalTokens: 725_892 }, true);
+    assert.equal(stream.contentType, "text/event-stream");
+    assert.ok(stream.body.includes("response.created"), "created first");
+    const doneMatch = stream.body.match(/data: (\{"type":"response\.output_item\.done".*})\n/);
+    assert.ok(doneMatch, "output_item.done present");
+    const doneItem = JSON.parse(doneMatch![1]!) as { item: { type: string; role: string; status: string; content: { type: string; text: string }[] } };
+    assert.equal(doneItem.item.type, "message");
+    assert.equal(doneItem.item.role, "assistant");
+    assert.equal(doneItem.item.status, "completed");
+    assert.equal(doneItem.item.content[0]!.type, "output_text");
+    assert.equal(doneItem.item.content[0]!.text, summary, "codex's summary_suffix = this text");
+    const completedMatch = stream.body.match(/data: (\{"type":"response\.completed".*})\n/);
+    assert.ok(completedMatch, "response.completed present (codex parser requires id + usage)");
+    const completed = JSON.parse(completedMatch![1]!) as { response: { id: string; usage: { input_tokens: number } } };
+    assert.equal(completed.response.usage.input_tokens, 725_892);
+    assert.ok(stream.body.trimEnd().endsWith("data: [DONE]"), "SSE terminator");
+
+    const json = buildPromptForgeBody(summary, { inputTokens: 10, outputTokens: 0, totalTokens: 10 }, false);
+    assert.equal(json.contentType, "application/json");
+    const parsed = JSON.parse(json.body) as { id: string; output: { type: string; role: string; content: { text: string }[] }[]; usage: { total_tokens: number } };
+    assert.equal(parsed.output.length, 1);
+    assert.equal(parsed.output[0]!.role, "assistant");
+    assert.equal(parsed.output[0]!.content[0]!.text, summary);
+    assert.equal(parsed.usage.total_tokens, 10);
 });

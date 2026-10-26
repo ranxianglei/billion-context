@@ -1,0 +1,59 @@
+# Config reference seed — rollout domain (#3062: per-install canary gating).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: rollout
+entries:
+  - key: rollout
+    type: object
+    default: "{}"
+    group: behavior
+    id: tt.rollout
+    site_group: beh
+    desc_en: "Feature rollout (canary) block: per-feature overrides of the version's baked-in rollout plan; features roll out by percent of installs, bucketed on a stable per-machine id."
+    desc_zh: "灰度发布配置块:按特性覆盖版本内置的灰度计划;特性按安装占比放量,分桶基于每台机器稳定的 id。"
+    site_en: "<code>rollout</code> — canary gating: features enable for a percent of installs, bucketed on a stable per-machine UUID; nested <span class='mech'>base</span> rolls B out only inside A's cohort."
+    site_zh: "<code>rollout</code> —— 灰度门控:特性按安装百分比启用,以每台机器稳定的 UUID 分桶;嵌套 <span class='mech'>base</span> 使 B 只在 A 的入组人群内放量。"
+  - key: rollout.installId
+    type: string
+    default: "auto-generated UUID persisted at ~/.local/state/billion-context/rollout-id.json"
+    group: behavior
+    desc_en: "Pins the bucketing identity instead of the auto-generated state-dir UUID (support/testing: pick or compute an id whose bucket lands inside a cohort)."
+    desc_zh: "钉住分桶身份,替代 state 目录自动生成的 UUID(支持/测试用:选取或计算一个桶值落在目标人群内的 id)。"
+  - key: rollout.features
+    type: "record feature name → { enabled?, percent?, salt?, base? } | boolean | number"
+    default: "{}"
+    group: behavior
+    desc_en: "Per-feature overrides, keyed by the feature names the running version has under rollout. enabled (boolean) overrides any percentage; percent (0–100) re-scales the cohort; salt re-randomizes it; base re-scopes the nesting. Shorthands: \"x\": true/false forces on/off, \"x\": 20 sets percent. Wrong-typed fields (e.g. enabled as a string) are ignored and named by the startup warning — never silently widening a cohort."
+    desc_zh: "按特性覆盖,键为当前版本处于灰度中的特性名。enabled(布尔)覆盖任何百分比;percent(0–100)重设比例;salt 重新洗牌;base 重设嵌套父特性。缩写:\"x\": true/false 强制开/关,\"x\": 20 等价 percent 20。类型写错的字段(如 enabled 写成字符串)会被忽略并在启动警告中点名,绝不静默放宽圈层。"
+  - key: rollout.features.enabled
+    type: boolean
+    default: "unset (bucket math decides)"
+    env: BILI_ROLLOUT_<FEATURE>
+    group: behavior
+    desc_en: "Force a gated feature on/off regardless of percentage. Env tier BILI_ROLLOUT_<FEATURE> (UPPER_SNAKE feature name; 0/false = off, any other value = on) wins over everything, including this field."
+    desc_zh: "无视百分比强制开关某个灰度特性。环境变量 BILI_ROLLOUT_<特性名>(大写下划线;0/false=关,其余值=开)优先于一切,包括本字段。"
+  - key: rollout.features.percent
+    type: number
+    default: "the version's baked-in plan"
+    group: behavior
+    desc_en: "Percent of installs (0–100, fractional allowed) that see the feature. Monotonic: raising the percent never drops an already-enabled install; the bucket is prefix-stable per install."
+    desc_zh: "看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。"
+  - key: rollout.features.salt
+    type: string
+    default: "the feature name"
+    group: behavior
+    desc_en: "Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles)."
+    desc_zh: "分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。"
+  - key: rollout.features.base
+    type: string
+    default: "unset (roll out over everyone)"
+    group: behavior
+    desc_en: "Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed)."
+    desc_zh: "嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。"
+  - key: rollout.features.pluginLaneServerHistory
+    type: "boolean | number"
+    default: "0 (off)"
+    default_zh: "0(关)"
+    env: BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY
+    group: behavior
+    desc_en: "Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out."
+    desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"

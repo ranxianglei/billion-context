@@ -7,7 +7,8 @@ process.env.NODE_ENV = "test";
 
 import type { CoreMessage } from "acp-kernel";
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -19,6 +20,10 @@ import { IMAGE_PLACEHOLDER, imagePlaceholders, messageImages } from "../src/imag
 // image-only items at toCore, anthropic left a bare information-free "[image]").
 // Each carried image must now render as an explicit placeholder in the summary
 // input, carrying real pixels nowhere (placeholder-only by design).
+// #2607: archivable (inline) media now FOLDS like text — the e2e lanes below
+// pin that its placeholder (with mNNNNN ref) reaches the summary input and its
+// bytes leave the forward; only unrecoverable media (URL/file refs) still
+// survives folds untouched.
 
 function pngB64(w: number, h: number): string {
     const b = Buffer.alloc(24);
@@ -187,6 +192,13 @@ async function startProxy(upstreamPort: number, model: string, path: string): Pr
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
@@ -197,11 +209,12 @@ async function startProxy(upstreamPort: number, model: string, path: string): Pr
 async function closeAll(...servers: http.Server[]): Promise<void> {
     for (const s of servers) {
         s.close();
+        s.closeIdleConnections?.();
         await once(s, "close");
     }
 }
 
-test("e2e #781 (Responses): media payloads survive folding — bytes reach the forward, not the summary", async () => {
+test("e2e #781/#2607 (Responses): archivable media folds — placeholders reach the summary, bytes leave the forward (restorable by ref)", async () => {
     const summaryBodies: unknown[] = [];
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
@@ -246,10 +259,17 @@ test("e2e #781 (Responses): media payloads survive folding — bytes reach the f
 
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const all = summaryBodies.map((b) => JSON.stringify(b)).join("\n");
-        assert.equal(countOcc(all, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholders in the summary input (#1188 path B)");
+        // Placeholders carry the ref suffix ("[image: png 1024x768 · m00001]"),
+        // so count on the prefix, not the closed-bracket literal.
+        assert.equal(countOcc(all, "[image: png 1024x768"), 2, "#2607: archivable media folds like text — each folded image rides the summary input as its placeholder (#781)");
         assert.ok(!all.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
+        assert.ok((all.match(/· m\d{5}/g) ?? []).length >= 2, "the summary-input placeholders carry the mNNNNN refs decompress({ imageRef }) needs");
         assert.equal(forwards.length, 1, "exactly one forward upstream");
-        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 2, "both folded-range images survive byte-exact in the post-compression forward");
+        // Exactly ONE image survives on the wire: the session-opening user
+        // message, which the kernel pins through folds (first-user pin,
+        // prune.ts rebuildMessages / DESIGN.md §8.1 — strict providers reject
+        // conversations with no user message). Every other folded image leaves.
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 1, "#2607: folded-range images leave the forward except the pinned opening message — pixels archived by ref, restorable via decompress({ imageRef })");
         assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
 
         const s = listSessions().find((x) => x.meta.label === "img-sess-781-resp");
@@ -260,7 +280,7 @@ test("e2e #781 (Responses): media payloads survive folding — bytes reach the f
     }
 });
 
-test("e2e #781 (Anthropic): media payload survives folding byte-exact in the forward", async () => {
+test("e2e #781/#2607 (Anthropic): archivable image folds — placeholder reaches the summary, bytes leave the forward", async () => {
     const summaryBodies: Array<{ messages?: Array<{ role?: string; content?: unknown }> }> = [];
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
@@ -316,18 +336,22 @@ test("e2e #781 (Anthropic): media payload survives folding byte-exact in the for
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const userTexts = summaryBodies.flatMap((b) => (b.messages ?? []).filter((m) => m.role === "user").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))));
         const joined = userTexts.join("\n");
-        assert.equal(countOcc(joined, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholder in the summary input (#1188 path B)");
+        // Count on the prefix — folded placeholders carry the ref suffix.
+        assert.equal(countOcc(joined, "[image: png 1024x768"), 1, "#2607: the archivable image folds like text and rides the summary input as its placeholder (#781)");
         assert.ok(!joined.includes("[image]"), "the bare codec literal no longer appears");
         assert.ok(!joined.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
+        assert.ok((joined.match(/· m\d{5}/g) ?? []).length >= 1, "the summary-input placeholder carries the mNNNNN ref decompress({ imageRef }) needs");
         assert.equal(forwards.length, 1, "exactly one forward upstream");
-        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 1, "the folded-range image survives byte-exact in the post-compression forward");
+        // The image rides the THIRD message, not the session-opening user
+        // message, so the first-user pin retains no bytes here.
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 0, "#2607: the folded-range image leaves the forward — pixels archived by ref, restorable via decompress({ imageRef })");
         assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {
         await closeAll(proxy, upstream);
     }
 });
 
-test("e2e #781 (OpenAI): media payloads survive folding — bytes reach the forward, not the summary", async () => {
+test("e2e #781/#2607 (OpenAI): archivable media folds — placeholders reach the summary, bytes leave the forward", async () => {
     const summaryBodies: unknown[] = [];
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
@@ -381,11 +405,15 @@ test("e2e #781 (OpenAI): media payloads survive folding — bytes reach the forw
 
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const all = summaryBodies.map((b) => JSON.stringify(b)).join("\n");
-        assert.equal(countOcc(all, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholders in the summary input (#1188 path B)");
+        // Count on the prefix — folded placeholders carry the ref suffix.
+        assert.equal(countOcc(all, "[image: png 1024x768"), 2, "#2607: archivable media folds like text — each folded image rides the summary input as its placeholder (#781)");
         assert.ok(!all.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
+        assert.ok((all.match(/· m\d{5}/g) ?? []).length >= 2, "the summary-input placeholders carry the mNNNNN refs decompress({ imageRef }) needs");
         assert.equal(forwards.length, 1, "exactly one forward upstream");
         assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
-        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 2, "both folded-range images survive byte-exact in the post-compression forward");
+        // The opening user message here is text-only, so the first-user pin
+        // (prune.ts / DESIGN.md §8.1) retains no image bytes.
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 0, "#2607: folded-range images leave the forward — pixels archived by ref, restorable via decompress({ imageRef })");
     } finally {
         await closeAll(proxy, upstream);
     }

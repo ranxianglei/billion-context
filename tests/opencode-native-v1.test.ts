@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { z } from "zod";
 
 import {
     createV1ServerHooks,
@@ -8,6 +7,8 @@ import {
     jsonSchemaToZodShape,
     rewriteV1Providers,
     type V1Config,
+    type V1ModelDef,
+    type V1ProviderDef,
     type V1ProviderOptions,
 } from "../src/agent/opencode-native.js";
 import { rmrf } from "./tmp-rm.ts";
@@ -22,7 +23,7 @@ const fakeZ = {
     boolean: () => ({ __fake: "boolean" }),
     array: (item: unknown) => ({ __fake: "array", item }),
     enum: (values: [string, ...string[]]) => ({ __fake: "enum", values }),
-} as unknown as typeof z;
+} as unknown as typeof import("zod");
 
 describe("jsonSchemaToZodShape", () => {
     it("maps primitive, enum, array and unknown fields", () => {
@@ -59,7 +60,7 @@ describe("jsonSchemaToZodShape", () => {
     it("produces fields the real host zod accepts in z.object()", async () => {
         // The v1 registry wraps our shape with the HOST's zod: simulate with
         // the real zod dependency (4.1.8) to prove cross-instance interop.
-        const real = (await import("zod")) as typeof z;
+        const real = await import("zod");
         const shape = jsonSchemaToZodShape(
             { type: "object", properties: { range: { type: "string" }, limit: { type: "number" } } },
             real,
@@ -109,7 +110,7 @@ describe("rewriteV1Providers", () => {
         };
         assert.equal(rewriteV1Providers(cfg, origin), 0);
         assert.deepEqual(rewriteV1Providers({}, origin), 0);
-        const broken: V1Config = { provider: "not-a-table" };
+        const broken: V1Config = { provider: "not-a-table" as unknown as Record<string, V1ProviderDef | undefined> };
         assert.equal(rewriteV1Providers(broken, origin), 0);
     });
 
@@ -165,9 +166,9 @@ describe("extractV1Windows", () => {
 
     it("returns an empty map for missing or broken provider tables", () => {
         assert.deepEqual(extractV1Windows({}), new Map());
-        assert.deepEqual(extractV1Windows({ provider: "nope" }), new Map());
+        assert.deepEqual(extractV1Windows({ provider: "nope" as unknown as Record<string, V1ProviderDef | undefined> }), new Map());
         assert.deepEqual(extractV1Windows({ provider: { p: {} } }), new Map());
-        assert.deepEqual(extractV1Windows({ provider: { p: { models: "nope" } } }), new Map());
+        assert.deepEqual(extractV1Windows({ provider: { p: { models: "nope" as unknown as Record<string, V1ModelDef | undefined> } } }), new Map());
     });
 });
 
@@ -175,13 +176,13 @@ describe("createV1ServerHooks", () => {
     const origin = "http://127.0.0.1:19199";
 
     function makeDeps() {
-        const forwarded: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }> = [];
         return {
             z: fakeZ,
-            forward: async (o: string, conversationId: string, tool: string, args: unknown) => {
-                forwarded.push({ conversationId, tool, args });
+            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => {
+                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
                 assert.equal(o, origin);
-                return `panel:${tool}`;
+                return { text: `panel:${tool}`, failed: false };
             },
             forwarded,
         };
@@ -210,7 +211,7 @@ describe("createV1ServerHooks", () => {
         assert.ok(compress);
         const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1" });
         assert.equal(out, "panel:compress");
-        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" } }]);
+        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true }]);
     });
 
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {
@@ -250,7 +251,7 @@ describe("createV1ServerHooks", () => {
         await hooks["command.execute.before"]?.({ command: "other", sessionID: "s" });
         // /acp path throws the sentinel after rendering — assert the sentinel shape
         await assert.rejects(
-            hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_x" }),
+            hooks["command.execute.before"]!({ command: "acp", sessionID: "ses_x" }),
             /__BILI_ACP_HANDLED__/,
         );
     });
@@ -261,7 +262,7 @@ describe("createV1ServerHooks", () => {
         const deps = makeDeps();
         deps.forward = async (o: string) => {
             forwarded.push(o);
-            return "ok";
+            return { text: "ok", failed: false };
         };
         const hooks = createV1ServerHooks(() => live, {}, deps);
         await hooks.tool?.compress?.execute({}, { sessionID: "s" });
@@ -278,7 +279,7 @@ describe("createV1ServerHooks", () => {
         assert.equal(headers["x-bili-plugin"], undefined);
         assert.equal(headers["x-bili-plugin-conversation"], undefined);
         const out = await hooks.tool?.compress?.execute({}, { sessionID: "ses_1" });
-        assert.match(out, /no live proxy/);
+        assert.match(out!, /no live proxy/);
         live = "http://127.0.0.1:19199";
         const h2: Record<string, string> = {};
         await hooks["chat.headers"]?.({ sessionID: "ses_1" }, { headers: h2 });
@@ -346,14 +347,14 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
     it("routes tools, headers, command and transforms per session lane", async () => {
         const events: string[] = [];
         const legacy = fakeLegacyModule(events);
-        const forwarded: { sid: string; tool: string; args: unknown }[] = [];
+        const forwarded: { sid: string; tool: string; args: unknown; nativeCaller?: boolean }[] = [];
         const hooks = createV1ServerHooks(() => "http://127.0.0.1:19999", {}, {
             z: fakeZ,
             legacy,
             isLegacy: (sid) => sid === "ses_legacy",
-            forward: async (_o, sid, tool, args) => {
-                forwarded.push({ sid, tool, args });
-                return "proxied";
+            forward: async (_o, sid, tool, args, nativeCaller?: boolean) => {
+                forwarded.push({ sid, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
+                return { text: "proxied", failed: false };
             },
             log: () => {},
         });
@@ -365,7 +366,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         // new session: forwarded to the proxy
         const r2 = await hooks.tool?.compress.execute({ content: [] }, { sessionID: "ses_new" });
         assert.equal(r2, "proxied");
-        assert.deepEqual(forwarded, [{ sid: "ses_new", tool: "compress", args: { content: [] } }]);
+        assert.deepEqual(forwarded, [{ sid: "ses_new", tool: "compress", args: { content: [] }, nativeCaller: true }]);
 
         // headers: legacy bypasses, new stamps plugin mode
         const h1: Record<string, string> = {};
@@ -383,7 +384,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         await hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_legacy", arguments: "" }, { parts: [] });
         assert.ok(events.includes("legacy-command:acp:ses_legacy:output"));
         events.length = 0;
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "ses_new", arguments: "" }), /__BILI_ACP_HANDLED__/);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp", sessionID: "ses_new", arguments: "" }), /__BILI_ACP_HANDLED__/);
         assert.equal(events.filter((e) => e.startsWith("legacy-command")).length, 0);
 
         // transforms gated to legacy sessions only; output reaches acp on the legacy lane
@@ -417,11 +418,11 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
             z: fakeZ,
             legacy: fakeLegacyModule(events),
             isLegacy: (sid) => sid === "ses_legacy",
-            forward: async () => "proxied",
+            forward: async () => ({ text: "proxied", failed: false }),
             log: () => {},
         });
         await assert.rejects(
-            hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "ses_legacy" }),
+            hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "ses_legacy" }),
             /__BILI_ACP_HANDLED__/,
         );
         assert.equal(prompts.length, 1);
@@ -439,7 +440,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
             z: fakeZ,
             legacy,
             isLegacy: () => false,
-            forward: async () => "proxied",
+            forward: async () => ({ text: "proxied", failed: false }),
             log: () => {},
         }).config?.(cfg);
         // legacy saw no provider key (shadow had provider: undefined)
@@ -447,7 +448,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         // its permission write survived the merge
         assert.deepEqual(cfg.permission, { deny: ["dcp_*"] });
         // and the rewrite still happened
-        assert.equal((cfg.provider.testprov?.options as V1ProviderOptions).baseURL, "http://127.0.0.1:19999/bili/http://127.0.0.1:19998/v1");
+        assert.equal((cfg.provider!.testprov?.options as V1ProviderOptions).baseURL, "http://127.0.0.1:19999/bili/http://127.0.0.1:19998/v1");
     });
 });
 
@@ -525,7 +526,7 @@ describe("derived-session inheritance report (#1362)", () => {
     }
 
     function v1Deps(extra: Record<string, unknown> = {}) {
-        return { z: fakeZ, forward: async () => "", ...extra };
+        return { z: fakeZ, forward: async () => ({ text: "", failed: false } as const), ...extra };
     }
 
     it("reports a child's parentID once through the identity register channel", async () => {
@@ -608,7 +609,7 @@ describe("derived-session inheritance report (#1362)", () => {
             await new Promise((r) => setTimeout(r, 60));
             await hooks["chat.headers"]?.({ sessionID: "ses_s" }, { headers: {} });
             await waitFor("recovered register", () => proxy.registers.length >= 1);
-            assert.equal(proxy.registers[0]?.parentConversationId, "ses_sp");
+            assert.equal((proxy.registers[0] as Register | undefined)?.parentConversationId, "ses_sp");
         } finally {
             await proxy.close();
         }

@@ -238,27 +238,6 @@ test("resolveCompress: prompts cascade end-to-end via provider routes", () => {
     assert.equal(p.howToCompressRules, "MODEL RULES");
 });
 
-test("mergeCompress: stripImages + stripImagesKeepRecent cascade deepest-wins per field", () => {
-    const merged = mergeCompress(
-        { stripImages: true, stripImagesKeepRecent: 5 },
-        { stripImagesKeepRecent: 3 },
-        { stripImagesKeepRecent: 1 },
-    );
-    assert.equal(merged.stripImages, true);
-    assert.equal(merged.stripImagesKeepRecent, 1);
-});
-
-test("parseCompressSettings: parses stripImages (bool) + stripImagesKeepRecent (number)", () => {
-    const ok = parseCompressSettings({ stripImages: true, stripImagesKeepRecent: 7 });
-    assert.equal(ok?.stripImages, true);
-    assert.equal(ok?.stripImagesKeepRecent, 7);
-    // Absent keys stay undefined (no default injected at parse time).
-    assert.equal(parseCompressSettings({})?.stripImages, undefined);
-    // Malformed types are rejected (whole object discarded).
-    assert.equal(parseCompressSettings({ stripImages: "yes" }), undefined);
-    assert.equal(parseCompressSettings({ stripImagesKeepRecent: "many" }), undefined);
-});
-
 test("mergeCompress: outputHeadroomMaxPct cascades deepest-wins per field (#896)", () => {
     const merged = mergeCompress(
         { outputHeadroomMaxPct: 1 },
@@ -370,4 +349,48 @@ test("parseCompressSettings: parses priceProfile sub-fields and rejects malforme
     assert.equal(parseCompressSettings({ priceProfile: { r: "cheap" } }), undefined);
     assert.equal(parseCompressSettings({ priceProfile: { q: Number.NaN } }), undefined);
     assert.deepEqual(parseCompressSettings({ priceProfile: { x: 3 } })?.priceProfile, {});
+});
+
+test("mergeCompress: tierNudgeTokens merges sub-field-wise deepest-wins (#2376)", () => {
+    const merged = mergeCompress(
+        { tierNudgeTokens: { t1: 40000, t2: 80000 } },
+        { tierNudgeTokens: { t2: 60000 } },
+        { tierNudgeTokens: { t3: 90000 } },
+    );
+    assert.deepEqual(merged.tierNudgeTokens, { t1: 40000, t2: 60000, t3: 90000 });
+    assert.deepEqual(
+        mergeCompress({ tierNudgeTokens: { t1: 1 } }, undefined, undefined).tierNudgeTokens,
+        { t1: 1 },
+    );
+});
+
+test("mergeCompress: tierNudgeTokens absent at all levels stays undefined", () => {
+    assert.equal(mergeCompress({ nudgeGrowthTokens: 50000 }, { tiers: false }, undefined).tierNudgeTokens, undefined);
+});
+
+test("parseCompressSettings: parses tierNudgeTokens sub-fields and rejects malformed (#2376)", () => {
+    assert.deepEqual(parseCompressSettings({ tierNudgeTokens: { t1: 50000, t2: 90000 } })?.tierNudgeTokens, { t1: 50000, t2: 90000 });
+    assert.equal(parseCompressSettings({})?.tierNudgeTokens, undefined);
+    assert.equal(parseCompressSettings({ nudgeGrowthTokens: 50000, tierNudgeTokens: { t2: 90000 } })?.nudgeGrowthTokens, 50000);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: "auto" }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: [] }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: null }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: { t1: 0 } }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: { t2: -5 } }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: { t3: "big" } }), undefined);
+    assert.equal(parseCompressSettings({ tierNudgeTokens: { t1: Number.NaN } }), undefined);
+    // empty / unknown-keys-only → field omitted entirely (legacy behavior)
+    assert.deepEqual(parseCompressSettings({ tierNudgeTokens: {} }), {});
+    assert.equal(parseCompressSettings({ tierNudgeTokens: { x: 3 } })?.tierNudgeTokens, undefined);
+});
+
+test("applyCompressSettings: maps tierNudgeTokens onto kernel nudge.tierGrowthTokens (#2376)", () => {
+    const base = defaultConfig(200000);
+    const out = applyCompressSettings(base, 200000, { tierNudgeTokens: { t1: 40000, t2: 80000 } });
+    assert.deepEqual(out.nudge.tierGrowthTokens, { t1: 40000, t2: 80000 });
+    const partial = applyCompressSettings(base, 200000, { tierNudgeTokens: { t3: 120000 } });
+    assert.deepEqual(partial.nudge.tierGrowthTokens, { t3: 120000 });
+    const absent = applyCompressSettings(base, 200000, {});
+    assert.equal(absent.nudge.tierGrowthTokens, undefined);
+    assert.equal(base.nudge.tierGrowthTokens, undefined, "base config not mutated");
 });

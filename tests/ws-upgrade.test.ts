@@ -84,7 +84,14 @@ function baseOpts(mitm: ProxyOptions["mitm"]): ProxyOptions {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm,
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm,
     };
 }
 

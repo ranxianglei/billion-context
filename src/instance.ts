@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { resolveZonePortBase } from "./config.js";
 import { stateDir } from "./paths.js";
@@ -134,6 +135,21 @@ export function writeZonePort(lane: string, port: number, file: string = portZon
  *  base (BILI_ZONE_PORT override). Explicit user overrides
  *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
  *  the lanes and imply strict-port launches. */
+/** #3654/#3116: append a diagnostic line to the spawner-owned per-port log
+ *  (%TMPDIR%/bili-proxy-<port>.log) — the exact file a spawner failure message
+ *  points users at. Post-#2864 the child mutes its stderr leg into bili.log as
+ *  soon as its logger is live, so a child that dies during listen setup leaves
+ *  that file EMPTY (the "0 bytes" dead-end); this writes the child-side truth
+ *  there. Named by the PREFERRED port (what the spawner uses for the file
+ *  name); the line itself names the port actually tried. Line grammar mirrors
+ *  logger.ts so mixed writers stay greppable. Best-effort: a failed append
+ *  never affects the exit. */
+export function writeSpawnPortLog(preferredPort: number, line: string): void {
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), `bili-proxy-${preferredPort}.log`), `${line}\n`, "utf8");
+    } catch {}
+}
+
 export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
     return readZonePort(lane, file) ?? resolveZonePortBase(env);
 }
@@ -161,6 +177,100 @@ export function findSameLanePredecessor(
         if (e.port !== port || e.lane !== lane) continue;
         if (!isPidAlive(e.pid)) continue;
         if (e.codeFingerprint !== ownFingerprint) return e;
+    }
+    return undefined;
+}
+
+/** #3801: the config-shape cells of a registered instance, normalized the
+ *  way every consumer already normalizes them (discoverLiveInstances):
+ *  absent fields ARE the empty value — a marker written before a cell
+ *  existed records nothing, which means "none". */
+export interface InstanceShape {
+    host: string;
+    passthrough: boolean;
+    mitmDomains: string[];
+    modelWindows: Record<string, number>;
+    modelMaxOutputs: Record<string, number>;
+}
+
+export function entryShape(e: Pick<RegistryEntry, "host" | "passthrough" | "mitmDomains" | "modelWindows" | "modelMaxOutputs">): InstanceShape {
+    return {
+        host: e.host ?? "",
+        passthrough: Boolean(e.passthrough),
+        mitmDomains: e.mitmDomains ?? [],
+        modelWindows: e.modelWindows ?? {},
+        modelMaxOutputs: e.modelMaxOutputs ?? {},
+    };
+}
+
+/** #3801: order-sensitive domain comparison (the launcher's want-side
+ *  projection compares positionally too) plus exact map equality on the two
+ *  per-model tables — the same cells instanceShapeMismatch judges on attach. */
+export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
+    if (a.host !== b.host || a.passthrough !== b.passthrough) return false;
+    if (a.mitmDomains.length !== b.mitmDomains.length || !a.mitmDomains.every((d, i) => d === b.mitmDomains[i])) return false;
+    const wa = Object.keys(a.modelWindows);
+    const wb = Object.keys(b.modelWindows);
+    if (wa.length !== wb.length || !wa.every((k) => a.modelWindows[k] === b.modelWindows[k])) return false;
+    const ma = Object.keys(a.modelMaxOutputs);
+    const mb = Object.keys(b.modelMaxOutputs);
+    if (ma.length !== mb.length || !ma.every((k) => a.modelMaxOutputs[k] === b.modelMaxOutputs[k])) return false;
+    return true;
+}
+
+/** #3801: classify the LIVE same-lane holder of a contended port against OUR
+ *  build. "twin" = identical code AND identical config shape — a true
+ *  duplicate: this launch could have attached to it, nothing is draining, so
+ *  laddering +1 would strand the newcomer as an orphan nobody routes to
+ *  (#3044). The duplicate must exit loudly; the serving instance wins.
+ *  "drifted" = identical code, DIFFERENT config shape (the client's model
+ *  config was edited after the holder spawned — #3801). It is NOT attachable
+ *  and therefore NOT a duplicate: the newcomer ladders off to a free port and
+ *  serves there while the holder keeps serving its own sessions untouched —
+ *  dying here instead wedges the lane behind the stale instance forever
+ *  (attach rejects it, rotation never applies to a same-version drift, and
+ *  the sticky port keeps pointing at it). Wrong port/lane, dead pid, or a
+ *  different/missing fingerprint never classify (those are predecessors or
+ *  foreign squatters, handled by their own paths). */
+export interface SameLanePeer {
+    kind: "twin" | "drifted";
+    entry: RegistryEntry;
+}
+
+export function classifySameLanePeer(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+): SameLanePeer | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        if (e.codeFingerprint !== ownFingerprint) continue;
+        return { kind: sameShape(e) ? "twin" : "drifted", entry: e };
+    }
+    return undefined;
+}
+
+/** #4341: a registry twin is safe to adopt before persistence initialization
+ * only after the listener proves the same pid + instance identity. A stale
+ * marker, pid reuse, or foreign listener must fall through to the existing
+ * bind/EADDRINUSE policy instead of causing a false adopt. */
+export async function findVerifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        const health = await healthOf(peer.entry.origin);
+        if (health?.pid === peer.entry.pid && health.instanceId === peer.entry.instanceId) return peer.entry;
     }
     return undefined;
 }
@@ -331,6 +441,29 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
+export interface PidProbe {
+    alive: boolean;
+    /** Errno code of the failed kill-0 (e.g. "ESRCH"); undefined when the
+     *  probe succeeded or no probe ran at all (invalid pid). */
+    errCode?: string;
+}
+
+/** #3890: kill-0 with errno visibility. On Windows Node maps every
+ *  OpenProcess failure other than ERROR_ACCESS_DENIED to ESRCH, so a LIVE
+ *  process can read dead with no way to tell which Win32 error caused it.
+ *  Callers that act destructively on a dead verdict log errCode on first
+ *  sight so field episodes can be attributed. */
+export function probePid(pid: number): PidProbe {
+    if (!Number.isInteger(pid) || pid <= 0) return { alive: false };
+    try {
+        process.kill(pid, 0);
+        return { alive: true };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        return { alive: code === "EPERM", errCode: code };
+    }
+}
+
 export interface RegistryEntry {
     instanceId: string;
     pid: number;
@@ -493,19 +626,48 @@ function lanesOverlap(a: string | undefined, b: string | undefined): boolean {
     return a === undefined || b === undefined || a === b;
 }
 
-export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): void {
-    const others = readAllRegistryEntries().filter((e) => e.instanceId !== entry.instanceId && isPidAlive(e.pid));
-    for (const other of others) {
-        if (!lanesOverlap(entry.lane, other.lane)) continue;
+/** Live registered peers whose lanes overlap ours (undeclared lane overlaps
+ *  everything — a manual `bili start` daemon can serve any client). */
+function liveOverlappingPeers(ownInstanceId: string, ownLane: string | undefined): RegistryEntry[] {
+    return readAllRegistryEntries().filter((e) => e.instanceId !== ownInstanceId && isPidAlive(e.pid) && lanesOverlap(ownLane, e.lane));
+}
+
+export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): string[] {
+    const warned: string[] = [];
+    for (const other of liveOverlappingPeers(entry.instanceId, entry.lane)) {
         const laneNote = entry.lane !== undefined && other.lane !== undefined ? ` on lane "${entry.lane}"` : "";
         warn(
             `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
         );
+        warned.push(other.instanceId);
     }
     reapDeadMarkers(entry.instanceId);
     try {
         atomicWriteJson(entry, registryEntryFile(entry.instanceId));
     } catch {}
+    return warned;
+}
+
+/** #2401: registration warns only the LATE starter — the long-lived resident
+ *  stays blind to a peer that appears minutes later, which is exactly the
+ *  dual-generation coexistence shape behind the stale-serving report. Rescan
+ *  the registry on a slow tick and warn once per newly-seen live peer.
+ *  Returns the newly-warned instance ids so the caller can remember them. */
+export function warnOnNewPeers(
+    own: { instanceId: string; lane?: string },
+    previouslyWarned: ReadonlySet<string>,
+    warn: (msg: string) => void,
+): string[] {
+    const fresh: string[] = [];
+    for (const other of liveOverlappingPeers(own.instanceId, own.lane)) {
+        if (previouslyWarned.has(other.instanceId)) continue;
+        const laneNote = own.lane !== undefined && other.lane !== undefined ? ` on lane "${other.lane}"` : "";
+        warn(
+            `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — both processes write the same sessions directory; stop one to avoid state pollution (#394/#2401)`,
+        );
+        fresh.push(other.instanceId);
+    }
+    return fresh;
 }
 
 /** #1232: every LIVE registered instance as a full identity record. The

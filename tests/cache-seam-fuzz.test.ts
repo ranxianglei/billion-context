@@ -93,6 +93,7 @@ function listen(srv: http.Server): Promise<void> {
 }
 async function closeServer(srv: http.Server): Promise<void> {
     srv.close();
+    srv.closeIdleConnections?.();
     await Promise.race([once(srv, "close"), new Promise((r) => setTimeout(r, 2000))]);
 }
 
@@ -143,7 +144,7 @@ function startUpstream(captured: string[], sc: Scenario): http.Server {
             })();
             sinceDemand++;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const sse = (obj: unknown): void => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+            const sse = (obj: unknown): void => { res.write(`data: ${JSON.stringify(obj)}\n\n`); };
             if (compressArgs !== undefined) {
                 sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_cmp_${calls}`, type: "function", function: { name: "compress", arguments: "" } }] } }] });
                 for (let i = 0; i < compressArgs.length; i += 64) sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: compressArgs.slice(i, i + 64) } }] } }] });
@@ -188,7 +189,14 @@ async function drive(sc: Scenario, sessionId: string): Promise<string[]> {
             log: false,
             debug: false,
             passthrough: false,
+            passthroughSource: null,
             autoUpdate: false,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
             mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(proxyOptions);
@@ -226,8 +234,9 @@ async function drive(sc: Scenario, sessionId: string): Promise<string[]> {
             }
         }
         if (process.env.FUZZ_DUMP) {
-            fs.mkdirSync(process.env.FUZZ_DUMP, { recursive: true });
-            captured.forEach((b, i) => fs.writeFileSync(path.join(process.env.FUZZ_DUMP, `${String(i).padStart(3, "0")}.json`), b));
+            const dumpDir = process.env.FUZZ_DUMP;
+            fs.mkdirSync(dumpDir, { recursive: true });
+            captured.forEach((b, i) => fs.writeFileSync(path.join(dumpDir, `${String(i).padStart(3, "0")}.json`), b));
         }
         return captured;
     } finally {
@@ -239,7 +248,7 @@ async function drive(sc: Scenario, sessionId: string): Promise<string[]> {
     }
 }
 
-const isRound2 = (p: Item): boolean => msgsOf(p).some((mm) => asArr((mm as Msg).tool_calls).some((tc) => (tc as Msg).function?.name === "compress"));
+const isRound2 = (p: Item): boolean => msgsOf(p).some((mm) => asArr((mm as Msg).tool_calls).some((tc) => (tc as { function?: { name?: string } }).function?.name === "compress"));
 
 function assertPairSeamStable(prev: string, cur: string, label: string): void {
     const a = JSON.parse(prev) as Item;

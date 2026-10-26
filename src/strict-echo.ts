@@ -6,7 +6,8 @@ import type { Logger } from "./logger.js";
  *  thinking-mode "reasoning_content ... must be passed back to the API" —
  *  a rebuilt request whose assistant tool-call turns lost their reasoning is
  *  rejected with 400. Learned flag first (set on first 400 whose body mentions
- *  reasoning_content, see the loop's UpstreamHttpError handler), then static
+ *  reasoning_content or reasoning_text — the Responses wire spells it
+ *  reasoning_text, #2169 — see the loop's UpstreamHttpError handler), then static
  *  detection: the upstream origin OR the request's own model id (#1027 —
  *  DeepSeek models served from non-deepseek gateways never trip the host
  *  check, so every fresh session re-paid the 400 through the learned flag). */
@@ -53,7 +54,31 @@ export function normalizeStrictEchoReasoning(
     return patched > 0 ? out : messages;
 }
 
-/** [#1479] Responses-wire twin of [#762]: a strict-echo gateway rejects an
+/** [#2169] A reasoning item whose `content` array consists EXCLUSIVELY of
+ *  whitespace-only `reasoning_text` parts — a blank echo that strict-echo
+ *  upstreams (DeepSeek thinking mode) reject with "reasoning_text must be passed
+ *  back": their validation accepts content-less / summary-only items but rejects
+ *  ANY content they did not issue, whitespace included (replacing the blank text
+ *  with real text still 400s — #2169 control experiments). Whitespace carries no
+ *  information, so clearing is lossless. Conservative by design: a missing or
+ *  non-array content, an empty array, any non-reasoning_text part, any
+ *  non-string text, or one part with real text all leave the item untouched. */
+function hasBlankReasoningContent(item: ResponseInputItem): boolean {
+    if ((item as { type?: unknown }).type !== "reasoning") return false;
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content) || content.length === 0) return false;
+    let sawTextPart = false;
+    for (const part of content) {
+        if (part === null || typeof part !== "object") return false;
+        const p = part as { type?: unknown; text?: unknown };
+        if (p.type !== "reasoning_text" || typeof p.text !== "string") return false;
+        sawTextPart = true;
+        if (p.text.trim().length > 0) return false;
+    }
+    return sawTextPart;
+}
+
+/** [#1479,#2169] Responses-wire twin of [#762]: a strict-echo gateway rejects an
  *  assistant RUN (maximal consecutive stretch of reasoning / assistant message
  *  / function_call / custom_tool_call items) that carries a tool call but no
  *  reasoning item. Fold + kernel round-trip leave exactly that shape (the turn's
@@ -61,9 +86,13 @@ export function normalizeStrictEchoReasoning(
  *  Responses equivalent of normalizeStrictEchoReasoning existed — the #762
  *  repair only ever ran on chat-completions messages. Insert one blank reasoning
  *  item at the start of each orphaned run; blank is what DeepSeek thinking mode
- *  accepts (hermes-agent PR #15527). Gated on at least one reasoning item
- *  existing anywhere in the input so non-thinking sessions are never touched.
- *  Returns the input array unchanged when disabled or nothing needed patching. */
+ *  accepts (hermes-agent PR #15527). Second duty (#2169): clear the `content` of
+ *  reasoning items whose content is whitespace-only reasoning_text — such items
+ *  ride the client's resent history into the request (bili never fabricates them:
+ *  the kernel round-trip re-emits raw items verbatim) and are rejected on the
+ *  wire as-is. Gated on at least one reasoning item existing anywhere in the
+ *  input so non-thinking sessions are never touched. Returns the input array
+ *  unchanged when disabled or nothing needed patching. */
 export function normalizeStrictEchoResponsesInput(
     input: ResponseInputItem[],
     enabled: boolean,
@@ -97,13 +126,24 @@ export function normalizeStrictEchoResponsesInput(
         else if (t === "reasoning") runReasoning++;
     }
     closeRun();
-    if (insertAt.size === 0) return input;
+    const clearAt = new Set<number>();
+    for (let i = 0; i < input.length; i++) {
+        if (hasBlankReasoningContent(input[i]!)) clearAt.add(i);
+    }
+    if (insertAt.size === 0 && clearAt.size === 0) return input;
     const out: ResponseInputItem[] = [];
     for (let i = 0; i < input.length; i++) {
         if (insertAt.has(i)) out.push({ type: "reasoning", summary: [{ type: "summary_text", text: "" }] });
-        out.push(input[i]!);
+        if (clearAt.has(i)) {
+            const copy: Record<string, unknown> = { ...(input[i]! as Record<string, unknown>) };
+            delete copy.content;
+            out.push(copy as ResponseInputItem);
+        } else {
+            out.push(input[i]!);
+        }
     }
-    log("info", `[${sessionId}] strict-echo-responses: injected ${insertAt.size} blank reasoning item(s) before tool-call run(s) missing their echo (#1479)`);
+    if (clearAt.size > 0) log("info", `[${sessionId}] strict-echo-responses: cleared whitespace-only reasoning content on ${clearAt.size} item(s) — blank reasoning_text echoes are rejected by strict-echo upstreams (#2169)`);
+    if (insertAt.size > 0) log("info", `[${sessionId}] strict-echo-responses: injected ${insertAt.size} blank reasoning item(s) before tool-call run(s) missing their echo (#1479)`);
     return out;
 }
 

@@ -25,7 +25,7 @@ function makeCtx(): Ctx {
         session: {
             id: `i1494-${Math.random().toString(36).slice(2)}`,
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -33,6 +33,7 @@ function makeCtx(): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,
@@ -112,7 +113,7 @@ test("#1494 A: a parse-dropped entry is surfaced in the SUCCESS receipt and logg
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: "valid fold" },
         { startId: "m00003" },
-    ] }), ctx);
+    ] }), ctx).text;
     assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), out);
     assert.ok(out.includes("entry 1: missing range bounds"), out);
@@ -132,7 +133,7 @@ test("#1494 A: a parse-dropped entry is surfaced in the FAILED receipt too (0-bl
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: "valid but too small" },
         { startId: "m00003" },
-    ] }), ctx);
+    ] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), out.split("\n")[0]);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), out);
     assert.ok(out.includes("entry 1: missing range bounds"), out);
@@ -143,7 +144,52 @@ test("#1494 A+B: single-object content folds end-to-end through applyRanges", ()
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
-    const out = applyRanges(parseCompressInput({ content: { startId: "m00001", endId: "m00002", summary: "solo fold via normalized content" } }), ctx);
+    const out = applyRanges(parseCompressInput({ content: { startId: "m00001", endId: "m00002", summary: "solo fold via normalized content" } }), ctx).text;
     assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
     assert.ok(!out.includes("REJECTED"), out);
+});
+
+// #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
+// serializing its args as text escapes the header/summary separator twice, so
+// `content` holds a LITERAL backslash+n instead of a real break. Undecoded the
+// kernel finds no newline, yields an empty summary, and rejects with
+// kind=content-not-array while hiding the real missing-summary reason. The host
+// salvage decodes once and retries, adopting the result only if it parses more
+// ranges (a no-real-newline string always yields zero undecoded, so a working
+// parse can never be degraded).
+test("#3780: double-escaped line-form string (literal backslash-n separator) is decoded once and recovered", () => {
+    // Runtime .content value: 'm00001–m00002 example topic' + <backslash>n + 'folded summary body'.
+    const parsed = parseCompressInput({ content: "m00001–m00002 example topic\\nfolded summary body" });
+    assert.equal(parsed.diagnostics.ok, true, JSON.stringify(parsed.diagnostics));
+    assert.equal(parsed.ranges.length, 1);
+    assert.equal(parsed.ranges[0].startRef, "m00001");
+    assert.equal(parsed.ranges[0].endRef, "m00002");
+    assert.equal(parsed.ranges[0].summary, "folded summary body");
+    assert.equal(parsed.ranges[0].topic, "example topic");
+});
+
+test("#3780: double-escaped line-form string folds end-to-end through applyRanges", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
+    const out = applyRanges(parseCompressInput({ content: "m00001–m00002 example topic\\nfolded summary body" }), ctx).text;
+    assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
+    assert.ok(!out.includes("FAILED"), out);
+    assert.ok(!out.includes("content-not-array"), out);
+    assert.equal(ctx.session.state.blocks.filter((b) => b.active).length, 1);
+});
+
+test("#3780: a payload that already carries a real newline is NOT re-decoded (literal backslash-n in the body survives)", () => {
+    // Real newline separates header from summary; the 'a<b>n' in the summary is a
+    // LITERAL backslash+n the user meant as text. The salvage must leave it untouched.
+    const parsed = parseCompressInput({ content: "m00001–m00002 t\na\\nb" });
+    assert.equal(parsed.diagnostics.ok, true, JSON.stringify(parsed.diagnostics));
+    assert.equal(parsed.ranges.length, 1);
+    assert.equal(parsed.ranges[0].summary, "a\\nb");
+});
+
+test("#3780: an escaped string with no valid refs header is NOT salvaged into a fake range", () => {
+    const parsed = parseCompressInput({ content: "no refs in this line\\njust some text" });
+    assert.equal(parsed.ranges.length, 0);
+    assert.notEqual(parsed.diagnostics.kind, "ok");
 });

@@ -57,6 +57,13 @@ test("forward: strips hop-by-hop and Connection-named headers both ways (#80)", 
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     };
     const proxy = await startServer(opts);
     await once(proxy, "listening");

@@ -1,12 +1,15 @@
 import assert from "node:assert";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
 import biliOpencodePlugin from "../src/agent/opencode.ts";
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RETRIEVE_TOOL_NAME, retrieveToolsFor } from "../src/compress-tool.ts";
 import { fetchManifest, fitNoticeDescription } from "../src/agent/shared.ts";
 
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
@@ -14,7 +17,7 @@ const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_
 const LONG_PANEL = Array.from({ length: 30 }, (_, i) => `panel line ${String(i + 1).padStart(2, "0")}: ${"x".repeat(38)}`).join("\n");
 const LONG_REPORT = Array.from({ length: 200 }, (_, i) => `report line ${String(i + 1).padStart(3, "0")}: ${"y".repeat(38)}`).join("\n");
 
-function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
+function startFakeProxyV2(manifestOpenaiTools?: Array<{ name?: string; description?: string; parameters?: unknown; type?: string; function?: { name?: string; description?: string; parameters?: unknown } }>): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
     const toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }> = [];
     const compacts: string[] = [];
     const server = http.createServer((req, res) => {
@@ -66,7 +69,10 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
         }
         if ((req.url ?? "") === "/__bili/plugin/manifest") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version: "9.9.9-test" }));
+            const manifest = manifestOpenaiTools && manifestOpenaiTools.length > 0
+                ? { version: "9.9.9-test", tools: { openai: manifestOpenaiTools } }
+                : { version: "9.9.9-test" };
+            res.end(JSON.stringify(manifest));
             return;
         }
         res.writeHead(404);
@@ -104,13 +110,15 @@ function makeFakeCtx() {
     const addedCommands: FakeAddedCommand[] = [];
     const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
+    let wsHandshakeCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
     const ctx = {
         session: {
             hook: async (name: string, cb: (e: Record<string, unknown>) => void | Promise<void>) => {
-                assert.equal(name, "http.request");
-                modelRequestCb = cb;
+                if (name === "http.request") modelRequestCb = cb;
+                else if (name === "experimental.ws.handshake") wsHandshakeCb = cb;
+                else assert.fail(`unexpected hook ${name}`);
                 return { dispose: () => { disposed.push(1); } };
             },
             synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
@@ -157,7 +165,7 @@ function makeFakeCtx() {
 
     return {
         ctx,
-        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown }) => {
+        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown; headers?: Record<string, string> }) => {
             const store: Record<string, string> = {};
             await modelRequestCb!({
                 sessionID: opts.sessionID,
@@ -170,6 +178,10 @@ function makeFakeCtx() {
             return { headers: store };
         },
         pushEvent: (evt: { type?: unknown; data?: Record<string, unknown> }) => { eventQueue.push(evt); wake?.(); },
+        fireWsHandshake: async (event: Record<string, unknown>) => {
+            await wsHandshakeCb!(event);
+            return event;
+        },
         get addedTools() { return addedTools; },
         get addedCommands() { return addedCommands; },
         get syntheticCalls() { return syntheticCalls; },
@@ -423,7 +435,7 @@ test("v2 setup: first /acp before any model request shows the idle notice (proxy
                 const acp = fake.addedCommands.find((c) => c.name === "acp")!;
                 await acp.execute({ sessionID: "ses_acp_idle" });
                 await until(() => fake.syntheticCalls.length === 1);
-                assert.match(fake.syntheticCalls[0].description!, /billion-context@9\.9\.9-test \u2014 proxy connected, no ACP session yet/);
+                assert.match(fake.syntheticCalls[0].description!, /billion-context@9\.9\.9-test \u2014 proxy connected via http:\/\/127\.0\.0\.1:\d+, no ACP session yet/);
                 assert.match(fake.syntheticCalls[0].text, /not an instruction/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
             } finally {
@@ -569,7 +581,8 @@ test("v2 setup: /acp-cache registered and renders the cache report via synthetic
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
                 assert.match(fake.syntheticCalls[0].text, /not an instruction/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
-                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {} }]);
+                // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
+                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {}, nativeCaller: true }]);
             } finally {
                 cleanup();
             }
@@ -590,7 +603,7 @@ test("v2 /acp-cache: full flag maps to detail=full; long reports keep the leadin
                 await cache.execute({ sessionID: "ses_cache_full", arguments: "full" });
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
-                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" } });
+                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" }, nativeCaller: true });
 
                 await cache.execute({ sessionID: "ses_cache_long" });
                 await until(() => fake.syntheticCalls.length === 2);
@@ -703,11 +716,13 @@ test("v2 /acp: a throwing command editor degrades to no-/acp without killing set
             return { dispose: () => {} };
         },
     };
-    const warns: string[] = [];
+    // #2831: the registration-unavailable degradation moved from console.warn to bili.log.
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-v2-acp-state-"));
+    const termLines: string[] = [];
     const origWarn = console.warn;
-    console.warn = (msg?: unknown) => { warns.push(String(msg)); };
+    console.warn = (msg?: unknown) => { termLines.push(String(msg)); };
     try {
-        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined, XDG_STATE_HOME: stateHome }, async () => {
             const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
             try {
                 assert.ok(typeof cleanup === "function", "setup resolved despite the command editor throwing");
@@ -715,16 +730,26 @@ test("v2 /acp: a throwing command editor degrades to no-/acp without killing set
                 cleanup();
             }
         });
-        assert.ok(warns.some((w) => w.includes("/acp")), "degradation logged");
+        const logFile = path.join(stateHome, "billion-context", "bili.log");
+        const mine = (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+            .split("\n")
+            .filter((l) => l.length > 0 && l.includes("/acp command registration unavailable"));
+        assert.ok(mine.length >= 1, `degradation logged in bili.log, got: ${JSON.stringify(mine)}`);
+        assert.equal(termLines.filter((w) => w.includes("/acp")).length, 0, "#2831: must not reach the terminal surface");
     } finally {
         console.warn = origWarn;
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 
-test("fetchManifest openai format maps parameters to inputSchema", async () => {
+test("fetchManifest openai format parses nested (served) and flat entries", async () => {
+    const NESTED_PARAMS = { type: "object", properties: { content: { type: "array" } }, required: ["content"] };
+    const FLAT_PARAMS = { type: "object", properties: {} };
+    // Production serves tools.openai NESTED ({type:"function", function:{…}}); a
+    // flat entry must parse too so either manifest layout works (#2656).
     const MANIFEST_OPENAI = [
-        { name: "compress", description: "Compress a range", parameters: { type: "object", properties: { content: { type: "array" } }, required: ["content"] } },
-        { name: "acp_status", description: "Context status", parameters: { type: "object", properties: {} } },
+        { type: "function", function: { name: "compress", description: "Compress a range", parameters: NESTED_PARAMS } },
+        { name: "acp_status", description: "Context status", parameters: FLAT_PARAMS },
     ];
     const server = http.createServer((req, res) => {
         if ((req.url ?? "") === "/__bili/plugin/manifest" && req.method === "GET") {
@@ -741,11 +766,50 @@ test("fetchManifest openai format maps parameters to inputSchema", async () => {
     try {
         const tools = await fetchManifest(origin, "openai");
         assert.deepEqual(tools.map((t) => t.name), ["compress", "acp_status"]);
-        assert.deepEqual(tools[0].inputSchema, MANIFEST_OPENAI[0].parameters);
+        assert.deepEqual(tools[0].inputSchema, NESTED_PARAMS);
+        assert.equal(tools[0].description, "Compress a range");
+        assert.deepEqual(tools[1].inputSchema, FLAT_PARAMS);
         const anthropic = await fetchManifest(origin, "anthropic").catch((e) => e);
         assert.ok(anthropic instanceof Error, "fake serves no anthropic tools — format must not cross-contaminate");
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("#2443: a manifest-advertised conditional tool (acp_retrieve) is registered on first routed request", async () => {
+    const rt = retrieveToolsFor(RETRIEVE_TOOL_NAME).openai.function;
+    // Serve the REAL proxy shape — nested {type:"function", function:{…}} — not a
+    // hand-flattened copy. The old flat fixture masked #2656 (fetchManifest dropped
+    // every nested entry), so a faithful fixture is what makes this test bite.
+    const proxy = await startFakeProxyV2([retrieveToolsFor(RETRIEVE_TOOL_NAME).openai]);
+    try {
+        const fake = makeFakeCtx();
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            // Before any traffic: only the static base set is registered (unchanged parity).
+            assert.deepEqual(fake.addedTools.map((t) => t.name), EXPECTED_TOOLS);
+            assert.ok(!fake.addedTools.some((t) => t.name === "acp_retrieve"), "no retrieve tool before first request");
+            // First routed request discovers the proxy base and triggers the manifest delta.
+            await fake.fireModelRequest({ sessionID: "ses_ccr", baseURL: `${proxy.origin}/bili/http://upstream.example/v1` });
+            await until(() => fake.addedTools.some((t) => t.name === "acp_retrieve"));
+            const names = fake.addedTools.map((t) => t.name);
+            // Base set intact, each present exactly once; retrieve added exactly once (no duplicate).
+            for (const expected of EXPECTED_TOOLS) {
+                assert.equal(names.filter((n) => n === expected).length, 1, `${expected} present exactly once`);
+            }
+            assert.equal(names.filter((n) => n === "acp_retrieve").length, 1, "acp_retrieve present exactly once");
+            const retrieve = fake.addedTools.find((t) => t.name === "acp_retrieve")!;
+            assert.deepEqual(retrieve.input, rt.parameters);
+            assert.equal(retrieve.options?.["codemode"], false);
+            assert.equal(retrieve.options?.["permission"], "allow");
+            // The registered executor forwards to the live proxy dispatcher (reachable, not a dead pointer).
+            const out = await retrieve.execute({ ref: "m00001" }, { sessionID: "ses_ccr" });
+            assert.ok(typeof out.content === "string" && out.content.length > 0, "retrieve executes against the proxy");
+        } finally {
+            await cleanup();
+        }
+    } finally {
+        await proxy.close();
     }
 });
 

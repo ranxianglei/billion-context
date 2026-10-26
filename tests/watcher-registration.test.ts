@@ -9,7 +9,7 @@ import { registerWatcherDefault, type WatcherRegistration } from "../src/launche
  *  the "lives and dies with the session" contract was void. The registration
  *  seam must now report its outcome so host-native bootstraps can surface it. */
 
-function stubWatcher(status: number): Promise<{ origin: string; close: () => Promise<void>; body: (req: http.IncomingMessage) => Promise<string> }> {
+function stubWatcher(status: number): Promise<{ origin: string; close: () => Promise<void>; body: (req?: http.IncomingMessage) => Promise<string> }> {
     let lastBody = "";
     const server = http.createServer((req, res) => {
         if (req.method === "POST" && req.url === "/__bili/watcher") {

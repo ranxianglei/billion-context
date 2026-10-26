@@ -37,8 +37,8 @@ function compressARange() {
     }
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
     session.state = turn.state;
-    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never);
+    const ctx: { core: typeof core; config: Config; messages: typeof turn.messages; session: typeof session; log: () => void; compressMessages?: CoreMessage[] } = { core, config, messages: turn.messages, session, log: () => {} };
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never).text;
     assert.match(out, /Compressed m00001–m00002 → 1 block\(s\)/, `compress must succeed: ${out}`);
     const block = [...session.state.blocks].slice(-1)[0]!;
     return { ctx, core, config, session, msgs, block };
@@ -47,7 +47,7 @@ function compressARange() {
 test("full-block decompress flips restoredInline (proxy wiring)", () => {
     const { ctx, session, block } = compressARange();
     assert.notEqual(block.restoredInline, true, "fresh block is not marked");
-    const out = resolveDecompress({ blockId: block.blockId }, ctx as never);
+    const out = resolveDecompress({ blockId: block.blockId }, ctx as never).text;
     assert.match(out, /Block b\d+ content/);
     const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
     assert.equal(after.restoredInline, true, "flag flipped by full-block restore");
@@ -64,7 +64,7 @@ test("full:true restore also flips the flag", () => {
 
 test("range restore (startId/endId) does NOT flip the flag — partial content is not refold material", () => {
     const { ctx, session, block } = compressARange();
-    const out = resolveDecompress({ blockId: block.blockId, startId: "m00002", endId: "m00003" }, ctx as never);
+    const out = resolveDecompress({ blockId: block.blockId, startId: "m00002", endId: "m00003" }, ctx as never).text;
     assert.ok(typeof out === "string" && out.length > 0);
     const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
     assert.notEqual(after.restoredInline, true, "partial restore must not mark the block");
@@ -74,7 +74,7 @@ test("toFile spill (>10K chars) does NOT flip the flag — material lives in a t
     const { ctx, session, block } = compressARange();
     // Force the spill path deterministically via the decompress cache entry.
     ctx.session.blockContents.set(block.blockId, { one: null, full: { text: "y".repeat(11000), count: 7 } });
-    const out = resolveDecompress({ blockId: block.blockId }, ctx as never);
+    const out = resolveDecompress({ blockId: block.blockId }, ctx as never).text;
     assert.match(out, /written to:/, "spilled to file");
     assert.doesNotMatch(out, /Re-fold:/, "no hint on the toFile path");
     const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
@@ -88,21 +88,43 @@ test("end-to-end: decompress then re-compress same span refolds in place (proxy-
     // tells the kernel the model holds the material via the kept tool result.
     ctx.messages = [];
     ctx.compressMessages = [];
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "Refolded summary: the model re-summarized from the restored content after finishing with the details." }] }), ctx as never);
+    // #2748: the gate now refuses any refold whose new summary is not strictly
+    // smaller than the one it replaces, so this mechanism test condenses
+    // FURTHER (shorter than the first summary) to keep the refold landing.
+    const refoldSummary = "Re-summarized: initial phase, setup and config done.";
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: refoldSummary }] }), ctx as never).text;
     assert.match(out, /Compressed m00001–m00002 → 1 block\(s\)/, `refold must land: ${out}`);
     const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
     assert.ok(after, "same block survived (in place, not replaced)");
-    assert.equal(after.summary, "Refolded summary: the model re-summarized from the restored content after finishing with the details.");
+    assert.equal(after.summary, refoldSummary);
     assert.notEqual(after.restoredInline, true, "marker cleared after refold");
     assert.equal(session.state.blocks.length, 1, "no second block created");
     void msgs;
+});
+
+test("#2748: a growing refold is refused — no net-benefit in-place update lands", () => {
+    const { ctx, session, block } = compressARange();
+    resolveDecompress({ blockId: block.blockId }, ctx as never);
+    ctx.messages = [];
+    ctx.compressMessages = [];
+    const original = session.state.blocks.find((b) => b.blockId === block.blockId)!.summary;
+    // Deliberately longer than the first summary → net delta < 0 → the
+    // in-place update must be refused, not committed (#2748 acceptance: refold
+    // growth must not land a no-net-benefit result).
+    const growSummary = "Refolded summary that is deliberately much longer than the one it replaces so the net context change goes negative.";
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: growSummary }] }), ctx as never);
+    assert.equal(out.outcome, "refused", `a growing refold must be refused: ${out.text}`);
+    assert.equal(out.reason, "gate:no-net-shrink");
+    const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
+    assert.equal(after.summary, original, "the existing summary is left untouched");
+    assert.equal(session.state.blocks.length, 1, "no second block created");
 });
 
 test("negative control: without the restore, re-compressing a consumed span is skipped (not refolded)", () => {
     const { ctx, session, block } = compressARange();
     ctx.messages = [];
     ctx.compressMessages = [];
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "Should never land — span already compressed and not restored." }] }), ctx as never);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "Should never land — span already compressed and not restored." }] }), ctx as never).text;
     const after = session.state.blocks.find((b) => b.blockId === block.blockId)!;
     assert.equal(after.summary, "First summary: messages 1-2 covered the initial phase in detail.", "summary untouched");
     assert.match(out, /already compressed/, `rejected with the already-compressed diagnostic: ${out}`);

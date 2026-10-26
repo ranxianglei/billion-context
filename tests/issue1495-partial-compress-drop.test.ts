@@ -22,7 +22,7 @@ function makeCtx(messages: CoreMessage[]): Ctx {
         session: {
             id: "issue1495-partial-drop-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -30,6 +30,7 @@ function makeCtx(messages: CoreMessage[]): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,
@@ -69,7 +70,7 @@ test("#1495: valid + invalid entry mix — success receipt names the rejected en
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: S },
         { summary: "no bounds" },
-    ]}), freshCtx());
+    ]}), freshCtx()).text;
     assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), `dropped entry must be named:\n${out}`);
     assert.ok(out.includes("entry 1: missing range bounds"), `rejection reason inline:\n${out}`);
@@ -82,7 +83,7 @@ test("#1495: truncated gateway-stringified array — salvage loss is named, lost
     assert.equal(parsed.ranges.length, 1, "one complete entry salvaged");
     assert.equal(parsed.diagnostics.kind, "truncated");
     const ctx = freshCtx();
-    const out = applyRanges(parsed, ctx);
+    const out = applyRanges(parsed, ctx).text;
     assert.ok(out.startsWith("[Compressed"), `salvage success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("arrived TRUNCATED"), `truncation loss must be named:\n${out}`);
     assert.ok(out.includes("was LOST, not compressed"), `salvage loss guidance:\n${out}`);
@@ -94,7 +95,7 @@ test("#1495: apply-layer per-range error surfaces on partial success (unknown re
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: S },
         { startId: "m00099", endId: "m00100", summary: S },
-    ]}), freshCtx());
+    ]}), freshCtx()).text;
     assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("Errors:"), `apply-layer error must be surfaced:\n${out}`);
 });
@@ -102,7 +103,7 @@ test("#1495: apply-layer per-range error surfaces on partial success (unknown re
 test("#1495: clean call — no drop/error annotation (existing output unchanged)", () => {
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: S },
-    ]}), freshCtx());
+    ]}), freshCtx()).text;
     assert.ok(out.startsWith("[Compressed"), `success expected, got: ${out.slice(0, 160)}`);
     assert.ok(!out.includes("REJECTED"), `clean call must stay unannotated:\n${out}`);
     assert.ok(!out.includes("TRUNCATED"), `clean call must stay unannotated:\n${out}`);

@@ -13,6 +13,18 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// #2941: registration now completes AFTER the bind (post-bind ownership
+// check), so "listening" no longer implies health-readiness — poll for it.
+async function waitReady(port: number): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+        try {
+            if ((await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(500) })).status === 200) return;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`proxy on port ${port} did not become ready`);
+}
+
 /** #897: /__bili/health and /__bili/stats must expose the blind-tunnel counter
  *  (loopback-only admin endpoints), so an operator can see which CONNECT
  *  targets were relayed opaquely and never entered the compression pipeline. */
@@ -55,12 +67,14 @@ test("health + stats expose blindTunnels counts with real hosts (#897)", async (
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: true, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     let proxy: http.Server | undefined;
     try {
         proxy = await startServer(opts);
         await once(proxy, "listening");
         const port = (proxy.address() as { port: number }).port;
+        await waitReady(port);
 
         const emptyHealth = (await (await fetch(`http://127.0.0.1:${port}/__bili/health`)).json()) as { blindTunnels: BlindTunnels };
         assert.deepEqual(emptyHealth.blindTunnels, { total: 0, hosts: {} }, "fresh instance reports zero blind tunnels");

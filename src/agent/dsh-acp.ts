@@ -10,9 +10,9 @@ import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest, forwardTool, ar
 export const name = "bili-acp";
 export const inject = ["commands"];
 
-type CommandOutcome = { kind: "success" | "error"; text: string };
+export type CommandOutcome = { kind: "success" | "error"; text: string };
 
-type CommandsService = {
+export type CommandsService = {
     register: (command: { name: string; description: string; handler: () => Promise<CommandOutcome> }) => unknown;
 };
 
@@ -36,7 +36,7 @@ async function statusOutcome(): Promise<CommandOutcome> {
     }
     const version = await fetchProxyVersion(base);
     if (version) {
-        return { kind: "success", text: armedIdleNotice(version) };
+        return { kind: "success", text: armedIdleNotice(version, base) };
     }
     return {
         kind: "error",
@@ -72,7 +72,7 @@ async function cacheOutcome(): Promise<CommandOutcome> {
             version = undefined;
         }
         if (version) {
-            return { kind: "success", text: `billion-context@${version} — proxy connected, compression armed. No model request yet; send one, then run /acp-cache again.` };
+            return { kind: "success", text: `billion-context@${version} — proxy connected via ${base}, compression armed. No model request yet; send one, then run /acp-cache again.` };
         }
         return {
             kind: "error",
@@ -80,7 +80,8 @@ async function cacheOutcome(): Promise<CommandOutcome> {
         };
     }
     try {
-        return { kind: "success", text: await forwardTool(base, cid, "acp_cache", {}) };
+        const out = await forwardTool(base, cid, "acp_cache", {}, undefined, true);
+        return out.failed ? { kind: "error", text: out.text } : { kind: "success", text: out.text };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {

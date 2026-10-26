@@ -56,7 +56,11 @@ test("parseArgs: doctor is a command and --json sets doctorJson (#1235)", () => 
     const r = parseArgs(["doctor"]);
     assert.equal(r.command, "doctor");
     assert.equal(r.doctorJson, false);
+    assert.equal(r.doctorFix, false, "#3496: --fix off by default — plain doctor stays read-only");
     const j = parseArgs(["--json", "doctor"]);
     assert.equal(j.command, "doctor");
     assert.equal(j.doctorJson, true);
+    const f = parseArgs(["doctor", "--fix"]);
+    assert.equal(f.command, "doctor");
+    assert.equal(f.doctorFix, true);
 });

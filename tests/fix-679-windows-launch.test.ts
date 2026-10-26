@@ -30,7 +30,12 @@ test("quoteWinToken: whitespace-bearing tokens get wrapped in double quotes", ()
     assert.equal(quoteWinToken("a\tb"), '"a\tb"');
 });
 
-test("quoteWinToken: embedded double quotes stay bare (cmd.exe has no quote escape — today's behavior preserved)", () => {
+// Formatter-level only: quoteWinToken is a pure formatter whose callers must
+// pre-validate through the #2196 safe-set guard — planClientSpawn refuses
+// embedded-quote tokens before they ever reach this function (see
+// win-cmd-argv.test.ts). The bare output here documents what the formatter
+// does with such input, NOT that it is a safe pass-through.
+test("quoteWinToken: embedded double quotes stay bare at the formatter level (rejected upstream since #2196)", () => {
     assert.equal(quoteWinToken('key="value"'), 'key="value"');
     assert.equal(quoteWinToken('C:\\x "q" y'), 'C:\\x "q" y');
 });

@@ -1,0 +1,162 @@
+# Config reference seed — diagnostics & tuning scalars (#2107 single source of truth).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: diagnostics
+entries:
+  - key: diagnostics
+    type: object
+    default: "{} (all defaults)"
+    group: diagnostics
+    id: tt.diag
+    site_group: diag
+    desc_en: "Local troubleshooting knobs (dumps, render/injection toggles, count-tokens passthrough)."
+    desc_zh: "本地排障旋钮（转储、渲染/注入开关、count-tokens 透传）。"
+    site_en: "<code>diagnostics</code> — local troubleshooting knobs: <span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol \"tools\"</span>."
+    site_zh: "<code>diagnostics</code> —— 本地排障旋钮：<span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol \"tools\"</span>。"
+  - key: diagnostics.dumpBody
+    type: boolean
+    default: "false"
+    env: ACP_DUMP_BODY
+    group: diagnostics
+    desc_en: "Dump full request/response bodies to the log for troubleshooting. Dumps are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把完整请求/响应体转储到日志用于排障。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
+  - key: diagnostics.dumpReq
+    type: boolean
+    default: "true"
+    env: ACP_DUMP_REQ
+    group: diagnostics
+    desc_en: "Log outgoing upstream request metadata per call; with dumpBody on, also gates the plaintext body dumps (scrub before sharing, #4482)."
+    desc_zh: "逐次调用记录发往上游的请求元数据；开启 dumpBody 时同时是明文请求体转储的闸门（分享前必须清洗，#4482）。"
+  - key: diagnostics.rawDumpDir
+    type: string
+    default: "<state dir>/raw"
+    env: ACP_RAW_DUMP_DIR
+    group: diagnostics
+    desc_en: "Directory for raw wire dumps."
+    desc_zh: "原始线路转储目录。"
+  - key: diagnostics.dump4xx
+    type: boolean
+    default: "false"
+    env: BILI_DUMP_4XX
+    group: diagnostics
+    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection. Bodies are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把上游 4xx 响应落盘以便事后检查。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
+  - key: diagnostics.dump4xxMaxBytes
+    type: number
+    default: "2097152 (floor 1024)"
+    env: BILI_DUMP_4XX_MAX_BYTES
+    group: diagnostics
+    desc_en: "Size cap for a single 4xx dump file."
+    desc_zh: "单个 4xx 转储文件的大小上限。"
+  - key: diagnostics.maxTotalBytes
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_TOTAL_BYTES
+    group: diagnostics
+    desc_en: "Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412)."
+    desc_zh: "调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。"
+  - key: diagnostics.maxAgeDays
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_AGE_DAYS
+    group: diagnostics
+    desc_en: "Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default."
+    desc_zh: "调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。"
+  - key: diagnostics.renderNone
+    type: boolean
+    default: "false"
+    env: ACP_RENDER_NONE
+    group: diagnostics
+    desc_en: "Disable all ACP tag rendering (raw wire study mode)."
+    desc_zh: "禁用所有 ACP 标签渲染（原始线路研究模式）。"
+  - key: diagnostics.invariantJudge
+    type: boolean
+    default: "true"
+    env: BILI_INVARIANT_JUDGE
+    group: diagnostics
+    desc_en: "Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false or BILI_INVARIANT_JUDGE=0 to silence it."
+    desc_zh: "保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。"
+  - key: diagnostics.noInjectTool
+    type: boolean
+    default: "false"
+    env: ACP_NO_INJECT_TOOL
+    group: diagnostics
+    desc_en: "Stop injecting the acp_compress tool definition into requests."
+    desc_zh: "停止向请求注入 acp_compress 工具定义。"
+  - key: diagnostics.noCompressPrompt
+    type: boolean
+    default: "false"
+    env: ACP_NO_COMPRESS_PROMPT
+    group: diagnostics
+    desc_en: "Stop appending the compression doctrine to system prompts."
+    desc_zh: "停止向系统提示词附加压缩教条文本。"
+  - key: diagnostics.countTokensPassthrough
+    type: boolean
+    default: "false"
+    env: ACP_COUNT_TOKENS_PASSTHROUGH
+    group: diagnostics
+    desc_en: "Forward /v1/messages/count_tokens to the upstream instead of answering locally."
+    desc_zh: "把 /v1/messages/count_tokens 转发给上游，而不是本地应答。"
+  - key: diagnostics.compressProtocol
+    type: "\"tools\" | \"marker\""
+    default: "\"tools\""
+    env: ACP_COMPRESS_PROTOCOL
+    group: diagnostics
+    desc_en: "ACP injection surface for compression: native tools (default) or legacy prompt markers."
+    desc_zh: "压缩的 ACP 注入面：原生工具（默认）或旧版提示词标记。"
+  - key: fakeCompletion
+    type: object
+    default: "{} (all defaults)"
+    group: diagnostics
+    id: tt.fake
+    site_group: diag
+    desc_en: "Retry loop that re-requests when a final chunk arrives truncated."
+    desc_zh: "末块被截断时重新发起请求的重试环。"
+    site_en: "<code>fakeCompletion</code> — retry loop for truncated final chunks: <span class='mech'>retries 0 (opt-in) · bufCapBytes 16 MiB</span>."
+    site_zh: "<code>fakeCompletion</code> —— 被截断末块的补完成重试环：<span class='mech'>retries 0 (可选) · bufCapBytes 16 MiB</span>。"
+  - key: fakeCompletion.retries
+    type: number
+    default: "0 (opt-in)"
+    env: BILI_FAKE_COMPLETION_RETRIES
+    group: diagnostics
+    desc_en: "How many times a truncated final completion may be re-requested; 0 disables the loop."
+    desc_zh: "被截断的末块完成可被重新请求的次数；0 禁用该重试环。"
+  - key: fakeCompletion.bufCapBytes
+    type: number
+    default: "16777216"
+    env: BILI_FAKE_BUF_CAP
+    group: diagnostics
+    desc_en: "Buffer size cap for the retry loop's accumulated stream."
+    desc_zh: "重试环累积流缓冲的大小上限。"
+  - key: codexCompact
+    type: "\"intercept\" | \"pass\""
+    default: "\"intercept\""
+    env: BILI_CODEX_COMPACT
+    group: diagnostics
+    id: tt.ccx
+    site_group: adv
+    desc_en: "Handle Codex's compaction requests inside bili (intercept, default) or forward them upstream (pass): the explicit forms (compaction_trigger + /responses/compact) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template (#3008) — a user-overridden compact_prompt falls out of detection and transits verbatim; a compaction bili only observed (pass/gate) is rebased post-hoc (#2372)."
+    desc_zh: "在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。"
+    site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex's compaction requests in bili or forward upstream — explicit forms plus the inline auto-compact transiting as an ordinary turn (prompt-form detection, #3008; overridden compact_prompt transits verbatim)."
+    site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex 压缩请求或转给上游 —— 显式形态 + 以普通请求形态过线的内联自动压缩（prompt 文本检测，#3008；自定义 compact_prompt 按原样转发）。"
+  - key: ccrRetrievalTtlMs
+    type: number
+    default: "600000 (0 disables retrieval)"
+    env: BILI_CCR_RETRIEVAL_TTL_MS
+    group: diagnostics
+    id: ttl.ttl
+    site_group: adv
+    desc_en: "Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve."
+    desc_zh: "CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。"
+    site_en: "<code>ccrRetrievalTtlMs</code> — lifetime of CCR retrieval pointers (default 600000; 0 disables retrieval)."
+    site_zh: "<code>ccrRetrievalTtlMs</code> —— CCR 回取指针有效期（默认 600000；0 禁用回取）。"
+  - key: decompressTmpCap
+    type: number
+    default: "50"
+    env: BILI_DECOMPRESS_TMP_CAP
+    group: diagnostics
+    id: ttl.tmp
+    site_group: adv
+    desc_en: "Size cap (blocks) for temporary decompressed content held in-session."
+    desc_zh: "会话内临时展开内容的大小上限（按块计）。"
+    site_en: "<code>decompressTmpCap</code> — size cap for temporary decompressed blocks (default 50)."
+    site_zh: "<code>decompressTmpCap</code> —— 临时展开块的大小上限（默认 50）。"

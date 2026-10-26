@@ -1,14 +1,11 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
 
-/** Host-side policy default for `compress.stripImagesKeepRecent` (#617): how
- *  many of the most recent messages keep their image payloads when stripping
- *  is enabled. The strip mechanism itself lives in acp-kernel's wire layer
- *  (kernel #215) — only the opt-in policy stays host-side. */
-export const DEFAULT_STRIP_IMAGES_KEEP_RECENT = 5;
+export type { CompressSettings } from "./config.js";
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
@@ -61,20 +58,28 @@ export function mergeCompress(
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
-    const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
     const priceProfileLevels = [global?.priceProfile, provider?.priceProfile, model?.priceProfile].filter(Boolean) as NonNullable<CompressSettings["priceProfile"]>[];
+    // `tierNudgeTokens` is another nested-object field merged sub-field-wise
+    // like `absorb`: a model-level t2 must not discard a provider-level t1.
+    const tierNudgeLevels = [global?.tierNudgeTokens, provider?.tierNudgeTokens, model?.tierNudgeTokens].filter(Boolean) as NonNullable<CompressSettings["tierNudgeTokens"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
+        minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
+        nudgeModelDecided: pick("nudgeModelDecided"),
+        nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
+        maxSummaryLength: pick("maxSummaryLength"),
+        minSummaryLength: pick("minSummaryLength"),
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
@@ -85,12 +90,10 @@ export function mergeCompress(
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
-        imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
-stripImages: pick("stripImages"),
-        stripImagesKeepRecent: pick("stripImagesKeepRecent"),
         visibilityMarkers: pick("visibilityMarkers"),
+        streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.
@@ -98,7 +101,12 @@ stripImages: pick("stripImages"),
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
+        reconcile: pick("reconcile"),
         promptPack: pick("promptPack"),
+        // Whole-chain replace (same semantics as `tiers`/`rules`): an
+        // `externalSummary` object at a deeper level replaces the entire
+        // chain above it — there is no per-target or per-budget sub-merge.
+        externalSummary: pick("externalSummary"),
     };
 }
 
@@ -144,7 +152,7 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
 
 let warnedUnknownPack = new Set<string>();
 
-export interface SurfaceResolution {
+interface SurfaceResolution {
     surface: PackSurface;
     /** Effective pack name — "default" when unset/invalid/unresolvable
      *  (the surface that actually serves requests). Feeds status-report
@@ -204,8 +212,14 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `maxContextLimit` → `nudge.maxContextLimitPct` (force-nudge trigger).
  *  - `emergencyThresholdPercent` → `nudge.emergencyThresholdPct` +
  *    `truncate.threshold` (emergency + hard-truncate).
- *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
- *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
+  *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
+  *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
+  *  - `tierNudgeTokens` → `nudge.tierGrowthTokens` (per-tier token-mass
+  *    thresholds, acp-kernel >= 0.0.108): each set sub-field pins that tier's
+  *    mass trigger independently; unset sub-fields fall back to the derived
+  *    defaults INSIDE the kernel (T1 = growth step, T2/T3 = ×1.5), so a
+  *    partially-set object still resolves fully. Absent leaves
+  *    `base.nudge.tierGrowthTokens` untouched.
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
   *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
   *    `compress.minCompressRange`. The unit is characters.
@@ -244,17 +258,13 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    been verified locally. Host arming (server.ts) further gates it behind
   *    the retrieve tool channel, so plugin mode / no-channel wires stay
   *    inert regardless.
-   *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
-   *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
-   *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
-   *    `s.imageCompression` leaves `base.imageCompression` untouched — the
-   *    feature stays off unless some level enables it. */
+ */
 // Config as resolved for the kernel, plus preserveRecentTools — the knob
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
 // (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[] };
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings };
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.
@@ -267,10 +277,15 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
         minToolTokens: s.minToolTokens ?? d.minToolTokens,
         contextThresholdPct: s.contextThresholdPct !== undefined ? parsePercent(s.contextThresholdPct) : d.contextThresholdPct,
         excludeTools: s.excludeTools ?? [...d.excludeTools],
+        // #3402: bili's default stance is media-scoped — the revival exists to fix
+        // image pile-up (#3398) and to kill the old full-text over-compression. The
+        // kernel ships mediaOnly neutral (unset); this is the single place the
+        // default-on policy is applied. Explicit false restores pre-revival full-text.
+        mediaOnly: s.mediaOnly ?? true,
     };
 }
 
-export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): ResolvedKernelConfig {
+export function applyCompressSettings(base: Config, limit: number, s: CompressSettings, recipes: Record<string, NamedProviderRecipe> = {}): ResolvedKernelConfig {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
     if (s.maxContextLimit !== undefined) nudge.maxContextLimitPct = parsePercent(s.maxContextLimit);
@@ -282,6 +297,16 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     if (s.nudgeGrowthTokens !== undefined && s.nudgeGrowthTokens > 0) {
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
+    }
+    // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
+    // so pass it through instead of skipping like the growth-token knobs.
+    if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
+    if (s.tierNudgeTokens !== undefined) {
+        const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
+        if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
+        if (typeof s.tierNudgeTokens.t2 === "number") tg.t2 = s.tierNudgeTokens.t2;
+        if (typeof s.tierNudgeTokens.t3 === "number") tg.t3 = s.tierNudgeTokens.t3;
+        if (tg.t1 !== undefined || tg.t2 !== undefined || tg.t3 !== undefined) nudge.tierGrowthTokens = tg;
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
@@ -303,17 +328,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
-    let imageCompression: ImageCompressionConfig | undefined;
-    if (s.imageCompression !== undefined) {
-        const d = DEFAULT_IMAGE_COMPRESSION_CONFIG;
-        imageCompression = {
-            enabled: s.imageCompression.enabled === true,
-            minTokens: s.imageCompression.minTokens ?? d.minTokens,
-            maxDimension: s.imageCompression.maxDimension ?? d.maxDimension,
-            quality: s.imageCompression.quality ?? d.quality,
-            format: s.imageCompression.format ?? d.format,
-        };
-    }
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -325,15 +339,24 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         compress: {
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
+            // #3635: previously unmapped, so a configured cap never reached the
+            // resolved kernel config (panel PUT and file edits were both inert).
+            maxSummaryLength: s.maxSummaryLength ?? base.compress.maxSummaryLength,
+            minSummaryLength: s.minSummaryLength ?? base.compress.minSummaryLength,
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
         neverPreserveRecentTools: s.neverPreserveRecentTools ?? base.neverPreserveRecentTools,
         // base is Config (0.0.92 lacks the field) — the cast keeps both kernel windows compiling.
         preserveRecentTools: s.preserveRecentTools ?? (base as ResolvedKernelConfig).preserveRecentTools,
+        // Host-only field, same inheritance pattern: never present on a raw
+        // kernel Config, carried through re-application unchanged. The chain
+        // (provider/model references) expands against the named recipes
+        // HERE, at resolve time — the executor still receives a fully
+        // expanded ExternalSummarySettings and never sees references.
+        externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
-        ...(imageCompression !== undefined ? { imageCompression } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -363,9 +386,10 @@ export function resolveRequestConfig(
     model: string,
     native: number | undefined,
     globalCompress?: CompressSettings,
+    namedProviders?: Record<string, NamedProviderRecipe>,
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
     if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
-    return applyCompressSettings(base, limit, compress);
+    return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }

@@ -3,12 +3,39 @@ import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { foldCoverage } from "../src/session.ts";
+import { responsesToCore } from "acp-kernel/wire";
+import { reconcileFoldCoverage, METADATA_DRIFT_ESCALATED, type FoldAnchor } from "../src/fold-reconcile.ts";
+
+test("projected short requests preserve real kernel folds until the main history returns", () => {
+    const { session, stableResend, coveredIds } = driftFixture();
+    const core = createCore();
+    const config = defaultConfig(200_000);
+    const opts = { mode: "repair" as const };
+    reconcileFoldCoverage(session, stableResend, opts);
+    const blockIds = session.state.blocks.map((b) => b.blockId);
+    const input = Array.from({ length: 6 }, (_, i) => ({
+        type: "message" as const, role: "user" as const,
+        content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text" as const, text: `short utility ${i} part ${j}` })),
+    }));
+    const { msgs } = responsesToCore({ input });
+    assert.ok(msgs.length >= 10);
+    for (let i = 0; i < 4; i++) {
+        reconcileFoldCoverage(session, msgs, { ...opts, inboundMessageCount: input.length });
+        session.state = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 0 }).state;
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds, "sync may deactivate but must retain every fold");
+    }
+    reconcileFoldCoverage(session, stableResend, opts);
+    session.state = core.processTurn({ messages: stableResend, state: session.state, config, tokenCount: 0 }).state;
+    assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+    assert.ok(session.state.blocks.every((b) => b.active));
+    assert.deepEqual(session.state.blocks[0].effectiveMessageIds, coveredIds);
+});
 
 function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -16,6 +43,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -101,4 +129,69 @@ test("server-side materialization check stays silent on stable resend and fires 
             assert.equal(gap.matched, gap.expected - 1);
         }
     }
+});
+
+// #2903: legacy foldAnchors persisted by ≤0.1.191 builds carry no content-type
+// class (`c`), so once their id leaves the wire the reconciler can never match
+// them again — they read as "missing" every pass and can never be backfilled
+// (the #2732 backfill needs live bytes). That permanent bili self-debt must NOT
+// count as non-reasoning loss in the destroy classifier, or a healthy long
+// session latches foldDriftEscalated after 3 passes; but a genuine client-side
+// rewrite/deletion still carries a concrete class and MUST keep escalating.
+// Drives reconcileFoldCoverage directly over a synthetic pre-0.1.192 ledger.
+function escalationFixture(legacyCount: number, realCount: number): { session: Session; resend: CoreMessage[] } {
+    const session = makeSession();
+    const coveredIds: string[] = [];
+    const anchors: Record<string, FoldAnchor> = {};
+    for (let i = 0; i < legacyCount; i++) {
+        const id = `cov_legacy_${i}`;
+        coveredIds.push(id);
+        anchors[id] = { n: `anc_legacy_${i}`, r: "user", b: 128 }; // ≤0.1.191 shape: no `c`
+    }
+    for (let i = 0; i < realCount; i++) {
+        const id = `cov_real_${i}`;
+        coveredIds.push(id);
+        anchors[id] = { n: `anc_real_${i}`, r: "user", c: "text", b: 128 }; // known non-reasoning
+    }
+    session.state.blocks = [{
+        blockId: "b0", runId: "r0", tier: 1, summary: "fold", directMessageIds: coveredIds,
+        effectiveMessageIds: coveredIds, directBlockIds: [], compressedTokens: 1000, createdAt: Date.now(),
+        survivedCount: 0, generation: "young", active: true,
+    }];
+    // Mirror the victim lane (dsh plugin): disables the proxy-only orphan-reap so
+    // the assertion isolates the drift-escalation path.
+    session.metadata = { pluginAgent: "dsh", foldAnchors: anchors, foldAnchorOrder: [...coveredIds] };
+    // Resend carrying none of the covered ids → every covered id is unmatched each
+    // pass and nothing reanchors (the fake `n` values never equal a live sha256).
+    const resend: CoreMessage[] = [];
+    for (let i = 0; i < 24; i++) resend.push({ id: `wire_${i}`, role: "user", contentType: "text", text: `fresh turn ${i} ${"y".repeat(64)}` });
+    return { session, resend };
+}
+
+function runEscalationPasses(session: Session, resend: CoreMessage[], passes: number): void {
+    for (let i = 0; i < passes; i++) reconcileFoldCoverage(session, resend, { mode: "repair" });
+}
+
+test("#2903: pure-legacy anchor debt never latches foldDriftEscalated", () => {
+    const { session, resend } = escalationFixture(20, 0);
+    runEscalationPasses(session, resend, 4);
+    // Prove the total-loss path actually ran (streak reached the escalate pass) —
+    // otherwise the not-escalated assertion would be vacuous.
+    assert.ok((session.metadata["foldDriftStreak"] as number) >= 3, "fixture must drive the total-loss streak to the escalate pass");
+    assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
+        "legacy (no-class) anchors are bili self-debt, not client destruction — must not escalate");
+});
+
+test("#2903: legacy debt + real missing still escalates (no wholesale silencing)", () => {
+    const { session, resend } = escalationFixture(40, 10);
+    runEscalationPasses(session, resend, 4);
+    assert.equal(session.metadata[METADATA_DRIFT_ESCALATED], true,
+        "a concrete-class missing message alongside legacy debt still counts toward the destroy threshold");
+});
+
+test("#2903: genuine client-side loss alone still escalates (detection intact)", () => {
+    const { session, resend } = escalationFixture(0, 10);
+    runEscalationPasses(session, resend, 4);
+    assert.equal(session.metadata[METADATA_DRIFT_ESCALATED], true,
+        "pure known-class missing ids (real rewrite/deletion) must still escalate");
 });

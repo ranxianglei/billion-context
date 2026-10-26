@@ -3,18 +3,20 @@
   "protocolVersion": 1,
   "proxy": "billion-context",
   "version": "<VERSION>",
+  "commit": "<COMMIT>",
   "toolNames": [
     "compress",
     "decompress",
     "search_context",
     "acp_status",
-    "acp_cache"
+    "acp_cache",
+    "acp_read_original_image"
   ],
   "tools": {
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -23,7 +25,7 @@
               "description": "Optional short title for the compressed range"
             },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
               "anyOf": [
                 {
                   "type": "array",
@@ -31,7 +33,7 @@
                     "anyOf": [
                       {
                         "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                       },
                       {
                         "type": "object",
@@ -106,33 +108,13 @@
                   "type": "string"
                 }
               ]
-            },
-            "startId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }
       },
       {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -147,6 +129,10 @@
             "full": {
               "type": "boolean",
               "description": "Restore all the way to original messages"
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -156,7 +142,7 @@
       },
       {
         "name": "search_context",
-        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -176,7 +162,7 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {}
@@ -184,7 +170,7 @@
       },
       {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -198,6 +184,22 @@
             }
           }
         }
+      },
+      {
+        "name": "acp_read_original_image",
+        "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+            }
+          },
+          "required": [
+            "ref"
+          ]
+        }
       }
     ],
     "openai": [
@@ -205,7 +207,7 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -214,7 +216,7 @@
                 "description": "Optional short title for the compressed range"
               },
               "content": {
-                "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
                 "anyOf": [
                   {
                     "type": "array",
@@ -222,7 +224,7 @@
                       "anyOf": [
                         {
                           "type": "string",
-                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                         },
                         {
                           "type": "object",
@@ -297,26 +299,6 @@
                     "type": "string"
                   }
                 ]
-              },
-              "startId": {
-                "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-              },
-              "endId": {
-                "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-              },
-              "startRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of startId"
-              },
-              "endRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of endId"
-              },
-              "summary": {
-                "type": "string",
-                "description": "Flat single-range form (no content): self-contained summary replacing the range"
               }
             }
           }
@@ -326,7 +308,7 @@
         "type": "function",
         "function": {
           "name": "decompress",
-          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -341,6 +323,10 @@
               "full": {
                 "type": "boolean",
                 "description": "Restore all the way to original messages"
+              },
+              "imageRef": {
+                "type": "string",
+                "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
               }
             },
             "required": [
@@ -353,7 +339,7 @@
         "type": "function",
         "function": {
           "name": "search_context",
-          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -376,7 +362,7 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {}
@@ -387,7 +373,7 @@
         "type": "function",
         "function": {
           "name": "acp_cache",
-          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -402,13 +388,32 @@
             }
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_read_original_image",
+          "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ref": {
+                "type": "string",
+                "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+              }
+            },
+            "required": [
+              "ref"
+            ]
+          }
+        }
       }
     ],
     "responses": [
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -417,7 +422,7 @@
               "description": "Optional short title for the compressed range"
             },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
               "anyOf": [
                 {
                   "type": "array",
@@ -425,7 +430,7 @@
                     "anyOf": [
                       {
                         "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                       },
                       {
                         "type": "object",
@@ -500,26 +505,6 @@
                   "type": "string"
                 }
               ]
-            },
-            "startId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }
@@ -527,7 +512,7 @@
       {
         "type": "function",
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -542,6 +527,10 @@
             "full": {
               "type": "boolean",
               "description": "Restore all the way to original messages"
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -552,7 +541,7 @@
       {
         "type": "function",
         "name": "search_context",
-        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -573,7 +562,7 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {}
@@ -582,7 +571,7 @@
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -595,6 +584,23 @@
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
             }
           }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_read_original_image",
+        "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+            }
+          },
+          "required": [
+            "ref"
+          ]
         }
       }
     ]
@@ -609,5 +615,16 @@
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
-  "runtimeInfoEndpoint": "/__bili/plugin/runtime-info"
+  "runtimeInfoEndpoint": "/__bili/plugin/runtime-info",
+  "capabilities": {
+    "fork": {
+      "protocolVersion": 2,
+      "acceptsProtocolVersions": [
+        1,
+        2
+      ],
+      "endpoint": "/__bili/plugin/fork",
+      "snapshotEndpoint": "/__bili/plugin/snapshot"
+    }
+  }
 }

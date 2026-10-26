@@ -1,0 +1,118 @@
+# Config reference seed — updates & advisories (#2107 single source of truth).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: updates
+entries:
+  - key: autoUpdate
+    type: boolean
+    default: "true"
+    env: ACP_AUTO_UPDATE
+    group: updates
+    id: tt.aupd
+    site_group: diag
+    desc_en: "Automatic npm version checks (every ~3 min); disable via ACP_AUTO_UPDATE=0 or --no-auto-update."
+    desc_zh: "自动 npm 版本检查（约每 3 分钟）；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭。"
+    site_en: "<code>autoUpdate</code> — automatic version checks (on by default; disable via ACP_AUTO_UPDATE=0 or --no-auto-update)."
+    site_zh: "<code>autoUpdate</code> —— 自动版本检查（默认开；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭）。"
+  - key: autoRestartOnUpdate
+    type: boolean
+    default: "false"
+    env: ACP_AUTO_RESTART_ON_UPDATE
+    group: updates
+    id: tt.arst
+    site_group: diag
+    desc_en: "Restart the daemon automatically once a newer version has been installed."
+    desc_zh: "新版本装好后自动重启守护进程。"
+    site_en: "<code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (opt-in)."
+    site_zh: "<code>autoRestartOnUpdate</code> —— 新版本装好后自动重启守护进程（可选开启）。"
+  - key: updateTag
+    type: string
+    default: "latest"
+    env: ACP_UPDATE_TAG
+    group: updates
+    id: tt.utag
+    site_group: diag
+    desc_en: "npm dist-tag channel for self-updates: latest (default), dev, or pr."
+    desc_zh: "自更新的 npm dist-tag 通道：latest（默认）、dev 或 pr。"
+    site_en: "<code>updateTag</code> — npm dist-tag channel: latest (default), dev, or pr."
+    site_zh: "<code>updateTag</code> —— npm dist-tag 通道：latest（默认）、dev 或 pr。"
+  - key: update
+    type: object
+    default: "{} (all defaults)"
+    group: updates
+    id: tt.update
+    site_group: proc
+    desc_en: "Self-update channel settings."
+    desc_zh: "自更新通道设置。"
+    site_en: "<code>update</code> — self-update channel: <span class='mech'>registry \"npmjs\" · checkIntervalMs 180000</span>."
+    site_zh: "<code>update</code> —— 自更新通道：<span class='mech'>registry \"npmjs\" · checkIntervalMs 180000</span>。"
+  - key: update.registry
+    type: string
+    default: "\"npmjs\" (registry.npmjs.org)"
+    env: BILI_UPDATE_REGISTRY
+    group: updates
+    desc_en: "Custom npm registry base URL for self-updates (private mirrors)."
+    desc_zh: "自更新用的自定义 npm registry 基础地址（私有镜像）。"
+  - key: update.checkIntervalMs
+    type: number
+    default: "180000"
+    env: BILI_UPDATE_CHECK_INTERVAL_MS
+    group: updates
+    desc_en: "Interval between npm registry version checks."
+    desc_zh: "npm registry 版本检查间隔。"
+  - key: update.staggerMinDelayMs
+    type: "number | string"
+    default: "900000 (built-in 15 min)"
+    env: BILI_UPDATE_STAGGER_MIN_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: lower bound of this machine's base upgrade-delay window; ms number or duration string (15m / 2d / 1d12h); 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口下限；毫秒数字或时长字符串（15m / 2d / 1d12h）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。"
+  - key: update.staggerMaxDelayMs
+    type: "number | string"
+    default: "172800000 (built-in 48 h)"
+    env: BILI_UPDATE_STAGGER_MAX_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。"
+  - key: update.policyUrl
+    type: string
+    default: "official repo raw URL"
+    env: BILI_UPDATE_POLICY_URL
+    group: updates
+    desc_en: "Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo)."
+    desc_zh: "远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。"
+  - key: advisoryCheck
+    type: boolean
+    default: "true"
+    env: BILI_ADVISORY_CHECK
+    group: updates
+    id: tt.advisory
+    site_group: diag
+    desc_en: "Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected."
+    desc_zh: "关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。"
+    site_en: "<code>advisoryCheck</code> / <code>advisoryUrl</code> — critical-defect advisory watcher (on by default; force-installs the recommended fix when your version is affected)."
+    site_zh: "<code>advisoryCheck</code> / <code>advisoryUrl</code> —— 关键缺陷公告监视器（默认开；本机版本命中受影响范围时装填推荐修复版本）。"
+  - key: advisoryUrl
+    type: string
+    default: "unset (built-in feed)"
+    env: BILI_ADVISORY_URL
+    group: updates
+    desc_en: "Override URL for the advisory feed."
+    desc_zh: "公告源覆盖地址。"
+  - key: releaseNotesCheck
+    type: boolean
+    default: "true"
+    env: BILI_RELEASE_NOTES_CHECK
+    group: updates
+    id: tt.rnotes
+    site_group: diag
+    desc_en: "Release-notes feed for the web panel (fetch + cache only; never installs anything)."
+    desc_zh: "Web 面板里的发布说明源（只抓取缓存、从不安装任何东西）。"
+    site_en: "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> — release-notes feed for the panel (on by default; fetch + cache only, never installs)."
+    site_zh: "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> —— 面板里的发布说明源（默认开；只抓取缓存、从不安装）。"
+  - key: releaseNotesUrl
+    type: string
+    default: "unset (built-in feed)"
+    env: BILI_RELEASE_NOTES_URL
+    group: updates
+    desc_en: "Override URL for the release-notes feed."
+    desc_zh: "发布说明源覆盖地址。"

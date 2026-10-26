@@ -50,7 +50,7 @@ test("resolveDecompress reaper: caps tracked temp files, unlinks oldest", async 
         const written: string[] = [];
         for (let i = 0; i < 5; i++) {
             const { ctx, blockId } = buildLargeBlock(`r${i}`, 11000);
-            const out = resolveDecompress({ blockId }, ctx);
+            const out = resolveDecompress({ blockId }, ctx).text;
             const m = out.match(/written to: (.+)$/m);
             assert.ok(m, `iteration ${i} should spill to temp file`);
             written.push(m![1]);

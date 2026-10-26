@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -92,8 +93,15 @@ function startProxy(upstreamPort: number): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
-    } as ProxyOptions);
+    } as unknown as ProxyOptions);
 }
 
 async function driveGeminiPreflight(proxyPort: number, upstreamPort: number, session: string, path = "streamGenerateContent?alt=sse"): Promise<{ status: number; body: string }> {
@@ -142,8 +150,10 @@ test("e2e preflight (#829): a Gemini summary reply that streams although the cal
         assert.ok(markers < 12 * 250, `the folded payload must drop raw marker text, still carried ${markers}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -176,8 +186,10 @@ test("e2e preflight (#829): the JSON summary of a non-streaming Gemini call is r
         assert.ok(body.includes("forwarded to the model"), `the model reply reached the client, got: ${body.slice(0, 300)}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

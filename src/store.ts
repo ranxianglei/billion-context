@@ -18,7 +18,9 @@ import { log as loggerLog } from "./logger.js";
 import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
+import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
 import type { PendingRetrieval, Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
 
@@ -56,6 +58,27 @@ export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }
 
+// #3400: per-request stamp of the acp_read_original_image TOOL registration gate.
+// The rescale PASS itself runs on every lane (governed by the BILI_IMAGE_RESCALE
+// knob); only the manifest registration and the annotation's invocation entry
+// follow this stamp — codex/plugin lanes get size-only notes.
+const EFFECTIVE_IMAGE_RESCALE_KEY = "effectiveImageRescale";
+
+/** Stamp whether acp_read_original_image may be registered for this session's
+ *  lane (per-request; mirrors the storeEffectiveCcr site). */
+export function storeEffectiveImageRescale(session: Session, armed: boolean | undefined): void {
+    // Absent == not armed (imageRescaleToolArmed reads === true). Writing only the
+    // armed state keeps non-armed lanes' metadata byte-identical to pre-#3400
+    // (storage-render digests pin that shape).
+    if (armed === true) session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] = true;
+    else delete session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY];
+}
+
+/** Read back the #3400 tool-registration stamp. */
+export function imageRescaleToolArmed(session: Session | undefined): boolean {
+    return session?.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] === true;
+}
+
 /** Model-facing retrieve tool name for this session: the config `ccr.toolName`
  *  override when set, else the kernel default. */
 export function retrieveToolName(session: Session | undefined): string {
@@ -90,10 +113,18 @@ export function ccrPluginWireOk(protocol: string): boolean {
 
 /** Lazily materialize the session's kernel content-store envelope: loaded
  *  from the session's content-store.json on first touch, fresh when the file
- *  is absent (or corrupt — degraded to retrieve misses, never a crash). */
+ *  is absent; corrupt originals are refused under bounded startup (#2803)
+ *  and degrade to a warned fresh store for legacy direct callers. */
 export function contentStoreOf(session: Session): MessageContentStore {
     if (!session.contentStore) {
-        session.contentStore = getStore().loadContentStore(session) ?? createContentStore();
+        // #2960 ③: unified-first. In full mode the index row's ccr mirror is
+        // at least as fresh as the sidecar (the sidecar saves payload-first
+        // in the same persist cycle that ingests the row), and it survives a
+        // lost/deleted sidecar. Legacy/shadow modes and rollback keep the
+        // file path unchanged.
+        session.contentStore = getStore().unifiedCcrFor(session.id)
+            ?? getStore().loadContentStore(session)
+            ?? createContentStore();
     }
     return session.contentStore;
 }
@@ -150,19 +181,19 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
  *  inline threshold are exported to <stateDir>/retrieve/<ref>.txt and the
  *  tool result carries a file pointer the model reads with its file tool.
  *  A hallucinated ref costs one tool call by design. */
-export function executeRetrieve(args: Record<string, unknown>, session: Session): string {
+export function executeRetrieve(args: Record<string, unknown>, session: Session): ProxyToolResult {
     session.stats.retrieveCalls = (session.stats.retrieveCalls ?? 0) + 1;
     const rawRef = args.ref;
     const ref = typeof rawRef === "string" ? rawRef.trim() : "";
     if (!ref) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
-        return `[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`;
+        return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
     const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
-        return result.toolResultText;
+        return toolFail(result.toolResultText);
     }
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
@@ -170,14 +201,14 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     if (result.export !== undefined && !writeRetrievalExport(result.export)) {
         // The pointer names a file we could not write — degrade to a bounded
         // head preview instead of handing the model a dead path.
-        return `[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`;
+        return toolFail(`[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`);
     }
     // Delivery is the tool result itself (the #1343 queued-injection
     // lifecycle is retired for CCR): the hit is delivered the moment this
     // returns, so it counts as delivered now — nothing left to queue.
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
-    return result.toolResultText;
+    return toolOk(result.toolResultText);
 }
 
 /** Host side of the kernel RetrievalExport effect: exports land under
@@ -216,9 +247,8 @@ type UndeliveredEntry = { ref: string; tokens: number; chars: number };
 // same-session requests can't clobber each other's commits. Pre-#1457
 // persisted notes carry no id — readers normalize them to "" so they ride
 // the same path and clear on the first confirmed delivery.
-export type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
+type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
 const MAX_DROP_NOTES = 64;
-const DEFAULT_RETRIEVAL_TTL_MS = 10 * 60 * 1000;
 
 function readLedger(session: Session): UndeliveredEntry[] {
     const v = session.metadata.ccrUndelivered;
@@ -233,10 +263,7 @@ function carrierOf(session: Session): PendingRetrieval[] {
 }
 
 function retrievalTtlMs(): number {
-    const raw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;
-    if (raw === undefined || raw === "") return DEFAULT_RETRIEVAL_TTL_MS;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_RETRIEVAL_TTL_MS;
+    return knobCcrRetrievalTtlMs();
 }
 
 function bufferDropNote(session: Session, refs: string[], reason: string): void {

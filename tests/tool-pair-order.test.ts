@@ -9,7 +9,7 @@ const cto = (id: string) => ({ type: "custom_tool_call_output", call_id: id });
 const msg = (text: string) => ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
 const reason = () => ({ type: "reasoning" });
 
-type Item = ReturnType<typeof fc | typeof fo | typeof msg>;
+type Item = { type: string; role?: string; content?: unknown[] | string; call_id?: string };
 
 // Invariant the fix guarantees: no non-tool item sits strictly between a
 // function_call/custom_tool_call and its matching output.
@@ -18,9 +18,9 @@ function assertNoTrap(items: Item[]): void {
     const outPos = new Map<string, number>();
     items.forEach((it, i) => {
         if (it.type === "function_call" || it.type === "custom_tool_call") {
-            if (!callPos.has(it.call_id)) callPos.set(it.call_id, i);
+            if (!callPos.has(it.call_id!)) callPos.set(it.call_id!, i);
         } else if (it.type === "function_call_output" || it.type === "custom_tool_call_output") {
-            if (!outPos.has(it.call_id)) outPos.set(it.call_id, i);
+            if (!outPos.has(it.call_id!)) outPos.set(it.call_id!, i);
         }
     });
     for (let p = 0; p < items.length; p++) {

@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CoreMessage } from "acp-kernel";
+import type { CoreMessage, Prompts } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { openaiToCore } from "acp-kernel/wire";
+import type { OpenAIRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -31,7 +32,7 @@ function makeSession(): Session {
     return {
         id: "issue539-loop-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, compressCreditTokens: 0, contextTokens: 100, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -39,6 +40,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -75,7 +77,7 @@ function findToolCallAssistant(rb: { messages: WireMessage[] }, toolName: string
 function prepare(body: Record<string, unknown>, session: Session) {
     const core = createCore();
     const config = defaultConfig(200000);
-    const { msgs, systemText } = openaiToCore(body) as { msgs: CoreMessage[]; systemText: string };
+    const { msgs, systemText } = openaiToCore(body as OpenAIRequestBody) as { msgs: CoreMessage[]; systemText: string };
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
     session.state = turn.state;
     return { core, config, processed: turn.messages, original: msgs, systemText };
@@ -116,7 +118,7 @@ test("#539: acp-loop re-request echoes reasoning_content on the proxy-tool assis
     try {
         const adapter = createOpenaiAdapter(OPENAI_BODY, systemText);
         const ctx = { core, config, messages: processed, session, log: () => {}, protocol: "openai" as const };
-        for await (const _c of runCompressLoop(new Response(ROUND1_STATUS, { status: 200 }).body!, ctx, OPENAI_BODY, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config))) { /* drain */ }
+        for await (const _c of runCompressLoop(new Response(ROUND1_STATUS, { status: 200 }).body!, ctx, OPENAI_BODY, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config as unknown as Prompts))) { /* drain */ }
     } finally {
         probe.restore();
     }
@@ -198,7 +200,7 @@ test("#539 compress-variant: current-round reasoning_content survives hideConsum
                 return [...t.messages, ...records];
             },
         };
-        for await (const _c of runCompressLoop(new Response(round1, { status: 200 }).body!, ctx, body, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config))) { /* drain */ }
+        for await (const _c of runCompressLoop(new Response(round1, { status: 200 }).body!, ctx, body, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config as unknown as Prompts))) { /* drain */ }
     } finally {
         probe.restore();
     }
@@ -233,7 +235,7 @@ test("#539 follow-up: rejected re-request (non-transient 4xx, OpenAI) propagates
     try {
         const adapter = createOpenaiAdapter(OPENAI_BODY, systemText);
         const ctx = { core, config, messages: processed, session, log: () => {}, protocol: "openai" as const };
-        for await (const c of runCompressLoop(new Response(ROUND1_STATUS, { status: 200 }).body!, ctx, OPENAI_BODY, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config))) out += c.toString();
+        for await (const c of runCompressLoop(new Response(ROUND1_STATUS, { status: 200 }).body!, ctx, OPENAI_BODY, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config as unknown as Prompts))) out += c.toString();
     } finally {
         probe.restore();
     }

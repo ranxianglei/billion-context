@@ -33,7 +33,8 @@ function makeOverflowFixture() {
     assert.equal(compressed.result.blocksCreated, 1);
     const session: Session = {
         id: "issue1372-preflight", meta: {}, metadata: {}, state: compressed.state,
-        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 287565, compressCreditTokens: 0, contextTokens: 287565 },
+        stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 287565, compressCreditTokens: 0, contextTokens: 287565 , retrieveCalls: 0, retrieveHits: 0,          retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        pendingRetrievals: [],
         createdAt: Date.now(), lastSeen: Date.now(), blockContents: new Map(), inFlight: 0, persisted: false,
     };
     return { core, config, messages, session };

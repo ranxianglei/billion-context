@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title data-i18n="doc.page_title">billion-context · Docs</title>
+  <meta name="description" content="billion-context documentation: run the local context-compression proxy and connect any AI coding agent — native plugin, bili launcher, or generic URL-prefix proxy."/>
+  <link rel="canonical" href="https://ranxianglei.github.io/billion-context/docs/"/>
+  <meta property="og:type" content="website"/>
+  <meta property="og:url" content="https://ranxianglei.github.io/billion-context/docs/"/>
+  <meta property="og:title" content="billion-context · Docs"/>
+  <meta property="og:description" content="Run the local context-compression proxy and connect any AI coding agent."/>
+  <meta name="twitter:card" content="summary"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f172a'/%3E%3Cpath d='M18 32c0-5 3.5-9 8-9s8 4 8 9-3.5 9-8 9-8-4-8-9zm12 0c0-5 3.5-9 8-9s8 4 8 9-3.5 9-8 9-8-4-8-9z' fill='none' stroke='%2338bdf8' stroke-width='6'/%3E%3C/svg%3E"/>
+  <link rel="stylesheet" href="../styles.css"/>
+</head>
+<body>
+  <header class="nav" id="top">
+    <div class="container nav-inner">
+      <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">&#8734;</span> billion-context</a>
+      <nav class="nav-links" aria-label="Main">
+        <a href="../#how" data-i18n="nav.how">How it works</a>
+        <a href="../#agents" data-i18n="nav.agents">Agents</a>
+        <a href="../#install" data-i18n="nav.install">Install</a>
+        <a href="../#paper" data-i18n="nav.paper">Paper</a>
+        <a href="./" class="on" aria-current="page" data-i18n="nav.docs">Docs</a>
+      </nav>
+      <div class="nav-right">
+        <button id="lang-toggle" class="ghost-btn" type="button" aria-label="Switch language">中文</button>
+        <a class="btn btn-dark" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">GitHub &#8599;</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="docs-wrap">
+      <aside class="docs-toc" aria-label="On this page">
+        <a href="#quickstart" data-i18n="d.toc_qs">Quickstart</a>
+        <a href="#webui" data-i18n="d.toc_webui">Web UI</a>
+        <a href="#connect" data-i18n="d.toc_connect">Connect clients</a>
+        <a href="#commands" data-i18n="d.toc_commands">Commands</a>
+        <a href="#config" data-i18n="d.toc_config">Configuration</a>
+        <a href="#reference" data-i18n="d.toc_ref">Full parameter reference</a>
+        <a href="#how" data-i18n="d.toc_how">How compression works</a>
+        <a href="#privacy" data-i18n="d.toc_privacy">Privacy</a>
+        <a href="#faq" data-i18n="d.toc_faq">FAQ</a>
+        <a href="#resources" data-i18n="d.toc_links">Resources</a>
+      </aside>
+
+      <article class="docs-body">
+        <h1 data-i18n="d.h1">Documentation</h1>
+        <p class="doc-sub" data-i18n="d.sub">Everything you need to run billion-context locally and connect your agents. Exhaustive references live in the repository: CONFIGURATION.md, TECHNICAL-NOTES.md, PLUGIN.md, SESSION-IDENTITY.md.</p>
+
+        <h2 id="quickstart" data-i18n="d.toc_qs">Quickstart</h2>
+        <p data-i18n="d.qs.p">One npm package, Node 22+. Install it, then start the local compression proxy:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context --prefix=~/.local&#10;bili" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>npm install -g billion-context --prefix=~/.local   # Node 22+ (nvm / Homebrew / Windows: drop --prefix)
+bili                                               # start the proxy (or: bili pi / claude / codex / omp / … to launch an agent through it)</code></pre>
+</div>
+        <p data-i18n="d.qs.p2">Everything binds loopback only — nothing is exposed externally. Every instance serves the same built-in dashboard under its own address:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">browser</span><button class="copy-btn" type="button" data-copy="http://127.0.0.1:8787/__bili/" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a></pre>
+        </div>
+        <p class="hint" data-i18n-html="d.qs.next">Next stop: the panel below — configuration, session stats, and live logs all live there.</p>
+
+        <h2 id="webui" data-i18n="d.toc_webui">Web UI</h2>
+        <p class="hint" data-i18n-html="d.wu.access">Access: open <a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a> once the proxy is up — every instance serves this same built-in dashboard on its own loopback address (ACP_PORT overrides). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.</p>
+        <p data-i18n-html="d.wu.p">Every running instance serves a built-in dashboard at <code>/__bili/</code>:</p>
+        <ul class="wu-list">
+          <li data-i18n="d.wu.ov">Overview — total sessions and requests, gross and net savings, global hit rate with miss breakdown, protocol distribution.</li>
+          <li data-i18n="d.wu.se">Sessions — usage cards, context trajectory chart, cache economics with fold detail, compression blocks, and the Markdown handoff document (copy or download).</li>
+          <li data-i18n="d.wu.cf">Configuration — view and edit the JSON config; changes apply immediately.</li>
+          <li data-i18n="d.wu.cn">Connect — per-instance wiring guide with copyable commands.</li>
+          <li data-i18n="d.wu.lo">Logs — live tail of the daemon log, filterable by session id or keyword, downloadable as plain text.</li>
+          <li data-i18n="d.wu.blog">Blog — a few release notes and long-form articles rendered inside the panel itself: bundled with the install, offline-readable; the always-fresh full library lives on GitHub Pages.</li>
+        </ul>
+
+        <h2 id="connect" data-i18n="d.toc_connect">Connect clients</h2>
+        <p data-i18n="d.cn.p">Three ways to put the proxy between your agent and the model. Pick whichever fits your client:</p>
+
+        <h3 data-i18n="im1.t">Native plugin — recommended</h3>
+        <p data-i18n="d.cn.m1">Installs a thin plugin straight into the client (the original file is backed up once); deepest integration, with native in-conversation tools. Covers pi · omp · claude · codex · opencode · dsh · kimi · hermes · zcode:</p>
+        <div class="chips">
+          <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install pi">bili plugin install pi</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install omp">bili plugin install omp</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install claude">bili plugin install claude</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install codex">bili plugin install codex</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install opencode">bili plugin install opencode</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install dsh">bili plugin install dsh</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install kimi">bili plugin install kimi</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install hermes">bili plugin install hermes</button>
+<button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install zcode">bili plugin install zcode</button>
+          <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin list">bili plugin list</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin update">bili plugin update</button>
+        </div>
+        <p class="hint" data-i18n="d.cn.chip_copy">Click any command chip to copy it.</p>
+        <p class="hint" data-i18n-html="d.cn.mcp_note">For opencode, <code>bili plugin install opencode --with-mcp</code> also registers its MCP tools.</p>
+
+        <h3 data-i18n="im2.t">Launcher — works for any agent</h3>
+        <p data-i18n="d.cn.m2">Zero config edits: wraps any CLI agent and injects the proxy + compression state automatically. Each launch brings up a fresh throwaway proxy instance:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="bili pi" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>bili pi        # or: bili codex / claude / omp / opencode / hermes /
+dsh / codebuddy / qoder / trae / jcode / kimi / gemini / iflow /
+qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code></pre>
+        </div>
+        <div class="chips">
+          <button class="chip-cmd copy-btn" type="button" data-copy="bili pi">bili pi</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili codex">bili codex</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili claude">bili claude</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili omp">bili omp</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili opencode">bili opencode</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili hermes">bili hermes</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili dsh">bili dsh</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili codebuddy">bili codebuddy</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili qoder">bili qoder</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili trae">bili trae</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili jcode">bili jcode</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili kimi">bili kimi</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili gemini">bili gemini</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili iflow">bili iflow</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili qwen">bili qwen</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili mcode">bili mcode</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili aider">bili aider</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili copilot">bili copilot</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili amp">bili amp</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili goose">bili goose</button>
+        </div>
+        <p class="hint" data-i18n-html="d.cn.launcher_args">Your own arguments pass straight through: <code>bili pi -r</code>.</p>
+
+        <h3 data-i18n="im3.t">Generic proxy — URL prefix routing</h3>
+        <p data-i18n="d.cn.m3">Any client that accepts a custom endpoint works out of the box: point its base URL at the prefix below, keeping the original upstream address as the tail:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">base url</span><button class="copy-btn" type="button" data-copy="http://localhost:8787/bili/https://api.openai.com/v1" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>http://localhost:8787/bili/https://api.openai.com/v1   # example</code></pre>
+        </div>
+
+        <p class="hint" data-i18n="d.cn.url_hint">Replace the trailing https://api.openai.com/v1 with each client's original upstream address — see the table below for exactly where to put it.</p>
+        <p data-i18n="d.cn.table_note">Per-client integration detail:</p>
+        <table class="client-table">
+          <thead><tr><th data-i18n="d.th_client">Client</th><th data-i18n="d.th_method">Methods</th><th data-i18n="d.th_mech">Key mechanism</th><th data-i18n="d.th_cmd">Command (click to copy)</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">pi</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">file-free extension + env</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili pi">bili pi</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install pi">bili plugin install pi</button></td></tr>
+            <tr><td class="mono">omp</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">file-free env</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili omp">bili omp</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install omp">bili plugin install omp</button></td></tr>
+            <tr><td class="mono">claude</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">env base URL + managed settings</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili claude">bili claude</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install claude">bili plugin install claude</button></td></tr>
+            <tr><td class="mono">codex</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">config.toml provider / openai_base_url</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili codex">bili codex</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install codex">bili plugin install codex</button></td></tr>
+            <tr><td class="mono">opencode</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">base_url (+ --with-mcp)</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili opencode">bili opencode</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install opencode">bili plugin install opencode</button></td></tr>
+            <tr><td class="mono">dsh</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">--patch plugin · DSH_HOME overlay</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili dsh">bili dsh</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install dsh">bili plugin install dsh</button></td></tr>
+            <tr><td class="mono">kimi</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">KIMI_CODE_HOME / managed OAuth</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili kimi">bili kimi</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install kimi">bili plugin install kimi</button></td></tr>
+            <tr><td class="mono">hermes</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">HTTPS_PROXY + MITM CA</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili hermes">bili hermes</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install hermes">bili plugin install hermes</button></td></tr>
+            <tr><td class="mono">zcode</td><td><span class="mbadge">plugin</span></td><td class="mech">native plugin · /bili/ prefix · GUI cert-MITM</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install zcode">bili plugin install zcode</button></td></tr>
+            <tr><td class="mono">jcode</td><td><span class="mbadge">launcher</span></td><td class="mech">HTTPS_PROXY + CA (api.z.ai)</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili jcode">bili jcode</button></td></tr>
+            <tr><td class="mono">gemini</td><td><span class="mbadge">launcher</span></td><td class="mech">GOOGLE_GEMINI_BASE_URL</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili gemini">bili gemini</button></td></tr>
+            <tr><td class="mono">iflow</td><td><span class="mbadge">launcher</span></td><td class="mech">IFLOW_BASE_URL</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili iflow">bili iflow</button></td></tr>
+            <tr><td class="mono">qwen</td><td><span class="mbadge">launcher</span></td><td class="mech">MITM · DashScope/Qwen hosts</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili qwen">bili qwen</button></td></tr>
+            <tr><td class="mono">mcode</td><td><span class="mbadge">launcher</span></td><td class="mech">MiniMax yaml endpoints</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili mcode">bili mcode</button></td></tr>
+            <tr><td class="mono">aider</td><td><span class="mbadge">launcher</span></td><td class="mech">OPENAI_API_BASE / .aider.conf.yml</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili aider">bili aider</button></td></tr>
+            <tr><td class="mono">copilot</td><td><span class="mbadge">launcher</span></td><td class="mech">MITM · githubcopilot.com</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili copilot">bili copilot</button></td></tr>
+            <tr><td class="mono">amp</td><td><span class="mbadge">launcher</span></td><td class="mech">MITM · ampcode.com</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili amp">bili amp</button></td></tr>
+            <tr><td class="mono">goose</td><td><span class="mbadge">launcher</span></td><td class="mech">OPENAI_HOST / ANTHROPIC_HOST redirect</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili goose">bili goose</button></td></tr>
+            <tr><td class="mono">trae</td><td><span class="mbadge">launcher</span></td><td class="mech">TRAE_CLI_API_HOST</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili trae">bili trae</button></td></tr>
+            <tr><td class="mono">codebuddy</td><td><span class="mbadge">launcher</span></td><td class="mech">CODEBUDDY_BASE_URL</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili codebuddy">bili codebuddy</button></td></tr>
+            <tr><td class="mono">qoder</td><td><span class="mbadge">launcher</span></td><td class="mech">MITM hosts whitelist</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili qoder">bili qoder</button></td></tr>
+          </tbody>
+        </table>
+        <p data-i18n="d.cn.mitm">Clients that hard-code HTTPS upstreams are handled by an automatic certificate: domains the client reaches are whitelisted on first sight. Need another host? Add it explicitly:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="bili pi --mitm-domain api.foo.com" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>bili pi --mitm-domain api.foo.com</code></pre>
+        </div>
+
+        <h2 id="commands" data-i18n="d.toc_commands">Commands</h2>
+        <dl class="cmd-list">
+          <dt><code>bili</code></dt><dd data-i18n="cmd.daemon">Start the standalone proxy daemon (default port 8787).</dd>
+          <dt><code>bili &lt;client&gt;</code></dt><dd data-i18n="cmd.launch">Bring up a throwaway proxy + launch the chosen client against it — no config edits.</dd>
+          <dt><code>bili plugin install|list|update|remove</code></dt><dd data-i18n="cmd.plugin">Manage the per-client plugins and their update lanes.</dd>
+          <dt><code>bili test pi</code></dt><dd data-i18n="cmd.test">Non-polluting smoke test through the proxy.</dd>
+          <dt><code>bili export [session] [--full]</code></dt><dd data-i18n="cmd.export">List sessions, or export one as a Markdown handoff document (--full restores original messages).</dd>
+          <dt><code>bili doctor</code></dt><dd data-i18n="cmd.doctor">Audit every install lane: versions, owners, running proxies (read-only).</dd>
+          <dt><code>bili update</code></dt><dd data-i18n="cmd.update">Check for and install a newer version now.</dd>
+          <dt><code>/acp</code></dt><dd data-i18n="cmd.acp">Live context panel inside your agent — includes this session's web-dashboard link.</dd>
+          <dt><code>/acp-cache</code></dt><dd data-i18n="cmd.acpcache">Token economics report for the session: new content vs cache hits vs compression repay.</dd>
+        </dl>
+
+        <h2 id="config" data-i18n="d.toc_config">Configuration</h2>
+        <p data-i18n="d.cf.p">Everything lives in one JSON file, created automatically on first run and hot-reloaded while you edit:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">path</span><button class="copy-btn" type="button" data-copy="~/.config/billion-context/billion-context.json" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>~/.config/billion-context/billion-context.json     # { } is valid — defaults cover most setups</code></pre>
+        </div>
+        <p class="hint" data-i18n-html="d.cf.panel_cta">Configure it in the panel instead of by hand: the <a href="http://127.0.0.1:8787/__bili/#/config">configuration page</a> (<a href="http://127.0.0.1:18787/__bili/#/config">here</a> on a launcher agent's instance) validates every edit, offers quick-config controls, and writes this same file — environment variables still win over it when set.</p>
+
+        <h2 id="reference" data-i18n="d.toc_ref">Full parameter reference</h2>
+        <p data-i18n="d.ref.intro">Every knob in detail. Generated from the same seed as the repository's CONFIGURATION.md (CI drift-guarded), so the site and the repo docs stay one copy.</p>
+        <h3 data-i18n="d.cf.t_compress">compress — every knob</h3>
+        <table class="client-table param-table">
+          <thead><tr><th data-i18n="d.cf.th_param">Parameter</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
+          <tbody>
+<!-- bili:gen compress-table -->
+            <tr><td class="mono">modelContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mcl">Effective context window (tokens or "N%"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default.</td></tr>
+            <tr><td class="mono">maxContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mxcl">Forced-compression nudge threshold (default "75%"): once history passes this share of the window the nudge fires immediately, bypassing the growth gates. Not a hard cap.</td></tr>
+            <tr><td class="mono">emergencyThresholdPercent</td><td class="mech">number | %</td><td data-i18n="cw.etc">Default "95%": emergency truncation of oversized tool outputs when history passes this share of the window (must be ≥ maxContextLimit).</td></tr>
+            <tr><td class="mono">outputHeadroomMaxPct</td><td class="mech">number | %</td><td data-i18n="cw.ohmp">Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens.</td></tr>
+            <tr><td class="mono">nudgeGrowthTokens</td><td class="mech">number</td><td data-i18n="cw.ngt">Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens.</td></tr>
+            <tr><td class="mono">tierNudgeTokens</td><td class="mech">object {t1?, t2?, t3?}</td><td data-i18n="cw.tnt">Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5).</td></tr>
+            <tr><td class="mono">minPressureBenefitTokens</td><td class="mech">number (≥ 0)</td><td data-i18n="cw.mpbt">Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211).</td></tr>
+            <tr><td class="mono">nudgeModelDecided</td><td class="mech">boolean</td><td data-i18n="cw.nmd">Model-decided nudge timing (off by default): an armed tier-1 nudge first asks the model, over the session's cached prefix, whether compressing now helps the current task; a strict-JSON yes injects a directive with a program-finalized span, anything else injects nothing this round.</td></tr>
+            <tr><td class="mono">nudgeDecisionMaxTokens</td><td class="mech">number</td><td data-i18n="cw.ndmt">Output budget (tokens) of the model-decision side call (default 200). Must be > 0.</td></tr>
+            <tr><td class="mono">streamSummary</td><td class="mech">boolean</td><td data-i18n="cw.ssm">Force streaming (SSE) summarization from the first attempt — stream-mandating upstreams now self-heal via a one-shot SSE probe on any non-streaming 400 (#2494); kept as the escape hatch for gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the self-learn cannot detect, or to skip the one probe round-trip.</td></tr>
+            <tr><td class="mono">preserveRecentMessages</td><td class="mech">number</td><td data-i18n="cw.prm">Kernel default 3 (tuned 5 → 3, #3058): the most recent messages stay soft-protected from folds.</td></tr>
+            <tr><td class="mono">preserveRecentTokens</td><td class="mech">number</td><td data-i18n="cw.prt">Kernel default ≈5000: the most recent tokens stay soft-protected from folds.</td></tr>
+            <tr><td class="mono">minCompressRangeChars</td><td class="mech">number (deprecated alias: minCompressRange)</td><td data-i18n="cw.mrc">Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold.</td></tr>
+            <tr><td class="mono">maxSummaryLength</td><td class="mech">number</td><td data-i18n="cw.msl">Hard cap, in characters, on one generated summary (kernel default 20000): longer replies are rejected whole by the kernel check or the external-summary executor. External summarizers receive this exact cap in their instructions (#3635); 0 disables the cap.</td></tr>
+            <tr><td class="mono">minSummaryLength</td><td class="mech">number</td><td data-i18n="cw.mnl">Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635).</td></tr>
+            <tr><td class="mono">reconcile</td><td class="mech">"off" | "warn" | "repair"</td><td data-i18n="cw.rec">"off" | "warn" | "repair" (default repair): reconcile folded state when the client rewinds or rewrites history between turns.</td></tr>
+            <tr><td class="mono">promptPack</td><td class="mech">string (builtin: "default", "lean")</td><td data-i18n="cw.ppk">Compression prompt pack, resolved project pack → user pack → builtin. Builtins: "default" and "lean" (one-line tool descriptions). Not gated by acknowledgePromptsRisk.</td></tr>
+            <tr><td class="mono">tiers</td><td class="mech">boolean</td><td data-i18n="cw.tiers">On by default: tiered T1→T3 distillation spreads folding cost across generations.</td></tr>
+            <tr><td class="mono">protectedTools</td><td class="mech">string[]</td><td data-i18n="ct.pt">Hard exclusion across all history: results of listed tools never fold (use with care).</td></tr>
+            <tr><td class="mono">protectedLatestTools</td><td class="mech">string[]</td><td data-i18n="ct.plt">Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists).</td></tr>
+            <tr><td class="mono">neverPreserveRecentTools</td><td class="mech">string[] ([] valid)</td><td data-i18n="ct.nprt">Excluded from the recent protection zone (immediately compressible); default ["decompress", "search_context", "read", "bash"]. An empty array is valid — it excludes nothing (maximum protection).</td></tr>
+            <tr><td class="mono">preserveRecentTools</td><td class="mech">string[]</td><td data-i18n="ct.prt2">Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo.</td></tr>
+            <tr><td class="mono">visibilityMarkers</td><td class="mech">boolean</td><td data-i18n="ct.vm">Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration).</td></tr>
+            <tr><td class="mono">rules</td><td class="mech">boolean</td><td data-i18n="ct.rules">Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode.</td></tr>
+            <tr><td class="mono">injectTool</td><td class="mech">boolean</td><td data-i18n="ct.it">Register the acp_compress tool for clients (on by default; global level only).</td></tr>
+            <tr><td class="mono">injectNudge</td><td class="mech">boolean</td><td data-i18n="ct.in">Send growth nudges as the window fills (on by default; global level only).</td></tr>
+            <tr><td class="mono">reasoning</td><td class="mech">{ drop?, threshold? }</td><td data-i18n="ct.rz">{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false.</td></tr>
+<!-- /bili:gen -->
+          </tbody>
+        </table>
+        <ul class="obj-list">
+<!-- bili:gen compress-objlist -->
+          <li data-i18n-html="co.absorb"><code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName "absorb"</span>).</li>
+          <li data-i18n-html="co.ccr"><code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName "acp_retrieve", maxHeadChars</span>).</li>
+          <li data-i18n-html="co.searchRoot"><code>search</code> — search-behavior settings for search_context; currently holds <code>planAware</code>.</li>
+          <li data-i18n-html="co.search"><code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results.</li>
+          <li data-i18n-html="co.prompts"><code>prompts</code> — override the kernel doctrine texts (<span class='mech'>compressPhilosophy, howToCompressRules, tier2DistillRules, tier3CondenseRules</span>); load-bearing for quality — gated behind acknowledgePromptsRisk.</li>
+          <li data-i18n-html="co.rg"><code>reasoningGuard</code> — auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (≤3 continue-nudge rounds, marker "Continue thinking...") (<span class='mech'>enabled, maxContinue, maxTierN, markerText, base, offset, debugLog</span>).</li>
+          <li data-i18n-html="co.os"><code>outputSteering</code> — <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>: appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests.</li>
+          <li data-i18n-html="co.pp"><code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire.</li>
+          <li data-i18n-html="co.es"><code>externalSummary</code> — optional chain of external summary models, each target a "provider/model" reference into the <code>providers</code> table; disabled unless <code>enabled</code> is true, targets tried in order with fall-through (<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>). Whole-chain replace semantics at all three compress levels.</li>
+          <li data-i18n-html="co.apr"><code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect.</li>
+<!-- /bili:gen -->
+        </ul>
+        <h3 data-i18n="d.cf.t_routes">providers — route table fields</h3>
+        <p class="hint" data-i18n-html="d.cf.routes_intro">Keys are upstream URL prefixes — longest match wins, boundary-safe. <code>https://</code> keys match /bili/ traffic; <code>mitm://</code> keys match login-client traffic on the MITM lane. An entry with no fields is still an ordinary compressed lane.</p>
+        <table class="client-table param-table">
+          <thead><tr><th data-i18n="d.cf.th_param">Field</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
+          <tbody>
+<!-- bili:gen routes-table -->
+            <tr><td class="mono">models</td><td class="mech">record name → { context?, output?, compress?, benefit? }</td><td data-i18n-html="cr.models">Record of model name → <span class='mech'>{context?, output?, compress?, benefit?}</span>: declares each model's context window, output ceiling, and per-model compression overrides (benefit marks free-quota billing). Not a traffic filter.</td></tr>
+            <tr><td class="mono">proxy</td><td class="mech">string ("" = explicit direct)</td><td data-i18n="cr.proxy">Per-route outbound proxy URL; empty string = explicitly direct.</td></tr>
+            <tr><td class="mono">compressProtocol</td><td class="mech">"tools" (default) | "marker"</td><td data-i18n="cr.cp">Which ACP injection surface this lane speaks: native tools (default) or prompt markers.</td></tr>
+            <tr><td class="mono">protocol</td><td class="mech">"anthropic" | "openai" | "responses" | "google"</td><td data-i18n="cr.proto">Declare this lane's wire protocol. A client-side /bili/&lt;protocol&gt;/ URL marker outranks the declaration; unparseable bodies relay verbatim.</td></tr>
+            <tr><td class="mono">compress</td><td class="mech">object (level 2)</td><td data-i18n="cr.compress">Any compress field can be overridden here — level 2 of the global→provider→model merge (per-field, deepest wins).</td></tr>
+            <tr><td class="mono">compat</td><td class="mech">{ roles?, dropFields? }</td><td data-i18n="cr.compat">{ roles?, dropFields? } — remap roles the upstream rejects (e.g. developer→system); provider entries beat the global block per key; dropFields strips fields strict schemas reject (additive union).</td></tr>
+            <tr><td class="mono">direct</td><td class="mech">boolean</td><td data-i18n="cr.direct">Client-side exemption: traffic for this upstream is never pointed at bili at all — unlike passthrough, it does not even terminate there.</td></tr>
+            <tr><td class="mono">passthrough</td><td class="mech">boolean</td><td data-i18n="cr.pt">Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams.</td></tr>
+            <tr><td class="mono">imageBilling</td><td class="mech">"auto" | "pixels" | "bytes"</td><td data-i18n="cr.ib">Image-token counting basis for this route: auto (→ pixels), pixels, or bytes (explicit opt-in for byte relays).</td></tr>
+            <tr><td class="mono">imageTokenCap</td><td class="mech">number</td><td data-i18n="cr.itc">Per-image token cost cap for this route; unset = uncapped.</td></tr>
+            <tr><td class="mono">resign</td><td class="mech">scheme → { enabled?, passthrough?, credentialRef? }</td><td data-i18n="cr.resign">Per-route overrides of the global resign map (level 2, deepest wins).</td></tr>
+            <tr><td class="mono">bind</td><td class="mech">string (named entries only)</td><td data-i18n="cr.bind">Named (non-URL) entry: deep-merged onto the bound URL lane at config load as an alias. Without bind a named entry stays routing-inert.</td></tr>
+            <tr><td class="mono">apiKeyEnv</td><td class="mech">string (env var name)</td><td data-i18n="cr.lanekey">Lane credential override (#2336): requests forwarded through this lane carry this env variable's value instead of the client's own credential — x-api-key / x-goog-api-key replaced outright, Bearer authorization replaced, injected when absent. Exactly one of apiKeyEnv / credentialRef per entry.</td></tr>
+            <tr><td class="mono">credentialRef</td><td class="mech">string (store name)</td><td data-i18n="cr.lanecred">Lane credential override via the private summary-credential store (`secret:NAME` semantics); exactly one of apiKeyEnv / credentialRef per entry.</td></tr>
+            <tr><td class="mono">calibration</td><td class="mech">{ disabled?: boolean, max?: number }</td><td data-i18n-html="cr.calib">Per-route k̂ calibration policy (#3211): `disabled` suppresses the learned factor on this route; `max` clamps it (0 < max ≤ 4). Applied at publication time — the learned ring stays raw.</td></tr>
+            <tr><td class="mono">compactionOptIn</td><td class="mech">boolean</td><td data-i18n="cr.optin">Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS.</td></tr>
+<!-- /bili:gen -->
+          </tbody>
+        </table>
+        <h3 data-i18n="d.cf.t_top">Other top-level fields</h3>
+        <ul class="cfg-list top-list">
+<!-- bili:gen top-list -->
+          <li class="tg" data-i18n-html="tg.core"><strong>Server &amp; core</strong></li>
+          <li data-i18n-html="tt.port"><code>port</code> — listen port (default 8787).</li>
+          <li data-i18n-html="tt.host"><code>host</code> — bind address (default 127.0.0.1; "::" is dual-stack, 0.0.0.0 exposes outward).</li>
+          <li data-i18n-html="tt.sessionheader"><code>sessionHeader</code> — HTTP header carrying the session id (default x-acp-session).</li>
+          <li data-i18n-html="tt.log"><code>log</code> — file logging master switch (on by default).</li>
+          <li data-i18n-html="tt.logfile"><code>logFile</code> — explicit path for bili.log (env ACP_LOG_FILE wins).</li>
+          <li data-i18n-html="tt.debug"><code>debug</code> — verbose per-request logging.</li>
+          <li data-i18n-html="tt.dumsse"><code>dumpSse</code> — raw SSE stream dump level for debugging.</li>
+          <li data-i18n-html="tt.pt3"><code>passthrough</code> — global raw-relay switch (off by default; ACP_PASSTHROUGH / --passthrough win over the file).</li>
+          <li class="tg" data-i18n-html="tg.up"><strong>Upstream &amp; billing</strong></li>
+          <li data-i18n-html="tt.upstream"><code>upstream</code> — fallback upstream base URL (ACP_UPSTREAM overrides).</li>
+          <li data-i18n-html="tt.proxy"><code>proxy</code> — global outbound proxy. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY env → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 is rejected.</li>
+          <li data-i18n-html="tt.mcl2"><code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit.</li>
+          <li data-i18n-html="tt.ib2"><code>imageBilling</code> — global image-token estimation: "auto" (default → pixels), "pixels" or "bytes" (explicit opt-in for byte relays).</li>
+          <li data-i18n-html="tt.itc2"><code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live).</li>
+          <li data-i18n-html="tt.ir2"><code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage.</li>
+          <li class="tg" data-i18n-html="tg.beh"><strong>Behavior toggles</strong></li>
+          <li data-i18n-html="tt.rollout"><code>rollout</code> — canary gating: features enable for a percent of installs, bucketed on a stable per-machine UUID; nested <span class='mech'>base</span> rolls B out only inside A's cohort.</li>
+          <li data-i18n-html="tt.mask"><code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked).</li>
+          <li data-i18n-html="tt.adminrelay"><code>security.adminRelay</code> — relay the /__bili/ admin surface through the embedding host's web entry (off by default; fail-closed).</li>
+          <li data-i18n-html="tt.subagent"><code>subagentSplit</code> — Claude subagents get their own session namespace (on by default).</li>
+          <li data-i18n-html="tt.fork"><code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default).</li>
+          <li data-i18n-html="tt.autoforge"><code>autoModeForge.enabled</code> — answer Claude Code auto-mode classifier calls locally with a forged allow verdict (on by default; <code>BILI_AUTO_MODE_FORGE=0</code> = pure passthrough).</li>
+          <li data-i18n-html="tt.simhash"><code>affinitySimhash</code> — simhash chain-alignment re-attaches sessions after pervasive client rewrites (on by default).</li>
+          <li data-i18n-html="tt.resinherit"><code>resumeInheritance</code> — inherited refs/blocks on resume (cc --resume) (on by default).</li>
+          <li data-i18n-html="tt.chain"><code>chainContentDetection</code> — recognize bili-owned traffic by body content (off; false-positive risk).</li>
+          <li data-i18n-html="tt.stamp"><code>chainEgressStamp</code> — model-visible stamp on egress messages (off; burns tokens).</li>
+          <li data-i18n-html="tt.anchor"><code>stableSystemAnchor</code> — best-effort wire-layer prefix-cache anchor (off; plain-proxy lanes).</li>
+          <li data-i18n-html="tt.compat"><code>compat</code> — wire-compatibility block: role remaps, stream error shape, strict-schema field drops, cache-control handling.</li>
+          <li class="tg" data-i18n-html="tg.mitm"><strong>MITM lane</strong></li>
+          <li data-i18n-html="tt.ppath"><code>providersPath</code> — external routes file path (env ACP_PROVIDERS beats both it and inline providers).</li>
+          <li data-i18n-html="tt.mitm"><code>mitm.enabled</code> / <code>mitm.domains</code> — HTTPS interception switch and whitelist domains for login clients.</li>
+          <li data-i18n-html="tt.mitm2"><code>mitm.handshakeTimeoutMs</code> — TLS handshake timeout (default 10000).</li>
+          <li class="tg" data-i18n-html="tg.proc"><strong>Process blocks</strong></li>
+          <li data-i18n-html="tt.network"><code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>.</li>
+          <li data-i18n-html="tt.guardrails"><code>guardrails</code> — pi/omp plugin tool-output + stream text-run guardrails: <span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true · textRunThreshold 200</span>.</li>
+          <li data-i18n-html="tt.persist"><code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>.</li>
+          <li data-i18n-html="tt.storage"><code>storage</code> — unified storage sidecar: <span class='mech'>unified legacy</span> — file tier selects the lane-wide storage mode; env BILI_STORAGE_UNIFIED wins when set.</li>
+          <li data-i18n-html="tt.sessions"><code>sessions</code> — <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> — GC is opt-in; user data is never pruned silently.</li>
+          <li data-i18n-html="tt.snap"><code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots).</li>
+          <li data-i18n-html="tt.update"><code>update</code> — self-update channel: <span class='mech'>registry "npmjs" · checkIntervalMs 180000</span>.</li>
+          <li class="tg" data-i18n-html="tg.diag"><strong>Diagnostics &amp; updates</strong></li>
+          <li data-i18n-html="tt.diag"><code>diagnostics</code> — local troubleshooting knobs: <span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol "tools"</span>.</li>
+          <li data-i18n-html="tt.fake"><code>fakeCompletion</code> — retry loop for truncated final chunks: <span class='mech'>retries 0 (opt-in) · bufCapBytes 16 MiB</span>.</li>
+          <li data-i18n-html="tt.aupd"><code>autoUpdate</code> — automatic version checks (on by default; disable via ACP_AUTO_UPDATE=0 or --no-auto-update).</li>
+          <li data-i18n-html="tt.arst"><code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (opt-in).</li>
+          <li data-i18n-html="tt.utag"><code>updateTag</code> — npm dist-tag channel: latest (default), dev, or pr.</li>
+          <li data-i18n-html="tt.advisory"><code>advisoryCheck</code> / <code>advisoryUrl</code> — critical-defect advisory watcher (on by default; force-installs the recommended fix when your version is affected).</li>
+          <li data-i18n-html="tt.rnotes"><code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> — release-notes feed for the panel (on by default; fetch + cache only, never installs).</li>
+          <li class="tg" data-i18n-html="tg.adv"><strong>Advanced scalars</strong></li>
+          <li data-i18n-html="tt.ccx"><code>codexCompact</code> — intercept | pass (default intercept): handle Codex's compaction requests in bili or forward upstream — explicit forms plus the inline auto-compact transiting as an ordinary turn (prompt-form detection, #3008; overridden compact_prompt transits verbatim).</li>
+          <li data-i18n-html="ttl.ttl"><code>ccrRetrievalTtlMs</code> — lifetime of CCR retrieval pointers (default 600000; 0 disables retrieval).</li>
+          <li data-i18n-html="ttl.tmp"><code>decompressTmpCap</code> — size cap for temporary decompressed blocks (default 50).</li>
+          <li data-i18n-html="tt.nat"><code>native.attachExternal</code> — let launcher-less native plugins attach to an external daemon (off by default).</li>
+<!-- /bili:gen -->
+        </ul>
+        <p data-i18n="d.cf.env">Environment variables win over the config file — precedence: env &gt; file &gt; built-in default, and a set variable owns the knob even if its value looks invalid. Common ones:</p>
+        <div class="codebox">
+          <div class="codebox-head"><span class="mono">env</span><button class="copy-btn" type="button" data-copy="ACP_PORT=8787&#10;ACP_HOST=127.0.0.1&#10;ACP_UPSTREAM=https://api.anthropic.com&#10;ACP_PASSTHROUGH=1&#10;ACP_PROVIDERS=/path/to/routes.json&#10;BILI_CONFIG_FILE=~/.config/billion-context/billion-context.json&#10;BILI_SESSIONS_DIR=~/.local/share/billion-context/sessions&#10;BILI_UPSTREAM_PROXY=http://host:port&#10;ACP_MODEL_CONTEXT_LIMIT=200000&#10;BILI_MITM_DOMAINS=api.foo.com&#10;BILI_REPLAY_RETRY_MAX=3&#10;BILI_SESSION_GC=1&#10;BILI_IMAGE_TOKEN_CAP=8192&#10;BILI_SUBAGENT_SPLIT=0&#10;BILI_FORK_ADOPTION=1&#10;ACP_LOG_FILE=/path/to/bili.log&#10;ACP_COMPRESS_TOOL=0&#10;ACP_COMPRESS_NUDGE=0" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono env-pre"><code>ACP_PORT=8787                    # listen port
+ACP_HOST=127.0.0.1               # bind address
+ACP_UPSTREAM=https://api.anthropic.com # fallback upstream base URL
+ACP_PASSTHROUGH=1                # force passthrough on (wins over file)
+ACP_PROVIDERS=/path/to/routes.json # external routes file (beats inline)
+BILI_CONFIG_FILE=~/.config/...   # override the config file path
+BILI_SESSIONS_DIR=~/.local/share/... # where session records are stored
+BILI_UPSTREAM_PROXY=http://host:port   # outbound egress proxy
+ACP_MODEL_CONTEXT_LIMIT=200000   # global context window override
+BILI_MITM_DOMAINS=api.foo.com    # add MITM whitelist domains
+BILI_REPLAY_RETRY_MAX=3          # transport-failure replays
+BILI_SESSION_GC=1                # enable session garbage collection
+BILI_IMAGE_TOKEN_CAP=8192        # per-image token budget
+BILI_SUBAGENT_SPLIT=0            # disable subagent session split
+BILI_FORK_ADOPTION=1             # adopt anonymous forks into parent session
+ACP_LOG_FILE=/path/to/bili.log   # explicit log path
+ACP_COMPRESS_TOOL=0              # disable the injected compress tool
+ACP_COMPRESS_NUDGE=0             # disable growth nudges</code></pre>
+        </div>
+
+        <h2 id="how" data-i18n="d.toc_how">How compression works</h2>
+        <p data-i18n="d.how.p">The same four mechanisms as the front page, condensed:</p>
+        <ul class="how-list">
+          <li><strong data-i18n="m1.t">Folded, not rewritten</strong> <span data-i18n-html="m1.b">When history outgrows its budget, only the newly consumed slice is folded into a compact summary block — once, per block. The window oscillates in a bounded band instead of growing without limit: production sessions run months at ten-thousand-plus calls. Any block decompresses back to full text when you need the detail.</span></li>
+          <li><strong data-i18n="m2.t">The provider's cache stays warm</strong> <span data-i18n-html="m2.b">A fold deactivates old ranges without touching the front of the conversation, so the prompt-cache prefix survives turn after turn — 94.2% of active input was served from cache in the study. Rewrite-style compaction invalidates the whole prefix and re-bills it. This does not.</span></li>
+          <li><strong data-i18n="m3.t">The model decides what to forget</strong> <span data-i18n-html="m3.b">A versioned compression doctrine lives in the system prompt; a growth-gated nudge says when folding pays off. The agent judges what the task still needs, may refuse, and compresses between steps — never mid-step.</span></li>
+          <li><strong data-i18n="m4.t">Every token is accounted</strong> <span data-i18n-html="m4.b">Each request is sampled into a per-session ledger — new content, cache reads, compression repay, TTL expiry — plotted in percentage points on a trajectory chart. Audit real savings with <code>/acp</code> in the terminal or the built-in web UI at <code>/__bili/</code>.</span></li>
+        </ul>
+        <p class="how-paper" data-i18n-html="d.how.paper">The full treatment, with numbers: <a href="https://github.com/ranxianglei/billion-context/blob/master/paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md" target="_blank" rel="noopener">read the preprint</a>.</p>
+
+        <h2 id="privacy" data-i18n="d.toc_privacy">Privacy</h2>
+        <p data-i18n="d.pr.p1">billion-context runs only on your machine and binds loopback by default. It forwards model traffic — OAuth tokens pass through untouched, unauthenticated probes aside — and uploads nothing.</p>
+        <p data-i18n-html="d.pr.p2">Session records stay local (<code>~/.local/share/billion-context/sessions</code>); the log sits beside the state dir. Export any session with <code>bili export</code>, delete files whenever you like.</p>
+
+        <h2 id="faq" data-i18n="d.toc_faq">FAQ</h2>
+        <details class="faq-item"><summary data-i18n="fa.node.q">Which Node version?</summary><p data-i18n="fa.node.a">Node 22 or newer — required by the npm package.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.win.q">Does it work on Windows?</summary><p data-i18n="fa.win.a">Recommended: WSL2. Inside WSL everything uses 127.0.0.1 as usual; a Windows-side client should reach the proxy via the WSL host IP, or simply run the client inside WSL too.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.cost.q">Do I pay for the proxy itself?</summary><p data-i18n="fa.cost.a">No — it's free and open source (MIT plus an attribution clause). Token savings come from smaller contexts and your provider's prompt caching; the economics panel shows the real per-session numbers.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.up.q">How do I upgrade?</summary><p data-i18n-html="fa.up.a">Run <code>bili update</code> (or reinstall via npm). Use <code>bili doctor</code> before and after to audit every install lane.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.panel.q">I can't reach the dashboard?</summary><p data-i18n-html="fa.panel.a">Check the daemon is running (<code>bili doctor</code>) and the port isn't changed (default 8787 for the standalone daemon; launcher lanes start at 18787). The dashboard binds <code>127.0.0.1</code> only — from another machine or phone you need an SSH port-forward or an explicit ACP_HOST setting.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.cache.q">How do I check my cache hit rate?</summary><p data-i18n-html="fa.cache.a">Don't dig through logs — type <code>/acp-cache</code> in your client: a summary report prints in the terminal headed by a clickable Web UI link (the session page adds the hit-rate chart plus per-break attribution). Rule of thumb: a healthy session sits at <strong>95–97%</strong>; compression itself costs ≤2%. When lower, the usual suspects in order: ① upstream cache-TTL expiry, ② a mid-session model switch (re-bills the whole stable prefix), ③ a bili bug — report it with the page attached. <code>/acp-cache full</code> lists every fold &amp; line item; HTTP equivalent: <code>GET /__bili/cache-report</code>.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.acp.q">What does /acp show?</summary><p data-i18n-html="fa.acp.a">In clients with the native plugin (opencode, dsh), <code>/acp</code> renders the ACP status panel of the current conversation straight from the proxy — session, blocks, compressible ranges, usage; before the first model request it shows an idle notice. <code>/acp-cache [full]</code> prints the cache report above.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.webq.q">Can I query sessions and config over the web?</summary><p data-i18n-html="fa.webq.a">Yes — open <a href="http://localhost:8787">http://localhost:8787</a>: overview dashboard, session list with per-session detail, live logs, a config editor, and an upstream connectivity test. Everything is also plain JSON for scripting (<code>/__bili/stats</code>, <code>/__bili/sessions</code>, <code>/__bili/config</code>, …).</p></details>
+        <details class="faq-item"><summary data-i18n="fa.when.q">When does compression happen?</summary><p data-i18n-html="fa.when.a">It is model-driven: the injected context tools are called by the model as context grows, growth nudges (~50K-token steps by design, adjustable via <code>compress.nudgeGrowthTokens</code>) prompt it along the way, and preflight fires as a hard backstop when the input alone exceeds the window. Watch it live with <code>/acp</code> or the web UI.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.fc.q">Why does the first compaction wait until ~200k?</summary><p data-i18n-html="fa.fc.a">Compaction triggers on growth intervals, not absolute window position: by default the first soft compaction fires 50k tokens past the boot content (<code>compress.nudgeGrowthTokens</code>, flat and window-independent) — with a ~100k boot it may wait until ~200k. To make it fire earlier: trim the system prompt / disable unneeded tools / prune skills, lower <code>compress.nudgeGrowthTokens</code> to ~50k, or enable lean mode.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.transp.q">Is bili transparent? How do I turn it off?</summary><p data-i18n-html="fa.transp.a">Unrecognized endpoints forward unchanged, and every mode reverses cleanly: <code>bili plugin remove &lt;client&gt;</code> for native installs; stop using the launcher command / env vars / <code>/bili/</code> prefix for the other two — traffic goes direct again immediately. Per-client mechanics: <a href="https://github.com/ranxianglei/billion-context/blob/master/CLIENTS.md">CLIENTS.md</a>.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.paths.q">Where are logs and session data stored?</summary><p data-i18n-html="fa.paths.a">Log: <code>~/.local/state/billion-context/bili.log</code> (also mirrored to stderr); session state: <code>~/.local/share/billion-context/</code> (XDG-overridable). Full paths: <a href="https://github.com/ranxianglei/billion-context/blob/master/CONFIGURATION.md">CONFIGURATION.md</a>.</p></details>
+
+        <h2 id="resources" data-i18n="d.toc_links">Resources</h2>
+        <ul class="res-list">
+          <li><a href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">billion-context — GitHub</a></li>
+          <li><a href="https://github.com/ranxianglei/acp-kernel" target="_blank" rel="noopener">acp-kernel — the compression kernel</a></li>
+          <li><a href="https://www.npmjs.com/package/billion-context" target="_blank" rel="noopener">npm package</a></li>
+          <li><a href="https://github.com/ranxianglei/billion-context/blob/master/paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md" target="_blank" rel="noopener">Paper / preprint</a></li>
+          <li>QQ: 1056132097 / 1108730198</li>
+        </ul>
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <div class="container foot-inner">
+      <div class="foot-brand"><span class="brand-mark" aria-hidden="true">&#8734;</span> billion-context</div>
+      <p class="foot-note" data-i18n="foot.note">MIT-licensed plus one attribution term: products built on it say so publicly. Built with open source; runs entirely on your machine.</p>
+      <nav class="foot-links" aria-label="Footer">
+        <a href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">billion-context</a>
+        <a href="https://github.com/ranxianglei/acp-kernel" target="_blank" rel="noopener">acp-kernel</a>
+        <a href="https://www.npmjs.com/package/billion-context" target="_blank" rel="noopener">npm</a>
+        <span class="foot-q">QQ: 1056132097 / 1108730198</span>
+      </nav>
+      <p class="copyline">&#169; 2026 ranxianglei</p>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

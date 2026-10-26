@@ -13,11 +13,12 @@ import {
     applyKimiManagedConfig,
     unrouteKimiConfig,
     resolveKimiRoute,
+    scanKimiModelWindows,
     stampKimiPluginHeader,
     type KimiRouteState,
 } from "./toml-edit.js";
 
-export type KimiNativePlan =
+type KimiNativePlan =
     | { readonly mode: "off" }
     | { readonly mode: "attach"; readonly attachOrigin: string }
     | { readonly mode: "spawn" };
@@ -109,7 +110,7 @@ export interface KimiRouteApplied {
     readonly authSource: string;
 }
 
-export interface RouteKimiOptions {
+interface RouteKimiOptions {
     readonly origin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly kimiHome?: string;
@@ -146,6 +147,7 @@ export async function routeKimiConfig(opts: RouteKimiOptions): Promise<KimiRoute
         contextWindow: res.contextWindow,
         maxOutput: res.maxOutput,
         authLines: res.authLines,
+        extraLines: res.extraLines,
     };
     const authSource = res.authSource;
     const bakPath = path.join(home, "config.toml.bili-bak");
@@ -221,7 +223,7 @@ export function unrouteKimi(opts: { env?: NodeJS.ProcessEnv; kimiHome?: string; 
     }
 }
 
-export interface RestoreKimiBackupResult {
+interface RestoreKimiBackupResult {
     readonly restored: boolean;
 }
 
@@ -256,7 +258,7 @@ export type BootstrapMode =
         readonly routed: KimiRouteApplied | undefined;
     };
 
-export interface BootstrapKimiOptions {
+interface BootstrapKimiOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly kimiHome?: string;
     readonly log?: (msg: string) => void;
@@ -292,12 +294,30 @@ export async function bootstrapKimiNative(opts: BootstrapKimiOptions = {}): Prom
     return { mode: "active", attached, routed };
 }
 
+/** #2954/#3436: every model window the client's own config.toml declares, or
+ *  undefined when none (no file / no windows / unreadable). Both kimi proxy
+ *  paths (plugin bootstrap AND the MCP watchdog respawn, native-mcp.ts) must
+ *  present this SAME map — different sources make their proxies mutually
+ *  unattachable on the model-windows cell and stack instances (#3557). */
+export function kimiConfigModelWindows(env: NodeJS.ProcessEnv = process.env): Record<string, number> | undefined {
+    try {
+        const scanned = scanKimiModelWindows(fs.readFileSync(path.join(resolveKimiHome(env), "config.toml"), "utf8"));
+        if (Object.keys(scanned).length > 0) return scanned;
+    } catch {}
+    return undefined;
+}
+
 async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean }> {
     // The spawned proxy's parent-gone watchdog (#server.ts BILI_PARENT_PID)
     // keys off OUR pid: kimi kills this MCP child when its session ends, so
     // the per-session proxy tears itself down with it.
+    // #2954: hand the proxy EVERY model window the client's own config declares
+    // (not just the active model's one-shot runtime-info report) so per-request
+    // window resolution knows the real window of any other model that flows
+    // through — mid-session switches used to resolve against a stale guess.
+    const modelWindows = kimiConfigModelWindows();
     const handle = await ensureProxyRunning(
-        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi" },
+        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
         { scriptPath: nativeProxyScriptPath() },
     );
     return { origin: handle.origin, attached: !!handle.attached };

@@ -9,9 +9,10 @@ function makeSession(): Session {
     return {
         id: `ct-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
+        pendingRetrievals: [],
         createdAt: Date.now(),
         lastSeen: Date.now(),
         blockContents: new Map(),
@@ -58,7 +59,7 @@ test("prepareCountTokens prunes covered messages when a compression block is act
     const log = (_level: string, msg: string) => logs.push(msg);
     const inputCount = body.messages.length;
     const prepared = prepareCountTokens(body, core, config, log, session);
-    const out = JSON.parse(prepared.body);
+    const out = JSON.parse(prepared.body.toString());
     assert.ok(out.messages.length < inputCount, `pruned output (${out.messages.length}) must be < input (${inputCount})`);
     // The block was created without a compress tool-call (no tool_use in the
     // payload), so the in-place anchor is the sole summary carrier and must
@@ -108,7 +109,7 @@ test("prepareCountTokens strips the redundant in-place anchor when the compress 
     assert.equal(res.result.blocksCreated, 1, "compression block should be created");
 
     const prepared = prepareCountTokens(body, core, config, () => {}, session);
-    const out = JSON.parse(prepared.body);
+    const out = JSON.parse(prepared.body.toString());
     const hasAnchor = out.messages.some((m: { content: unknown }) => {
         const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
         return /\[Compressed conversation section\]/.test(text);
@@ -147,7 +148,7 @@ test("prepareCountTokens leaves messages unchanged when no compression blocks ex
     }
     const inputCount = body.messages.length;
     const prepared = prepareCountTokens(body, core, config, () => {}, session);
-    const out = JSON.parse(prepared.body);
+    const out = JSON.parse(prepared.body.toString());
     assert.equal(out.messages.length, inputCount, "no compression → no pruning");
     assert.equal(session.state.blocks.length, 0, "no blocks created");
 });

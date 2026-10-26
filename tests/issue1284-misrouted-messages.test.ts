@@ -47,6 +47,8 @@ async function startProxy(upstream: http.Server): Promise<Harness> {
     process.env.BILI_CONFIG_FILE = biliConfig;
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         port: 0,
         host: "127.0.0.1",
         upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -65,6 +67,11 @@ async function startProxy(upstream: http.Server): Promise<Harness> {
         passthrough: false,
         passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

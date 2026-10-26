@@ -8,7 +8,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import {
     _setForTest as setRegistryForTest,
@@ -73,7 +74,7 @@ async function startRig(inputTokens = 500, log = false): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     const proxy = await startServer({
@@ -90,20 +91,29 @@ async function startRig(inputTokens = 500, log = false): Promise<Rig> {
         logFile: log ? path.join(os.tmpdir(), "issue-393-test.log") : undefined,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     return { proxyPort, upstreamPort, proxy, upstream };
 }
 
 function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     return once(rig.proxy, "close").then(() => {
         rig.upstream.close();
+        rig.upstream.closeIdleConnections?.();
         return once(rig.upstream, "close");
-    });
+    }) as Promise<void>;
 }
 
 function body(model: string): string {

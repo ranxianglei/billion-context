@@ -21,14 +21,14 @@ import { rmrf } from "./tmp-rm.ts";
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
 
-import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { defaultConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
+import { startServer } from "../src/server.ts";
+import { findCcrPluginDivergences, loadOptions, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions } from "../src/session.ts";
+import { _resetSessionsForTest, listSessions } from "../src/session.ts";
 import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
-import { findCcrPluginDivergences, loadOptions } from "../src/config.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const MODEL = "test-model";
@@ -59,7 +59,7 @@ test("handlePluginManifest: acp_retrieve NOT advertised by default (CCR off)", (
 });
 
 test("handlePluginManifest: acp_retrieve advertised on anthropic+openai only when CCR enabled", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
     assert.ok(m.toolNames.includes("acp_retrieve"), "enabled CCR advertises acp_retrieve");
     assert.ok(namesOnWire(m.tools.anthropic).includes("acp_retrieve"), "anthropic wire carries acp_retrieve");
     assert.ok(namesOnWire(m.tools.openai).includes("acp_retrieve"), "openai wire carries acp_retrieve");
@@ -69,7 +69,7 @@ test("handlePluginManifest: acp_retrieve advertised on anthropic+openai only whe
 });
 
 test("handlePluginManifest: custom ccr.toolName is honored", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true, toolName: "fetch_full" } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true, toolName: "fetch_full" } });
     assert.ok(m.toolNames.includes("fetch_full"), "custom retrieve tool name advertised");
     assert.ok(namesOnWire(m.tools.anthropic).includes("fetch_full"));
 });
@@ -128,7 +128,7 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -160,10 +160,17 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxyPort: proxy.address().port as number, upstreamPort, forwards, proxy, upstream };
+    return { proxyPort: (proxy.address() as { port: number }).port, upstreamPort, forwards, proxy, upstream };
 }
 
 // The SessionStore is file-global (closeRig only closes sockets), so every
@@ -201,12 +208,90 @@ const BASE_MSGS = (): unknown[] => [
     { role: "tool", tool_call_id: "call_1", content: BIG_TEXT },
 ];
 
+test("native retrieval bridge preserves proxy compression ownership", async () => {
+    const rig = await startRig();
+    const conversationId = "ccr-native-retrieval-bridge";
+    const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+    const send = async (messages: unknown[]): Promise<void> => {
+        const response = await fetch(url, {
+            method: "POST",
+            // Isolate retrieval ownership from the separate native identity fix (#2779).
+            headers: { "content-type": "application/json", "x-session-id": conversationId },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages }),
+        });
+        assert.equal(response.status, 200, await response.text());
+    };
+    try {
+        await send(BASE_MSGS());
+        const session = listSessions().find((s) => s.metadata.pluginAgent === undefined && ccrEnabled(s));
+        assert.ok(session, "proxy session was armed without claiming plugin ownership");
+        const ref = Object.keys(contentStoreOf(session).byRef)[0];
+        assert.ok(ref, "original tool output has a stored ref");
+        const response = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId, nativeCaller: true, tool: "acp_retrieve", args: { ref } }),
+        });
+        const result = await response.json() as { ok: boolean; result?: string };
+        assert.equal(response.status, 200);
+        assert.equal(result.ok, true);
+        assert.match(result.result ?? "", /acp-retrieved/);
+        assert.ok(result.result?.includes(BIG_TEXT.slice(0, 120)), "retrieval returns the original");
+        assert.equal(session.metadata.pluginAgent, undefined, "read-only retrieval does not prove ownership of compression tools");
+        await send([...BASE_MSGS(), { role: "user", content: "Continue the build." }]);
+        const next = JSON.parse(rig.forwards.at(-1)!) as { tools?: Array<{ function?: { name?: string } }> };
+        assert.ok(next.tools?.some((t) => t.function?.name === "compress"), "proxy must keep injecting compression tools");
+    } finally {
+        await closeRig(rig);
+        _resetSessionsForTest();
+    }
+});
+
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
+
+test("native retrieval exports preserve each session's original when refs collide", async () => {
+    const rig = await startRig();
+    const originals = ["Alpha original\r\n".repeat(1800), "Beta original\r\n".repeat(1800)];
+    const identities = ["ses_ExportAlpha", "ses_ExportBeta"];
+    try {
+        for (let i = 0; i < identities.length; i++) {
+            const messages = BASE_MSGS();
+            messages[2] = { role: "tool", tool_call_id: "call_1", content: originals[i] };
+            const response = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+                method: "POST", headers: { "content-type": "application/json", "x-session-id": identities[i] },
+                body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages }),
+            });
+            assert.equal(response.status, 200, await response.text());
+        }
+        const refs = rig.forwards.map(body => /\[acp-stored #(m\d+)/.exec(body)?.[1]);
+        assert.ok(refs[0]);
+        assert.equal(refs[0], refs[1], "independent sessions can reuse the same message ref");
+        const results = await Promise.all(identities.map(async (conversationId, i) => {
+            const response = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId, nativeCaller: true, tool: "acp_retrieve", args: { ref: refs[i] } }),
+            });
+            assert.equal(response.status, 200);
+            return await response.json() as { ok: boolean; retrievalExport?: { path: string; text: string }; result: string };
+        }));
+        for (let i = 0; i < results.length; i++) {
+            assert.equal(results[i].ok, true);
+            assert.equal(results[i].retrievalExport?.text, originals[i], "export snapshot retains exact CRLF bytes from its own session");
+            assert.ok(results[i].result.includes(results[i].retrievalExport?.path ?? "MISSING"));
+        }
+        assert.ok(listSessions().filter(ccrEnabled).every(session => session.metadata.pluginAgent === undefined));
+    } finally {
+        await closeRig(rig);
+        _resetSessionsForTest();
+    }
+});
 
 test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides full text back", async () => {
     const rig = await startRig();

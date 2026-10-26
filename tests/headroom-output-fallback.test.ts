@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import type { ProxyOptions } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -82,7 +82,7 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest(s.registry ?? {});
@@ -99,12 +99,19 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         chainContentDetection: false,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
@@ -129,8 +136,10 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         return (received[1] as unknown[]).length;
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

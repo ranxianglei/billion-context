@@ -38,6 +38,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -148,6 +149,7 @@ async function drive(sessionId: string): Promise<string[]> {
             passthrough: false,
             autoUpdate: false,
             mitm: { enabled: false, domains: [] },
+            compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         };
         proxy = await startServer(options);
         await listen(proxy);
@@ -177,9 +179,10 @@ async function drive(sessionId: string): Promise<string[]> {
             input.push({ type: "function_call", id: `fc_t${t}`, call_id: `call_t${t}`, name: "shell", arguments: JSON.stringify({ command: `ls -la mod-${t}` }), status: "completed" });
             input.push({ type: "function_call_output", id: `fco_t${t}`, call_id: `call_t${t}`, output: `total 8\ndrwxr-xr-x mod-${t}\n${FILLER(t, 2)}` });
         }
-        if (process.env.RESPONSES_SEAM_DUMP) {
-            fs.mkdirSync(process.env.RESPONSES_SEAM_DUMP, { recursive: true });
-            captured.forEach((b, i) => fs.writeFileSync(path.join(process.env.RESPONSES_SEAM_DUMP, `${String(i).padStart(3, "0")}.json`), b));
+        const dumpDir = process.env.RESPONSES_SEAM_DUMP;
+        if (dumpDir) {
+            fs.mkdirSync(dumpDir, { recursive: true });
+            captured.forEach((b, i) => fs.writeFileSync(path.join(dumpDir, `${String(i).padStart(3, "0")}.json`), b));
         }
         return captured;
     } finally {
@@ -187,7 +190,7 @@ async function drive(sessionId: string): Promise<string[]> {
         await closeServer(upstream);
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(tmp, { recursive: true, force: true });
+        rmrf(tmp);
     }
 }
 

@@ -3,7 +3,7 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -12,7 +12,7 @@
               "description": "Optional short title for the compressed range"
             },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
               "anyOf": [
                 {
                   "type": "array",
@@ -20,7 +20,7 @@
                     "anyOf": [
                       {
                         "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                       },
                       {
                         "type": "object",
@@ -95,33 +95,13 @@
                   "type": "string"
                 }
               ]
-            },
-            "startId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }
       },
       {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -144,6 +124,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -202,7 +186,7 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -211,7 +195,7 @@
                 "description": "Optional short title for the compressed range"
               },
               "content": {
-                "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
                 "anyOf": [
                   {
                     "type": "array",
@@ -219,7 +203,7 @@
                       "anyOf": [
                         {
                           "type": "string",
-                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                         },
                         {
                           "type": "object",
@@ -294,26 +278,6 @@
                     "type": "string"
                   }
                 ]
-              },
-              "startId": {
-                "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-              },
-              "endId": {
-                "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-              },
-              "startRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of startId"
-              },
-              "endRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of endId"
-              },
-              "summary": {
-                "type": "string",
-                "description": "Flat single-range form (no content): self-contained summary replacing the range"
               }
             }
           }
@@ -323,7 +287,7 @@
         "type": "function",
         "function": {
           "name": "decompress",
-          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -346,6 +310,10 @@
               "endId": {
                 "type": "string",
                 "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+              },
+              "imageRef": {
+                "type": "string",
+                "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
               }
             },
             "required": [
@@ -413,7 +381,7 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -422,7 +390,7 @@
               "description": "Optional short title for the compressed range"
             },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. Array form: one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. Single-string form (PREFERRED for multi-range batches — plain text survives lossy gateways best): ONE plain string holding ALL ranges, each block starting with its 'm00150–m00220 optional topic' header line followed by that block's summary. A JSON-encoded array of ranges as that string is also accepted (some gateways stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
               "anyOf": [
                 {
                   "type": "array",
@@ -430,7 +398,7 @@
                     "anyOf": [
                       {
                         "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
+                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
                       },
                       {
                         "type": "object",
@@ -505,26 +473,6 @@
                   "type": "string"
                 }
               ]
-            },
-            "startId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }
@@ -532,7 +480,7 @@
       {
         "type": "function",
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -555,6 +503,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -614,7 +566,7 @@
     "google": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form — one string may hold ALL ranges, each block starting with its refs header line — or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -659,7 +611,7 @@
       },
       {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -682,6 +634,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -722,7 +678,7 @@
       {
         "type": "function",
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -745,6 +701,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -889,7 +849,7 @@
     },
     "decompressAnthropic": {
       "name": "decompress",
-      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -912,6 +872,10 @@
           "endId": {
             "type": "string",
             "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+          },
+          "imageRef": {
+            "type": "string",
+            "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
           }
         },
         "required": [
@@ -923,7 +887,7 @@
       "type": "function",
       "function": {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -946,6 +910,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -957,7 +925,7 @@
     "decompressResponses": {
       "type": "function",
       "name": "decompress",
-      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -980,6 +948,10 @@
           "endId": {
             "type": "string",
             "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+          },
+          "imageRef": {
+            "type": "string",
+            "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
           }
         },
         "required": [
@@ -989,7 +961,7 @@
     },
     "decompressGoogle": {
       "name": "decompress",
-      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1012,6 +984,10 @@
           "endId": {
             "type": "string",
             "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+          },
+          "imageRef": {
+            "type": "string",
+            "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
           }
         },
         "required": [
@@ -1199,22 +1175,6 @@
             "ref"
           ]
         }
-      }
-    },
-    "imageFullGoogle": {
-      "name": "image_full",
-      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-          }
-        },
-        "required": [
-          "ref"
-        ]
       }
     }
   }

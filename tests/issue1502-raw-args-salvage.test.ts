@@ -60,7 +60,7 @@ function makeCtx(): Ctx {
     const session: Session = {
         id: "issue1502-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -68,6 +68,7 @@ function makeCtx(): Ctx {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
     session.state.messageRefs = refMap;
     return {
@@ -86,7 +87,7 @@ test("#1502: salvageable args that strict JSON.parse rejects compress via rawArg
     const raw = `{"content": [{"startId": "m00001", "endId": "m00002", "summary": "${LONG_SUMMARY}"}],}`;
     assert.throws(() => JSON.parse(raw), "premise: strict JSON.parse really fails");
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c1", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c1", raw).text;
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
     assert.equal(ctx.session.state.blocks.length, 1, "block created");
 });
@@ -99,7 +100,7 @@ test("#1502: lenient ladder variants all salvage via rawArguments (fenced / sing
     ];
     for (const [label, raw] of variants) {
         const ctx = makeCtx();
-        const out = executeProxyTool("compress", {}, ctx, `c_${label}`, raw);
+        const out = executeProxyTool("compress", {}, ctx, `c_${label}`, raw).text;
         assert.ok(out.startsWith("[Compressed"), `${label}: expected success, got: ${out}`);
         assert.equal(ctx.session.state.blocks.length, 1, `${label}: block created`);
     }
@@ -107,7 +108,7 @@ test("#1502: lenient ladder variants all salvage via rawArguments (fenced / sing
 
 test("#1502: without rawArguments the degraded {} still gets the #1384 empty-call receipt (unchanged)", () => {
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_empty");
+    const out = executeProxyTool("compress", {}, ctx, "c_empty").text;
     assert.ok(out.includes("carried no content at all"), out);
     assert.ok(out.includes("Do NOT re-issue an empty call"), out);
 });
@@ -115,7 +116,7 @@ test("#1502: without rawArguments the degraded {} still gets the #1384 empty-cal
 test("#1502: unparseable garbage gets the corruption receipt, not the empty-call verdict (unbalanced → truncated)", () => {
     const raw = '{"content": [{"startId": "m00001"';
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_garbage", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c_garbage", raw).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes(`(${raw.length} chars)`), "safe len label present: " + out);
     assert.ok(out.includes("were not parseable JSON"), out);
@@ -129,7 +130,7 @@ test("#1502: unparseable garbage gets the corruption receipt, not the empty-call
 test("#1502: balanced garbage → malformed-json label without the truncation note", () => {
     const raw = "{this is not json at all}";
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_garbage2", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c_garbage2", raw).text;
     assert.ok(out.includes("were not parseable JSON"), out);
     assert.ok(!out.includes("(looks truncated)"), out);
     const keys = ctx.session.metadata["compressFailKeys"] as unknown[];
@@ -205,7 +206,10 @@ test("#1502 loop: garbage args log head+tail and yield the corruption marker, no
         assert.doesNotMatch(output, /executing with \{\}/, "old degradation wording gone");
         assert.match(output, /were not parseable JSON/, "corruption marker streamed to client");
         assert.doesNotMatch(output, /carried no content at all/, "not mislabeled as empty");
-        assert.equal(refetches, 1, "re-request proceeds after failed compress too");
+        // #4186: a failed-only round ends the turn — the corruption receipt is
+        // surfaced to the client above and NO re-request carries the ephemeral
+        // failure frame upstream (old contract asserted refetches === 1).
+        assert.equal(refetches, 0, "failed-only compress round ends the turn without a re-request");
     } finally {
         globalThis.fetch = originalFetch;
     }

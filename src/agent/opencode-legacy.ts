@@ -46,7 +46,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-export interface LegacyAcpToolDef {
+interface LegacyAcpToolDef {
     description?: unknown;
     args?: unknown;
     execute?: (args: Record<string, unknown>, ctx: { sessionID: string; messageID?: string }) => Promise<unknown>;
@@ -74,7 +74,7 @@ export interface LegacyAcpModule {
  *  `~/.cache/opencode/packages/opencode-acp@<ver>/node_modules`; every
  *  version present is offered, newest first), global user npm root, and
  *  opencode's config-scope node_modules. */
-export function legacyAcpCandidates(cwd: string | undefined): string[] {
+function legacyAcpCandidates(cwd: string | undefined): string[] {
     const dirs: string[] = [];
     if (cwd !== undefined && cwd.length > 0) {
         dirs.push(path.join(cwd, ".opencode", "node_modules"));

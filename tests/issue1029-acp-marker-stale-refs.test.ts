@@ -30,7 +30,7 @@ function makeSession(): Session {
     return {
         id: `issue1029-${randomUUID()}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -38,6 +38,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -56,7 +57,7 @@ test("#1029-②: no-valid-ranges failure is self-contained on line 1 (no danglin
     const out = applyRanges(
         parseCompressInput({ content: [{ summary: "no bounds" }, { startId: "m00001", endId: "m00002" }] }),
         ctx,
-    );
+    ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.equal(out.split("\n").length, 1, `failure must be single-line, got: ${JSON.stringify(out)}`);
     assert.match(out, /Rejected entries: entry 0: missing range bounds/, "reason 0 inlined");
@@ -67,7 +68,7 @@ test("#1029-②: no-valid-ranges failure is self-contained on line 1 (no danglin
 
 test("#1029-②: repeated identical malformed calls escalate via the repeat-failure guard", () => {
     const ctx = makeCtx([textMsg("raw_1", "assistant", "a".repeat(800))]);
-    const bad = () => applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002" }] }), ctx);
+    const bad = () => applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002" }] }), ctx).text;
     const first = bad();
     assert.ok(first.startsWith("[Compression FAILED"), first);
     assert.ok(!first.includes("Repeat-failure guard"), "first attempt has no escalation");
@@ -89,7 +90,7 @@ test("#1029-③: zero-block rejection inlines the current ref span (stale refs f
     const out = applyRanges(
         parseCompressInput({ content: [{ startId: "m00100", endId: "m00110", summary: SUMMARY }] }),
         ctx,
-    );
+    ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.match(out, /\[Current context: 3 visible message\(s\), refs m00001–m00003, \d+ active block\(s\)\./, "current span inlined");
     assert.match(out, /refs inside this span|acp_status/i, "points at actionable refs or acp_status");

@@ -1,0 +1,72 @@
+{
+  "name": "acp-kernel",
+  "version": "0.0.163",
+  "description": "Framework-agnostic context-compression engine (model-driven, 3-tier LSM). Pure core: no host dependency.",
+  "license": "MIT",
+  "author": "ranxianglei",
+  "type": "module",
+  "homepage": "https://github.com/ranxianglei/billion-context/tree/master/kernel#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ranxianglei/billion-context.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ranxianglei/billion-context/issues"
+  },
+  "keywords": [
+    "acp",
+    "context",
+    "compression",
+    "context-management",
+    "llm",
+    "context-window",
+    "summarization"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./wire": {
+      "types": "./dist/wire/index.d.ts",
+      "import": "./dist/wire/index.js"
+    },
+    "./panel": {
+      "types": "./dist/panel/index.d.ts",
+      "import": "./dist/panel/index.js"
+    },
+    "./persist": {
+      "types": "./dist/persist/index.d.ts",
+      "import": "./dist/persist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "DESIGN.md",
+    "PROVENANCE.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsup && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "format": "node scripts/format-until-stable.mjs",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.3.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

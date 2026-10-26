@@ -19,7 +19,7 @@
 
 const ACP_TAG_RE = /\x3cacp\s+tokens=\\"?[0-9]+(?:\.[0-9]+)?K?\\"?\s+type=\\"?[^\\"]*\\"?\s*\x3em[0-9]{1,8}\x3c\/acp\x3e/;
 
-export type AcpArtifactKind = "tags" | "tool-history";
+type AcpArtifactKind = "tags" | "tool-history";
 
 /** Allocation-free byte pre-filter: true when either artifact family could
  *  be present. A miss is definitive (both seeds are literal substrings of

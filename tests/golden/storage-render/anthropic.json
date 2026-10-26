@@ -1,0 +1,146 @@
+{
+ "wire": "anthropic",
+ "turns": [
+  {
+   "i": 0,
+   "sha": "daf2182687948ef53790608f8fe13f21f457552bd56c61e914699d71793a95d0",
+   "bytes": 22287,
+   "shaCiteNorm": "37a0f1ef30156301cae88e2dece8a03f8ba557440925d3f8fd4b6f654e9880aa"
+  },
+  {
+   "i": 1,
+   "sha": "2894d8949694f953aef9b0a7d4c4ad03b3633b8cd90886852109468d10e72b45",
+   "bytes": 30997,
+   "shaCiteNorm": "ae251c0c242448c1d87f417194f38d42c901e563ca0234a616e22254d8d29352"
+  },
+  {
+   "i": 2,
+   "sha": "911f0c635e145362329fef63920e7b4802f2f9c9528062173e867ad891832873",
+   "bytes": 36896,
+   "shaCiteNorm": "efbc1fcc13a7968e0dd8120bc1dc0e04b24d0aac997700fe52dd414e0270c351"
+  },
+  {
+   "i": 3,
+   "sha": "425dee6b9938613b65f9c944aea28228eda5679915fd39597196876dda2915f6",
+   "bytes": 45569,
+   "shaCiteNorm": "0d5a15e5216f11dd47816ff0bc336532ffdaec00fecad51ff2c9995a4bb00254"
+  },
+  {
+   "i": 4,
+   "sha": "e62cbddd7d1facbcf2efe3c781c09b14b5cf096067b7d7ae4818ee7a4639e0b6",
+   "bytes": 51431,
+   "shaCiteNorm": "43615d160671fcbd9408a80e0779f6cf122fdbde81b901e35a277d8e6ee8495a"
+  },
+  {
+   "i": 5,
+   "sha": "03a6265741bdb3f74788ae479f5b1505e552e6082009dd3419605dff8143b5da",
+   "bytes": 60104,
+   "shaCiteNorm": "66411dc16ffa93bb1fbc28b167302372c7b170af10bfca6c95ef9466cf4b8628"
+  },
+  {
+   "i": 6,
+   "sha": "c7f62d7a595006a08aaa71427f0bcdb3b620c8eac104723bc6ace7516aa3321c",
+   "bytes": 65966,
+   "shaCiteNorm": "c9d9ff30521f6d1fa5e3e94f9ed778a1491224fc6440cd8bc3dde9e6bd7f77e6"
+  },
+  {
+   "i": 7,
+   "sha": "edb9fadc1d20813a24f45ea2d1e2ab0d92972d1cee22d45ac278d9dd1c17bd4c",
+   "bytes": 74639,
+   "shaCiteNorm": "4e4c14113531fb4152983af6c3596dd3944f30ca0ab4e720e92a31bd7a253a9d"
+  },
+  {
+   "i": 8,
+   "sha": "d2be70c3953a492bf1b974ff4922001d74d0d61012446c59e732fec18852d713",
+   "bytes": 80501,
+   "shaCiteNorm": "ca749fa6f80100f404d828594314c8823dc2900aedb089264a057e72f54536fa"
+  },
+  {
+   "i": 9,
+   "sha": "2ddad1b2186f7f0444543f1b72b2f4fe3dcfe6d8cf709211a54e820b7c3a6a4a",
+   "bytes": 49528,
+   "shaCiteNorm": "8008f1d0bbe5e604ca7b1201e6d60e04ab7a10c117373eda0412308319f5c6b2"
+  },
+  {
+   "i": 10,
+   "sha": "7da7b1f5aed39a2af9df234e8ad97fff4fe1cf49623a3adc4a3c45cd22989be0",
+   "bytes": 57070,
+   "shaCiteNorm": "09e0e277a54ce862f28c41a40d4b1261a8b8198240a10191986f07ddb1b9ad34"
+  },
+  {
+   "i": 11,
+   "sha": "fca40b7b4dae14bfa94542cb8d802ce7b097b7b2946f987437db98a1cbc0385c",
+   "bytes": 62892,
+   "shaCiteNorm": "58178314a73fd15478a8d1cef6e6f3f535e216ff3a27d5d5c0af85f3cc480fe5"
+  },
+  {
+   "i": 12,
+   "sha": "8b5ff77e47604fe58cbb19234306863e3ec754c1d51a7a354bab40ffb12ef59a",
+   "bytes": 77030,
+   "shaCiteNorm": "0afc5df7cd478a9a127da7cb011c61a20cbf35ebe31409daad93e0e9c2944f24"
+  },
+  {
+   "i": 13,
+   "sha": "375a80af22ca3da9763155fd5394cff9066e0695490105830137cdcd9432f7d1",
+   "bytes": 82815,
+   "shaCiteNorm": "c16a407ec4983f77cd62792e46a093c839853077d4b52cd799b81adb38a1ca20"
+  },
+  {
+   "i": 14,
+   "sha": "3f23c183e08dfe04772ea8cf1b5196f8ad92a57868896d55aafc7eb9300ed53a",
+   "bytes": 91464,
+   "shaCiteNorm": "415619a3a81f1aad4f2790ffc63eaeb3a0410e27027e77609a01f0fbd1471abe"
+  }
+ ],
+ "foldAt": 9,
+ "editedAt": 12,
+ "summaryFrom": 9,
+ "stateDigest": "0a241435d456ba994c92b0072d2173bf2a6d00ee73223458fb4302e170efb1e3",
+ "stateDigestAligned": "c7079cd68bf9eb0075c3844a5cb1ae54ff6ecad8a43da424a7ffebd033eceb7f",
+ "sectionDigests": {
+  "state": "f93dc1c876c672d4",
+  "blockContents": "dc7d13d250c94bb4",
+  "stats": "c6f1d434975d047d",
+  "metadata": "16cad648ccf41950"
+ },
+ "stateKeyDigests": {
+  "blocks": "3a454b9a16e4f0b9",
+  "messageRefs": "3d09c9004582bdbc",
+  "nudge": "ba03a8a4b58554a7",
+  "stats": "23312f7d5a0b9e27",
+  "nextBlockId": "d4735e3a265e16ee",
+  "nextRunId": "d4735e3a265e16ee",
+  "tokenSnapshot": "7c8dbc981fdfcbd6",
+  "lastPassIds": "f13452893a1b4980",
+  "hiddenOrphanRefs": "4f53cda18c2baa0c",
+  "deadRefs": "74234e98afe7498f",
+  "refLedgerAligned": "74234e98afe7498f",
+  "terminalStreak": "5feceb66ffc86f38",
+  "nextRuleId": "6b86b273ff34fce1",
+  "absorbed": "4f53cda18c2baa0c",
+  "rules": "4f53cda18c2baa0c",
+  "sweptOrphanCallIds": "74234e98afe7498f",
+  "pendingOrphanSweepMinRef": "74234e98afe7498f",
+  "emergencyTruncateLatch": "74234e98afe7498f",
+  "renderDeferredRefs": "74234e98afe7498f",
+  "viewLatches": "74234e98afe7498f",
+  "viewLatchConfigDigest": "74234e98afe7498f"
+ },
+ "stateShape": {
+  "refs": 49,
+  "blocks": 1,
+  "activeBlocks": 1,
+  "deadRefs": 0,
+  "blockContents": 1,
+  "coveredRefSample": [
+   "h_e40995eea3f07d55",
+   "h_5e8c02240a65740e",
+   "h_a9607fb18a2fa39d",
+   "h_7fab6026ce5a72e7",
+   "h_b5b946fa2455d77e",
+   "h_e40995eea3f07d55_1",
+   "h_ce9559b8e1773afc",
+   "h_e40995eea3f07d55_2"
+  ]
+ }
+}

@@ -209,7 +209,7 @@ test("refreshDshProfileBundles: registry-pinned profiles get the exact new versi
     });
     const calls: string[] = [];
     const logs: string[] = [];
-    const log = (level: string, msg: string): void => logs.push(`${level}: ${msg}`);
+    const log = (level: string, msg: string): void => { logs.push(`${level}: ${msg}`); };
     try {
         _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
         await refreshDshProfileBundles("0.1.121", log, { ...process.env, DSH_HOME: home });
@@ -265,7 +265,7 @@ test("runDshPlugin: failure message renders the executed argv, no duplicated 'pl
 
 test("refreshDshProfileBundles: no profiles root or no bili deps → silent no-op", async () => {
     const logs: string[] = [];
-    const log = (level: string, msg: string): void => logs.push(`${level}: ${msg}`);
+    const log = (level: string, msg: string): void => { logs.push(`${level}: ${msg}`); };
     await refreshDshProfileBundles("0.1.121", log, { ...process.env, DSH_HOME: "/nonexistent-dsh-home-xyz" });
     assert.equal(logs.length, 0);
 

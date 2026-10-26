@@ -31,9 +31,9 @@ test("parseOmpYaml: captures per-model contextWindow (models after baseUrl)", ()
         "        maxTokens: 32768",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.equal(cfg.providers["sglang-responses"]?.baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers?.["sglang-responses"]?.baseUrl, "http://127.0.0.1:8199/v1");
     // #971: maxTokens at model-entry depth now completes the entry as maxOutput.
-    assert.deepEqual(cfg.providers["sglang-responses"]?.models, [{ id: "qwen3.8-27b", contextWindow: 262144, maxOutput: 32768 }]);
+    assert.deepEqual(cfg.providers?.["sglang-responses"]?.models, [{ id: "qwen3.8-27b", contextWindow: 262144, maxOutput: 32768 }]);
 });
 
 test("parseOmpYaml: baseUrl AFTER models: is still captured", () => {
@@ -46,8 +46,8 @@ test("parseOmpYaml: baseUrl AFTER models: is still captured", () => {
         "    baseUrl: http://after.example/v1",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.equal(cfg.providers.prov?.baseUrl, "http://after.example/v1");
-    assert.deepEqual(cfg.providers.prov?.models, [{ id: "m1", contextWindow: 32768 }]);
+    assert.equal(cfg.providers?.prov?.baseUrl, "http://after.example/v1");
+    assert.deepEqual(cfg.providers?.prov?.models, [{ id: "m1", contextWindow: 32768 }]);
 });
 
 test("parseOmpYaml: multiple models + multiple providers", () => {
@@ -67,8 +67,8 @@ test("parseOmpYaml: multiple models + multiple providers", () => {
         "        contextWindow: 3000",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.deepEqual(cfg.providers.a?.models, [{ id: "m1", contextWindow: 1000 }, { id: "m2", contextWindow: 2000 }]);
-    assert.deepEqual(cfg.providers.b?.models, [{ id: "m1", contextWindow: 3000 }]);
+    assert.deepEqual(cfg.providers?.a?.models, [{ id: "m1", contextWindow: 1000 }, { id: "m2", contextWindow: 2000 }]);
+    assert.deepEqual(cfg.providers?.b?.models, [{ id: "m1", contextWindow: 3000 }]);
 });
 
 test("readPiConfig: captures models[].contextWindow from models.json", () => {
@@ -111,8 +111,8 @@ test("readOpencodeConfig: captures models.<id>.limit", () => {
         }),
     );
     const cfg = readOpencodeConfig(file);
-    assert.equal(cfg.providers.prov?.baseURL, "http://prov/v1");
-    assert.deepEqual(cfg.providers.prov?.models, [{ id: "glm-5.2", contextWindow: 1000000 }]);
+    assert.equal(cfg.providers?.prov?.baseURL, "http://prov/v1");
+    assert.deepEqual(cfg.providers?.prov?.models, [{ id: "glm-5.2", contextWindow: 1000000 }]);
 });
 
 test("parseCodexToml: model + model_context_window pair captured", () => {

@@ -9,6 +9,7 @@ import {
     bootstrapZcodeNative,
     handoffZcodeRoutingOnExit,
     planNativeZcode,
+    planZcodeRouting,
     probeProxyHealth,
     repairSharedStoreDrift,
     restoreZcodeBackup,
@@ -50,13 +51,25 @@ async function withHealthServer<T>(fn: (origin: string) => Promise<T>): Promise<
     }
 }
 
-async function deadOrigin(): Promise<string> {
-    const server = http.createServer();
+// #2548/#1689: a released port can be rebound by any parallel process before
+// the consumer acts, so a "dead" origin could answer healthy and flip the
+// expected refusal into an active attach. Keep a LIVE server bound for the whole
+// test that answers 500 — probeProxyHealth judges a 500 answer unhealthy — so the
+// expectation is constructed, not assumed: the race is closed, not narrowed.
+async function withUnhealthyOrigin<T>(fn: (origin: string) => Promise<T>): Promise<T> {
+    const server = http.createServer((_req, res) => {
+        res.writeHead(500);
+        res.end();
+    });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     const addr = server.address();
     if (addr === null || typeof addr === "string") throw new Error("no port");
-    await new Promise<void>((r) => server.close(() => r()));
-    return `http://127.0.0.1:${addr.port}`;
+    try {
+        return await fn(`http://127.0.0.1:${addr.port}`);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
 }
 
 test("planNativeZcode resolves kill-switches > attach > spawn", () => {
@@ -77,7 +90,9 @@ test("probeProxyHealth accepts any live proxy answer and rejects failures", asyn
     await withHealthServer(async (origin) => {
         assert.equal(await probeProxyHealth(origin), true);
     });
-    assert.equal(await probeProxyHealth(await deadOrigin()), false);
+    await withUnhealthyOrigin(async (origin) => {
+        assert.equal(await probeProxyHealth(origin), false);
+    });
     const bad = http.createServer((_req, res) => {
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"ok":true}');
@@ -206,6 +221,7 @@ test("bootstrapZcodeNative attaches to a healthy proxy and routes", async () => 
             assert.equal(out.mode, "active");
             if (out.mode !== "active") return;
             assert.equal(out.attached, true);
+            assert.equal(out.externallyOwned, true);
             assert.ok(out.routed);
             assert.equal(out.routed.origin, origin);
         });
@@ -217,11 +233,12 @@ test("bootstrapZcodeNative attaches to a healthy proxy and routes", async () => 
 test("bootstrapZcodeNative fails closed on an unhealthy attach target", async () => {
     const dir = dataDir();
     try {
-        const origin = await deadOrigin();
-        await assert.rejects(
-            bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {}, healthDeadlineMs: 300 }),
-            /not healthy/,
-        );
+        await withUnhealthyOrigin(async (origin) => {
+            await assert.rejects(
+                bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {}, healthDeadlineMs: 300 }),
+                /not healthy/,
+            );
+        });
     } finally {
         rmrf(dir);
     }
@@ -240,8 +257,29 @@ test("bootstrapZcodeNative spawns through the injected ensureProxy seam", async 
             assert.equal(out.mode, "active");
             if (out.mode !== "active") return;
             assert.equal(out.attached, false);
+            assert.equal(out.externallyOwned, false);
             assert.ok(out.routed);
             assert.equal(out.routed.origin, origin);
+        });
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("bootstrap marks a lane-owned instance found alive at bootstrap as NOT externally owned (#1821)", async () => {
+    const dir = dataDir();
+    try {
+        await withHealthServer(async (origin) => {
+            const out = await bootstrapZcodeNative({
+                env: {},
+                dataDir: dir,
+                log: () => {},
+                ensureProxy: async () => ({ origin, attached: true }),
+            });
+            assert.equal(out.mode, "active");
+            if (out.mode !== "active") return;
+            assert.equal(out.attached, true);
+            assert.equal(out.externallyOwned, false);
         });
     } finally {
         rmrf(dir);
@@ -306,7 +344,7 @@ test("routeZcodeConfig refuses to wrap the v3.14+ store (#1621 client signing)",
     }
 });
 
-test("bootstrapZcodeNative degrades to off on the v3.14+ store without proxy bring-up (#1621)", async () => {
+test("bootstrapZcodeNative degrades (no proxy bring-up) on the v3.14+ signing store (#1621/#1892)", async () => {
     const { dir, file } = newStoreDir();
     writeFileSync(file, readFileSync(file, "utf8").replace(UPSTREAM, `http://127.0.0.1:9999/bili/${UPSTREAM}`));
     try {
@@ -323,7 +361,7 @@ test("bootstrapZcodeNative degrades to off on the v3.14+ store without proxy bri
                 return { origin: "http://127.0.0.1:1", attached: false };
             },
         });
-        assert.deepEqual(out, { mode: "off" });
+        assert.deepEqual(out, { mode: "degraded", reason: "signing" });
         assert.equal(proxyTouched, false);
         assert.match(logs[0], /client signing/);
         // mcp-entry's off path runs unrouteZcode — a wrapper left by a
@@ -540,10 +578,11 @@ test("repairSharedStoreDrift repoints a dead foreign pointer at the healthy self
     await withHealthServer(async (selfOrigin) => {
         const dir = dataDir();
         try {
-            const dead = await deadOrigin();
-            await routeZcodeConfig({ origin: dead, dataDir: dir, log: NO_LOG });
-            assert.equal(await repairSharedStoreDrift({ selfOrigin, dataDir: dir, log: NO_LOG }), "repointed-self");
-            assert.equal(detectCurrentZcodeOrigin(dir), selfOrigin);
+            await withUnhealthyOrigin(async (dead) => {
+                await routeZcodeConfig({ origin: dead, dataDir: dir, log: NO_LOG });
+                assert.equal(await repairSharedStoreDrift({ selfOrigin, dataDir: dir, log: NO_LOG }), "repointed-self");
+                assert.equal(detectCurrentZcodeOrigin(dir), selfOrigin);
+            });
         } finally {
             rmrf(dir);
         }
@@ -666,6 +705,157 @@ test("handoffZcodeRoutingOnExit reverts to direct when no replacement lives (#16
         const text = readFileSync(storeFile(dir), "utf8");
         assert.ok(text.includes(UPSTREAM));
         assert.doesNotMatch(text, /\/bili\//);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+// #1892: the zero-wrapped path must explain itself instead of leaving the
+// client a bare "Connection closed". An empty personal store is NOT "no
+// provider" — this build sources active providers from the built-in/account
+// layer, not the legacy file — so the diagnostic names that basis, and the
+// suite also pins the resulting bootstrap state (active + routed undefined).
+
+const EMPTY_NEW_STORE = JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [] } } }) + "\n";
+
+test("#1892: empty personal store names the built-in/account basis, not a missing-provider verdict", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-emptynew-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    writeFileSync(newFile, EMPTY_NEW_STORE);
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /no explicit provider rule/);
+        assert.match(joined, /built-in\/account layer/);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: empty personal store with legacy records notes them as migration leftovers, not targets", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-emptynew-legacy-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    const legacyFile = zcodeStoreCandidates(dir, "legacy", {})[0];
+    const legacyOriginal = JSON.stringify({ provider: { "custom:other-vendor": { options: { baseURL: "https://api.other.example/v1" } } } }) + "\n";
+    writeFileSync(newFile, EMPTY_NEW_STORE);
+    writeFileSync(legacyFile, legacyOriginal);
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /no explicit provider rule/);
+        assert.match(joined, /does not read it as a provider source/);
+        assert.match(joined, /migration/);
+        assert.equal(readFileSync(newFile, "utf8"), EMPTY_NEW_STORE);
+        assert.equal(readFileSync(legacyFile, "utf8"), legacyOriginal);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: every personal rule behind the #1621 signing wall names cert-MITM", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-signingwall-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    writeFileSync(newFile, JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [{ providerId: "account:bigmodel-individual-coding-plan", config: { api: { baseUrl: UPSTREAM } } }] } } }) + "\n");
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /client-signing/);
+        assert.match(joined, /#1621/);
+        assert.match(joined, /every provider rule/);
+        assert.match(joined, /cert-MITM/);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: bootstrap on an empty personal store degrades BEFORE bring-up (entry serves idle, never exits pre-init)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-bootstrap-empty-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    writeFileSync(zcodeStoreCandidates(dir, "new", {})[0], EMPTY_NEW_STORE);
+    try {
+        await withHealthServer(async () => {
+            const out = await bootstrapZcodeNative({ env: {}, dataDir: dir, log: () => {}, ensureProxy: async () => { throw new Error("degraded bootstrap must not bring up a proxy"); } });
+            assert.deepEqual(out, { mode: "degraded", reason: "empty-rules" });
+        });
+    } finally {
+        rmrf(dir);
+    }
+});
+
+// ── #1892: pure routing plan + degraded bootstrap (no bring-up) ──────────────
+
+function emptyPersonalStoreDir(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-plan-empty-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    writeFileSync(path.join(dir, "v2", "provider_config.json"), JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [] } } }) + "\n");
+    return dir;
+}
+
+test("planZcodeRouting classifies the no-route world before any bring-up (#1892)", async () => {
+    // No store at all → no-store.
+    const bare = mkdtempSync(path.join(tmpdir(), "zcode-plan-bare-"));
+    try {
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: bare, log: () => {} }), { routable: false, reason: "no-store" });
+        // v2 dir but the personal store file is absent → no-file.
+        mkdirSync(path.join(bare, "v2"), { recursive: true });
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: bare, log: () => {} }), { routable: false, reason: "no-file" });
+    } finally {
+        rmrf(bare);
+    }
+    // Personal store present with zero rules → empty-rules + the #1896 hint.
+    const empty = emptyPersonalStoreDir();
+    try {
+        const logs: string[] = [];
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: empty, log: (m) => logs.push(m) }), { routable: false, reason: "empty-rules" });
+        assert.match(logs.join(" "), /no routable provider entry found/);
+        assert.match(logs.join(" "), /built-in\/account layer/);
+    } finally {
+        rmrf(empty);
+    }
+    // Whole store behind the signing wall under route:"plans" → signing.
+    const { dir } = newStoreDir();
+    try {
+        const logs: string[] = [];
+        assert.deepEqual(
+            planZcodeRouting({ env: { BILI_ZCODE_ROUTE: "plans" }, dataDir: dir, log: (m) => logs.push(m) }),
+            { routable: false, reason: "signing" },
+        );
+        assert.match(logs.join(" "), /client[- ]signing/);
+    } finally {
+        rmrf(dir);
+    }
+    // A legacy store with a wrappable provider is routable (dry-run wraps >0).
+    const legacy = dataDir();
+    try {
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: legacy, log: () => {} }), { routable: true });
+        // …and the dry-run never touched the file.
+        assert.doesNotMatch(readFileSync(zcodeStoreCandidates(legacy, "legacy", {})[0], "utf8"), /\/bili\//);
+    } finally {
+        rmrf(legacy);
+    }
+});
+
+test("bootstrapZcodeNative returns degraded, without proxy bring-up, for an empty personal store (#1892)", async () => {
+    const dir = emptyPersonalStoreDir();
+    try {
+        let proxyTouched = false;
+        const out = await bootstrapZcodeNative({
+            env: {},
+            dataDir: dir,
+            log: () => {},
+            ensureProxy: async () => {
+                proxyTouched = true;
+                return { origin: "http://127.0.0.1:1", attached: false };
+            },
+        });
+        assert.deepEqual(out, { mode: "degraded", reason: "empty-rules" });
+        assert.equal(proxyTouched, false);
     } finally {
         rmrf(dir);
     }

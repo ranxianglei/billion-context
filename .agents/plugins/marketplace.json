@@ -1,0 +1,21 @@
+{
+  "name": "billion-context",
+  "interface": {
+    "displayName": "billion-context"
+  },
+  "plugins": [
+    {
+      "name": "billion-context",
+      "version": "0.1.205",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -23,7 +23,7 @@ function makeSession(): Session {
     return {
         id: `issue847-${randomUUID()}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -31,6 +31,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -62,9 +63,13 @@ test("#847: acp_status lists only ranges that pass the submit gate (chars >= min
     const subCtx = makeCtx(sub, defaultConfig(200000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
     assert.equal(subCtx.config.compress.minCompressRange, 5000, "fixture sanity: default gate is 5000 chars");
     assert.equal(sub.map((m) => m.text?.length ?? 0).reduce((a, b) => a + b, 0), 4400, "fixture sanity: whole span is sub-gate");
-    const subReport = handleAcpStatus({}, subCtx);
+    const subReport = handleAcpStatus({}, subCtx).text;
     assert.ok(!subReport.includes("Compressible ranges"), "all-sub-gate session must NOT advertise any range");
-    assert.ok(!subReport.includes("m00001"), "sub-gate range must NOT be listed");
+    // #4331 (behavior change): the run is never OFFERED (gate discipline above
+    // unchanged), but the uncovered-history diagnostic NAMES it — visibility
+    // for mass that no offer will ever carry, explicitly not a fold suggestion.
+    assert.ok(subReport.includes("UNCOVERED HISTORY"), "sub-gate residue must be visible in the diagnostic section:\n" + subReport);
+    assert.ok(subReport.includes("m00001"), "the sub-gate run must be named in the diagnostic section");
 
     const big = [
         textMsg("raw_1", "assistant", "a".repeat(1700)),
@@ -74,7 +79,7 @@ test("#847: acp_status lists only ranges that pass the submit gate (chars >= min
         textMsg("raw_5", "assistant", "d".repeat(1100)),
     ];
     const bigCtx = makeCtx(big, defaultConfig(200000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
-    const bigReport = handleAcpStatus({}, bigCtx);
+    const bigReport = handleAcpStatus({}, bigCtx).text;
     const idx = bigReport.indexOf("Compressible ranges");
     assert.ok(idx !== -1, "ranges section present for a >= gate span");
     const section = bigReport.slice(idx);
@@ -87,7 +92,7 @@ test("#847: reversed refs surface an explicit note on gate failure instead of si
         textMsg("raw_2", "assistant", "b".repeat(800)),
     ];
     const ctx = makeCtx(msgs);
-    const out = applyRanges(parseCompressInput(compressArgs("m00002", "m00001")), ctx);
+    const out = applyRanges(parseCompressInput(compressArgs("m00002", "m00001")), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), `gate rejection expected (got: ${out.slice(0, 100)})`);
     assert.match(out, /Total compressible content too small \(1600 chars/, "normalized span was evaluated (kernel swapped bounds)");
     assert.match(out, /reversed/, "explicit reversal note present");
@@ -101,24 +106,27 @@ test("#847: repeated identical failing spec escalates; success clears the streak
     for (let i = 3; i <= 8; i++) msgs.push(textMsg(`raw_${i}`, "assistant", "x".repeat(5000)));
     const ctx = makeCtx(msgs);
 
-    const first = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx);
+    const first = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
     assert.ok(first.startsWith("[Compression FAILED:"), `first attempt fails at gate (got: ${first.slice(0, 100)})`);
     assert.ok(!first.includes("Repeat-failure guard"), "first failure carries no escalation");
 
-    const second = applyRanges(parseCompressInput(compressArgs("m00002", "m00001")), ctx);
+    const second = applyRanges(parseCompressInput(compressArgs("m00002", "m00001")), ctx).text;
     assert.ok(second.startsWith("[Compression FAILED:"), "second attempt fails identically (reversed spec normalizes to the same key)");
     assert.match(second, /Repeat-failure guard/, "escalation on repeat");
     assert.match(second, /2 time\(s\)/, "occurrence count reported");
     assert.match(second, /acp_status/, "escalation points at acp_status");
 
-    const third = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx);
-    assert.match(third, /3 time\(s\)/, "alternating direction still counts as the same spec");
+    const third = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
+    // #2146: at 3 consecutive failures (same or distinct specs) the cross-spec
+    // circuit breaker supersedes the exact-spec repeat text — alternating
+    // direction still counts as the same spec.
+    assert.match(third, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "third consecutive failure upgrades to the loop breaker");
 
-    const success = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx);
+    const success = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx).text;
     assert.ok(success.startsWith("[Compressed "), `large range compresses (got: ${success.slice(0, 100)})`);
     assert.equal(ctx.session.metadata["compressFailKeys"], undefined, "streak cleared on success");
 
-    const after = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx);
+    const after = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
     assert.ok(after.startsWith("[Compression FAILED:"), "small range still fails after the successful compress");
     assert.ok(!after.includes("Repeat-failure guard"), "streak restarted after the clear");
 });

@@ -7,8 +7,14 @@
 // braces may nest); when the queue is exhausted the model answers plain text
 // "收到#done". `compress` with no explicit args is
 // special-cased: the fake cites REAL refs harvested from the request's ACP tags
-// so the kernel has a foldable range. Every /chat/completions request is
-// appended to FAKE_REQLOG (JSONL) as the assertion oracle.
+// so the kernel has a foldable range. Every request — /chat/completions AND
+// /v1/messages (anthropic SSE, #2791 cross-protocol lanes) — is appended to
+// FAKE_REQLOG (JSONL) as the assertion oracle, with a `wire` field.
+// The anthropic wire renders the same logical conversation differently
+// (top-level system, content BLOCKS, tool_use objects, tool_result inside the
+// next user message), so /v1/messages bodies are normalized to the openai-ish
+// shape this scripting core already understands; a session that switches
+// wires mid-flight keeps its directive queue and oracle fields.
 
 import http from "node:http";
 import fs from "node:fs";
@@ -119,6 +125,69 @@ function compressArgs(refs) {
 const isChainCarrierMsg = (m) =>
     m?.role === "user" && /^\s*\x3cbili-chain\s[\s\S]*\/\x3e\s*$/.test(String(flatContent(m.content)));
 
+function anthropicToOpenai(body) {
+    const out = [];
+    const sys = body.system;
+    const sysText = typeof sys === "string" ? sys : Array.isArray(sys) ? sys.map((b) => (b && b.text) || "").join("") : "";
+    if (sysText) out.push({ role: "system", content: sysText });
+    for (const m of body.messages ?? []) {
+        const blocks = Array.isArray(m?.content)
+            ? m.content
+            : typeof m?.content === "string" ? [{ type: "text", text: m.content }] : [];
+        if (m?.role === "assistant") {
+            const text = blocks.filter((b) => b?.type === "text").map((b) => b.text).join("");
+            const tus = blocks.filter((b) => b?.type === "tool_use");
+            if (tus.length > 0) {
+                out.push({ role: "assistant", content: text || null, tool_calls: tus.map((b) => ({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } })) });
+            } else if (text) {
+                out.push({ role: "assistant", content: text });
+            }
+        } else {
+            for (const tr of blocks.filter((b) => b?.type === "tool_result")) {
+                out.push({ role: "tool", tool_call_id: tr.tool_use_id, content: typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content ?? "") });
+            }
+            const text = blocks.filter((b) => b?.type === "text").map((b) => b.text).join("");
+            if (text) out.push({ role: "user", content: text });
+        }
+    }
+    return {
+        messages: out,
+        model: body.model,
+        stream: body.stream,
+        tools: (body.tools ?? []).map((t) => ({ function: { name: t?.name } })),
+        nmsgNative: (body.messages ?? []).length,
+    };
+}
+
+function responsesToOpenai(body) {
+    // Responses-API input items (pi `openai-responses`, codex): message items
+    // carry content blocks; function_call / function_call_output arrive as
+    // SIBLING items. Normalized to the openai-ish shape the scripting core
+    // understands so a session that switches onto this wire keeps its
+    // directive queue and oracle fields.
+    const out = [];
+    if (typeof body.instructions === "string" && body.instructions) {
+        out.push({ role: "system", content: body.instructions });
+    }
+    for (const it of body.input ?? []) {
+        if (it?.type === "function_call") {
+            out.push({ role: "assistant", content: null, tool_calls: [{ id: it.call_id ?? it.id, type: "function", function: { name: it.name, arguments: typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? {}) } }] });
+        } else if (it?.type === "function_call_output") {
+            out.push({ role: "tool", tool_call_id: it.call_id, content: typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "") });
+        } else if (it?.type === "message") {
+            const text = flatContent(it.content);
+            if (text) out.push({ role: it.role, content: text });
+        }
+    }
+    return {
+        messages: out,
+        model: body.model,
+        stream: body.stream,
+        tools: (body.tools ?? []).map((t) => ({ function: { name: t?.name } })),
+        nmsgNative: (body.input ?? []).length,
+    };
+}
+
 function answerFor(convKey, firstUserText, body) {
     // Directives are parsed from the LAST user message: a `pi -p --continue`
     // follow-up run re-sends the whole history, and its fresh prompt must
@@ -192,11 +261,18 @@ const server = http.createServer((req, res) => {
                     ? flatContent(lastUserMsg.content).match(/\x3cacp\s+[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/)
                     : null;
                 const convKey = req.headers["x-bili-plugin-conversation"] ?? "anon";
+                // #2546: user messages carrying an acp_delegate completion
+                // notification ("[acp_delegate ..." prefix — notification texts
+                // only). Lets suites assert the notification PERSISTS across
+                // requests: a request-local injection would show up in exactly
+                // one row, a persisted session message in every later one.
+                const notifCount = users.filter((u) => flatContent(u.content).replace(/\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/g, "").includes("[acp_delegate")).length;
                 const reply = answerFor(convKey, firstUserText, parsed);
                 try {
                     fs.appendFileSync(REQLOG, JSON.stringify({
                         t: Date.now(),
                         url: req.url,
+                        wire: "openai",
                         stream: !!parsed.stream,
                         model: parsed.model,
                         plugin: req.headers["x-bili-plugin"] ?? null,
@@ -209,6 +285,7 @@ const server = http.createServer((req, res) => {
                         acpRefs: acpRefs(parsed),
                         acpToolRefs: acpRefs(parsed, "tool"),
                         acpTagCount: (JSON.stringify(messages).match(/\x3cacp\s/g) ?? []).length,
+                        fillerHits: (raw.match(/filler line \d+/g) ?? []).length,
                         toolResults: toolResultsOf(messages),
                         queueIdx: reply.queueIdx,
                         toolName: reply.toolName ?? null,
@@ -224,6 +301,7 @@ const server = http.createServer((req, res) => {
                         // rows route VERBATIM (no ref tags, no injected tools),
                         // so suites must not mistake them for main turns.
                         title: reply.title === true,
+                        notifCount,
                     }) + "\n");
                 } catch { /* noop */ }
                 if (parsed.stream) {
@@ -252,6 +330,167 @@ const server = http.createServer((req, res) => {
                         choices: [{ index: 0, message: { role: "assistant", ...(reply.tool_calls ? { tool_calls: reply.tool_calls } : { content: reply.content }) }, finish_reason: reply.tool_calls ? "tool_calls" : "stop" }],
                         usage: { prompt_tokens: estIn(raw), completion_tokens: estOut(String(reply.content ?? "tool")), total_tokens: estIn(raw) + 3 },
                     }));
+                }
+            });
+            return;
+        }
+        if (req.method === "POST" && /\/messages\/count_tokens$/.test(req.url)) {
+            let raw = ""; req.on("data", (c) => { raw += c; });
+            req.on("end", () => {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ input_tokens: Math.ceil(raw.length / 4) }));
+            });
+            return;
+        }
+        if (req.method === "POST" && /\/(v1\/)?messages$/.test(req.url)) {
+            let raw = "";
+            req.on("data", (c) => { raw += c; });
+            req.on("end", () => {
+                let parsed = {};
+                try { parsed = JSON.parse(raw || "{}"); } catch { /* noop */ }
+                if (process.env.FAKE_DUMP) { try { fs.appendFileSync(process.env.FAKE_DUMP, raw + "\n"); } catch { /* noop */ } }
+                const norm = anthropicToOpenai(parsed);
+                const messages = norm.messages;
+                const users = messages.filter((x) => x?.role === "user" && !isChainCarrierMsg(x));
+                const firstUserText = users.length > 0 ? flatContent(users[0].content) : "";
+                const lastUserMsg = users.length > 0 ? users[users.length - 1] : null;
+                const lastUserRefMatch = lastUserMsg
+                    ? flatContent(lastUserMsg.content).match(/\x3cacp\s+[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/)
+                    : null;
+                const convKey = req.headers["x-bili-plugin-conversation"] ?? "anon";
+                const notifCount = users.filter((u) => flatContent(u.content).replace(/\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/g, "").includes("[acp_delegate")).length;
+                const reply = answerFor(convKey, firstUserText, { messages, tools: norm.tools });
+                try {
+                    fs.appendFileSync(REQLOG, JSON.stringify({
+                        t: Date.now(),
+                        url: req.url,
+                        wire: "anthropic",
+                        stream: !!parsed.stream,
+                        model: parsed.model,
+                        plugin: req.headers["x-bili-plugin"] ?? null,
+                        conv: req.headers["x-bili-plugin-conversation"] ?? null,
+                        ctxwin: req.headers["x-bili-plugin-context-window"] ?? null,
+                        maxout: req.headers["x-bili-plugin-max-output"] ?? null,
+                        tools: (parsed.tools ?? []).map((t) => t?.name),
+                        nmsg: norm.nmsgNative,
+                        roles: messages.map((x) => x?.role).join(","),
+                        acpRefs: acpRefs(parsed),
+                        acpToolRefs: acpRefs(parsed, "tool"),
+                        acpTagCount: (JSON.stringify(parsed.messages ?? []).match(/\x3cacp\s/g) ?? []).length,
+                        fillerHits: (raw.match(/filler line \d+/g) ?? []).length,
+                        toolResults: toolResultsOf(messages),
+                        queueIdx: reply.queueIdx,
+                        toolName: reply.toolName ?? null,
+                        toolArgs: reply.toolArgs ?? null,
+                        lastUser: firstUserText.slice(0, 120),
+                        lastUserHead: (lastUserMsg ? flatContent(lastUserMsg.content) : "").slice(0, 120),
+                        lastUserRef: lastUserRefMatch ? lastUserRefMatch[1] : null,
+                        title: reply.title === true,
+                        notifCount,
+                    }) + "\n");
+                } catch { /* noop */ }
+                const usageIn = estIn(raw);
+                if (parsed.stream) {
+                    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+                    const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                    ev("message_start", { type: "message_start", message: { id: "msg_fake", type: "message", role: "assistant", model: parsed.model ?? MODEL, usage: { input_tokens: usageIn, output_tokens: 1 } } });
+                    ev("content_block_start", { type: "content_block_start", index: 0, content_block: reply.tool_calls ? { type: "tool_use", id: reply.tool_calls[0].id, name: reply.tool_calls[0].function.name, input: {} } : { type: "text", text: "" } });
+                    if (reply.tool_calls) {
+                        ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: reply.tool_calls[0].function.arguments } });
+                    } else {
+                        ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: reply.content } });
+                    }
+                    ev("content_block_stop", { type: "content_block_stop", index: 0 });
+                    ev("message_delta", { type: "message_delta", delta: { stop_reason: reply.tool_calls ? "tool_use" : "end_turn" }, usage: { output_tokens: reply.tool_calls ? 5 : estOut(String(reply.content ?? "")) } });
+                    ev("message_stop", { type: "message_stop" });
+                    res.end();
+                } else {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({
+                        id: "msg_fake", type: "message", role: "assistant", model: parsed.model ?? MODEL,
+                        content: reply.tool_calls
+                            ? [{ type: "tool_use", id: reply.tool_calls[0].id, name: reply.tool_calls[0].function.name, input: JSON.parse(reply.tool_calls[0].function.arguments || "{}") }]
+                            : [{ type: "text", text: reply.content }],
+                        stop_reason: reply.tool_calls ? "tool_use" : "end_turn",
+                        usage: { input_tokens: usageIn, output_tokens: estOut(String(reply.content ?? "tool")) },
+                    }));
+                }
+            });
+            return;
+        }
+        if (req.method === "POST" && /\/responses$/.test(req.url)) {
+            let raw = "";
+            req.on("data", (c) => { raw += c; });
+            req.on("end", () => {
+                let parsed = {};
+                try { parsed = JSON.parse(raw || "{}"); } catch { /* noop */ }
+                if (process.env.FAKE_DUMP) { try { fs.appendFileSync(process.env.FAKE_DUMP, raw + "\n"); } catch { /* noop */ } }
+                const norm = responsesToOpenai(parsed);
+                const messages = norm.messages;
+                const users = messages.filter((x) => x?.role === "user" && !isChainCarrierMsg(x));
+                const firstUserText = users.length > 0 ? flatContent(users[0].content) : "";
+                const lastUserMsg = users.length > 0 ? users[users.length - 1] : null;
+                const lastUserRefMatch = lastUserMsg
+                    ? flatContent(lastUserMsg.content).match(/\x3cacp\s+[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/)
+                    : null;
+                const convKey = req.headers["x-bili-plugin-conversation"] ?? "anon";
+                const notifCount = users.filter((u) => flatContent(u.content).replace(/\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/g, "").includes("[acp_delegate")).length;
+                const reply = answerFor(convKey, firstUserText, { messages, tools: norm.tools });
+                try {
+                    fs.appendFileSync(REQLOG, JSON.stringify({
+                        t: Date.now(),
+                        url: req.url,
+                        wire: "responses",
+                        stream: !!parsed.stream,
+                        model: parsed.model,
+                        plugin: req.headers["x-bili-plugin"] ?? null,
+                        conv: req.headers["x-bili-plugin-conversation"] ?? null,
+                        ctxwin: req.headers["x-bili-plugin-context-window"] ?? null,
+                        maxout: req.headers["x-bili-plugin-max-output"] ?? null,
+                        tools: (parsed.tools ?? []).map((t) => t?.name),
+                        nmsg: norm.nmsgNative,
+                        roles: messages.map((x) => x?.role).join(","),
+                        acpTagCount: (JSON.stringify(parsed.input ?? []).match(/\x3cacp\s/g) ?? []).length,
+                        fillerHits: (raw.match(/filler line \d+/g) ?? []).length,
+                        toolResults: toolResultsOf(messages),
+                        queueIdx: reply.queueIdx,
+                        toolName: reply.toolName ?? null,
+                        toolArgs: reply.toolArgs ?? null,
+                        lastUser: firstUserText.slice(0, 120),
+                        lastUserHead: (lastUserMsg ? flatContent(lastUserMsg.content) : "").slice(0, 120),
+                        lastUserRef: lastUserRefMatch ? lastUserRefMatch[1] : null,
+                        title: reply.title === true,
+                        notifCount,
+                    }) + "\n");
+                } catch { /* noop */ }
+                const usageIn = estIn(raw);
+                const rid = `resp_fake_${++globalCallN}`;
+                const fcId = `fc_${rid}`;
+                const msgId = `msg_${rid}`;
+                const item = reply.tool_calls
+                    ? { type: "function_call", id: fcId, call_id: reply.tool_calls[0].id, name: reply.tool_calls[0].function.name, arguments: reply.tool_calls[0].function.arguments, status: "completed" }
+                    : { type: "message", id: msgId, role: "assistant", status: "completed", content: [{ type: "output_text", text: String(reply.content ?? ""), annotations: [] }] };
+                if (parsed.stream) {
+                    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+                    const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                    ev("response.created", { type: "response.created", response: { id: rid, object: "response", status: "in_progress", output: [] } });
+                    ev("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", ...(reply.tool_calls ? { arguments: "" } : { content: [] }) } });
+                    if (reply.tool_calls) {
+                        ev("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: fcId, output_index: 0, delta: reply.tool_calls[0].function.arguments });
+                        ev("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: fcId, output_index: 0, arguments: reply.tool_calls[0].function.arguments });
+                    } else {
+                        ev("response.content_part.added", { type: "response.content_part.added", item_id: msgId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+                        ev("response.output_text.delta", { type: "response.output_text.delta", item_id: msgId, output_index: 0, content_index: 0, delta: String(reply.content ?? "") });
+                        ev("response.output_text.done", { type: "response.output_text.done", item_id: msgId, output_index: 0, content_index: 0, text: String(reply.content ?? "") });
+                        ev("response.content_part.done", { type: "response.content_part.done", item_id: msgId, output_index: 0, content_index: 0, part: { type: "output_text", text: String(reply.content ?? ""), annotations: [] } });
+                    }
+                    ev("response.output_item.done", { type: "response.output_item.done", output_index: 0, item });
+                    ev("response.completed", { type: "response.completed", response: { id: rid, object: "response", model: parsed.model ?? MODEL, status: "completed", output: [item], usage: { input_tokens: usageIn, output_tokens: reply.tool_calls ? 5 : estOut(String(reply.content ?? "")), total_tokens: usageIn + 10 } } });
+                    res.write("data: [DONE]\n\n");
+                    res.end();
+                } else {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ id: rid, object: "response", status: "completed", model: parsed.model ?? MODEL, output: [item], usage: { input_tokens: usageIn, output_tokens: estOut(String(reply.content ?? "tool")) } }));
                 }
             });
             return;

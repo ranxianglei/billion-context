@@ -1,0 +1,67 @@
+name: dist-tag cleanup (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test = 只删 tmp-write-probe 验证权限; all = 全量清理"
+        required: true
+        default: "test"
+        type: choice
+        options: [test, all]
+
+permissions:
+  id-token: write   # OIDC 换取 npm 短时 token 的必要权限
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Upgrade npm to 12.2.0 (dist-tag OIDC support)
+        run: |
+          npm install -g npm@12.2.0
+          hash -r
+          npm --version
+
+      - name: Delete dist-tags via OIDC
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -u
+          if [ "$MODE" = "test" ]; then
+            echo "=== 测试模式: 只删 tmp-write-probe ==="
+            npm dist-tag rm billion-context tmp-write-probe
+            echo "=== 测试成功 ==="
+            exit 0
+          fi
+          curl -s https://registry.npmjs.org/billion-context \
+            | jq -r '."dist-tags" | keys_unsorted[]' \
+            | grep -vE '^(latest|pr|master)$' | sort > /tmp/tags.txt
+          total=$(wc -l < /tmp/tags.txt)
+          echo "=== 全量模式: 待删 $total 个(保留 latest/pr/master) ==="
+          fail=0; ok=0
+          while read -r t; do
+            if npm dist-tag rm billion-context "$t" >/dev/null 2>&1; then
+              ok=$((ok+1)); [ $((ok % 50)) -eq 0 ] && echo "进度: OK $ok / $total"
+            else
+              echo "FAIL $t"; fail=$((fail+1))
+            fi
+            sleep 0.2
+          done < /tmp/tags.txt
+          echo "=== 完成: OK=$ok FAIL=$fail ==="
+          [ "$fail" -eq 0 ]

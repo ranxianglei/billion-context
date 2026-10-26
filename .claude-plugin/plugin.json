@@ -1,0 +1,16 @@
+{
+  "name": "billion-context",
+  "version": "0.1.205",
+  "description": "Context-compression plugin for Claude Code · month-long single sessions (billions of tokens) · high compression quality even in small context windows (100K is enough) · 5× fewer tokens",
+  "author": {
+    "name": "ranxianglei"
+  },
+  "homepage": "https://github.com/ranxianglei/billion-context",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "compression",
+    "long-context",
+    "token-saving"
+  ]
+}

@@ -8,6 +8,13 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
+// #3128: the oversized-decompressed-body 413 below is asserted at the LEGACY caps. Pin the
+// knobs to the old 100/200/100 MiB values so this stays independent of the new 5 GiB shipped
+// defaults (covered by knobs-config-precedence); small bodies in the other tests are unaffected.
+process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
+process.env.BILI_DECODED_BODY_BYTES = "209715200";
+process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+
 type Captured = { url: string; headers: http.IncomingHttpHeaders; body: Buffer };
 
 function listen(server: http.Server): Promise<void> {
@@ -39,6 +46,9 @@ test("undecodable content-encoding body is forwarded verbatim instead of 400", a
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: {
@@ -48,7 +58,12 @@ test("undecodable content-encoding body is forwarded verbatim instead of 400", a
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },
+        streamErrorShape: "protocol",
         passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -102,6 +117,9 @@ test("oversized decompressed body is rejected 413 and not forwarded", async () =
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: {
@@ -111,7 +129,12 @@ test("oversized decompressed body is rejected 413 and not forwarded", async () =
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },
+        streamErrorShape: "protocol",
         passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -165,6 +188,9 @@ test("unknown-path passthrough keeps content-encoding on the forwarded request",
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: {
@@ -174,7 +200,12 @@ test("unknown-path passthrough keeps content-encoding on the forwarded request",
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },
+        streamErrorShape: "protocol",
         passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -225,6 +256,9 @@ test("response content-encoding is stripped when forwarding upstream responses",
     const upstreamPort = (upstream.address() as { port: number }).port;
     const opts: ProxyOptions = {
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: {
@@ -234,7 +268,12 @@ test("response content-encoding is stripped when forwarding upstream responses",
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },
+        streamErrorShape: "protocol",
         passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

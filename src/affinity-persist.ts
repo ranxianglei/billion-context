@@ -13,7 +13,14 @@ import { log } from "./logger.js";
  * debounced atomic write and hydrate on boot.
  */
 
-const PERSIST_DEBOUNCE_MS = 5_000;
+/** #1834: quiesce window. Every chain mutation restarts this debounce (a
+ *  busy proxy would otherwise push the write out indefinitely and a SIGKILL
+ *  lost EVERYTHING since the last flush, not just 5s worth), and the
+ *  max-delay budget caps how long a pending write can be starved: the file
+ *  is on disk within ~500ms of the last mutation, or within 5s under
+ *  sustained traffic — previously a flat 5s trailing window. */
+const PERSIST_DEBOUNCE_MS = 500;
+const PERSIST_MAX_DELAY_MS = 5_000;
 
 function affinityFile(): string {
     return path.join(stateDir(), "prefix-affinity.json");
@@ -21,6 +28,7 @@ function affinityFile(): string {
 
 let timer: NodeJS.Timeout | null = null;
 let writing = false;
+let pendingSince: number | null = null;
 
 /** Entries another process left on disk since we hydrated; null on read failure
  *  (the caller then writes its own snapshot unchanged). */
@@ -91,7 +99,15 @@ function writeSnapshot(): void {
         const snapshot = { version: 1, entries };
         const tmp = `${file}.tmp`;
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(tmp, JSON.stringify(snapshot));
+        // fsync before rename: a crash between write and rename otherwise leaves
+        // a size-correct, VDL=0 zero file (#3157).
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(snapshot));
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
         fs.renameSync(tmp, file);
         if (disk !== null) {
             const mineIds = new Set(mine.map((e) => e.sessionId));
@@ -104,16 +120,25 @@ function writeSnapshot(): void {
         log("warn", `[prefix-affinity] persist failed (${e instanceof Error ? e.message : String(e)}); affinity survives in memory`);
     } finally {
         writing = false;
+        pendingSince = null;
     }
 }
 
-/** Debounced snapshot write — call after every affinity mutation. */
+/** Debounced snapshot write — call after every affinity mutation. The
+ *  trailing debounce quiesces bursts; the #1834 max-delay budget guarantees
+ *  the write still lands under sustained traffic (see constants above). */
 export function scheduleAffinityPersist(): void {
+    const now = Date.now();
+    if (pendingSince === null) pendingSince = now;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-        timer = null;
-        writeSnapshot();
-    }, PERSIST_DEBOUNCE_MS);
+    const budget = PERSIST_MAX_DELAY_MS - (now - pendingSince);
+    timer = setTimeout(
+        () => {
+            timer = null;
+            writeSnapshot();
+        },
+        Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, budget)),
+    );
     timer.unref?.();
 }
 

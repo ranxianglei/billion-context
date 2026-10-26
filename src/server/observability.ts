@@ -1,13 +1,14 @@
 import { log as loggerLog } from "../logger.js";
 import { maskUrlsInText } from "../log-mask.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled } from "../knobs.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
 // default. They are decoupled from --debug (verbose logging) and enabled only
-// with ACP_DUMP_BODY=1 so `bili <client>` users don't leak conversation bodies
-// to disk by default (#276).
+// with ACP_DUMP_BODY=1 / diagnostics.dumpBody so `bili <client>` users don't
+// leak conversation bodies to disk by default (#276).
 export function bodyDumpEnabled(): boolean {
-    return process.env.ACP_DUMP_BODY === "1";
+    return knobBodyDumpEnabled();
 }
 
 // Raw dumps are best-effort: a failure (disk full, locked dir, EPERM) must not
@@ -46,7 +47,7 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
 // #1290: instance-level view of the map above — surfaced at /__bili/stats
 // (unrecognizedPaths) and in the /acp status report so "this path never got
 // compressed" is visible in a status face, not just 3 transient stderr warns.
-export type UnrecognizedPathStats = { total: number; paths: Record<string, number> };
+type UnrecognizedPathStats = { total: number; paths: Record<string, number> };
 export function getUnrecognizedPathStats(): UnrecognizedPathStats {
     const paths: Record<string, number> = {};
     let total = 0;
@@ -62,4 +63,17 @@ export function getUnrecognizedPathStats(): UnrecognizedPathStats {
 // the warn-level "unrecognized path" log.
 export function isModelDiscoveryPath(path: string): boolean {
     return path.replace(/\/+$/, "").endsWith("/models");
+}
+
+// #3129: Antigravity fires seven non-model /v1internal:* control-plane POSTs
+// (loadCodeAssist, fetchUserInfo, retrieveUserQuotaSummary, listExperiments,
+// fetchAdminControls, fetchAvailableModels, writeTrajectoryAcls) at startup and
+// during a session. Expected passthroughs — exempt from the "unrecognized path"
+// warn/stats like isModelDiscoveryPath. The three model endpoints are matched by
+// googlePathKind and never reach this path, so they are excluded by the lookahead.
+export function isV1InternalControlPlanePath(path: string): boolean {
+    // The proxy sees these as `/bili/<origin>/v1internal:<ep>` — match the
+    // endpoint by suffix so the routing prefix doesn't defeat the exemption.
+    const p = path.split("?", 2)[0];
+    return /\/v1internal:(?!streamGenerateContent$|generateContent$|countTokens$)/.test(p);
 }

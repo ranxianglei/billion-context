@@ -19,7 +19,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://upstream" },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -27,6 +27,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -74,7 +75,8 @@ test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key reje
     const other = createStorageCodec({ key: Buffer.from(KEY_OTHER, "hex") })!;
     const json = JSON.stringify({ hello: "world", n: [1, 2, 3] });
 
-    const enc = Buffer.isBuffer(codec.encode(json)) ? codec.encode(json) : Buffer.from(codec.encode(json));
+    const rawEnc = codec.encode(json);
+    const enc = Buffer.isBuffer(rawEnc) ? rawEnc : Buffer.from(rawEnc);
     assert.ok(enc.subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "file starts with BILIENC1 magic");
     assert.equal(codec.decode(enc), json);
 
@@ -84,8 +86,8 @@ test("codec: roundtrip, magic prefix, per-write nonce, tamper and wrong-key reje
 
     const tampered = Buffer.from(enc);
     tampered[tampered.length - 1] ^= 0xff;
-    assert.throws(() => codec.decode(tampered), undefined, "tampered tag must throw");
-    assert.throws(() => other.decode(enc), undefined, "wrong key must throw");
+    assert.throws(() => codec.decode(tampered), "tampered tag must throw");
+    assert.throws(() => other.decode(enc), "wrong key must throw");
 });
 
 test("codec passes legacy plaintext through untouched", () => {

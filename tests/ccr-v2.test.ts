@@ -115,7 +115,7 @@ test("CCR v2 first-write-wins: arrival entries survive fold-time storing", () =>
 
 test("CCR v2 range decompress: restores only the span via ephemeral injection", () => {
     const f = fold({ ccr: true });
-    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
+    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f)).text;
     assert.match(ack, new RegExp(`\\[decompress ${f.blockId} m00002\u2013m00004: restored 3 item\\(s\\)`));
     const injs = drainPendingRetrievals(f.session);
     assert.equal(injs.length, 1, "one ephemeral injection queued");
@@ -143,7 +143,7 @@ test("CCR v2 range decompress: falls back to the content store when the client v
     // a compacted client: the re-sent history no longer carries the covered
     // originals — only the fold-time content store does.
     const trimmed = { core: f.core, config: f.config, messages: f.msgs.slice(10), session: f.session, log: () => {} };
-    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, trimmed);
+    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, trimmed).text;
     assert.match(ack, /restored 3 item\(s\)/, `store fallback should restore, got: ${ack.slice(0, 200)}`);
     const injs = drainPendingRetrievals(f.session);
     assert.equal(injs.length, 1);
@@ -161,8 +161,8 @@ test("CCR v2 range decompress: store-first per-ref beats an arrival placeholder 
     // non-empty; per-ref store-first must restore the stored original.
     const pre = storeOriginal(createContentStore(), { ref: "m00003", rawId: "h_2", text: "ARRIVAL-WINS FULL ORIGINAL", kind: "shell output", toolName: "bash", tokens: 40, head: "ARRIVAL-WINS HEAD" });
     const f = fold({ ccr: true, preStore: pre });
-    const msgs = f.msgs.map((m) => (m.id === "h_2" ? { ...m, contentType: "text", toolName: undefined, text: buildStoredPlaceholder({ ref: "m00003", kind: "shell output", tokens: 40, head: "ARRIVAL-WINS HEAD", retrieveToolName: "acp_retrieve" }) } : m));
-    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, { core: f.core, config: f.config, messages: msgs, session: f.session, log: () => {} });
+    const msgs: CoreMessage[] = f.msgs.map((m) => (m.id === "h_2" ? { ...m, contentType: "text", toolName: undefined, text: buildStoredPlaceholder({ ref: "m00003", kind: "shell output", tokens: 40, head: "ARRIVAL-WINS HEAD", retrieveToolName: "acp_retrieve" }) } : m));
+    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, { core: f.core, config: f.config, messages: msgs, session: f.session, log: () => {} }).text;
     assert.match(ack, /restored 3 item\(s\)/);
     const injs = drainPendingRetrievals(f.session);
     assert.equal(injs.length, 1);
@@ -173,8 +173,8 @@ test("CCR v2 range decompress: store-first per-ref beats an arrival placeholder 
 test("CCR v2 range decompress: client retry dedupes the injection and the stat (#1207 F5)", () => {
     const f = fold({ ccr: true });
     const ctx = ctxOf(f);
-    const a1 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx);
-    const a2 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx);
+    const a1 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx).text;
+    const a2 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx).text;
     assert.match(a1, /restored 2 item\(s\)/);
     assert.equal(a2, a1, "retry re-acks identically");
     assert.equal(drainPendingRetrievals(f.session).length, 1, "no duplicate full-text injection");
@@ -184,19 +184,19 @@ test("CCR v2 range decompress: client retry dedupes the injection and the stat (
 test("CCR v2 range decompress: failure modes queue nothing", () => {
     const f = fold({ ccr: true });
     const ctx = ctxOf(f);
-    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00002" }, ctx), /given together/);
-    assert.match(resolveDecompress({ blockId: f.blockId, startId: "b1", endId: "m00004" }, ctx), /must be mNNNNN/);
-    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00004", endId: "m00002" }, ctx), /swap them/);
-    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00015", endId: "m00016" }, ctx), /covers no messages in m00015\u2013m00016/);
+    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00002" }, ctx).text, /given together/);
+    assert.match(resolveDecompress({ blockId: f.blockId, startId: "b1", endId: "m00004" }, ctx).text, /must be mNNNNN/);
+    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00004", endId: "m00002" }, ctx).text, /swap them/);
+    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00015", endId: "m00016" }, ctx).text, /covers no messages in m00015\u2013m00016/);
     assert.equal(drainPendingRetrievals(f.session).length, 0);
     assert.equal(f.session.stats.rangeRestores, 0);
     const g = fold({ ccr: false });
-    assert.match(resolveDecompress({ blockId: g.blockId, startId: "m00002", endId: "m00004" }, ctxOf(g)), /requires CCR/);
+    assert.match(resolveDecompress({ blockId: g.blockId, startId: "m00002", endId: "m00004" }, ctxOf(g)).text, /requires CCR/);
 });
 
 test("CCR v2 whole-block decompress behavior unchanged", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId }, ctxOf(f)).text;
     // 7 x ~2KB exceeds the 10K inline threshold — file mode is the expected path.
     const m = out.match(/Content \((\d+) chars\) written to: (.+)\nUse the read tool/);
     assert.ok(m, `expected file-mode ack, got: ${out.slice(0, 200)}`);
@@ -215,7 +215,7 @@ test("coveredRefSpan collapses contiguous refs", () => {
 
 test("CCR v2 search_context hits carry covered spans", () => {
     const f = fold({ ccr: true });
-    const out = executeSearchContext({ query: "Early" }, f.core, f.session.state);
+    const out = executeSearchContext({ query: "Early" }, f.core, f.session.state).text;
     assert.match(out, /Early history/);
     assert.match(out, /\[m00001\u2013m00007 \u00b7 7 msgs\]/);
 });
@@ -223,16 +223,16 @@ test("CCR v2 search_context hits carry covered spans", () => {
 test("acp_status exposes BLOCK SPANS and counts range-restores separately", () => {
     const f = fold({ ccr: true });
     const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session };
-    const out = handleAcpStatus({}, ctx);
+    const out = handleAcpStatus({}, ctx).text;
     assert.match(out, /BLOCK SPANS \u2014 b\d+=m00001\u2013m00007/);
     resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
-    const after = handleAcpStatus({}, ctx);
+    const after = handleAcpStatus({}, ctx).text;
     assert.match(after, /range-restored 1/);
 });
 
 test("acp_status hides BLOCK SPANS when CCR is disarmed (#1207 review)", () => {
     const f = fold({ ccr: false });
-    const out = handleAcpStatus({}, { core: f.core, config: f.config, messages: f.msgs, session: f.session });
+    const out = handleAcpStatus({}, { core: f.core, config: f.config, messages: f.msgs, session: f.session }).text;
     assert.doesNotMatch(out, /BLOCK SPANS/);
 });
 
@@ -318,7 +318,14 @@ async function startV2Proxy(captured: string[], noCcr?: boolean): Promise<{ prox
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: noCcr ? { injectTool: true, minCompressRangeChars: 1000 } : { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compress: noCcr ? { injectTool: true, injectNudge: false, minCompressRangeChars: 1000 } : { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -394,12 +401,17 @@ test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed �
         });
         const sse = await res.text();
         assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
-        assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
+        // The refused decompress is a failed-only round: under #156/#4186 its
+        // ephemeral frame never reaches upstream again, so the turn ends after
+        // the compress re-request and the refusal surfaces to the client as the
+        // failure receipt instead of riding a third request.
+        assert.equal(captured.length, 2, "initial + compress re-request only; refused decompress is never re-requested");
+        assert.match(captured[1]!, /Early history: messages 1-7 covered initial setup\./, "compress fold landed before the decompress attempt");
         // [#1207 owner decision] CCR is opt-in on every lane: with no ccr key
         // at any level the session never arms, so the range restore ack is the
         // "requires CCR" refusal instead of restored content.
-        assert.ok(!/restored 3 item\(s\)/.test(captured[2]!), "no restore without explicit opt-in");
-        assert.match(captured[2]!, /requires CCR/, "range restore refused: session unarmed by default");
+        assert.ok(!/restored 3 item\(s\)/.test(sse), "no restore without explicit opt-in");
+        assert.match(sse, /requires CCR/, "refusal surfaced to the client via the failure receipt");
     } finally {
         await closeAll();
     }
@@ -436,7 +448,14 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

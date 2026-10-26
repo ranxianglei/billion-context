@@ -85,8 +85,11 @@ test("compressLoopResponsesJson: no guard — both compress calls in a turn exec
 
         assert.ok(forwarded, "upstream was re-requested with both compress markers folded in");
         const input = forwarded.input as Array<Record<string, unknown>>;
-        const devMessages = input.filter((item) => item.role === "developer");
-        assert.equal(devMessages.length, 2, "two developer markers (one per compress call)");
+        // #1999: mid-history developer markers are re-voiced as user before the
+        // re-request (strict single-system backends reject a mid developer);
+        // pin the marker count by content, not by role.
+        const devMessages = input.filter((item) => item.role === "user" && JSON.stringify(item.content).includes("[ACP]"));
+        assert.equal(devMessages.length, 2, "two visibility markers (one per compress call, re-voiced as user per #1999)");
 
         const NO_OP = /Already compressed once this turn\. Do not compress again; generate your normal response now\./;
         for (const dm of devMessages) {
