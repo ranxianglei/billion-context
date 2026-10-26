@@ -1711,13 +1711,14 @@ export class SessionStore {
         }
     }
 
-    /** #4316 PR3/3: live (non-retired) row count for a session — the fork
-     *  endpoint passes count - 1 as the inclusive throughSeq. -1 when the
-     *  unified store is unavailable (kernel-only fork). */
-    unifiedLiveRowCount(id: string): number {
+    /** #4316 PR3/3 + #4730: highest live (non-retired) row seq for a session —
+     *  the fork endpoint passes it directly as the inclusive throughSeq. -1 when
+     *  the unified store is unavailable or the parent has no live rows
+     *  (kernel-only fork). */
+    unifiedLastLiveSeq(id: string): number {
         if (!this.shadow) return -1;
         try {
-            return this.shadow.liveRowCount(id);
+            return this.shadow.lastLiveSeq(id);
         } catch {
             return -1;
         }

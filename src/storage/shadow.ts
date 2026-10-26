@@ -797,10 +797,10 @@ export class UnifiedShadow {
         return this.sync.seqByRaw(sessionId);
     }
 
-    /** #4316 PR3/3: live (non-retired) message row count. */
-    liveRowCount(sessionId: string): number {
+    /** #4316 PR3/3 + #4730: highest live (non-retired) message row seq (-1 when none). */
+    lastLiveSeq(sessionId: string): number {
         this.assertLive();
-        if (this.sync !== null) return this.sync.liveRowCount(sessionId);
+        if (this.sync !== null) return this.sync.lastLiveSeq(sessionId);
         return -1;
     }
 

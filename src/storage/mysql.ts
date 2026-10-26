@@ -896,13 +896,15 @@ export class MysqlBackend implements StorageBackend {
         }));
     }
 
-    /** #4316 PR3/3 — MySQL twin of UnifiedStore.liveRowCount. */
-    async liveRowCount(sessionId: string): Promise<number> {
+    /** #4316 PR3/3 + #4730 — MySQL twin of UnifiedStore.lastLiveSeq (MAX(seq)
+     *  of live rows, -1 when none). */
+    async lastLiveSeq(sessionId: string): Promise<number> {
         const [rows] = (await this.pool.query(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            "SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL",
             [sessionId],
         )) as unknown as Row[][];
-        return num(rows[0].n);
+        const m = rows[0]?.m;
+        return typeof m === "number" && Number.isFinite(m) ? m : -1;
     }
 
     /** #4316 PR3/3 — MySQL twin of UnifiedStore.seqByRaw. */

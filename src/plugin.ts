@@ -1534,8 +1534,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // fail for a storage nicety.
             try {
                 const store = getStore();
-                const throughSeq = store.unifiedLiveRowCount(parent.id);
-                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                // #4730: cut at the parent's HIGHEST live row seq, not its live
+                // row COUNT — seq is append-only, so a retired row makes COUNT
+                // undershoot the newest position and the child silently loses
+                // tail messages. unifiedLastLiveSeq returns -1 when there is
+                // nothing to clone (kernel-only fork).
+                const lastLiveSeq = store.unifiedLastLiveSeq(parent.id);
+                if (lastLiveSeq >= 0 && !store.unifiedCloneSessionRows(parent.id, child.id, lastLiveSeq)) {
                     loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
                 }
             } catch (err) {
