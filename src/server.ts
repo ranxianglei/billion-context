@@ -19,6 +19,7 @@ import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
+import { noteUpstreamThrottle429 } from "./upstream-throttle.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
@@ -4032,6 +4033,8 @@ export async function preflightCompressIfNeeded(
         ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
     }
     const ff = failFast(status, ffDetail, retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
+    // #4743 review fix (#4772): the withhold verdict carries the 429 evidence — arm the egress hold HERE, not per-response inside the walk: the fits-case forward runs after preflight and must not be blocked by its own summary probe's 429 (#301). Nothing is forwarded on this request, so the armed hold only answers the NEXT turn's relay forward locally. No retry-after header is available at this layer — base-delay backoff applies.
+    if (f?.kind === "upstream" && f.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, null);
     // (#4079) the #726 dead-end cooldown arming was removed with the whole
     // mechanism — see the block comment where the walk starts. The retry
     // contract lives entirely in this answer's retryable:false/status.

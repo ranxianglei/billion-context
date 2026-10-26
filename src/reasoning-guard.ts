@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "./upstream-throttle.js";
 import { scrubLoneSurrogatesOnWire } from "./text-safe.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -558,6 +559,9 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
                 finish(buildIncomplete(st, "upstream_error"));
                 return;
             }
+            // #4743: reasoning-guard continuation rounds feed the 429 governor — a 429 arms the hold for the next client turn.
+            if (roundRes.response.status === 429) noteUpstreamThrottle429(p.upstreamUrl, p.reqHeaders, roundRes.response.headers.get("retry-after"));
+            else noteUpstreamThrottleResolved(p.upstreamUrl, p.reqHeaders, roundRes.response.status);
             const contBody = roundRes.response.body;
             roundRes.stopIdleTimer();
             result = contBody ? await consumeRound(contBody, st, p.res) : { error: "no_body" };

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import test from "node:test";
+import { afterEach, test } from "node:test";
 
 process.env.NODE_ENV = "test";
 // Fail fast on the very first 429 instead of the default 3 attempts with
@@ -16,6 +16,9 @@ import { METADATA_FOLD_COVERAGE } from "../src/fold-reconcile.ts";
 import { getSession } from "../src/session.ts";
 import { normalizeUpstreamOrigin } from "../src/util.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { _resetUpstreamThrottleForTest, upstreamThrottleLocalReject } from "../src/upstream-throttle.ts";
+
+afterEach(() => { _resetUpstreamThrottleForTest(); });
 
 // #301: when preflight (overflow) compression cannot proceed — the summary
 // upstream is rate-limiting, or the compress budget is exhausted — the proxy
@@ -214,6 +217,54 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
         assert.ok(json.error?.message?.includes("NOT forwarded"), `message states the payload was withheld (got: ${json.error?.message})`);
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
         assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight attempted the (429'd) summarization call");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #4743: preflight 429 withhold arms the egress hold — the next forward answers locally", async () => {
+    const calls: Call[] = [];
+    // The summarization endpoint 429s (non-stream); stream forwards would 200 —
+    // so any stream call reaching upstream proves the hold did NOT answer locally.
+    const upstream = makeUpstream429(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const targetUrl = `http://127.0.0.1:${upstreamPort}/v1/messages`;
+
+    try {
+        // Turn 1: over-window history, summary upstream 429s → 503 fail-fast,
+        // payload withheld. The withhold verdict arms the egress hold (#4743).
+        const r1 = await fetch(`http://127.0.0.1:${proxyPort}/bili/${targetUrl}`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "issue4743-hold-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        });
+        assert.equal(r1.status, 503, "fail-fast 503 when the summary upstream rate-limits");
+        await r1.text();
+        assert.ok(upstreamThrottleLocalReject(targetUrl, { "content-type": "application/json" }), "the 429 withhold arms the egress hold");
+
+        // Turn 2: a small fitting payload — the relay gate must answer LOCALLY
+        // (429 + stage:"forward") instead of storming the rate-limited upstream again.
+        const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/${targetUrl}`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "issue4743-hold-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(r2.status, 429, "the held origin answers locally while the hold is armed");
+        const json2 = JSON.parse(await r2.text()) as { error?: { type?: string; stage?: string } };
+        assert.equal(json2.error?.type, "rate_limit_error");
+        assert.equal(json2.error?.stage, "forward");
+        assert.equal(calls.filter((c) => c.stream).length, 0, "zero egress while held — nothing was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

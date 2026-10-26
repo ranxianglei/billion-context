@@ -16,6 +16,7 @@ import { type ResponseInputItem } from "acp-kernel/wire";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "./upstream-throttle.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
@@ -215,24 +216,32 @@ export async function compressLoopResponsesJson(
         requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
         const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
-        const result = await fetchWithRetry(requestOptions.url, {
-            method: "POST",
-            headers: requestOptions.headers,
-            body: roundBody,
-            ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-        }, undefined, undefined, (info) => {
-            // #189: correlate the rejection with the rewrite that preceded it.
-            const lc = lastCompressSuffix(ctx.session.lastCompress);
-            ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
-            loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
-        }).catch((e) => {
+        let result: Awaited<ReturnType<typeof fetchWithRetry>>;
+        try {
+            result = await fetchWithRetry(requestOptions.url, {
+                method: "POST",
+                headers: requestOptions.headers,
+                body: roundBody,
+                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+            }, undefined, undefined, (info) => {
+                // #189: correlate the rejection with the rewrite that preceded it.
+                const lc = lastCompressSuffix(ctx.session.lastCompress);
+                ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
+                loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
+            });
+            // #4743: the Responses-wire compress loop feeds the 429 governor — a settled ok response clears any hold.
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, result.response.status);
+        } catch (e) {
             if (e instanceof UpstreamHttpError) {
+                // #4743: a terminal 429 exhausted the retry budget — arm the governor for the next client turn; any other settled status proves the endpoint is processing again — clear it (relay parity, #4204).
+                if (e.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+                else noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, e.status);
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: responses compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
-                loggerLog("error", `[acp-compress-responses] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                loggerLog("error", `[acp-compress-responses] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
             }
             throw e;
-        });
+        }
         try {
             current = await result.response.json() as Record<string, unknown>;
         } finally {
