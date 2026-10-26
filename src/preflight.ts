@@ -606,6 +606,22 @@ function splitChunks(
     return chunks;
 }
 
+// #4740: the kernel's minCompressRange gate counts raw msg.text.length over
+// the submitted bounds BEFORE tool-pair widening runs (the gate sits in
+// applyCompression's pre-check; adjustBoundariesForToolPairs only runs inside
+// applySingleRange). A span whose own text mass is under the gate is
+// atomically rejected no matter what the widened fold would cover — e.g. a
+// tool-result over the chunk budget splits its small call fragment off into
+// its own span, and that span's preview always dies "too small". Summing the
+// same field host-side lets walk/batch discard such spans CPU-only (no
+// preview burn, no misleading warn), honoring the kernel invariant that
+// preflight never submits a range it cannot apply.
+function spanRawChars(messages: CoreMessage[], start: number, end: number): number {
+    let total = 0;
+    for (let i = start; i <= end; i++) total += messages[i]?.text?.length ?? 0;
+    return total;
+}
+
 // #853: the summary max_tokens for a model — the 32k default, clamped down to
 // the model's known output ceiling when models.dev reports a smaller one.
 // Host comes from the upstream URL so a known provider's namespaced entry
@@ -2364,8 +2380,29 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         rangesTried += 1;
                     }
                     const spans = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
-                    const span = spans.pop();
-                    if (!span) continue;
+                    // #4740: the oldest chunk of a range whose head mass sits under
+                    // the kernel's minCompressRange gate (a tool-result over the
+                    // chunk budget splits its small call fragment off) is
+                    // atomically rejected at preview — and the old one-shot pop
+                    // abandoned the WHOLE range for the round, so while the batch
+                    // lane stayed active such ranges never folded. Advance past
+                    // sub-minimum fragments CPU-only (no preview burn, no skipSet
+                    // poisoning) and nominate the first viable span; pair-widening
+                    // at apply time pulls the fragment back into the fold.
+                    let span: [number, number] | undefined;
+                    let skippedFragments = 0;
+                    while ((span = spans.pop()) !== undefined) {
+                        const fragmentChars = spanRawChars(messages, span[0], span[1]);
+                        if (activeConfig.compress.minCompressRange <= 0 || fragmentChars >= activeConfig.compress.minCompressRange) break;
+                        skippedFragments += 1;
+                    }
+                    if (!span) {
+                        if (skippedFragments > 0) {
+                            deps.log("debug", `[preflight] range ${skipKey}: all ${skippedFragments} span(s) below minCompressRange (${activeConfig.compress.minCompressRange} chars) — not nominated this round (#4740)`);
+                            noteSkip(`${skipKey}: all ${skippedFragments} span(s) below minCompressRange (#4740)`);
+                        }
+                        continue;
+                    }
                     const [cs, ce] = span;
                     const maps = refMaps(messages, deps.session.state);
                     let startRef = maps.idxToRef.get(cs);
@@ -2630,6 +2667,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (refNum(startRef) > refNum(endRef)) {
                     deps.log("warn", `[preflight] normalized reversed range ${startRef}–${endRef} → ${endRef}–${startRef} (non-monotonic refs after client history rewrite, #1001)`);
                     [startRef, endRef] = [endRef, startRef];
+                }
+                // #4740: a span whose own raw char mass is below the kernel's
+                // minCompressRange gate is atomically rejected before pair-
+                // widening runs — skip it CPU-only instead of burning a preview
+                // and logging a misleading "too small" warn every round. The
+                // next span still carries the mass (and pair-widening pulls any
+                // orphaned fragment back in when it folds).
+                const spanChars = spanRawChars(messages, cs, ce);
+                if (activeConfig.compress.minCompressRange > 0 && spanChars < activeConfig.compress.minCompressRange) {
+                    deps.log("debug", `[preflight] skipping sub-minimum span ${startRef}:${endRef} (${spanChars} chars < min ${activeConfig.compress.minCompressRange}) of range ${skipKey} without preview (#4740)`);
+                    noteSkip(`${skipKey}: span ${startRef}:${endRef} below minCompressRange — skipped without preview (#4740)`);
+                    continue;
                 }
                 const preview = deps.core.applyCompression({
                     messages,
