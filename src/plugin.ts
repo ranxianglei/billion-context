@@ -291,6 +291,59 @@ const WARNED_NO_MODEL_REQUESTS_CAP = 4096;
  *  tool-witness TTL in tool-ring.ts. */
 const WITNESS_TTL_MS_PLUGIN = 10 * 60 * 1000;
 
+// #4661: quiet window for stale-binding diagnosis. Hosts that pin a static
+// session id into their MCP shim (ZCode's BILI_CONVERSATION_ID config pin; a
+// CLAUDE_CODE_SESSION_ID captured before a host resume) keep querying a
+// session that no longer receives model traffic while the host's REAL
+// conversation runs under a new id — every tool then answers from the frozen
+// old ledger with zero diagnostics. A bound session quiet past this window
+// (or never seen in this process) while ANOTHER non-restored session has
+// strictly newer model traffic is flagged as a suspected stale binding.
+const STALE_BINDING_QUIET_MS = 15 * 60 * 1000;
+
+// #4661: evidence floor for sessions never touched by a model request in THIS
+// process — their quiet window is measured from proxy start, not the epoch
+// (traffic before a restart is invisible here, so claiming "quiet for 365d"
+// would be dishonest).
+const STALE_BINDING_PROCESS_START_MS = Date.now();
+
+// #4661: one-shot warn log per bound conversation (same rate-limit shape as
+// warnedNoModelRequests).
+const warnedStaleBindings = new Set<string>();
+const WARNED_STALE_BINDINGS_CAP = 4096;
+
+type StaleBindingDiagnosis = {
+    /** The conversation id the caller sent (the suspected stale binding). */
+    boundConversationId: string;
+    /** The session whose runtime traffic evidence says it is the live one. */
+    candidateSessionId: string;
+    /** The candidate's registered conversation id when one exists. */
+    candidateConversationId?: string;
+    /** Milliseconds since the bound session's last model request in this
+     *  process (never-seen sessions measure from proxy start). */
+    quietMs: number;
+};
+
+function staleBindingDiagnosis(bound: Session, boundConversationId: string, now: number): StaleBindingDiagnosis | undefined {
+    const boundAt = bound.lastModelRequestAt ?? STALE_BINDING_PROCESS_START_MS;
+    if (now - boundAt < STALE_BINDING_QUIET_MS) return undefined;
+    let best: Session | undefined;
+    for (const s of listSessions()) {
+        if (s.id === bound.id || s.restored === true) continue;
+        const at = s.lastModelRequestAt;
+        if (at !== undefined && at > boundAt && (best === undefined || at > (best.lastModelRequestAt ?? 0))) best = s;
+    }
+    if (!best) return undefined;
+    return { boundConversationId, candidateSessionId: best.id, candidateConversationId: conversationIdForSession(best.id), quietMs: now - boundAt };
+}
+
+function formatQuietMs(ms: number): string {
+    const min = Math.max(1, Math.round(ms / 60000));
+    if (min < 60) return `${min} min`;
+    const h = Math.floor(min / 60);
+    return `${h}h ${min % 60}m`;
+}
+
 // The conversationId → session mapping is in-memory. Persist it so a resumed
 // or restarted proxy can still resolve /acp + tool calls to the (persisted)
 // session without waiting for a fresh model request. Best-effort: a crash
@@ -1699,6 +1752,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         return;
     }
     if (entry) entry.lastSeen = Date.now();
+    // #4661: additive diagnostic for statically-bound shims polling status —
+    // same evidence as the tool-route diagnosis, surfaced so a suspected stale
+    // binding is visible BEFORE any tool call answers from the frozen ledger.
+    const staleBinding = !viaFallback && conversationId ? staleBindingDiagnosis(session, conversationId, Date.now()) : undefined;
     const limit = session.metadata.effectiveContextLimit;
     const observation = currentContextObservation(session);
     const contextTokensSource = observation?.source ?? "unavailable";
@@ -1862,6 +1919,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         panel,
         webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,
+        ...(staleBinding ? { staleBinding } : {}),
     }));
 }
 
@@ -1899,9 +1957,23 @@ export async function handlePluginTool(
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
     let routedBy: "witness" | "body" | "arb" | "native" = "body";
+    // #4661: stale-binding diagnosis for statically-bound MCP shims (ZCode's
+    // BILI_CONVERSATION_ID config pin, a CLAUDE_CODE_SESSION_ID captured
+    // before a host resume). Drives the witness-conflict self-heal below and
+    // the advisory notice appended to the result. nativeCaller is skipped —
+    // host-stamped ids stay authoritative (#2024).
+    let stale: StaleBindingDiagnosis | undefined;
     if (conversationId) {
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
+        if (session && !nativeCaller) {
+            stale = staleBindingDiagnosis(session, conversationId, Date.now());
+            if (stale && !warnedStaleBindings.has(stale.boundConversationId)) {
+                if (warnedStaleBindings.size >= WARNED_STALE_BINDINGS_CAP) warnedStaleBindings.clear();
+                warnedStaleBindings.add(stale.boundConversationId);
+                deps.log("warn", `[plugin] STALE BINDING suspected for conversation "${stale.boundConversationId}" (no model traffic ${formatQuietMs(stale.quietMs)} in this process) while session "${stale.candidateSessionId}" is active — the MCP shim likely pins a stale session id (new host session or host restart; #4661). Verify: compare the [sess=...] markers in bili.log against the binding.`);
+            }
+        }
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             // #2601: a persona-lineage witness is not a spoof — the host stamps
             // its own raw conversation id while the live traffic (and the ref
@@ -1924,7 +1996,9 @@ export async function handlePluginTool(
                 // re-route via the #760 per-call conversation_id channel, and
                 // hand the shim the recency facts it needs to self-rebind. The
                 // fields are additive; `code` and the error prefix stay stable
-                // for existing consumers.
+                // for existing consumers. (#4661: the no-witness stale shape
+                // never reaches this branch — it is diagnosed on the success
+                // path below instead.)
                 const witnesses = [...witnessIds];
                 let witnessLastSeen = 0;
                 for (const wid of witnesses) {
@@ -2154,12 +2228,30 @@ export async function handlePluginTool(
         const wu = webSessionUrl(deps.webOrigin, session.id);
         if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result.text}`;
     }
+    // #4661: make a suspected stale binding LOUD on the result channel — the
+    // silent shape is a frozen old ledger answering every query with zeros.
+    // The witness-conflict shape never gets here (#4168's 409 names the
+    // witness instead); this covers calls with no matching outbound witness,
+    // which execute on the bound id and would otherwise answer from the
+    // frozen ledger without any diagnostic anywhere.
+    if (stale) {
+        const candidateRef = stale.candidateConversationId ?? stale.candidateSessionId;
+        sentResult = `⚠️ STALE BINDING SUSPECTED (#4661): your bound conversation "${stale.boundConversationId}" has had no model requests for ${formatQuietMs(stale.quietMs)} while session "${candidateRef}" received more recent model traffic — the results below describe the OLD (frozen) session. Rebind your MCP shim to "${candidateRef}" (update BILI_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID and restart the host).\n\n${sentResult}`;
+    }
     // #1875: ok stays the transport/execution signal (200 = the tool ran); the
     // business effect rides additive fields so clients can distinguish an
     // accepted fold from a kernel refusal without parsing the receipt text.
     const body: Record<string, unknown> = { ok: true, tool, conversationId };
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
+    if (stale) {
+        body.staleBinding = {
+            boundConversationId: stale.boundConversationId,
+            candidateSessionId: stale.candidateSessionId,
+            ...(stale.candidateConversationId ? { candidateConversationId: stale.candidateConversationId } : {}),
+            quietMs: stale.quietMs,
+        };
+    }
     body.result = sentResult;
     if (retrievalExport !== undefined) body.retrievalExport = retrievalExport;
     res.writeHead(200, { "content-type": "application/json" });

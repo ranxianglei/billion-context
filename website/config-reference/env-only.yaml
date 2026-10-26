@@ -490,6 +490,14 @@ entries:
     group: envonly
     desc_en: "Opt out of resumed-session orphan adoption when several host sessions share one proxy."
     desc_zh: "多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。"
+  - key: BILI_MCP_NO_STALE_ADOPT
+    type: boolean-ish
+    default: "off (=1 disables stale-binding adoption)"
+    kind: env-only
+    audience: internal
+    group: envonly
+    desc_en: "Opt out of #4661's evidence-based stale-binding self-rebind: the MCP shim adopts the proxy-named live conversation only when the proxy proves the bound session has had no model traffic recently."
+    desc_zh: "退出 #4661 的证据型过期绑定自动换绑：仅当代理证明所绑会话近期无模型流量时，MCP shim 才会换绑到代理指名的活跃会话。"
   - key: BILI_MITM_HOSTS
     type: "string[] (csv)"
     default: "unset"

@@ -21,6 +21,14 @@
 // to this shim's global conversationId — main/sub-agent threads sharing one
 // MCP process must not clobber each other's binding. Absent or malformed
 // metadata leaves the legacy channels untouched.
+// #4661: hosts that pin a STATIC id (ZCode's BILI_CONVERSATION_ID config pin)
+// go stale the moment the host starts a new session or restarts — every tool
+// then answers from the frozen old session. The proxy detects the shape with
+// runtime traffic evidence (bound session quiet >15 min while another session
+// receives model requests), says so in the tool result, and names the live
+// candidate in an additive `staleBinding` body field; this shim adopts that
+// candidate for subsequent calls (and retries once when the answered call ran
+// against the old session). Opt out with BILI_MCP_NO_STALE_ADOPT=1.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -90,6 +98,13 @@ const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // BILI_MCP_NO_ORPHAN_ADOPT=1 when several host sessions share one proxy and
 // the resumed one must not adopt a sibling's conversation.
 const ORPHAN_ADOPT = IDENTITY_BINDING && process.env.BILI_MCP_NO_ORPHAN_ADOPT !== "1";
+// #4661: adopt the proxy-named live conversation when it proves our binding
+// is stale (evidence-based, unlike ORPHAN_ADOPT's recency guess) — armed for
+// every global binding kind; opt out with BILI_MCP_NO_STALE_ADOPT=1.
+const STALE_ADOPT = process.env.BILI_MCP_NO_STALE_ADOPT !== "1";
+// #4661: a static config pin (ZCode's BILI_CONVERSATION_ID) is the one binding
+// kind ORPHAN_ADOPT never arms for — extend #4168's 409 self-rebind to it.
+const STATIC_PIN = !IDENTITY_BINDING && Boolean(process.env.BILI_CONVERSATION_ID?.trim());
 let manifestTools: McpToolDef[] = [];
 let manifestMaxToolDurationMs: number | undefined;
 let conversationId = CONVERSATION_FROM_ENV;
@@ -153,7 +168,7 @@ export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: 
 
 export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
     for (let attempt = 0; ; attempt++) {
-        // Recomputed per attempt: an in-loop adoption (#656/#4168) rewrites the
+        // Recomputed per attempt: an in-loop adoption (#656/#4168/#4661) rewrites the
         // global binding, and the retry must carry the NEW id — capturing it
         // once above the loop would silently re-POST the stale one.
         const effectiveConversationId = conversationIdOverride ?? conversationId;
@@ -175,11 +190,25 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown; code?: unknown; witnessSessions?: unknown; namedSessionLastSeen?: unknown; witnessLastSeen?: unknown };
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown; code?: unknown; witnessSessions?: unknown; namedSessionLastSeen?: unknown; witnessLastSeen?: unknown; staleBinding?: { boundConversationId?: string; candidateSessionId?: string; candidateConversationId?: string; quietMs?: number } };
         // #1875: ok:true means the tool RAN; the business effect rides outcome.
         // failure/refusal receipts become MCP isError so hosts surface them to
         // the model — partial still counts as success.
         if (res.ok && data.ok) {
+            // #4661: the proxy proved our binding is stale with runtime traffic
+            // evidence and named the live candidate (additive body field). The
+            // answered call ran against the OLD session, so adopt the candidate
+            // for subsequent calls AND retry once to hand the caller the live
+            // session's answer instead of the frozen ledger's zeros. Per-call
+            // (#760/#2024) routes never write back to the global binding.
+            const sb = data.staleBinding;
+            const candidate = (typeof sb?.candidateConversationId === "string" && sb.candidateConversationId.length > 0 ? sb.candidateConversationId : undefined)
+                ?? (typeof sb?.candidateSessionId === "string" && sb.candidateSessionId.length > 0 ? sb.candidateSessionId : undefined);
+            if (candidate && candidate !== effectiveConversationId && STALE_ADOPT && conversationIdOverride === undefined && !nativeCaller) {
+                conversationId = candidate;
+                process.stderr.write(`[bili-mcp] proxy reported stale binding "${sb?.boundConversationId ?? effectiveConversationId}" (no model traffic ${typeof sb?.quietMs === "number" ? Math.round(sb.quietMs / 60000) + " min" : "?"}); adopting live conversation ${candidate} (#4661)\n`);
+                if (attempt === 0) continue;
+            }
             const outcome = parseToolOutcome(data.outcome);
             const blocksCreated = parseBlocksCreated(data.blocksCreated);
             let text = data.result ?? "";
@@ -213,8 +242,10 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
         // traffic moved there AFTER the bound session's last activity.
         // Multiple witnesses, missing facts (older proxy), or a still-fresh
         // binding all stay on the loud 409 — fail closed, never guess.
+        // #4661: armed for static config pins too — ZCode's BILI_CONVERSATION_ID
+        // pin hits exactly this shape with ORPHAN_ADOPT off (no identity env).
         if (
-            res.status === 409 && attempt === 0 && ORPHAN_ADOPT && conversationIdOverride === undefined && conversationId &&
+            res.status === 409 && attempt === 0 && (ORPHAN_ADOPT || (STATIC_PIN && STALE_ADOPT)) && conversationIdOverride === undefined && conversationId &&
             data.code === "TOOL_CONVERSATION_CONFLICT"
         ) {
             const witnesses = Array.isArray(data.witnessSessions)
@@ -419,6 +450,13 @@ async function handleMessage(msg: {
     }
 }
 async function mcpMain(): Promise<void> {
+    // #4661: a static pin (BILI_CONVERSATION_ID, no CLAUDE_CODE_SESSION_ID)
+    // goes stale on every new host session / host restart — say so at startup
+    // instead of letting every tool silently answer from the frozen old
+    // ledger until someone notices.
+    if (!IDENTITY_BINDING && conversationId && process.env.BILI_CONVERSATION_ID?.trim()) {
+        process.stderr.write(`[bili-mcp] warning: session binding "${conversationId}" is STATIC (BILI_CONVERSATION_ID) — it goes stale when the host starts a new session or restarts (the id changes). Until rebinded, tools may answer from the frozen old session; the proxy flags suspected stale bindings in tool results and this shim rebinds automatically once it has evidence (#4661). Manual rebind: point BILI_CONVERSATION_ID at the live session id and restart the host.\n`);
+    }
     let buf = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk: string) => {

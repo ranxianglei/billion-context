@@ -156,6 +156,7 @@
 | `BILI_MCP_PROXY` | codex MCP shell 用的 proxy origin（含发现回退） |
 | `BILI_MCP_DEFAULT_ORIGIN` | zcode MCP entry 默认 origin（http://127.0.0.1:8787） |
 | `BILI_MCP_NO_ORPHAN_ADOPT` | `=1` 多宿主共享一个 proxy 时禁用孤儿 adopt |
+| `BILI_MCP_NO_STALE_ADOPT` | `=1` 禁用 #4661 证据型过期绑定自动换绑（代理证明所绑会话近期无模型流量时 shim 换绑到活跃会话） |
 | `BILI_UPSTREAM_PROXY` / `BILI_UPSTREAM_PROXY_MODE` | 上游出口代理及 manual/auto 模式（默认直连是有意设计，#346/#357） |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | 远端隧道允许清单（host / host:port） |
 | `BILI_ZONE_PORT` | USER zone 基址覆盖（#1660） |

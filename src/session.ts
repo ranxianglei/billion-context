@@ -615,9 +615,17 @@ export type Session = {
      *  session was restored from disk and has seen no request in THIS process
      *  (#404). Restored sessions carry their on-disk savedAt as lastSeen (not
      *  Date.now()), so consumers can tell boot-restore staleness from real
-     *  activity; fallback=latest skips restored sessions rather than guessing
-     *  among a readdir-order tie. Cleared on the first real request touch. */
+     * activity; fallback=latest skips restored sessions rather than guessing
+     * among a readdir-order tie. Cleared on the first real request touch. */
     restored?: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): timestamp of
+     *  the last MODEL REQUEST that touched this session in THIS process
+     *  (#4661). Stamped by the request pipeline only — tool calls and
+     *  disk-reload paths must never refresh it, so it stays honest evidence
+     *  of live traffic for stale-binding diagnosis (a statically-bound MCP
+     *  shim querying a quiet session while another session receives model
+     *  requests). Undefined until the first request of this process. */
+    lastModelRequestAt?: number;
     /** In-memory only (NOT persisted): one-shot set by persist's load (#1343).
      *  getSession() clears `restored` on the first request touch, but
      *  reconcileReloadedRetrievals runs LATER in that same request — so it

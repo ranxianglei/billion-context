@@ -391,6 +391,26 @@ two small node scripts that do the work around the client:
   against the live proxy manifest, the routed entries gain
   `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
   Tool calls bind via the per-call `conversation_id` argument (#760).
+- **Session binding & stale pins (#4661):** ZCode injects no session id into
+  the MCP child, so the shim binds to the `BILI_CONVERSATION_ID` you pinned in
+  `~/.zcode/cli/config.json`; that pin goes stale whenever ZCode mints a new
+  session id (new session or host restart). Before #4661 a stale pin failed
+  silently — every MCP tool answered from the frozen old session (`CONTEXT
+  BREAKDOWN 0 tool / 0 text`, `Nudge: idle`) while the real session's ledger
+  stayed healthy in `GET /__bili/sessions`. The proxy now proves staleness with
+  runtime evidence (bound session without model requests for 15 min while
+  another session has fresher traffic) and surfaces it three ways: executing
+  calls gain a `⚠️ STALE BINDING SUSPECTED` prefix plus an additive
+  `staleBinding` field naming the live candidate, `GET /__bili/plugin/status`
+  carries the same field, and the shim rebinds itself to the proxy-named
+  candidate and retries once — for static pins as well as identity bindings —
+  alongside a startup warning that the pin is static. Conflicting calls (the
+  live session emitted the identical tool call) get the informative 409 of
+  #4168, which the shim now self-heals on too. Opt out of the auto-rebind with
+  `BILI_MCP_NO_STALE_ADOPT=1`. Manual rebind instead: take the live id from the
+  `[sess=...]` markers in `~/.local/state/billion-context/bili.log` (or the
+  host's `$TMPDIR/.../sess_<id>/` working dir), point `BILI_CONVERSATION_ID`
+  at it, restart ZCode.
 - **What gets cleaned vs. never touched (unified ACP invariants):** model
   prose may have bili render-tag echoes / marker lines / degenerate residue
   stripped in transit; the **thinking channel** (anthropic `thinking`, google

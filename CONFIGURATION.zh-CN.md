@@ -415,6 +415,7 @@
 | `BILI_LAUNCH_TOKEN` | string | unset (generated per launch) | — | 启动令牌，鉴权启动器与其派生代理之间的车道内部端点（机密）。 |
 | `BILI_MCP_DEFAULT_ORIGIN` | string | http://127.0.0.1:8787 | — | MCP 入口的兜底代理 origin 候选。 |
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | 多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。 |
+| `BILI_MCP_NO_STALE_ADOPT` | boolean-ish | off (=1 disables stale-binding adoption) | — | 退出 #4661 的证据型过期绑定自动换绑：仅当代理证明所绑会话近期无模型流量时，MCP shim 才会换绑到代理指名的活跃会话。 |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |

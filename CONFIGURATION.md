@@ -415,6 +415,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_LAUNCH_TOKEN` | string | unset (generated per launch) | — | Launch token authenticating lane-internal endpoints between a launcher and its spawned proxy (secret). |
 | `BILI_MCP_DEFAULT_ORIGIN` | string | http://127.0.0.1:8787 | — | Fallback proxy origin candidate for MCP entry points. |
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | Opt out of resumed-session orphan adoption when several host sessions share one proxy. |
+| `BILI_MCP_NO_STALE_ADOPT` | boolean-ish | off (=1 disables stale-binding adoption) | — | Opt out of #4661's evidence-based stale-binding self-rebind: the MCP shim adopts the proxy-named live conversation only when the proxy proves the bound session has had no model traffic recently. |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS). |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design. |

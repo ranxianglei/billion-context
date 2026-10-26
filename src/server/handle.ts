@@ -1372,6 +1372,9 @@ async function handleRequest(
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // #4661: runtime traffic evidence for stale-binding diagnosis — only
+        // real requests refresh it (tool calls / disk reloads must not).
+        session.lastModelRequestAt = Date.now();
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
