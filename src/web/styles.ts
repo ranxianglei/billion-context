@@ -480,6 +480,11 @@ table.data.fold-table th, table.data.fold-table td { display: table-cell; }
 .twrap { overflow-x: auto; }
 .tproc table.data { min-width: 520px; }
 .twide table.data { min-width: 940px; table-layout: fixed; }
+.twide th { position: relative; }
+.col-resize { position: absolute; top: 0; right: 0; width: 8px; height: 100%; padding: 0; border: 0; border-right: 1px solid var(--border); background: transparent; cursor: col-resize; touch-action: none; }
+.col-resize:hover, .col-resize:focus-visible { background: var(--accent-soft); border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: -2px; }
+.twide .columns-resized .w-title, .twide .columns-resized .row-id, .twide .columns-resized .w-up { max-width: 100%; }
+.twide .columns-resized th, .twide .columns-resized td { overflow: hidden; text-overflow: ellipsis; }
 .hitc { font-size: 11px; letter-spacing: -0.2px; }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .client-cell { min-width: 0; }
