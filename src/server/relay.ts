@@ -349,7 +349,7 @@ async function forwardCaptured(
     releaseRequestInput?: () => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
-    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
+    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
