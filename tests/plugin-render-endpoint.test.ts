@@ -17,7 +17,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { __resetIncrementalLaneForTests } from "../src/incremental-lane.js";
@@ -259,6 +259,76 @@ test("S5 guard rails: poison msgids hard-fail; count mismatch degrades silently"
         const mismatch = await h.turn({ sinceSeq: 1, messages: [assistantMsg(1)], msgIds: ["only-one"] });
         assert.equal(mismatch.status, 200);
         assert.equal(mismatch.headers.get("x-bili-applied-seq"), "2");
+    } finally {
+        await h.close();
+    }
+});
+
+/** #4732: seed 3 rows, then attach an active fold block covering the given
+ *  row indices (by stored-row message id) to the warm in-memory session. */
+async function seedFolded(h: Harness, coverIdx: number[], blockId: string): Promise<void> {
+    const seed = await h.turn({ sinceSeq: 0, messages: [userMsg(1)] });
+    assert.equal(seed.status, 200);
+    const delta = await h.turn({ sinceSeq: 1, messages: [assistantMsg(1), userMsg(2, "second")] });
+    assert.equal(delta.status, 200);
+    await settle(h, "conv-render-1", 3);
+    const rows = h.store.unifiedTailViewRows("conv-render-1");
+    assert.ok(rows && rows.length === 3);
+    const ids = rows.map((r) => (JSON.parse(r.content) as { id: string }).id);
+    const session = peekSession("conv-render-1");
+    assert.ok(session, "session must be warm after turns");
+    session.state.blocks.push({
+        blockId, runId: `r-${blockId}`, tier: 1, summary: `${blockId} summary`,
+        directMessageIds: coverIdx.map((i) => ids[i]), effectiveMessageIds: coverIdx.map((i) => ids[i]),
+        directBlockIds: [], compressedTokens: 100, createdAt: Date.now(),
+        survivedCount: 1, generation: "young", active: true,
+    });
+}
+
+interface WireMsg { role: string; content: unknown; }
+function wireBlocks(m: WireMsg): { type?: string; text?: string }[] {
+    return Array.isArray(m.content) ? m.content as { type?: string; text?: string }[] : [{ type: "text", text: String(m.content) }];
+}
+
+test("#4732 fold reaching the window tail keeps its acp_summary carrier (suppressed rows never render bare)", async () => {
+    const h = await harness(true);
+    try {
+        // The ordinary post-compression state: the fold's last covered row IS
+        // the transcript tail — nothing appended since the compress call.
+        await seedFolded(h, [1, 2], "bTail");
+
+        for (const untilSeq of [3, 2]) {
+            const r = await h.render({ conversationId: "conv-render-1", untilSeq });
+            assert.equal(r.status, 200, JSON.stringify(r.body));
+            const out = r.body as { ok: boolean; appliedSeq: number; messages: WireMsg[] };
+            assert.equal(out.ok, true);
+            assert.equal(out.appliedSeq, untilSeq);
+            // Covered rows are suppressed but the carrier must ride at the window
+            // tail: coreToAnthropic voices the system anchor as a user message
+            // whose empty text block merges into the preceding user entry, so the
+            // observable shape is one user message ending in the empty anchor block.
+            assert.equal(out.messages.length, 1, JSON.stringify(out.messages));
+            assert.equal(out.messages[0].role, "user");
+            const blocks = wireBlocks(out.messages[0]);
+            assert.equal(blocks.length, 2, `untilSeq=${untilSeq}: carrier missing — ${JSON.stringify(out.messages)}`);
+            assert.deepEqual(blocks[blocks.length - 1], { type: "text", text: "" }, `untilSeq=${untilSeq}: trailing block must be the fold carrier`);
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+test("#4732 negative direction: a fold NOT reaching the tail anchors mid-window as before", async () => {
+    const h = await harness(true);
+    try {
+        await seedFolded(h, [0], "bMid");
+        const r = await h.render({ conversationId: "conv-render-1", untilSeq: 3 });
+        assert.equal(r.status, 200, JSON.stringify(r.body));
+        const out = r.body as { ok: boolean; messages: WireMsg[] };
+        assert.equal(out.ok, true);
+        // Anchor first (before the assistant row), then the visible rows.
+        assert.deepEqual(out.messages.map((m) => m.role), ["user", "assistant", "user"]);
+        assert.deepEqual(wireBlocks(out.messages[0]), [{ type: "text", text: "" }]);
     } finally {
         await h.close();
     }
