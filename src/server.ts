@@ -4166,24 +4166,60 @@ export class BodyTooLargeError extends Error {
     }
 }
 
+// #4753: every settlement path (end / error / over-limit / close-before-end)
+// detaches its OWN listeners and empties the chunk array — the pre-fix version
+// left all three listeners attached to the request for its whole life, and each
+// listener closure retained every network chunk received before concatenation.
+// A socket that closed mid-body WITHOUT an 'error' event (clean FIN) used to
+// leave the promise — and the admission slot awaiting it — pending forever; it
+// now settles as an abort.
 export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
-        let aborted = false;
-        req.on("data", (c: Buffer) => {
-            if (aborted) return;
+        let settled = false;
+        const detach = (): void => {
+            req.removeListener("data", onData);
+            req.removeListener("end", onEnd);
+            req.removeListener("error", onError);
+            req.removeListener("close", onClose);
+        };
+        const settle = (): void => {
+            settled = true;
+            detach();
+            chunks.length = 0;
+        };
+        const onData = (c: Buffer): void => {
+            if (settled) return;
             size += c.length;
             if (size > knobLimitsReceiveBytes()) {
-                aborted = true;
+                settle();
                 req.destroy();
                 reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
-        });
-        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
-        req.on("error", (e) => { if (!aborted) reject(e); });
+        };
+        const onEnd = (): void => {
+            if (settled) return;
+            const out = Buffer.concat(chunks);
+            settle();
+            resolve(out);
+        };
+        const onError = (e: Error): void => {
+            if (settled) return;
+            settle();
+            reject(e);
+        };
+        const onClose = (): void => {
+            if (settled) return;
+            settle();
+            reject(new Error("request aborted before body completed"));
+        };
+        req.on("data", onData);
+        req.on("end", onEnd);
+        req.on("error", onError);
+        req.on("close", onClose);
     });
 }
 

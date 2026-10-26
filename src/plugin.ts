@@ -393,10 +393,30 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
     scheduleSaveConversations();
 }
 
+// #4753: the raw inbound body no longer survives to this post-forward point —
+// the request frame releases it when upstream retries settle. These two
+// scalars are computed from the SAME bytes BEFORE any mutation (the caller
+// passes the original parse result, not the envelope-unwrapped/chain-stripped
+// graph) so the bookkeeping here is byte-for-byte what the old post-forward
+// hash+walk produced; only the scalars cross the boundary.
+export type RawWireBookkeeping = { wireHash: string; textComparable: boolean };
+
+export function computeRawWireBookkeeping(rawWire: Buffer, wireJson: unknown): RawWireBookkeeping {
+    const wireHash = createHash("sha256").update(rawWire).digest("hex");
+    let textComparable: boolean;
+    try {
+        const wire = wireJson as Record<string, unknown>;
+        textComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+    } catch {
+        textComparable = false;
+    }
+    return { wireHash, textComparable };
+}
+
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
+export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: RawWireBookkeeping): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
     // so both the ≤200 heuristic and size-based guards are proxies that a new
@@ -517,21 +537,13 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             snapshotRefsEvaluatedStore.set(session, session.contentStore);
         }
         if (rawWire !== undefined) {
-            // The comparable verdict is a property of the wire body: hash it
-            // (native speed) and only re-parse + walk when the body actually
-            // changed, so a retry with an identical body stays cheap.
-            const wireHash = createHash("sha256").update(rawWire).digest("hex");
-            if (session.metadata.publicSnapshotWireHash !== wireHash) {
-                let comparable: boolean;
-                try {
-                    const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
-                    comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
-                } catch {
-                    comparable = false;
-                }
-                session.metadata.publicSnapshotWireHash = wireHash;
-                if (session.metadata.publicSnapshotTextComparable !== comparable) {
-                    session.metadata.publicSnapshotTextComparable = comparable;
+            // #4753: precomputed scalars (see computeRawWireBookkeeping). The
+            // hash gate is unchanged: an identical body skips the metadata
+            // write entirely, so retries stay cheap.
+            if (session.metadata.publicSnapshotWireHash !== rawWire.wireHash) {
+                session.metadata.publicSnapshotWireHash = rawWire.wireHash;
+                if (session.metadata.publicSnapshotTextComparable !== rawWire.textComparable) {
+                    session.metadata.publicSnapshotTextComparable = rawWire.textComparable;
                     changed = true;
                 }
             }

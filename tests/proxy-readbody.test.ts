@@ -45,3 +45,51 @@ test("readBody: BodyTooLargeError carries the limit", async () => {
         if (e instanceof BodyTooLargeError) assert.equal(e.limit, MAX_REQUEST_BYTES);
     }
 });
+
+// #4753: the old implementation never removed its listeners, so the closure holding
+// every network chunk stayed attached to the request for its whole life. These pins
+// cover all four settlement paths, including the five-byte repro from the issue.
+const READBODY_EVENTS = ["data", "end", "error", "close"] as const;
+function assertNoReadBodyListeners(req: EventEmitter, label: string): void {
+    for (const ev of READBODY_EVENTS) {
+        assert.equal(req.listenerCount(ev), 0, `${label}: no leftover "${ev}" listeners`);
+    }
+}
+
+test("readBody: detaches all owned listeners on success (five-byte repro)", async () => {
+    const req = Readable.from([Buffer.from("hello")]) as unknown as EventEmitter & Readable;
+    const out = await readBody(req as never);
+    assert.equal(out.toString("utf8"), "hello");
+    assertNoReadBodyListeners(req, "success");
+});
+
+test("readBody: detaches all owned listeners on error", async () => {
+    const req = new EventEmitter();
+    Object.defineProperty(req, "destroy", { value: () => {}, configurable: true });
+    const p = readBody(req as never);
+    req.emit("data", Buffer.from("hel"));
+    req.emit("error", new Error("socket hang up"));
+    await assert.rejects(p, /socket hang up/);
+    assertNoReadBodyListeners(req, "error");
+});
+
+test("readBody: close before end settles as an abort instead of dangling", async () => {
+    const req = new EventEmitter();
+    Object.defineProperty(req, "destroy", { value: () => {}, configurable: true });
+    const p = readBody(req as never);
+    req.emit("data", Buffer.from("hel"));
+    req.emit("close");
+    await assert.rejects(p, /aborted before body completed/);
+    assertNoReadBodyListeners(req, "close-before-end");
+});
+
+test("readBody: detaches all owned listeners when the body exceeds the limit", async () => {
+    const req = new EventEmitter();
+    let destroyed = false;
+    Object.defineProperty(req, "destroy", { value: () => { destroyed = true; }, configurable: true });
+    const p = readBody(req as never);
+    req.emit("data", Buffer.alloc(MAX_REQUEST_BYTES + 1));
+    await assert.rejects(p, BodyTooLargeError);
+    assert.equal(destroyed, true);
+    assertNoReadBodyListeners(req, "over-limit");
+});

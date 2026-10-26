@@ -266,6 +266,13 @@ async function forwardCaptured(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
+    // #4753: fired exactly once at the settlement point below — after EVERY
+    // upstream attempt (initial send, role-ladder retry, image-count retry,
+    // overflow refold) has finished and before response streaming begins. The
+    // caller uses it to release input-side data that no longer has a consumer;
+    // outbound bodies stay (fake-completion retries + echo provenance read them
+    // post-settlement). Fast paths that answer before settlement never fire it.
+    onRetriesSettled?: () => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
@@ -1449,6 +1456,16 @@ async function forwardCaptured(
             }
         }
     }
+    // #4753: every upstream attempt has settled here (initial send, role-ladder
+    // retry, pck probe, image-count retry, overflow refold — all above). Below
+    // this line the response may stream for minutes while both frames stay
+    // suspended: drop our own refold-hook slot and hand the caller its release
+    // callback so the raw inbound body, the parsed graph and the preparation
+    // closure stop riding along for the duration of the stream. Outbound bytes
+    // (body/wireBody) stay — fake-completion retries and echo provenance read
+    // them post-settlement.
+    overflowRefold = undefined;
+    onRetriesSettled?.();
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
     // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is

@@ -40,7 +40,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { computeRawWireBookkeeping, consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -96,6 +96,12 @@ function persistLineageLinkNow(session: Session): void {
  *  be noise on a stream that re-sends the same id every turn. */
 const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
+
+// #4753: sentinel swapped into the request-input slots when upstream retries
+// settle — keeps the slot types stable while releasing the (potentially
+// multi-gigabyte) inbound allocations ahead of a long response stream. All
+// post-settlement readers see an empty body / null graph by construction.
+const RELEASED_REQUEST_BODY = Buffer.alloc(0);
 
 export async function handle(
     req: http.IncomingMessage,
@@ -509,12 +515,18 @@ async function handleRequest(
     // windows behind different relays), then the built-in table. Falls back to
     // the global env default if neither matches.
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
+    // #4753: rawWireJson keeps the ORIGINAL parse result — the v1internal
+    // unwrap below and the chain-stale strip reassign `parsed` to new objects,
+    // but the raw-wire bookkeeping verdict must describe the wire bytes, not
+    // any pipeline view of them.
     let parsed: unknown = null;
+    let rawWireJson: unknown = null;
     let bodyText: string | undefined;
     if (protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
         try {
             parsed = JSON.parse(bodyText);
+            rawWireJson = parsed;
         } catch {
             parsed = null;
         }
@@ -2756,6 +2768,14 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
+            // #4753: precompute the raw-wire bookkeeping scalars BEFORE prepare
+            // mutates the parsed graph — the verdict describes the wire bytes,
+            // anchored on the ORIGINAL parse (rawWireJson). Gated on the plugin
+            // lane because that is the only consumer; bypass/relay/chain-skip
+            // requests pay nothing extra here.
+            const rawWireBookkeeping = typeof session.metadata.pluginAgent === "string"
+                ? computeRawWireBookkeeping(bodyBuffer, rawWireJson)
+                : undefined;
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
                 forwarded = true;
@@ -2769,7 +2789,7 @@ async function handleRequest(
                 // re-sending it within this same request. An unchanged body
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
-                const overflowRefold = pendingForward.prepared
+                let overflowRefold: ((realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
@@ -2778,14 +2798,34 @@ async function handleRequest(
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta);
+                // #4753: the last consumer of the INPUT side (raw body, decoded
+                // text, parsed graph, refold preparation closure) settles inside
+                // forward() once every upstream attempt has finished — release it
+                // THERE instead of riding both suspended frames across the whole
+                // response stream. Closures capture the cells, not the values, so
+                // reassigning these locals frees the allocations even though
+                // runPreparedPipeline itself stays on the frame until forward
+                // returns. The OUTBOUND body (fake-completion/blind retries + echo
+                // provenance read it post-settlement) and the session pin stay
+                // through the response by design.
+                const releaseRequestInput = (): void => {
+                    bodyBuffer = RELEASED_REQUEST_BODY;
+                    bodyText = undefined;
+                    parsed = null;
+                    overflowRefold = undefined;
+                    // The chain-fingerprint/resume memo aliases parsed.messages
+                    // (or input/contents) — drop it or the inbound message array
+                    // stays pinned on this frame across the response stream.
+                    affinityMessagesCache = null;
+                };
+                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, releaseRequestInput);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, rawWireBookkeeping));
                 }
             }
         } finally {
