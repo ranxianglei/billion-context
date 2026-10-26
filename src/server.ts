@@ -3348,6 +3348,7 @@ export async function preflightCompressIfNeeded(
     // floor under the documented minimum. Clamping to the minimum disarms
     // auto-fold on sub-8K windows outright (target >= overflow ⇒ growthArmed
     // false), which matches the documented feature scope.
+    const configuredAutoFoldTarget = (config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens;
     // [#3444] A configured target below what this session can physically reach
     // (system prompt + tool schemas + live tail) is UNREACHABLE: every fold
     // lands above it and the trigger re-fires on every request (fold storm).
@@ -3359,10 +3360,19 @@ export async function preflightCompressIfNeeded(
     // releases via growthFoldingArmed's measuredFloor arg).
     const measuredFloor = autoFoldOn ? autoFoldFloor(session) : undefined;
     const autoFoldTarget = autoFoldOn
-        ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
+        ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min(configuredAutoFoldTarget ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
         : undefined;
     const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
+    // #4543: an explicit autoFoldTargetTokens ≥ this route's overflow target clamps
+    // to it and leaves growth folding SILENTLY inert (noteAutoFoldIgnored only
+    // covers the disabled-chain no-op). Warn once per session per distinct route
+    // bar — logging only, no behavior change.
+    if (autoFoldOn && typeof configuredAutoFoldTarget === "number" && overflowTarget > 0 && configuredAutoFoldTarget >= overflowTarget
+        && session.metadata.autoFoldInertBarWarned !== overflowTarget) {
+        session.metadata.autoFoldInertBarWarned = overflowTarget;
+        log("warn", `[external-summary] auto-fold INERT on this route: autoFoldTargetTokens=${configuredAutoFoldTarget} is at or above this route's overflow target ${overflowTarget}; growth folding arms only while the target is below the overflow bar, so no pre-forward growth fold will run here — folding happens only at overflow. Set autoFoldTargetTokens below ${overflowTarget} (or use a wider-window route) to arm it (#4543).`);
+    }
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
     // trigger on the real post-fold payload too. outboundPayloadBreakdown is the
