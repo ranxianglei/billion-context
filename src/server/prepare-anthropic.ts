@@ -7,6 +7,7 @@ import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforg
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -591,10 +592,9 @@ export async function prepareAnthropic(
     // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
     // char-count upper bound) — settleUsageReport pairs it with this turn's
     // usage report to learn the per-route estimate-calibration factor k̂.
-    session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+    noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
-    if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin), upstreamOrigin);
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 

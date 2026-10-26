@@ -7,6 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -489,11 +490,9 @@ export async function prepareOpenai(
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
-        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
-        const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
-        if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

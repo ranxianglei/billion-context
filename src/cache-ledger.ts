@@ -1652,6 +1652,27 @@ export const CALIBRATION_CLAMP_MAX = 4;
 // One lucky/degenerate pair must not flip every estimate on the route.
 export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
+// #4425: write-side twin of the #4383 reader guard (the read side degrades a
+// stale anchor once it sits far below the established load; the write side
+// must be stricter because here the incumbent is EVIDENCE BEING DESTROYED,
+// not a value being read). A usage sample billing less than one order of
+// magnitude below the session's established input scale (lastInputTokens +
+// active compress credit — resetSessionCompression zeroes the baseline at
+// native-compaction boundaries, so post-compaction small settles bootstrap
+// freely) is an auxiliary/sidecar request that slipped past the side-request
+// lane's evidence allowlist and shared the main session id (#2740 documents
+// the claude-code no-stop s2 shape taking the normal lane; any unrecognized
+// aux shape is the same class). Such a sample is billing-only: it must not
+// clear the emergency shrink arm, wipe overflow evidence, burn the
+// post-rebuild anchor, consume or roll the main turn's k̂ pending pair, or
+// book a cache ledger line whose body pairing points at the aux request
+// (#4425 facets 1–5). Margin: aux samples typically bill <2% of session load
+// (rejected), while the smallest legitimate main settle after an armed round
+// still bills ≥ ~23% of the arm estimate — char-based estimator inflation
+// caps around 4.4× on the measured band (#4383 evidence) — so 1/10 separates
+// the two with margin in both directions. A rejected sample self-heals within
+// one main turn: the next accepted settle refreshes the incumbent scale.
+export const NON_MAIN_USAGE_RATIO = 0.1;
 
 /** #2867/#2973: the canonical incoming system fp is a responses-LANE-ONLY
  *  classification input — its sole writer is prepare-responses'
@@ -1781,11 +1802,41 @@ export function noteOutboundContextEstimates(
     session.stats.contextTokensSource = "estimate";
 }
 
+/** #1933 F1 / #4425: record this request's billed-caliber text estimate as the
+ *  pending k̂ pair (consumed by the next same-route settleUsageReport). Shared
+ *  by all four prepare lanes so the clobber discipline cannot drift per wire.
+ *  #4425: an auxiliary-sized body (< NON_MAIN_USAGE_RATIO × the outstanding
+ *  pair) must NOT replace it — aux requests prepare and settle between main
+ *  turns, and if one swapped in its tiny denominator the main settle would
+ *  consume a (auxEstimate, mainBilled) mispair the plausibility band rejects,
+ *  starving k̂ forever on hosts that fire an aux call before every tool call.
+ *  Keeping the larger pair is safe: append-only histories only grow between
+ *  main turns, so a surviving large pair is either overwritten by the next
+ *  main prepare or consumed in-band by a billed total at least as large as
+ *  its true ratio. */
+export function noteLocalTextEstimate(session: Session, estimate: number, origin?: string): void {
+    const pending = session.stats.lastLocalTextEstimate;
+    if (pending !== undefined && estimate < NON_MAIN_USAGE_RATIO * pending) return;
+    session.stats.lastLocalTextEstimate = estimate;
+    if (origin) session.stats.lastLocalTextEstimateOrigin = origin;
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
     localTextEstimate?: number,
 ): void {
+    // #4425: non-main sample gate — see NON_MAIN_USAGE_RATIO. An auxiliary
+    // request that slipped past the side lane settles here with a tiny total;
+    // running the effect set below would destroy main-turn decision state
+    // (arm, overflow evidence, post-rebuild anchor, k̂ pair, cache-line
+    // pairing). Raw billing stays honest: the tokens were really billed.
+    const establishedScale = (session.stats.lastInputTokens ?? 0) + (session.stats.compressCreditTokens ?? 0);
+    if (s.total > 0 && establishedScale > 0 && s.total < NON_MAIN_USAGE_RATIO * establishedScale) {
+        session.stats.inputTokens += s.total;
+        loggerLog("info", `[${session.id}] [acp-usage] non-main sample input=${s.total} (<${Math.round(NON_MAIN_USAGE_RATIO * 100)}% of established ${Math.round(establishedScale)}) — decision state kept, billing only (#4425)`);
+        return;
+    }
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {

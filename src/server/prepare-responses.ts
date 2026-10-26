@@ -6,6 +6,7 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -651,12 +652,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // see the anthropic-lane counterpart above. #4166: mid-history sys/dev
         // items are cores now, so both estimators see the same wire set the
         // preflight base measures.
-        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
-        const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
-        if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
