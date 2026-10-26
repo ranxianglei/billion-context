@@ -5,10 +5,11 @@
 // land at the tail and flush after the merge loop.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import http from "node:http";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
+import { rmrf } from "./tmp-rm.ts";
 import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -22,7 +23,7 @@ import { __resetIncrementalLaneForTests } from "../src/incremental-lane.js";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-pr-tail-"));
-test.after(() => rmSync(testRoot, { recursive: true, force: true }));
+test.after(() => rmrf(testRoot));
 
 const userMsg = (n: number, text = "hello") => ({ role: "user", content: `${text} ${n}`.repeat(40) });
 const assistantMsg = (n: number) => ({ role: "assistant", content: `model answer ${n}` });
@@ -79,7 +80,7 @@ async function harness() {
         }
         throw new Error(`rows never reached ${want}`);
     };
-    return { turn, render, settle, store, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { turn, render, settle, store, close: async () => { store.closeQuietly(); await new Promise<void>((resolve) => proxy.close(() => resolve())); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 function once0(server: { once: (e: string, cb: () => void) => void }): Promise<void> {

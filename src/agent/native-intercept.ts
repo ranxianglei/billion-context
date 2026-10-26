@@ -600,8 +600,12 @@ function fallbackOversizeRefusal(
     doom: { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number },
     reason?: UnavailableReason,
 ): Response {
+    // #4824: "send-failed" reads as died here too — the proxy WAS live and
+    // died mid-session; the give-up reason slot keeps the branch name for the
+    // fire-time consumer (#4125), while this steady-state wording cares only
+    // about died-vs-never-came-up-vs-busy.
     const why =
-        reason === "dead"
+        reason === "dead" || reason === "send-failed"
             ? "the bili proxy died and no replacement came up"
             : reason === "busy-exhausted"
               ? "the bili proxy is alive but unresponsive within the wait budget (#3654)"
@@ -1295,7 +1299,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 }
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
+                // #4125/#4824: no trailing "dead" stomp here — the give-up
+                // consumer (dsh client-event line) reads this slot AFTER the
+                // callback to name the branch that fired; overwriting it with
+                // the steady-state verdict rewrites history. Steady-state
+                // degraded-mode visibility is #4516's dispatch-mode tracker's
+                // job (noteDispatchMode below), not this slot's.
                 return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init, "no live proxy — model requests go direct (uncompressed)");
             }
         }
@@ -1502,7 +1511,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // state.
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
+                // #4125/#4824: same as the routed branch — the branch reason
+                // stays readable after the fire; the degraded-mode tracker
+                // carries the steady-state visibility.
                 return directSendOrRefuse(url, input, init, "proxy respawn failed — model requests go direct (uncompressed)");
             }
             throw err;

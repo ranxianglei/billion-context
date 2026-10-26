@@ -2114,6 +2114,10 @@ function cloneState(state: CompressionState): CompressionState {
     pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
     lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
+    // #4797: the one-time ledger-alignment gate must survive the fold clone
+    // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
+    // re-arms the restamp on every applyCompression.
+    refLedgerAligned: state.refLedgerAligned,
   };
 }
 

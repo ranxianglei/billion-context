@@ -1625,6 +1625,12 @@ export class SessionStore {
             }
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
+            } else {
+                // #4797: a converged pass (everything already aligned) must
+                // CLEAR any stale map — the guard keeps consulting the
+                // process-lifetime map, and an empty outcome that leaves an
+                // old map in place keeps refusing live refs forever.
+                delete session.restampSuperseded;
             }
             // The token snapshot is keyed by ref (#3488 render-refs): renumbered
             // refs would otherwise inherit the stale count of whichever message
