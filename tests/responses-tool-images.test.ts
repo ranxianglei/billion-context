@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { defaultConfig } from "acp-kernel";
+import { createCore, defaultConfig } from "acp-kernel";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { responsesToCore as kernelResponsesToCore, type ResponseInputItem } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, coreToResponsesWithToolImages as coreToResponses } from "../src/responses-tool-output.ts";
 import { imageTokensInParsedBody } from "../src/image-tokens.ts";
@@ -11,6 +14,8 @@ import { createResponsesAdapter } from "../src/loop/adapter-responses.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession, listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { resolveDecompress } from "../src/decompress-shared.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 process.env.NODE_ENV = "test";
@@ -204,7 +209,7 @@ test("ordinary JSON tool outputs retain their existing projection and are not ch
 
 type RequestBody = { stream?: boolean; input?: ResponseInputItem[] };
 
-async function testProxy(window: number, run: (url: string, forwarded: RequestBody[], summaries: RequestBody[]) => Promise<void>): Promise<void> {
+async function testProxy(window: number, run: (url: string, forwarded: RequestBody[], summaries: RequestBody[]) => Promise<void>, store = new SessionStore({ enabled: false })): Promise<void> {
     const forwarded: RequestBody[] = [];
     const summaries: RequestBody[] = [];
     const upstream = http.createServer((req, res) => {
@@ -226,7 +231,7 @@ async function testProxy(window: number, run: (url: string, forwarded: RequestBo
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    _setStoreForTest(store);
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
@@ -250,6 +255,82 @@ async function testProxy(window: number, run: (url: string, forwarded: RequestBo
         }
     }
 }
+
+test("a persisted partial compression block keeps its summary, correct live image and archived original on raw resends", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-partial-block-"));
+    let store = new SessionStore({ enabled: true, dir });
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const a = { type: "input_image", image_url: `data:image/png;base64,${png}`, detail: "low" };
+    const b = { type: "input_image", image_url: `data:image/png;base64,${png}`, detail: "high" };
+    const opaque = { type: "compaction", encrypted_content: "opaque-client-state" };
+    const input: ResponseInputItem[] = [
+        { type: "message", role: "user", content: "Preserve independent opening." },
+        { type: "message", role: "assistant", content: "Ready." },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Archived A decisions and constraints. ".repeat(200) }, a,
+            { type: "input_text", text: "Current B facts." }, b] },
+        opaque, { type: "message", role: "assistant", content: "Continue." },
+    ];
+    const config = { ...defaultConfig(100_000), preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const summary = "A established the accepted decisions and constraints. Those findings remain authoritative while continuing from B.";
+    try {
+        await testProxy(100_000, async (url, forwarded) => {
+            const send = async (history: ResponseInputItem[] = input): Promise<void> => {
+                const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ model: "image-test", stream: true, session_id: "persisted-partial-block", input: history }) });
+                assert.equal(response.status, 200, await response.text());
+                await new Promise<void>(resolve => setImmediate(resolve));
+            };
+            await send();
+            const session = listSessions().find(item => item.meta.label === "persisted-partial-block");
+            assert.ok(session);
+            const projection = responsesToCore({ input });
+            const folded = createCore().applyCompression({ messages: projection.msgs, state: session.state, config,
+                ranges: [{ startRef: session.state.messageRefs.byRaw[projection.msgs[2]!.id]!,
+                    endRef: session.state.messageRefs.byRaw[projection.msgs[3]!.id]!, summary }] });
+            assert.equal(folded.result.blocksCreated, 1, JSON.stringify(folded.result));
+            session.state = folded.state;
+            const blockId = session.state.blocks.at(-1)!.blockId;
+            const check = (): void => {
+                const wire = forwarded.at(-1)!.input!;
+                const pictures = wire.flatMap(item => Array.isArray(item.content) ? item.content.filter(part => part.type === "input_image") : []);
+                assert.deepEqual(pictures, [b], "A stays folded; B remains exactly once with its own detail");
+                assert.equal(JSON.stringify(wire).split(summary).length - 1, 1, "one block has one visible summary");
+                assert.deepEqual(wire.find(item => item.type === "compaction"), opaque, "untracked client state survives reconstruction");
+                assert.ok(getSession(session.id).state.blocks.some(block => block.blockId === blockId && block.active));
+            };
+            await send(); check();
+            // A temporary short view must not make the subsequent full echo
+            // resurrect the originals hidden by this same compression block.
+            await send([input[0]!, input[1]!, opaque, input.at(-1)!]);
+            await send(); check();
+            // Conversely, a new identical upload outside the covered span is
+            // current user content, not an echo to suppress by pixel hash.
+            await send([...input, { type: "message", role: "user", content: [a] }]);
+            const withNewImage = forwarded.at(-1)!.input!.flatMap(item => Array.isArray(item.content)
+                ? item.content.filter(part => part.type === "input_image") : []);
+            assert.deepEqual(withNewImage, [b, a], "the genuinely new identical image remains once");
+            await send(); check();
+            await store.writeNow(getSession(session.id));
+            await store.closeQuietlyAsync();
+            _resetSessionsForTest();
+            store = new SessionStore({ enabled: true, dir });
+            _setStoreForTest(store);
+            await send(); check();
+            const restoredSession = getSession(session.id);
+            const imageRef = restoredSession.state.messageRefs.byRaw[projection.msgs[3]!.id];
+            assert.ok(imageRef && imageRef !== "BLOCKED");
+            const restored = resolveDecompress({ imageRef }, { core: createCore(), config, messages: [], session: restoredSession, log: () => {} });
+            assert.equal(restored.outcome, "success", restored.text);
+            const path = restored.text.match(/\n  (.+\.png)/)?.[1];
+            assert.ok(path, restored.text);
+            assert.deepEqual(readFileSync(path), Buffer.from(png, "base64"));
+            await send(); check();
+        }, store);
+    } finally {
+        await store.closeQuietlyAsync();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 function screenshotItems(): ResponseInputItem[] {
     return [

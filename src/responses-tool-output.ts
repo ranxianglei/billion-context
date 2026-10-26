@@ -5,7 +5,7 @@ import { systemToUser } from "./util.js";
 
 const responsesPartBinding = Symbol("responsesPartBinding");
 type PartBoundMessage = CoreMessage & {
-    [responsesPartBinding]?: { source: ResponseInputItem; part: ResponseContentPart };
+    [responsesPartBinding]?: { source: ResponseInputItem; part: ResponseContentPart; sourceId: string };
 };
 
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
@@ -46,7 +46,7 @@ export function responsesToCoreWithToolImages(body: ResponsesRequestBody): Respo
         if (ids.length !== emitted.length) continue;
         ids.forEach((id, index) => {
             const message = byId.get(id) as PartBoundMessage | undefined;
-            if (message) message[responsesPartBinding] = { source, part: emitted[index]! };
+            if (message) message[responsesPartBinding] = { source, part: emitted[index]!, sourceId: id };
         });
     }
     for (const message of projection.msgs) {
@@ -126,9 +126,59 @@ export function mergeAdjacentConfigurationUpdates(items: readonly ResponseInputI
 // (isRenderedSummaryMessage) — client-origin mid system/developer cores are
 // conversation data and re-emit verbatim through their rawResponsesItem
 // sidecar; they are NOT rewritten here.
+function boundCarrier(messages: PartBoundMessage[]): ResponseInputItem {
+    const source = messages[0]![responsesPartBinding]!.source;
+    const parts = messages.map(message => {
+        const part = message[responsesPartBinding]!.part;
+        return part.type === "input_image" || part.text === message.text ? part : { ...part, text: message.text ?? "" };
+    });
+    const original = source.content;
+    const unchanged = Array.isArray(original) && original.length === parts.length
+        && parts.every((part, index) => part === original[index]);
+    return unchanged ? source : { type: "message", role: "user", content: parts };
+}
+
+function boundProjection(projection: ResponsesProjection, messages: CoreMessage[]): ResponsesProjection {
+    const runs = new Map<ResponseInputItem, PartBoundMessage[][]>();
+    let previous: PartBoundMessage | undefined;
+    for (const message of messages) {
+        const bound = message as PartBoundMessage;
+        const binding = bound[responsesPartBinding];
+        if (!binding || message.role !== "user" || isRenderedSummaryMessage(message)) {
+            previous = undefined;
+            continue;
+        }
+        const groups = runs.get(binding.source) ?? [];
+        if (previous?.[responsesPartBinding]?.source === binding.source) groups.at(-1)!.push(bound);
+        else groups.push([bound]);
+        runs.set(binding.source, groups);
+        previous = bound;
+    }
+    const sources = new Map(projection.msgs.map(message => [message.id, message]));
+    const replaced = new Set<string>();
+    const rebound: BiliMessage[] = [];
+    const layout = projection.layout.flatMap(slot => {
+        const groups = runs.get(slot.original);
+        if (!groups) return [slot];
+        for (const id of slot.coreIds ?? (slot.coreId ? [slot.coreId] : [])) replaced.add(id);
+        return groups.map(group => {
+            for (const message of group) {
+                const source = sources.get(message[responsesPartBinding]!.sourceId);
+                if (source) rebound.push({ ...source, id: message.id, text: message.text });
+            }
+            const ids = group.map(message => message.id);
+            return { original: boundCarrier(group), coreId: ids[0], ...(ids.length > 1 ? { coreIds: ids } : {}) };
+        });
+    });
+    // The virtual layout retains untracked wire items, but gives each surviving
+    // part its actual current ID. Separate runs leave an insertion anchor for
+    // a block summary between parts from the same original carrier.
+    return { ...projection, layout, msgs: [...projection.msgs.filter(message => !replaced.has(message.id)), ...rebound] };
+}
+
 export function patchResponsesInputWithToolImages(projection: ResponsesProjection, messages: CoreMessage[]): string | ResponseInputItem[] {
     const voiced = systemToUser(messages, (m) => isRenderedSummaryMessage(m));
-    const input = patchResponsesInput(projection, voiced);
+    const input = patchResponsesInput(boundProjection(projection, voiced), voiced);
     if (typeof input === "string") return input;
     const byOriginal = new Map<unknown, ResponseInputItem>();
     const byCall = new Map<string, ResponseInputItem>();
@@ -148,18 +198,7 @@ export function coreToResponsesWithToolImages(messages: CoreMessage[], customToo
     let pending: PartBoundMessage[] = [];
     const flush = (): void => {
         if (pending.length === 0) return;
-        const source = pending[0]![responsesPartBinding]!.source;
-        const parts = pending.map(message => {
-            const part = message[responsesPartBinding]!.part;
-            return part.type === "input_image" ? part : { ...part, text: message.text ?? "" };
-        });
-        const original = source.content;
-        // Preserve a complete unchanged carrier verbatim. Partial carriers
-        // follow the codec's generated-item convention, with exact surviving
-        // parts rather than resurrecting every image from the raw item.
-        const unchanged = Array.isArray(original) && original.length === parts.length
-            && parts.every((part, index) => part === original[index] || JSON.stringify(part) === JSON.stringify(original[index]));
-        out.push(unchanged ? source : { type: "message", role: "user", content: parts });
+        out.push(boundCarrier(pending));
         pending = [];
     };
     for (const message of systemToUser(messages, (m) => isRenderedSummaryMessage(m))) {
