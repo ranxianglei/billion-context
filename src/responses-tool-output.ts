@@ -3,6 +3,11 @@ import { coreToResponses, patchResponsesInput, responsesToCore, type BiliMessage
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { systemToUser } from "./util.js";
 
+const responsesPartBinding = Symbol("responsesPartBinding");
+type PartBoundMessage = CoreMessage & {
+    [responsesPartBinding]?: { source: ResponseInputItem; part: ResponseContentPart };
+};
+
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
     if (typeof item !== "object" || item === null) return undefined;
     const raw = item as Record<string, unknown>;
@@ -27,6 +32,23 @@ function outputText(parts: ResponseContentPart[]): string {
 
 export function responsesToCoreWithToolImages(body: ResponsesRequestBody): ResponsesProjection {
     const projection = responsesToCore(body);
+    // The layout supplies exact source ownership, including duplicate images.
+    // Keep it on the core while it survives rendering; never guess ownership
+    // later from text equality or the first image in a multipart carrier.
+    const byId = new Map(projection.msgs.map(message => [message.id, message]));
+    for (const slot of projection.layout) {
+        const source = slot.original;
+        if (source.role !== "user" || !Array.isArray(source.content)) continue;
+        const parts = source.content as ResponseContentPart[];
+        if (!parts.every(part => part.type === "input_image" || part.type === "input_text" || part.type === "output_text")) continue;
+        const emitted = parts.filter(part => part.type === "input_image" || (typeof part.text === "string" && part.text.length > 0));
+        const ids = slot.coreIds ?? (slot.coreId ? [slot.coreId] : []);
+        if (ids.length !== emitted.length) continue;
+        ids.forEach((id, index) => {
+            const message = byId.get(id) as PartBoundMessage | undefined;
+            if (message) message[responsesPartBinding] = { source, part: emitted[index]! };
+        });
+    }
     for (const message of projection.msgs) {
         const parts = responsesToolImageParts(message.rawResponsesItem);
         // Keep the codec's original content-derived id so persisted refs still
@@ -123,32 +145,33 @@ export function patchResponsesInputWithToolImages(projection: ResponsesProjectio
 // #4166: carriers only — client-origin mid system/developer stays verbatim.
 export function coreToResponsesWithToolImages(messages: CoreMessage[], customToolCallIds: Set<string> = new Set()): ResponseInputItem[] {
     const out: ResponseInputItem[] = [];
-    let run: CoreMessage[] = [];
-    const flush = () => {
-        if (run.length === 0) return;
-        const sources = new Set(run.map((m) => (m as BiliMessage).rawResponsesItem).filter(Boolean));
-        // #4767: batch a single carrier's cores. The kernel cannot yet separate
-        // adjacent source items; retain legacy encoding there to avoid image loss.
-        if (sources.size === 1) out.push(...coreToResponses(run, customToolCallIds));
-        else for (const message of run) out.push(...coreToResponses([message], customToolCallIds));
-        run = [];
+    let pending: PartBoundMessage[] = [];
+    const flush = (): void => {
+        if (pending.length === 0) return;
+        const source = pending[0]![responsesPartBinding]!.source;
+        const parts = pending.map(message => {
+            const part = message[responsesPartBinding]!.part;
+            return part.type === "input_image" ? part : { ...part, text: message.text ?? "" };
+        });
+        const original = source.content;
+        // Preserve a complete unchanged carrier verbatim. Partial carriers
+        // follow the codec's generated-item convention, with exact surviving
+        // parts rather than resurrecting every image from the raw item.
+        const unchanged = Array.isArray(original) && original.length === parts.length
+            && parts.every((part, index) => part === original[index] || JSON.stringify(part) === JSON.stringify(original[index]));
+        out.push(unchanged ? source : { type: "message", role: "user", content: parts });
+        pending = [];
     };
-    for (const message of messages) {
-        if (isRenderedSummaryMessage(message)) {
-            flush();
-            out.push(...coreToResponses(systemToUser([message]), customToolCallIds));
+    for (const message of systemToUser(messages, (m) => isRenderedSummaryMessage(m))) {
+        const bound = message as PartBoundMessage;
+        if (bound[responsesPartBinding] && message.role === "user" && !isRenderedSummaryMessage(message)) {
+            if (pending.length && pending[0]![responsesPartBinding]!.source !== bound[responsesPartBinding].source) flush();
+            pending.push(bound);
             continue;
         }
+        flush();
         const rebuilt = rebuildToolImages(message);
-        if (rebuilt) {
-            flush();
-            out.push(rebuilt);
-        } else if (message.role === "user") {
-            run.push(message);
-        } else {
-            flush();
-            out.push(...coreToResponses([message], customToolCallIds));
-        }
+        out.push(...(rebuilt ? [rebuilt] : coreToResponses([message], customToolCallIds)));
     }
     flush();
     return out;
