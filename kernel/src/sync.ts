@@ -3,7 +3,9 @@ import type { CompressionState, CoreMessage } from "./types.js";
 
 /** #4316 layer 3: true when any visible message's ledgerSeq stamp falls
  * inside the block's exact interval claim. Unbounded blocks and unstamped
- * views answer false — the id path decides those. */
+ * views answer false — the id path decides those. The -1/-1 "no claim"
+ * sentinel (PR #4725 N1) also answers false: it is absence of evidence, not
+ * a positional claim (a [0,0] row IS a real claim over seq 0). */
 function blockSeqPresent(
   block: { startSeq?: number; endSeq?: number },
   messages: CoreMessage[],
@@ -11,6 +13,7 @@ function blockSeqPresent(
   if (
     typeof block.startSeq !== "number" ||
     typeof block.endSeq !== "number" ||
+    block.startSeq < 0 ||
     block.endSeq < block.startSeq
   ) {
     return false;

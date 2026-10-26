@@ -2085,6 +2085,8 @@ type FileConfig = {
         outboundBodyBytes?: number;
         /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
         wsOutboundBytes?: number;
+        /** Soft egress byte budget for the plain/proxy/pi-native HTTP relay lane (#3909; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending, because an image-dense session can carry tens of MiB of base64 that upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space folding stays below its trigger. Applies only when no managed transport is installed (the spawned relay); the WS lane uses wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never shed here (#3701 Finding 1). Env BILI_HTTP_OUTBOUND_BYTES wins. */
+        httpOutboundBytes?: number;
         /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
          *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
          *  MITM proxy whose re-signed upstream cert Node's default trust rejects with

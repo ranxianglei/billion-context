@@ -100,6 +100,11 @@ test("contract: ingest → reads round-trip through the interface", async () => 
             const counters = await backend.sessionCounters("sess-contract");
             assert.ok(counters, "session counters readable");
 
+            // #4730: last live seq through the interface — the fork lane's
+            // inclusive bound (NOT count-1; mysql must answer identically).
+            assert.equal(await backend.lastLiveSeq("sess-contract"), 1, "last live seq = newest live row");
+            assert.equal(await backend.lastLiveSeq("sess-contract-absent"), null, "no live rows → null");
+
             const ids = await backend.listSessionIds();
             assert.ok(ids.includes("sess-contract"), "session enumerated");
         } finally {
@@ -232,6 +237,8 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     assert.ok(typeof rows[1]!.contentHash === "string" && rows[1]!.contentHash.length > 0, "content hashes ride the rows");
     const counters = await backend.sessionCounters(sid);
     assert.ok(counters && counters.nextBlockId >= 1, "counters readable");
+    assert.equal(await backend.lastLiveSeq(sid), 1, "#4730: last live seq = newest live row");
+    assert.equal(await backend.lastLiveSeq(`${sid}-absent`), null, "#4730: no live rows → null");
     assert.ok((await backend.listSessionIds()).includes(sid), "enumerated");
 
     // ext / watermark / tailSeqs

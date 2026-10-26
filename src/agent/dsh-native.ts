@@ -61,7 +61,7 @@ import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { dshContextTabEnabled, dshContextTabLabel } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -593,33 +593,24 @@ function effectiveContextWindow(ctx: PluginContext): number | undefined {
     return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
 }
 
-/** #4111: the shared two-stage doom predicate for the gate's oversize arms
- *  (the `threw` arm and the unattributed arm). Stage 1 prices the RAW body at
- *  bytes/4 — exactly the old math, cheap — and disarms when that is not even
- *  provisionally over the #4079-floored window. Stage 2 runs ONLY on the
- *  would-refuse path: re-price on media-excluded core bytes and disarm when
- *  the core text alone still fits (the #4111 false refusal was media mass
- *  billed as text). Returns the refusal's numbers when the body is PROVABLY
- *  over (core text alone cannot fit), undefined otherwise. No body, unreadable
- *  body, or unresolvable window → undefined — the arms keep #1117 direct
- *  semantics and can never false-refuse from missing data. */
+// Gate face of the shared doom math (#4111/#4516): keeps the gate's
+// init-body signature for its call sites and tests, decoding init.body into
+// the raw string the shared form (native-intercept.ts) prices with the
+// media-aware walk (media-bytes.ts).
+function rawBodyStringOf(init: RequestInit | undefined): string | undefined {
+    const body: unknown = init?.body;
+    if (typeof body === "string") return body;
+    if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+    if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+    return undefined;
+}
+
 export function bodyProvablyOverWindow(
     body: { bytes: number } | undefined,
     init: RequestInit | undefined,
     declaredWindow: number | undefined,
-): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
-    if (body === undefined || declaredWindow === undefined) return undefined;
-    const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-    if (Math.ceil(body.bytes / 4) <= window) return undefined;
-    const rawBody: unknown = init?.body;
-    let raw: string | undefined;
-    if (typeof rawBody === "string") raw = rawBody;
-    else if (rawBody instanceof Uint8Array) raw = new TextDecoder().decode(rawBody);
-    else if (rawBody instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(rawBody));
-    const mediaBytes = raw === undefined ? 0 : mediaBytesOfWireBody(raw);
-    const coreBytes = Math.max(body.bytes - mediaBytes, 0);
-    if (Math.ceil(coreBytes / 4) <= window) return undefined;
-    return { coreBytes, mediaBytes, floorTokens: Math.ceil(coreBytes / 4), window, declaredWindow };
+): ReturnType<typeof sharedBodyProvablyOverWindow> {
+    return sharedBodyProvablyOverWindow(body?.bytes, rawBodyStringOf(init), declaredWindow);
 }
 
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {

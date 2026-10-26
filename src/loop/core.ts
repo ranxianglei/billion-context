@@ -4,6 +4,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import type { HandoffReply } from "../server/handoff-response.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
@@ -31,6 +32,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -185,6 +187,7 @@ export interface LoopCtx {
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
     session: Session;
+    reply?: HandoffReply;
     log: (msg: string) => void;
     proxyUrl?: string;
     /** #2809: diagnostic-only — the proxy the auto chain would have picked
@@ -437,6 +440,13 @@ export async function* runCompressLoop(
     systemPrompt: string,
     signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
+    let replyPart = 0;
+    let replyKind: "text" | "reasoning" | undefined;
+    const recordReplyText = (kind: "text" | "reasoning", text: string) => {
+        if (replyKind !== kind) replyPart++;
+        replyKind = kind;
+        ctx.reply?.append(`part_${replyPart}`, kind, text);
+    };
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     let roundBody: Record<string, unknown> = requestBody;
@@ -469,10 +479,10 @@ export async function* runCompressLoop(
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
         let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
-        // #3701: internal re-requests ride the same WS transport as the outer
-        // turn (AsyncLocalStorage), so an oversized rebuild dies the same way —
-        // run the same soft byte budget here, before resign/forensics, so both
-        // see the bytes actually transmitted.
+        // #3701/#3909: internal re-requests ride the same transport as the outer turn
+        // (AsyncLocalStorage) — WS or plain HTTP relay — so an oversized rebuild dies the
+        // same way; run the same lane-keyed soft byte budget here, before resign/forensics,
+        // so both see the bytes actually transmitted.
         if (ctx.protocol) {
             wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
                 sessionId: ctx.session.id,
@@ -514,7 +524,13 @@ export async function* runCompressLoop(
                 });
             }
         }
-        return fetchWithRetry(
+        // N3 (PR #4725 round-3 review): the loop lane's own sends (compression
+        // re-requests, round-2+ rebuilds) were invisible to the 429 governor —
+        // exactly the sends most likely to retry in a storm. Observe-only here
+        // (the loop's own round budget already bounds amplification; arming the
+        // hold from loop verdicts lets the relay's pre-forward gate protect the
+        // NEXT client turn without changing loop behavior mid-flight).
+        const throttledSend = fetchWithRetry(
             requestOptions.url,
             {
                 method: "POST",
@@ -525,6 +541,7 @@ export async function* runCompressLoop(
             undefined,
             signal,
             (info) => {
+                if (info.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null); // retry-after isn't carried in ReplayRetryInfo; the settled response below re-notes with the header
                 // #189: correlate the rejection with the rewrite that
                 // preceded it (shrink ratio + fold point), if any.
                 const lc = lastCompressSuffix(ctx.session.lastCompress);
@@ -532,6 +549,21 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
+        // fetchWithRetry only ever RESOLVES ok responses — non-ok terminal
+        // states (incl. 429) throw UpstreamHttpError — so there is no settled
+        // 429 response here. An ok send resolves any throttle hold armed by
+        // the retry callback above; a terminal 429 re-notes the governor
+        // (retry-after is not carried on the error) before rethrowing.
+        try {
+            const upstreamSend = await throttledSend;
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status);
+            return upstreamSend;
+        } catch (error) {
+            if (error instanceof UpstreamHttpError && error.status === 429) {
+                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+            }
+            throw error;
+        }
     };
 
     // #1455: single adoption point for every loop-originated upstream body so
@@ -757,8 +789,10 @@ export async function* runCompressLoop(
                         }
                         tp.text += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
+                            recordReplyText("text", ev.delta);
                             yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                            recordReplyText("text", ev.delta);
                             yield fwd(adapter.emitText(ev.delta), true);
                         }
                     } else if (ev.kind === "reasoning") {
@@ -781,8 +815,10 @@ export async function* runCompressLoop(
                         if (ev.blockEnd) reasoningSealed = true;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
+                                recordReplyText("reasoning", ev.delta);
                                 yield fwd(ev.raw);
                             } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
+                                recordReplyText("reasoning", ev.delta);
                                 yield fwd(adapter.emitReasoning(ev.delta));
                             }
                         }
@@ -792,6 +828,10 @@ export async function* runCompressLoop(
                         roundParts.push({ kind: "standalone_signature", signature: ev.signature });
                     } else if (ev.kind === "tool_call") {
                         calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
+                        if (ev.passthrough) {
+                            replyKind = undefined;
+                            ctx.reply?.tool(`tool_${++replyPart}`, ev.name, ev.callId, ev.arguments);
+                        }
                     } else if (ev.kind === "usage") {
                         usage = {
                             inputTokens: ev.inputTokens,
@@ -1139,6 +1179,7 @@ export async function* runCompressLoop(
             const functionCallIds = new Set(allCalls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
+                recordReplyText("text", resolvedText);
                 yield adapter.emitText(resolvedText);
             }
 
@@ -1389,6 +1430,8 @@ export async function* runCompressLoop(
 
             for (const tc of realToolCalls) {
                 if (tc.passthrough) continue;
+                replyKind = undefined;
+                ctx.reply?.tool(`tool_${++replyPart}`, tc.name, tc.callId, tc.arguments);
                 yield adapter.emitToolCall(tc);
             }
 
@@ -1414,6 +1457,7 @@ export async function* runCompressLoop(
                     yield adapter.emitError(msg);
                     return;
                 }
+                if (!truncatedDone && streamError === undefined && finishReason !== "failed" && finishReason !== "incomplete" && finishReason !== "error" && !signal?.aborted) ctx.reply?.save();
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
                 // regenerated completion would duplicate them.

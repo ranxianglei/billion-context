@@ -2107,20 +2107,33 @@ function changelogCatOf(rawLine) {
         if (lp < 0) return null;
         return { kind: kind, name: nameId.slice(0, lp), cid: nameId.slice(lp + 1), text: line.slice(mark + tailLen) };
     }
+    // Terminates the reasoning cell of a reply: _reasoning_: has no end
+    // marker, so the handoff renderer would otherwise fold the answer that
+    // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
+    const HANDOFF_THINK_END = "<!-- /reasoning -->";
     function splitHandoffBody(bodyLines) {
         const segs = [];
-        for (const raw of bodyLines) {
+        let thinkClosed = false;
+        for (let i = 0; i < bodyLines.length; i++) {
+            const raw = bodyLines[i];
             if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            const activeThink = segs[segs.length - 1];
+            if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
+                if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
+                else thinkClosed = true;
+                continue;
+            }
             const tool = parseToolLine(raw);
             if (tool) { segs.push({ type: "tool", kind: tool.kind, name: tool.name, cid: tool.cid, lines: [tool.text] }); continue; }
             if (raw.indexOf("_reasoning_: ") === 0) {
                 const lastT = segs[segs.length - 1];
-                if (!lastT || lastT.type !== "think") segs.push({ type: "think", lines: [] });
+                if (!lastT || lastT.type !== "think" || thinkClosed) segs.push({ type: "think", lines: [] });
                 segs[segs.length - 1].lines.push(raw.slice("_reasoning_: ".length));
+                thinkClosed = false;
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || last.type === "think")) last.lines.push(raw);
+            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -2256,206 +2269,162 @@ function changelogCatOf(rawLine) {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
-    // one level beyond the block that absorbed it), edges drawn as beziers — a
-    // knowledge-graph-ish shape for reading structure, while the list view stays
-    // the place to read concrete messages. Modest trees are scaled down to fit
-    // the card; pathologically WIDE ones used to be scaled the same way and
-    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
-    // those rotate: depth runs along x, sibling stacks pile along y at full node
-    // size (#4173).
-    const GRAPH_NODE_W = 118;
-    const GRAPH_NODE_H = 36;
-    const GRAPH_GAP_X = 16;
-    const GRAPH_LEVEL_H = 84;
-    const GRAPH_FIT_W = 1120;
-    // #4173 review: the in-page live map draws with tighter nodes so long
-    // sessions stay one readable drawing; every other call site keeps the
-    // original full-size metrics byte-for-byte.
-    const MAP_NODE_W = 92;
-    const MAP_NODE_H = 30;
-    const MAP_GAP_X = 8;
-    const MAP_LEVEL_H = 46;
-    const FULL_METRICS = { w: GRAPH_NODE_W, h: GRAPH_NODE_H, gx: GRAPH_GAP_X, lh: GRAPH_LEVEL_H };
-    const MAP_METRICS = { w: MAP_NODE_W, h: MAP_NODE_H, gx: MAP_GAP_X, lh: MAP_LEVEL_H };
-    function blockGraphLayout(blocks, m) {
-        m = m || FULL_METRICS;
-        const shape = blockTreeShape(blocks);
-        const nodes = [];
-        const links = [];
-        let cursor = 0;
-        let maxDepth = 0;
-        const place = function (b, depth) {
-            if (depth > 40) return null;
-            const kids = shape.children[b.blockId] || [];
-            const childNodes = [];
-            kids.forEach(function (k) {
-                const kid = place(k, depth + 1);
-                if (kid) childNodes.push(kid);
-            });
-            let x;
-            if (!childNodes.length) {
-                x = cursor;
-                cursor += m.w + m.gx;
-            } else {
-                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
-            }
-            const node = { b: b, x: x, y: depth * m.lh };
-            nodes.push(node);
-            if (depth > maxDepth) maxDepth = depth;
-            childNodes.forEach(function (c) { links.push([node, c]); });
-            return node;
-        };
-        const roots = shape.roots.length ? shape.roots : blocks;
-        roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - m.gx, height: maxDepth * m.lh + m.h };
-    }
-    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
-    // shared cursor packs sibling stacks along y. Chosen when a tree is far
-    // wider than it is tall: rotating puts the long dimension on the one axis
-    // the page scrolls, keeping every box at natural size (the in-page map's
-    // tighter metrics arrive from the caller).
-    function blockGraphLayoutVertical(blocks, m) {
-        m = m || FULL_METRICS;
-        const shape = blockTreeShape(blocks);
-        const nodes = [];
-        const links = [];
-        let cursor = 0;
-        let maxDepth = 0;
-        const place = function (b, depth) {
-            if (depth > 40) return null;
-            const kids = shape.children[b.blockId] || [];
-            const childNodes = [];
-            kids.forEach(function (k) {
-                const kid = place(k, depth + 1);
-                if (kid) childNodes.push(kid);
-            });
-            let y;
-            if (!childNodes.length) {
-                y = cursor;
-                cursor += m.h + m.gx;
-            } else {
-                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
-            }
-            const node = { b: b, x: depth * (m.w + m.gx), y: y };
-            nodes.push(node);
-            if (depth > maxDepth) maxDepth = depth;
-            childNodes.forEach(function (c) { links.push([node, c]); });
-            return node;
-        };
-        const roots = shape.roots.length ? shape.roots : blocks;
-        roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: maxDepth * (m.w + m.gx) + m.w, height: cursor - m.gx };
-    }
-    // #4173: orientation shared by the full graph and the in-pane tree map —
-    // flat unless the tree overflows the card AND rotation shortens the long
-    // dimension; small trees stay byte-identical to the original rendering.
-    function graphLayouts(blocks, m) {
-        const lh = blockGraphLayout(blocks, m);
-        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks, m) : null;
-        const vertical = !!lv && lv.height < lh.width;
-        return { layout: vertical ? lv : lh, vertical: vertical };
-    }
-    // Bezier for one parent→child edge in either orientation — shared by every
-    // #4173 drawing (static graph and live in-pane map) so they always agree.
-    function graphEdgePath(l, pad, vertical, m) {
-        m = m || FULL_METRICS;
-        if (vertical) {
-            const x1 = l[0].x + pad + m.w;
-            const y1 = l[0].y + pad + m.h / 2;
-            const x2 = l[1].x + pad;
-            const y2 = l[1].y + pad + m.h / 2;
-            const mx = (x1 + x2) / 2;
-            return "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
-        }
-        const x1 = l[0].x + pad + m.w / 2;
-        const y1 = l[0].y + pad + m.h;
-        const x2 = l[1].x + pad + m.w / 2;
-        const y2 = l[1].y + pad;
-        const my = (y1 + y2) / 2;
-        return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
-    }
-    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
-    // it carries its NATURAL pixel size (width/height attrs) so the pane can
-    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
-    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
-    // honest while the browser scales the drawing uniformly.
-    function buildGraphSvg(blocks, wrapped, m) {
-        m = m || FULL_METRICS;
-        const g = graphLayouts(blocks, m);
-        const layout = g.layout;
-        const vertical = g.vertical;
-        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
-        const pad = 14;
-        const W = Math.ceil(layout.width + pad * 2);
-        const H = Math.ceil(layout.height + pad * 2);
-        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
-        const parts = [];
-        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
-        if (wrapped) parts.push('<g class="tm-g">');
-        // compact rows carry the two text lines closer together
-        const idY = m.h >= 36 ? 15 : 12;
-        const metaY = m.h >= 36 ? 28 : 22;
-        layout.links.forEach(function (l) {
-            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical, m) + '" fill="none"/>');
+    // #4608: geometry for the collapsible-tree reading of the blocks pane.
+    // (The flame-chart reading was cut at owner request — the pane keeps
+    // the tree plus the classic folded-block list instead.)
+    const TREE_W = 200;          // collapsible-tree node box
+    const TREE_H = 44;
+    const TREE_GAP_X = 22;       // column spacing (depth axis)
+    const TREE_GAP_Y = 10;
+    // Collapsible depth-column tree: roots always show, a branch appears only
+    // while its parent carries the expand mark; the "+N" chip counts the whole
+    // hidden subtree so a deep collapse still says how much hides behind it.
+    function collapSubtreeSize(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = true; });
+        const childIds = {};
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && pid !== b.blockId && byId[pid]) (childIds[pid] = childIds[pid] || []).push(b.blockId);
         });
-        layout.nodes.forEach(function (n) {
+        const memo = {};
+        const size = function (id, trail) {
+            if (memo[id] != null) return memo[id];
+            if (trail.indexOf(id) >= 0) return 1;
+            trail.push(id);
+            const total = 1 + (childIds[id] || []).reduce(function (acc, k) { return acc + size(k, trail); }, 0);
+            trail.pop();
+            memo[id] = total;
+            return total;
+        };
+        blocks.forEach(function (b) { size(b.blockId, []); });
+        return memo;
+    }
+    function collapTreeLayout(blocks, expanded) {
+        const shape = blockTreeShape(blocks);
+        const sizes = collapSubtreeSize(blocks);
+        const nodes = [], links = [];
+        let cursor = 0, maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const node = { b: b, x: depth, y: 0 };
+            const ys = [];
+            if (expanded && expanded[b.blockId])
+                (shape.children[b.blockId] || []).forEach(function (k) {
+                    const kn = place(k, depth + 1);
+                    if (kn) { ys.push(kn.y); links.push([node, kn]); }
+                });
+            if (ys.length) node.y = (ys[0] + ys[ys.length - 1]) / 2;
+            else { node.y = cursor; cursor += TREE_H + TREE_GAP_Y; }
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            return node;
+        };
+        (shape.roots.length ? shape.roots : blocks).forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: nodes, links: links, cols: 1, height: 0, sizes: sizes };
+        return { nodes: nodes, links: links, cols: maxDepth + 1, height: cursor - TREE_GAP_Y + TREE_H, sizes: sizes };
+    }
+    function renderCollapSvg(blocks, expanded, selectedBid) {
+        const lay = collapTreeLayout(blocks, expanded || {});
+        if (!lay.nodes.length) return { html: "" };
+        const colW = TREE_W + TREE_GAP_X;
+        const W = 12 + lay.cols * colW + 4;
+        const H = lay.height + 12;
+        const sel = selectedBid || "";
+        const p = [];
+        p.push('<svg class="g-svg g-svg-v" viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" preserveAspectRatio="xMinYMin meet" role="img">');
+        lay.links.forEach(function (l) {
+            const x1 = l[0].x * colW + 12 + TREE_W, y1 = l[0].y + 6 + TREE_H / 2;
+            const x2 = l[1].x * colW + 12, y2 = l[1].y + 6 + TREE_H / 2;
+            const mx = (x1 + x2) / 2;
+            p.push('<path class="g-edge" fill="none" d="M' + x1.toFixed(1) + " " + y1.toFixed(1) + " C" + mx.toFixed(1) + " " + y1.toFixed(1) + " " + mx.toFixed(1) + " " + y2.toFixed(1) + " " + x2.toFixed(1) + " " + y2.toFixed(1) + '"></path>');
+        });
+        lay.nodes.forEach(function (n) {
             const b = n.b;
             const tierNum = Number(b.tier) || 1;
-            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
-            const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
-            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
-            // not only in the list row; tokens stay in the hover tooltip.
+            const hidden = (lay.sizes[b.blockId] || 1) - 1;
+            const isOpen = !!(expanded && expanded[b.blockId]);
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive") + (sel === b.blockId ? " fsel" : "");
+            let topic = blockTopic(b);
+            const maxCh = Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
             const rr = refRangeOf(b);
-            parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
-                + '<rect width="' + m.w + '" height="' + m.h + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="' + idY + '">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="' + metaY + '">' + escapeHtml(rr || meta) + "</text>"
-                + "</g>");
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
+            p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
+            if (hidden > 0)
+                p.push('<g class="tchip" data-toggle="' + escapeHtml(b.blockId) + '" transform="translate(' + (TREE_W - 34) + ',13)">' + '<rect width="28" height="18" rx="9"></rect><text x="14" y="13">' + (isOpen ? "−" : "+" + hidden) + '</text></g>');
+            p.push("</g>");
         });
-        if (wrapped) parts.push("</g>");
-        parts.push("</svg>");
-        return { html: parts.join(""), vertical: vertical, width: W, height: H };
-    }
-    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
-    // drawing's natural pixels; treeMapApply() resizes it when zooming.
-    function treeMapInnerHtml(graph) {
-        if (!graph.html) return "";
-        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
-    }
-    function treeMapApply(view) {
-        const inner = view.querySelector(".tm-inner");
-        if (!inner) return;
-        const k = view.__vm ? view.__vm.k : 1;
-        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
-        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
-        inner.style.width = (nw * k) + "px";
-        inner.style.height = (nh * k) + "px";
-    }
-    function treeMapFit(view) {
-        const inner = view.querySelector(".tm-inner");
-        if (!inner) return;
-        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
-        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
-        if (!nw || !nh) return;
-        // #4173 review: the map flows with the page, so Fit shrinks the whole
-        // tree into roughly the current viewport and centers it there.
-        const w = Math.max(320, document.documentElement.clientWidth - 120);
-        const h = Math.max(320, window.innerHeight - 180);
-        view.__vm = { k: Math.min(1, Math.min(w / nw, h / nh) * 0.98) };
-        treeMapApply(view);
-        const r = inner.getBoundingClientRect();
-        window.scrollBy(0, (r.top + (nh * view.__vm.k) / 2) - window.innerHeight / 2);
+        p.push("</svg>");
+        return { html: p.join("") };
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
         return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
     }
-    function blockNodeHtml(b, shape, idx, depth) {
+    // #4608: one pre-rendered detail panel per fold block — hidden until its
+    // bar/node is selected, so the drawings stay light while the summary, the
+    // kernel's own accounting and the lazy raw-content endpoints all live next
+    // to the thing you clicked.
+    function sidePanelHtml(b, idx) {
+        const tierNum = Number(b.tier) || 1;
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        const rr = refRangeOf(b);
+        if (rr) meta.push(rr);
+        meta.push(timeAgo(b.createdAt));
+        // Same contract as the old list row: long summaries open as five
+        // clamped lines behind a show-all button; the clamp only survives
+        // measurement if it actually cut anything.
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + "</div>"
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<div class="bd-panel" data-bid="' + bid + '" hidden><div class="bd-head"><span class="mono">' + bid + "</span>" + badge + extBadge
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<div class="topic">' + escapeHtml(blockTopic(b)) + "</div>"
+            + '<div class="meta mono">' + escapeHtml(meta.join(" \u00b7 ")) + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" data-blkbox hidden></div>';
+        // The messages this block folded — preview only, bytes arrive lazily
+        // (#3917) through the very same endpoint the old list rows used.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        return html + "</div>";
+    }    function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
         // #4173 review: rows start COLLAPSED — a 200-block session must not
@@ -2495,7 +2464,7 @@ function changelogCatOf(rawLine) {
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
             + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
             + "</div>"
-            + '<div class="blk-content" id="blk-content-' + bid + '" hidden></div>';
+            + '<div class="blk-content" data-blkbox hidden></div>';
         // #3917: the messages this block folded, one leaf per mNNNNN ref. The
         // preview is all the tree needs; the bytes arrive on the first click
         // (the lazy endpoint), so a wide session never ships its transcript.
@@ -2521,6 +2490,8 @@ function changelogCatOf(rawLine) {
         if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
         return html + "</details>";
     }
+
+
     function buildTreePane(blocks) {
         const parts = [];
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
@@ -2528,32 +2499,40 @@ function changelogCatOf(rawLine) {
             parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
             return parts.join("");
         }
+        window.__biliDetailBlocks = blocks; // consumed by bindTreeModeActions() after insertion
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
-    parts.push('<div class="tree-stats mono small">'
+        parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
             + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
             + "</div>");
         parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        parts.push('<div class="tree-modes">'
+            + '<button class="btn sm tree-mode active" data-mode="tree">' + t("det.tree_view_graph") + "</button>"
+            + '<button class="btn sm tree-mode" data-mode="list">' + t("det.tree_view_list") + "</button>"
+            + '<button id="tm-expand-all" class="btn sm" hidden>' + t("det.tree_expand_all") + "</button>"
+            + '<button id="tm-collapse-all" class="btn sm" hidden>' + t("det.tree_collapse_all") + "</button>"
+            + '<span class="hint" id="tree-hint">' + t("det.tree_interact") + "</span>"
+            + "</div>");
+        // Left: the two interchangeable readings inside one scrollable frame
+        // (the collapsible tree by default, the classic folded-block list on
+        // demand); right: the selected block, sticky beside the tree.
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
-        const mapGraph = buildGraphSvg(blocks, true, MAP_METRICS);
-        // #4173 review: the live map comes FIRST (总揽全局), the full block
-        // list stacks below it — with the old order the map ended up under a
-        // screen of detail rows.
-        parts.push('<div class="tm-view" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
-        parts.push('<div class="tree-list" id="tree-list">');
-        parts.push('<div class="block-tree">');
+        parts.push('<div class="fd-grid"><div class="fd-left">');
+        parts.push('<div class="tm-view" id="tree-graph"><div class="tm-inner"></div></div>');
+        parts.push('<div class="tree-list" id="tree-list" hidden><div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
         rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
-        parts.push("</div>");
-        parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
-        parts.push("</div>");
+        parts.push("</div></div>");
+        parts.push('</div><aside class="fd-side"><div class="card bd-card"><div class="card-h"><span>' + t("det.block_detail_title") + '</span></div><div class="card-b">');
+        parts.push('<div class="dim small" id="bd-empty">' + t("det.block_side_hint") + "</div>");
+        parts.push('<div id="bd-panels">');
+        blocks.forEach(function (b) { parts.push(sidePanelHtml(b, idxOf[b.blockId])); });
+        parts.push("</div></div></div></aside></div>");
         parts.push("</div></div>");
         return parts.join("");
     }
@@ -2739,7 +2718,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
                 const cli = ev.client ? ' · <span style="color:#0969da">' + t("det.attr_client") + " @" + ev.client.idx + " (" + ev.client.role + "/" + ev.client.cls + ", " + fmtB(ev.client.len || 0) + ")</span>" : "";
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + cli + "</td></tr>");
@@ -2752,7 +2731,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
             const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.key_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + kHead + "</thead><tbody>");
             keySw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2764,7 +2743,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (promptSw && promptSw.count > 0 && promptSw.events && promptSw.events.length > 0) {
             const pHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.prompt_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2775,7 +2754,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
             const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + jHead + "</thead><tbody>");
             projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2865,7 +2844,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // numeric headers align with their columns; long lists just scroll.
             const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
             const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
-            parts.push('<div class="fold-scroll"><table class="data"><thead>' + foldHead + '</thead><tbody>');
+            parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");
         }
@@ -2920,7 +2899,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindBlockContentActions(d);
             bindTreeModeActions();
             bindDetTabs();
-            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -3133,6 +3111,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // #3917: lazy raw-content loader per block — the tree ships summary + numbers
     // only; the conversation bytes behind a block come on demand. "one" is what
     // decompress(block) hands back, "full" is the whole covered span.
+    // A summary clamp can only be measured once its card has layout —
+    // side panels get checked on selection, classic list rows on first
+    // expand. If the five-line clamp cut nothing, it is removed outright.
+    function fixSumClamp(pn) {
+        const body = pn.querySelector(":scope > .body.md");
+        if (!body || body.__sumChk) return;
+        body.__sumChk = 1;
+        let sum = null, btn = null;
+        for (let i = 0; i < body.children.length; i++) {
+            const c = body.children[i];
+            if (c.classList.contains("blk-sum")) sum = c;
+            if (c.classList.contains("blk-sum-toggle")) btn = c;
+        }
+        if (!sum || !btn) return;
+        if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+        btn.addEventListener("click", function () {
+            const clamped = sum.classList.toggle("clamp");
+            btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+        });
+    }
     function bindBlockContentActions(d) {
         document.querySelectorAll(".blk-content-btn").forEach((btn) => {
             btn.addEventListener("click", async (ev) => {
@@ -3140,7 +3138,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 ev.stopPropagation();
                 const bid = btn.getAttribute("data-bid") || "";
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
-                const box = $("blk-content-" + bid);
+                // #4608: classic list rows and the side panels share the
+                // .blk-content class, so resolve the target box inside the
+                // button's own card — getElementById would grab whichever
+                // card happens to come first.
+                const hostEl = btn.closest(".bd-panel") || btn.closest(".block-item");
+                const box = hostEl ? hostEl.querySelector(":scope > .blk-content") : null;
                 if (!box) return;
                 // #4173 review: pressing the same button again collapses the
                 // raw view (it used to be one-way, so users were stuck).
@@ -3191,123 +3194,127 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             });
         });
-        // #4173 review: measure each clamped summary when its row first opens —
-        // a closed <details> has no layout, so the cut-or-not verdict can only
-        // happen here; rows the clamp never shortened lose their button.
-        document.querySelectorAll(".block-node").forEach(function (det) {
-            det.addEventListener("toggle", function () {
-                if (!det.open) return;
-                const body = det.querySelector(":scope > .body.md");
-                if (!body || body.__sumChk) return;
-                body.__sumChk = 1;
-                let sum = null, btn = null;
-                for (let i = 0; i < body.children.length; i++) {
-                    const c = body.children[i];
-                    if (c.classList.contains("blk-sum")) sum = c;
-                    if (c.classList.contains("blk-sum-toggle")) btn = c;
-                }
-                if (!sum || !btn) return;
-                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
-                btn.addEventListener("click", function () {
-                    const clamped = sum.classList.toggle("clamp");
-                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
-                });
-            });
+        // #4173 review: classic list rows start collapsed — measure each
+        // row's clamp once on first expand (panels get the same treatment
+        // on selection).
+        document.querySelectorAll("#tree-list .block-node").forEach((row) => {
+            row.addEventListener("toggle", () => { if (row.open) fixSumClamp(row); });
         });
     }
-    // #3917: the compression pane carries two readings of the same data — the
-    // list (read concrete messages) and the graph (read the overall shape).
-    // Clicking a graph node jumps back to that block's expanded row in the list.
+    // #4608: master-detail pane binder — the left frame shows the
+    // collapsible tree (default) or the classic folded-block list; in tree
+    // mode the right side is the selected block's panel. Click selects;
+    // chips (+N/−) expand or collapse a branch; Esc collapses back to the
+    // roots. All hits are point-tested because the poller may have swapped
+    // innerHTML under a pressed finger (same trick as the #4173 live map).
+    let treeViewState = null;
+    let treeViewRender = null;
     function bindTreeModeActions() {
-        const list = $("tree-list");
-        const graph = $("tree-graph");
-        if (!list || !graph) return;
+        const graphView = $("tree-graph");
+        const listView = $("tree-list");
+        if (!graphView || !listView) return;
+        const blocks = window.__biliDetailBlocks || [];
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
-        const setMode = function (mode) {
-            const g = mode === "graph";
-            // #4173 review: graph mode STACKS the live map above the full
-            // block list (总揽全局 + 看细节 in one screen); list mode just
-            // hides the drawing. The list is never hidden anymore — it used
-            // to be, which read as "all the per-block details were lost".
-            list.hidden = false;
-            graph.hidden = !g;
-            // #4173 review: Fit only makes sense while the tree drawing is visible.
-            const fit = $("tm-fit");
-            if (fit) fit.hidden = !g;
-            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
-        };
-        btns.forEach(function (b) {
-            b.addEventListener("click", function (ev) {
-                ev.preventDefault();
-                setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
+        const expBtn = $("tm-expand-all");
+        const colBtn = $("tm-collapse-all");
+        const gridEl = graphView.closest(".fd-grid");
+        const sideEl = gridEl ? gridEl.querySelector(".fd-side") : null;
+        const hintEl = $("tree-hint");
+        let mode = "tree";
+        try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
+        const st = { mode: mode, selected: "", expanded: {} };
+        treeViewState = st;
+        function renderTree() {
+            const inner = graphView.querySelector(".tm-inner");
+            if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+        }
+        treeViewRender = renderTree;
+        function select(bid) {
+            st.selected = bid;
+            document.querySelectorAll("#tree-graph [data-bid]").forEach(function (el) {
+                el.classList.toggle("fsel", el.getAttribute("data-bid") === bid);
             });
-        });
-        // #4173 review: default to the live map stacked over the list.
-        setMode("graph");
-    }
-    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
-    // size (a block box is always 118x36 px, labels readable) inside a
-    // natively scrollable viewport — pathological trees (very wide OR very
-    // tall) stay legible instead of meeting into smears. All interaction
-    // binds on the stable #tree-graph container (event delegation) because the
-    // 5s poller swaps its innerHTML. The map flows WITH the page (a plain
-    // wheel scrolls the document over it); Ctrl/⌘-wheel or trackpad pinch
-    // zooms around the cursor by resizing .tm-inner, #tm-fit shrinks the whole
-    // tree into the current viewport, double-click restores natural size, and
-    // a plain click on a node jumps to that block's row in the list below.
-    // Zoom state (view.__vm) survives re-renders.
-    function bindTreeMap() {
-        const view = $("tree-graph");
-        if (!view) return;
-        const fb = $("tm-fit");
-        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
-        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
-        view.addEventListener("wheel", function (e) {
-            if (!e.ctrlKey) return; // a plain wheel keeps scrolling the page
-            e.preventDefault();
-            const inner = view.querySelector(".tm-inner");
-            if (!inner) return;
-            const old = view.__vm ? view.__vm.k : 1;
-            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
-            if (k2 === old) return;
-            const r0 = inner.getBoundingClientRect();
-            const px = (e.clientX - r0.left) / old;
-            const py = (e.clientY - r0.top) / old;
-            view.__vm = { k: k2 };
-            treeMapApply(view);
-            const r1 = inner.getBoundingClientRect();
-            // hold the world point under the cursor still while the page reflows
-            window.scrollBy((r1.left + px * k2) - (r0.left + px * old), (r1.top + py * k2) - (r0.top + py * old));
-        }, { passive: false });
-        let downAt = null;
-        view.addEventListener("pointerdown", function (e) {
-            if (e.button !== 0) return;
-            downAt = { x: e.clientX, y: e.clientY };
-        });
-        view.addEventListener("pointerup", function (e) {
-            if (!downAt) return;
-            const moved = Math.abs(e.clientX - downAt.x) > 3 || Math.abs(e.clientY - downAt.y) > 3;
-            downAt = null;
-            if (moved) return;
-            // The page can scroll under a pressed finger, so the node under
-            // the pointer has to be hit-tested by point rather than target.
+            let found = null;
+            document.querySelectorAll("#bd-panels .bd-panel").forEach(function (pn) {
+                const on = pn.getAttribute("data-bid") === bid;
+                pn.hidden = !on;
+                if (on) found = pn;
+            });
+            const empty = $("bd-empty");
+            if (empty) {
+                empty.style.display = found ? "none" : "";
+                if (!found) empty.textContent = bid ? t("det.block_side_live") : t("det.block_side_hint");
+            }
+            if (found) fixSumClamp(found);
+        }
+        function hitEl(e) {
             let el = e.target;
-            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
-            const n = el && el.closest ? el.closest("[data-bid]") : null;
-            if (!n) return;
-            const bid = n.getAttribute("data-bid");
-            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-            if (!row) return;
-            row.open = true;
-            row.classList.add("flash");
-            // #4173 review: land at the TOP of the block — long rows used to
-            // scroll to their middle and looked lost.
-            row.scrollIntoView({ block: "start", behavior: "smooth" });
-            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || el; } catch (err) {}
+            return el;
+        }
+        function setMode(m) {
+            st.mode = m;
+            try { sessionStorage.setItem("bili-tree-mode", m); } catch (e) {}
+            graphView.hidden = m !== "tree";
+            listView.hidden = m !== "list";
+            if (expBtn) expBtn.hidden = m !== "tree";
+            if (colBtn) colBtn.hidden = m !== "tree";
+            if (gridEl) gridEl.classList.toggle("list-mode", m === "list");
+            if (sideEl) sideEl.hidden = m !== "tree";
+            if (hintEl) hintEl.textContent = m === "tree" ? t("det.tree_interact") : t("det.tree_list_hint");
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === m); });
+        }
+        btns.forEach(function (b) {
+            b.addEventListener("click", function (ev) { ev.preventDefault(); setMode(b.getAttribute("data-mode") === "list" ? "list" : "tree"); });
         });
-        view.addEventListener("pointercancel", function () { downAt = null; });
+        if (expBtn) expBtn.addEventListener("click", function () {
+            blocks.forEach(function (b) { st.expanded[b.blockId] = true; });
+            renderTree();
+        });
+        if (colBtn) colBtn.addEventListener("click", function () { st.expanded = {}; renderTree(); });
+        const pressAt = { on: false, x: 0, y: 0 };
+        function down(e) { if (e.button !== 0) return; pressAt.on = true; pressAt.x = e.clientX; pressAt.y = e.clientY; }
+        function up(e) {
+            if (!pressAt.on) return null;
+            const moved = Math.abs(e.clientX - pressAt.x) > 3 || Math.abs(e.clientY - pressAt.y) > 3;
+            pressAt.on = false;
+            if (moved || e.button !== 0) return null;
+            return hitEl(e);
+        }
+        graphView.addEventListener("pointerdown", down);
+        graphView.addEventListener("pointercancel", function () { pressAt.on = false; });
+        graphView.addEventListener("pointerup", function (e) {
+            const el = up(e);
+            if (!el) return;
+            const chip = el.closest ? el.closest("[data-toggle]") : null;
+            if (chip) {
+                const bid = chip.getAttribute("data-toggle");
+                if (st.expanded[bid]) delete st.expanded[bid]; else st.expanded[bid] = true;
+                renderTree();
+                return;
+            }
+            const n = el.closest ? el.closest("[data-bid]") : null;
+            if (n) select(n.getAttribute("data-bid"));
+        });
+        // One global Esc listener per page life: collapse the tree back to
+        // its roots (only while the tree is the visible reading). The view
+        // and renderer resolve at keypress time, so a re-rendered detail
+        // pane (hash navigation) stays reachable instead of closing over
+        // the first pane's detached nodes.
+        if (!window.__biliTreeEscBound) {
+            window.__biliTreeEscBound = true;
+            window.addEventListener("keydown", function (e) {
+                const gv = $("tree-graph");
+                if (e.key !== "Escape" || !treeViewState || !gv || gv.hidden) return;
+                treeViewState.expanded = {};
+                if (treeViewRender) treeViewRender();
+            });
+        }
+        renderTree();
+        setMode(mode);
     }
-    function bindCacheReportActions(d) {
+
+        function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
@@ -4358,7 +4365,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     async function refreshTreeMap() {
         if (mapBusy) return true;
         const view = $("tree-graph");
-        if (!view) return true;
+        if (!view || view.hidden) return true; // list mode: nothing live to repaint
         const m = location.hash.match(new RegExp("^#/session/(.+)$"));
         if (!m) return true;
         mapBusy = true;
@@ -4368,11 +4375,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
-                    // #4173 review: swap only the drawing frame so the pane's other
-                    // children (the legend row) survive live refreshes.
-                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
-                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
-                    treeMapApply(view);
+                    // #4608: repaint only the tree drawing — expansion and
+                    // selection survive the tick (the list is static DOM).
+                    const inner = view.querySelector(".tm-inner");
+                    const stv = treeViewState || { expanded: {}, selected: "" };
+                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
                 }
             }
         } catch (e) {

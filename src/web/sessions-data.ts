@@ -1135,20 +1135,50 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // client sent (folded messages included — a client never drops them because
     // of OUR folding), so the tree can name every message a block folded — ref,
     // role, preview — without shipping a byte of full text. A raw id with no
-    // resident message (host-pruned / archived-only session) simply has no leaf;
-    // `directMessageCount` still tells the UI how many were folded.
+    // resident message (host-pruned / archived-only session) used to simply
+    // become a missing leaf — but #4738 found the window itself moves under us:
+    // host-side native compaction prunes `lastMessages` client-side, so EVERY
+    // older leaf read as missing even though the unified store still holds the
+    // bytes. Leaves absent from the window are hydrated from storage below; refs
+    // absent from BOTH keep the honest missing marker.
+    // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
+    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    try {
+        const pending: number[] = [];
+        for (const b of session.state.blocks) {
+            for (const raw of b.directMessageIds || []) {
+                if (!messageById.has(raw)) {
+                    const r = byRaw[raw];
+                    const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
+                    if (num) pending.push(Number(num[1]));
+                }
+            }
+        }
+        if (pending.length > 0) {
+            const rows = getDiskStore().unifiedMessageContentByRefs(session.id, pending);
+            for (const row of rows ?? []) {
+                const text = storedMessageText(row.content);
+                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+            }
+        }
+    } catch {
+        // sidecar unavailable/degraded: fall through to legacy missing leaves
+    }
     const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
         for (const raw of rawIds) {
             const ref = byRaw[raw];
             if (typeof ref !== "string" || ref.length === 0) continue;
             const msg = messageById.get(raw);
-            // #3917: a folded message whose bytes are gone from the store still
-            // gets a row — the ref is the identity the user asked for — but it
-            // carries no preview and the UI says so instead of inventing text.
+            // #3917: a folded message whose bytes are gone from the resident
+            // window still gets a row — the ref is the identity the user asked
+            // for. #4738: bytes gone from the window but stored are hydrated,
+            // never missed; nothing invented either way.
             if (!msg) {
-                out.push({ ref, missing: true });
+                const num = /^m(\d+)$/.exec(ref);
+                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
+                out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
                 continue;
             }
             out.push({
@@ -1275,6 +1305,20 @@ function utf8Bytes(s: string): number {
     return Buffer.byteLength(s, "utf8");
 }
 
+/** #4738: a stored row carries the VERBATIM serialized message (ingest interns
+ *  `JSON.stringify(msg)`), not the bare text the resident path serves — extract
+ *  the text field so previews and click-to-open read identically either way.
+ *  Non-message payloads report null → the leaf stays an honest miss. */
+function storedMessageText(content: string): string | null {
+    try {
+        const parsed = JSON.parse(content) as { id?: unknown; text?: unknown };
+        if (typeof parsed?.id !== "string") return null;
+        return typeof parsed.text === "string" ? parsed.text : "";
+    } catch {
+        return null;
+    }
+}
+
 /** Largest prefix of `s` whose UTF-8 encoding fits in `maxBytes`, never cutting
  *  a surrogate pair in half (a lone surrogate would surface as U+FFFD). */
 function sliceUtf8(s: string, maxBytes: number): string {
@@ -1375,15 +1419,44 @@ export type MessageContentLookup =
 /** #3917: ONE message's text, addressed by its ref. Resolves the ref to its raw
  *  id and reads the message out of the newest request snapshot (`lastMessages`),
  *  which still carries the messages this proxy folded — folding only changes the
- *  OUTBOUND projection, never what the client keeps sending. A ref whose message
- *  is gone (host-side native compaction pruning) reports `unknown-message`
- *  instead of guessing. */
+ *  OUTBOUND projection, never what the client keeps sending. #4738: a ref whose
+ *  message left that window (host-side native compaction prunes it client-side)
+ *  falls back to the unified store, which outlives the window — only refs absent
+ *  from BOTH report `unknown-message` instead of guessing. */
 export async function buildMessageContent(id: string, ref: string): Promise<MessageContentLookup> {
     const session = await sessionForContent(id);
     if (!session) return { ok: false, reason: "unknown-session" };
     const raw = session.state.messageRefs.byRef[ref];
     const msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
-    if (!msg) return { ok: false, reason: "unknown-message" };
+    if (!msg) {
+        // #4738: pruned from the resident window ≠ gone — the stored bytes
+        // survive host-side native compaction. The ledger (byRef) stays the
+        // authority on identity: refs it never stamped skip the probe entirely.
+        const num = /^m(\d+)$/.exec(ref);
+        if (typeof raw === "string" && num) {
+            try {
+                const rows = getDiskStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                const row = rows && rows.length > 0 ? rows[0] : undefined;
+                const stored = row ? storedMessageText(row.content) : null;
+                if (row && stored !== null) {
+                    const totalBytes = utf8Bytes(stored);
+                    const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                    return {
+                        ok: true,
+                        ref,
+                        role: row.role,
+                        bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                        totalBytes,
+                        truncated,
+                        text: truncated ? sliceUtf8(stored, BLOCK_CONTENT_MAX_BYTES) : stored,
+                    };
+                }
+            } catch {
+                // sidecar degraded mid-request: report the miss, never 500
+            }
+        }
+        return { ok: false, reason: "unknown-message" };
+    }
     const text = msg.text ?? "";
     const totalBytes = utf8Bytes(text);
     const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;

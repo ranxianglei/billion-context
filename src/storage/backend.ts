@@ -69,6 +69,8 @@ export interface StorageBackend {
     getSessionRow(sessionId: string): Promise<SessionRow | null>;
     /** #4316 PR3/3: live (non-retired) row count. */
     liveRowCount(sessionId: string): Promise<number>;
+    /** #4730: highest live seq — fork endpoint's inclusive throughSeq. */
+    lastLiveSeq(sessionId: string): Promise<number | null>;
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only). */
     seqByRaw(sessionId: string): Promise<Map<string, number> | null>;
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
@@ -178,6 +180,9 @@ export class SqliteBackend implements StorageBackend {
     }
     liveRowCount(sessionId: string): Promise<number> {
         return Promise.resolve(this.store.liveRowCount(sessionId));
+    }
+    lastLiveSeq(sessionId: string): Promise<number | null> {
+        return Promise.resolve(this.store.lastLiveSeq(sessionId));
     }
     seqByRaw(sessionId: string): Promise<Map<string, number> | null> {
         return Promise.resolve(this.store.seqByRaw(sessionId));

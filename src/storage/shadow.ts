@@ -32,7 +32,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow } from "./store.js";
+import type { MessageRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -765,6 +765,15 @@ export class UnifiedShadow {
         return this.sync.getMessages(sessionId);
     }
 
+    /** #4738: per-ref stored message bodies (sync store only, like
+     *  tailViewRows) — the web preview fallback when host-side native
+     *  compaction pruned the resident window. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (this.sync === null || refNums.length === 0) return [];
+        this.assertLive();
+        return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         this.assertLive();
@@ -793,6 +802,15 @@ export class UnifiedShadow {
         this.assertLive();
         if (this.sync !== null) return this.sync.liveRowCount(sessionId);
         return -1;
+    }
+
+    /** #4730: highest live seq — the fork endpoint's inclusive throughSeq
+     *  (NOT count - 1: tombstones keep their seq). Null when the unified
+     *  store is unavailable or the session has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.lastLiveSeq(sessionId);
     }
 
     /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —

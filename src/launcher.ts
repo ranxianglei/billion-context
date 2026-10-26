@@ -60,7 +60,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
-import { log as teeLog } from "./logger.js";
+import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -4273,7 +4273,7 @@ async function waitForStarterInstance(
 function defaultAttachDiag(debug: boolean): (msg: string) => void {
     return (msg: string): void => {
         logHostEvent("info", "", msg);
-        if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
+        if (debug) process.stderr.write(`${logTimestamp()} [info] [v=${VERSION}] ${msg}\n`);
     };
 }
 

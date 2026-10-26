@@ -36,6 +36,10 @@ import type { MessageContentStore } from "acp-kernel";
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
+/** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
+ *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
+const SEQ_SPAN_QUERY_BATCH = 500;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -108,6 +112,10 @@ export interface MessageRow {
      *  the surviving generation. Optional for direct callers. */
     identity?: string;
 }
+
+/** #4738: one stored message addressed by its mNNNNN ref number — the web
+ *  hydration row, served when the resident window no longer carries the bytes. */
+export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
 
 export interface BlockRow {
     blockId: string;
@@ -863,18 +871,34 @@ export class UnifiedStore {
             // bounds from the append-only transcript. Final absolute seqs exist
             // only here (delta placeholders are renumbered in-transaction), so
             // the pure planner cannot know them. Coverage whose ids have no
-            // transcript row (imported pre-fold) keeps the 0 placeholder.
+            // transcript row (imported pre-fold) stores the -1 "no claim"
+            // sentinel — a [0,0] would read back as a REAL claim over seq 0
+            // and suppress the seq-0 message (PR #4725 N1); -1 keeps the
+            // #4608 CASE guard honest (unknown < 0 → preserve stored bounds).
             const seqSpanById = new Map<string, [number, number]>();
             if (input.blocks.length > 0) {
-                const rows = this.db
-                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
-                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
-                for (const r of rows) {
-                    const cur = seqSpanById.get(r.msg_id);
-                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
-                    else {
-                        if (r.seq < cur[0]) cur[0] = r.seq;
-                        if (r.seq > cur[1]) cur[1] = r.seq;
+                // point query over the covered ids only (PR #4725 N3): a
+                // full-session scan per save taxed every session with blocks.
+                const wanted = new Set<string>();
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
+                    } catch { /* malformed payload: no covered ids to resolve */ }
+                }
+                const wantedIds = Array.from(wanted);
+                for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    const rows = this.db
+                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`)
+                        .all(s.sessionId, ...ids) as Array<{ msg_id: string; seq: number }>;
+                    for (const r of rows) {
+                        const cur = seqSpanById.get(r.msg_id);
+                        if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                        else {
+                            if (r.seq < cur[0]) cur[0] = r.seq;
+                            if (r.seq > cur[1]) cur[1] = r.seq;
+                        }
                     }
                 }
             }
@@ -889,8 +913,8 @@ export class UnifiedStore {
                         if (sp[0] < lo) lo = sp[0];
                         if (sp[1] > hi) hi = sp[1];
                     }
-                } catch { /* malformed payload: keep the 0 placeholder */ }
-                return hi < 0 ? [0, 0] : [lo, hi];
+                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                return hi < 0 ? [-1, -1] : [lo, hi];
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -1097,7 +1121,7 @@ export class UnifiedStore {
         // when the plan carries no tail (envelope-only imports): the next
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
-        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
+        const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1118,12 +1142,44 @@ export class UnifiedStore {
                 // corrupted row heals on the next full ingest.
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
-                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
         for (const r of repairs) {
+            // #4793: a sibling row may already hold the target bytes for this
+            // msg_id — e.g. an old generation stamped with an EMPTY identity
+            // by a pre-#4390 build while the plan re-derives the real one,
+            // or two generations of the same edited message. identity is a
+            // pure function of stable content, so any live row holding r.to
+            // for this msg_id is a second generation of the SAME logical
+            // message. UNIQUE(session_id, msg_id, content_hash) spans the
+            // whole table including retired rows, so the UPDATE below would
+            // throw and roll back the entire ingest unless those blockers are
+            // cleared first; three such throws then trip the shadow's
+            // process-wide 3-strike disable (one stuck session degraded every
+            // other session's index, banner "SQLite storage degraded"). Same
+            // content_hash ⇒ same CAS blob ⇒ retiring the sibling loses no
+            // information, and our row keeps its stable seq (#4390 D4-1).
+            this.db
+                .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL")
+                .run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
+            // A retired duplicate still occupies the triple (the constraint
+            // is not partial): it is byte-identical, so dropping the row and
+            // its media mappings loses nothing. Rare path; common case stays
+            // single-statement above.
+            const leftovers = this.db
+                .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL")
+                .all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
+            if (leftovers.length > 0) {
+                const delMedia = this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+                const delRow = this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
+                for (const l of leftovers) {
+                    delMedia.run(s.sessionId, l.seq);
+                    delRow.run(s.sessionId, l.seq);
+                }
+            }
             this.putContent(r.content, r.to);
             this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
             this.releaseContent(r.from);
@@ -1299,6 +1355,30 @@ export class UnifiedStore {
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
+    /** #4738: message bodies addressed by their ref number (the mNNNNN
+     *  identity in the web UI). Storage outlives the resident `lastMessages`
+     *  window — host-side native compaction prunes that window client-side,
+     *  so "gone from the window" must not read as "gone". Unknown refs simply
+     *  come back absent; retired rows (rewound/undo history) stay excluded,
+     *  matching every other view-lane reader. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (refNums.length === 0) return [];
+        const nums = [...new Set(refNums)];
+        const CHUNK = 500;
+        const out: MessageRefContentRow[] = [];
+        for (let i = 0; i < nums.length; i += CHUNK) {
+            const chunk = nums.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND ref_num IN (${ph})`)
+                .all(sessionId, ...chunk) as { ref_num: number; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ refNum: r.ref_num, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
      *  state.blocks loses the entry, blockContents keeps the text). The full
      *  ingest skips orphan-shaped records (envelope-served, owner-pinned
@@ -2176,13 +2256,24 @@ export class UnifiedStore {
      *  edit left both bytes in the log) has no single "the" seq — picking one
      *  would silently re-bind the citation to the wrong generation. Those
      *  stay on their legacy refs (kept honestly instead of re-bound wrongly). */
-    /** #4316 PR3/3: live (non-retired) row count — fork endpoint's
-     *  throughSeq source (count - 1, inclusive). */
+    /** #4316 PR3/3: live (non-retired) row count. */
     liveRowCount(sessionId: string): number {
         const row = this.db
             .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
             .get(sessionId) as Record<string, unknown>;
         return (row.n as number) ?? 0;
+    }
+
+    /** #4730: highest live (non-retired) seq — the fork endpoint's inclusive
+     *  throughSeq. NOT the live row count: tombstones keep their seq, so once
+     *  any row is retired count < lastLiveSeq + 1 and count - 1 would silently
+     *  drop the newest live rows from the cloned child. Null when the session
+     *  has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        const row = this.db
+            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .get(sessionId) as Record<string, unknown>;
+        return (row.m as number | null) ?? null;
     }
 
     seqByRaw(sessionId: string): Map<string, number> {
@@ -2204,7 +2295,7 @@ export class UnifiedStore {
      *  session row records the lineage; content/media CAS refcounts are
      *  bumped per copied row. Idempotent: replaying the same clone is a no-op.
      *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
-     *  parent's live row count - 1). */
+     *  parent's last live seq — #4730). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): void {
         this.db.transaction(() => {
             const parent = this.getSessionRow(parentId);

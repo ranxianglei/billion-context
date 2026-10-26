@@ -11,6 +11,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { WEB_STYLES } from "../src/web/styles.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -185,7 +186,7 @@ test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries
     assert.equal(await buildSessionTree("no-such-session"), null, "unknown session resolves to a 404 payload");
 });
 
-test("#3917: the tree's strings exist in both locales with identical placeholders", () => {
+test("#4608: the pane's strings exist in both locales with identical placeholders", () => {
     const keys = [
         "det.tab_overview",
         "det.tab_blocks",
@@ -202,14 +203,17 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_orig_missing",
         "det.tree_msgs_unavailable",
         "det.tree_msg_gone",
-        "det.tree_hint",
-        "det.tree_view_list",
         "det.tree_view_graph",
-        "det.tree_map_hint",
+        "det.tree_view_list",
+        "det.tree_list_hint",
+        "det.tree_expand_all",
+        "det.tree_collapse_all",
+        "det.tree_interact",
+        "det.block_detail_title",
+        "det.block_side_hint",
+        "det.block_side_live",
         "det.tree_sum_more",
         "det.tree_sum_less",
-        "det.tree_map_fit",
-        "det.tree_graph_legend",
     ];
     const placeholders = (s: string) => (s.match(/\{[a-z]+\}/g) ?? []).sort().join(",");
     for (const key of keys) {
@@ -221,119 +225,126 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
     }
 });
 
-test("#3917: the web client bundle stays parseable JS after the tree additions", () => {
+test("#4608: the web client bundle stays parseable JS with the master-detail pane wired", () => {
     assert.doesNotThrow(() => new vm.Script(WEB_CLIENT), "WEB_CLIENT must compile as a standalone script");
     assert.match(WEB_CLIENT, /function buildTreePane\(blocks\)/);
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
-    // the graph reading of the same folds: layered boxes + list⇄graph switch
-    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks/);
-    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks,/);
-    // #4173: pathologically wide trees rotate instead of shrinking to sub-pixel
-    assert.match(WEB_CLIENT, /function blockGraphLayoutVertical\(blocks,/);
-    assert.match(WEB_CLIENT, /g-svg-v/);
-    // #4173: in-pane live tree map — the full labeled drawing in wrapped mode
-    // (compact nodes at natural pixel size flowing with the page), fed by
-    // GET /sessions/<id>/tree on the 5s poller; wheel/pan/click bind on the
-    // stable #tree-graph container and zoom resizes .tm-inner via treeMapApply.
-    assert.match(WEB_CLIENT, /function graphLayouts\(blocks,/);
-    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks, wrapped,/);
-    assert.match(WEB_CLIENT, /class="tm-g"/);
-    assert.match(WEB_CLIENT, /class="tm-inner" data-nw=/);
-    assert.match(WEB_CLIENT, /function treeMapInnerHtml\(graph\)/);
-    assert.match(WEB_CLIENT, /function treeMapApply\(view\)/);
-    assert.match(WEB_CLIENT, /function treeMapFit\(view\)/);
-    assert.match(WEB_CLIENT, /function bindTreeMap\(\)/);
-    assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
-    assert.match(WEB_CLIENT, /addEventListener\("wheel"/);
-    // #4173 review: plain wheel scrolls the page over the in-flow map; only
-    // Ctrl/pinch wheels zoom (anchored via window.scrollBy), and the map draws
-    // with tighter metrics than the legacy fit-shrunk graph.
-    assert.match(WEB_CLIENT, /if \(!e\.ctrlKey\) return;/);
-    assert.match(WEB_CLIENT, /const MAP_METRICS = \{ w: MAP_NODE_W/);
-    assert.match(WEB_CLIENT, /window\.scrollBy\(/);
-    assert.match(WEB_CLIENT, /pointerdown/);
-    assert.match(WEB_CLIENT, /tm-fit/);
-    // #4173 review: Fit is mode-gated (visible only while the tree drawing shows)
-    // and live refreshes swap just the .tm-inner frame so the legend row survives.
-    assert.match(WEB_CLIENT, /fit\.hidden = !g/);
-    assert.match(WEB_CLIENT, /insertAdjacentHTML\("afterbegin", treeMapInnerHtml/);
-    // #4173 review: click-to-jump hit-tests by point (pointer capture
-    // retargets the event), and graph mode stacks map+list instead of hiding
-    // the detail rows.
-    assert.match(WEB_CLIENT, /document\.elementFromPoint\(e\.clientX, e\.clientY\)/);
-    assert.match(WEB_CLIENT, /list\.hidden = false/);
-    // #4173 review: list rows start collapsed; tree nodes carry the message
-    // span (mXXXX–mYYYY); the raw-text button can be pressed again to close.
-    assert.match(WEB_CLIENT, /const openAttr = "";/);
-    assert.match(WEB_CLIENT, /const rr = refRangeOf\(b\)/);
-    assert.match(WEB_CLIENT, /escapeHtml\(rr \|\| meta\)/);
-    assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);
-    // #4173 review: jump lands at the top of the target row; long summaries
-    // open as five clamped lines behind a show-all toggle.
-    assert.match(WEB_CLIENT, /row\.scrollIntoView\(\{ block: "start", behavior: "smooth" \}\)/);
-    assert.match(WEB_CLIENT, /blk-sum clamp/);
-    assert.match(WEB_CLIENT, /blk-sum-toggle/);
-    assert.match(WEB_CLIENT, /body\.__sumChk/);
-    assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring present in the bundle");
-    assert.match(WEB_CLIENT, /"g-node tier-" \+/);
-    assert.match(WEB_CLIENT, /data-mode="graph"/);
+    // collapsible tree reading (default) + the restored classic list
+    assert.match(WEB_CLIENT, /function collapTreeLayout\(blocks/);
+    assert.match(WEB_CLIENT, /function renderCollapSvg\(blocks/);
+    assert.match(WEB_CLIENT, /function sidePanelHtml\(b, idx\)/);
+    assert.match(WEB_CLIENT, /function blockNodeHtml\(b, shape, idx, depth\)/);
     assert.match(WEB_CLIENT, /id="tree-graph"/);
-    assert.match(WEB_CLIENT, /\.block-node\[data-bid=/);
+    assert.match(WEB_CLIENT, /id="tree-list"/);
+    assert.match(WEB_CLIENT, /id="bd-panels"/);
+    assert.match(WEB_CLIENT, /data-mode="tree"/);
+    assert.match(WEB_CLIENT, /data-mode="list"/);
+    assert.match(WEB_CLIENT, /"g-node tier-" \+/);
+    assert.match(WEB_CLIENT, /tchip/);
+    // point hit-testing survives innerHTML swaps; the mode choice persists
+    assert.match(WEB_CLIENT, /document\.elementFromPoint/);
+    assert.match(WEB_CLIENT, /sessionStorage\.setItem\("bili-tree-mode"/);
+    assert.match(WEB_CLIENT, /let treeViewState = null;/);
+    assert.match(WEB_CLIENT, /window\.__biliDetailBlocks = blocks;/);
+    // live lane repaints only the tree drawing from GET /sessions/<id>/tree
+    assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
+    assert.match(WEB_CLIENT, /renderCollapSvg\(r\.blocks/);
+    assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring still present");
+    // raw-view buttons stay reversible; the clamp machinery now measures panels
+    assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);
+    assert.match(WEB_CLIENT, /blk-sum clamp/);
+    assert.match(WEB_CLIENT, /body\.__sumChk/);
 });
 
-// #4173: run the actual layout/graph code from the bundle against fixtures.
-test("#4173: wide trees rotate to vertical full-size instead of shrinking to smears", () => {
-    const start = WEB_CLIENT.indexOf("function blockTreeShape(");
-    const end = WEB_CLIENT.indexOf("function refRangeOf(");
-    assert.ok(start > 0 && end > start, "graph section anchors present in the bundle");
-    const stubs = "var escapeHtml=function(s){return String(s);};var fmtW=function(n){return String(n);};var blockTopic=function(b){return b.topic||'';};var t=function(k){return k;};var refRangeOf=function(b){return '';};";
+// Run the actual drawing code out of the bundle against fixtures (#4173
+// precedent): the section is extracted between stable function anchors and
+// executed in a vm with the page helpers stubbed.
+interface PaneBlock {
+    blockId: string;
+    tier?: number;
+    active?: boolean;
+    topic?: string;
+    startRef?: string;
+    endRef?: string;
+    parentBlockId?: string;
+    compressedTokens?: number;
+    summaryTokens?: number;
+}
+interface PaneApi {
+    collapTreeLayout(blocks: PaneBlock[], expanded: Record<string, boolean>): { nodes: { b: PaneBlock; x: number; y: number }[]; links: unknown[]; sizes: Record<string, number> };
+    renderCollapSvg(blocks: PaneBlock[], expanded: Record<string, boolean>, selectedBid?: string): { html: string };
+    buildTreePane(blocks: PaneBlock[]): string;
+}
+function loadPaneApi(): PaneApi {
+    const start = WEB_CLIENT.indexOf("function blockTreeStats(");
+    const end = WEB_CLIENT.indexOf("function buildDetailHtml(d) {");
+    assert.ok(start > 0 && end > start, "pane section anchors present in the bundle");
+    const stubs = [
+        "var escapeHtml=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');};",
+        "var fmtW=function(n){return String(n);};",
+        "var fmtB=function(n){return String(n)+'B';};",
+        "var timeAgo=function(){return 'now';};",
+        "var blockTopic=function(b){return b.topic||'';};",
+        "var t=function(k,v){return k;};",
+        "var renderBlockMd=function(s){return '<p>'+escapeHtml(String(s))+'</p>';};",
+        "var window={};",
+    ].join("");
     const ctx = vm.createContext({});
-    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "this.api={blockGraphLayout:blockGraphLayout,blockGraphLayoutVertical:blockGraphLayoutVertical,buildGraphSvg:buildGraphSvg,graphLayouts:graphLayouts};;this.api", ctx, { filename: "web-graph.js" });
-    const api = ctx.api;
+    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "\nthis.api={collapTreeLayout:collapTreeLayout,renderCollapSvg:renderCollapSvg,buildTreePane:buildTreePane};this.api", ctx, { filename: "web-pane.js" });
+    return (ctx as { api: PaneApi }).api;
+}
 
-    // 30 independent T1 roots → flat row 4004px wide: the old code fit-scaled it
-    // to ≈ 33px boxes; now it must rotate.
-    const wide = [];
-    for (let i = 0; i < 30; i++) wide.push({ blockId: "b" + i, tier: 1, active: true, parentBlockId: undefined });
-    const res = api.buildGraphSvg(wide);
-    assert.equal(res.vertical, true, "a 30-root flat tree rotates");
-    assert.match(res.html, /class="g-svg g-svg-v"/);
-    assert.ok((res.html.match(/data-bid=/g) || []).length === 30, "rotation keeps every node");
-    const m = res.html.match(/ width="(\d+)" height="(\d+)"/);
-    assert.ok(m, "svg carries explicit dimensions");
-    // vertical extent ≈ 30 slots × 52 − gap (+padding), rendered UNscaled (width axis ~3 levels)
-    assert.ok(Number(m[1]) < 600, "long dimension moved off the width axis (got " + m[1] + "px)");
-    assert.ok(Number(m[2]) >= 1400, "height holds the 30 stacked nodes near natural size (got " + m[2] + "px)");
+// vm-run code returns foreign-realm arrays/objects; JSON round-trip on the
+// host side restores plain prototypes so deepEqual compares structure, not realms.
+const fromVm = (x: unknown) => JSON.parse(JSON.stringify(x)) as never;
 
-    // small deep chain: stays top-down, byte-level unchanged rendering path
-    const chain = [{ blockId: "c1", tier: 1, active: true, parentBlockId: undefined }, { blockId: "c2", tier: 2, active: true, parentBlockId: "c1" }, { blockId: "c3", tier: 3, active: true, parentBlockId: "c2" }];
-    const small = api.buildGraphSvg(chain);
-    assert.equal(small.vertical, false, "a narrow chain does not rotate");
-    assert.doesNotMatch(small.html, /g-svg-v/);
-    assert.ok(small.html.includes('viewBox="0 0'), "still an svg");
+test("#4608: the collapsible tree shows roots until a branch is opened; chips count what hides", () => {
+    const api = loadPaneApi();
+    const fam: PaneBlock[] = [
+        { blockId: "r1", tier: 1, active: true, topic: "root topic" },
+        { blockId: "k1", tier: 2, active: true, parentBlockId: "r1" },
+        { blockId: "k2", tier: 2, active: false, parentBlockId: "r1" },
+    ];
+    const folded = api.collapTreeLayout(fam, {});
+    assert.deepEqual(fromVm(folded.nodes.map((n) => n.b.blockId)), ["r1"], "only roots sit on canvas by default");
+    assert.equal(folded.sizes.r1, 3, "subtree size counts the hidden descendants");
+    const open = api.collapTreeLayout(fam, { r1: true });
+    assert.equal(open.nodes.length, 3);
+    assert.equal(open.links.length, 2);
+    assert.equal(open.nodes.find((n) => n.b.blockId === "k1")!.x, 1, "children land one column deeper");
+    const svgF = api.renderCollapSvg(fam, {}, "").html;
+    assert.ok(svgF.includes("+2"), "the closed branch advertises how much hides behind it");
+    assert.ok(svgF.includes('data-toggle="r1"'), "chips toggle their parent");
+    assert.ok(!svgF.includes("k1"), "collapsed children never reach the DOM");
+    const svgO = api.renderCollapSvg(fam, { r1: true }, "k2").html;
+    assert.ok(svgO.includes("\u2212") || svgO.includes("-"), "the open branch offers a collapse mark");
+    assert.ok(svgO.includes("fsel"), "selection rides the node");
+    assert.ok(svgO.includes("tier-2 inactive"), "archived children keep the dashed styling");
+    assert.equal(api.renderCollapSvg([], {}, "").html, "", "an empty forest renders nothing");
+});
 
-    // empty tree keeps the old falsy contract via {html:""}
-    const none = api.buildGraphSvg([]);
-    assert.equal(none.html, "");
+test("#4608: buildTreePane wires the two drawings beside the pre-rendered panels", () => {
+    const api = loadPaneApi();
+    const fam: PaneBlock[] = [
+        { blockId: "r1", tier: 1, active: true, topic: "root topic" },
+        { blockId: "k1", tier: 2, active: true, parentBlockId: "r1", compressedTokens: 9, summaryTokens: 1 },
+    ];
+    const pane = api.buildTreePane(fam);
+    assert.ok(pane.includes('id="tree-graph"') && !pane.includes('id="tree-graph" hidden'), "the tree reading shows by default");
+    assert.ok(pane.includes('id="tree-list" hidden'), "the classic list starts under the tree");
+    assert.ok(pane.includes('class="block-item block-node tier-1"'), "the classic list keeps the master-folded rows");
+    assert.equal((pane.match(/class="bd-panel"/g) || []).length, 2, "one pre-rendered panel per block");
+    assert.ok(pane.includes('data-mode="tree"') && pane.includes('data-mode="list"'), "mode switch offers both readings");
+    assert.ok(!pane.includes("flame-stage"), "no flame leftovers in the pane");
+    assert.ok(pane.includes('id="tm-expand-all"'), "expand/collapse controls ship with the tree mode");
+    assert.ok(!api.buildTreePane([]).includes("tree-list"), "no blocks -> the empty card, no frames");
+});
 
-    // #4173: the in-pane live map reuses the full labeled drawing — every node
-    // keeps its box AND its text — but switches into wrapped mode: content sits
-    // in the pan/zoom <g class="tm-g"> group and the svg tag carries NO fixed
-    // size attributes (CSS owns the viewport). The plain path is untouched.
-    const mapRes = api.buildGraphSvg(wide, true);
-    const mapWide = mapRes.html;
-    assert.ok(mapWide.startsWith('<svg class="g-svg g-svg-v tm-svg"'), "wide trees rotate in the map too");
-    assert.ok(mapWide.includes('<g class="tm-g">'), "map wraps its drawing in the transform group");
-    assert.ok(mapWide.includes("<text"), "map keeps the labels");
-    assert.equal((mapWide.match(/data-bid="/g) || []).length, 30, "every block still gets a node");
-    const mvb = mapWide.match(/viewBox="0 0 (\d+) (\d+)"/);
-    const mwd = mapWide.match(/ width="(\d+)" height="(\d+)"/);
-    assert.ok(mvb && mwd, "wrapped svg carries viewBox plus natural size attrs");
-    assert.equal(Number(mvb[1]), Number(mwd[1]), "wrapped width is the natural width (no fit shrink)");
-    assert.equal(Number(mvb[2]), Number(mwd[2]), "wrapped height is the natural height (no fit shrink)");
-    assert.equal(mapRes.width, Number(mwd[1]), "returned width matches the drawing");
-    assert.ok(api.buildGraphSvg(wide).html.match(/<svg[^>]*>/)[0].includes("width="), "plain svg keeps fit size attrs");
-    const mapChain = api.buildGraphSvg(chain, true).html;
-    assert.ok(mapChain.length > 0 && mapChain.includes('viewBox="0 0'), "a narrow chain renders a non-empty map with viewBox geometry");
-    assert.equal(api.buildGraphSvg([], true).html, "", "empty tree renders nothing");
+test("#4737 review: pane surfaces follow the theme and list markdown rules keep their element suffixes", () => {
+    assert.ok(!/\.fd-left \{[^}]*#fff/.test(WEB_STYLES), ".fd-left must not hardcode white (dark scheme)");
+    assert.ok(!/\.bd-card \{[^}]*#fff/.test(WEB_STYLES), ".bd-card must not hardcode white (dark scheme)");
+    assert.ok(!/\.block-item \.body\.md,/.test(WEB_STYLES), "no bare '.block-item .body.md,' selector (element suffix dropped)");
+    for (const sel of ["p", "h2", "ul", "li", "pre", "code", "blockquote", "hr", "strong"]) {
+        assert.match(WEB_STYLES, new RegExp(`\\.block-item \\.body\\.md ${sel},`), `list-mode ${sel} rule keeps its element suffix`);
+    }
 });

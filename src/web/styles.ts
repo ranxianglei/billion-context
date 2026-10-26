@@ -229,17 +229,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .chart-legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 
 .blocks-list { max-height: 420px; overflow-y: auto; }
-.block-item { border-bottom: 1px solid var(--border-soft); }
-.block-item:last-child { border-bottom: none; }
-.block-item summary { list-style: none; cursor: pointer; padding: 9px 16px; display: flex; gap: 10px; align-items: baseline; }
-.block-item summary::-webkit-details-marker { display: none; }
-.block-item summary:hover { background: var(--bg-muted); }
-.block-item .bid { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); min-width: 52px; }
-.block-item .topic { font-weight: 600; font-size: 13px; flex: 1; }
-.block-item .meta { font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
-.block-item .body { padding: 0 16px 12px 78px; font-size: 12.5px; color: var(--text-muted); white-space: pre-wrap; }
-.block-item .body.md { white-space: normal; }
-.block-item .body.md p { margin: 6px 0; }
+.block-item .body.md p, .bd-panel .body.md p { margin: 6px 0; }
 
 /* Changelog section (#3719): collapsible releases inside the overview card */
 .cl-card summary { list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 13px; display: flex; gap: 8px; align-items: center; }
@@ -271,16 +261,16 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .cl-cat .dim { font-weight: 400; font-size: 11.5px; }
 .cl-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-soft); transition: background .4s ease-out; }
-.block-item .body.md h2, .block-item .body.md h3, .block-item .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
-.block-item .body.md h2 { font-size: 13.5px; } .block-item .body.md h3 { font-size: 13px; } .block-item .body.md h4 { font-size: 12.5px; }
-.block-item .body.md ul, .block-item .body.md ol { margin: 6px 0; padding-left: 22px; }
-.block-item .body.md li { margin: 2px 0; }
-.block-item .body.md pre { background: var(--bg-muted); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 10px; overflow-x: auto; font-size: 11.5px; white-space: pre; max-height: 320px; }
-.block-item .body.md code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-muted); padding: 1px 5px; border-radius: 5px; }
-.block-item .body.md pre code { background: none; padding: 0; }
-.block-item .body.md blockquote { margin: 6px 0; padding: 5px 10px; border-left: 3px solid var(--border); background: var(--bg-muted); border-radius: 0 8px 8px 0; }
-.block-item .body.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-.block-item .body.md strong { color: var(--text); }
+.block-item .body.md h2, .bd-panel .body.md h2, .block-item .body.md h3, .bd-panel .body.md h3, .block-item .body.md h4, .bd-panel .body.md h4 { margin: 12px 0 6px; line-height: 1.35; color: var(--text); }
+.block-item .body.md h2, .bd-panel .body.md h2 { font-size: 13.5px; } .block-item .body.md h3, .bd-panel .body.md h3 { font-size: 13px; } .block-item .body.md h4, .bd-panel .body.md h4 { font-size: 12.5px; }
+.block-item .body.md ul, .bd-panel .body.md ul, .block-item .body.md ol, .bd-panel .body.md ol { margin: 6px 0; padding-left: 22px; }
+.block-item .body.md li, .bd-panel .body.md li { margin: 2px 0; }
+.block-item .body.md pre, .bd-panel .body.md pre { background: var(--bg-muted); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 10px; overflow-x: auto; font-size: 11.5px; white-space: pre; max-height: 320px; }
+.block-item .body.md code, .bd-panel .body.md code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-muted); padding: 1px 5px; border-radius: 5px; }
+.block-item .body.md pre code, .bd-panel .body.md pre code { background: none; padding: 0; }
+.block-item .body.md blockquote, .bd-panel .body.md blockquote { margin: 6px 0; padding: 5px 10px; border-left: 3px solid var(--border); background: var(--bg-muted); border-radius: 0 8px 8px 0; }
+.block-item .body.md hr, .bd-panel .body.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+.block-item .body.md strong, .bd-panel .body.md strong { color: var(--text); }
 
 /* #3917: detail-page panes + compression tree */
 .det-tabs { display: flex; gap: 4px; margin: 16px 0 0; border-bottom: 1px solid var(--border); }
@@ -291,7 +281,6 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .det-pane { margin-top: 16px; }
 .tree-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 2px 0 10px; color: var(--text-muted); }
 .tree-actions { display: flex; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
-.block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
 /* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
    (layered block boxes on a light canvas, tier-tinted borders). */
 .tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
@@ -303,9 +292,6 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
    long session reads as one continuous document (drawing on top, list below).
    The drawing keeps full-size fonts unless it is the compact map. */
 .tm-view { position: relative; }
-.tm-svg { display: block; width: 100%; height: 100%; }
-.tm-svg .g-id { font-size: 10px; }
-.tm-svg .g-meta { font-size: 9px; }
 /* zoom resizes .tm-inner; the browser scales the svg uniformly to fill it. */
 .tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
@@ -322,15 +308,6 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .g-meta { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text-muted); }
 .blk-sum.clamp { display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
 .blk-sum-toggle { margin-top: 6px; }
-.block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
-.block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
-.block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }
-.block-node summary .blk-copy { margin-left: auto; flex: none; }
-.block-node summary .meta { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
-.block-node .topic { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.block-node .body { padding: 0 16px 10px 70px; }
-.block-node .blk-content-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px 8px 70px; }
-.block-node .blk-content { margin: 0 16px 12px 70px; }
 .blk-content-meta { color: var(--text-muted); margin-bottom: 6px; }
 .blk-msgs { list-style: none; margin: 0 16px 10px 70px; padding: 0; border-left: 1px dashed var(--border-soft); }
 .blk-msgs li { margin: 0; }
@@ -344,9 +321,32 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .blk-msgs .msg-body { margin: 0 6px 8px 8px; }
 .blk-msgs .msg-body .blk-content-pre { max-height: 320px; }
 .blk-content-pre { background: var(--bg-muted); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word; }
-.tier-1 summary .bid { color: var(--accent); }
+.blk-content-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding-top: 4px; }
+.blk-content { margin-bottom: 12px; }
 .warn-text { color: #bf8700; }
 
+/* #4608: master-detail compression pane — the collapsible tree (default)
+   or the classic folded-block list on the left; in tree mode the
+   selected block rides the sticky right pane. */
+.fd-grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 14px; align-items: start; margin-top: 2px; }
+@media (max-width: 1180px) { .fd-grid { grid-template-columns: 1fr; } }
+.fd-grid.list-mode { grid-template-columns: minmax(0, 1fr); }
+.fd-left { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-elev); overflow: auto; max-height: calc(100vh - 240px); padding: 8px; }
+.g-node.fsel rect { stroke: var(--accent); stroke-width: 2.6; }
+.g-topic { font-size: 11.5px; font-weight: 600; fill: var(--text); }
+.tchip { cursor: pointer; }
+.tchip rect { fill: var(--bg-muted); stroke: var(--border-soft); }
+.tchip:hover rect { stroke: var(--accent); }
+.tchip text { font-size: 10px; font-weight: 700; fill: var(--text-muted); text-anchor: middle; }
+.fd-side { min-width: 0; }
+.bd-card { border: 1px solid var(--border-soft); border-radius: 10px; position: sticky; top: 12px; max-height: calc(100vh - 240px); overflow-y: auto; }
+.bd-panel { padding-bottom: 14px; }
+.bd-panel .bd-head { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.bd-panel .bd-head .mono { color: var(--text-faint, var(--text-muted)); font-size: 12px; }
+.bd-panel .topic { font-weight: 600; font-size: 13.5px; margin: 8px 0 2px; color: var(--text); }
+.bd-panel .meta { color: var(--text-muted); font-size: 11.5px; margin-bottom: 4px; }
+.bd-panel .body.md { white-space: normal; font-size: 12.5px; color: var(--text-muted); }
+.bd-panel .blk-msgs { margin-left: 16px; }
 .handoff { font-size: 13.5px; line-height: 1.65; }
 .handoff h1, .handoff h2, .handoff h3, .handoff h4 { margin: 18px 0 8px; line-height: 1.3; }
 .handoff h1 { font-size: 17px; } .handoff h2 { font-size: 15.5px; } .handoff h3 { font-size: 14px; }
@@ -465,6 +465,15 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .seam-ev summary { list-style: none; cursor: pointer; padding: 12px 16px; font-size: 13.5px; font-weight: 650; display: flex; align-items: baseline; gap: 8px; }
 .seam-ev summary::-webkit-details-marker { display: none; }
 .seam-ev[open] summary { border-bottom: 1px solid var(--border-soft); }
+table:is(.event-table, .fold-table) { min-width: 38rem; table-layout: fixed; }
+table:is(.event-table, .fold-table) th, table:is(.event-table, .fold-table) td { padding: 8px 14px; white-space: nowrap; text-align: center; }
+table:is(.event-table, .fold-table) th:first-child, table:is(.event-table, .fold-table) td:first-child { width: 8%; text-align: left; }
+table:is(.event-table, .fold-table) th:nth-child(2) { width: 20%; }
+table.event-table th:nth-child(3), table.event-table th:nth-child(4) { width: 14%; }
+table:is(.event-table, .fold-table) th:last-child, table:is(.event-table, .fold-table) td:last-child { text-align: right; }
+table.event-table td:last-child { white-space: normal; overflow-wrap: anywhere; }
+table:is(.event-table, .fold-table) tbody tr { cursor: default; }
+table.data.fold-table th, table.data.fold-table td { display: table-cell; }
 .qmark { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; margin-left: 5px; border-radius: 50%; background: var(--bg-muted); color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; user-select: none; vertical-align: -2px; flex: none; }
 .qmark:hover { color: var(--accent); }
 .qtip { position: fixed; z-index: 60; max-width: 380px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15); padding: 10px 12px; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
@@ -532,11 +541,16 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
    columns' <col> tracks must release their widths or the title column
    collapses and rows render double-exposed. */
 .embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+/* #4362: except the fold-detail table — its six numeric columns are the
+   payload of the session detail view, so they stay visible on the narrow
+   embed face too (horizontal scroll inside .fold-scroll instead). */
+.embed table.data.fold-table th:nth-child(n + 6), .embed table.data.fold-table td:nth-child(n + 6) { display: table-cell; }
 .embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
 /* #2560: the frame hugs its edges hard at narrow panel widths — give the
    embed face a little breathing room instead of zero gutter. */
 .embed main { max-width: none; padding: 8px 10px 16px; }
 .embed .banner { margin: 8px 0 0; }
+
 
 /* #4587: panel-embedded blog & article view (#/blog index + #/blog/<slug> pages) */
 .bl-row { display: flex; align-items: baseline; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border-soft); text-decoration: none; color: inherit; }
@@ -556,4 +570,30 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .post-body blockquote { border-left: 3px solid var(--accent); margin: 12px 0; padding: 4px 14px; color: var(--text-muted); background: var(--bg-elev); border-radius: 0 8px 8px 0; }
 .post-body h2 { margin-top: 22px; }
 .post-body .md-img { max-width: 100%; border-radius: 8px; border: 1px solid var(--border-soft); }
+
+/* #4608: classic folded-block list — the #3917 rows came back next to
+   the tree reading (owner decision: keep the master-folded list, drop
+   the flame chart). Rules sit after the shared .block-item typography
+   on purpose: .block-node overrides must win the cascade. */
+.block-item { border-bottom: 1px solid var(--border-soft); }
+.block-item:last-child { border-bottom: none; }
+.block-item summary { list-style: none; cursor: pointer; padding: 9px 16px; display: flex; gap: 10px; align-items: baseline; }
+.block-item summary::-webkit-details-marker { display: none; }
+.block-item summary:hover { background: var(--bg-muted); }
+.block-item .bid { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); min-width: 52px; }
+.block-item .topic { font-weight: 600; font-size: 13px; flex: 1; }
+.block-item .meta { font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
+.block-item .body { padding: 0 16px 12px 78px; font-size: 12.5px; color: var(--text-muted); white-space: pre-wrap; }
+.block-item .body.md { white-space: normal; }
+.tier-1 summary .bid { color: var(--accent); }
+.block-tree { max-height: 70vh; overflow-y: auto; border-top: 1px solid var(--border-soft); }
+.block-node.flash { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+.block-node .block-node { margin-left: 18px; border-left: 2px solid var(--border-soft); }
+.block-node summary { align-items: center; flex-wrap: wrap; row-gap: 4px; }
+.block-node summary .blk-copy { margin-left: auto; flex: none; }
+.block-node summary .meta { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.block-node .topic { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.block-node .body { padding: 0 16px 10px 70px; }
+.block-node .blk-content-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px 8px 70px; }
+.block-node .blk-content { margin: 0 16px 12px 70px; }
 `;

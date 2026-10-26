@@ -234,6 +234,7 @@ const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
+const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -270,6 +271,19 @@ export function limitsOutboundBytes(): number {
 export function limitsWsOutboundBytes(): number {
     const v = tInt("BILI_WS_OUTBOUND_BYTES", loadConfigFile().network?.wsOutboundBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_WS_OUTBOUND_BYTES;
+}
+
+/** BILI_HTTP_OUTBOUND_BYTES > network.httpOutboundBytes > 10 MiB. Soft egress byte budget for the
+ *  plain/proxy/pi-native HTTP relay lane (#3909): above it, older non-protected images are shed from
+ *  the OUTBOUND COPY before sending, because an image-dense session can carry tens of MiB of base64
+ *  that upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space
+ *  folding stays below its trigger. Applies only when no managed transport is installed; the WS lane
+ *  uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never
+ *  shed (#3701 Finding 1). 0 disables the pre-send shed (legacy send-as-is). The hard refusal cap
+ *  stays network.outboundBodyBytes. */
+export function limitsHttpOutboundBytes(): number {
+    const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---

@@ -537,6 +537,19 @@ export function lastForwardedBody(session: Session): SeamSlot | undefined {
     return pendingCapture(session).sentBody;
 }
 
+/** #4731: the pending evidence PAIR of the in-flight request — outbound body
+ *  AND inbound view from ONE source: the ALS capture when this code runs
+ *  inside withCacheCapture (relay lane), else session.transient (loop lane).
+ *  Callers that pair the two sides MUST take both from here; mixing one side
+ *  from the capture with the other from the fallback can mate an old body
+ *  with fresh usage and mis-attribute the seam. Settled baselines
+ *  (settledBody/settledInBody) always live on session.transient and stay
+ *  read from there on every lane. */
+export function pendingEvidencePair(session: Session): { sentBody?: SeamSlot; inBody?: InboundSlot } {
+    const pending = pendingCapture(session);
+    return { sentBody: pending.sentBody, inBody: pending.inBody };
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
@@ -1291,10 +1304,14 @@ export function recordCacheSample(
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
-            const curB = session.transient?.sentBody;
+            // #4731: both pending sides come from ONE source via
+            // pendingEvidencePair — on the relay lane the evidence lives in
+            // the #4430 ALS capture (session.transient.sentBody is never
+            // written there), on the loop lane it falls back to the transient
+            // slot byte-identically.
+            const { sentBody: curB, inBody: curIn } = pendingEvidencePair(session);
             const prevB = session.transient?.settledBody;
             if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
-                const curIn = session.transient?.inBody;
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1923,6 +1940,12 @@ export function settleUsageReport(
     else delete settled.settledBody;
     delete pending.sentBody;
     const seamIn = pending.inBody;
+    // #4731: noteForwardedBody deletes pending.inBody on round>1 of a capture,
+    // so a same-request retry settles without inbound evidence and drops the
+    // settledInBody baseline (the round-2 delete-then-miss). That conservative
+    // behavior stays BY DESIGN: #3023 attribution is diagnostic-only (nothing
+    // bills on settledInBody), and the pair accessor cannot cheaply recover
+    // the evidence here because the delete removes it from the capture itself.
     if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
     else delete settled.settledInBody;
     delete pending.inBody;

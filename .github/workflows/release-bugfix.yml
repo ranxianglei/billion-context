@@ -53,6 +53,15 @@ jobs:
       id-token: write
       actions: write
     steps:
+      - name: Ensure jq (2026-10 runner images are unreliable about it — always install our own)
+        run: |
+          type -a jq || true
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64" -o "$HOME/.local/bin/jq"
+          chmod +x "$HOME/.local/bin/jq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/jq" --version
+
       - name: Validate trigger + resolve the publish ref
         id: resolve
         run: |
@@ -119,6 +128,24 @@ jobs:
           SHA="${{ steps.resolve.outputs.sha }}"
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
+
+      - name: Verify plugin manifests match package.json (#4449)
+        # The four plugin manifests carry their own version fields — the
+        # marketplaces use them for UPDATE DETECTION, so a release whose
+        # manifests disagree with package.json ships a plugin that never
+        # prompts users to upgrade. Drift = red release, nothing shipped.
+        # See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        # #4576 follow-up: lanes cut from a pre-#4449 tag do not carry the
+        # manifest sync script at all -- fail-open with a notice there instead
+        # of MODULE_NOT_FOUND (same existence-guard philosophy as release-manual's
+        # lane guard).
+        run: |
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs --check
+          else
+            echo "::notice::this tree predates #4449 (no scripts/sync-codex-plugin-version.mjs) — manifest sync check skipped for the pre-#4449 lane"
+          fi
 
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'

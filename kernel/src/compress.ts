@@ -1641,7 +1641,9 @@ function resolveCoverageInterval(
       !consumed ||
       typeof consumed.startSeq !== "number" ||
       typeof consumed.endSeq !== "number" ||
-      consumed.endSeq < consumed.startSeq
+      consumed.endSeq < consumed.startSeq ||
+      consumed.startSeq < 0 ||
+      consumed.endSeq < 0
     ) {
       return undefined; // unbounded consumed block (or legacy) — never guess
     }

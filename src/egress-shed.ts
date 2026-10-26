@@ -1,8 +1,11 @@
-// #3701: egress byte shedding for the WebSocket lane. The compression pipeline makes
-// folding decisions in TOKEN space, but the observed upstream WS gateway rejects in BYTE
-// space (close 1009, zero events received) — at 30–40% token usage no token gate fires
-// while outbound carries >16 MiB of mostly base64 images. This module is the byte-space
-// backstop: when the FINAL serialized request exceeds network.wsOutboundBytes, images are
+// #3701/#3909: egress byte shedding for the WS lane and the plain/proxy/pi-native HTTP relay
+// lane. The compression pipeline makes folding decisions in TOKEN space, but upstreams reject
+// in BYTE space — the WS gateway answers close 1009 with zero events (#3701), edge runtimes
+// 503 on tens of MiB of base64 / pixel-decode CPU (#3909) — at 30–40% token usage no token gate
+// fires while outbound carries >16 MiB of mostly base64 images. This module is the byte-space
+// backstop: when the FINAL serialized request exceeds its lane's budget (network.wsOutboundBytes
+// on the WS lane, network.httpOutboundBytes on the HTTP relay; managed non-WS transports are
+// never shed, #3701 Finding 1), images are
 // shed from the OUTBOUND COPY ONLY, in two rungs — (A) archive the oldest non-protected
 // images to placeholder notes (originals stay in session storage + the incoming-image
 // index, so read_original_image / decompress({imageRef}) still reach them, and the client
@@ -15,7 +18,7 @@ import { parseDataUrl } from "acp-kernel/wire";
 import type { Session } from "./session.js";
 import type { WireProtocol } from "./util.js";
 import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
-import { limitsWsOutboundBytes } from "./knobs.js";
+import { limitsHttpOutboundBytes, limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
@@ -382,31 +385,51 @@ interface ShedContext {
     phase?: string;
 }
 
-/** WS-lane pre-send gate (#3701): passthrough unless the request actually rides the
- *  WebSocket transport AND exceeds network.wsOutboundBytes. #3701 Finding 1: the
- *  gate matches ONLY transports tagged markWsLaneTransport (responses-ws.ts) — a
- *  managed-but-HTTP transport (dsh-inline via inline-engine.ts) delivers large
- *  bodies fine (16 MiB observed) and must never be shed. On a shed, records
- *  session.metadata.wsByteShed and logs the exact before→after bytes. */
+/** Pre-send egress byte-budget gate — one shared two-rung image shed, keyed per lane off the
+ *  transport actually riding the request (#3701 WS lane, #3909 HTTP relay lane):
+ *   - WS lane: transport tagged markWsLaneTransport (responses-ws.ts) vs network.wsOutboundBytes —
+ *     the gateway answers an oversized frame with close 1009 and zero events.
+ *   - plain/proxy/pi-native HTTP relay: NO transport installed (global fetch) vs
+ *     network.httpOutboundBytes — an image-dense session forwards tens of MiB of base64 that
+ *     upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space
+ *     folding stays below its trigger, so every retry resends the same pixels forever.
+ *  A MANAGED-but-not-WS transport (inline-engine / dsh-inline) is NEVER shed here (#3701 Finding 1):
+ *  it delivers large bodies fine (16 MiB observed). On a shed, records session.metadata.*ByteShed
+ *  and logs the exact before→after bytes. */
 export async function shedEgressIfOverBudget(
     body: string,
     protocol: WireProtocol,
     ctx: ShedContext,
 ): Promise<{ body: string; stats: ShedStats }> {
-    const budget = limitsWsOutboundBytes();
     const originalBytes = byteLen(body);
-    if (budget <= 0 || !isWsLaneTransport(currentFetchTransport()) || originalBytes <= budget) {
+    const t = currentFetchTransport();
+    let budget: number;
+    let lane: "ws" | "http";
+    if (isWsLaneTransport(t)) {
+        budget = limitsWsOutboundBytes();
+        lane = "ws";
+    } else if (t === undefined) {
+        budget = limitsHttpOutboundBytes();
+        lane = "http";
+    } else {
+        // managed-but-not-WS transport (inline-engine / dsh-inline): pass through untouched
+        // (#3701 Finding 1 — large bodies deliver fine over it; never shed).
         return { body, stats: { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false } };
     }
+    if (budget <= 0 || originalBytes <= budget) {
+        return { body, stats: { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false } };
+    }
+    const tag = `${lane}-byte-shed`;
+    const metaKey = lane === "ws" ? "wsByteShed" : "httpByteShed";
     const { body: next, stats } = await shedWireImages(body, protocol, budget, {
         resolveRef: ctx.session ? (mt, b64) => refForItemBytes(ctx.session!, mt, b64) : undefined,
     });
     if (!stats.changed) {
-        ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [ws-byte-shed] ${ctx.phase ?? "send"}: outbound ${formatMiB(originalBytes)} MiB over budget ${formatMiB(budget)} MiB but no sheddable images outside the protected tail — sending as-is`);
+        ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: outbound ${formatMiB(originalBytes)} MiB over budget ${formatMiB(budget)} MiB but no sheddable images outside the protected tail — sending as-is`);
         return { body, stats };
     }
     if (ctx.session) {
-        ctx.session.metadata.wsByteShed = {
+        ctx.session.metadata[metaKey] = {
             at: Date.now(),
             phase: ctx.phase ?? "send",
             fromBytes: stats.originalBytes,
@@ -416,9 +439,9 @@ export async function shedEgressIfOverBudget(
         };
     }
     if (stats.finalBytes <= budget) {
-        ctx.log?.("info", `[${ctx.sessionId ?? "?"}] [ws-byte-shed] ${ctx.phase ?? "send"}: ${formatMiB(stats.originalBytes)} -> ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled} budget=${formatMiB(budget)} MiB) — originals stay in session storage`);
+        ctx.log?.("info", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: ${formatMiB(stats.originalBytes)} -> ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled} budget=${formatMiB(budget)} MiB) — originals stay in session storage`);
     } else {
-        ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [ws-byte-shed] ${ctx.phase ?? "send"}: shed to ${formatMiB(stats.finalBytes)} MiB but still over budget ${formatMiB(budget)} MiB (protected recent messages hold the rest) — sending anyway; hard cap network.outboundBodyBytes unchanged`);
+        ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: shed to ${formatMiB(stats.finalBytes)} MiB but still over budget ${formatMiB(budget)} MiB (protected recent messages hold the rest) — sending anyway; hard cap network.outboundBodyBytes unchanged`);
     }
     return { body: next, stats };
 }

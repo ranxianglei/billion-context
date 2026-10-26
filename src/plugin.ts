@@ -26,6 +26,8 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./s
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
+import type { HandoffReply } from "./server/handoff-response.js";
+import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -1161,7 +1163,7 @@ function forkSnapshot(session: Session) {
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
-    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
+    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || (session.state.messageRefs.byRaw[entry.rawId] !== undefined && (session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)))) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
@@ -1534,8 +1536,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // fail for a storage nicety.
             try {
                 const store = getStore();
-                const throughSeq = store.unifiedLiveRowCount(parent.id);
-                if (throughSeq > 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq - 1)) {
+                // #4730: the inclusive throughSeq is the parent's LAST LIVE SEQ,
+                // not live count - 1. Tombstones keep their seq, so once any
+                // row is retired count < lastLiveSeq + 1 and count - 1 silently
+                // dropped the newest live rows from the cloned child.
+                const lastLiveSeq = store.unifiedLastLiveSeq(parent.id);
+                const throughSeq = lastLiveSeq === null ? -1 : lastLiveSeq;
+                if (throughSeq >= 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq)) {
                     loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
                 }
             } catch (err) {
@@ -2379,11 +2386,27 @@ export async function pipePluginChatWithStrip(
     // stay source-compatible; the plugin lane's resolveFakeCompletion refetch
     // swallows the original response object, hence optional.
     upstreamMeta?: UpstreamMeta,
+    reply?: HandoffReply,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    let replyPart = 0;
+    let lastReplyEntry = "";
+    let replyTool = 0;
+    const appendReply = (field: string, index: number, text: string) => {
+        if (!reply || !text || (protocol !== "anthropic" && index !== 0)) return;
+        const base = `${index}:${field}`;
+        if (lastReplyEntry !== base) replyPart++;
+        lastReplyEntry = base;
+        reply.append(`text_${replyPart}`, field === "content" || field === "text" ? "text" : "reasoning", text);
+    };
+    const setReplyTool = (key: string, name: string, id: string, args: string, start = false) => {
+        if (start) lastReplyEntry = "";
+        reply?.tool(key, name, id, args);
+    };
+    let sawReplyError = false;
     let sawStrippedEcho = false;
     // #2405(c): one warn line per event, session-prefixed — the former second
     // write through the request logger landed in the SAME tee file, doubling
@@ -2723,6 +2746,8 @@ export async function pipePluginChatWithStrip(
             const tail = s.filter.flush();
             if (tail.length > 0) {
                 out += syntheticTail(s, tail);
+                const replyIndex = protocol === "anthropic" ? s.index + (inRetry ? retryIndexOffset : 0) : s.index;
+                appendReply(s.field, replyIndex, tail);
                 proseAcc += tail;
                 if (s.field === "content" || s.field === "text") {
                     visibleTextChars += tail.length;
@@ -2879,7 +2904,9 @@ export async function pipePluginChatWithStrip(
                         const t = tcf as Record<string, unknown>;
                         const tIdx = typeof t["index"] === "number" ? t["index"] : ti;
                         const key = `${ci}:${tIdx}`;
+                        const firstToolFragment = !seenToolCalls.has(key);
                         const accTc = seenToolCalls.get(key) ?? { label: `idx=${tIdx}`, id: "", name: "", argsLen: 0, frags: 0, args: "" };
+                        if (ci === 0 && firstToolFragment) setReplyTool(key, "", "", "", true);
                         if (typeof t["id"] === "string" && t["id"]) accTc.id = t["id"];
                         const fn = t["function"];
                         if (fn && typeof fn === "object") {
@@ -2892,6 +2919,7 @@ export async function pipePluginChatWithStrip(
                         }
                         accTc.frags++;
                         seenToolCalls.set(key, accTc);
+                        if (ci === 0) setReplyTool(key, accTc.name, accTc.id, accTc.args);
                     }
                 }
             }
@@ -2913,6 +2941,7 @@ export async function pipePluginChatWithStrip(
                 if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !(absorbInstructed === true && mayStartToolCallEmission(v)) && !anyPending()) {
                     if (v.length > 0) {
                         keptText = true;
+                        appendReply(field, typeof ch?.["index"] === "number" ? ch["index"] as number : ci, v);
                         proseAcc += v;
                         // #2190: residue audit — bytes that bypassed the state
                         // machine must be observable, not silent.
@@ -2938,6 +2967,7 @@ export async function pipePluginChatWithStrip(
                         proseAcc += tail;
                     }
                 }
+                appendReply(field, typeof ch?.["index"] === "number" ? ch["index"] as number : ci, clean);
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
@@ -3015,8 +3045,11 @@ export async function pipePluginChatWithStrip(
                     frags: 1,
                     args: "",
                 });
+                setReplyTool(`block:${blockIndex}`, tcName, tcId, JSON.stringify(cb?.["input"] ?? {}), true);
                 if (tcName === COMPRESS_TOOL_NAME) heldCompressBlocks.set(blockIndex, { id: tcId, frags: 0, json: "" });
             } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
+            const field = bt === "thinking" ? "thinking" : bt === "text" ? "text" : undefined;
+            if (field && typeof cb?.[field] === "string") appendReply(field, typeof ev["index"] === "number" ? ev["index"] : 0, cb[field]);
             // #2248: raw exit — content_block_start payloads never enter the filter.
             auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
@@ -3028,6 +3061,7 @@ export async function pipePluginChatWithStrip(
                 heldCompressBlocks.delete(stopIndex);
                 const salvage = salvageCompressArgs(held.json, held.id || `block=${stopIndex}`);
                 loggerLog(salvage.action === "verbatim" ? "debug" : "warn", `[plugin] compress tool args ${salvage.action}: ${held.json.length} char(s), ${held.frags} fragment(s), ${salvage.ranges} range(s)${salvage.kind ? `, kind=${salvage.kind}` : ""} (#2580)`);
+                setReplyTool(`block:${stopIndex}`, COMPRESS_TOOL_NAME, held.id, salvage.out);
                 return compressDeltaFrame(stopIndex, salvage.out) + rawEvent + "\n\n";
             }
         }
@@ -3039,6 +3073,7 @@ export async function pipePluginChatWithStrip(
                     heldCompressBlocks.delete(idx);
                     const salvage = salvageCompressArgs(held.json, held.id || `block=${idx}`);
                     loggerLog("warn", `[plugin] compress tool args flushed at terminal without content_block_stop (${salvage.action}, ${held.json.length} char(s)) (#2580)`);
+                    setReplyTool(`block:${idx}`, COMPRESS_TOOL_NAME, held.id, salvage.out);
                     pre += compressDeltaFrame(idx, salvage.out);
                 }
                 return pre + rawEvent + "\n\n";
@@ -3059,6 +3094,7 @@ export async function pipePluginChatWithStrip(
             if (accTc && typeof d["partial_json"] === "string") {
                 accTc.argsLen += d["partial_json"].length;
                 accTc.args += d["partial_json"];
+                setReplyTool(`block:${index}`, accTc.name, accTc.id, accTc.args);
             }
             const held = heldCompressBlocks.get(index);
             if (held && typeof d["partial_json"] === "string") {
@@ -3081,6 +3117,7 @@ export async function pipePluginChatWithStrip(
         // field, so the fast path must not pre-empt it.
         if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
             if (raw.length > 0) {
+                appendReply(field, index, raw);
                 proseAcc += raw;
                 // #2190: residue audit — see the twin above.
                 if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
@@ -3092,6 +3129,7 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
+        appendReply(field, index, clean);
         if (!changed) {
             if (field === "text" && raw.length > 0) {
                 visibleTextChars += raw.length;
@@ -3173,6 +3211,9 @@ export async function pipePluginChatWithStrip(
                         frags: 1,
                         args: fcArgs,
                     });
+                    if (protocol !== "google" || ci === 0) {
+                        setReplyTool(`google_${++replyTool}`, fcObj && typeof fcObj["name"] === "string" ? fcObj["name"] : "", typeof fcObj?.["id"] === "string" ? fcObj["id"] : "", fcArgs, true);
+                    }
                 }
                 if (p["thought"] === true) sawThinking = true;
                 const raw = p["text"];
@@ -3189,6 +3230,7 @@ export async function pipePluginChatWithStrip(
                 if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
                     if (raw.length > 0) {
                         keptText = true;
+                        appendReply(field, index, raw);
                         proseAcc += raw;
                         // #2190: residue audit — see the twin above.
                         if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
@@ -3214,6 +3256,7 @@ export async function pipePluginChatWithStrip(
                         proseAcc += tail;
                     }
                 }
+                appendReply(field, index, clean);
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
@@ -3346,6 +3389,7 @@ export async function pipePluginChatWithStrip(
                         diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
                     } else diagPushType("frame");
                     if (retryFraming(ev)) continue;
+                    if (ev["error"] || ev["type"] === "error") sawReplyError = true;
                     if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
                     // After the retryFraming gate: only the first attempt's
                     // message_start reaches here (the retry's was consumed).
@@ -3433,7 +3477,9 @@ export async function pipePluginChatWithStrip(
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
+        if (sawTerminal && !sawReplyError && !res.destroyed && !res.writableEnded) reply?.save();
         if (truncated) {
+            reply?.discard();
             // #721 → #2563: the client still owns the stream from here.
             // Permitlist hosts (pi) get the raw cut — their native layer
             // classifies it as transient and retries; everyone else gets the
@@ -3588,11 +3634,33 @@ export async function pipePluginResponsesWithStrip(
     requestText?: string,
     // #2328 Q2 — see pipePluginChatWithStrip.
     upstreamMeta?: UpstreamMeta,
+    reply?: HandoffReply,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const replyItems = new Map<number, Record<string, unknown>>();
+    let replyBytes = 0;
+    let replyDropped = false;
+    const appendReplyDelta = (meta: Record<string, unknown>, text: string, reasoning = false) => {
+        if (!reply || replyDropped || !text) return;
+        const index = Number(meta["output_index"] ?? 0);
+        const existing = replyItems.get(index);
+        replyBytes += Buffer.byteLength(text) + (existing ? 0 : 128);
+        if (replyBytes > HANDOFF_REPLY_MAX_BYTES) { replyDropped = true; replyItems.clear(); reply.discard(); return; }
+        const item = existing ?? (reasoning ? { type: "reasoning", summary: [] } : { type: "message", role: "assistant", content: [] });
+        const field = reasoning ? "summary" : "content";
+        const parts = (Array.isArray(item[field]) ? item[field] : []) as Array<{ type: string; text: string }>;
+        const at = Number(meta[reasoning ? "summary_index" : "content_index"] ?? 0);
+        if (!Number.isInteger(at) || at < 0 || at > 10000) { replyDropped = true; replyItems.clear(); reply.discard(); return; }
+        const part = parts[at] ?? { type: reasoning ? "summary_text" : "output_text", text: "" };
+        part.text += text;
+        parts[at] = part;
+        item[field] = parts;
+        replyItems.set(index, item);
+    };
+    let replyCompleted = false;
     // #2328 Q2/Q4 — see the chat-pipe twin.
     let diagEvents = 0;
     let diagBytes = 0;
@@ -3788,6 +3856,7 @@ export async function pipePluginResponsesWithStrip(
             visibleTextChars += tail.length;
             answerProse += tail;
             const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
         return after;
@@ -4120,6 +4189,7 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
+                        if (reply && type === "response.output_item.done" && evOut["item"] && typeof evOut["item"] === "object") replyItems.set(Number(evOut["output_index"] ?? 0), evOut["item"] as Record<string, unknown>);
                         const doneText = responsesEventText(evOut, true);
                         heldVisibleChars += doneText.length;
                         answerProse += doneText;
@@ -4154,6 +4224,7 @@ export async function pipePluginResponsesWithStrip(
                             argStreams.clear();
                             heldEvents = [];
                             heldVisibleChars = 0;
+                            replyItems.clear();
                             continue;
                         }
                         const tailFrame = flushTail("");
@@ -4175,6 +4246,12 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
+                        if (type === "response.completed") {
+                            const response = evOut["response"] as Record<string, unknown> | undefined;
+                            const output = Array.isArray(response?.["output"]) && response["output"].length ? response["output"] : [...replyItems.entries()].sort(([a], [b]) => a - b).map(([, item]) => item);
+                            captureHandoffJson(reply, "responses", { ...response, output });
+                            replyCompleted = true;
+                        } else reply?.discard();
                         // Hosts finish on this frame, before EOF settles billing and late usage.
                         if (session && acc.inputTokens !== undefined && acc.inputTokens > 0) {
                             const credit = session.stats.compressCreditTokens ?? 0;
@@ -4198,6 +4275,7 @@ export async function pipePluginResponsesWithStrip(
                             visibleTextChars += delta.length;
                             fastPathChars += delta.length;
                             answerProse += delta;
+                            appendReplyDelta(ev, delta);
                             // #2190: residue audit — see the twin above.
                             if (delta.length > 0 && containsEchoResidue(delta)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${delta.slice(0, 80).replace(/\n/g, " ")}`);
                             await write(rawEvent + "\n\n");
@@ -4216,6 +4294,7 @@ export async function pipePluginResponsesWithStrip(
                         visibleTextChars += clean.length;
                         proseAcc += clean;
                         answerProse += clean;
+                        appendReplyDelta(ev, clean);
                         if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
                             continue;
@@ -4232,6 +4311,7 @@ export async function pipePluginResponsesWithStrip(
                     // generic rawEvent write below.
                     if (type === "response.reasoning_summary_text.delta" && typeof ev["delta"] === "string") {
                         const v = ev["delta"] as string;
+                        appendReplyDelta(ev, v, true);
                         if (v.length > 0) proseAcc += v;
                         await write(rawEvent + "\n\n");
                         continue;
@@ -4258,6 +4338,7 @@ export async function pipePluginResponsesWithStrip(
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
+        if (replyCompleted && !res.destroyed && !res.writableEnded) reply?.save();
         // #721 → #2563: never leave the stream hanging on a missing done-family
         // event. Permitlist hosts (pi) get the raw cut for their native
         // classifier; everyone else gets the in-band error frame.
@@ -4368,6 +4449,7 @@ export async function pipePluginJson(
     absorbInstructed?: boolean,
     // m00885: echoed (user-requested verbatim) emission spans survive.
     requestText?: string,
+    reply?: HandoffReply,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -4451,6 +4533,10 @@ export async function pipePluginJson(
             : protocol === "google" ? stripGoogleText(json, dropEmission, requestText)
             : stripOpenaiChatText(json, dropEmission, requestText);
         mutated = true;
+    }
+    if (json && !res.destroyed) {
+        captureHandoffJson(reply, protocol, json);
+        reply?.save();
     }
     if (mutated && json) {
         res.end(Buffer.from(JSON.stringify(json), "utf8"));

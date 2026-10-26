@@ -2596,7 +2596,7 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             // proxy's own line shape, origin-marked — stderr alone is invisible
             // to GUI hosts, which is exactly how #1158 stayed silent.
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
             assert.equal(errs.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
         });
     } finally {
@@ -2618,7 +2618,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
             assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
