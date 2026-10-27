@@ -267,13 +267,6 @@ export interface LoopCtx {
      *  rebuilt history. Default (undefined) keeps markers on. Paired
      *  tool-call/tool-result messages are unaffected. */
     visibilityMarkers?: boolean;
-    /** #3906: when `false`, keep the 📦/❌ ACP receipt in rebuilt history (and in
-     *  the round-N+1 system message the model sees) but stop emitting it into
-     *  the client's content stream. Independent of `visibilityMarkers`: this is
-     *  the cosmetic-only switch for clients that merge the marker into the
-     *  assistant's single text part, which makes the answer render above the
-     *  reasoning that produced it. Default (undefined) keeps streaming. */
-    streamMarkers?: boolean;
     /** #1455: tee loop-originated upstream responses (re-request and every
      *  retry fetch) to raw SSE files — the outer request's ACP_DUMP_SSE tee
      *  only covers the FIRST response, so an internal re-request that dies
@@ -1448,22 +1441,7 @@ export async function* runCompressLoop(
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            // #3906: streamMarkers=false keeps the receipt in the
-                            // rebuilt history (and in the round-N+1 system message
-                            // below) while keeping it OUT of the client's content
-                            // stream. The marker is an assistant-prose delta emitted
-                            // before the continuation re-request, so on a client that
-                            // keys one text part per assistant message (opencode's
-                            // openai-compatible transform uses a fixed txt-0) it opens
-                            // the text part and the round-2 answer merges into it while
-                            // round-2 reasoning opens a NEW part after it — the answer
-                            // renders above the thinking that produced it and the turn
-                            // appears to end mid-thought.
-                            if (ctx.streamMarkers !== false) yield adapter.emitMarker(call.name, result.text);
-                            // The model-side recovery receipt keeps the marker line even when
-                            // the client stream is withheld.
-                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
-                        }
+                            yield adapter.emitMarker(call.name, result.text);                        }
                     }
                 } else {
                     realToolCalls.push(call);
