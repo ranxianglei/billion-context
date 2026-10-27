@@ -5,7 +5,7 @@ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMess
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, noteRebasePricing, postRebaseTokenCount, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -143,7 +143,7 @@ export async function prepareGoogle(
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
+        let { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -163,6 +163,7 @@ export async function prepareGoogle(
         // checkpoint framing in resent history AND decimated fold coverage;
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
+        let googleRebased = false;
         if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
@@ -175,9 +176,18 @@ export async function prepareGoogle(
                     recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
                     log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
                     markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    googleRebased = reconcileNativeCompactionBoundary(session);
                 }
             }
+        }
+        if (googleRebased) {
+            // #3712: the rebase just wiped the sizing anchors tokenCount was derived
+            // from (and tokenCount itself described the pre-compaction payload).
+            // Re-measure the current compacted view so this turn's nudge decision
+            // prices reality instead of a stale-low value that strands firstSightMassReady.
+            ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, imageReserveFor(session, "google", parsed, opts, upstreamOrigin)));
+            noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
         }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client

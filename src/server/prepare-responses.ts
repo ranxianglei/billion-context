@@ -6,7 +6,7 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, noteRebasePricing, planReasoningDrop, postRebaseTokenCount, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
@@ -70,7 +70,8 @@ export async function prepareResponses(
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
-    if (reconcileNativeCompactionBoundary(session)) {
+    const earlyRebased = reconcileNativeCompactionBoundary(session);
+    if (earlyRebased) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
 
@@ -245,7 +246,16 @@ export async function prepareResponses(
         if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
+        const imageReserve = imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin);
+        // #3712: an early native-compaction rebase (a boundary marked by a previous
+        // request's forged-compact handoff) already wiped the sizing anchors this
+        // request's tokenCount would otherwise derive from — re-measure the current
+        // view instead of feeding a stale/zero value into decideNudge.
+        let { tokens: tokenCount, source: tokenCountSource } = earlyRebased ? postRebaseTokenCount(parsed, imageReserve) : effectiveTokenCount(session, renderMsgs, imageReserve);
+        if (earlyRebased) {
+            noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
+        }
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -298,7 +308,12 @@ export async function prepareResponses(
                         log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
                     }
                     markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    if (reconcileNativeCompactionBoundary(session)) {
+                        // #3712: same post-rebase re-measure as the early site above.
+                        ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, imageReserve));
+                        noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+                        log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
+                    }
                 }
             }
         }

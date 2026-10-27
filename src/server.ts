@@ -2599,6 +2599,44 @@ export function usageGradeInputBaseline(session: Session): number {
     return session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0;
 }
 
+// #3712: a native-compaction rebase (#2432/#2373) calls resetSessionCompression,
+// which wipes every sizing anchor effectiveTokenCount reads (lastInputTokens → 0,
+// lastUsageGradeTokens deleted, localInputEstimate cleared) — and the value
+// computed BEFORE the rebase describes the PRE-compaction payload. Feeding either
+// into the immediate decideNudge strands the meter: a stale-low usage gates off
+// firstSightMassReady (usage >= minContextLimitPct) while the real ready mass sits
+// undrained until unrelated growth crosses the band (the #3712 permanent-degradation
+// deadlock, blocked: T1 (cadence) forever); a naive post-rebase read is just 0.
+// Re-measure the CURRENT compacted view with the tokenizer-consistent fit-gate
+// estimator preflight uses (defaultCountTokens, same basis as the kernel's own
+// count) — truthful, so a genuinely over-window payload still hits its band while
+// code/JSON payloads do NOT fire a phantom EMERGENCY the way the char-count upper
+// bound would (#1839 ghost class).
+// The measure is taken over the RAW outbound body, not just the message array:
+// the usage-grade baseline this replaces (upstream prompt_tokens) prices the FULL
+// request — tool schemas and system frame included. A messages-only count drops
+// exactly that delta (measured on the #3712 incident payload: 97 tool schemas ≈
+// 23.6K tok + largest system frame ≈ 8.9K tok), re-introducing an underprice that
+// can sit a near-gate payload below minContextLimitPct. estimateRawBodyTokens walks
+// every string leaf of the parsed body through defaultCountTokens (binary image
+// fields excluded — inboundImageTokens charges those separately); its residual
+// overcount is structural strings only (ids/roles), a conservative bias of ~1%.
+export function postRebaseTokenCount(parsed: unknown, inboundImageTokens = 0): { tokens: number; source: "estimate" } {
+    return { tokens: estimateRawBodyTokens(parsed) + inboundImageTokens, source: "estimate" };
+}
+
+// #3712: stamp how the rebased turn priced its context onto the native-compaction
+// boundary itself. stats.contextTokens is refreshed by the turn's usage report into
+// the freshest upstream figure, so this event-scoped record is the only place that
+// keeps the compaction landing's OWN pricing visible afterwards (panel/status) — the
+// stale pre-compaction sample that stranded the meter is exactly what must NOT be the
+// surviving number.
+export function noteRebasePricing(session: Session, priced: { tokens: number; source: "usage" | "estimate" }): void {
+    const boundary = session.metadata.nativeCompactionBoundary;
+    if (!boundary || typeof boundary !== "object") return;
+    (boundary as Record<string, unknown>).priced = priced;
+}
+
 // #1403: top-level prompt_cache_key is NOT part of the Anthropic Messages API.
 // It is the omp plugin's session id stamped for the proxy's identity chain
 // (#268); the fully-processed path strips it (prepareAnthropic), but every

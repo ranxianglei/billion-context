@@ -7,7 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, noteRebasePricing, planReasoningDrop, postRebaseTokenCount, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -137,7 +137,7 @@ export async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
+        let { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -187,6 +187,15 @@ export async function prepareOpenai(
                     dshRebased = reconcileNativeCompactionBoundary(session);
                 }
             }
+        }
+        if (dshRebased) {
+            // #3712: the rebase just wiped the sizing anchors tokenCount was derived
+            // from (and tokenCount itself described the pre-compaction payload).
+            // Re-measure the current compacted view so this turn's nudge decision
+            // prices reality instead of a stale-low value that strands firstSightMassReady.
+            ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin)));
+            noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
         }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client

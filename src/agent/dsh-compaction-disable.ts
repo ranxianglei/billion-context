@@ -33,6 +33,8 @@
 // bundle-patch gate rows may target ids a profile does not ship — their miss
 // is otherwise visible only in the host loader log).
 
+import { logHostEvent } from "./host-log.js";
+
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
 const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
@@ -188,18 +190,34 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
             if (!isDshCompactionActive()) return resolved;
+            const rawName = this?.entry?.options?.name;
+            const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
+            // #3712: this middleware is global and fires for EVERY package's config
+            // resolution — anything other than the factory preset is an expected
+            // pass-through (logging it would spam), so only the preset's outcomes
+            // below are observable. The genuine silent-miss there: we ARE the preset
+            // (gate satisfied) but its resolved shape changed so the overlay cannot
+            // reach the nested compaction rows — dsh native compaction would run
+            // while bili owns compression, and pre-fix that was indistinguishable
+            // from success using only bili.log.
+            const isFactoryPreset = entryName === DSH_AGENT_PRESET_PACKAGE;
+            const config = (resolved ?? {}) as { plugins?: unknown };
+            if (!Array.isArray(config.plugins)) {
+                if (isFactoryPreset) logHostEvent("warn", "[dsh-client]", `compaction-disable overlay MISSED on ${DSH_AGENT_PRESET_PACKAGE}: resolved config has no plugins array — nested compaction rows were NOT stood down (#3354)`);
+                return resolved;
+            }
             // #4147: match STRUCTURALLY, not by entry name — custom presets run
             // their compaction inside nested rows under their own entry, and a
             // name filter leaves exactly those armed. Rewrite only when the
             // tree actually nests a compaction row, so unrelated entries keep
             // their resolved config object identity.
-            const config = (resolved ?? {}) as { plugins?: unknown };
-            if (!Array.isArray(config.plugins)) return resolved;
             const compactionRows = countCompactionRows(config.plugins);
-            if (compactionRows === 0) return resolved;
-            const rawName = this?.entry?.options?.name;
-            const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
-            noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
+            if (compactionRows === 0) {
+                if (isFactoryPreset) logHostEvent("warn", "[dsh-client]", `compaction-disable overlay MISSED on ${DSH_AGENT_PRESET_PACKAGE}: resolved plugins tree has no compaction rows — dsh native compaction NOT stood down (#3354)`);
+                return resolved;
+            }
+            noteGateCoverage(entryName.slice(0, 120), compactionRows, isFactoryPreset);
+            if (isFactoryPreset) logHostEvent("info", "[dsh-client]", `compaction-disable overlay applied to ${DSH_AGENT_PRESET_PACKAGE}: nested compaction rows stood down (${compactionRows} rows, #3354)`);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
         }, { global: true });
     }

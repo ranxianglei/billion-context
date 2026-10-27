@@ -7,7 +7,7 @@ import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforg
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, noteRebasePricing, planReasoningDrop, postRebaseTokenCount, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -284,7 +284,7 @@ export async function prepareAnthropic(
         // zero-baseline forks replay their FULL raw history with no measurement,
         // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
         // compression trigger fires until overflow. See effectiveTokenCount.
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, inboundImageTokens);
+        let { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, inboundImageTokens);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers are injected by the kernel's processTurn from
         // config.absorb. With no channel to call the tool (injection off),
@@ -336,6 +336,15 @@ export async function prepareAnthropic(
                     dshRebased = reconcileNativeCompactionBoundary(session);
                 }
             }
+        }
+        if (dshRebased) {
+            // #3712: the rebase just wiped the sizing anchors tokenCount was derived
+            // from (and tokenCount itself described the pre-compaction payload).
+            // Re-measure the current compacted view so this turn's nudge decision
+            // prices reality instead of a stale-low value that strands firstSightMassReady.
+            ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, inboundImageTokens));
+            noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
         }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
