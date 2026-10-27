@@ -2971,7 +2971,12 @@ export async function pipePluginChatWithStrip(
         // output is a one-line promise of the next action ("Running verify after
         // formatting:"). Without this branch the answerChars gate below would read
         // that promise as a delivered answer and refuse the retry.
-        const announceTail = !draftTail && visibleTextChars > 0 && !sawToolUse && endsWithAnnouncement(proseAcc) && !requestExpectsProseSummary(requestText);
+        // The detector reads ANSWER prose, not proseAcc: proseAcc also carries
+        // the thinking/reasoning channel, and a thought that ends mid-sentence on
+        // ":" or "…" is internal monologue, not an announcement — feeding it here
+        // reclassified #2756's whitespace-only degenerate stops as announcements
+        // and swallowed their refusal/retry logs.
+        const announceTail = !draftTail && visibleTextChars > 0 && !sawToolUse && endsWithAnnouncement(answerProse) && !requestExpectsProseSummary(requestText);
         const stalledTail = draftTail || announceTail;
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
@@ -4648,8 +4653,9 @@ export async function pipePluginResponsesWithStrip(
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
-        // #3905: bare-announcement twin — see the chat-pipe twin above.
-        const announceTail = !draftTail && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithAnnouncement(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #3905: bare-announcement twin — see the chat-pipe twin above
+        // (including why the detector reads answerProse, not proseAcc).
+        const announceTail = !draftTail && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithAnnouncement(answerProse) && !requestExpectsProseSummary(requestText);
         const stalledTail = draftTail || announceTail;
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
