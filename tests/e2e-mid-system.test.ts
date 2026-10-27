@@ -30,14 +30,23 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 //
 // Range choices are load-bearing: the kernel NEVER folds the first user
 // message (rebuildMessages preserves firstUserIndex), so after compress #1
-// refs[0] is still m00001; and the protected zone (preserveRecentTokens)
-// excludes the last ~11 visible messages from compression at any point, so
-// compress #2 must fire once enough NEW messages have accumulated past the
-// zone (refs.length >= 25 ⇒ zone starts at m00029, ranges end at m00022).
+// refs[0] is still m00001; and the protected zone excludes the recent tail
+// from compression at any point, so compress #2 must fire only once enough
+// NEW messages have accumulated past the zone (COMPRESS2_MIN_REFS ⇒ range
+// ending at m00022 is foldable; at refs.length 25 the zone still covers it).
 // The assertion is sglang's exact validation: in every upstream request, all
 // system/developer messages must form a contiguous leading prefix.
 
 const TURN_COUNT = 23;
+// #4037/#4019 stream parity: a non-stream compress round now executes the proxy
+// tool and RE-REQUESTS upstream (old behavior terminated inline with a note),
+// so each fired compress adds exactly one upstream request. The mock's state
+// machine fires exactly two compress rounds ⇒ +2 over the client turn count.
+const EXPECTED_UPSTREAM_REQUESTS = TURN_COUNT + 2;
+// Under the same-turn re-request above, compress #2 can no longer assume a
+// later client turn: it must be gated until its range (ending at m00022) has
+// left the protected recent zone, or the kernel rightly refuses the fold.
+const COMPRESS2_MIN_REFS = 29;
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -105,7 +114,7 @@ test("e2e #355: multi-segment compress never puts a system message mid-conversat
                 ));
                 return;
             }
-            if (didCompress1 && !didCompress2 && refs.length >= 25) {
+            if (didCompress1 && !didCompress2 && refs.length >= COMPRESS2_MIN_REFS) {
                 didCompress2 = true;
                 res.end(chatJson(
                     {
@@ -186,7 +195,7 @@ test("e2e #355: multi-segment compress never puts a system message mid-conversat
 
         assert.ok(didCompress1, "mock upstream never fired compress #1 (head-anchored) — ref layout unexpected");
         assert.ok(didCompress2, "mock upstream never fired compress #2 (two segments, user msg between) — ref layout unexpected");
-        assert.equal(captured.length, TURN_COUNT, `expected ${TURN_COUNT} upstream requests, got ${captured.length}`);
+        assert.equal(captured.length, EXPECTED_UPSTREAM_REQUESTS, `expected ${EXPECTED_UPSTREAM_REQUESTS} upstream requests, got ${captured.length}`);
 
         for (let i = 0; i < captured.length; i++) {
             const sent = JSON.parse(captured[i]!) as { messages: Array<{ role: string; content?: unknown }> };
