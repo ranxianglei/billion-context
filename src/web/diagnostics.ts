@@ -42,6 +42,7 @@ import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
+import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
 import { getLogPath } from "../logger.js";
 import { configFile, defaultLogFile } from "../paths.js";
@@ -60,6 +61,9 @@ const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
 const DSH_PROFILE_CAP = 8;
+// #4649: display budget for the observed-UA lines (the registry itself is
+// bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
+const OBSERVED_UA_LINES = 12;
 const DSH_REPORT_PACKAGES = ["@deepseek-ai/dsh", "@deepseek-ai/dsh-compaction-basic", "@deepseek-ai/dsh-web-app"] as const;
 
 function humanUptime(seconds: number): string {
@@ -128,12 +132,23 @@ function storageLogTail(lines: string[]): string[] {
 // routed-call refusals (#1729), the destruction verdict (#2193), successful
 // rebases (#2432), and the web-app preset notice that says whether the #3354
 // load-time overlay applies to this machine's profiles.
+// #4649: the same evidence chain for the codex lane — before these entries a
+// codex conflict report matched ZERO lines and could not be adjudicated
+// without a manual log round-trip (#4648). One entry per distinct log SITE:
+// the not-intercepted forward (src/server/handle.ts), the inline auto-compact
+// detection + rebase (#3008/#2372), the intercepted forge (trigger form AND
+// endpoint form share the prefix), and the forge failure that passes through
+// (src/server/prepare-responses.ts).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
     "compression substrate appears destroyed",
     "native compaction boundary",
     "profile bundles include @deepseek-ai/dsh-web-app",
+    "codex compaction_trigger request not intercepted",
+    "codex local auto-compaction detected",
+    "codex compact intercepted",
+    "codex compact forge failed",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
@@ -201,19 +216,39 @@ function dshPackageVersion(profileDir: string, pkg: string): string | undefined 
     }
 }
 
+// #4649: the dsh profile bundles only carry the version truth for the dsh lane;
+// every OTHER client's version lives in its User-Agent, which bili sees on each
+// request. The registry (src/client-ua-registry.ts) keeps a bounded recent
+// sample; publish this so a non-dsh conflict report carries its own client
+// version instead of forcing `codex --version` round-trips (#4648). The values
+// are raw header bytes — the sink-level redactForPublish in buildDiagnostics
+// (#4427) is what makes them publish-safe, same as every other section here.
+function observedUaLines(): string[] {
+    const obs = recentClientUas();
+    if (obs.length === 0) return ["observed client user-agents: (none recorded by this process yet)"];
+    const shown = obs.slice(0, OBSERVED_UA_LINES);
+    const lines = shown.map((o) => `observed client user-agents: ${o.family}: ${o.ua}`);
+    if (obs.length > OBSERVED_UA_LINES) lines.push(`observed client user-agents: … ${obs.length - OBSERVED_UA_LINES} more observation(s)`);
+    return lines;
+}
+
 function hostClientVersionLines(): string[] {
     const lines: string[] = ["--- host client versions ---"];
     let dirs: string[] = [];
     try { dirs = dshProfileDirs(process.env); } catch { dirs = []; }
     if (dirs.length === 0) {
         lines.push(`dsh: no profiles under DSH_HOME (${path.basename(resolveDshHome(process.env)) || "?"}/profiles missing — dsh has never run here, or DSH_HOME points elsewhere)`);
-        return lines;
+    } else {
+        for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
+            const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
+            lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+        }
+        if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     }
-    for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-        const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-        lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
-    }
-    if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
+    // #4649: appended AFTER the dsh part and outside the early-return path — a
+    // machine with no dsh profiles at all (the #4648 codex case) must still get
+    // its observed client versions.
+    lines.push(...observedUaLines());
     return lines;
 }
 
