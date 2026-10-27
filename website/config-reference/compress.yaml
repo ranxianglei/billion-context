@@ -346,15 +346,15 @@ entries:
     site_en: "<code>outputSteering</code> — <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>: appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests."
     site_zh: "<code>outputSteering</code> —— <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>：向系统提示词尾部附加简洁度指令；只收紧机械延续请求。"
   - key: compress.priceProfile
-    type: "{ w?, r?, q? }"
+    type: "{ w?, r?, q?, inputPerMtok?, outputPerMtok?, cacheReadPerMtok?, cacheWritePerMtok? }"
     default: "unset (registry, kernel fallback {1, 0.1, 4})"
     group: compress
     id: co.pp
     render: obj-item
-    desc_en: "w/r/q ratios normalized to the input price (write/cache-read/output); report-only — never affects triggers or the wire."
-    desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。"
-    site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
-    site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
+    desc_en: "w/r/q ratios normalized to the input price (write/cache-read/output), or absolute $/Mtok unit prices (any *PerMtok present wins wholesale); report-only — never affects triggers or the wire."
+    desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出），或绝对 $/Mtok 单价（任一 *PerMtok 存在即整体胜出）；仅供报告，不影响触发条件或线上行为。"
+    site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output), or absolute <span class='mech'>$ / Mtok</span> unit prices (any <span class='mech'>*PerMtok</span> field present wins wholesale); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
+    site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出），或绝对 <span class='mech'>$ / Mtok</span> 单价（任一 <span class='mech'>*PerMtok</span> 字段存在即整体胜出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
   - key: compress.externalSummary
     type: object
     default: "opt-in (disabled)"
@@ -543,6 +543,30 @@ entries:
     group: compress
     desc_en: "Output price ratio relative to the input price."
     desc_zh: "输出价相对输入价的比率。"
+  - key: compress.priceProfile.inputPerMtok
+    type: number
+    default: "unset (registry)"
+    group: compress
+    desc_en: "Absolute input list price in $/Mtok; presence switches the profile to absolute mode (wins over w/r/q)."
+    desc_zh: "绝对输入列表价（$/Mtok）；存在即切换到绝对价模式（整体胜出 w/r/q）。"
+  - key: compress.priceProfile.outputPerMtok
+    type: number
+    default: "unset (registry)"
+    group: compress
+    desc_en: "Absolute output list price in $/Mtok (absolute mode)."
+    desc_zh: "绝对输出列表价（$/Mtok，绝对价模式）。"
+  - key: compress.priceProfile.cacheReadPerMtok
+    type: number
+    default: "unset (registry)"
+    group: compress
+    desc_en: "Absolute cache-read list price in $/Mtok (absolute mode)."
+    desc_zh: "绝对缓存读列表价（$/Mtok，绝对价模式）。"
+  - key: compress.priceProfile.cacheWritePerMtok
+    type: number
+    default: "unset (registry)"
+    group: compress
+    desc_en: "Absolute cache-write list price in $/Mtok (absolute mode)."
+    desc_zh: "绝对缓存写列表价（$/Mtok，绝对价模式）。"
   - key: compress.reasoning.drop
     type: boolean
     default: "true"

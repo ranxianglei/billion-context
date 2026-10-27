@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { peekRegistryPriceProfile, providerFromHost, _resetForTest, _setForTest } from "../src/registry.ts";
+import { peekRegistryCostRow, peekRegistryPriceProfile, providerFromHost, _resetForTest, _setForTest } from "../src/registry.ts";
 import bundledSnapshot from "../src/registry-snapshot.json" with { type: "json" };
 
 // #1279 follow-up: registry-derived default price profiles. The lookup is
@@ -93,6 +93,49 @@ test("unlisted model yields undefined (stamp site then keeps kernel defaults)", 
     _resetForTest();
     _setForTest({}, { "anthropic/claude-haiku-4-5": { input: 1, output: 5, cache_read: 0.1 } });
     assert.equal(peekRegistryPriceProfile("totally-unlisted-model-xyz"), undefined);
+});
+
+test("peekRegistryCostRow returns the raw $/Mtok row with the winning catalog key (#2478)", () => {
+    _resetForTest();
+    _setForTest({}, {
+        "anthropic/claude-sonnet-4-5": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+        "host-b/model-no-output": { input: 4, cache_read: 0.4 },
+        "host-c/model-bare-input": { input: 6 },
+    });
+    assert.deepEqual(peekRegistryCostRow("claude-sonnet-4-5"), {
+        key: "anthropic/claude-sonnet-4-5",
+        input: 3,
+        output: 15,
+        cacheRead: 0.3,
+        cacheWrite: 3.75,
+    });
+    // Optional price parts are omitted (not zero) when models.dev lists none.
+    assert.deepEqual(peekRegistryCostRow("model-no-output"), { key: "host-b/model-no-output", input: 4, cacheRead: 0.4 });
+    assert.deepEqual(peekRegistryCostRow("model-bare-input"), { key: "host-c/model-bare-input", input: 6 });
+});
+
+test("peekRegistryCostRow shares name resolution with the profile lookup (#2478)", () => {
+    _resetForTest();
+    _setForTest({}, {
+        "deepinfra/claude-haiku-4-5": { input: 0.5, output: 2.5 },
+        "anthropic/claude-haiku-4-5": { input: 1, output: 5, cache_read: 0.1 },
+        "aaa/dual/model-x": { input: 0.15, output: 0.6 },
+        "zzz/dual/model-x": { input: 1.04, output: 4.16 },
+    });
+    // Known-provider host wins its own listing — same row as the profile path.
+    const own = peekRegistryCostRow("claude-haiku-4-5", "api.anthropic.com")!;
+    assert.equal(own.key, "anthropic/claude-haiku-4-5");
+    assert.equal(own.input, 1);
+    // Unknown relay → first listing in key order; key + input stay consistent
+    // with the profile stamped from the very same row.
+    const relay = peekRegistryCostRow("dual/model-x")!;
+    assert.equal(relay.key, "aaa/dual/model-x");
+    assert.equal(relay.input, 0.15);
+    assert.deepEqual(peekRegistryPriceProfile("dual/model-x"), { w: 0.15, r: 0.015, q: 0.6 });
+    // Unresolvable model and cold cache → undefined on both lanes.
+    assert.equal(peekRegistryCostRow("totally-unlisted-model-xyz"), undefined);
+    _resetForTest();
+    assert.equal(peekRegistryCostRow("claude-sonnet-4-5"), undefined);
 });
 
 test("price lookup is case-insensitive like the window lookup (same mechanism, #2074)", () => {
