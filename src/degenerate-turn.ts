@@ -73,23 +73,38 @@ export function endsWithDraftClose(text: string): boolean {
 }
 
 // #3905: the announcement-tail shape. Unlike #2303 there is no draft tag: the
-// ENTIRE visible output of the turn is a one-line promise of the next action
+// ENTIRE visible output of the turn is a short promise of the next action
 // ("Running verify after formatting:") that ends on a colon or ellipsis, with
 // no tool call and a clean stop. The upstream reports a healthy turn, the host
 // gets nothing actionable, and the session stalls until the user types
 // something. Observed verbatim at 24 output tokens / 32 visible chars behind a
 // deepseek-v4.1-flash combo member.
 //
-// The character cap is the whole precision boundary, not a performance guard:
-// a genuine answer that happens to end on a colon is prose, and prose is long.
-// 400 chars sits an order of magnitude above the observed stub and well below
-// any real answer tail.
-const ANNOUNCE_TAIL = /(?::|\u2026|\.\.\.)\s*$/;
+// Three precision boundaries — each one denies a real answer class that the
+// raw tail shape alone would misread as a stall (a false positive burns the
+// one-shot BILLED retry on a turn that was already complete):
+//   1. length cap: a genuine answer that happens to end on a colon is prose,
+//      and prose is long. 400 chars sits an order of magnitude above the
+//      observed stub and well below any real answer tail.
+//   2. action-intent cue: a bare colon/ellipsis appears in legitimate short
+//      answers ("The answer is 42:", "I'm not sure…"). Only progressive-form
+//      action verbs and first-person intent phrases count as cues — the forms
+//      the production stubs actually use. The list is English-first by design:
+//      non-English announcements keep pre-#3905 behavior (no retry) until
+//      traffic evidence justifies more languages.
+//   3. closed code fence: an UNCLOSED fence means the output was cut inside a
+//      code block — the truncated-output defect class (#1755/#2190), not a
+//      stalled promise; retrying it as an announcement would double-bill a
+//      length cut.
+const ANNOUNCE_TAIL = /(?::|…|\.\.\.)\s*$/;
 const ANNOUNCE_MAX_CHARS = 400;
+const ANNOUNCE_CUE = /\b(?:let me|i(?:'ll| will)|going to|gonna|running|checking|testing|inspecting|examining|looking|applying|adding|removing|updating|fixing|building|installing|scanning|verifying|formatting|cleaning|writing|reading|searching|starting|committing|pushing|deploying|restarting|compiling|linting|patching)\b/i;
 export function endsWithAnnouncement(text: string): boolean {
     const t = text.trimEnd();
     if (t.length === 0 || t.length > ANNOUNCE_MAX_CHARS) return false;
-    return ANNOUNCE_TAIL.test(t);
+    if ((t.match(/```/g)?.length ?? 0) % 2 === 1) return false;
+    if (!ANNOUNCE_TAIL.test(t)) return false;
+    return ANNOUNCE_CUE.test(t);
 }
 
 // #2612: the #2303 draft-tail shape has a legitimate producer — the CLIENT's
