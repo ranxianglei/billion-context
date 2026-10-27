@@ -255,7 +255,7 @@ export interface PreflightDeps {
     proxyUrl?: string;
     signal?: AbortSignal;
     log: (level: string, msg: string) => void;
-    /** Image cost of the initial wire view. */
+    /** #1843: the image reserve — the billed cost of the images riding the payload verbatim (#488). Every TEXT-channel decision compares the text estimate against `limit − reserve` instead of adding the reserve to each total, so an image-estimate error can no longer move a fold decision; kernel-facing quantities keep the total view (reserve added back), which is the conservative direction. This field is the INITIAL wire view; on lanes where folds archive images off the wire (`measureImageReserve`), the working copy is re-measured from the post-fold view every round (#4932). */
     imageReserve?: number;
     /** Rebuild the protocol image view after folds; archived images no longer consume the window. */
     measureImageReserve?: (messages: CoreMessage[]) => number;
