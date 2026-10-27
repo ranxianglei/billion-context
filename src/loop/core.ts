@@ -48,7 +48,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -267,6 +267,13 @@ export interface LoopCtx {
      *  rebuilt history. Default (undefined) keeps markers on. Paired
      *  tool-call/tool-result messages are unaffected. */
     visibilityMarkers?: boolean;
+    /** #3906: when `false`, keep the 📦/❌ ACP receipt in rebuilt history (and in
+     *  the round-N+1 system message the model sees) but stop emitting it into
+     *  the client's content stream. Independent of `visibilityMarkers`: this is
+     *  the cosmetic-only switch for clients that merge the marker into the
+     *  assistant's single text part, which makes the answer render above the
+     *  reasoning that produced it. Default (undefined) keeps streaming. */
+    streamMarkers?: boolean;
     /** #1455: tee loop-originated upstream responses (re-request and every
      *  retry fetch) to raw SSE files — the outer request's ACP_DUMP_SSE tee
      *  only covers the FIRST response, so an internal re-request that dies
@@ -1268,6 +1275,18 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // #2303 / #3905: classify the terminal tail shape. Both shapes are
+                // non-converged handoffs — visible prose with no tool call — and share
+                // the budget, the openai/anthropic framing boundary and the #2612
+                // exemption below.
+                const stalledTail: "draft" | "announce" | null =
+                    assistantText.length === 0 || calls.length > 0
+                        ? null
+                        : endsWithDraftClose(assistantText)
+                          ? "draft"
+                          : endsWithAnnouncement(assistantText)
+                            ? "announce"
+                            : null;
                 // #2303: a terminal turn that DID deliver visible prose but ends with a
                 // compression-draft closing tag (summary/analysis close forms) and no
                 // tool call — the model wrote a handoff/compression draft in prose
@@ -1293,7 +1312,7 @@ export async function* runCompressLoop(
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
-                    endsWithDraftClose(assistantText) &&
+                    (stalledTail === "draft" || stalledTail === "announce") &&
                     // #2612: the client's own compaction request instructs the
                     // model to answer with a plain-text summary block and no
                     // tool call — that compliant reply is a draft tail by
@@ -1303,8 +1322,13 @@ export async function* runCompressLoop(
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
-                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    if (stalledTail === "announce") {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with continuation nudge (#3905)`);
+                        loggerLog("warn", `[acp-loop] announcement-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    } else {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                        loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    }
                     const nudge: CoreMessage = {
                         id: `acp_draft_tail_retry_r${round}`,
                         role: "user",
@@ -1324,11 +1348,11 @@ export async function* runCompressLoop(
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
                         } else {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
                         }
-                        loggerLog("warn", `[acp-loop] draft-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                        loggerLog("warn", `[acp-loop] stalled-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
                 break;
@@ -1424,7 +1448,20 @@ export async function* runCompressLoop(
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result.text);
+                            // #3906: streamMarkers=false keeps the receipt in the
+                            // rebuilt history (and in the round-N+1 system message
+                            // below) while keeping it OUT of the client's content
+                            // stream. The marker is an assistant-prose delta emitted
+                            // before the continuation re-request, so on a client that
+                            // keys one text part per assistant message (opencode's
+                            // openai-compatible transform uses a fixed txt-0) it opens
+                            // the text part and the round-2 answer merges into it while
+                            // round-2 reasoning opens a NEW part after it — the answer
+                            // renders above the thinking that produced it and the turn
+                            // appears to end mid-thought.
+                            if (ctx.streamMarkers !== false) yield adapter.emitMarker(call.name, result.text);
+                            // The model-side recovery receipt keeps the marker line even when
+                            // the client stream is withheld.
                             streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
                         }
                     }

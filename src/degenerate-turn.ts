@@ -72,6 +72,26 @@ export function endsWithDraftClose(text: string): boolean {
     return text.length > 0 && DRAFT_CLOSE_TAIL.test(text);
 }
 
+// #3905: the announcement-tail shape. Unlike #2303 there is no draft tag: the
+// ENTIRE visible output of the turn is a one-line promise of the next action
+// ("Running verify after formatting:") that ends on a colon or ellipsis, with
+// no tool call and a clean stop. The upstream reports a healthy turn, the host
+// gets nothing actionable, and the session stalls until the user types
+// something. Observed verbatim at 24 output tokens / 32 visible chars behind a
+// deepseek-v4.1-flash combo member.
+//
+// The character cap is the whole precision boundary, not a performance guard:
+// a genuine answer that happens to end on a colon is prose, and prose is long.
+// 400 chars sits an order of magnitude above the observed stub and well below
+// any real answer tail.
+const ANNOUNCE_TAIL = /(?::|\u2026|\.\.\.)\s*$/;
+const ANNOUNCE_MAX_CHARS = 400;
+export function endsWithAnnouncement(text: string): boolean {
+    const t = text.trimEnd();
+    if (t.length === 0 || t.length > ANNOUNCE_MAX_CHARS) return false;
+    return ANNOUNCE_TAIL.test(t);
+}
+
 // #2612: the #2303 draft-tail shape has a legitimate producer — the CLIENT's
 // own summarization request. Claude Code's compaction (/compact, auto-compact,
 // precomputed compression) instructs the model, in the final user message, to

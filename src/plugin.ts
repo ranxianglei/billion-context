@@ -59,7 +59,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -2967,6 +2967,12 @@ export async function pipePluginChatWithStrip(
         // answer — a client compaction asking for a plain-text <summary> block
         // must not be retried (its compliant reply IS a draft tail).
         const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #3905: the same non-convergence without a draft tag — the whole visible
+        // output is a one-line promise of the next action ("Running verify after
+        // formatting:"). Without this branch the answerChars gate below would read
+        // that promise as a delivered answer and refuse the retry.
+        const announceTail = !draftTail && visibleTextChars > 0 && !sawToolUse && endsWithAnnouncement(proseAcc) && !requestExpectsProseSummary(requestText);
+        const stalledTail = draftTail || announceTail;
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
         // B-accident shape) is not an answer; the empty-turn retry must fire for
@@ -2974,9 +2980,9 @@ export async function pipePluginChatWithStrip(
         // chars are already excluded here), and real text keeps refusing the
         // retry byte-for-byte, so a delivered answer is never duplicated.
         const answerChars = answerProse.trim().length;
-        if (!draftTail && (answerChars > 0 || sawToolUse)) return false;
+        if (!stalledTail && (answerChars > 0 || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) {
-            if (!sawToolUse && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            if (!sawToolUse && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
@@ -3002,14 +3008,16 @@ export async function pipePluginChatWithStrip(
         // re-issuing it double-bills an empty completion (#732/#821 keep the
         // same boundary in the compress loop). A draft-tail turn is NOT bare:
         // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) {
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
             log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
         }
         degenerateRetried = true;
-        log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
-            : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        log?.(announceTail
+            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with a continuation nudge (#3905)"
+            : draftTail
+              ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+              : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -4640,6 +4648,9 @@ export async function pipePluginResponsesWithStrip(
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #3905: bare-announcement twin — see the chat-pipe twin above.
+        const announceTail = !draftTail && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithAnnouncement(proseAcc) && !requestExpectsProseSummary(requestText);
+        const stalledTail = draftTail || announceTail;
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
         // llama.cpp reasoning_text) and whitespace-only output_text (a bare
@@ -4647,9 +4658,9 @@ export async function pipePluginResponsesWithStrip(
         // bare check below, but whitespace-only answer prose must also retry.
         // Real answer text still refuses the retry byte-for-byte.
         const answerChars = answerProse.trim().length;
-        if (!draftTail && (answerChars > 0 || sawFunctionCall)) return false;
+        if (!stalledTail && (answerChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") {
-            if (!sawFunctionCall && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
+            if (!sawFunctionCall && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
@@ -4658,14 +4669,16 @@ export async function pipePluginResponsesWithStrip(
         // double-bills an empty completion (#732/#821 keep the same boundary in
         // the compress loop). A draft-tail turn delivered a full handoff draft:
         // precisely the stall signal.
-        if (!sawReasoning && !sawStrippedEcho && !draftTail) {
+        if (!sawReasoning && !sawStrippedEcho && !stalledTail) {
             log?.(`[plugin] degenerate terminal turn not retried (bare: no reasoning, no stripped echo): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
         degenerateRetried = true;
-        log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
-            : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.(announceTail
+            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying once with a continuation nudge (#3905)"
+            : draftTail
+              ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+              : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
