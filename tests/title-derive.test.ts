@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { deriveTitle, isContextualUserFragment, isAutoInjectedNotification } from "../src/server.js";
+import { deriveTitle, isContextualUserFragment, isAutoInjectedNotification, isTagShapedText } from "../src/server.js";
 import type { CoreMessage } from "acp-kernel";
 
 let seq = 0;
@@ -142,5 +142,74 @@ describe("#2286 isAutoInjectedNotification prefix permitlist", () => {
     it("does not match empty or whitespace-only text", () => {
         assert.equal(isAutoInjectedNotification(""), false);
         assert.equal(isAutoInjectedNotification("  \t\n "), false);
+    });
+});
+
+// Wrapper shapes observed in WorkBuddy 5.9.2 (CodeBuddy kernel) traffic (#4776):
+// the host injects these as USER-role messages ahead of the first real question,
+// and 139 of 166 session titles were exactly these wrappers.
+const WB_COMPACT_SUMMARY = '<system-reminder data-role="compact-summary"> This session is being continued from a previous conversation that ran out of context. The conversation is summarized below:\n…';
+const WB_USER_CTX = '<system-reminder data-role="user-context"> <environment_context>\n<cwd>/c/Users/dev</cwd>\n</environment_context>';
+const WB_MEMORY = '<system-reminder data-role="memory"><memory> # auto memory\n- user prefers concise answers\n</memory></system-reminder>';
+const WB_USER_QUERY = "<user_query><redacted personal info>\nPlease fix the login bug</user_query>";
+const WB_TASK_NOTIF = "<task-notification>The background task completed successfully.</task-notification>";
+const WB_CB_SUMMARY = "<cb_summary>Session summary: …</cb_summary>";
+
+describe("#4776 deriveTitle skips tag-shaped host wrapper openers", () => {
+    it("a WorkBuddy compact-summary wrapper ahead of the real question does not become the title", () => {
+        const t = deriveTitle([msg("user", "text", WB_COMPACT_SUMMARY), msg("user", "text", "帮我看看这个报错")]);
+        assert.equal(t, "帮我看看这个报错");
+    });
+
+    it("every observed WorkBuddy wrapper shape is skipped in favor of the real question", () => {
+        for (const w of [WB_COMPACT_SUMMARY, WB_USER_CTX, WB_MEMORY, WB_USER_QUERY, WB_TASK_NOTIF, WB_CB_SUMMARY]) {
+            const t = deriveTitle([msg("user", "text", w), msg("user", "text", "real question")]);
+            assert.equal(t, "real question", `wrapper: ${w.slice(0, 40)}`);
+        }
+    });
+
+    it("only wrappers present: no title yet (retries once the real question arrives)", () => {
+        assert.equal(deriveTitle([msg("user", "text", WB_USER_QUERY)]), undefined);
+    });
+
+    it("a literal paste that opens with a tag defers the title instead of locking garbage", () => {
+        const t = deriveTitle([msg("user", "text", '<div class="x"> why is this red?</div>'), msg("user", "text", "debug this page")]);
+        assert.equal(t, "debug this page");
+    });
+
+    it("plain questions never look tag-shaped — no false positives", () => {
+        for (const s of ["Fix auth bug", "<3 warm up this session", "<<bracketed>> note", "1 < 2 ? a : b"]) {
+            assert.equal(deriveTitle([msg("user", "text", s)]), s, s);
+        }
+    });
+});
+
+describe("#4776 isTagShapedText structural rule", () => {
+    it("matches opening tags with attributes, hyphens, underscores, colons; case-insensitive", () => {
+        assert.equal(isTagShapedText('<system-reminder data-role="x">y'), true);
+        assert.equal(isTagShapedText("<user_query>x</user_query>"), true);
+        assert.equal(isTagShapedText("<SYSTEM_REMINDER>x"), true);
+        assert.equal(isTagShapedText("<ns:tag attr='v'>x"), true);
+        assert.equal(isTagShapedText("  <memory> x "), true);
+    });
+
+    it("matches closing-tag openers (wrapper residue)", () => {
+        assert.equal(isTagShapedText("</INSTRUCTIONS>"), true);
+    });
+
+    it("matches a polluted set-once title truncated at 60 chars with ellipsis", () => {
+        const truncated = WB_USER_QUERY.slice(0, 57) + "\u2026";
+        assert.equal(isTagShapedText(truncated), true);
+    });
+
+    it("does not match non-tag text starting with <", () => {
+        assert.equal(isTagShapedText("<3 warm up"), false);
+        assert.equal(isTagShapedText("<<double>x"), false);
+        assert.equal(isTagShapedText("<  spaced out>"), false);
+    });
+
+    it("does not match empty text or mid-sentence mentions", () => {
+        assert.equal(isTagShapedText(""), false);
+        assert.equal(isTagShapedText("why is my <div> broken?"), false);
     });
 });

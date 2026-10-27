@@ -1275,8 +1275,12 @@ async function handleRequest(
                 anonProvenance = buildAnonymousProvenance(req.headers, affinityMessageList(), req.socket?.remoteAddress);
                 const provSuffix = `; ua=${JSON.stringify(anonProvenance.ua ?? "-")} plugin=${anonProvenance.pluginAgent ?? "-"} first=${JSON.stringify(anonProvenance.firstMsg ?? "-")}`;
                 const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix})`);
+                // #4776: name the identity gap at the ONE observable moment — this
+                // client sent no stable conversation id, so the pfa-* id is
+                // content-affinity-derived and will split again on fork/resume.
+                const identityNote = "; no client-provided conversation id - content-affinity identity, unstable across forks";
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix}${identityNote})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage}${provSuffix}${identityNote})`);
                 // A verified anonymous history replay is evidence of possible
                 // identity loss, not proof that the identified client moved.
                 if (anonAffinity.orphanSuspect !== undefined && anonAffinity.orphanSuspect.length > 0) {
@@ -1430,14 +1434,17 @@ async function handleRequest(
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
-            // The rest of this stamp is latest-wins; `producer` is NOT — the
-            // mint request's fingerprint must survive every later turn (#2879).
-            const existingProducer = (session.metadata.anonymousPrefixAffinity as { producer?: AnonymousProvenance } | undefined)?.producer;
+            // The rest of this stamp is latest-wins; `producer` and `lineage` are NOT —
+            // both exist only on the mint request (via==="new"), so latest-wins would
+            // erase them on the first continuation turn: the mint fingerprint (#2879)
+            // and the birth attribution that /__bili/status counts on (#4776).
+            const existingApa = session.metadata.anonymousPrefixAffinity as { producer?: AnonymousProvenance; lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number } } | undefined;
+            const existingProducer = existingApa?.producer;
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
                 via: anonAffinity.via,
-                ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
+                ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : existingApa?.lineage ? { lineage: existingApa.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
         } else if (clientProvided) {

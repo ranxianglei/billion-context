@@ -1296,6 +1296,31 @@ export function splitSessionWarnings(sessions: Session[], now: number = Date.now
     return out;
 }
 
+// #4776: splitSessionWarnings is the #2165 stolen-anchor canary — it only fires
+// when several sessions SHARE one id base (`|sub:` children), so it is structurally
+// blind to anonymous prefix-affinity forks: every pfa-* fork owns a unique id, and an
+// anonymous-heavy deployment reads [] while one conversation split dozens of times.
+// This reports what bili actually knows from session metadata: how many in-memory
+// sessions carry no client-provided identity, and how many were born as a fork
+// (diverged shared prefix) or truncated replay (compaction/resume dropped the head)
+// of another anonymous session's history.
+interface AnonymousIdentitySummary {
+    total: number;
+    forkBorn: number;
+    truncatedBorn: number;
+}
+export function anonymousIdentitySummary(sessions: Session[]): AnonymousIdentitySummary {
+    let total = 0, forkBorn = 0, truncatedBorn = 0;
+    for (const s of sessions) {
+        const apa = s.metadata?.anonymousPrefixAffinity as { lineage?: { reason?: string } } | undefined;
+        if (!apa) continue;
+        total++;
+        if (apa.lineage?.reason === "forked") forkBorn++;
+        else if (apa.lineage?.reason === "truncated") truncatedBorn++;
+    }
+    return { total, forkBorn, truncatedBorn };
+}
+
 /** Read-only in-memory lookup. Unlike getSession, never creates or reloads a
  *  session — used by the plugin tool API, which must not conjure state for a
  *  conversation it has never seen. */

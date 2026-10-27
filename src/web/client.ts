@@ -555,12 +555,23 @@ export const WEB_CLIENT = `(function () {
         }
     }
 
+    // #4776: a markup-shaped derived title (a host XML wrapper captured before the #4776 skip
+    // rule shipped) identifies nothing — treat it as absent so the label / firstBlockHint
+    // fallbacks can show instead of being shadowed forever. The raw stored title stays visible
+    // in the detail KV row; self-healing re-derivation fixes the data itself on next request.
+    function effectiveSessionName(d) {
+        const raw = d && typeof d.title === "string" ? d.title : "";
+        const title = /^\s*</.test(raw) ? "" : raw;
+        return title || (d && d.label) || (d && d.firstBlockHint) || "";
+    }
+
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
         // shown underneath so rows stay identifiable. Disk-restored pool entries read as history,
         // not live.
-        const named = Boolean(s.title || s.label || s.firstBlockHint);
-        const name = s.title || s.label || s.firstBlockHint || t("ses.no_title");
+        const name0 = effectiveSessionName(s);
+        const named = Boolean(name0);
+        const name = name0 || t("ses.no_title");
         const live = s.live && !s.restored;
         // Only actively running sessions get a status tag; disk/restored rows carry none.
         // The whole cell is a real hash anchor: plain clicks route inside the SPA exactly as
@@ -2542,7 +2553,8 @@ function changelogCatOf(rawLine) {
         // array (originally declared further down, inside the tree pane).
         const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
-        parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
+        const headName = effectiveSessionName(d) || d.id.slice(0, 16);
+        parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(effectiveSessionName(d) || d.id) + '">' + escapeHtml(headName) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         // #3917: the detail page splits into panes — overview (identity, usage,
         // cache economics), the compression tree, and the handoff document. The

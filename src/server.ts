@@ -4133,11 +4133,29 @@ export function isAutoInjectedNotification(text: string): boolean {
     return AUTO_INJECTED_NOTIFICATION_PREFIXES.some((p) => asciiCI(t.slice(0, p.length), p));
 }
 
+// Host-injected XML-wrapped context fragments (WorkBuddy/CodeBuddy, #4776):
+// closed-source harnesses splice machine-generated wrappers into the
+// conversation as USER-role messages ahead of the first real question —
+// `<system-reminder data-role="compact-summary|user-context|memory">…`,
+// `<user_query>…`, `<task-notification>…`, `<cb_summary>…`, `<memory>…`. The
+// marker/prefix permitlists above are per-host and cannot keep up with
+// closed-source harnesses, so this one is a STRUCTURAL rule instead: a
+// tag-shaped opener identifies no human question on any host observed so far,
+// while real user text essentially never opens with a tag. A literal paste
+// that does (e.g. HTML being debugged) only DEFERS the title to the next
+// message — self-healing — whereas adopting it locks a garbage title behind
+// set-once semantics. That consequence asymmetry is what licenses deviating
+// from the evidence-permitlist discipline used by the two checks above.
+export function isTagShapedText(text: string): boolean {
+    const t = text.trim();
+    return /^<\/?[a-z_][\w:.-]*/i.test(t);
+}
+
 /** Derive a short human-readable title from the first real user text message.
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
- *  Contextual fragments (#2118) and host-injected notifications (#2286) are
- *  skipped — if no real question has arrived yet, no title is set and
- *  derivation retries on later requests. */
+ *  Contextual fragments (#2118), host-injected notifications (#2286) and
+ *  tag-shaped wrapper openers (#4776) are skipped — if no real question has
+ *  arrived yet, no title is set and derivation retries on later requests. */
 export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
@@ -4145,6 +4163,7 @@ export function deriveTitle(messages: CoreMessage[]): string | undefined {
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
         if (isAutoInjectedNotification(raw)) continue;
+        if (isTagShapedText(raw)) continue;
         const clean = raw.replace(/\s+/g, " ").trim();
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
