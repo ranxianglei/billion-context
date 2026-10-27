@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerResponse } from "node:http";
-import { getBlogFeed, handleBlogGet, handleBlogAssetGet, _setBlogRootForTest } from "../src/web/blogfeed.ts";
+import { getBlogFeed, handleBlogAssetGet, _setBlogRootForTest } from "../src/web/blogfeed.ts";
 
 let pkgRoot = "";
 let outsideDir = "";
@@ -126,13 +126,7 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     assert.equal(md.status, 404);
 });
 
-test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-only", () => {
-    const warm = fakeRes();
-    handleBlogGet(warm.res);
-    assert.equal(warm.status, 200);
-    assert.match(String(warm.headers["content-type"]), /^application\/json/);
-    assert.ok(Array.isArray(JSON.parse(warm.body).items));
-
+test("a broken articles manifest degrades to posts-only", () => {
     writeFileSync(join(pkgRoot, "website", "articles.json"), "{ not json");
     _setBlogRootForTest(pkgRoot); // clears the cache
     const data = getBlogFeed();

@@ -5,7 +5,9 @@
  * served to the panel as a JSON feed (GET /__bili/blog); their images ride
  * GET /__bili/blog-assets/<rel>. The panel renders them with its own look —
  * no full site is served. Content is frozen per package release and advances
- * with self-update; GitHub Pages stays the always-fresh canonical copy.
+ * with self-update; web/blog-live.ts (#4906) overlays POSTS from GitHub master
+ * on top of this bundled base (articles stay bundled); GitHub Pages remains the
+ * always-fresh canonical copy of the full library.
  *
  * Fail-soft like web/changelog.ts: missing folders/manifest → empty feed or
  * plain 404s, never an exception out of the handler. No config keys, no env
@@ -32,7 +34,7 @@ let rootOverride: string | undefined;
 let probedRoot: string | undefined;
 let state: { items: BlogItem[] } | undefined;
 
-type BlogItem = {
+export type BlogItem = {
     id: string;
     kind: "post" | "article";
     /** "" when the source carries no usable date. */
@@ -131,11 +133,51 @@ function splitH1(body: string): [string, string] {
     return [m[1].replace(/[*_`]/g, "").trim(), body.slice(m[0].length)];
 }
 
-function renderBody(absFile: string, root: string): { html: string; h1: string } {
-    const { body } = parseFrontmatter(readFileSync(absFile, "utf8"));
+export type PostHalf = { html: string; h1: string; fm: Record<string, string> };
+
+/** One language half of a post: frontmatter parse + H1 split + caller-supplied
+ *  image rewrite + markdown render. The disk path (collectPosts) and the live
+ *  overlay (#4906) share this so the two views cannot drift apart. */
+export function renderPostText(raw: string, rewriteImagesInMd: (md: string) => string): PostHalf {
+    const { fm, body } = parseFrontmatter(raw);
     const [h1, rest] = splitH1(body);
-    const srcDir = dirname(absFile);
-    return { html: markdownToHtml(rewriteImages(rest, srcDir, root)), h1 };
+    return { html: markdownToHtml(rewriteImagesInMd(rest)), h1, fm };
+}
+
+/** Post id from its filename base: strip a leading YYYY-MM-DD_ date prefix,
+ *  fall back to the raw base. Single definition shared by disk + live (#4906). */
+export function postIdFromBase(base: string): string {
+    return base.replace(/^\d{4}-\d{2}-\d{2}_/, "") || base;
+}
+
+/** Assemble one bilingual post item from its rendered halves; undefined when
+ *  neither half survived. The single definition of the id/date/title/excerpt
+ *  fallback chains — disk and live share it (#4906). */
+export function shapePost(base: string, en?: PostHalf, zh?: PostHalf): BlogItem | undefined {
+    if (!en && !zh) return undefined;
+    const slug = postIdFromBase(base);
+    return {
+        id: slug,
+        kind: "post",
+        date: validDate(en?.fm.date || "") ? en!.fm.date : validDate(zh?.fm.date || "") ? zh!.fm.date : (validDate(base.slice(0, 10)) ? base.slice(0, 10) : ""),
+        title: en?.fm.title || en?.h1 || slug,
+        titleZh: zh?.fm.title_zh || zh?.fm.title || zh?.h1 || "",
+        excerpt: en?.fm.excerpt || "",
+        excerptZh: zh?.fm.excerpt_zh || "",
+        html: en?.html || "",
+        htmlZh: zh?.html || "",
+    };
+}
+
+/** Newest-first dated, stable id-ordered undated tail — the ONE feed ordering
+ *  definition (collect() and the live merge, #4906). */
+export function sortBlogItems(items: BlogItem[]): BlogItem[] {
+    items.sort((a, b) => {
+        if (a.date && b.date) return a.date === b.date ? a.id.localeCompare(b.id) : a.date < b.date ? 1 : -1;
+        if (a.date !== b.date) return a.date ? -1 : 1;
+        return a.id.localeCompare(b.id);
+    });
+    return items;
 }
 
 function collectPosts(root: string): BlogItem[] {
@@ -154,8 +196,7 @@ function collectPosts(root: string): BlogItem[] {
     }
     const items: BlogItem[] = [];
     for (const [base, pair] of pairs) {
-        const slug = base.replace(/^\d{4}-\d{2}-\d{2}_/, "") || base;
-        const renderOne = (kind: "en" | "zh"): { html: string; h1: string; fm: Record<string, string> } | undefined => {
+        const renderOne = (kind: "en" | "zh"): PostHalf | undefined => {
             const name = pair[kind];
             if (!name) return undefined;
             let raw: string;
@@ -164,24 +205,10 @@ function collectPosts(root: string): BlogItem[] {
             } catch {
                 return undefined;
             }
-            const { fm, body } = parseFrontmatter(raw);
-            const [h1, rest] = splitH1(body);
-            return { html: markdownToHtml(rewriteImages(rest, postsDir, root)), h1, fm };
+            return renderPostText(raw, (md) => rewriteImages(md, postsDir, root));
         };
-        const en = renderOne("en");
-        const zh = renderOne("zh");
-        if (!en && !zh) continue;
-        items.push({
-            id: slug,
-            kind: "post",
-            date: validDate(en?.fm.date || "") ? en!.fm.date : validDate(zh?.fm.date || "") ? zh!.fm.date : (validDate(base.slice(0, 10)) ? base.slice(0, 10) : ""),
-            title: en?.fm.title || en?.h1 || slug,
-            titleZh: zh?.fm.title_zh || zh?.fm.title || zh?.h1 || "",
-            excerpt: en?.fm.excerpt || "",
-            excerptZh: zh?.fm.excerpt_zh || "",
-            html: en?.html || "",
-            htmlZh: zh?.html || "",
-        });
+        const shaped = shapePost(base, renderOne("en"), renderOne("zh"));
+        if (shaped !== undefined) items.push(shaped);
     }
     return items;
 }
@@ -251,14 +278,8 @@ function collectArticles(root: string): BlogItem[] {
 function collect(): BlogItem[] {
     const root = pkgRoot();
     if (!root) return [];
-    const items = [...collectPosts(root), ...collectArticles(root)];
     // Dated entries newest-first; undated ones keep a stable id-ordered tail.
-    items.sort((a, b) => {
-        if (a.date && b.date) return a.date === b.date ? a.id.localeCompare(b.id) : a.date < b.date ? 1 : -1;
-        if (a.date !== b.date) return a.date ? -1 : 1;
-        return a.id.localeCompare(b.id);
-    });
-    return items;
+    return sortBlogItems([...collectPosts(root), ...collectArticles(root)]);
 }
 
 /** Cached feed (content only changes across package updates → one compute per
@@ -272,13 +293,6 @@ export function getBlogFeed(): { items: BlogItem[]; error?: string } {
         }
     }
     return state;
-}
-
-/** GET /__bili/blog — always 200 JSON; the panel degrades on an empty list. */
-export function handleBlogGet(res: ServerResponse): void {
-    const data = getBlogFeed();
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-cache" });
-    res.end(JSON.stringify(data));
 }
 
 /** One decoded-and-validated path segment list, or undefined for every
