@@ -268,6 +268,7 @@ async function handleRequest(
     admission: DecodedRequestAdmission,
     decodingSignal: AbortSignal,
 ): Promise<void> {
+
     // #1073/#3245: an absolute-form request addressed to THIS instance's own
     // endpoint is a fetch of us, not a tunnel — strip the authority so every
     // downstream stage (admin gate, /bili/ tunnel admission, protocol detection)
@@ -305,6 +306,7 @@ async function handleRequest(
      *  reason: that wire's body carries `anthropic_version` and never `model`.
      *  Undefined for every other protocol. */
     let vertexModel: string | undefined;
+
     // #903: cost clock starts BEFORE the body read — local= covers body
     // reception + parse + processTurn + rebuild/serialize, i.e. everything bili
     // does before handing off. inboundBytes stays the raw wire size (pre-decode).
@@ -422,6 +424,7 @@ async function handleRequest(
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
     }
+
     // #1757: resolve compat.dropFields once, ahead of the verbatim branches
     // that forward before reaching the final boundary (they can't use
     // forward()'s own resolution). Same destination derivation as
@@ -467,6 +470,7 @@ async function handleRequest(
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
         return;
     }
+
     // #300: bili→bili chain detection. If the inbound request already carries
     // the x-bili-hop marker, an upstream bili instance already ran the
     // compression pipeline on it. Processing it again would double-compress
@@ -481,6 +485,7 @@ async function handleRequest(
             ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
             : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
     }
+
     // #1086: byte pre-filter for the ACP-artifact content fallback — the only
     // remaining signal when a middlebox strips x-bili-hop. The DECISION is
     // deferred until session identity is resolved below: artifacts in a
@@ -494,6 +499,7 @@ async function handleRequest(
     // entirely when the store is disabled; the hop marker above still catches chains.
     const artifactSeed = hopMarker === undefined && bodyBuffer.length > 0
         && opts.chainContentDetection !== false && getStore().enabled && artifactSeedHit(bodyBuffer);
+
     // #920: legacy opencode-acp sessions bypass the whole pipeline. The thin
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
@@ -504,6 +510,7 @@ async function handleRequest(
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
+
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
     // windows behind different relays), then the built-in table. Falls back to
@@ -519,6 +526,7 @@ async function handleRequest(
             parsed = null;
         }
     }
+
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
@@ -540,6 +548,7 @@ async function handleRequest(
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
     }
+
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
     //  index builds (each one re-converts the full history wire→core). The
@@ -554,6 +563,7 @@ async function handleRequest(
         if (Array.isArray(p.input)) return p.input.length;
         return null;
     })();
+
     // #1395 step 3 (#1421): chain-checkpoint ENFORCEMENT — first-processor-
     // wins. A verifiable checkpoint means an upstream bili already ran the
     // pipeline on this exact body: forward it verbatim (pipeline skipped)
@@ -598,6 +608,7 @@ async function handleRequest(
             log("debug", `[chain] evaluation failed (${String(err)}); ignoring`);
         }
     }
+
     // #806: a parseable body missing the conversation field used to crash the
     // kernel's conversation-signal fingerprint (body.messages.find on undefined —
     // top-level arrays included) and surface as an opaque 502; #806 answered that
@@ -626,6 +637,7 @@ async function handleRequest(
             return;
         }
     }
+
     // The effective model for this request. Every wire carries it in the body
     // except Gemini, whose URL path holds it (`/v1beta/models/<model>:…`), and
     // Anthropic-on-Vertex, whose path holds it the same way
@@ -652,6 +664,7 @@ async function handleRequest(
         const inLen = Array.isArray(p.input) ? p.input.length : 0;
         log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
     }
+
     // Per-request context limit + compression tuning: look up body.model against
     // the per-route model declaration first, then the built-in table / registry.
     // Compress settings (global → provider → model) merge deepest-field-wins and
@@ -843,6 +856,7 @@ async function handleRequest(
         }
     }
     let prepared: Prepared | null = null;
+
     // Whether this request has already been handed to forward(). `prepared`
     // cannot answer that: the codex compaction_trigger path deliberately skips
     // the kernel and forwards its own normalized body with `prepared === null`,
@@ -855,6 +869,7 @@ async function handleRequest(
     if (routePassthrough && hopMarker === undefined && protocol && parsed) {
         log("info", `[route-passthrough] ${maskUrlsInText(providerDestUrl)} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
+
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim. #1421: `chainSkip` is the
@@ -972,6 +987,7 @@ async function handleRequest(
                   clientProvided: !!v1ConvId || !!convHeader,
               }
             : undefined;
+
         // #2156: a request that will ride the #388 side passthrough further
         // down must NEVER participate in persona namespace resolution.
         // subagentNamespace's first-seen-system anchor is mutable process
@@ -1019,6 +1035,7 @@ async function handleRequest(
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
                      && detectAcpArtifacts(bodyBuffer, parsed) === null));
+
         // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
         // conversation id on every model request of a session, INCLUDING the
         // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
@@ -1858,6 +1875,7 @@ async function handleRequest(
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
+
         // #1897: omp-style hosts register bili's ACP tools as first-class extension
         // tools and include them in EVERY model request — including side requests
         // (title-gen), which carry no host action tools of their own. omp titles with
@@ -2095,6 +2113,7 @@ async function handleRequest(
         // header) can false-positive it — only intent-certain side
         // identification (declared side agent, a tool-less tiny budget, or the
         // #2500 server-tool utility shape) diverts under a receipt.
+
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
         const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : undefined });
@@ -2157,6 +2176,7 @@ async function handleRequest(
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
+
         // #2170 measure 4 (runtime canary): every legitimately side-shaped
         // LANE-ELIGIBLE request returned inside the lane above. count_tokens,
         // /responses/compact and session-less (protocol-less) requests are
@@ -2171,173 +2191,31 @@ async function handleRequest(
             session.metadata.sideEffectLeaks = (typeof session.metadata.sideEffectLeaks === "number" ? session.metadata.sideEffectLeaks : 0) + 1;
             log("warn", `[${session.id}] SIDE-EFFECT LEAK (#2170 canary): ${sideLane.reason} request entered the full pipeline — expected the #388 side passthrough; kernel state pollution likely (cf. #2156/#2164)`);
         }
-        // #987: the window is NEVER learned from traffic — no self-heal read
-        // here. Only the one-shot emergency shrink (armed on the overflow
-        // itself) reacts to a wrong declared window.
-        // Reserve the model's OUTPUT budget for this turn from the window so the
-        // kernel's nudge/truncate bands sit below (window - reserved) and a
-        // context+output overflow can't happen on a small window (e.g. 100k with a
-        // large max_tokens — the most common "context blew up" cause; none of the
-        // three layers reserved room for the output before this). #4205: EVERY
-        // wire reserves unless the route carries positive evidence of a separate
-        // output budget (real-Claude routing — api.anthropic.com or a claude-*
-        // model id; see shouldReserveOutputHeadroom / hasSeparateOutputBudgetEvidence).
-        // The old blanket anthropic exemption is what let wrapper providers on
-        // that wire (DeepSeek /anthropic bills completion against the same
-        // window) 400 at the wall (#3900); proven-share learning (#3973) composes
-        // here later. The request's own budget field is the exact
-        // output budget requested for THIS turn, so it is precise and per-request;
-        // when the harness omits every budget field (#924 fallback below) the
-        // model's declared max output stands in for it.
-        // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
-        // with billion-context-pi #207) caps the reservation at headroomCap × window
-        // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
-        // reservation overflow once; the self-heal above recovers it next turn.
-        // Only reserve when it leaves a usable window (maxOutput < window);
-        // otherwise the request is degenerate (output >= whole window) and the
-        // self-heal above handles the resulting overflow. Feeds reqConfig (→
-        // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+
+        // Output-headroom reservation: the DECLARED window becomes the window
+        // this turn actually judges against — reserved = min(maxOutput, cap ×
+        // window), floored for fallback-derived windows (#282) and clamped by a
+        // proven completion share (#3450). Algorithm and rationale live in
+        // reserveJudgingWindow().
         const nativeWindow = reqConfig.modelContextLimit;
-        const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
-        // #3450 follow-up (#3973): a 400 that stated a completion share disproves
-        // any separate-wall evidence for this origin+model — judging input against
-        // the full window would re-earn the same 400 every turn (#3738: nudge and
-        // preflight must judge on a number the upstream will accept). #4205 made
-        // the reservation the default for every wire without separate-budget
-        // evidence, so the proven share now forces the reservation where that
-        // evidence exists and clamps the resulting window below (see provenWindow).
-        const provenReserve = provenCompletionReserve(
-            session.stats,
-            headroomOrigin,
-            (parsed as { model?: string }).model,
-        );
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
-            const p = parsed as Record<string, unknown>;
-            const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
-            let maxOutput = typeof rawMax === "number" ? rawMax : 0;
-            // #924: harnesses that omit every output-budget field (Codex native
-            // Responses sends no max_output_tokens — openai/codex#36180) still get
-            // the upstream's own default output cap applied, so reserving nothing
-            // leaves the nudge/truncate bands able to overflow with one long
-            // reply. Fall back to the model's declared max output — per-route
-            // config first (operator-declared, outranks auto-fetched data, same
-            // order as the window resolution #344), then the models.dev registry
-            // ceiling (cache-only + bundled-snapshot floor, never fetches — the
-            // source preflight's summary cap uses, #853) — through the SAME capped
-            // reservation below. Unknown model → 0 → today's behavior.
-            if (!(maxOutput > 0)) {
-                // Runtime-info protocol (#955): the plugin reported the client's
-                // CONFIGURED max output (or the model's declared default, e.g.
-                // dsh's defaultMaxTokens) for exactly this model — outranks
-                // configured/registry because it is what the client will
-                // actually ask the upstream for. Still only a fallback: a
-                // max_tokens on the wire beat it above.
-                const fbModel0 = (parsed as { model?: string }).model;
-                // #1531: same dual lookup as the window chain above — header
-                // agent wins exclusively, header-less agents resolve by
-                // conversation signal.
-                const fbAgent = pluginAgentHeader(req.headers);
-                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
-                    ?? (fbAgent !== undefined
-                        ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
-                        : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
-                if (typeof runtimeMax === "number" && runtimeMax > 0) {
-                    maxOutput = runtimeMax;
-                    if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
-                        headroomFallbackLogged.add(`${fbModel0 ?? "?"}|runtime-info`);
-                        log("info", `[headroom] model=${fbModel0 ?? "?"}: request carries no output budget; reserving against runtime-info max output ${runtimeMax} (#955)`);
-                    }
-                }
-            }
-            if (!(maxOutput > 0)) {
-                // Launcher env channel (#971): the client's OWN config declares
-                // this model's output ceiling (codex model_max_output_tokens,
-                // pi/omp maxTokens, opencode limit.output, codebuddy
-                // maxOutputTokens) — handed over at launch time. Below
-                // runtime-info (per-request plugin truth) but above the
-                // generic configured/registry sources, same rank order as the
-                // window chain's launcher tier (1b).
-                const fbLauncher = (parsed as { model?: string }).model;
-                const launcherMax = fbLauncher !== undefined ? launcherMaxOutput(fbLauncher) : undefined;
-                if (typeof launcherMax === "number" && launcherMax > 0) {
-                    maxOutput = launcherMax;
-                    if (!headroomFallbackLogged.has(`${fbLauncher}|launcher`)) {
-                        headroomFallbackLogged.add(`${fbLauncher}|launcher`);
-                        log("info", `[headroom] model=${fbLauncher}: request carries no output budget; reserving against launcher max output ${launcherMax} (#971)`);
-                    }
-                }
-            }
-            if (!(maxOutput > 0)) {
-                const fbModel = (parsed as { model?: string }).model;
-                if (fbModel) {
-                    let host: string | undefined;
-                    try { host = providerDestUrl ? new URL(providerDestUrl).host : undefined; } catch { host = undefined; }
-                    const cfgOut = resolveConfiguredOutputLimit(opts.routes, providerDestUrl, fbModel);
-                    const regOut = peekRegistryOutputLimit(fbModel, host);
-                    const budget = cfgOut !== undefined ? cfgOut : regOut;
-                    if (typeof budget === "number" && budget > 0) {
-                        maxOutput = budget;
-                        const source = cfgOut !== undefined ? "configured" : "registry";
-                        if (!headroomFallbackLogged.has(`${fbModel}|${source}`)) {
-                            headroomFallbackLogged.add(`${fbModel}|${source}`);
-                            log("info", `[headroom] model=${fbModel}: request carries no output budget; reserving against ${source} max output ${budget} (#924)`);
-                        }
-                    }
-                }
-            }
-            if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
-                // Proven share outranks the client-side fallbacks: it is what
-                // the upstream already counted into a rejection on this exact
-                // origin+model, so window − proven share is the input it accepts.
-                if (provenReserve > maxOutput) maxOutput = provenReserve;
-                const proofModel = (parsed as { model?: string }).model ?? "?";
-                if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
-                    headroomFallbackLogged.add(`${proofModel}|proven-completion`);
-                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
-                }
-            }
-            // #2283 sub-defect 1: emit [window-change] when the per-session resolution
-            // triple (model/source/base) moves mid-session. Placed pre output-headroom so
-            // #2096's per-request max_tokens reservation can't read as a base change.
-            {
-                const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
-                const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
-                if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
-                    log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
-                }
-                if (session.metadata) session.metadata.lastWindowResolution = curRes;
-            }
-            let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
-            // Fallback-derived windows are optimistic guesses: never let the
-            // output-headroom reservation push the effective window below the
-            // floor (issue #282: 128k table − 64k max_tokens → 64k effective
-            // for a 1M-window model). If the real window is smaller, the first
-            // upstream overflow self-heals it.
-            if (nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
-                log("info", `[${session.id}] fallback context window floored: ${reserved} → ${FALLBACK_EFFECTIVE_WINDOW_FLOOR} (model=${String(requestModel ?? "?")} not authoritatively identified; self-heal corrects it if the real window is smaller)`);
-                reserved = FALLBACK_EFFECTIVE_WINDOW_FLOOR;
-            }
-            // The #896 cap bounds GUESSED budgets; a proven share is measured —
-            // the upstream already counted it in a rejection on this origin+model —
-            // so the window may never stay above (declared window − proven share).
-            if (provenReserve > 0 && nativeWindow > provenReserve) {
-                const provenWindow = nativeWindow - provenReserve;
-                if (provenWindow < reserved) reserved = provenWindow;
-            }
-            if (reserved !== reqConfig.modelContextLimit) {
-                reqConfig = { ...reqConfig, modelContextLimit: reserved };
-                // #2096: the [window] line above already went out with the
-                // pre-reservation base — surface the value nudge/preflight
-                // actually judge against, once per model|value. The clamp's
-                // native-window guarantee is stated here so the two windows
-                // can't be read as one in an incident log.
-                const headroomModel = String(requestModel ?? "?");
-                if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
-                    headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
-                    log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap} via compress.outputHeadroomMaxPct) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096, #3837)`);
-                }
-            }
-        }
+        reqConfig = reserveJudgingWindow({
+            reqConfig,
+            nativeWindow,
+            headroomCap,
+            nativeFromFallback,
+            parsed,
+            req,
+            opts,
+            protocol,
+            requestModel,
+            providerDestUrl,
+            headroomOrigin: normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin),
+            reqModelId,
+            windowSource: wsSourceForLog,
+            session,
+            log,
+        });
+
         // #4205 caliber: status surfaces record the UNRESERVED window (post
         // self-heal, pre output-headroom) — the wall the client/upstream
         // declares, stable across turns regardless of per-request max_tokens.
@@ -2369,6 +2247,7 @@ async function handleRequest(
         storeEffectiveConfig(session, reqConfig);
         const durableClassifier = pluginAgent ? durableMessageToolPaths[pluginAgent] : undefined;
         if (durableClassifier !== undefined) reqConfig = withDurableProtection(reqConfig, durableClassifier);
+
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -2492,6 +2371,7 @@ async function handleRequest(
                     preparedOut.model = requestModel;
                     return preparedOut;
                 };
+
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
                 // intercepted, preserve what codex sent except for local bili
@@ -2526,6 +2406,7 @@ async function handleRequest(
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
                 }
+
                 // #3450: ONE wall per request — on the refold path the
                 // prepare/nudge stage must judge against the same window the
                 // preflight stage folds on. min(declared, stated): the
@@ -2571,6 +2452,7 @@ async function handleRequest(
                     }
                     prepared.threadsReforge = undefined;
                 }
+
                 // #2607: prepare just assigned numeric refs to this turn's new
                 // messages (archivable media folds by default) — archive their
                 // pixels before preflight or the model can fold them away.
@@ -2580,6 +2462,7 @@ async function handleRequest(
                 if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
                     session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
                 }
+
                 // #2155 self-heal round: one evaluation per request, on the
                 // nudge-carrying prepared result (bypass lanes have nudge
                 // undefined and the hook no-ops inside). Side requests
@@ -2607,6 +2490,7 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
+
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
@@ -2680,6 +2564,7 @@ async function handleRequest(
                     }
                     prepared = outcome;
                 }
+
                 // #1266: capture the CLIENT's raw incoming wire AFTER session
                 // binding so the filename carries the session id — INCOMING↔REQ
                 // dumps pair by id for `bili acp-cache diff`. Moved from the
@@ -2705,6 +2590,7 @@ async function handleRequest(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
+
             // #1884/#2090 (un-armed signed traffic): a request that already
             // carries a body-covering signature (SDK-HMAC-SHA256 family —
             // CodeArts APIG, or any gateway-invented scheme the shape-based
@@ -2808,4 +2694,202 @@ async function handleRequest(
         }
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);
     }
+}
+
+    // #987: the window is NEVER learned from traffic — no self-heal read
+    // here. Only the one-shot emergency shrink (armed on the overflow
+    // itself) reacts to a wrong declared window.
+    // Reserve the model's OUTPUT budget for this turn from the window so the
+    // kernel's nudge/truncate bands sit below (window - reserved) and a
+    // context+output overflow can't happen on a small window (e.g. 100k with a
+    // large max_tokens — the most common "context blew up" cause; none of the
+    // three layers reserved room for the output before this). #4205: EVERY
+    // wire reserves unless the route carries positive evidence of a separate
+    // output budget (real-Claude routing — api.anthropic.com or a claude-*
+    // model id; see shouldReserveOutputHeadroom / hasSeparateOutputBudgetEvidence).
+    // The old blanket anthropic exemption is what let wrapper providers on
+    // that wire (DeepSeek /anthropic bills completion against the same
+    // window) 400 at the wall (#3900); proven-share learning (#3973) composes
+    // here later. The request's own budget field is the exact
+    // output budget requested for THIS turn, so it is precise and per-request;
+    // when the harness omits every budget field (#924 fallback below) the
+    // model's declared max output stands in for it.
+    // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
+    // with billion-context-pi #207) caps the reservation at headroomCap × window
+    // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
+    // reservation overflow once; the self-heal above recovers it next turn.
+    // Only reserve when it leaves a usable window (maxOutput < window);
+    // otherwise the request is degenerate (output >= whole window) and the
+    // self-heal above handles the resulting overflow. Feeds reqConfig (→
+    // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+// The 15 parameters below ARE the real coupling surface of this block: it takes
+// no decision, forwards nothing and never touches kernel state — it only reads
+// what the pipeline already resolved and returns a tightened Config. Extracting
+// it does not decouple anything; it makes that surface visible and testable.
+export function reserveJudgingWindow(input: {
+    reqConfig: Config;
+    /** The window BEFORE reservation (= the incoming Config's modelContextLimit).
+     *  Later logs and metadata must tell "the wall the client declared" apart
+     *  from "the wall this turn judges against". */
+    nativeWindow: number;
+    headroomCap: number;
+    nativeFromFallback: boolean;
+    parsed: unknown;
+    req: http.IncomingMessage;
+    opts: ProxyOptions;
+    protocol: WireProtocol;
+    requestModel: string | undefined;
+    providerDestUrl: string;
+    headroomOrigin: string | undefined;
+    reqModelId: string | undefined;
+    windowSource: string | undefined;
+    session: Session;
+    log: (level: string, msg: string) => void;
+}): Config {
+    const {
+        reqConfig: incoming, nativeWindow, headroomCap, nativeFromFallback, parsed, req,
+        opts, protocol, requestModel, providerDestUrl, headroomOrigin, reqModelId,
+        session, log, windowSource: wsSourceForLog,
+    } = input;
+    let reqConfig = incoming;
+    // #3450 follow-up (#3973): a 400 that stated a completion share disproves
+    // any separate-wall evidence for this origin+model — judging input against
+    // the full window would re-earn the same 400 every turn (#3738: nudge and
+    // preflight must judge on a number the upstream will accept). #4205 made
+    // the reservation the default for every wire without separate-budget
+    // evidence, so the proven share now forces the reservation where that
+    // evidence exists and clamps the resulting window below (see provenWindow).
+    const provenReserve = provenCompletionReserve(
+        session.stats,
+        headroomOrigin,
+        (parsed as { model?: string }).model,
+    );
+    if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
+        const p = parsed as Record<string, unknown>;
+        const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+        let maxOutput = typeof rawMax === "number" ? rawMax : 0;
+        // #924: harnesses that omit every output-budget field (Codex native
+        // Responses sends no max_output_tokens — openai/codex#36180) still get
+        // the upstream's own default output cap applied, so reserving nothing
+        // leaves the nudge/truncate bands able to overflow with one long
+        // reply. Fall back to the model's declared max output — per-route
+        // config first (operator-declared, outranks auto-fetched data, same
+        // order as the window resolution #344), then the models.dev registry
+        // ceiling (cache-only + bundled-snapshot floor, never fetches — the
+        // source preflight's summary cap uses, #853) — through the SAME capped
+        // reservation below. Unknown model → 0 → today's behavior.
+        if (!(maxOutput > 0)) {
+            // Runtime-info protocol (#955): the plugin reported the client's
+            // CONFIGURED max output (or the model's declared default, e.g.
+            // dsh's defaultMaxTokens) for exactly this model — outranks
+            // configured/registry because it is what the client will
+            // actually ask the upstream for. Still only a fallback: a
+            // max_tokens on the wire beat it above.
+            const fbModel0 = (parsed as { model?: string }).model;
+            // #1531: same dual lookup as the window chain above — header
+            // agent wins exclusively, header-less agents resolve by
+            // conversation signal.
+            const fbAgent = pluginAgentHeader(req.headers);
+            const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
+                ?? (fbAgent !== undefined
+                    ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
+                    : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
+            if (typeof runtimeMax === "number" && runtimeMax > 0) {
+                maxOutput = runtimeMax;
+                if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
+                    headroomFallbackLogged.add(`${fbModel0 ?? "?"}|runtime-info`);
+                    log("info", `[headroom] model=${fbModel0 ?? "?"}: request carries no output budget; reserving against runtime-info max output ${runtimeMax} (#955)`);
+                }
+            }
+        }
+        if (!(maxOutput > 0)) {
+            // Launcher env channel (#971): the client's OWN config declares
+            // this model's output ceiling (codex model_max_output_tokens,
+            // pi/omp maxTokens, opencode limit.output, codebuddy
+            // maxOutputTokens) — handed over at launch time. Below
+            // runtime-info (per-request plugin truth) but above the
+            // generic configured/registry sources, same rank order as the
+            // window chain's launcher tier (1b).
+            const fbLauncher = (parsed as { model?: string }).model;
+            const launcherMax = fbLauncher !== undefined ? launcherMaxOutput(fbLauncher) : undefined;
+            if (typeof launcherMax === "number" && launcherMax > 0) {
+                maxOutput = launcherMax;
+                if (!headroomFallbackLogged.has(`${fbLauncher}|launcher`)) {
+                    headroomFallbackLogged.add(`${fbLauncher}|launcher`);
+                    log("info", `[headroom] model=${fbLauncher}: request carries no output budget; reserving against launcher max output ${launcherMax} (#971)`);
+                }
+            }
+        }
+        if (!(maxOutput > 0)) {
+            const fbModel = (parsed as { model?: string }).model;
+            if (fbModel) {
+                let host: string | undefined;
+                try { host = providerDestUrl ? new URL(providerDestUrl).host : undefined; } catch { host = undefined; }
+                const cfgOut = resolveConfiguredOutputLimit(opts.routes, providerDestUrl, fbModel);
+                const regOut = peekRegistryOutputLimit(fbModel, host);
+                const budget = cfgOut !== undefined ? cfgOut : regOut;
+                if (typeof budget === "number" && budget > 0) {
+                    maxOutput = budget;
+                    const source = cfgOut !== undefined ? "configured" : "registry";
+                    if (!headroomFallbackLogged.has(`${fbModel}|${source}`)) {
+                        headroomFallbackLogged.add(`${fbModel}|${source}`);
+                        log("info", `[headroom] model=${fbModel}: request carries no output budget; reserving against ${source} max output ${budget} (#924)`);
+                    }
+                }
+            }
+        }
+        if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+            // Proven share outranks the client-side fallbacks: it is what
+            // the upstream already counted into a rejection on this exact
+            // origin+model, so window − proven share is the input it accepts.
+            if (provenReserve > maxOutput) maxOutput = provenReserve;
+            const proofModel = (parsed as { model?: string }).model ?? "?";
+            if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
+                headroomFallbackLogged.add(`${proofModel}|proven-completion`);
+                log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
+            }
+        }
+        // #2283 sub-defect 1: emit [window-change] when the per-session resolution
+        // triple (model/source/base) moves mid-session. Placed pre output-headroom so
+        // #2096's per-request max_tokens reservation can't read as a base change.
+        {
+            const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
+            const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
+            if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
+                log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
+            }
+            if (session.metadata) session.metadata.lastWindowResolution = curRes;
+        }
+        let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
+        // Fallback-derived windows are optimistic guesses: never let the
+        // output-headroom reservation push the effective window below the
+        // floor (issue #282: 128k table − 64k max_tokens → 64k effective
+        // for a 1M-window model). If the real window is smaller, the first
+        // upstream overflow self-heals it.
+        if (nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
+            log("info", `[${session.id}] fallback context window floored: ${reserved} → ${FALLBACK_EFFECTIVE_WINDOW_FLOOR} (model=${String(requestModel ?? "?")} not authoritatively identified; self-heal corrects it if the real window is smaller)`);
+            reserved = FALLBACK_EFFECTIVE_WINDOW_FLOOR;
+        }
+        // The #896 cap bounds GUESSED budgets; a proven share is measured —
+        // the upstream already counted it in a rejection on this origin+model —
+        // so the window may never stay above (declared window − proven share).
+        if (provenReserve > 0 && nativeWindow > provenReserve) {
+            const provenWindow = nativeWindow - provenReserve;
+            if (provenWindow < reserved) reserved = provenWindow;
+        }
+        if (reserved !== reqConfig.modelContextLimit) {
+            reqConfig = { ...reqConfig, modelContextLimit: reserved };
+            // #2096: the [window] line above already went out with the
+            // pre-reservation base — surface the value nudge/preflight
+            // actually judge against, once per model|value. The clamp's
+            // native-window guarantee is stated here so the two windows
+            // can't be read as one in an incident log.
+            const headroomModel = String(requestModel ?? "?");
+            if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
+                headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
+                log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap} via compress.outputHeadroomMaxPct) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow} (#2096, #3837)`);
+            }
+        }
+    }
+    return reqConfig;
 }
