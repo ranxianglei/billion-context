@@ -1441,7 +1441,9 @@ export function planReconciliation(
     // the words still on the wire. Doctrine (order carries, content gates,
     // the id is only a hint): when a MISSING MASSES of cells still carry
     // word evidence, pair them in order instead of diagnosing destruction.
-    //   non-user prose anchors: wordbag equality + simhash ≤ GAP bar (the same
+    //   text user anchors: exact normalizedIdentity after newline→space unwrap
+    //     (line wrap that reconstructs the stored identity; never wordbag/simhash);
+    //   other prose anchors: wordbag equality + simhash ≤ GAP bar (the same
     //     edit-honesty gate as the sim tier) — role-checked, length-guarded;
     //   textless anchors (image families, no sh/wh by construction): k-th
     //     family pairing, only when the anchor/candidate counts per
@@ -1452,11 +1454,15 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
-            if (anchor.r === "user") return false;
-            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) return false;
+            if (anchor.r === "user") {
+                if (anchor.c !== "text" || m.contentType !== "text") return false;
+                const unwrapped: CoreMessage = { ...m, text: (m.text ?? "").replace(/\r?\n/g, " ") };
+                return normalizedIdentity(unwrapped) === anchor.n;
+            }
+            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
             if (wh !== anchor.wh) return false;
             const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));

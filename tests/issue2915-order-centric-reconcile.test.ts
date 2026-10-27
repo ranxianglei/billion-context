@@ -121,6 +121,7 @@ for (const [name, editedIndexes, before, after] of [
     ["changed approval", [5], "Deployment is APPROVED.", "Deployment is FORBIDDEN."],
     ["reordered instructions", [5], "Allow Alice; deny Bob.", "Deny Alice; allow Bob."],
     ["several reordered instructions", [5, 7, 9, 11], "Allow Alice; deny Bob.", "Deny Alice; allow Bob."],
+    ["several punctuation edits", [5, 7, 9, 11], "Allow Alice; deny Bob.", "Allow Alice? deny Bob."],
 ] satisfies Array<[string, number[], string, string]>) {
     test(`outgoing history retains ${name} after message ids change`, () => {
         const originals = Array.from({ length: 30 }, (_, i): CoreMessage => msg(
@@ -157,6 +158,34 @@ for (const [name, editedIndexes, before, after] of [
 }
 
 describe("Pass 0 order-centric resync (#2915)", () => {
+    test("line-wrapped user history stays folded and the next resend is quiet", () => {
+        const originals = Array.from({ length: 30 }, (_, i): CoreMessage => msg(
+            `original-${i}`, i % 2 === 0 ? "assistant" : "user",
+            `Historical context for step ${i}. `.repeat(100),
+        ));
+        const covered = originals.slice(3, 13).map((m) => m.id!);
+        const session = createSession("instruction-line-wrap");
+        session.state.blocks.push({
+            blockId: "wrapped-block", runId: "wrapped-run", tier: 1,
+            summary: "Historical steps.", directMessageIds: [...covered], effectiveMessageIds: [...covered],
+            directBlockIds: [], compressedTokens: 4000, createdAt: 1,
+            survivedCount: 0, generation: "young", active: true,
+        });
+        reconcileFoldCoverage(session, originals, opts());
+        const reshaped = originals.map((m, i): CoreMessage => ({
+            ...m, id: `wrapped-${i}`, text: (m.text ?? "").replace(/ /g, "\n"),
+        }));
+        reconcileFoldCoverage(session, reshaped, opts());
+        const outgoing = prune(reshaped, session.state);
+        for (let i = 3; i < 13; i++) {
+            assert.ok(!outgoing.some((m) => m.id === `wrapped-${i}`), "unchanged user and assistant content stays folded");
+        }
+        const logs: string[] = [];
+        reconcileFoldCoverage(session, reshaped, opts((_level, text) => logs.push(text)));
+        assert.ok(!logs.some((text) => text.includes("drifted") || text.includes("destroyed")),
+            "an unchanged resend must not keep reporting drift");
+    });
+
     test("#2821 replay: full id re-mint + changed preamble + appended turn — order carries, one resync, no mass loss", () => {
         const old = history();
         const next = remint(old, "g1", true, "brand new request turn");
@@ -337,13 +366,8 @@ describe("gap resolution tiers (owner rule 2026-10-12: any channel → flanks �
             "The quick brown fox jumps over the lazy dog near the river bank at dawn while birds chirp");
         const plan = planFor(old, next, storedOf(old));
         assert.equal(plan.bySim, 0, "a word change is never swallowed by the simhash tier");
-        // The bracket tier (same index, fenced between verified flanks — the
-        // owner-sanctioned delete+insert tradeoff, #2821) may still claim it:
-        // order evidence, not content similarity, is the carrier there.
-        const claimed = plan.byOrder === 1;
-        assert.ok(claimed || plan.unmatched.includes("m4"),
-            "falls through to the bracket tier or honest unmatched — never bySim");
-        if (claimed) assert.deepEqual(plan.claims.get("m4"), ["g1_7"]);
+        assert.equal(plan.byOrder, 1, "verified flanks pin the non-user slot to the order bracket");
+        assert.deepEqual(plan.claims.get("m4"), ["g1_7"]);
     });
 
     test("mid-column deletion (#2915 review gap ③): flanks absorb the shift, the deleted id stays honestly unmatched", () => {
