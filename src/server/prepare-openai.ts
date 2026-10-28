@@ -10,7 +10,7 @@ import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { applyDecisionReasoningPolicy, buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -438,10 +438,10 @@ export async function prepareOpenai(
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
                 const stable = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...stable, { role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut as OpenAITool[] | undefined, stream: false };
+                const sideBody: Record<string, unknown> = { ...parsed, messages: [...stable, { role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut as OpenAITool[] | undefined, stream: false, ...(decide.timeoutMs !== undefined ? { "bili:decideTimeoutMs": decide.timeoutMs } : {}) };
                 sideBody[typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens"] = decide.maxTokens;
                 delete sideBody.prompt_cache_retention;
-                stripDecisionReasoningFields("openai", sideBody);
+                applyDecisionReasoningPolicy("openai", sideBody, decide.reasoning ?? "strip");
                 const outcome = await runNudgeDecision({ req, opts, protocol: "openai", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);

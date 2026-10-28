@@ -21,12 +21,24 @@
 
 import type { CompressibleRange } from "acp-kernel";
 
-/** Output budget for the decision call. Matches the SIDE_REQUEST_MAX_TOKENS=200
- *  system (title-gen side requests use the same ceiling class). */
-export const DEFAULT_DECIDE_MAX_TOKENS = 200;
+/** Output budget for the decision call. #5030: default raised 200 → 1024 —
+ *  hybrid-thinking models (glm-5.3 via z.ai) spend their hidden reasoning
+ *  BEFORE the visible answer within the same output budget; at 200 the
+ *  budget is exhausted by reasoning and message.content comes back empty
+ *  (finish_reason "length", reasoning_tokens 140–199), which parseDecision
+ *  reads as a hard "empty response" failure feeding the ladder. 1024 leaves
+ *  room for short reasoning plus the one-line JSON verdict while staying a
+ *  tiny fraction of a normal output budget. */
+export const DEFAULT_DECIDE_MAX_TOKENS = 1024;
 /** Idle timeout for the decision call. Cache-hit input + ~50 output tokens
- *  normally lands in 1–3 s; 15 s bounds the worst case before we veto. */
-export const DECIDE_TIMEOUT_MS = 15_000;
+ *  normally lands in 1–3 s; 15 s bounds the worst case before we veto.
+ *  #5030: the wire call consumes DecideConfig.timeoutMs when provided (the
+ *  three-level cascade can raise it for providers whose full-context side
+ *  calls routinely prefill >15 s — measured 25–60 s at 200–450k cached
+ *  tokens); this constant is the default and the fallback. */
+export const DEFAULT_DECIDE_TIMEOUT_MS = 15_000;
+/** Back-compat alias for the pre-#5030 name (imported by server.ts). */
+export const DECIDE_TIMEOUT_MS = DEFAULT_DECIDE_TIMEOUT_MS;
 /** Consecutive hard failures before the next arm falls back to the advisory
  *  nudge once and resets the counter. */
 export const DECIDE_FALLBACK_THRESHOLD = 3;
@@ -38,9 +50,17 @@ const TOPIC_MAX_CHARS = 80;
 
 /** Presence = enabled. Resolved by runPrepare from the three-level compress
  *  cascade (global → provider → model); undefined means the feature is off
- *  and the prepare* paths take the byte-identical legacy branch. */
+ *  and the prepare* paths take the byte-identical legacy branch.
+ *  #5030: timeoutMs overrides the 15 s default for the side call — set it
+ *  when the provider's full-context prefill routinely exceeds the default
+ *  (the side call rides the cached prefix, but cache-hit time still scales
+ *  with absolute context size on several providers). reasoning selects the
+ *  policy for host-stamped reasoning knobs on the side call (see
+ *  stripDecisionReasoningFields). */
 export interface DecideConfig {
     maxTokens: number;
+    timeoutMs?: number;
+    reasoning?: NudgeDecisionReasoning;
 }
 
 export type DecisionOutcome =
@@ -181,6 +201,43 @@ export function recordDecision(metadata: Record<string, unknown>, ok: boolean): 
  *  the counter so the next failures start a fresh streak. */
 export function consumeFallback(metadata: Record<string, unknown>): void {
     metadata[LADDER_KEY] = 0;
+}
+
+/** #5030: policy for reasoning knobs on the decision side call.
+ *  - "strip" (default): delete host-stamped reasoning fields (#3004
+ *    behavior, byte-identical when unset).
+ *  - "follow": KEEP the host's fields — the side call obeys the thinking
+ *    effort the host already configured for the model (e.g. pi's per-model
+ *    thinking effort). Use when the host deliberately tuned effort low/off.
+ *  - "off": strip, then explicitly write the protocol-native disable
+ *    (reasoning_effort:"none" / thinking:{type:"disabled"} /
+ *    thinkingConfig.includeThoughts:false+thinkingBudget:0 /
+ *    reasoning:{effort:"none"}) so default-thinking models (glm-5.3)
+ *    cannot burn the output budget on hidden reasoning. Verified against
+ *    z.ai: "none" yields reasoning_tokens 0 and a normal short answer. */
+export type NudgeDecisionReasoning = "strip" | "follow" | "off";
+
+export function applyDecisionReasoningPolicy(
+    protocol: "anthropic" | "openai" | "google" | "responses",
+    body: Record<string, unknown>,
+    policy: NudgeDecisionReasoning,
+): void {
+    // "follow": keep the host's knobs verbatim — the side call obeys the
+    // thinking effort the host configured for the model (#5030).
+    if (policy === "follow") return;
+    stripDecisionReasoningFields(protocol, body);
+    if (policy !== "off") return;
+    if (protocol === "openai") {
+        body["reasoning_effort"] = "none";
+    } else if (protocol === "anthropic") {
+        body["thinking"] = { type: "disabled" };
+    } else if (protocol === "google") {
+        const gc = (body["generationConfig"] as Record<string, unknown> | undefined) ?? {};
+        gc["thinkingConfig"] = { includeThoughts: false, thinkingBudget: 0 };
+        body["generationConfig"] = gc;
+    } else {
+        body["reasoning"] = { effort: "none" };
+    }
 }
 
 /** #3004: reasoning-family fields a host stamps on its MAIN request and that

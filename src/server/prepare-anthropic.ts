@@ -8,7 +8,7 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { applyDecisionReasoningPolicy, buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -530,9 +530,9 @@ export async function prepareAnthropic(
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens, ...(decide.timeoutMs !== undefined ? { "bili:decideTimeoutMs": decide.timeoutMs } : {}) };
                 delete sideBody.prompt_cache_key;
-                stripDecisionReasoningFields("anthropic", sideBody);
+                applyDecisionReasoningPolicy("anthropic", sideBody, decide.reasoning ?? "strip");
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
