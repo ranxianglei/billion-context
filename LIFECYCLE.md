@@ -104,6 +104,7 @@
 | `BILI_RECEIVE_BODY_BYTES` / `BILI_DECODED_BODY_BYTES` | network.receive/decodedBodyBytes，5 GiB / 10 GiB——单请求入站/解码后内存上限（#3128：曾硬编码 100 MiB，多 GB 单请求被 reset） |
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
+| `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
 | `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
 | `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
 | `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 0.9 |

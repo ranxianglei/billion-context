@@ -4,12 +4,20 @@
  * website/articles.json) are rendered server-side with web/markdown.ts and
  * served to the panel as a JSON feed (GET /__bili/blog); their images ride
  * GET /__bili/blog-assets/<rel>. The panel renders them with its own look —
- * no full site is served. Content is frozen per package release and advances
- * with self-update; GitHub Pages stays the always-fresh canonical copy.
+ * no full site is served.
+ *
+ * Freshness (#4906): the bundled content is the floor, never the ceiling —
+ * web/blog-refresh.ts may overlay a newer GitHub-master pull via
+ * registerRemoteBlogFeed(); the merged feed de-dupes by id with the REMOTE
+ * entry winning (master is canonical and ahead of any frozen release), while
+ * bundled-only ids survive (offline machines keep their shipped content).
+ * The asset route answers remote image bytes (memory) before falling back to
+ * the on-disk package copies.
  *
  * Fail-soft like web/changelog.ts: missing folders/manifest → empty feed or
  * plain 404s, never an exception out of the handler. No config keys, no env
- * vars, no disk cache — it reads static bytes from the install itself.
+ * vars, no disk cache — static bytes come from the install itself or from
+ * the in-memory overlay registered by the refresher.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
@@ -19,7 +27,7 @@ import { markdownToHtml } from "./markdown.js";
 
 const BLOG_ASSET_PREFIX = "/__bili/blog-assets";
 
-const ASSET_TYPES: Record<string, string> = {
+export const ASSET_TYPES: Record<string, string> = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -31,6 +39,26 @@ const ASSET_TYPES: Record<string, string> = {
 let rootOverride: string | undefined;
 let probedRoot: string | undefined;
 let state: { items: BlogItem[] } | undefined;
+
+/** Defense-in-depth on EVERY blog-asset response (#4958): asset bytes can
+ *  come from GitHub master (remote overlay, #4906) and .svg is served as
+ *  image/svg+xml — DIRECTLY NAVIGATED, that is active content on the panel
+ *  origin (which also hosts the config editor and its provider API keys), so
+ *  an embedded <script> would run same-origin. `sandbox` CSP strips
+ *  script/origin powers from such a navigation; in-page <img> usage — the
+ *  only way web/markdown.ts references these — is unaffected. nosniff pins
+ *  the declared type. */
+const ASSET_SECURITY_HEADERS: Record<string, string> = {
+    "content-security-policy": "sandbox",
+    "x-content-type-options": "nosniff",
+};
+
+/** One decoded-and-typed image served from the GitHub overlay (#4906), keyed
+ *  by repo-relative POSIX path (e.g. "website/blog/posts/figures/x.png"). */
+type RemoteAsset = { buf: Buffer; type: string };
+/** Last registered GitHub-master round; absent until the refresher succeeds.
+ *  A failed round only updates `error` — previous good bytes survive. */
+let remote: { items: BlogItem[]; assets: Map<string, RemoteAsset>; error?: string } | undefined;
 
 type BlogItem = {
     id: string;
@@ -72,6 +100,7 @@ export function _setBlogRootForTest(root: string | null): void {
     rootOverride = root ?? undefined;
     probedRoot = undefined;
     state = undefined;
+    remote = undefined;
 }
 
 /** Mirror of the website tools' frontmatter parser (key: value between --- fences). */
@@ -80,14 +109,17 @@ function parseFrontmatter(text: string): { fm: Record<string, string>; body: str
     text = text.replace(/\r\n/g, "\n");
     const fm: Record<string, string> = {};
     let body = text;
-    if (text.startsWith("---\n")) {
-        const end = text.indexOf("\n---\n", 4);
+    // Git-for-Windows autocrlf checks .md posts out with CRLF; normalize so
+    // the exact-match fences below survive Windows checkouts (#4599).
+    const src = text.startsWith("---\r\n") ? text.replace(/\r\n/g, "\n") : text;
+    if (src.startsWith("---\n")) {
+        const end = src.indexOf("\n---\n", 4);
         if (end !== -1) {
-            for (const line of text.slice(4, end).split("\n")) {
+            for (const line of src.slice(4, end).split("\n")) {
                 const j = line.indexOf(":");
                 if (j > 0) fm[line.slice(0, j).trim()] = line.slice(j + 1).trim().replace(/^["']|["']$/g, "");
             }
-            body = text.slice(end + 5);
+            body = src.slice(end + 5);
         }
     }
     return { fm, body };
@@ -123,6 +155,71 @@ function statSyncSafe(p: string): boolean {
     }
 }
 
+/** Image targets that carry a scheme (http(s), mailto, data, …) or are
+ *  protocol-relative — passed through verbatim by BOTH rewrite paths. */
+const SCHEME_OR_PROTO_REL_RE = /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i;
+
+/** Pure (no-fs) resolution of a markdown image target against a repo-relative
+ *  base dir — the remote-content twin of the root+statSync dance in
+ *  rewriteImages above (#4906). Returns the normalized repo-relative POSIX
+ *  path, or undefined when the target cannot exist in the tree: bad
+ *  percent-encoding, NUL, absolute path, or `..` climbing ABOVE the repo root
+ *  (plain stack semantics: each `..` pops the accumulator, but popping an
+ *  empty stack escapes the tree — mirroring how the disk path refuses
+ *  resolve() results outside the package root).
+ *  Scheme/protocol-relative targets are the CALLER's business (passthrough).
+ */
+export function resolveRepoRel(base: string, targetRaw: string): string | undefined {
+    let target: string;
+    try {
+        target = decodeURIComponent(targetRaw);
+    } catch {
+        return undefined;
+    }
+    if (target === "" || target.includes("\0") || target.startsWith("/")) return undefined;
+    const keep = (s: string): boolean => s !== "" && s !== ".";
+    const out: string[] = base.split("/").filter(keep);
+    for (const seg of target.split("/")) {
+        if (!keep(seg)) continue;
+        if (seg === "..") {
+            if (out.length === 0) return undefined; // would climb above the tree root
+            out.pop();
+            continue;
+        }
+        out.push(seg);
+    }
+    return out.length > 0 ? out.join("/") : undefined;
+}
+
+/** Every repo-relative image target inside one markdown source (scheme
+ *  targets excluded), resolved through resolveRepoRel — the prefetch list the
+ *  GitHub refresher downloads BEFORE rendering, so the render's drop-decision
+ *  and the download's candidate set can never disagree (#4906). */
+export function collectImageTargets(md: string, base: string): string[] {
+    const found = new Set<string>();
+    for (const m of md.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)/g)) {
+        const target = m[1];
+        if (SCHEME_OR_PROTO_REL_RE.test(target)) continue;
+        const rel = resolveRepoRel(base, target);
+        if (rel !== undefined) found.add(rel);
+    }
+    return [...found];
+}
+
+/** Remote-content twin of rewriteImages: candidates are pure strings checked
+ *  against a downloaded-key set instead of disk stats — same prefix rewrite,
+ *  same drop-on-miss, same scheme passthrough (#4906). */
+function rewriteImagesFromAssets(md: string, assetKeys: ReadonlySet<string>, base = "website/blog/posts"): string {
+    return md.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, _alt: string, target: string) => {
+        if (SCHEME_OR_PROTO_REL_RE.test(target)) return `![${_alt}](${target})`;
+        const rel = resolveRepoRel(base, target);
+        if (rel === undefined) return "";
+        const ext = rel.slice(rel.lastIndexOf(".")).toLowerCase();
+        if (ASSET_TYPES[ext] === undefined || !assetKeys.has(rel)) return "";
+        return `![${_alt}](${BLOG_ASSET_PREFIX}/${rel})`;
+    });
+}
+
 /** Strip a leading H1 line; returns [titleTextOrEmpty, rest]. */
 function splitH1(body: string): [string, string] {
     const m = body.match(/^#[ \t]+([^ \t\n][^\n]*)\r?\n?/);
@@ -151,24 +248,36 @@ function collectPosts(root: string): BlogItem[] {
         if (!pairs.has(base)) pairs.set(base, {});
         pairs.get(base)![f.endsWith(".zh.md") ? "zh" : "en"] = f;
     }
+    const items = postsFromPairs(pairs, (name) => {
+        if (name === undefined) return undefined;
+        let raw: string;
+        try {
+            raw = readFileSync(join(postsDir, name), "utf8");
+        } catch {
+            return undefined;
+        }
+        const { fm, body } = parseFrontmatter(raw);
+        const [h1, rest] = splitH1(body);
+        return { html: markdownToHtml(rewriteImages(rest, postsDir, root)), h1, fm };
+    });
+    return items;
+}
+
+/** One rendered side of a post pair; renderOne returns undefined when the
+ *  source file/text is absent. */
+type RenderedSide = { html: string; h1: string; fm: Record<string, string> };
+
+/** Shared item assembly for bundled AND remote post pairs (#4906) — slug, date
+ *  ladder, bilingual title fallbacks live in exactly ONE place. */
+function postsFromPairs(
+    pairs: Map<string, { en?: string; zh?: string }>,
+    renderOne: (fileName: string | undefined) => RenderedSide | undefined,
+): BlogItem[] {
     const items: BlogItem[] = [];
     for (const [base, pair] of pairs) {
         const slug = base.replace(/^\d{4}-\d{2}-\d{2}_/, "") || base;
-        const renderOne = (kind: "en" | "zh"): { html: string; h1: string; fm: Record<string, string> } | undefined => {
-            const name = pair[kind];
-            if (!name) return undefined;
-            let raw: string;
-            try {
-                raw = readFileSync(join(postsDir, name), "utf8");
-            } catch {
-                return undefined;
-            }
-            const { fm, body } = parseFrontmatter(raw);
-            const [h1, rest] = splitH1(body);
-            return { html: markdownToHtml(rewriteImages(rest, postsDir, root)), h1, fm };
-        };
-        const en = renderOne("en");
-        const zh = renderOne("zh");
+        const en = renderOne(pair.en);
+        const zh = renderOne(pair.zh);
         if (!en && !zh) continue;
         items.push({
             id: slug,
@@ -250,7 +359,31 @@ function collectArticles(root: string): BlogItem[] {
 function collect(): BlogItem[] {
     const root = pkgRoot();
     if (!root) return [];
-    const items = [...collectPosts(root), ...collectArticles(root)];
+    return sortItems([...collectPosts(root), ...collectArticles(root)]);
+}
+
+/** Cached feed (bundled content only changes across package updates → one
+ *  compute per process). Never throws: any surprise degrades to an empty
+ *  list. When the GitHub refresher has registered a round (#4906) the bundled
+ *  floor is overlaid by the remote set — id-dedup, REMOTE wins; `error`
+ *  carries the last failed round's "offline" marker (changelog-style).
+ */
+export function getBlogFeed(): { items: BlogItem[]; error?: string } {
+    if (state === undefined) {
+        try {
+            state = { items: collect() };
+        } catch {
+            state = { items: [] };
+        }
+    }
+    if (remote === undefined) return { items: state.items };
+    const byId = new Map<string, BlogItem>();
+    for (const item of state.items) byId.set(item.id, item);
+    for (const item of remote.items) byId.set(item.id, item); // remote wins by id
+    return { items: sortItems([...byId.values()]), ...(remote.error !== undefined ? { error: remote.error } : {}) };
+}
+
+function sortItems(items: BlogItem[]): BlogItem[] {
     // Dated entries newest-first; undated ones keep a stable id-ordered tail.
     items.sort((a, b) => {
         if (a.date && b.date) return a.date === b.date ? a.id.localeCompare(b.id) : a.date < b.date ? 1 : -1;
@@ -260,17 +393,111 @@ function collect(): BlogItem[] {
     return items;
 }
 
-/** Cached feed (content only changes across package updates → one compute per
- *  process). Never throws: any surprise degrades to an empty list. */
-export function getBlogFeed(): { items: BlogItem[]; error?: string } {
-    if (state === undefined) {
+/** One decoded-and-typed image served from the GitHub overlay (#4906), keyed
+ *  by repo-relative POSIX path (e.g. "website/blog/posts/figures/x.png"). */
+export function getRemoteBlogAsset(rel: string): RemoteAsset | undefined {
+    return remote?.assets.get(rel);
+}
+
+/** Register ONE successful/failed GitHub-master pull round (#4906). Success:
+ *  replaces the overlay wholesale (a fresh tree is self-consistent). Failure:
+ *  sets the "offline" marker while KEEPING the last good overlay bytes/items,
+ *  so a flaky network never blanks the panel. Never throws. */
+export function registerRemoteBlogFeed(round: {
+    items: BlogItem[];
+    assets: Map<string, RemoteAsset>;
+    error?: string;
+}): void {
+    if (round.error !== undefined) {
+        remote = remote === undefined
+            ? { items: [], assets: new Map(), error: round.error }
+            : { items: remote.items, assets: remote.assets, error: round.error };
+        return;
+    }
+    remote = { items: round.items, assets: round.assets };
+}
+
+const REMOTE_POST_DIR = "website/blog/posts";
+
+/** Build feed items from ALREADY-DOWNLOADED repository files (#4906):
+ *  `files` maps repo-relative POSIX paths to raw text, `assetKeys` is the set
+ *  of images whose download succeeded. Post pairing + slug/date/bilingual
+ *  title logic is shared with the bundled path (postsFromPairs); the article
+ *  section mirrors collectArticles verbatim except image candidates are
+ *  checked against assetKeys instead of a disk stat. Per-entry failures
+ *  degrade exactly like the bundled path. */
+export function buildRemoteBlogPosts(files: Map<string, string>, assetKeys: ReadonlySet<string>): BlogItem[] {
+    const renderText = (relPath: string, text: string): RenderedSide | undefined => {
         try {
-            state = { items: collect() };
+            const { fm, body } = parseFrontmatter(text);
+            const [h1, rest] = splitH1(body);
+            const baseDir = relPath.includes("/") ? relPath.slice(0, relPath.lastIndexOf("/")) : "";
+            return { html: markdownToHtml(rewriteImagesFromAssets(rest, assetKeys, baseDir)), h1, fm };
         } catch {
-            state = { items: [] };
+            return undefined;
+        }
+    };
+    const items: BlogItem[] = [];
+    // Posts — mirror collectPosts' flat-directory .md/.zh.md pairing.
+    const pairs = new Map<string, { en?: string; zh?: string }>();
+    for (const key of [...files.keys()].sort()) {
+        if (!key.startsWith(REMOTE_POST_DIR + "/") || !key.endsWith(".md")) continue;
+        const name = key.slice(REMOTE_POST_DIR.length + 1);
+        if (name.includes("/")) continue;
+        const base = name.endsWith(".zh.md") ? name.slice(0, -".zh.md".length) : name.slice(0, -".md".length);
+        if (!pairs.has(base)) pairs.set(base, {});
+        pairs.get(base)![name.endsWith(".zh.md") ? "zh" : "en"] = key;
+    }
+    items.push(...postsFromPairs(pairs, (key) => {
+        if (key === undefined) return undefined;
+        const text = files.get(key);
+        return text === undefined ? undefined : renderText(key, text);
+    }));
+    // Articles — mirrors collectArticles; manifest is optional.
+    const manifestRaw = files.get("website/articles.json");
+    if (manifestRaw !== undefined) {
+        let list: unknown[] = [];
+        try {
+            const parsed = JSON.parse(manifestRaw) as { articles?: unknown };
+            if (Array.isArray(parsed.articles)) list = parsed.articles;
+        } catch {
+            list = [];
+        }
+        for (const entryRaw of list) {
+            const entry = entryRaw as { file?: unknown; zh_file?: unknown; slug?: unknown; title?: unknown; title_zh?: unknown };
+            const file = typeof entry.file === "string" ? entry.file : "";
+            const raw = files.get(file);
+            if (!file || raw === undefined) continue;
+            const en = renderText(file, raw);
+            const slugIn = typeof entry.slug === "string" && entry.slug ? entry.slug : file.replace(/\.md$/, "").split("/").pop()!;
+            let zhHtml = "";
+            let zhTitle = "";
+            if (typeof entry.zh_file === "string" && entry.zh_file) {
+                const zhRaw = files.get(entry.zh_file);
+                if (zhRaw !== undefined) {
+                    const zh = renderText(entry.zh_file, zhRaw);
+                    if (zh !== undefined) {
+                        zhHtml = zh.html;
+                        zhTitle = (typeof entry.title_zh === "string" && entry.title_zh ? entry.title_zh : "") || zh.fm.title_zh || zh.fm.title || zh.h1 || "";
+                    }
+                }
+            }
+            if (!en) continue;
+            const date = en.fm.date || "";
+            items.push({
+                id: slugIn,
+                kind: "article",
+                date: validDate(date) ? date : "",
+                title: (typeof entry.title === "string" && entry.title ? entry.title : "") || en.fm.title || en.h1 || slugIn,
+                titleZh: zhTitle,
+                excerpt: en.fm.excerpt || "",
+                excerptZh: en.fm.excerpt_zh || "",
+                html: en.html,
+                htmlZh: zhHtml,
+            });
         }
     }
-    return state;
+    return sortItems(items);
 }
 
 /** GET /__bili/blog — always 200 JSON; the panel degrades on an empty list. */
@@ -300,11 +527,12 @@ function safeSegments(urlPath: string): string[] | undefined {
     return out;
 }
 
-/** GET /__bili/blog-assets/<rel> — bundled image bytes only (extension gate +
- *  traversal gate); anything else is a plain-text 404. */
+/** GET /__bili/blog-assets/<rel> — remote overlay bytes first (#4906), then
+ *  bundled disk bytes (extension gate + traversal gate); anything else is a
+ *  plain-text 404. EVERY response carries sandbox CSP + nosniff (#4958). */
 export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
     const notFound = () => {
-        res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache" });
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
         res.end(`404 Not Found: ${urlPath}\n`);
     };
     const clean = urlPath.split(/[?#]/)[0];
@@ -318,6 +546,14 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
         notFound();
         return;
     }
+    // GitHub overlay first (#4906): the master copy of an image beats the
+    // frozen bundle bytes; a miss falls through to the package below.
+    const overlaid = getRemoteBlogAsset(segments.join("/"));
+    if (overlaid !== undefined) {
+        res.writeHead(200, { "content-type": overlaid.type, "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
+        res.end(overlaid.buf);
+        return;
+    }
     const file = resolve(root, ...segments);
     if (!file.startsWith(root + sep)) {
         notFound();
@@ -329,6 +565,6 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
         notFound();
         return;
     }
-    res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+    res.writeHead(200, { "content-type": type, "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
     res.end(readFileSync(file));
 }

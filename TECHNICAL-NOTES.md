@@ -384,6 +384,43 @@ remove <client>` best-effort queries the live proxy (instance file →
 `GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
 when sessions of that client were active within the last **10 minutes**.
 
+## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
+
+When a native lane's proxy is unavailable, model traffic falls back to direct
+sends (`directSendOrRefuse`, `src/agent/native-intercept.ts`). That path is a
+degraded mode with three contracts, all shared by every lane (the gateless
+lanes pi/omp/opencode-V1 had none of them before #4516 — a 1.06M-token raw
+history rode straight to the provider):
+
+- **Size arm** — before ANY degraded send, the body is priced with the same
+  doom math as dsh's gate (`bodyProvablyOverWindow`): stage 1 is the raw
+  byte floor vs the window, stage 2 strips structural media bytes (#4111
+  direction: media-heavy bodies whose core TEXT fits are NOT refused). The
+  bar never assumes a window below `MIN_ASSUMED_WINDOW_TOKENS` (1M, #4079 —
+  declared windows can be wrong-small); bodies in that band are left to
+  preflight. Missing data (no `x-bili-plugin-context-window` header,
+  unreadable body) fails OPEN to the direct send — a local guard must never
+  false-block on its own ignorance. Verdict: 422
+  `x-bili-gate: oversize-refusal-fallback`, retryable, wire-shaped per
+  upstream dialect, message names floor/core/window and the unavailability
+  reason (`bootstrap-failed` vs `dead` — the latter only after the lane held
+  an origin and lost it).
+- **Self-heal** — a failed bootstrap no longer means
+  direct-for-process-lifetime. Each request that finds no live origin fires
+  the owner's `respawn` (singleFlight — concurrent requests share ONE
+  attempt) under a 15 s cooldown, then holds out for the in-flight attempt
+  under `state.spawnWaitMs ?? readyTimeoutMs ?? 15_000`: the pi spawn lane
+  sets `SPAWN_BUDGET_MS + 10 s` so a slow cold start (#4515) is waited out
+  instead of refused at the generic cap. Recovery needs no host restart.
+- **Announce** — every TRANSITION into/out of the degraded state logs one
+  line to bili.log (proxy recovered / goes direct / refused), not one line
+  per request; `state.lastUnavailableReason` carries WHY into the refusal
+  wording so the user can tell "still starting" from "died".
+
+The opencode V2 resolver lanes (`createLiveOriginResolver`) keep their own
+probe-driven retry; this contract covers the plain intercept path they do
+not. Attribution reporting into the panel remains dsh-only (see #4516).
+
 ## Unified ACP tag-echo remediation — the four invariants (#2023/#2066/#2190/#2248)
 
 One PR folds the three remediation legs together (refs-run residue #2023,

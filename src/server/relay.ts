@@ -1,4 +1,5 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
+import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
@@ -58,6 +59,7 @@ import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUp
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -267,6 +269,7 @@ async function forwardCaptured(
     v1Meta?: Record<string, unknown>,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
+    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
@@ -553,11 +556,14 @@ async function forwardCaptured(
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
-    // #3701: WS-lane soft byte budget — shed older images from the OUTBOUND COPY before
-    // signing, so an oversized frame never reaches the gateway (it answers close 1009 with
-    // zero events, and no retry can fix a size rejection without a smaller payload). Runs
-    // only when this request actually rides the WebSocket transport and only above
-    // network.wsOutboundBytes; HTTP lanes are untouched.
+    // #3701/#3909: lane-keyed soft byte budget — shed older images from the OUTBOUND COPY
+    // before signing, so an oversized body never reaches the upstream (the WS gateway
+    // answers close 1009 with zero events, edge runtimes 503 on raw-byte limits, and no
+    // retry can fix a size rejection without a smaller payload). Runs only above the
+    // budget of the lane actually riding the request: network.wsOutboundBytes for a
+    // WS-tagged transport, network.httpOutboundBytes for the plain/proxy/pi-native relay
+    // (no transport installed); managed non-WS transports pass through untouched
+    // (#3701 Finding 1).
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
         wireBody = shed.body;
@@ -1773,6 +1779,7 @@ async function forwardCaptured(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -1800,10 +1807,11 @@ async function forwardCaptured(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText, reply);
             }
         } finally {
             clearUpstreamTimer();
@@ -1932,6 +1940,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -1976,6 +1985,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2000,6 +2010,7 @@ async function forwardCaptured(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             }
         } else if (
@@ -2011,7 +2022,7 @@ async function forwardCaptured(
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol);
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
         } else {
             await pipeThrough(responseBody, res);
         }
@@ -2146,7 +2157,7 @@ async function forwardCaptured(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
@@ -2232,7 +2243,7 @@ async function forwardCaptured(
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2243,14 +2254,18 @@ async function forwardCaptured(
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
                     // Use the send-time capture; settlement is not another send.
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
                 } else {
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
-                if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                if (typeof out === "number") {
+                    prepared.session.stats.outputTokens += out;
+                    // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+                    billOutputUsage(prepared.session, out);
+                }
                 if (prepared.protocol === "openai") {
                     await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponseAsync(json, ctx, clientAbort.signal));
                 } else if (prepared.protocol === "responses") {
@@ -2260,6 +2275,8 @@ async function forwardCaptured(
                 } else {
                     await withSessionLock(prepared.session, () => rewriteJsonResponseAsync(json, ctx, clientAbort.signal));
                 }
+                captureHandoffJson(reply, prepared.protocol, json);
+                reply?.save();
                 res.end(JSON.stringify(json));
             } catch {
                 res.end(text);

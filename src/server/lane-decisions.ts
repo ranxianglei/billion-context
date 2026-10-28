@@ -114,10 +114,12 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
         matches: (s) => !s.headerNames.has("x-bili-plugin") && (s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent),
     },
     {
-        // claude over Responses (#970): subagents SHARE the main agent's
-        // session id (the anthropic path splits them via claudeSubagentSplit;
-        // a claude client on the Responses wire only has this fingerprint).
-        profile: { ...ANONYMOUS, identity: "claude-responses", instructionsFingerprintKeyed: true },
+        // claude code (#970/#4352): subagents SHARE the main agent's session
+        // id on every wire. The responses wire separates them via the
+        // instructions fingerprint (instructionsFingerprintKeyed); the
+        // anthropic wire via the order resolver (personaOrderKeyed) when the
+        // two-signal header gate (claudeSubagentAgentId) misses.
+        profile: { ...ANONYMOUS, identity: "claude-responses", instructionsFingerprintKeyed: true, personaOrderKeyed: true },
         matches: (s) => s.conversationSourceName === "x-claude-code-session-id",
     },
 ];

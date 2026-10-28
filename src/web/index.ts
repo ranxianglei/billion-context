@@ -4,6 +4,7 @@ import { VERSION, BUILD_COMMIT } from "../version.js";
 export {
     handleConfigGet,
     handleConfigPut,
+    handlePricingGet,
     handleSummaryCredentialPut,
     readProviders,
     readUpstreamSettings,

@@ -346,7 +346,13 @@ jobs:
       # resolves it to the built dist. Same prerequisite as the main test
       # matrix (run-ci-tests pretest parity) and ci-e2e-dsh.yml.
       - run: npm --prefix kernel run build
-      - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
+      # --test-concurrency=1: every mysql lane in these files shares ONE DSN
+      # and database; node's default file parallelism (cores-1) would let two
+      # suites race on the same tables once runners grow past 2 vCPUs.
+      # storage-backend-mysql-e2e.test.ts is deliberately NOT listed: its hot-
+      # path test fails deterministically on real MySQL (pre-existing defect,
+      # not caused by any PR in flight) — tracked in #4926; re-add it there.
+      - run: node --import tsx --test --test-concurrency=1 tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts tests/issue4666-migration-dedup.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
 
@@ -430,9 +436,16 @@ jobs:
             exit 0
           fi
           # Rule 1: any PR touching kernel/** must declare 'kernel-change:' in its body.
-          if git diff --name-only origin/master...HEAD -- kernel/ | grep -q .; then
+          # #4828: kernel/package-lock.json is GENERATED state, not kernel source —
+          # agents' test-prep installs churn it without any intent to change the
+          # kernel (8 PRs tripped this gate on lockfile-only diffs). The human gate
+          # protects kernel SOURCE; lockfile consistency is already enforced by the
+          # separate lock-sync job (which FAILS on real drift). Exempt the lockfile
+          # here so pure churn passes without an owner round-trip.
+          KERNEL_TOUCHED="$(git diff --name-only origin/master...HEAD -- kernel/ | grep -v '^kernel/package-lock\.json$' || true)"
+          if [[ -n "$KERNEL_TOUCHED" ]]; then
             if ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
-              echo "::error::This PR modifies kernel/ but does not declare 'kernel-change: <reason>' in its body."
+              echo "::error::This PR modifies kernel/ ($KERNEL_TOUCHED) but does not declare 'kernel-change: <reason>' in its body."
               echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
               exit 1
             fi

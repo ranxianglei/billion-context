@@ -24,6 +24,7 @@ import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type Sq
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
+import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
 
@@ -35,6 +36,10 @@ import type { MessageContentStore } from "acp-kernel";
  *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
+
+/** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
+ *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
+const SEQ_SPAN_QUERY_BATCH = 500;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -108,6 +113,10 @@ export interface MessageRow {
      *  the surviving generation. Optional for direct callers. */
     identity?: string;
 }
+
+/** #4738: one stored message addressed by its mNNNNN ref number — the web
+ *  hydration row, served when the resident window no longer carries the bytes. */
+export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
 
 export interface BlockRow {
     blockId: string;
@@ -335,13 +344,20 @@ export class UnifiedStore {
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
+    private readonly dbPath: string;
+    /** #4609: the last completed check (sync, cache hit, or background
+     * verdict) said the file set is sound — a clean close then refreshes the
+     * verdict cache onto the post-checkpoint stats so the next boot skips
+     * the rescan. Never true while a check is still in flight or failed. */
+    private lastIntegrityOk = false;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
         this.lockPath = lockPath;
         this.foreignLockHolder = foreignLockHolder;
+        this.dbPath = dbPath;
     }
 
     static open(
@@ -351,11 +367,29 @@ export class UnifiedStore {
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
-        // #4175: integrity self-check BEFORE migrations — a corrupt file must
-        // never be migrated against. quick_check is the fast form (it skips
-        // index-vs-table cross-validation) and is skippable for
-        // boot-time-sensitive huge deployments via BILI_STORAGE_QUICK_CHECK=0.
-        if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
+        // #4175/#4609: integrity self-check, verdict-cached and size-gated.
+        // An unchanged file set (index.db + -wal stats + schema version) skips
+        // the rescan; a small store checks synchronously BEFORE migrations (a
+        // corrupt file must never be migrated against — #4175's premise,
+        // preserved wherever it is cheap); a large store checks in the
+        // background post-open (#4609: a 14 GB quick_check costs ~260 s and
+        // the 60 s native spawn budget killed the child mid-scan). A cached
+        // failure throws here so the shadow's quarantine-and-reopen-fresh
+        // path (#4175) runs — including for failures found by the background
+        // check of a previous run. BILI_STORAGE_QUICK_CHECK=0 opts out of all
+        // of it (no check, no cache IO).
+        let integrityOk = false;
+        const mode = integrityModeFor(path);
+        if (mode.kind === "cached-fail") {
+            recordIntegrityOutcome(path, false, 0, mode.detail);
+            db.close();
+            throw new StorageIntegrityError(path, mode.detail);
+        }
+        if (mode.kind === "cached-ok") {
+            recordIntegrityOutcome(path, true, 0, "verdict cache hit (file set unchanged since the last check)");
+            integrityOk = true;
+        } else if (mode.kind === "sync") {
+            noteIntegrityCheckRun();
             const started = Date.now();
             let verdict: string;
             try {
@@ -377,6 +411,8 @@ export class UnifiedStore {
                 db.close();
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
+            writeIntegrityCache(path, true);
+            integrityOk = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
         // is reported loudly (web wire + banner) but never blocks — blocking
@@ -438,7 +474,21 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
+        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+        if (integrityOk) store.noteIntegrityOk();
+        // #4609: a large store's cache-miss check runs post-open on a second
+        // read-only connection — open() returns immediately; the verdict
+        // lands in runtime-status and the cache (a cached failure makes the
+        // NEXT open quarantine + reopen fresh via the #4175 path).
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
+        return store;
+    }
+
+    /** #4609: mark this instance's file set as verified (sync check ok,
+     * cache hit, or background verdict ok) so a clean close refreshes the
+     * verdict cache onto the post-checkpoint stats. */
+    noteIntegrityOk(): void {
+        this.lastIntegrityOk = true;
     }
 
     close(): void {
@@ -452,6 +502,13 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
+        // #4609: a clean close of a verified store refreshes the verdict
+        // cache onto the post-checkpoint stats — the normal restart path then
+        // skips the rescan. Deferred while a background check is still in
+        // flight (its own completion writes the cache). Best-effort.
+        if (this.lastIntegrityOk && !backgroundIntegrityInflightForTests(this.dbPath)) {
+            writeIntegrityCache(this.dbPath, true);
+        }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a
         // foreign holder was reported at open we never owned the lock — leave it.
@@ -744,8 +801,8 @@ export class UnifiedStore {
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
                        @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
-                       parent_session_id = excluded.parent_session_id,
-                       fork_point_seq = excluded.fork_point_seq,
+                       parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+                       fork_point_seq = COALESCE(excluded.fork_point_seq, sessions.fork_point_seq),
                        protocol = excluded.protocol,
                        label = excluded.label,
                        title = excluded.title,
@@ -863,18 +920,42 @@ export class UnifiedStore {
             // bounds from the append-only transcript. Final absolute seqs exist
             // only here (delta placeholders are renumbered in-transaction), so
             // the pure planner cannot know them. Coverage whose ids have no
-            // transcript row (imported pre-fold) keeps the 0 placeholder.
+            // transcript row (imported pre-fold) stores the -1 "no claim"
+            // sentinel — a [0,0] would read back as a REAL claim over seq 0
+            // and suppress the seq-0 message (PR #4725 N1); -1 keeps the
+            // #4608 CASE guard honest (unknown < 0 → preserve stored bounds).
             const seqSpanById = new Map<string, [number, number]>();
             if (input.blocks.length > 0) {
-                const rows = this.db
-                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
-                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
-                for (const r of rows) {
-                    const cur = seqSpanById.get(r.msg_id);
-                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
-                    else {
-                        if (r.seq < cur[0]) cur[0] = r.seq;
-                        if (r.seq > cur[1]) cur[1] = r.seq;
+                // point query over the covered ids only (PR #4725 N3): a
+                // full-session scan per save taxed every session with blocks.
+                const wanted = new Set<string>();
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
+                    } catch { /* malformed payload: no covered ids to resolve */ }
+                }
+                // LIVE rows only (#4801 review): block bounds describe what is
+                // CURRENTLY covered in the unified replay — getMessages filters
+                // retired rows, so a bound spanning a retired generation would
+                // claim coverage over rows the replay never serves (a pinned-id
+                // edit/rewind leaves the old generation tombstoned while its id
+                // is re-covered at a new seq). An id whose rows are all retired
+                // yields no span → boundsForCovered demotes it honestly; if that
+                // empties the whole claim the -1 sentinel preserves stored bounds (#4608).
+                const wantedIds = Array.from(wanted);
+                for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    const rows = this.db
+                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")}) AND retired_at IS NULL`)
+                        .all(s.sessionId, ...ids) as Array<{ msg_id: string; seq: number }>;
+                    for (const r of rows) {
+                        const cur = seqSpanById.get(r.msg_id);
+                        if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                        else {
+                            if (r.seq < cur[0]) cur[0] = r.seq;
+                            if (r.seq > cur[1]) cur[1] = r.seq;
+                        }
                     }
                 }
             }
@@ -889,8 +970,8 @@ export class UnifiedStore {
                         if (sp[0] < lo) lo = sp[0];
                         if (sp[1] > hi) hi = sp[1];
                     }
-                } catch { /* malformed payload: keep the 0 placeholder */ }
-                return hi < 0 ? [0, 0] : [lo, hi];
+                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                return hi < 0 ? [-1, -1] : [lo, hi];
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -916,27 +997,34 @@ export class UnifiedStore {
                     // identical-re-ingest undo (same hash) is a pure -1
                     // against the +1 bump and cannot reach zero while the row
                     // itself holds the reference.
+                    // Re-saves bind the TRANSCRIPT-resolved bounds (same source
+                    // as the fresh-insert branch below), never the plan-local
+                    // b.startSeq/endSeq: those are positions in THIS plan's log,
+                    // and once a covered id's old generation is tombstoned (an
+                    // in-place edit lands the new one past max(seq)) they no
+                    // longer coincide with absolute seqs — writing them would
+                    // clobber the durable interval with plan-relative numbers.
                     this.db
                         .prepare(
                             `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
                                summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                             ON CONFLICT(session_id, block_id) DO UPDATE SET
-                               ord = excluded.ord,
-                               start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
-                               end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
-                               start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
-                               summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
-                               supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
-                               created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                               payload_json = excluded.payload_json`,
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              ON CONFLICT(session_id, block_id) DO UPDATE SET
+                                ord = excluded.ord,
+                                start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                                end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
+                                start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
+                                summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
+                                supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
+                                created_at = excluded.created_at, covered_hash = excluded.covered_hash,
+                                payload_json = excluded.payload_json`,
                         )
                         .run(
                             b.blockId,
                             s.sessionId,
                             b.ord,
-                            b.startSeq,
-                            b.endSeq,
+                            bStartSeq,
+                            bEndSeq,
                             b.startRef,
                             b.endRef,
                             b.tier,
@@ -1097,7 +1185,7 @@ export class UnifiedStore {
         // when the plan carries no tail (envelope-only imports): the next
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
-        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
+        const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1118,12 +1206,54 @@ export class UnifiedStore {
                 // corrupted row heals on the next full ingest.
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
-                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
         for (const r of repairs) {
+            // #4793: a sibling row may already hold the target bytes for this
+            // msg_id — e.g. an old generation stamped with an EMPTY identity
+            // by a pre-#4390 build while the plan re-derives the real one,
+            // or two generations of the same edited message. identity is a
+            // pure function of stable content, so any live row holding r.to
+            // for this msg_id is a second generation of the SAME logical
+            // message. UNIQUE(session_id, msg_id, content_hash) spans the
+            // whole table including retired rows, so the UPDATE below would
+            // throw and roll back the entire ingest unless those blockers are
+            // cleared first; three such throws then trip the shadow's
+            // process-wide 3-strike disable (one stuck session degraded every
+            // other session's index, banner "SQLite storage degraded"). Same
+            // content_hash ⇒ same CAS blob ⇒ retiring the sibling loses no
+            // information, and our row keeps its stable seq (#4390 D4-1).
+            this.db
+                .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL")
+                .run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
+            // A retired duplicate still occupies the triple (the constraint
+            // is not partial): it is byte-identical, so dropping the row and
+            // its media mappings loses nothing. Rare path; common case stays
+            // single-statement above.
+            const leftovers = this.db
+                .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL")
+                .all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
+            if (leftovers.length > 0) {
+                const selMedia = this.db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
+                const delMedia = this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+                const delRow = this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
+                for (const l of leftovers) {
+                    const leftoverMedia = selMedia.all(s.sessionId, l.seq) as { media_hash: string }[];
+                    delMedia.run(s.sessionId, l.seq);
+                    delRow.run(s.sessionId, l.seq);
+                    // Every deleted row owned one refcount on r.to (bumped at
+                    // its insert) and each of its mapping rows owned one on
+                    // its media hash. Deleting without releasing is a
+                    // permanent over-count — #4800's delete-on-zero GC can
+                    // then never reclaim the blob. Same per-row discipline as
+                    // deleteSession() and the retire path above.
+                    this.releaseContent(r.to);
+                    for (const lm of leftoverMedia) this.releaseContent(lm.media_hash);
+                }
+            }
             this.putContent(r.content, r.to);
             this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
             this.releaseContent(r.from);
@@ -1299,6 +1429,30 @@ export class UnifiedStore {
      *  of the session: PINNED ones survive (their state blob keeps its
      *  refcount — replica GC protection, #2671 Phase 2); unpinned ones are
      *  swept here together with the session. */
+    /** #4738: message bodies addressed by their ref number (the mNNNNN
+     *  identity in the web UI). Storage outlives the resident `lastMessages`
+     *  window — host-side native compaction prunes that window client-side,
+     *  so "gone from the window" must not read as "gone". Unknown refs simply
+     *  come back absent; retired rows (rewound/undo history) stay excluded,
+     *  matching every other view-lane reader. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (refNums.length === 0) return [];
+        const nums = [...new Set(refNums)];
+        const CHUNK = 500;
+        const out: MessageRefContentRow[] = [];
+        for (let i = 0; i < nums.length; i += CHUNK) {
+            const chunk = nums.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND ref_num IN (${ph})`)
+                .all(sessionId, ...chunk) as { ref_num: number; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ refNum: r.ref_num, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
      *  state.blocks loses the entry, blockContents keeps the text). The full
      *  ingest skips orphan-shaped records (envelope-served, owner-pinned
@@ -1935,7 +2089,10 @@ export class UnifiedStore {
             return fail("sessions.kstate_json", "must not carry nextBlockId/nextRunId (columns own them)");
         }
 
-        const messages = this.getMessages(sessionId);
+        // #4666: retired rows carry the same projections (tombstone-only) —
+        // verifying them too closes the diagnostic gap where corruption on a
+        // retired row was invisible.
+        const messages = this.getMessages(sessionId, { includeRetired: true });
         const refByRaw = new Map(this.getRefs(sessionId).map((r) => [r.rawId, r.ref]));
         for (const m of messages) {
             checks++;
@@ -2176,13 +2333,24 @@ export class UnifiedStore {
      *  edit left both bytes in the log) has no single "the" seq — picking one
      *  would silently re-bind the citation to the wrong generation. Those
      *  stay on their legacy refs (kept honestly instead of re-bound wrongly). */
-    /** #4316 PR3/3: live (non-retired) row count — fork endpoint's
-     *  throughSeq source (count - 1, inclusive). */
+    /** #4316 PR3/3: live (non-retired) row count. */
     liveRowCount(sessionId: string): number {
         const row = this.db
             .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
             .get(sessionId) as Record<string, unknown>;
         return (row.n as number) ?? 0;
+    }
+
+    /** #4730: highest live (non-retired) seq — the fork endpoint's inclusive
+     *  throughSeq. NOT the live row count: tombstones keep their seq, so once
+     *  any row is retired count < lastLiveSeq + 1 and count - 1 would silently
+     *  drop the newest live rows from the cloned child. Null when the session
+     *  has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        const row = this.db
+            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .get(sessionId) as Record<string, unknown>;
+        return (row.m as number | null) ?? null;
     }
 
     seqByRaw(sessionId: string): Map<string, number> {
@@ -2204,8 +2372,11 @@ export class UnifiedStore {
      *  session row records the lineage; content/media CAS refcounts are
      *  bumped per copied row. Idempotent: replaying the same clone is a no-op.
      *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
-     *  parent's live row count - 1). */
-    cloneSessionRows(parentId: string, childId: string, throughSeq: number): void {
+     *  parent's last live seq — #4730). Returns false when the parent session
+     *  has no row (never mirrored — nothing to clone), true otherwise
+     *  (including zero-row clones and idempotent replays). */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        if (this.getSessionRow(parentId) === null) return false;
         this.db.transaction(() => {
             const parent = this.getSessionRow(parentId);
             if (parent === null) return;
@@ -2231,18 +2402,22 @@ export class UnifiedStore {
                      WHERE session_id = ? AND seq <= ?`,
                 )
                 .run(childId, parentId, throughSeq);
-            // One refcount bump per distinct CAS body now referenced by the
-            // child (rows sharing content must bump once each, not per row).
+            // One refcount bump per COPIED ROW — the same discipline as the
+            // insert path (putContent per landed row) and every release path
+            // (deleteSession/gc/retire release per row). DISTINCT here
+            // under-counted when one session attached the same media bytes to
+            // two messages (two mapping rows, one hash → +1 instead of +2):
+            // deleting the child then the parent dropped the count to zero
+            // while a third session still referenced the bytes, and the
+            // zero-ref sweep deleted live media. (For message content the
+            // serialized JSON embeds the message id, so distinct == per-row
+            // there — but per-row is the invariant, not the optimization.)
             const hashes = this.db
-                .prepare(
-                    "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
-                )
+                .prepare("SELECT content_hash AS h FROM messages WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
             for (const row of hashes) this.putContentRef(row.h as string);
             const media = this.db
-                .prepare(
-                    "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
-                )
+                .prepare("SELECT media_hash AS h FROM message_media WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
             for (const row of media) this.putContentRef(row.h as string);
             this.db
@@ -2261,14 +2436,21 @@ export class UnifiedStore {
                     throughSeq,
                 );
         });
+        return true;
     }
 
     private putContentRef(hash: string): void {
-        this.db
+        const res = this.db
             .prepare(
                 "UPDATE content SET refcount = refcount + 1 WHERE hash = ?",
             )
             .run(hash);
+        if (res.changes === 0) {
+            // A dangling reference would otherwise be an uncounted clone row:
+            // every later delete releases a ref nobody took (negative count →
+            // delete-on-zero GC sweeps bytes other sessions still reference).
+            throw new Error(`putContentRef: content row missing for hash ${hash.slice(0, 16)}… — refusing to fork with an uncounted ref`);
+        }
     }
 
     /** #D5-5 render windowing: identity-only rows (seq + msg_id) — no

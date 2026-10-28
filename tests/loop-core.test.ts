@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { createHandoffReply } from "../src/server/handoff-response.ts";
 import type { WireProtocol } from "../src/util.ts";
 import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
 
@@ -65,6 +66,42 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
         sse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name, arguments: args }, output_index: outputIndex }),
     ].join("");
 }
+
+test("handoff uses the loop's parsed output without changing client bytes", async () => {
+    const raw = sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_reply", delta: "loop answer" })
+        + fcEvents(1, "call_read", "read", '{"path":"file.ts"}') + COMPLETED;
+    const ctx = makeCtx([], "responses");
+    const baseline = await drain(new Response(raw).body!, makeCtx([], "responses"), { input: [], stream: true }, { url: "http://mock", headers: {} });
+    const reply = createHandoffReply(ctx.session);
+    const chunks: Buffer[] = [];
+    for await (const chunk of runCompressLoop(new Response(raw).body!, { ...ctx, reply }, { input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) chunks.push(chunk);
+    assert.equal(Buffer.concat(chunks).toString(), baseline);
+    const saved = (ctx.session.metadata.handoffResponse as { messages: CoreMessage[] }).messages;
+    assert.equal(saved.find((m) => m.contentType === "text")?.text, "loop answer");
+    assert.equal(saved.find((m) => m.contentType === "tool-call")?.text, '{"path":"file.ts"}');
+    assert.equal(ctx.session.lastMessages, undefined);
+});
+
+test("handoff retains forwarded continuation text and omits a failed terminal", async () => {
+    const frame = (content: string, finish_reason: string | null = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason }] })}\n\n`;
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const fails of [false, true]) {
+            globalThis.fetch = async () => fails
+                ? new Response(frame("unfinished"))
+                : new Response(frame(" tail", "stop") + "data: [DONE]\n\n");
+            const ctx = makeCtx([], "openai");
+            const body = { messages: [], stream: true };
+            const reply = createHandoffReply(ctx.session);
+            for await (const _chunk of runCompressLoop(new Response(frame("head")).body!, { ...ctx, reply }, body, { url: "http://mock", headers: {} }, createOpenaiAdapter(body), buildCompressSystemPrompt())) {}
+            const saved = ctx.session.metadata.handoffResponse as { messages: CoreMessage[] } | undefined;
+            if (fails) assert.equal(saved, undefined);
+            else assert.equal(saved?.messages.filter((m) => m.contentType === "text").map((m) => m.text).join(""), "head tail");
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
@@ -316,6 +353,51 @@ test("loop usage: protocol='responses' → cached NOT double-counted (input_toke
     assert.equal(ctx.session.stats.cachedTokens, 900);
     assert.equal(ctx.session.stats.cacheSamples, 1);
 });
+
+for (const completion of ["text", "tool"] as const) {
+    for (const placement of ["empty-delta-tail", "empty-choices-tail", "finish"] as const) {
+        test(`#4943: OpenAI ${completion} ${placement} usage settles once and replaces the stale anchor`, async () => {
+            const ctx = makeCtx([], "openai");
+            ctx.session.stats.lastInputTokens = 1000;
+            ctx.session.stats.lastUsageGradeTokens = 1000;
+            const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+            const frame = (value: unknown): string => `data: ${JSON.stringify(value)}\n\n`;
+            let totalInput = 0;
+            for (let turn = 1; turn <= 2; turn++) {
+                const prompt = 50000 * turn;
+                const usage = { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10, prompt_tokens_details: { cached_tokens: 4096 } };
+                const delta = completion === "tool"
+                    ? { tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "{}" } }] }
+                    : { content: "hello world" };
+                const finishReason = completion === "tool" ? "tool_calls" : "stop";
+                const finish = frame({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }], ...(placement === "finish" ? { usage } : {}) });
+                const tail = placement === "finish" ? "" : frame({ choices: placement === "empty-choices-tail" ? [] : [{ index: 0, delta: {} }], usage });
+                const raw = frame({ choices: [{ index: 0, delta }] }) + finish + tail + "data: [DONE]\n\n";
+                const chunks: Buffer[] = [];
+                for await (const part of runCompressLoop(
+                    new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+                    createOpenaiAdapter(body), buildCompressSystemPrompt(),
+                )) chunks.push(part);
+                totalInput += prompt;
+                assert.equal(ctx.session.stats.lastInputTokens, prompt);
+                assert.equal(ctx.session.stats.lastUsageGradeTokens, prompt);
+                assert.equal(ctx.session.stats.inputTokens, totalInput);
+                assert.equal(ctx.session.stats.outputTokens, 10 * turn);
+                assert.equal(ctx.session.stats.cachedTokens, 4096 * turn);
+                assert.equal(ctx.session.stats.cacheSamples, turn);
+                const output = Buffer.concat(chunks).toString("utf8");
+                if (completion === "tool") {
+                    const usageFrame = tail || finish;
+                    assert.equal(output.split(usageFrame).length - 1, 1, "client receives the original usage frame exactly once");
+                    assert.ok(output.indexOf(usageFrame) < output.indexOf("data: [DONE]"));
+                    if (tail) assert.ok(output.indexOf(tail) > output.indexOf(finish));
+                } else {
+                    assert.ok(output.includes("hello world"));
+                }
+            }
+        });
+    }
+}
 
 test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
     const ctx = makeCtx();

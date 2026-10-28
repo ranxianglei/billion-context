@@ -61,70 +61,21 @@ test("no union type arrays anywhere in the shared compress schema (#447)", () =>
   }
 });
 
-test("every anyOf alternative is explicitly typed (#447)", () => {
-  let checked = 0;
+test("no combinators survive the 2026-10-26 single-string narrowing (#447)", () => {
+  // The former anyOf alternation (typed array + typed string with
+  // self-contained object branches) was the Copilot WC-008 workaround for
+  // advertising MULTIPLE forms. The narrowed schema advertises exactly one
+  // scalar string branch — no anyOf anywhere — which is trivially legal for
+  // every validator the walk emulates.
+  let sawAnyOf = false;
   for (const [path, node] of walk(params, "$")) {
-    if (!node.anyOf) continue;
-    for (let i = 0; i < node.anyOf.length; i++) {
-      const sub = node.anyOf[i];
-      if (!sub) continue;
-      assert.notEqual(
-        sub.type,
-        undefined,
-        `${path}.anyOf[${i}]: alternative must declare its own type (Gemini rejects required-only fragments)`,
-      );
-      checked++;
+    if (node.anyOf) {
+      sawAnyOf = true;
+      assert.fail(`${path}: unexpected anyOf after narrowing`);
     }
   }
-  assert.equal(checked, 5, "content anyOf (2) + content array items anyOf (3)");
-});
-
-test("content alternation: typed array alternative + typed string alternative", () => {
-  const content = params.properties?.content;
-  assert.ok(content, "content property missing");
-  assert.equal(
-    content.type,
-    undefined,
-    "content carries no own type (union removed)",
-  );
-  assert.ok(Array.isArray(content.anyOf), "content uses nested anyOf");
-  assert.equal(content.anyOf?.length, 2);
-  const arrayAlt = alt(content, 0);
-  const stringAlt = alt(content, 1);
-  assert.equal(arrayAlt.type, "array");
-  assert.equal(stringAlt.type, "string");
-  assert.ok(arrayAlt.items, "array alternative declares items");
-  const itemAlts = arrayAlt.items?.anyOf ?? [];
-  assert.equal(itemAlts.length, 3, "line form + both bound spellings");
-  assert.equal(
-    itemAlts[0]?.type,
-    "string",
-    "items keep the line-form string alternative",
-  );
-  const expectedRequired: Array<[number, string[]]> = [
-    [1, ["startId", "endId", "summary"]],
-    [2, ["startRef", "endRef", "summary"]],
-  ];
-  for (const [i, required] of expectedRequired) {
-    const obj = alt(arrayAlt.items as SchemaNode, i);
-    assert.equal(obj.type, "object", `object alternative ${i} is typed`);
-    assert.deepEqual(
-      obj.required,
-      required,
-      `object alternative ${i} required list`,
-    );
-    const props = obj.properties ?? {};
-    for (const k of [
-      "topic",
-      "startId",
-      "endId",
-      "startRef",
-      "endRef",
-      "summary",
-    ]) {
-      assert.ok(props[k], `object alternative ${i} keeps property ${k}`);
-    }
-  }
+  assert.equal(sawAnyOf, false);
+  assert.equal(params.properties?.content?.type, "string");
 });
 
 test("top level stays a plain object (Anthropic constraint, bili #1299)", () => {

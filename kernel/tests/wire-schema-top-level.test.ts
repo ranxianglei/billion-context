@@ -99,31 +99,13 @@ test("google functionDeclarations parameters: no top-level combinators on any to
   assertPlainTopLevel(ABSORB_TOOL_GOOGLE as Record<string, unknown>, "google");
 });
 
-test("content alternatives use scalar types and self-contained object branches", () => {
+test("content is advertised as the single string form (2026-10-26 narrowing)", () => {
+  // Formerly pinned the anyOf array/string alternation with self-contained
+  // object branches (Copilot WC-008 workarounds). The narrowed schema keeps
+  // only the scalar string branch, which is trivially Copilot-legal.
   const params = ACP_TOOLS_OPENAI[0].function.parameters as {
-    properties: {
-      content: {
-        anyOf: {
-          type: string;
-          items?: {
-            anyOf: { type: string; properties?: object; required?: string[] }[];
-          };
-        }[];
-      };
-    };
+    properties: { content: { type: string; anyOf?: unknown } };
   };
-  const alternatives = params.properties.content.anyOf;
-  assert.deepEqual(
-    alternatives.map((entry) => entry.type),
-    ["array", "string"],
-  );
-  const entries = alternatives[0].items!.anyOf;
-  assert.deepEqual(
-    entries.map((entry) => entry.type),
-    ["string", "object", "object"],
-  );
-  for (const entry of entries.slice(1)) {
-    assert.ok(entry.properties);
-    for (const key of entry.required!) assert.ok(key in entry.properties!);
-  }
+  assert.equal(params.properties.content.type, "string");
+  assert.equal(params.properties.content.anyOf, undefined);
 });

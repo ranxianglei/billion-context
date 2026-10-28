@@ -249,6 +249,16 @@ export type Session = {
          *  bili's rebuild. */
         inBody?: InboundSlot;
         settledInBody?: InboundSlot;
+        /** #4805: the conversation's latest ADMITTED message id — the single
+         *  needle the settle-side membership probe tests each resent history
+         *  against. Updated only by member / first-turn / main-scale
+         *  requests, so a foreign payload can neither pass nor hijack it.
+         *  In-memory only; a restart replants it on the first turn. */
+        latestKnownMsgId?: string;
+        needlePayloadUpper?: number;
+        /** #4805: the in-flight request's probe verdict ({member, needle}),
+         *  recorded at prepare and consumed by settleUsageReport. */
+        requestMembership?: { member: boolean; needle: string | null };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -290,6 +300,11 @@ export type Session = {
      *  one upstream usage report. Persisted; survives restart. */
     stats: {
         requests: number;
+        /** #4899: cumulative USD spend ledger (input / cacheRead / cacheWrite /
+         *  output), billed at the per-request stamped price
+         *  (metadata.billingPrice). Absent while no price resolves — the UI
+         *  shows tokens only, never fabricated dollars. */
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
         /** Approximate tokens saved by compression (legacy/rough — kept for
          *  backward compat with old session files, not shown in UI). */
         tokensSaved: number;
@@ -396,6 +411,11 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #4805: the payload upper estimate of the request whose usage report
+         *  wrote the current usage-grade anchor — the meter-side size guard
+         *  compares it against the payload at hand to refuse anchors that
+         *  cannot describe this conversation (side-lane pollution). */
+        lastUsagePayloadUpper?: number;
         /** #2117: billing-caliber estimate of the CURRENT outbound request —
          *  estimateCoreMessages + wire overhead, k̂-scaled only where the
          *  factor's route+model provenance matches (#1933 F1 / #2117 B), plus
@@ -1369,6 +1389,7 @@ export function snapshotMessages(session: Session, messages: CoreMessage[]): voi
     if (messages.length > 0) {
         session.lastMessages = messages;
         session.lastMessagesFolded = false;
+        delete session.metadata.handoffResponse;
     }
 }
 

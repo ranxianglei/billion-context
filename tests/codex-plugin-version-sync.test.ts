@@ -154,3 +154,11 @@ test("marketplace without a billion-context plugin entry is skipped, not drifted
   const r = run(fx.script, "--check");
   assert.equal(r.code, 0, `missing entry must not fail the gate: ${r.out}${r.err}`);
 });
+
+test("a MISSING manifest file fails the gate instead of silently passing (#4725 review)", () => {
+  const fx = makeFixture(NEW_VERSION, NEW_VERSION);
+  fs.rmSync(path.join(fx.root, ".claude-plugin/plugin.json"));
+  const r = run(fx.script, "--check");
+  assert.notEqual(r.code, 0, "a missing manifest must be red, not a silent skip that greens the gate");
+  assert.match(r.err, /缺少 manifest/, `must name the missing file: ${r.out}${r.err}`);
+});

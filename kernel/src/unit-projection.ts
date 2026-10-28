@@ -334,39 +334,106 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // computeIntegrityWithdrawals: withdrawing a pair for the result half can
   // strand a turn whose reasoning still folds and whose call now stays visible.
   {
-    const {
-      withdrawn: withdrawIds,
-      splitTurnCount: turns,
-      splitPairCount: pairs,
-    } = computeIntegrityWithdrawals(input.messages, effectiveMessageIds);
-    withdrawnIds = withdrawIds;
-    splitTurnCount = turns;
-    splitPairCount = pairs;
-    if (withdrawIds.size > 0) {
-      for (const id of withdrawIds) effectiveMessageIds.delete(id);
-      const beforeWithdraw = filteredIds.length;
-      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
+    // #4484/#3322: on a MERGE (this unit consumes existing blocks) the integrity
+    // gate needs two things a fresh fold does not. (a) Judge POST-FOLD coverage —
+    // this unit's ids PLUS every still-active sibling block's coverage — so a tool
+    // half already covered by an unconsumed sibling reads as folded, not a spurious
+    // "visible" half (#3322 withdrew inherited coverage for exactly this reason).
+    // (b) Never drop an id whose ONLY covering block is consumed here: those blocks
+    // deactivate below, so removing their id strands it uncovered — the regression
+    // the host pre-commit guard then refuses (#4484). We therefore unfold only ids
+    // whose coverage does not depend on a consumed block, re-checking to a fixed
+    // point; if consistency would force unfolding such an id we fail honestly rather
+    // than emit a doomed regressive candidate. Fresh folds keep the legacy behavior.
+    const isMerge = consumedBlockIds.length > 0;
+    let consumedCoverage = new Set<string>();
+    let survivingCoverage = new Set<string>();
+    if (isMerge) {
+      const consumedSet = new Set(consumedBlockIds);
+      for (const block of activeBlocks(input.state)) {
+        const target = consumedSet.has(block.blockId)
+          ? consumedCoverage
+          : survivingCoverage;
+        for (const id of block.effectiveMessageIds) target.add(id);
+      }
+    }
+    let foldedRef = effectiveMessageIds;
+    if (isMerge) {
+      foldedRef = new Set(effectiveMessageIds);
+      for (const id of survivingCoverage) foldedRef.add(id);
+    }
+    const initial = computeIntegrityWithdrawals(input.messages, foldedRef);
+    splitTurnCount = initial.splitTurnCount;
+    splitPairCount = initial.splitPairCount;
+    if (initial.withdrawn.size > 0) {
       const splitDesc = [
         splitTurnCount > 0 ? `${splitTurnCount} turn(s)` : null,
-        splitPairCount > 0
-          ? `${splitPairCount} tool call/result pair(s)`
-          : null,
+        splitPairCount > 0 ? `${splitPairCount} tool call/result pair(s)` : null,
       ]
         .filter((part): part is string => part !== null)
         .join(" and ");
-      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-        return finish({
-          fatal: {
-            kind: "split",
-            error: new Error(
-              `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
-            ),
-          },
-        });
+      if (!isMerge) {
+        withdrawnIds = initial.withdrawn;
+        for (const id of initial.withdrawn) effectiveMessageIds.delete(id);
+        const beforeWithdraw = filteredIds.length;
+        filteredIds = filteredIds.filter((id) => !initial.withdrawn.has(id));
+        if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+          return finish({
+            fatal: {
+              kind: "split",
+              error: new Error(
+                `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
+              ),
+            },
+          });
+        }
+        warnings.push(
+          `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
+        );
+      } else {
+        const unfoldable = new Set<string>(
+          [...effectiveMessageIds].filter((id) => !consumedCoverage.has(id)),
+        );
+        const unfolded = new Set<string>();
+        let current = initial.withdrawn;
+        let guard = unfoldable.size + 2;
+        let stuck = false;
+        while (current.size > 0 && guard-- > 0) {
+          let progress = false;
+          for (const id of current) {
+            if (unfoldable.has(id) && !unfolded.has(id)) {
+              unfolded.add(id);
+              progress = true;
+            }
+          }
+          if (!progress) {
+            stuck = true;
+            break;
+          }
+          const recheck = new Set(effectiveMessageIds);
+          for (const id of unfolded) recheck.delete(id);
+          for (const id of survivingCoverage) recheck.add(id);
+          current = computeIntegrityWithdrawals(input.messages, recheck).withdrawn;
+        }
+        if (stuck || current.size > 0) {
+          const sample = [...consumedCoverage].slice(0, 5).join(", ");
+          return finish({
+            fatal: {
+              kind: "split",
+              error: new Error(
+                `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without unfolding already-folded message(s) owned by those blocks (${sample}) — doing so would drop their existing coverage. Align the range to whole turns (do not cut through a reasoning/tool-call/result group) or merge fewer blocks.`,
+              ),
+            },
+          });
+        }
+        withdrawnIds = unfolded;
+        for (const id of unfolded) effectiveMessageIds.delete(id);
+        const beforeWithdraw = filteredIds.length;
+        filteredIds = filteredIds.filter((id) => !unfolded.has(id));
+        warnings.push(
+          `Withdrew ${beforeWithdraw - filteredIds.length} newly-folded message(s) from the merge to keep ${splitDesc} intact while preserving the existing coverage of ${consumedBlockIds.join(", ")}.`,
+        );
       }
-      warnings.push(
-        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
-      );
     }
   }
 

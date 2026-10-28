@@ -102,9 +102,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
  *    predicate); the fingerprint still matters for root threads and older
  *    codex builds, detected by the turn-metadata header or the user agent
  *    (same convention as isCodexClient, #645).
- *  - claude over Responses (#970): subagents SHARE the main agent's session
- *    id (the Anthropic path splits them via claudeSubagentSplit; a claude
- *    client on the Responses wire only has this fingerprint).
+ *  - claude code (#970/#4352): subagents SHARE the main agent's session id
+ *    on every wire (the anthropic path also separates them via the order
+ *    resolver when its two-signal header gate misses — see
+ *    claudeAnthropicPersonaOrderApplies below; the responses wire relies on
+ *    this fingerprint alone).
  *
  * Everyone else keys VERBATIM: instructions drift mid-id means "same
  * conversation, evolved system context" (software upgrade, plugin install,
@@ -120,21 +122,53 @@ export function conversationHeaderSource(headers: Record<string, string | string
  * by instructions must be added here (same evidence-per-client discipline as
  * #1104, inverted).
  */
-export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
-    // Detection only — the client-identity DECISION (who keys by
-    // instructions) lives in the lane-decisions wire-client registry
-    // (#3482 site 4): the header-name literals are registry data, not
-    // scattered comparisons. Signals are name-free observations here.
+/** Name-free wire observations for the lane-decisions client registry
+ * (#3482): present header names, the resolved conversation-source header,
+ * and the codex user-agent fact. Shared by every predicate below so the
+ * signal extraction stays single-sourced. */
+function wireClientSignals(headers: Record<string, string | string[] | undefined>): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean } {
     const headerNames = new Set<string>();
     for (const [name, value] of Object.entries(headers ?? {})) {
         const first = Array.isArray(value) ? value[0] : value;
         if (typeof first === "string" && first.trim().length > 0) headerNames.add(name);
     }
-    return resolveWireClientProfile({
+    return {
         headerNames,
         conversationSourceName: conversationHeaderSource(headers)?.name,
         codexUserAgent: isCodexClient(headers),
-    }).instructionsFingerprintKeyed;
+    };
+}
+
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    // Detection only — the client-identity DECISION (who keys by
+    // instructions) lives in the lane-decisions wire-client registry
+    // (#3482 site 4): the header-name literals are registry data, not
+    // scattered comparisons. Signals are name-free observations here.
+    return resolveWireClientProfile(wireClientSignals(headers)).instructionsFingerprintKeyed;
+}
+
+/** #4352: whether THIS request's claude-code-over-Anthropic traffic should
+ * ride the continuity-aware order resolver (personaConversationOrder) for
+ * persona separation when the #970 two-signal header gate
+ * (claudeSubagentAgentId) misses.
+ *
+ * Evidence (v0.1.204 field report, #4352): Claude Code stamps ONE session id
+ * on every model request of a session INCLUDING Task-tool subagents, and the
+ * VS Code extension build's subagent requests carry no agent-id headers at
+ * all — so claudeSubagentAgentId misses and those subagents ride the raw
+ * parent id, where their disjoint short histories accumulate fold-reconcile
+ * drop events until epoch confirmation fires substrate-destruction and the
+ * parent's refs go permanently DEAD (compress rejected for the rest of the
+ * session). Routing such traffic through the order resolver separates exactly
+ * those disjoint rides onto |sub:<fp> lanes while a continuing main
+ * conversation keeps the raw key on order+content evidence (#2944) — the same
+ * mechanism the dsh lane uses (#1916).
+ *
+ * Detection only — the client-identity DECISION lives in the lane-decisions
+ * wire-client registry (#3482 site 4), same shape as
+ * instructionsFingerprintApplies above. */
+export function claudeAnthropicPersonaOrderApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system

@@ -156,7 +156,7 @@ export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 export function usageTotals(
     protocol: WireProtocol,
     usage: Record<string, unknown>,
-): { total: number | undefined; cached: number | undefined } {
+): { total: number | undefined; cached: number | undefined; creation?: number | undefined } {
     const num = (v: unknown): number | undefined =>
         typeof v === "number" && Number.isFinite(v) ? v : undefined;
     if (protocol === "anthropic") {
@@ -169,6 +169,9 @@ export function usageTotals(
         return {
             total: any ? promptInputTotal("anthropic", fresh ?? 0, read, creation, declaredInclusiveFromUsage(usage)) : undefined,
             cached: read,
+            // #4899: anthropic is the only wire with a cache-WRITE premium —
+            // surface creation tokens for the USD ledger (billing.ts).
+            creation,
         };
     }
     if (protocol === "openai") {

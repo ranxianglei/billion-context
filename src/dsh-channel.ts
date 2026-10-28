@@ -407,7 +407,10 @@ export function planDshSpawn(
             "Set BILI_DSH_BIN to the dsh executable, or reword the argument.",
         );
     });
-    const comspec = env.COMSPEC?.trim() || "cmd.exe";
+    // #4599: sanitized env copies keep original key casing (`ComSpec`) — an
+    // exact `env.COMSPEC` probe misses it on plain objects.
+    const comspecRaw = env.COMSPEC ?? env.ComSpec ?? env.comspec;
+    const comspec = comspecRaw?.trim() || "cmd.exe";
     const line = `"${[command, ...args].map(quoteWinToken).join(" ")}"`;
     return { command: comspec, args: ["/d", "/s", "/c", line], windowsVerbatimArguments: true };
 }

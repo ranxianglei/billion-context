@@ -15,6 +15,7 @@ import { startServer } from "../src/server.ts";
 import { ResponsesWsHistory, ResponsesWsUpstream, finalizeResponsesWsUpstreamHeaders } from "../src/responses-ws.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { proxyDispatcher } from "../src/upstream-proxy.ts";
+import { _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 import { ensureRootCA, mintHostCert, rootCaPath } from "../src/ca.ts";
 import { validateResponsesWsCreate } from "./wire-contract-fakes.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -142,6 +143,8 @@ test("V2 handshake: openai/azure and custom OpenAI-compatible responses sockets 
 });
 
 async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" | "suffix" = "full") {
+    // #4204: the 429-hold table is process-global (keyed by origin+credential); clear it per fixture so a prior test's hold cannot answer this fixture's first turn locally when the OS reuses the same ephemeral port (#4945 CI flake).
+    _resetUpstreamThrottleForTest();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-responses-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});

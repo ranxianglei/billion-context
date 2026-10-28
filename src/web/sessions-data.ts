@@ -7,6 +7,12 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
+
+/** Shape of a resolved price row — taken via ReturnType so this module never
+ *  couples to billing.ts's internal export surface (see #4916 unused-export
+ *  gate: ResolvedBillingPrice itself stays module-private there). */
+type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
@@ -98,6 +104,51 @@ interface WebSessionSummary {
     grossSaved?: number;
     /** Per-session net: Σ ((S−σ)×requestsAfter − T − σ); may be negative. */
     netSaved?: number;
+    /** #4899: model id the session last ran on (metadata.lastModel) — the key
+     *  the pricing editor resolves against. */
+    model?: string;
+    /** #4899: cumulative USD spend billed at the per-request stamped price
+     *  (session.stats.costUsd). When that ledger is absent/zero, falls back to
+     *  a LIVE-derived estimate (`estimated: true`) — displayed tokens × the
+     *  currently resolved tier rates — so pre-upgrade sessions show dollars
+     *  too. Absent only when no price resolves at all. */
+    costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean };
+    /** #4899 v2: money mirror of netSaved — the folds priced with the CURRENTLY
+     *  resolved tier rates (live price table); stamped profiles are only a
+     *  fallback when the model resolves nowhere today; fold-less sessions
+     *  estimate flat at the input rate. Can be negative while a fold has not
+     *  paid back (honest, like the token display). */
+    savedUsd?: number;
+    /** #4899 v2: money mirror of grossSaved — avoided turns priced at the read rate. */
+    savedUsdGross?: number;
+    /** #4899 v2: hit-rate miss buckets in dollars — genuinely-new content at the
+     *  input rate, compression/TTL repays at the read rate. Only ledgered
+     *  sessions with a resolvable price. */
+    missSplitUsd?: { n: number; c: number; x: number };
+    /** #4899 v3: compression PAYBACK at current prices — where is this session's
+     *  fold money now? `spentUsd` is the effective one-time cost of folding
+     *  (full-price replay of re-sent tokens + summary output − credit for the
+     *  previously-cached content the fold replaced; it is exactly
+     *  savedUsdGross − savedUsd, so on-screen numbers reconcile); the split
+     *  fields show which part each term contributed. `breakevenTurns` is the
+     *  turn count at which avoided turns outrun the cost (absent when not
+     *  computable — zero gross savings, or already broken even from turn 0);
+     *  compare against `actualTurns` to read paid-back / not-yet. */
+    payback?: {
+        spentUsd: number;
+        replayUsd: number;
+        sigmaUsd: number;
+        creditUsd: number;
+        /** Σ σ output priced at the output rate — the compression side of the output bill. */
+        normalOutputUsd: number;
+        breakevenTurns?: number;
+        actualTurns: number;
+    };
+    /** #4899 v4: the exact tier rates (USD/Mtok) this session's dollar figures
+     *  were computed with — live price tiers when resolvable, else the stamped
+     *  profile. Exposed so panel formula lines can print the prices themselves.
+     *  Absent when no price resolves (tokens-only session). */
+    rates?: { w: number; r: number; q: number };
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -143,6 +194,33 @@ interface WebOverview {
     coverageLostFrozenTotal: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
+    /** #4899: Σ per-session USD spend (only priced sessions contribute). */
+    costUsdTotal: number;
+    /** #4899 v3: per-tier split of costUsdTotal so each overview token card can
+     *  carry its own ≈$ line. i = fresh (uncached) input, r = cache reads,
+     *  w = cache writes, o = output — i+r+w+o == costUsdTotal. */
+    costUsdSplitTotal?: { i: number; r: number; w: number; o: number };
+    /** #4899 v4: fold count across all sessions — makes "how many × how many"
+     *  concrete next to grossSavedTotal. */
+    foldsTotal: number;
+    /** #4899 v4: single rate triple (USD/Mtok) when every priced session
+     *  resolves identical rates — lets formula lines name THE price. Absent
+     *  when several models bill differently (totals stay per-session then). */
+    moneyRates?: { w: number; r: number; q: number };
+    /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
+    savedUsdTotal: number;
+    /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
+     *  Only priced sessions contribute. */
+    savedUsdGrossTotal: number;
+    /** #4899 v3: fleet payback aggregation over sessions that HAVE fold USD
+     *  data — spent/saved in dollars plus Σ actual post-fold turns so the
+     *  client can render one break-even line. Absent when no session has it. */
+    paybackUsdTotal?: { spent: number; saved: number; turns: number };
+    /** #4899 v2: Σ hit-rate miss buckets in dollars across priced ledgered sessions. */
+    missSplitUsdTotal?: { n: number; c: number; x: number };
+    /** #4899: true when at least one session had a USD ledger or priced folds
+     *  (else the money totals are meaningless — hide them, don't fake $0). */
+    hasMoneyData: boolean;
     /** Σ compression re-read missed tokens across ledger sessions. */
     missCompTotal: number;
     /** Σ upstream-TTL-expiry / other-prefix-invalidation missed tokens across ledger sessions. */
@@ -153,7 +231,7 @@ interface WebOverview {
     hiddenEmpty: number;
     hitPct: number | null;
     blocks: number;
-    byProtocol: Array<{ protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; hitPct: number | null; missDropNew?: number; missDropComp?: number; missDropTtl?: number }>;
+    byProtocol: Array<{ protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; hitPct: number | null; missDropNew?: number; missDropComp?: number; missDropTtl?: number; savedUsd?: number }>;
     recent: WebSessionSummary[];
 }
 
@@ -542,7 +620,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
 interface SummarySource {
     id: string;
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
-    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean; costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number } };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
@@ -555,6 +633,61 @@ function num(v: unknown, fallback = 0): number {
 
 function str(v: unknown): string | undefined {
     return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** #4899: validate the persisted USD ledger blob — metadata/stats are
+ *  user-editable JSON, so only finite non-negative fields survive; anything
+ *  else reads as "no ledger" instead of poisoning the display. */
+function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
+    const input = f(o.input), cacheRead = f(o.cacheRead), cacheWrite = f(o.cacheWrite), output = f(o.output);
+    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
+    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
+}
+
+/** #4899 v2 (owner design): the dollar faces of the panel are a DERIVED VIEW.
+ *  They recompute on every fetch from the CURRENTLY resolved price table
+ *  (`billing.prices` overrides > models.dev snapshot) — never gated on
+ *  request-time stamps. A session created yesterday shows dollars as soon as
+ *  its model resolves a price; editing a price re-prices every token number
+ *  instantly. Purpose: see whether compression saves MONEY given the model's
+ *  differing input/output/cache rates — an estimate by design, not an invoice.
+ *  Host-aware like the pricing editor (`handlePricingGet`). */
+function livePriceForSummary(s: SummarySource): LivePrice | undefined {
+    const model = typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? s.metadata.lastModel : undefined;
+    if (!model) return undefined;
+    let host: string | undefined;
+    if (s.meta.upstreamOrigin) {
+        try { host = new URL(s.meta.upstreamOrigin).host; } catch { host = undefined; }
+    }
+    return resolveBillingPrice(model, host);
+}
+
+/** Absolute $/Mtok profile {w,r,q} for the fold economics mirror, newest
+ *  source first: (1) the live-resolved tier prices (input / cacheRead /
+ *  output) — always fresh, so price edits propagate; (2) a stamped ABSOLUTE
+ *  profile (model no longer in any price table); (3) legacy dimensionless
+ *  ratio profiles anchored against the stamped billing price (kernel defaults
+ *  1/0.1/4 fill partial profiles, as before). Nothing usable → undefined:
+ *  tokens only, never fabricated dollars. */
+function savedUsdProfileForSummary(s: SummarySource, live?: LivePrice): { w: number; r: number; q: number } | undefined {
+    if (live !== undefined) return { w: live.cacheWrite, r: live.cacheRead, q: live.output };
+    const o = s.metadata["cachePriceProfile"];
+    if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
+    const rec = o as Record<string, unknown>;
+    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
+    const w = f(rec.w), r = f(rec.r), q = f(rec.q);
+    if (w === undefined && r === undefined && q === undefined) return undefined;
+    const filled = { w: w ?? 1, r: r ?? 0.1, q: q ?? 4 };
+    if (s.metadata["cachePriceProfileAbs"] === true) return filled;
+    // Legacy dimensionless ratios: anchor against the stamped billing price's
+    // input rate when present — kept as a last resort for models that resolve
+    // nowhere today but were priced at request time.
+    const bp = s.metadata["billingPrice"];
+    const input = bp && typeof bp === "object" ? f((bp as Record<string, unknown>).input) : undefined;
+    return input === undefined ? undefined : { w: filled.w * input, r: filled.r * input, q: filled.q * input };
 }
 
 /** Normalizer mirroring buildSession's v1-flat → grouped fallback for exactly
@@ -591,6 +724,7 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
@@ -639,6 +773,7 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata,
         state: { blocks },
@@ -671,6 +806,10 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // engine's health across the fleet before the rollout flip.
     const shadowBlob = s.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
     const agg = led;
+    // #4899 v2: resolve THIS session's price live, once per fetch (see the
+    // helpers' docs). Drives every dollar face below — old or new session alike.
+    const livePrice = livePriceForSummary(s);
+    const usdProf = savedUsdProfileForSummary(s, livePrice);
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
     const cachedTokens = Math.max(s.stats.cachedTokens ?? 0, agg?.agg?.cached ?? 0);
@@ -704,6 +843,85 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     let blocksSaved = 0;
     for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
     const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
+    // #4899 v2: spend — the persisted per-request ledger wins when present
+    // (exact beats estimated); otherwise derive from the displayed tokens ×
+    // the live tier rates (fresh input @ input rate, cached @ read rate,
+    // output @ output rate). Unpriced model → undefined: tokens only, never
+    // fabricated dollars.
+    const costLedger = validCostUsd(s.stats.costUsd);
+    const persistedSum = costLedger === undefined ? 0 : costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output;
+    const costUsd: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean } | undefined =
+        costLedger !== undefined && persistedSum > 0
+            ? { input: costLedger.input, cacheRead: costLedger.cacheRead, cacheWrite: costLedger.cacheWrite, output: costLedger.output, total: persistedSum }
+            : (() => {
+                  if (livePrice === undefined) return undefined;
+                  const cachedPart = Math.min(Math.max(0, cachedTokens), Math.max(0, inputTokens));
+                  const freshPart = Math.max(0, inputTokens) - cachedPart;
+                  const inputSide = (freshPart * livePrice.input) / 1e6;
+                  const cacheSide = (cachedPart * livePrice.cacheRead) / 1e6;
+                  const outputSide = (outputTokens * livePrice.output) / 1e6;
+                  const total = inputSide + cacheSide + outputSide;
+                  return total > 0
+                      ? { input: inputSide, cacheRead: cacheSide, cacheWrite: 0, output: outputSide, total, estimated: true }
+                      : undefined;
+              })();
+    // Savings — net-$ mirror through the canonical fold formula (validated in
+    // billing.ts + tests/billing-prices.test.ts), gross-$ = avoided turns at
+    // the read rate; fold-less sessions estimate flat at the live INPUT rate
+    // (uncompressed, those tokens would have been re-sent as input; nothing
+    // repayable is known, so gross == net here).
+    const foldsArr = led?.folds ?? [];
+    let savedUsd: number | undefined;
+    let savedUsdGross: number | undefined;
+    let payback: WebSessionSummary["payback"];
+    if (hasFolds && usdProf !== undefined) {
+        const net = savedUsdFromFolds(foldsArr, usdProf);
+        if (net !== undefined) {
+            savedUsd = net;
+            // #4899 v3: payback decomposition — same canonical formula as
+            // savedUsdFromFolds (net = gross − oneTime), with the one-time
+            // terms separated on screen: full-price replay (w−r)·T, summary
+            // output q·σ, and the r·S credit for content that was cached
+            // before the fold (hence net == gross − spent holds by
+            // construction — no second arithmetic the user can't reconcile).
+            let gross = 0, replayUsd = 0, sigmaUsd = 0, creditUsd = 0, actualTurns = 0;
+            for (const f of foldsArr) {
+                const S = f.S ?? 0, sig = f.sigma ?? 0, T = f.T ?? 0, ra = f.requestsAfter ?? 0;
+                gross += ((S - sig) * ra * usdProf.r) / 1e6;
+                replayUsd += ((usdProf.w - usdProf.r) * T) / 1e6;
+                sigmaUsd += (usdProf.q * sig) / 1e6;
+                creditUsd += (usdProf.r * S) / 1e6;
+                actualTurns += ra;
+            }
+            savedUsdGross = gross;
+            const spentUsd = replayUsd + sigmaUsd - creditUsd;
+            const avgPerTurn = actualTurns > 0 ? gross / actualTurns : 0;
+            payback = {
+                spentUsd: Math.round(spentUsd * 1e4) / 1e4,
+                replayUsd: Math.round(replayUsd * 1e4) / 1e4,
+                sigmaUsd: Math.round(sigmaUsd * 1e4) / 1e4,
+                creditUsd: Math.round(creditUsd * 1e4) / 1e4,
+                normalOutputUsd: Math.round((Math.max(0, outputTokens - summaryCost) * usdProf.q) / 1e6 * 1e4) / 1e4,
+                ...(spentUsd > 0 && avgPerTurn > 0 ? { breakevenTurns: Math.round((spentUsd / avgPerTurn) * 100) / 100 } : {}),
+                actualTurns,
+            };
+        }
+    } else if (!hasFolds && livePrice !== undefined && tokensSaved > 0) {
+        savedUsd = savedUsdGross = (tokensSaved * livePrice.input) / 1e6;
+    }
+    // Dollar face of the hit-rate miss buckets: genuinely-new content bills at
+    // the input rate; compression/TTL repays are cache reads.
+    const missUsd = hasLedger && livePrice !== undefined && ((agg?.agg?.nc ?? 0) + (agg?.agg?.cr ?? 0) + (agg?.agg?.tr ?? 0)) > 0
+        ? { n: ((agg?.agg?.nc ?? 0) * livePrice.input) / 1e6, c: ((agg?.agg?.cr ?? 0) * livePrice.cacheRead) / 1e6, x: ((agg?.agg?.tr ?? 0) * livePrice.cacheRead) / 1e6 }
+        : undefined;
+    // #4899 v4: publish the unit rates this session's dollars were computed
+    // with so the panel can print them INSIDE the formulas (fold math uses
+    // usdProf; spend/miss mirrors use livePrice — same tiers whenever both).
+    const rates = usdProf !== undefined
+        ? { w: usdProf.w, r: usdProf.r, q: usdProf.q }
+        : livePrice !== undefined
+            ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
+            : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -772,6 +990,15 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
+        ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
+        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
+        ...(savedUsdGross !== undefined ? { savedUsdGross: Math.round(savedUsdGross * 1e4) / 1e4 } : {}),
+        ...(payback !== undefined ? { payback } : {}),
+        ...(rates !== undefined ? { rates } : {}),
+        ...(missUsd !== undefined
+            ? { missSplitUsd: { n: Math.round(missUsd.n * 1e4) / 1e4, c: Math.round(missUsd.c * 1e4) / 1e4, x: Math.round(missUsd.x * 1e4) / 1e4 } }
+            : {}),
         ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
@@ -904,9 +1131,18 @@ export async function buildOverview(): Promise<WebOverview> {
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
+    // #4899 v2: fleet USD totals — now live-derived per session (see
+    // summaryOf), so OLD sessions contribute too; unresolvable models still
+    // contribute nothing (never $0 fake).
+    let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
+    let cuI = 0, cuR = 0, cuW = 0, cuO = 0;
+    // #4899 v4: fold count + fleet-wide rate uniformity (see WebOverview.rates).
+    let foldsTotal = 0, mrSeen = false, mrMulti = false, mW = 0, mR = 0, mQ = 0;
+    let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
+    let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
-    const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
+    const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number; savedUsd: number; hasSavedUsd: boolean }>();
     for (const s of all) {
         requests += s.requests;
         input += s.inputTokens;
@@ -920,7 +1156,7 @@ export async function buildOverview(): Promise<WebOverview> {
         // tokensSaved is a local estimate (upstream never reports it); flag
         // the share coming from sessions without usage samples (ledger).
         const key = s.protocol ?? "unknown";
-        const row = protoMap.get(key) ?? { protocol: key, sessions: 0, requests: 0, inputTokens: 0, cachedTokens: 0, savedNet: 0, folds: 0, missNew: 0, missComp: 0, missTtl: 0, missInput: 0 };
+        const row = protoMap.get(key) ?? { protocol: key, sessions: 0, requests: 0, inputTokens: 0, cachedTokens: 0, savedNet: 0, folds: 0, missNew: 0, missComp: 0, missTtl: 0, missInput: 0, savedUsd: 0, hasSavedUsd: false };
         row.sessions += 1;
         row.requests += s.requests;
         row.inputTokens += s.inputTokens;
@@ -938,6 +1174,42 @@ export async function buildOverview(): Promise<WebOverview> {
             row.missComp += s.compRepay ?? 0;
             row.missTtl += s.ttlRepay ?? 0;
             row.missInput += s.inputTokens;
+        }
+        if (s.costUsd !== undefined) {
+            hasMoneyData = true;
+            costUsdTotal += s.costUsd.total;
+            cuI += s.costUsd.input;
+            cuR += s.costUsd.cacheRead;
+            cuW += s.costUsd.cacheWrite;
+            cuO += s.costUsd.output;
+        }
+        foldsTotal += s.foldCount ?? 0;
+        if (s.rates !== undefined) {
+            if (!mrSeen) {
+                mrSeen = true;
+                mW = s.rates.w;
+                mR = s.rates.r;
+                mQ = s.rates.q;
+            } else if (s.rates.w !== mW || s.rates.r !== mR || s.rates.q !== mQ) mrMulti = true;
+        }
+        if (s.savedUsd !== undefined) {
+            hasMoneyData = true;
+            savedUsdTotal += s.savedUsd;
+            row.hasSavedUsd = true;
+            row.savedUsd += s.savedUsd;
+        }
+        if (s.savedUsdGross !== undefined) savedUsdGrossTotal += s.savedUsdGross;
+        if (s.payback !== undefined) {
+            hasPayback = true;
+            pbSpent += s.payback.spentUsd;
+            pbSaved += s.savedUsdGross ?? 0;
+            pbTurns += s.payback.actualTurns;
+        }
+        if (s.missSplitUsd !== undefined) {
+            hasMissUsd = true;
+            missUsdN += s.missSplitUsd.n;
+            missUsdC += s.missSplitUsd.c;
+            missUsdX += s.missSplitUsd.x;
         }
         if (s.hasLedger && s.grossSaved != null) {
             hasFoldData = true;
@@ -968,6 +1240,21 @@ export async function buildOverview(): Promise<WebOverview> {
         summaryCostTotal,
         coverageLostFoldTotal,
         coverageLostFrozenTotal,
+        costUsdTotal,
+        ...(hasMoneyData && costUsdTotal > 0
+            ? { costUsdSplitTotal: { i: Math.round(cuI * 1e4) / 1e4, r: Math.round(cuR * 1e4) / 1e4, w: Math.round(cuW * 1e4) / 1e4, o: Math.round(cuO * 1e4) / 1e4 } }
+            : {}),
+        savedUsdTotal,
+        savedUsdGrossTotal,
+        foldsTotal,
+        ...(mrSeen && !mrMulti ? { moneyRates: { w: mW, r: mR, q: mQ } } : {}),
+        ...(hasPayback
+            ? { paybackUsdTotal: { spent: Math.round(pbSpent * 1e4) / 1e4, saved: Math.round(pbSaved * 1e4) / 1e4, turns: pbTurns } }
+            : {}),
+        ...(hasMissUsd
+            ? { missSplitUsdTotal: { n: Math.round(missUsdN * 1e4) / 1e4, c: Math.round(missUsdC * 1e4) / 1e4, x: Math.round(missUsdX * 1e4) / 1e4 } }
+            : {}),
+        hasMoneyData,
         missNewTotal,
         missCompTotal,
         missTtlTotal,
@@ -987,6 +1274,7 @@ export async function buildOverview(): Promise<WebOverview> {
                 folds: r.folds,
                 hitPct: hitPct(r.inputTokens, r.cachedTokens),
                 ...(base > 0 ? { missDropNew: drop(r.missNew), missDropComp: drop(r.missComp), missDropTtl: drop(r.missTtl) } : {}),
+                ...(r.hasSavedUsd ? { savedUsd: Math.round(r.savedUsd * 1e4) / 1e4 } : {}),
             };
         }),
         recent: all.slice(0, 8),
@@ -1135,20 +1423,50 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // client sent (folded messages included — a client never drops them because
     // of OUR folding), so the tree can name every message a block folded — ref,
     // role, preview — without shipping a byte of full text. A raw id with no
-    // resident message (host-pruned / archived-only session) simply has no leaf;
-    // `directMessageCount` still tells the UI how many were folded.
+    // resident message (host-pruned / archived-only session) used to simply
+    // become a missing leaf — but #4738 found the window itself moves under us:
+    // host-side native compaction prunes `lastMessages` client-side, so EVERY
+    // older leaf read as missing even though the unified store still holds the
+    // bytes. Leaves absent from the window are hydrated from storage below; refs
+    // absent from BOTH keep the honest missing marker.
+    // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
+    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    try {
+        const pending: number[] = [];
+        for (const b of session.state.blocks) {
+            for (const raw of b.directMessageIds || []) {
+                if (!messageById.has(raw)) {
+                    const r = byRaw[raw];
+                    const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
+                    if (num) pending.push(Number(num[1]));
+                }
+            }
+        }
+        if (pending.length > 0) {
+            const rows = getDiskStore().unifiedMessageContentByRefs(session.id, pending);
+            for (const row of rows ?? []) {
+                const text = storedMessageText(row.content);
+                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+            }
+        }
+    } catch {
+        // sidecar unavailable/degraded: fall through to legacy missing leaves
+    }
     const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
         for (const raw of rawIds) {
             const ref = byRaw[raw];
             if (typeof ref !== "string" || ref.length === 0) continue;
             const msg = messageById.get(raw);
-            // #3917: a folded message whose bytes are gone from the store still
-            // gets a row — the ref is the identity the user asked for — but it
-            // carries no preview and the UI says so instead of inventing text.
+            // #3917: a folded message whose bytes are gone from the resident
+            // window still gets a row — the ref is the identity the user asked
+            // for. #4738: bytes gone from the window but stored are hydrated,
+            // never missed; nothing invented either way.
             if (!msg) {
-                out.push({ ref, missing: true });
+                const num = /^m(\d+)$/.exec(ref);
+                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
+                out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
                 continue;
             }
             out.push({
@@ -1275,6 +1593,20 @@ function utf8Bytes(s: string): number {
     return Buffer.byteLength(s, "utf8");
 }
 
+/** #4738: a stored row carries the VERBATIM serialized message (ingest interns
+ *  `JSON.stringify(msg)`), not the bare text the resident path serves — extract
+ *  the text field so previews and click-to-open read identically either way.
+ *  Non-message payloads report null → the leaf stays an honest miss. */
+function storedMessageText(content: string): string | null {
+    try {
+        const parsed = JSON.parse(content) as { id?: unknown; text?: unknown };
+        if (typeof parsed?.id !== "string") return null;
+        return typeof parsed.text === "string" ? parsed.text : "";
+    } catch {
+        return null;
+    }
+}
+
 /** Largest prefix of `s` whose UTF-8 encoding fits in `maxBytes`, never cutting
  *  a surrogate pair in half (a lone surrogate would surface as U+FFFD). */
 function sliceUtf8(s: string, maxBytes: number): string {
@@ -1375,15 +1707,44 @@ export type MessageContentLookup =
 /** #3917: ONE message's text, addressed by its ref. Resolves the ref to its raw
  *  id and reads the message out of the newest request snapshot (`lastMessages`),
  *  which still carries the messages this proxy folded — folding only changes the
- *  OUTBOUND projection, never what the client keeps sending. A ref whose message
- *  is gone (host-side native compaction pruning) reports `unknown-message`
- *  instead of guessing. */
+ *  OUTBOUND projection, never what the client keeps sending. #4738: a ref whose
+ *  message left that window (host-side native compaction prunes it client-side)
+ *  falls back to the unified store, which outlives the window — only refs absent
+ *  from BOTH report `unknown-message` instead of guessing. */
 export async function buildMessageContent(id: string, ref: string): Promise<MessageContentLookup> {
     const session = await sessionForContent(id);
     if (!session) return { ok: false, reason: "unknown-session" };
     const raw = session.state.messageRefs.byRef[ref];
     const msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
-    if (!msg) return { ok: false, reason: "unknown-message" };
+    if (!msg) {
+        // #4738: pruned from the resident window ≠ gone — the stored bytes
+        // survive host-side native compaction. The ledger (byRef) stays the
+        // authority on identity: refs it never stamped skip the probe entirely.
+        const num = /^m(\d+)$/.exec(ref);
+        if (typeof raw === "string" && num) {
+            try {
+                const rows = getDiskStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                const row = rows && rows.length > 0 ? rows[0] : undefined;
+                const stored = row ? storedMessageText(row.content) : null;
+                if (row && stored !== null) {
+                    const totalBytes = utf8Bytes(stored);
+                    const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                    return {
+                        ok: true,
+                        ref,
+                        role: row.role,
+                        bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                        totalBytes,
+                        truncated,
+                        text: truncated ? sliceUtf8(stored, BLOCK_CONTENT_MAX_BYTES) : stored,
+                    };
+                }
+            } catch {
+                // sidecar degraded mid-request: report the miss, never 500
+            }
+        }
+        return { ok: false, reason: "unknown-message" };
+    }
     const text = msg.text ?? "";
     const totalBytes = utf8Bytes(text);
     const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;

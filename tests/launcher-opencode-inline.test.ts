@@ -28,7 +28,7 @@ interface SpawnRecord {
     command: string;
     args: string[];
     env: NodeJS.ProcessEnv | undefined;
-    windowsVerbatimArguments?: boolean;
+    verbatim: boolean | undefined;
 }
 
 // `bili opencode-inline` (#4669): the launcher must start NO proxy, hand the
@@ -72,7 +72,7 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
 
     const spawns: SpawnRecord[] = [];
     const spawnImpl: SpawnFn = (cmd, args, options) => {
-        spawns.push({ command: cmd, args: [...args], env: options?.env, windowsVerbatimArguments: options?.windowsVerbatimArguments });
+        spawns.push({ command: cmd, args: [...args], env: options?.env, verbatim: options?.windowsVerbatimArguments });
         const child = makeFakeChild(0);
         const orig = child.on!.bind(child);
         (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -106,16 +106,27 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
             { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(spawns.length, 1, "exactly one child (opencode itself) — no proxy spawn");
-        const env = spawns[0].env!;
+        // #679: on Windows the .cmd shim rides comspec /d /s /c "<line>"
+        // (CreateProcess cannot execute a batch file); elsewhere it spawns directly.
+        // Expectations derive from the child's captured env, not ambient
+        // process.env — concurrent tests in one CI shard rewrite globals mid-flight (#4599).
+        const cap = spawns[0];
         if (process.platform === "win32") {
-            assert.equal(spawns[0].command, env.COMSPEC?.trim() ? env.COMSPEC : "cmd.exe");
+            // Mirror planClientSpawn's case-insensitive probe: sanitized env
+            // copies keep the OS key casing (`ComSpec`), plain objects don't (#4599).
+            const ce = cap.env ?? {};
+            const childComspec = ce.COMSPEC ?? ce.ComSpec ?? ce.comspec;
+            const expectedComspec = typeof childComspec === "string" && childComspec.trim().length > 0 ? childComspec : "cmd.exe";
+            assert.equal(cap.command, expectedComspec, "#679 comspec wrap uses the child env's COMSPEC");
             const quotedOc = /\s/.test(fakeOc) ? `"${fakeOc}"` : fakeOc;
-            assert.deepEqual(spawns[0].args, ["/d", "/s", "/c", `"${quotedOc}"`]);
-            assert.equal(spawns[0].windowsVerbatimArguments, true);
+            assert.deepEqual(cap.args, ["/d", "/s", "/c", `"${quotedOc}"`]);
+            assert.equal(cap.verbatim, true, "#679 verbatim argv keeps cmd.exe from re-splitting");
+            assert.match(cap.args[3] ?? "", /^".*\.cmd"$/, "comspec line wraps the quoted .cmd shim");
         } else {
-            assert.equal(spawns[0].command, fakeOc);
-            assert.deepEqual(spawns[0].args, []);
+            assert.equal(cap.command, fakeOc);
+            assert.deepEqual(cap.args, []);
         }
+        const env = cap.env!;
         assert.equal(env.BILI_OPENCODE_INLINE, "1");
         assert.equal(env.BILLION_CONTEXT_PROXY, undefined, "inherited BILLION_CONTEXT_PROXY must be stripped (attach would win)");
         assert.equal(env.HTTPS_PROXY, undefined, "inherited HTTPS_PROXY must be stripped (no MITM lane)");
@@ -181,7 +192,7 @@ test("runLaunch opencode-inline: refuses (exit 2) when the bili opencode plugin 
 
     const spawns: SpawnRecord[] = [];
     const spawnImpl: SpawnFn = (cmd, args, options) => {
-        spawns.push({ command: cmd, args: [...args], env: options?.env });
+        spawns.push({ command: cmd, args: [...args], env: options?.env, verbatim: options?.windowsVerbatimArguments });
         return makeFakeChild(0);
     };
     const prevExit = process.exit;

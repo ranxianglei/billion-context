@@ -11,6 +11,7 @@ import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
+import { stampBillingPrice } from "../billing.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -32,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -40,7 +41,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -64,6 +65,7 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
@@ -1085,15 +1087,29 @@ async function handleRequest(
                           // semantics): ride the verbatim id — never route
                           // empty-tag traffic through the order resolver
                           // (codex turn-1 shape keys by its session header).
-                          ? (anthropicIdentity?.value ?? anthropicSignal)
-                          : personaConversationOrder(
-                              anthropicIdentity?.value ?? anthropicSignal,
-                              (parsed as AnthropicRequestBody).messages,
-                              personaSystemText,
-                              pluginReportedModel(req.headers),
-                          ))
-                    : anthropicIdentity?.value ?? anthropicSignal)
-            : protocol === "openai"
+                           ? (anthropicIdentity?.value ?? anthropicSignal)
+                           : personaConversationOrder(
+                               anthropicIdentity?.value ?? anthropicSignal,
+                               (parsed as AnthropicRequestBody).messages,
+                               personaSystemText,
+                               pluginReportedModel(req.headers),
+                           ))
+                     : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
+                       && !sideRequestLike && personaSystemText !== ""
+                       // #4352: header-less claude code subagents (VS Code
+                       // build) ride the raw parent id; route them through the
+                       // continuity-aware order resolver so a history-disjoint
+                       // ride forks onto its own |sub:<fp> lane while a
+                       // continuing main conversation keeps the raw key on
+                       // order+content evidence (#2944).
+                       ? personaConversationOrder(
+                           anthropicIdentity?.value ?? anthropicSignal,
+                           (parsed as AnthropicRequestBody).messages,
+                           personaSystemText,
+                           pluginReportedModel(req.headers),
+                         )
+                       : anthropicIdentity?.value ?? anthropicSignal)
+             : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
@@ -1788,7 +1804,17 @@ async function handleRequest(
                 log("info", `[${sessionId}] [pi-subagents] child "${subagentFallback.agent ?? "unknown"}" role allowlist lacks ACP context tools — serving proxy-style compression channel (#2268)`);
             }
         }
-        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present;
+        // #4855: a plugin whose host declines to put the ACP tools in the outgoing request (Hermes
+        // defers every plugin toolset behind tool_search) asks for the proxy channel explicitly.
+        // Same demotion as the two signals above — identity/budget stay plugin-bound, compression
+        // moves server-side — so a deferred toolset stops degenerating into anonymous proxy mode.
+        const compressionProxy = pluginCompressionProxyHeader(req.headers);
+        if (compressionProxy && session.metadata.compressionProxyNotified !== true) {
+            session.metadata.compressionProxyNotified = true;
+            markDirty(session);
+            log("info", `[${sessionId}] [plugin] "${pluginAgent}" asked for the proxy compression channel (native tools are not in this request) — identity and budget stay plugin-bound`);
+        }
+        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present && !compressionProxy;
         // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
         // channel that can round-trip the full original, so CCR arms only where
         // that channel exists and is resolvable: proxy mode always (the proxy
@@ -2405,13 +2431,34 @@ async function handleRequest(
                     // model's models.dev price (absolute $/Mtok) so out-of-box
                     // reports read in real money instead of Anthropic-ratio
                     // guesses. Report-only — no trigger impact.
-                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) session.metadata.cachePriceProfile = cs.priceProfile;
-                    else {
-                        const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    // #4899 follow-up: the two sources carry DIFFERENT UNIT
+                    // SYSTEMS in one field — user-configured values are
+                    // dimensionless RATIOS (input ≡ 1), registry fallbacks are
+                    // absolute $/Mtok. The companion flag records which, so the
+                    // panel's dollar views can anchor ratios against the
+                    // session's stamped billing price (or stay tokens-only)
+                    // while every existing consumer keeps reading the profile
+                    // verbatim. The flag clears with the profile.
+                    const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) {
+                        session.metadata.cachePriceProfile = cs.priceProfile;
+                        session.metadata.cachePriceProfileAbs = false;
+                    } else {
                         const registryProfile = peekRegistryPriceProfile(requestModel, priceHost);
-                        if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
-                        else delete session.metadata.cachePriceProfile;
+                        if (registryProfile !== undefined) {
+                            session.metadata.cachePriceProfile = registryProfile;
+                            session.metadata.cachePriceProfileAbs = true;
+                        } else {
+                            delete session.metadata.cachePriceProfile;
+                            delete session.metadata.cachePriceProfileAbs;
+                        }
                     }
+                    // #4899: stamp the billing price for this request's model
+                    // (config `billing.prices` > models.dev) so the usage-report
+                    // settle path bills USD without re-resolving. Model-less
+                    // requests keep the previous stamp; a model with NO resolvable
+                    // price clears it (tokens-only display, never fake dollars).
+                    stampBillingPrice(session, requestModel, priceHost);
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW
@@ -2529,6 +2576,11 @@ async function handleRequest(
                 }
                 prepared = await runPrepare();
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
+                // #4528: prepare ran the per-turn O(messages) scan passes over
+                // the resent history; yield so UI/API requests queue-drained
+                // during it are served before the (possibly multi-round)
+                // compression pass starts.
+                await yieldToEventLoop();
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
@@ -2692,6 +2744,10 @@ async function handleRequest(
                         gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
+                // #4528: last local-processing yield before the upstream
+                // forward — anything that queued during the turn is served
+                // here rather than behind the response stream setup.
+                await yieldToEventLoop();
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };

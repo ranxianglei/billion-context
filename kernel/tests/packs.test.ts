@@ -375,31 +375,13 @@ test("lean surface applies to wire tools via applyAcpToolOverrides", () => {
     leanPack.surface.toolPrompts?.compress?.description,
   );
   const params = compress.function.parameters as {
-    properties: {
-      content: {
-        anyOf: {
-          items?: {
-            anyOf: {
-              type: string;
-              properties?: Record<string, { description?: string }>;
-            }[];
-          };
-        }[];
-      };
-    };
+    properties: { content: { type?: string; description?: string } };
   };
-  const objectForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "object",
-  );
-  assert.ok(objectForm?.properties?.startId);
+  assert.equal(params.properties.content.type, "string");
   assert.equal(
-    objectForm!.properties!.startId!.description,
-    "Inclusive first mNNNNN or bN ref.",
+    params.properties.content.description,
+    leanPack.surface.toolPrompts?.compress?.paramDescriptions?.content,
   );
-  const lineForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "string",
-  );
-  assert.ok(lineForm, "line-form string variant is taught in the schema");
 });
 
 test("pack promptSections flow into buildCompressSystemPrompt", () => {

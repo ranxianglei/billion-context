@@ -32,7 +32,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow } from "./store.js";
+import type { MessageRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -212,6 +212,16 @@ export class UnifiedShadow {
                     } catch {
                         /* absent sidecar files are fine */
                     }
+                }
+                // #4609: the verdict cache belongs to the quarantined file set —
+                // move it along so the fresh store starts with a clean cache
+                // (its stats differ anyway; this keeps the directory honest).
+                try {
+                    const cacheFrom = `${dir}/index.db.chk`;
+                    renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
+                    quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
+                } catch {
+                    /* absent cache is fine */
                 }
                 loggerLog(
                     "error",
@@ -765,6 +775,15 @@ export class UnifiedShadow {
         return this.sync.getMessages(sessionId);
     }
 
+    /** #4738: per-ref stored message bodies (sync store only, like
+     *  tailViewRows) — the web preview fallback when host-side native
+     *  compaction pruned the resident window. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (this.sync === null || refNums.length === 0) return [];
+        this.assertLive();
+        return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         this.assertLive();
@@ -795,16 +814,25 @@ export class UnifiedShadow {
         return -1;
     }
 
-    /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
-     *  cloning parent rows the shadow has already mirrored keeps the child
-     *  view self-consistent in both modes; a parent with no rows (never
-     *  mirrored) clones nothing and the fork proceeds kernel-only. */
+    /** #4730: highest live seq — the fork endpoint's inclusive throughSeq
+     *  (NOT count - 1: tombstones keep their seq). Null when the unified
+     *  store is unavailable or the session has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.lastLiveSeq(sessionId);
+    }
+
+    /** #4316 PR3/3: fork adoption row clone (SYNC facade — sqlite only).
+     *  Works in shadow AND full mode: cloning parent rows the shadow has
+     *  already mirrored keeps the child view self-consistent in both modes;
+     *  a parent with no rows (never mirrored) clones nothing and reports
+     *  false so the fork proceeds kernel-only. Network backends
+     *  (sync === null) cannot serve this sync facade — the fork lane awaits
+     *  cloneSessionRowsAsync instead (#4911). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
         this.assertLive();
-        if (this.sync !== null) {
-            this.sync.cloneSessionRows(parentId, childId, throughSeq);
-            return true;
-        }
+        if (this.sync !== null) return this.sync.cloneSessionRows(parentId, childId, throughSeq);
         return false;
     }
 
@@ -1085,6 +1113,39 @@ export class UnifiedShadow {
 
     tailViewRowsAsync(sessionId: string): Promise<MessageRow[]> {
         return this.viaAsync([], () => this.tailViewRows(sessionId), () => this.backend!.getMessages(sessionId));
+    }
+
+    /** #4730/#4911: async twin of lastLiveSeq — the fork endpoint's inclusive
+     *  throughSeq awaits this one. Network backends cannot serve the sync
+     *  facade; sqlite delegates to the identical sync body via viaAsync. */
+    lastLiveSeqAsync(sessionId: string): Promise<number | null> {
+        return this.viaAsync(null, () => this.lastLiveSeq(sessionId), async () => {
+            if (this.stats.disabled) return null;
+            try {
+                return await this.backend!.lastLiveSeq(sessionId);
+            } catch (err) {
+                loggerLog("warn", `[storage] lastLiveSeq failed for ${sessionId} (${String(err)}) — kernel-only fork bound`);
+                return null;
+            }
+        });
+    }
+
+    /** #4316 PR3/3, #4911: async twin of cloneSessionRows — routes the fork
+     *  adoption row clone through the backend on network backends; sqlite
+     *  delegates to the identical sync body. Serialized on the shadow queue
+     *  like every other write twin so it can never race a pending parent
+     *  ingest. A failed or disabled sidecar degrades to the kernel-only
+     *  fork (false) — the fork itself must never fail for a storage nicety. */
+    cloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        return this.viaAsync(false, () => this.cloneSessionRows(parentId, childId, throughSeq), async () => {
+            if (this.stats.disabled) return false;
+            try {
+                return await this.enqueue(() => this.backend!.cloneSessionRows(parentId, childId, throughSeq));
+            } catch (err) {
+                loggerLog("warn", `[storage] fork row clone ${parentId} -> ${childId} failed (${String(err)}) — kernel-only fork`);
+                return false;
+            }
+        });
     }
 
     getCcrAsync(sessionId: string): Promise<MessageContentStore | null> {

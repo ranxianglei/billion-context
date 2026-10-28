@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeDelegateTool, runningRunsSnapshot, setDelegatePolicy } from "../src/delegate-tool.js";
@@ -84,18 +84,31 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 8000): Pro
 }
 
 let fixtureDir: string;
-let fastCli: string;
+let gatedCli: string;
 let slowCli: string;
 
 before(async () => {
   fixtureDir = join(tmpdir(), "acp-delegate-widget-test");
   await mkdir(fixtureDir, { recursive: true });
-  const fake = (delayMs: number) =>
-    `process.stdin.resume();\nsetTimeout(() => process.exit(0), ${delayMs});\n`;
-  fastCli = join(fixtureDir, "fake-pi-fast.js");
+  // Gated fake CLI: stays alive while the sentinel file is absent and exits on
+  // the first poll tick that sees it. Lets a test hold a concurrency slot
+  // deterministically instead of racing a fixed delay against wall clock.
+  const gated = [
+    "process.stdin.resume();",
+    'const fs = require("fs");',
+    "const gate = process.env.PI_TEST_GATE_FILE;",
+    "const iv = setInterval(() => {",
+    "  let seen = false;",
+    "  try { seen = fs.existsSync(gate); } catch { /* unresolvable path: keep waiting */ }",
+    "  if (seen) process.exit(0);",
+    "}, 20);",
+    "setTimeout(() => process.exit(0), 8000);",
+    "",
+  ].join("\n");
+  gatedCli = join(fixtureDir, "fake-pi-gated.cjs");
   slowCli = join(fixtureDir, "fake-pi-slow.js");
-  await writeFile(fastCli, fake(150), "utf8");
-  await writeFile(slowCli, fake(900), "utf8");
+  await writeFile(gatedCli, gated, "utf8");
+  await writeFile(slowCli, "process.stdin.resume();\nsetTimeout(() => process.exit(0), 900);\n", "utf8");
 });
 
 test("widget state machine: queued→running transition needs the launch poke (#2737)", () => {
@@ -174,8 +187,14 @@ test("queued run renders once it enters running under maxConcurrent=1 (#2737)", 
   delegateStatusWidget.setContext(tuiCtx(ui, cwd), runningRunsSnapshot, "");
   const baseline = liveTimers.size;
 
+  // A's child must hold its slot until we say so: the gated CLI exits only
+  // when the sentinel file appears, so B can never observe a free slot early
+  // (a fixed-delay fake raced wall clock on loaded Windows runners).
+  const gateFile = join(fixtureDir, "gate-widget-q");
+  await unlink(gateFile).catch(() => {});
   setDelegatePolicy({ ...DEFAULT_DELEGATE_POLICY, maxConcurrent: 1 });
-  process.env.PI_CLI_PATH = fastCli;
+  process.env.PI_CLI_PATH = gatedCli;
+  process.env.PI_TEST_GATE_FILE = gateFile;
   try {
     const resA = await tool.execute(
       "tc-widget-q-a",
@@ -201,11 +220,16 @@ test("queued run renders once it enters running under maxConcurrent=1 (#2737)", 
     assert.ok(early.some((c) => c.lines!.some((l) => l.includes("researcher"))), "A rendered while running");
     assert.ok(!calls.some((c) => c.lines !== undefined && c.lines!.some((l) => l.includes("worker"))), "B not rendered while queued");
 
+    // Release A: its child exits on the next poll tick, the FIFO queue drains
+    // event-driven and spawns B (whose child sees the sentinel already present
+    // and exits promptly). No sleep anywhere on this path.
+    await writeFile(gateFile, "", "utf8");
     await waitFor(
       () => calls.some((c) => c.lines !== undefined && c.lines!.some((l) => l.includes("worker"))),
       "B rendered after entering running",
+      10000,
     );
-    await waitFor(() => sent.length >= 2, "both completions", 10000);
+    await waitFor(() => sent.length >= 2, "both completions", 15000);
     await waitFor(
       () => [...calls].reverse().find((c) => c.key === WIDGET_KEY)?.lines === undefined,
       "widget cleared after all runs finished",
@@ -214,5 +238,7 @@ test("queued run renders once it enters running under maxConcurrent=1 (#2737)", 
   } finally {
     setDelegatePolicy(DEFAULT_DELEGATE_POLICY);
     delete process.env.PI_CLI_PATH;
+    delete process.env.PI_TEST_GATE_FILE;
+    await unlink(gateFile).catch(() => {});
   }
 });

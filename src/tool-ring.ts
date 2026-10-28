@@ -152,9 +152,74 @@ export function lookupToolWitness(name: string, args: unknown): Set<string> {
     return sessions ? new Set(sessions) : new Set();
 }
 
+// ── #4580: tool_use id → session ring ────────────────────────────────────────
+// Claude Code (≥2.1.308) stamps every MCP tools/call with the originating
+// tool_use id (_meta["claudecode/toolUseId"]) — including calls made by Task
+// subagents, whose traffic streams through a DIFFERENT proxy session (lane)
+// than the conversation the shared MCP shim bound at startup. The (name,
+// args) witness hash cannot tell them apart (subagent compresses can collide
+// with the parent's or be absent from the parent's ring entirely), but the
+// proxy witnessed each tool_use id in exactly one session's response stream.
+// Host-stamped ids therefore route with the same authority as #2024 native
+// caller ids. The ring is observe-only: recording never touches forwarded
+// bytes, and an id absent from the ring simply falls back to the existing
+// routing ladder — fail-closed semantics are unchanged.
+
+/** Same staleness budget as the hash ring: a tools/call POST follows its
+ *  tool_use within seconds; ten minutes tolerates a stuck host. */
+const TOOL_USE_ID_TTL_MS = 10 * 60 * 1000;
+/** Ids are ~30 bytes; a generous cap keeps pathological streams bounded. */
+const TOOL_USE_ID_CAPACITY = 1024;
+
+/** tool_use id → { sessionId, at }. Last write wins: host-issued ids are
+ *  unique per call, so a re-record is a retry/replay, and the most recent
+ *  stream position names the live lane. */
+const toolUseIds = new Map<string, { sessionId: string; at: number }>();
+
+/** Record that `sessionId`'s response stream carried a tool call bearing this
+ *  host id (anthropic tool_use `id`, openai `tool_calls[].id`, responses
+ *  `function_call.call_id`). Called from the same settle paths as
+ *  recordToolWitness. */
+export function recordToolUseId(toolUseId: string, sessionId: string): void {
+    if (toolUseId.length === 0 || toolUseId.length > 512) return;
+    toolUseIds.set(toolUseId, { sessionId, at: nowMs() });
+    while (toolUseIds.size > TOOL_USE_ID_CAPACITY) {
+        // Evict the entry with the smallest recorded time. Full scan — the cap
+        // is tiny and this only runs past it. A re-record keeps its insertion
+        // slot but refreshes `at`, so position order is NOT age order (a
+        // first-inserted id can be the freshest one in the ring).
+        let oldestKey: string | undefined;
+        let oldestAt = Infinity;
+        for (const [k, v] of toolUseIds) {
+            if (v.at < oldestAt) {
+                oldestAt = v.at;
+                oldestKey = k;
+            }
+        }
+        // Never evict what this call just wrote (clock went backwards): leave
+        // the ring one over the cap until a normal insert can evict someone else.
+        if (oldestKey === undefined || oldestKey === toolUseId) break;
+        toolUseIds.delete(oldestKey);
+    }
+}
+
+/** The session whose stream carried this tool_use id, or undefined when the
+ *  id never streamed through this proxy (restart), or its entry expired. */
+export function lookupToolUseIdSession(toolUseId: string): string | undefined {
+    if (toolUseId.length === 0 || toolUseId.length > 512) return undefined;
+    const hit = toolUseIds.get(toolUseId);
+    if (!hit) return undefined;
+    if (nowMs() - hit.at > TOOL_USE_ID_TTL_MS) {
+        toolUseIds.delete(toolUseId);
+        return undefined;
+    }
+    return hit.sessionId;
+}
+
 export function resetToolRingForTest(): void {
     rings.clear();
     hashIndex.clear();
+    toolUseIds.clear();
     clockForTest = undefined;
 }
 
