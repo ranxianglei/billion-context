@@ -228,21 +228,26 @@ async function waitForStatus(port: number, timeoutMs: number): Promise<boolean> 
 
 async function killChild(child: ChildProcess): Promise<void> {
     if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
-    await Promise.race([
-        new Promise<void>((resolve) => child.once("exit", () => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-    ]);
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+        child.once("close", () => {
+            clearTimeout(timer);
+            resolve();
+        });
+        child.kill("SIGTERM");
+    });
 }
 
 /** A TCP listener that accepts connections and then says nothing — invisible
  *  to /__bili/health probes (they time out as "no evidence") but still owns
  *  the socket, so binders get EADDRINUSE. Deterministically forces the LATE
  *  EADDRINUSE decision path instead of the pre-bind foreign-owner ladder. */
-function silentTcpListener(port: number): Promise<net.Server> {
+function silentTcpListener(port: number): Promise<{ close(): Promise<void> }> {
     return new Promise((resolve, reject) => {
+        const sockets = new Set<net.Socket>();
         const server = net.createServer((sock) => {
+            sockets.add(sock);
+            sock.once("close", () => sockets.delete(sock));
             // accept and hang — never answer HTTP; drain the probe's bytes so peer
             // EOF is actually delivered (a paused socket buffers them and never sees
             // EOF) and release the connection, or a dead prober pins server.close()
@@ -251,7 +256,12 @@ function silentTcpListener(port: number): Promise<net.Server> {
             sock.on("end", () => sock.destroy());
         });
         server.once("error", reject);
-        server.listen(port, "127.0.0.1", () => resolve(server));
+        server.listen(port, "127.0.0.1", () => resolve({
+            close: () => new Promise<void>((done) => {
+                server.close(() => done());
+                for (const socket of sockets) socket.destroy();
+            }),
+        }));
     });
 }
 
@@ -319,6 +329,9 @@ function spawnBili(sandbox: string, port: number): { child: ChildProcess; out: {
 async function waitUntilLadderedHealthy(stateHome: string, child: ChildProcess, label: string): Promise<number> {
     let port = 0;
     await waitUntil(async () => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+            throw new Error(`${label} exited before becoming healthy`);
+        }
         const m = readMarkers(stateHome).find((e) => e.pid === child.pid);
         if (!m || typeof m.port !== "number") return false;
         port = m.port as number;
@@ -335,7 +348,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
     let p1Ref: ReturnType<typeof spawnBili> | null = null;
     let p2Ref: ReturnType<typeof spawnBili> | null = null;
     let heldRef: net.Socket | null = null;
-    let squatterRef: net.Server | null = null;
+    let squatterRef: Awaited<ReturnType<typeof silentTcpListener>> | null = null;
     try {
         // P1: the serving proxy that will enter graceful shutdown.
         const p1 = spawnBili(sandbox, port);
@@ -353,7 +366,18 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         });
         heldRef = held;
 
-        p1.child.kill("SIGTERM");
+        if (process.platform === "win32") {
+            // Windows SIGTERM terminates immediately instead of invoking the
+            // handler. The loopback admin route enters the same graceful path.
+            const response = await fetch(`http://127.0.0.1:${port}/__bili/shutdown`, {
+                method: "POST",
+                signal: AbortSignal.timeout(2_000),
+            });
+            assert.equal(response.status, 202, "P1 must accept the graceful shutdown request");
+            await response.arrayBuffer();
+        } else {
+            p1.child.kill("SIGTERM");
+        }
         const p1MarkerFile = path.join(stateHome, "billion-context", "instances", `${p1Marker.instanceId}.json`);
         await waitUntil(async () => {
             let stamped = false;
@@ -395,7 +419,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         heldRef?.destroy();
         if (p1Ref) await killChild(p1Ref.child);
         const squatter = squatterRef;
-        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        if (squatter) await squatter.close();
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
@@ -406,7 +430,7 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
     const port = await freePort();
     await assertPortDead(port, { label: "4982 unverified-twin port" });
     let p2Ref: ReturnType<typeof spawnBili> | null = null;
-    let squatterRef: net.Server | null = null;
+    let squatterRef: Awaited<ReturnType<typeof silentTcpListener>> | null = null;
     try {
         // A registry marker claiming `port` with a LIVE pid and full identity
         // match — but NO portReleasedAt stamp (pre-fix build, or a failed
@@ -456,7 +480,7 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
     } finally {
         if (p2Ref) await killChild(p2Ref.child);
         const squatter = squatterRef;
-        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        if (squatter) await squatter.close();
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
