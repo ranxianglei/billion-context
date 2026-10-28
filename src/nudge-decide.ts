@@ -37,8 +37,6 @@ export const DEFAULT_DECIDE_MAX_TOKENS = 1024;
  *  calls routinely prefill >15 s — measured 25–60 s at 200–450k cached
  *  tokens); this constant is the default and the fallback. */
 export const DEFAULT_DECIDE_TIMEOUT_MS = 15_000;
-/** Back-compat alias for the pre-#5030 name (imported by server.ts). */
-export const DECIDE_TIMEOUT_MS = DEFAULT_DECIDE_TIMEOUT_MS;
 /** Consecutive hard failures before the next arm falls back to the advisory
  *  nudge once and resets the counter. */
 export const DECIDE_FALLBACK_THRESHOLD = 3;
