@@ -259,6 +259,25 @@ function substrateDestructionPauseParagraph(n: number): string {
     return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one success clears this breaker. If acp_status reports no compressible ranges, continue your task without compressing.]`;
 }
 
+// #4812: short refusal for parse-failure receipts once the breaker has climbed
+// PAST its arm moment (n > threshold). The full format lecture is first-sight
+// teaching — failures 1-3 deliver it, and the arm-moment receipt (n ==
+// threshold) keeps its verbatim pause paragraph. Observed in the field: a
+// looping model re-issued the same malformed call six times and bili
+// re-broadcast the same ~2K-token lecture plus guard plus paragraph on every
+// attempt (~12K burned, all ignored) — the breaker escalated wording but never
+// enforced. From n+1 on the receipt collapses to this one-liner instead. It is
+// self-contained (hideConsumedCompressCalls may have folded the earlier
+// lectures away) and deliberately never mentions acp_status: the loop-noise
+// paragraph orders "do not poll acp_status", and #2360 measured that two
+// contradictory orders in one receipt get obeyed as zero. Calls whose args DO
+// parse are never refused here (see applyRanges), so the #2432 substrate
+// recovery step — acp_status once, then ONE live range — still goes through
+// and can clear the breaker.
+function armedRefusalReceipt(n: number, decayMinutes: number): string {
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+}
+
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
@@ -814,30 +833,78 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
-/** #4316 layer 3 PR3/3: does this compress call cite a ref that changed
- *  hands in this process's one-time ledger re-stamp? Returns a one-line
- *  explanation when at least one cited ref is superseded, null when the call
- *  is clean (or the session never re-stamped — the common case). */
-export function supersededRefRejection(
-    ranges: { startRef: string; endRef: string }[],
+/** #4316 layer 3 PR3/3, #4797 rework: resolve a compress call's refs
+ *  against the CURRENT live map first, the superseded map second, and refuse
+ *  only genuinely-dead cites.
+ *
+ *  The original span-scan refused any range with a superseded KEY anywhere
+ *  between its endpoints — but the restamp's vacated numbers can be handed to
+ *  other messages as seq+1 targets in the same sweep, so in a dense space a
+ *  superseded key is routinely ALSO the live ref of a different message
+ *  (exactly the numbers acp_status advertises). That made the guard reject
+ *  every advertised range and dead-loop the session: "call acp_status" →
+ *  status lists the same live numbers → refused again — the proxy's own
+ *  preflight rescue included (#4797).
+ *
+ *  Resolution ladder, per ENDPOINT (span folding is endpoint-defined; the
+ *  interior number scan only manufactured false hits):
+ *  1. live in the current map → keep as-is (collision-band artifact, the
+ *     common case for numbers straight out of acp_status / the nudge);
+ *  2. superseded key (genuinely vacated) → identity-preserving translation
+ *     oldRef → rawId → the same message's current ref — a model citing a
+ *     number it saw BEFORE the restamp folds the SAME messages, never the
+ *     new owner of that number;
+ *  3. neither → leave to the kernel's boundary-not-found handling.
+ *  Refusal only when an endpoint is a superseded key whose translation
+ *  dead-ends (the message lost its mapping entirely — an honest stale cite).
+ *
+ *  Transitional honesty: for sessions restamped by kernels WITHOUT the
+ *  superseded-liveness prune, case 1 can in principle swallow a resent
+ *  pre-restart call's intent (number now owned by someone else). The replay
+ *  window is seconds; the deadlock it replaces is permanent — live-first is
+ *  the right trade, and the kernel prune removes the ambiguity entirely for
+ *  fresh restamps. */
+interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
+    rejection: string | null;
+    translatedRanges: T[];
+    translated: number;
+}
+
+export function supersededRefRejection<T extends { startRef: string; endRef: string }>(
+    ranges: T[],
     session: Session,
-): string | null {
+): SupersededResolution<T> {
     const superseded = session.restampSuperseded;
-    if (!superseded || superseded.size === 0) return null;
-    const hits: string[] = [];
-    for (const range of ranges) {
-        const start = refToIndex(range.startRef);
-        const end = refToIndex(range.endRef);
-        if (start === null || end === null) continue;
-        for (let index = start; index <= end; index++) {
-            const ref = indexToRef(index);
-            if (superseded.has(ref)) hits.push(ref);
-        }
+    const out: SupersededResolution<T> = { rejection: null, translatedRanges: [], translated: 0 };
+    if (!superseded || superseded.size === 0) {
+        out.translatedRanges = ranges.map((r) => ({ ...r }));
+        return out;
     }
-    if (hits.length === 0) return null;
-    const listed = hits.slice(0, 5).join(", ");
-    const more = hits.length > 5 ? ` (+${hits.length - 5} more)` : "";
-    return `ref(s) ${listed}${more} were re-numbered by the ledger alignment. Call acp_status to see the current refs.`;
+    const byRef = session.state.messageRefs?.byRef ?? {};
+    const byRaw = session.state.messageRefs?.byRaw ?? {};
+    const dead: string[] = [];
+    const resolveEndpoint = (ref: string): string => {
+        if (byRef[ref] !== undefined) return ref;
+        const rawId = superseded.get(ref);
+        if (rawId === undefined) return ref;
+        const next = byRaw[rawId];
+        if (typeof next === "string" && next !== ref && byRef[next] === rawId) {
+            out.translated++;
+            return next;
+        }
+        dead.push(ref);
+        return ref;
+    };
+    out.translatedRanges = ranges.map((range) => ({
+        ...range,
+        startRef: resolveEndpoint(range.startRef),
+        endRef: resolveEndpoint(range.endRef),
+    }));
+    if (dead.length === 0) return out;
+    const listed = dead.slice(0, 5).join(", ");
+    const more = dead.length > 5 ? ` (+${dead.length - 5} more)` : "";
+    out.rejection = `ref(s) ${listed}${more} were re-numbered by the ledger alignment and no longer resolve to a live message. Re-read the current labels with acp_status and re-issue.`;
+    return out;
 }
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
@@ -845,7 +912,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
-    const { ranges, diagnostics } = parsed;
+    let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
@@ -889,6 +956,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
+        // #4812: enforce the armed breaker on parse-failure receipts — see
+        // armedRefusalReceipt for the invariants (arm-moment receipt unchanged;
+        // parsing-valid calls never blocked; preflight lane untouched via
+        // trackLoop).
+        const armedDetail = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
+        if (armedDetail !== undefined && armedDetail.n > COMPRESS_LOOP_THRESHOLD) {
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
+            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
+        }
         if (isEmptyCall) {
             return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
@@ -909,16 +985,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
-    // #4316 PR3/3: this process re-stamped the citation space onto the ledger
-    // at cold load; a resent in-flight call may still cite pre-restart numbers
-    // that now belong to DIFFERENT messages. Folding those would silently
-    // compress the wrong span — refuse, point at the fresh labels, let the
-    // caller re-read them. Cheap and safe: refusal never mis-folds, and the
-    // one-time cost disappears once the caller re-syncs.
-    const supersededHit = supersededRefRejection(ranges, ctx.session);
-    if (supersededHit !== null) {
-        ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededHit} (#4316 PR3/3)]`);
-        return compressResult(`[Compression REFUSED: ${supersededHit} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
+    // #4316 PR3/3 (#4797 rework): resolve the cited refs against the live map
+    // first, the superseded map second — see supersededRefRejection. Live
+    // endpoints pass untouched; genuinely-vacated ones are translated onto
+    // the SAME message's current ref (identity-preserving); only
+    // dead-end translations refuse.
+    const supersededRes = supersededRefRejection(ranges, ctx.session);
+    if (supersededRes.rejection !== null) {
+        ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededRes.rejection} (#4316 PR3/3)]`);
+        return compressResult(`[Compression REFUSED: ${supersededRes.rejection} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
+    }
+    if (supersededRes.translated > 0) {
+        ranges = supersededRes.translatedRanges;
+        ctx.log(`[acp-proxy: translated ${supersededRes.translated} superseded ref(s) onto current labels (identity-preserving, #4797): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
+    } else {
+        ranges = supersededRes.translatedRanges;
     }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");

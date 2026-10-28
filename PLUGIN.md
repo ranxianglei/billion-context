@@ -43,7 +43,10 @@ Fetch once at plugin startup.
     "agent": "x-bili-plugin",
     "conversation": "x-bili-plugin-conversation",
     "contextWindow": "x-bili-plugin-context-window",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "maxOutput": "x-bili-plugin-max-output",
+    "model": "x-bili-plugin-model",
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "compression": "x-bili-plugin-compression"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
@@ -53,7 +56,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents. `headers.compression` names an optional per-request override (#4855): when your host keeps the registered ACP tools out of the outgoing request (Hermes defers every plugin toolset behind `tool_search`), stamp `proxy` on that header alongside the identity headers — the proxy then keeps the session identity and model budget bound to your conversation but serves compression through its own wire channel (it injects the tools and executes compress server-side). Use it only when advertised; older proxies omit it, and the proxy honors it only from a request that already carries `headers.agent`.
 
 ### 2. Request headers
 

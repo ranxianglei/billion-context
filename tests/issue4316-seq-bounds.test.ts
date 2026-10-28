@@ -86,19 +86,27 @@ test("#4316: a block whose covered messages are present carries their real seq b
     }
 });
 
-test("#4316: a block whose covered ids are absent from the transcript keeps placeholder 0 (no crash, honest gap)", () => {
+test("#4316/#4725: a block whose covered ids are absent from the transcript stores the -1 no-claim sentinel (never a [0,0] claim)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4316-gap-"));
     try {
         const store = UnifiedStore.open(path.join(dir, "index.db"));
         const sid = "sess-4316-gap";
         // Visible tail holds only h_x/h_y; the block covers h_old, which was
         // folded away / imported pre-fold and thus has no seq row to join.
+        // PR #4725 N1: [0,0] read back as a REAL claim over seq 0 and would
+        // suppress the seq-0 message as already folded; the -1/-1 sentinel is
+        // absence of a claim (and keeps the #4608 preserve-on-unknown CASE
+        // honest on re-save).
         store.ingestSession(planIngest(session(sid, [msg("h_x", "user"), msg("h_y", "assistant")], [block("b1", ["h_old"])])));
 
         assert.equal(seqOf(store, sid, "h_old"), undefined, "fixture sanity: h_old must NOT be a transcript row");
         const b = store.getBlocks(sid).find((x) => x.blockId === "b1")!;
-        assert.equal(b.startSeq, 0, "unresolvable coverage keeps the 0 placeholder, never a fabricated bound");
-        assert.equal(b.endSeq, 0, "unresolvable coverage keeps the 0 placeholder, never a fabricated bound");
+        assert.equal(b.startSeq, -1, "unresolvable coverage stores the -1 sentinel, never a fabricated bound");
+        assert.equal(b.endSeq, -1, "unresolvable coverage stores the -1 sentinel, never a fabricated bound");
+        // The stored sentinel must not claim ANY row — seq 0 included (the
+        // N1 data-loss shape: [0,0] excluded the seq-0 row from uncoveredRows).
+        const uncovered = store.uncoveredRows(sid, [[b.startSeq, b.endSeq]]);
+        assert.deepEqual(uncovered.map((r) => r.msgId).sort(), ["h_x", "h_y"], "sentinel interval claims no transcript row");
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }

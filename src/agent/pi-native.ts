@@ -27,7 +27,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
@@ -306,6 +306,12 @@ export function armNativePi(p: typeof plan): void {
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         const start = singleFlight(bootstrap);
         state.respawn = start;
+        // #4516: a request may hold out for an IN-FLIGHT spawn under the
+        // launcher's own bring-up budget (+margin for health settle) instead of
+        // degrading at the generic 15s readiness cap — a slow cold start
+        // (#4515) must not refuse or direct-send a turn the proxy would have
+        // served had it finished starting a few seconds later.
+        state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
         // #1243: the factory's before_provider_headers reads the proxy base from
         // BILLION_CONTEXT_PROXY, which bootstrap() writes asynchronously — a
         // one-shot's single header event fires before that. Publish the ready
@@ -356,6 +362,7 @@ export function _resetNativeStateForTest(): void {
     state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    state.spawnWaitMs = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;

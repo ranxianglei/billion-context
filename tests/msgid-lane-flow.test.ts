@@ -215,3 +215,42 @@ test("msgid lane flow: turns without msgIds stay on content-derived identities (
         await h.close();
     }
 });
+
+test("msgid lane flow: multi-block wire content degrades to derived ids, never a sticky 400", async () => {
+    const h = await harness(true);
+    try {
+        // #4801 review (P0): dsh/omp wire shapes carry multi-block messages —
+        // an assistant turn of [text, tool_use] converts to TWO core rows
+        // while the client's msgIds stay parallel to the WIRE (one id per
+        // message). A hard 400 on the count mismatch made the turn fail
+        // FOREVER: the client retries the identical shape and only handles
+        // 200/409/503. The lane contract is degrade-not-refuse — the ids for
+        // that delta drop (derived ids pin the rows instead), the turn still
+        // applies, and a subsequent delta with clean 1:1 ids pins again.
+        const seed = await h.turn({ sinceSeq: 0, resync: true, msgIds: ["u1", "a1", "u2"], messages: [umsg("alpha"), amsg("beta"), umsg("gamma")] });
+        assert.equal(seed.status, 200);
+        const next = await h.turn({
+            sinceSeq: seed.appliedSeq ?? 0,
+            msgIds: ["u3", "a2"],
+            messages: [
+                umsg("delta question"),
+                { role: "assistant", content: [{ type: "text", text: "acting" }, { type: "tool_use", id: "tu_1", name: "read", input: { path: "/x" } }] },
+            ],
+        });
+        assert.equal(next.status, 200, "count mismatch after wire→core expansion degrades, not a 400");
+        assert.ok((next.appliedSeq ?? 0) > (seed.appliedSeq ?? 0), "the delta applied and advanced the tip");
+
+        // The dropped ids must NOT be stamped into rows (they were ambiguous);
+        // the derived ids own the turn's rows.
+        const stamped = h.rows().map((r) => r.msgId);
+        assert.ok(!stamped.includes("a2"), "the ambiguous client id was dropped, not misattributed");
+        assert.ok(!stamped.includes("u3"), "the whole delta's ids drop together (per-message granularity is a lie mid-expansion)");
+
+        // Recovery: a clean 1:1 delta pins again — the lane is not poisoned.
+        const after = await h.turn({ sinceSeq: next.appliedSeq ?? 0, msgIds: ["u4"], messages: [umsg("clean follow-up")] });
+        assert.equal(after.status, 200);
+        assert.ok(h.rows().some((r) => r.msgId === "u4"), "subsequent clean deltas pin client ids again");
+    } finally {
+        await h.close();
+    }
+});

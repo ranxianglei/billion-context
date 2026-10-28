@@ -101,25 +101,9 @@ test("issue #374 repro shapes: flat form and string content are accepted by both
   acceptedByBoth({ content: "m00150–m00220 T\nS body" }, 1);
 });
 
-test("every shape parseCompressArgs accepts passes the declared schema", () => {
-  acceptedByBoth({ content: ["m00150-m00220\nS body"] }, 1);
-  acceptedByBoth(
-    { content: [{ startId: "m00150", endId: "m00220", summary: "S" }] },
-    1,
-  );
-  acceptedByBoth(
-    {
-      content: [
-        "m00150-m00160 A\nfirst",
-        { startId: "m00170", endId: "m00220", summary: "second", topic: "B" },
-      ],
-    },
-    2,
-  );
-  acceptedByBoth(
-    { content: [{ startRef: "m00150", endRef: "m00220", summary: "S" }] },
-    1,
-  );
+test("every advertised shape passes both layers", () => {
+  acceptedByBoth({ content: "m00150–m00220 T\nS body" }, 1);
+  acceptedByBoth({ content: "m00150–m00160 A\nfirst\nm00170–m00220 B\nsecond" }, 2);
   acceptedByBoth({ startRef: "m00150", endRef: "m00220", summary: "S" }, 1);
   acceptedByBoth(
     {
@@ -128,10 +112,6 @@ test("every shape parseCompressArgs accepts passes the declared schema", () => {
       ]),
     },
     1,
-  );
-  acceptedByBoth(
-    { content: "m00150–m00160 A\nfirst\nm00170–m00220 B\nsecond" },
-    2,
   );
 });
 
@@ -183,11 +163,13 @@ test("an object under content: schema stays strict, the parser salvages (#470)",
   assert.equal(diagnostics.contentSalvage, true);
 });
 
-test("empty content array passes the schema; the parser degrades gracefully", () => {
-  // Deliberate leniency pin: no minItems. The kernel handles an empty batch
-  // with a warning and zero blocks instead of failing the turn.
-  assert.ok(
+test("empty content array: schema rejects, the parser degrades gracefully", () => {
+  // 2026-10-26 narrowing: array content is no longer advertised, so the
+  // schema layer rejects it. The kernel still honors it with zero blocks
+  // (no minItems leniency moved, only where it lives).
+  assert.equal(
     validate(COMPRESS_PARAMETERS as Record<string, unknown>, { content: [] }),
+    false,
   );
   assert.equal(parseCompressArgs({ content: [] }).ranges.length, 0);
 });
@@ -203,57 +185,69 @@ test("the content description still teaches the line form and the string form", 
   );
 });
 
-test("typed alternatives preserve the former schema's acceptance set", () => {
-  const content = COMPRESS_PARAMETERS.properties.content;
-  const entries = content.anyOf[0].items!.anyOf;
-  const { required: _required, ...object } = entries[1];
-  const former = {
-    ...COMPRESS_PARAMETERS,
-    properties: {
-      ...COMPRESS_PARAMETERS.properties,
-      content: {
-        type: ["array", "string"],
-        items: {
-          anyOf: [
-            entries[0],
-            {
-              ...object,
-              anyOf: entries.slice(1).map(({ required }) => ({ required })),
-            },
-          ],
-        },
-      },
-    },
-  };
-  const values: unknown[] = [
+test("advertised schema admits exactly the string form (2026-10-26 narrowing)", () => {
+  // The former test compared acceptance against the pre-narrowing schema
+  // (anyOf array/string with object entries). #4252's intent is now
+  // structural: content is declared as ONE string branch, no anyOf
+  // anywhere, no top-level topic. Legacy array/object calls stay
+  // parser-honored (kernel leniency unchanged) but are deliberately no
+  // longer schema-valid — the acceptance-set reduction that closes the
+  // guided-decoding blend hole (gate 2026-10-26, qwen3.8 content arrays).
+  const content = (
+    COMPRESS_PARAMETERS.properties as Record<string, unknown>
+  ).content as Record<string, unknown>;
+  assert.equal(content.type, "string");
+  assert.equal(content.anyOf, undefined);
+  assert.equal(
+    (COMPRESS_PARAMETERS.properties as Record<string, unknown>).topic,
     undefined,
-    null,
-    false,
-    42,
-    "s",
-    [],
-    {},
-    ["line"],
-    [42],
-  ];
-  const keys = ["startId", "endId", "startRef", "endRef", "summary", "topic"];
-  for (let mask = 0; mask < 1 << keys.length; mask++) {
-    const range = Object.fromEntries(
-      keys.filter((_, i) => mask & (1 << i)).map((key) => [key, "s"]),
+  );
+  const json = JSON.stringify(COMPRESS_PARAMETERS);
+  assert.ok(!json.includes("anyOf"), "no combinator may reappear anywhere");
+  assert.ok(json.includes("m00150–m00220"), "line-form example kept");
+
+  // Open shell preserved (#374): undeclared props and flat calls validate.
+  for (const input of [
+    { topic: "x" },
+    { startId: "m1", endId: "m2", summary: "s" },
+    { content: "m00150–m00220 t\ns", extra: 1 },
+  ]) {
+    assert.ok(
+      validate(COMPRESS_PARAMETERS as Record<string, unknown>, input),
+      `open shell must keep validating: ${JSON.stringify(input)}`,
     );
-    values.push([range], ["line", range], [{ ...range, extra: true }]);
-    for (const key of keys) values.push([{ ...range, [key]: 42 }]);
   }
-  for (const content of values) {
-    for (const input of [
-      { content },
-      { content, startId: "m1", endId: "m2", summary: "s" },
-    ]) {
-      assert.equal(
-        validate(COMPRESS_PARAMETERS, input),
-        validate(former, input),
-        JSON.stringify(input),
-      );
-    }
+});
+
+test("legacy array content: parser honors, schema no longer advertises", () => {
+  // The narrowing is advertise-side ONLY. The parser keeps recovering
+  // every legacy shape below; a strict pre-validating host would now
+  // reject them, which is the accepted trade (no known upstream validates
+  // outgoing tool args against input_schema; Anthropic/OpenAI do not).
+  const legacy: Array<[unknown, number]> = [
+    [{ content: ["m00150-m00220\nS body"] }, 1],
+    [{ content: [{ startId: "m00150", endId: "m00220", summary: "S" }] }, 1],
+    [
+      {
+        content: [
+          "m00150-m00160 A\nfirst",
+          { startId: "m00170", endId: "m00220", summary: "second", topic: "B" },
+        ],
+      },
+      2,
+    ],
+    [{ content: [{ startRef: "m00150", endRef: "m00220", summary: "S" }] }, 1],
+  ];
+  for (const [input, expected] of legacy) {
+    assert.equal(
+      validate(COMPRESS_PARAMETERS as Record<string, unknown>, input),
+      false,
+      `schema must not advertise array content: ${JSON.stringify(input)}`,
+    );
+    assert.equal(
+      parseCompressArgs(input).ranges.length,
+      expected,
+      `parser must keep honoring legacy shapes: ${JSON.stringify(input)}`,
+    );
   }
 });

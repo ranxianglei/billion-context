@@ -40,93 +40,48 @@ export const ACP_DECOMPRESS_CLOSE = "</acp_decompress>";
  *  parseCompressArgs accepts both (startRef/endRef canonical, startId/endId
  *  legacy drift) — a pre-validating host must reject nothing the kernel
  *  accepts (#374). */
-const COMPRESS_RANGE_OBJECT = {
-  type: "object",
-  properties: {
-    topic: { type: "string" },
-    startId: {
-      type: "string",
-      description: "mNNNNN ref at the start of the range",
-    },
-    endId: {
-      type: "string",
-      description: "mNNNNN ref at the end of the range",
-    },
-    startRef: {
-      type: "string",
-      description: "Alternate spelling of startId",
-    },
-    endRef: {
-      type: "string",
-      description: "Alternate spelling of endId",
-    },
-    summary: {
-      type: "string",
-      description: "Self-contained summary replacing the range",
-    },
-  },
-};
 
-/** Shared parameter schema for every compress wire shape (anthropic
+/**
+ *  Shared parameter schema for every compress wire shape (anthropic
  *  `input_schema`, openai `function.parameters`, responses flat
  *  `parameters`).
  *
- *  ADVERTISED FORM (#4252 decision): exactly one — content = ONE plain
- *  string holding ALL ranges (line form). The parser keeps honoring the
- *  legacy shapes (array content of line strings / range objects, the flat
- *  single-range call, and summary-as-plain-text in content with top-level
- *  refs), but the schema no longer teaches them: advertising several forms
- *  is what led models to blend them into invalid hybrids.
+ *  ADVERTISED FORM (#4252 decision, completed 2026-10-26): exactly one —
+ *  content = ONE plain string holding ALL ranges (line form), declared as
+ *  a single {type:"string"}. The earlier #4252 pass rewrote only the prose
+ *  and kept the anyOf branches; guided-decoding models still blended the
+ *  branches into parser-invalid hybrids (bili gate 2026-10-26: content sent
+ *  as an array of headerless bare-summary strings with a top-level topic),
+ *  so the array alternatives and the top-level `topic` declaration are now
+ *  structurally removed. The parser keeps honoring every legacy shape
+ *  (array content of line strings / range objects, the flat single-range
+ *  call, summary-as-plain-text with top-level refs, top-level topic) —
+ *  narrowing is advertise-side only.
  *
- *  Contract (#374, still holds): the schema must never kill a call the
- *  kernel would honor. It stays an OPEN object schema — no top-level
- *  `required`, no `additionalProperties: false` — so a flat single-range
- *  call {startId, endId, summary} still validates even though those
- *  properties are no longer declared. Do not add strictness here without
+ *  Contract (#374, still holds for the object shell): the schema stays an
+ *  OPEN object schema — no top-level `required`, no
+ *  `additionalProperties: false` — so a flat single-range call
+ *  {startId, endId, summary} and an undeclared top-level `topic` still
+ *  validate. One deliberate acceptance-set reduction vs the pre-2026-10
+ *  schema: `content` as a JSON ARRAY no longer validates (the kernel
+ *  parser still honors it). Do not add strictness here without
  *  re-checking parse-compress-input.ts.
  *
  *  Wire-legality constraint (bili #1299, fixed after the #374 follow-up
- *  regressed it): the TOP LEVEL must stay a plain object schema — no
+ *  regressed it): the TOP LEVEL stays a plain object schema — no
  *  `oneOf`/`allOf`/`anyOf`/`not`. Anthropic rejects tool input_schema with
- *  top-level combinators (400 on every request carrying the tool), so the
- *  content string-vs-array alternation lives in the `anyOf` under `content`
- *  and is enforced by parseCompressInput, never by a top-level combinator.
- *  Copilot Gemini also needs scalar types and self-contained typed
- *  alternatives; keep each nested object alternative's properties with it.
+ *  top-level combinators (400 on every request carrying the tool).
+ *  Copilot Gemini needs scalar types; the single string branch is
+ *  trivially compliant.
  */
+
 export const COMPRESS_PARAMETERS = {
   type: "object",
   properties: {
-    topic: {
-      type: "string",
-      description: "Optional short title for the compressed range",
-    },
     content: {
+      type: "string",
       description:
         "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-      anyOf: [
-        {
-          type: "array",
-          items: {
-            anyOf: [
-              {
-                type: "string",
-                description:
-                  "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
-              },
-              {
-                ...COMPRESS_RANGE_OBJECT,
-                required: ["startId", "endId", "summary"],
-              },
-              {
-                ...COMPRESS_RANGE_OBJECT,
-                required: ["startRef", "endRef", "summary"],
-              },
-            ],
-          },
-        },
-        { type: "string" },
-      ],
     },
   },
 };
@@ -236,7 +191,7 @@ Each message in the conversation is annotated with a <acp tokens="2.1K" type="to
 
 You have five context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Never split a batch into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
@@ -647,48 +602,15 @@ export const ABSORB_TOOL_OPENAI = {
 
 // Gemini native format: flat `{ name, description, parameters }` function
 // declarations (no `{type:"function"}` wrapper), injected as
-// `tools[].functionDeclarations`.
+// `tools[].functionDeclarations`. Since the 2026-10-26 narrowing the
+// parameters are the shared single-string schema: the historical reason
+// for a separate Google shape was `anyOf` rejection by older API
+// revisions, and the narrowed schema no longer uses anyOf at all. The
+// legacy object-array form stays parser-honored (parseCompressInput).
 export const COMPRESS_TOOL_GOOGLE = {
   name: COMPRESS_TOOL_NAME,
   description: COMPRESS_TOOL.description,
-  // `anyOf` is rejected by older API revisions, so `content` declares the
-  // object form; a JSON-encoded string of that array is still accepted by
-  // parseCompressInput, and the line form (a summary whose first line is
-  // 'm00150–m00220 optional topic') is documented in the description.
-  parameters: {
-    type: "object",
-    properties: {
-      topic: {
-        type: "string",
-        description: "Optional short title for the compressed range",
-      },
-      content: {
-        type: "array",
-        description:
-          "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
-        items: {
-          type: "object",
-          properties: {
-            topic: { type: "string" },
-            startId: {
-              type: "string",
-              description: "mNNNNN ref at the start of the range",
-            },
-            endId: {
-              type: "string",
-              description: "mNNNNN ref at the end of the range",
-            },
-            summary: {
-              type: "string",
-              description: "Self-contained summary replacing the range",
-            },
-          },
-          required: ["startId", "endId", "summary"],
-        },
-      },
-    },
-    required: ["content"],
-  },
+  parameters: COMPRESS_PARAMETERS,
 };
 
 export const DECOMPRESS_TOOL_GOOGLE = {

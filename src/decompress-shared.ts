@@ -419,7 +419,11 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     for (const { raw, num } of cov.raws) {
         if (!pickedSet.has(raw)) continue;
         const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
-        if (r.ok) {
+        // #4733: a ref whose stored entry belongs to a DIFFERENT raw id is a
+        // post-restamp frozen alias — serving it here would silently restore
+        // another message's original under this one's citation. Treat as
+        // not-found and fall through to the view text.
+        if (r.ok && r.entry.rawId === raw) {
             parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
             restoredFromStore++;
             continue;

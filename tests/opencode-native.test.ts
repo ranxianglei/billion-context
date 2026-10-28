@@ -31,7 +31,7 @@ import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
-const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
+const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, wireBodyMediaBytes, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
@@ -523,6 +523,51 @@ for (const unavailable of ["dead", "busy-exhausted"] as const) {
         }
     });
 }
+
+// #4912: a body past V8's max string length (~536MB; #3128 admits up to 5GiB)
+// cannot be decoded — the RangeError used to escape the route handler. Now an
+// undecodable body gets no media credit (all-core-text pricing, the same
+// convention as non-JSON bodies) and the arm refuses cleanly. The decoder is
+// injectable so the seam is testable without allocating a multi-GB buffer.
+test("#4912 wireBodyMediaBytes: decodable body still credits inline media", () => {
+    const b64 = "A".repeat(8_000);
+    const raw = JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } }] }] });
+    const buf = new TextEncoder().encode(raw).buffer as ArrayBuffer;
+    assert.equal(wireBodyMediaBytes(buf), Buffer.byteLength(`data:image/png;base64,${b64}`));
+});
+
+test("#4912 wireBodyMediaBytes: undecodable body credits no media instead of throwing", () => {
+    const buf = new ArrayBuffer(16);
+    assert.equal(wireBodyMediaBytes(buf, () => { throw new RangeError("Invalid string length"); }), 0);
+    assert.equal(wireBodyMediaBytes(buf, () => { throw new TypeError("boom"); }), 0);
+});
+
+test("#4912 route: undecodable over-window body refuses cleanly instead of escaping a RangeError", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const body = JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] });
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_4912",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+    };
+    const RealTextDecoder = globalThis.TextDecoder;
+    globalThis.TextDecoder = class {
+        decode(): string { throw new RangeError("Invalid string length"); }
+    } as unknown as typeof TextDecoder;
+    try {
+        await assert.rejects(route(e, s), (err: unknown) => {
+            assert.ok(err instanceof Error && !(err instanceof RangeError), "clean local refusal Error, not the escaped RangeError");
+            assert.match(err.message, /proxy unavailable/);
+            return true;
+        });
+    } finally {
+        globalThis.TextDecoder = RealTextDecoder;
+    }
+    assert.equal(s.proxyBase, undefined);
+    assert.equal(await (e.request as Request).text(), body, "measuring through the clone leaves the original body sendable");
+});
 
 test("route: proxy down + under-window body keeps the fail-open direct send", async () => {
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };

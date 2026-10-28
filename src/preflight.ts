@@ -11,6 +11,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { yieldToEventLoop } from "./yield-loop.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -574,6 +575,52 @@ function truncateSummaryToLimit(text: string, maxChars: number, minChars: number
     if (cut < minChars) cut = room;
     const out = `${text.slice(0, cut)}${marker}`;
     return out.length <= maxChars && out.trim().length >= minChars ? out : null;
+}
+
+// #4740: merge away poison fragments — chunks whose char mass is below
+// the kernel's minCompressRange gate. applyCompression counts msg.text
+// chars and rejects such a range ATOMICALLY, so folding it wastes a whole
+// round (and in the batch lane, one span per range, the range never folds
+// at all). Extend the FOLLOWING chunk to swallow the fragment; a trailing
+// fragment folds into the previous chunk instead. Budget discipline is
+// preserved downstream: the summarizer request content is split by budget
+// (splitSummaryContent), and the alternative to merging is a guaranteed
+// kernel rejection, not a smaller request.
+function mergeSubMinimumFragments(
+    messages: CoreMessage[],
+    spans: Array<[number, number]>,
+    minChars: number,
+    isCoveredIdx?: (idx: number) => boolean,
+): Array<[number, number]> {
+    if (minChars <= 0 || spans.length === 0) return spans;
+    const chars = (s: [number, number]) => {
+        let total = 0;
+        for (let i = s[0]; i <= s[1]; i++) total += (messages[i]?.text ?? "").length;
+        return total;
+    };
+    const out: Array<[number, number]> = [];
+    let fragStart = -1;
+    for (let i = 0; i < spans.length; i++) {
+        const s = spans[i]!;
+        const run: [number, number] = fragStart >= 0 ? [fragStart, s[1]] : [s[0], s[1]];
+        const blockedByCoverage = i + 1 < spans.length && (isCoveredIdx?.(spans[i + 1]![0]) ?? false);
+        if (chars(run) < minChars && i < spans.length - 1 && !blockedByCoverage) {
+            fragStart = run[0];
+            continue;
+        }
+        // Known corner (round-2 review F3, master parity): a sub-min fragment
+        // blocked by coverage with nothing ahead and nothing behind to absorb
+        // it is still emitted — the kernel's apply gate rejects it at the cheap
+        // preview (no LLM call), the walk skips the span and retries next
+        // round; bounded churn, never poison beyond this span. Merging across
+        // the covered boundary would fold covered content into a new range —
+        // worse than the churn.
+        // A trailing fragment (nothing ahead to swallow it) folds backward.
+        if (chars(run) < minChars && out.length > 0) out[out.length - 1]![1] = run[1];
+        else out.push(run);
+        fragStart = -1;
+    }
+    return out;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -1612,6 +1659,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    // #4288: set when the round-top fit exit fired — the walk ended in a
+    // forward decision, and no later verdict may override it (see the final
+    // failure stamp below).
+    let fitExitForward = false;
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
@@ -1628,6 +1679,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
     const minChars = deps.config.compress.minCompressRange;
+    // #4740/#1372: fragment merging must not glue a poison fragment onto a
+    // span that begins with an already-covered message — that span's pure
+    // "already covered" preview verdict IS the #1372 diagnosable trace.
+    const coveredRawIds = new Set<string>();
+    for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredRawIds.add(id);
+    const coveredIdx = (idx: number): boolean => coveredRawIds.has(messages[idx]?.id ?? "");
     // The fit check runs on the real post-fold payload size, not on
     // stats.lastInputTokens: a session without a measured baseline
     // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
@@ -1987,6 +2044,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             break;
         }
         if (poolQueueDrop) break;
+        // #4528: each round re-runs the full O(messages) kernel pass over the
+        // resent history; yield between rounds so UI/API requests on the same
+        // listener are served instead of queueing behind the whole compression
+        // run.
+        await yieldToEventLoop();
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -2049,7 +2111,47 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (decisionTokens < textTarget) break;
+        // #4288: the round-boundary exit must judge on the payload's OWN estimate —
+        // the same floorless quantity the caller's forward gate trusts (#1839/#1492) —
+        // NOT on decisionTokens, which is floored by the session's usage baseline.
+        // After a mid-session switch to a smaller-window model that baseline was
+        // measured under the prior (wider) model and sits above the new target, so a
+        // floored comparison never trips and the loop burns the whole slow
+        // summarization ladder on a payload that already fits (the client then times
+        // out mid-ladder and the session appears stuck).
+        // Judge against the round's fold TARGET, not the hard window limit: callers
+        // may still demand folding on a window-fitting payload — a compressionTarget
+        // below the window (external summary plans, #a66353ac target stability) or a
+        // headroom reservation (codex native compaction, #68f6bfe3).
+        // Compare TEXT to TEXT: roundText is the text-space estimate and textTarget
+        // already subtracts imageReserve, while payloadEstimate is total-space
+        // (roundText + imageReserve) — a total-to-text comparison subtracts the
+        // reserve twice and misses the exit on image lanes.
+        // EXCEPTION (#1195/#987, the reason the original #4294 was reverted): an
+        // OVERFLOW-ARM baseline is upstream rejection evidence for THIS request —
+        // the provider's own counting rejected this exact payload, so the local
+        // text estimate (which cannot see provider-side counting, cache stamps,
+        // tokenizers that differ from ours) may NOT outrank it. Under an arm the
+        // floored decisionTokens comparator stays: the #1195 in-request rescue
+        // must keep folding until the payload fits the STATED window on the
+        // upstream's scale. The arm is one-shot (#1110) and retires on the next
+        // real usage report, so this exception cannot resurrect the #4288
+        // marathon — that burn was driven by a stale USAGE-sourced baseline
+        // measured under a prior wider-window model, which keeps the floorless
+        // roundText path.
+        const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
+        if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+            // #4288: the walk ends in a fit-forward — the caller's gate judges
+            // on the same floorless payloadEstimate and forwards. The final
+            // verdict below must not stamp an exhausted/failure verdict over
+            // this exit just because the STALE-floored currentTokens still
+            // reads over-limit.
+            fitExitForward = true;
+            if (baselineFloor >= textTarget && !armedBaseline) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            break;
+        }
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
@@ -2363,7 +2465,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         triedKeys.add(skipKey);
                         rangesTried += 1;
                     }
-                    const spans = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+                    // #4740: the min-chars floor applies in BOTH regimes. With
+                    // minUnits = 0 a pair range whose tool-result alone exceeds the
+                    // budget split into [call-only fragment][oversized result], and
+                    // the fragment's preview is atomically rejected by the kernel's
+                    // minCompressRange gate (a 64-char call vs min 5000) — in this
+                    // batch lane the range then never folds at all (one span per
+                    // range), and in the walk it burns a preview per round.
+                    const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
                     const span = spans.pop();
                     if (!span) continue;
                     const [cs, ce] = span;
@@ -2583,7 +2692,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
             // exceeding the upstream's real input cap, and halving recovers
             // exactly those cases. Bounded by the per-regime call budget below.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            // #4740: floor in both regimes — see the batch nomination comment.
+            // Sub-floor fragments were guaranteed-rejected previews, not packing.
+            const spans: Array<[number, number]> = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
@@ -2996,7 +3107,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
-    if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
+    // #4288: a fit-forward exit outranks the stale-floored currentTokens —
+    // the payload fits by its own estimate and the caller forwards it; an
+    // exhausted verdict here would report a marathon that did not happen.
+    if ((currentTokens >= limit && !fitExitForward) || failure?.kind === "aborted") result.failure = failure;
     // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
     // char-count upper bound was the trigger arm, never the reject-forward gate.
     result.fitsWindow = result.payloadEstimate < limit;

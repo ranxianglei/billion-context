@@ -60,7 +60,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
-import { log as teeLog } from "./logger.js";
+import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -73,7 +73,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -4041,7 +4041,7 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
-    if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
+    if (inst.host !== opts.host || inst.passthrough !== resolveRecordedPassthrough(opts.passthrough)) return "host-or-passthrough-mismatch";
     // #3436: each cell wants what a spawned child will RECORD, not the raw
     // caller input — the child records loadOptions' gated mitm tier and the
     // parse of the BILI_LAUNCHER_MODEL_* env it receives. Native lanes pass no
@@ -4076,31 +4076,41 @@ async function probeLiveInstances(
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
     isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
-): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
+): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
     if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
     for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
     const checked = await Promise.all(
-        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
+        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo | undefined } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
             const health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) {
                 // #3654: a refused connection and a saturated event loop both
                 // fail this probe — tell them apart in the log: connect-but-
                 // silent is BUSY (alive, loop inside a large fold), not dead.
-                // Still dropped either way (#1335 gate unchanged).
-                const busy = await isConnectable(c.origin);
-                diag?.(busy
-                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654)`
-                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`);
+                // #4811: BUSY candidates are KEPT (health: undefined), not
+                // dropped — dropping them made discovery declare "empty" over a
+                // live same-lane holder, and the spawn that followed raced it
+                // into EADDRINUSE plus a two-writer index.db window before the
+                // twin adoption that finally converged (#3923/#3959). Which
+                // BUSY instances are actually attachable is pickAttachable's
+                // call, on lifecycle evidence. An ANSWERED probe that reports
+                // not-ok (instance draining) stays dropped.
+                if (health === undefined && (await isConnectable(c.origin))) {
+                    diag?.(`native-attach: keep ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654/#4811)`);
+                    return { inst: c, health: undefined };
+                }
+                diag?.(health === undefined
+                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`
+                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
                 return undefined;
             }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
         }),
     );
-    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo } => c !== undefined);
+    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo | undefined } => c !== undefined);
 }
 
 /** #1335: the attach gate — a listener may be attached to only when its
@@ -4109,9 +4119,9 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo | undefined, attachExternal: boolean): boolean {
     if (attachExternal) return true;
-    return health.watchdog?.armed === true;
+    return health?.watchdog?.armed === true;
 }
 
 /** #1660: the user-sovereignty zone marker — neither a declared lane nor a
@@ -4162,7 +4172,7 @@ function normalizeOrigin(o: string): string {
  *  lane-less / user-zone daemon), while "global-fallback" keeps the pre-#2877
  *  wildcard fallback. */
 function pickAttachable(
-    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
@@ -4197,7 +4207,7 @@ function pickAttachable(
         // target, and attachExternal=true (the pre-existing #1335 permissive
         // opt-in — keeping it fully permissive means existing users of that
         // flag see NO change from this flip).
-        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health.watchdog?.armed !== true) {
+        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health?.watchdog?.armed !== true) {
             diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not own lane and not an armed shared daemon (attachPolicy=own-lane)`);
             continue;
         }
@@ -4205,7 +4215,22 @@ function pickAttachable(
         // never an attach target by default; log the refusal once per origin.
         // #1660: a user-zone instance (manual `bili start`) is exempt — the
         // missing watchdog is the user's deliberate posture, not drift.
-        if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
+        // #4811: a BUSY candidate (health probe silent, TCP alive) cannot prove
+        // its watchdog state, so it is attachable only when its lifecycle is
+        // verifiable another way — its own lane (#1231 same-lane spawn
+        // discipline), the explicit attachExternal opt-in, or the user zone.
+        // Declared foreign lanes stay refused while BUSY (#1335 unchanged).
+        if (c.health === undefined) {
+            if (!sameLane && !attachExternal && !isUserZoneInstance(c.inst)) {
+                if (!refusedLog.has(c.inst.origin)) {
+                    refusedLog.add(c.inst.origin);
+                    const msg = `bili: refusing to attach to ${c.inst.origin} (pid ${c.inst.pid}) — health probe silent but TCP alive (BUSY, event loop saturated #3654) and its lifecycle is unverifiable from this lane. Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
+                    console.error(msg);
+                    diag?.(msg);
+                }
+                continue;
+            }
+        } else if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
             if (!refusedLog.has(c.inst.origin)) {
                 refusedLog.add(c.inst.origin);
                 console.error(gateRefusalMessage(c.inst, c.health));
@@ -4244,10 +4269,11 @@ async function waitForStarterInstance(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
+    isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag, isConnectable), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -4273,7 +4299,7 @@ async function waitForStarterInstance(
 function defaultAttachDiag(debug: boolean): (msg: string) => void {
     return (msg: string): void => {
         logHostEvent("info", "", msg);
-        if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
+        if (debug) process.stderr.write(`${logTimestamp()} [info] [v=${VERSION}] ${msg}\n`);
     };
 }
 
@@ -4292,7 +4318,7 @@ export async function findLiveAttachableInstance(
     const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
     const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
     return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
 }
 
@@ -4656,7 +4682,7 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
  *  preference resolver is stateful/sticky (#1660) and must not be touched on
  *  bring-ups where nothing rotates. */
 async function rotateStalePredecessor(
-    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     resolveTargetPort: () => number | undefined,
     opts: LaunchOptions,
     attachUrl: string | undefined,
@@ -4667,12 +4693,17 @@ async function rotateStalePredecessor(
     requestShutdown: (origin: string) => Promise<boolean>,
 ): Promise<void> {
     if (attachUrl !== undefined) return;
-    const stale = probed.filter((c) =>
-        !isUserZoneInstance(c.inst)
-        && c.health.watchdog?.armed === true
-        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
-        && c.health.version !== undefined
-        && isVersionNewer(VERSION, c.health.version));
+    // #4811: BUSY candidates carry no health (probe silent) — their version is
+    // unverifiable, so they are never rotation targets; the type guard drops
+    // them here and keeps `stale` narrowed to real HealthInfo below.
+    const stale = probed.filter(
+        (c): c is { inst: ProxyInstanceFile; health: HealthInfo } =>
+            c.health !== undefined
+            && !isUserZoneInstance(c.inst)
+            && c.health.watchdog?.armed === true
+            && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+            && c.health.version !== undefined
+            && isVersionNewer(VERSION, c.health.version));
     if (stale.length === 0) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
@@ -4807,7 +4838,7 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable);
     const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
@@ -4863,7 +4894,7 @@ export async function ensureProxyRunning(
         // #3404: same host-safe channel as attachTo above — normal startup
         // progress, not user-actionable.
         attachDiag("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes, deps?.isConnectable ?? tcpConnectable);
         if (waited) {
             return attachTo(waited);
         }
@@ -4911,6 +4942,13 @@ export async function ensureProxyRunning(
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
+    // #4811: where THIS spawn's output begins. The port log is append-only and
+    // rotates only at PORT_LOG_MAX_BYTES, so byte 0 may hold another (much
+    // older) spawn's bytes — sampling from here keeps failure reports about
+    // this child. If the file shrank between open and stat (rotation under us)
+    // every byte present is ours and the whole file is sampled.
+    let spawnLogOffset = 0;
+    try { spawnLogOffset = fs.fstatSync(logFd).size; } catch { /* keep 0 */ }
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is
     // the cross-process arbiter: the read above is only a fast path, so a
@@ -5022,10 +5060,21 @@ export async function ensureProxyRunning(
         // open a multi-MB file in %TEMP%.
         const logHeadSample = (): string => {
             try {
+                const size = fs.statSync(logPath).size;
+                // #4811: sample THIS spawn's bytes (from spawnLogOffset), not
+                // byte 0 — an append-only port log keeps every earlier spawn's
+                // output until it rotates at PORT_LOG_MAX_BYTES, and a stale
+                // head actively misdirected triage (#4811 field case: a
+                // two-day-old EADDRINUSE from an older build). A shrunken file
+                // means rotation happened under us — everything left is ours.
+                let start = spawnLogOffset;
+                if (size < start) start = Math.max(0, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
                 const fd = fs.openSync(logPath, "r");
                 try {
-                    const buf = Buffer.alloc(256);
-                    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
@@ -5043,8 +5092,18 @@ export async function ensureProxyRunning(
                 // "0 bytes" alone cannot tell "child wrote nothing" from "output
                 // rotated away" (rotatePortLogIfNeeded renames to .old before
                 // the fd is opened) — say which when the rotated half exists.
-                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
-                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}${logHeadSample()}`;
+                // Same honesty when the child appended NOTHING to a non-empty
+                // file: the bytes on disk then belong to an EARLIER spawn, and
+                // quoting them as this child's head is exactly the #4811
+                // misdirection (a shrunken file means rotation under us — the
+                // bytes left ARE ours, so the tail sample stands). The .old
+                // guard keeps that claim honest: if a rotation happened, the
+                // captured offset is untrustworthy and the sample path applies.
+                const rotatedFile = fs.existsSync(`${logPath}.old`);
+                const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
+                if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
+                if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
+                return `, ${size} bytes${rotated}${logHeadSample()}`;
             } catch {
                 return "";
             }
@@ -5187,7 +5246,7 @@ export async function ensureProxyRunning(
             const rediscoveryDeadline = now() + POST_EXIT_REDISCOVERY_MS;
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
                     // #3404: successful-attach announcement on the recovery
@@ -5418,7 +5477,12 @@ export function planClientSpawn(
             "Set BILI_CLIENT_BIN to the native executable (e.g. the real codex.exe) or to a script entry run under node, or reword the argument.",
         );
     });
-    const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
+    // #4599: Windows env vars are case-insensitive, but sanitized copies
+    // (spread objects, e.g. stripInheritedProxy's inlineEnv) keep the original
+    // key casing — `ComSpec` — where an exact `env.COMSPEC` probe misses it
+    // and silently degrades to the bare-name fallback. Probe every spelling.
+    const comspecRaw = env.COMSPEC ?? env.ComSpec ?? env.comspec;
+    const comspec = nonEmpty(comspecRaw) ? comspecRaw : "cmd.exe";
     return {
         command: comspec,
         args: ["/d", "/s", "/c", buildWindowsCommandLine(cmd, args)],

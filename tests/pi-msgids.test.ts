@@ -271,3 +271,88 @@ test("pi msgids: tool turns pin tool_use and tool_result entry ids by call id", 
         assert.equal(t2.body.msgIds?.length, t2.body.messages?.length, "msgIds parallel to messages");
     });
 });
+
+// --- transform-tolerant walker (cross-model rewrites must not drop msgIds) ---
+// laneMsgIdsForWire is a pure function over (wire, branch) — unit-test the
+// pairing lattice directly. Shapes mirror pi-stable-ai's transformMessages
+// output (verified against its dist): thinking→text, redacted dropped,
+// non-vision image placeholder, tool-call id normalization.
+import { laneMsgIdsForWire } from "../src/agent/pi-msgids.ts";
+
+function msgEntry(id: string, role: string, content: unknown): Record<string, unknown> {
+    return { type: "message", id, message: { role, content } };
+}
+
+test("pi msgids unit: cross-model thinking flattens to text — id still ships", () => {
+    const branch = [
+        msgEntry("e1", "assistant", [{ type: "thinking", thinking: "plan x" }, { type: "text", text: "answer" }]),
+        msgEntry("e2", "user", "next question"),
+    ];
+    const wire = [
+        { role: "assistant", content: [{ type: "text", text: "plan x" }, { type: "text", text: "answer" }] },
+        { role: "user", content: "next question" },
+    ];
+    assert.deepEqual(laneMsgIdsForWire(wire, branch), ["e1", "e2"]);
+});
+
+test("pi msgids unit: redacted thinking dropped cross-model — id still ships", () => {
+    const branch = [
+        msgEntry("e1", "assistant", [{ type: "thinking", redacted: true, thinkingSignature: "sig==" }, { type: "text", text: "answer" }]),
+        msgEntry("e2", "user", "q"),
+    ];
+    const wire = [
+        { role: "assistant", content: [{ type: "text", text: "answer" }] },
+        { role: "user", content: "q" },
+    ];
+    assert.deepEqual(laneMsgIdsForWire(wire, branch), ["e1", "e2"]);
+});
+
+test("pi msgids unit: non-vision image downgrade (incl. collapse) — id still ships", () => {
+    const branch = [
+        { type: "message", id: "e1", message: { role: "user", content: [{ type: "image", data: "AAAA" }, { type: "image", data: "BBBB" }] } },
+        msgEntry("e2", "user", "caption"),
+    ];
+    const wire = [
+        { role: "user", content: [{ type: "text", text: "(image omitted: model does not support images)" }] },
+        { role: "user", content: "caption" },
+    ];
+    assert.deepEqual(laneMsgIdsForWire(wire, branch), ["e1", "e2"]);
+});
+
+test("pi msgids unit: tool-call id renumbered cross-model — ids still ship", () => {
+    const branch = [
+        msgEntry("e1", "assistant", [{ type: "toolCall", id: "call-450char-openai|style", name: "read" }]),
+        { type: "message", id: "e2", message: { role: "toolResult", toolCallId: "call-450char-openai|style", content: [{ type: "text", text: "data" }] } },
+    ];
+    const wire = [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_normalized1", name: "read", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_normalized1", content: "data" }] },
+    ];
+    assert.deepEqual(laneMsgIdsForWire(wire, branch), ["e1", "e2"]);
+});
+
+test("pi msgids unit: genuine text drift still refuses the whole field", () => {
+    const branch = [
+        msgEntry("e1", "assistant", [{ type: "thinking", thinking: "plan x" }, { type: "text", text: "answer" }]),
+        msgEntry("e2", "user", "next question"),
+    ];
+    const wire = [
+        // thinking flattened BUT the text was edited — not a transform, refuse
+        { role: "assistant", content: [{ type: "text", text: "plan x" }, { type: "text", text: "EDITED answer" }] },
+        { role: "user", content: "next question" },
+    ];
+    assert.equal(laneMsgIdsForWire(wire, branch), undefined);
+});
+
+test("pi msgids unit: an inserted wire message still refuses the whole field", () => {
+    const branch = [
+        msgEntry("e1", "user", "q1"),
+        msgEntry("e2", "user", "q2"),
+    ];
+    const wire = [
+        { role: "user", content: "q1" },
+        { role: "user", content: "injected" },
+        { role: "user", content: "q2" },
+    ];
+    assert.equal(laneMsgIdsForWire(wire, branch), undefined);
+});

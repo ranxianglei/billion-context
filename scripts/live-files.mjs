@@ -64,6 +64,10 @@ export const LIVE_FILES = [
     // #3890: spawns the drain fixture; that fixture is listen(0) and reports
     // READY <port>, so no zone band is needed — the entry is for the tripwire
     "tests/issue3890-parent-gone-confirm-drain.test.ts",
+    // #4811: ensureProxyRunning rows drive real instance records + probe
+    // servers; every socket is listen(0), spawns are mocked, so the zone band
+    // is belt-and-braces like #3890's — the entry is for the tripwire
+    "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

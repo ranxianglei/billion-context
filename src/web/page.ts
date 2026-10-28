@@ -18,11 +18,12 @@ export function renderPage(origin: string, version: string, embed = false, theme
     const caPath = rootCaPath();
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
-    // #3536: declare an EMPTY icon so browsers (dsh desktop's Electron frame
-    // included) never fall back to probing /favicon.ico on the proxy origin —
-    // that request used to miss every admin route and get relayed onto the
-    // configured upstream (a wasted request + 403 noise in the log).
-    return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
+    // #3536/#4830: declare the bundled icon explicitly so browsers (dsh
+    // desktop's Electron frame included) fetch it from /favicon.ico — served
+    // locally by admin.ts — instead of falling back to a bare origin probe
+    // that used to miss every admin route and get relayed onto the configured
+    // upstream (a wasted request + timeout noise in the log).
+    return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" type="image/x-icon" href="/favicon.ico"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
 <header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/blog" data-nav="blog" data-i18n="nav.blog">${zh("nav.blog")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
@@ -47,11 +48,14 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="stat"><div class="k" data-i18n="ov.total_requests">${zh("ov.total_requests")}</div><div class="v" id="st-reqs">—</div></div>
 <div class="stat good"><div class="k" data-i18n="ov.gross_saved">${zh("ov.gross_saved")}</div><div class="v" id="st-gross">—</div><div class="s" id="st-gross-sub" data-i18n="common.none">${zh("common.none")}</div></div>
 <div class="stat good"><div class="k" data-i18n="ov.net_saved">${zh("ov.net_saved")}</div><div class="v" id="st-netsaved">—</div><div class="s" id="st-net-sub"></div></div>
+<div class="stat" id="st-payback-card"><div class="k" data-i18n="ov.payback">${zh("ov.payback")}</div><div class="v" id="st-payback">—</div><div class="s" id="st-payback-sub"></div></div>
 <div class="stat"><div class="k" data-i18n="ov.global_hitpct">${zh("ov.global_hitpct")}</div><div class="v" id="st-hitpct">—</div><div class="s" id="st-hit-split" data-i18n="common.none">${zh("common.none")}</div></div>
-<div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div></div>
-<div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div></div>
-<div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div><div class="s" id="st-input-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div><div class="s" id="st-cached-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div><div class="s" id="st-output-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.spend">${zh("ov.spend")}</div><div class="v" id="st-spend">—</div><div class="s" id="st-spend-sub"></div></div>
 </div>
+<div class="dim small" style="margin-top:8px" data-i18n="common.price_est_note">${zh("common.price_est_note")}</div>
 <div style="margin-top:16px">
 <div class="card"><div class="card-h"><span data-i18n="ov.by_protocol">${zh("ov.by_protocol")}</span></div><div class="card-b flush"><div class="twrap tproc"><table class="data"><thead><tr><th data-i18n="common.protocol">${zh("common.protocol")}</th><th class="num" data-i18n="common.sessions">${zh("common.sessions")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</th><th class="num" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th></tr></thead><tbody id="protocol-body"></tbody></table></div></div></div>
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="sys.title">${zh("sys.title")}</span></div><div class="card-b"><dl class="kv">
@@ -91,6 +95,16 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="summary-fields"></div>
 <div class="cfg-dirty-note small" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <button id="save-summary" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button>
+</div></div>
+<div class="card" id="card-pricing"><div class="card-h"><span data-i18n="cfg.pricing">${zh("cfg.pricing")}</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px" data-i18n="cfg.pricing_desc">${zh("cfg.pricing_desc")}</p>
+<div id="pricing-fields" style="display:flex;flex-direction:column;gap:12px"><span class="dim small" data-i18n="common.loading">${zh("common.loading")}</span></div>
+<div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<input id="pricing-add-model" class="field-input mono" style="flex:1;min-width:220px" placeholder="${zh("cfg.pricing_add_ph")}">
+<button id="pricing-add-btn" class="btn sm" data-i18n="cfg.pricing_add">${zh("cfg.pricing_add")}</button>
+</div>
+<div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
+<div style="margin-top:10px"><button id="save-pricing" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
 <div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>

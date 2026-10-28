@@ -65,7 +65,12 @@ test("Web UI exposes upstream controls without inline handlers", async () => {
     const port = (proxy.address() as { port: number }).port;
     const base = `http://127.0.0.1:${port}`;
     try {
-        const ui = await (await fetch(`${base}/__bili/`)).text();
+        const uiRes = await fetch(`${base}/__bili/`);
+        const ui = await uiRes.text();
+        // #4958 negative direction: the sandbox CSP + nosniff pair is scoped to
+        // the blog ASSET route only — the panel HTML route must not gain it.
+        assert.equal(uiRes.headers.get("content-security-policy"), null);
+        assert.equal(uiRes.headers.get("x-content-type-options"), null);
         assert.match(ui, /Codex（ChatGPT 登录）/);
         assert.match(ui, /上游网络/);
         assert.match(ui, /Fork me on GitHub/);

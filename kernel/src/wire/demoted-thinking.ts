@@ -38,8 +38,10 @@ type DelimitedForm = {
   close: string;
 };
 
-/** The three inline tag forms hosts actually emit (see file comment). */
-const FORMS: readonly DelimitedForm[] = [
+/** The three inline tag forms hosts actually emit (see file comment).
+ *  Single source: src/fold-reconcile.ts (THINKING_MERGE_FORMS) imports this
+ *  list — extend here, never fork a second copy. */
+export const FORMS: readonly DelimitedForm[] = [
   { open: "<think>\n", close: "\n</think>" },
   { open: "<thinking>\n", close: "\n</thinking>" },
   { open: "```thinking\n", close: "\n```" },

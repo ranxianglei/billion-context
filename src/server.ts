@@ -54,7 +54,6 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
@@ -95,13 +94,13 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
-import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
+import { mayClobberPointer, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -158,6 +157,7 @@ import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
+import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -658,7 +658,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before exiting or the buffered line can be lost with the process.
         configureLogger(opts.logFile ?? defaultLogFile());
         logMsg(opts, "error", listenLine);
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
         await closeLogger();
         process.exit(eaddrinuseExitCode("twin-collision"));
     }
@@ -676,6 +676,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx);
         } catch (err) {
+            // #4817/#4804: an anchored WS delta continuation whose seam check
+            // failed is OWNED by the WS session above — it answers with the
+            // client's standard 400 previous_response_not_found frame, clears
+            // the checkpoint chain, and the client's full replay re-anchors.
+            // Swallowing it into the generic 503 here would retain the
+            // checkpoint and loop the client on the same deterministic miss.
+            // The rethrow rides ONLY the request the WS session stamped
+            // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
+            if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
@@ -1383,72 +1392,113 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Node treats it as an unhandled 'error' and throws, aborting before the
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
+    // #4982: the twin verdict needs an async health probe (verifyEntryOwnsPort),
+    // so the handler body runs through a promise. At most one listen attempt is
+    // ever in flight (each retry is scheduled FROM this handler), so two error
+    // handlers can never interleave.
     server.on("error", (err: NodeJS.ErrnoException) => {
-        let busyReason: FailFastReason | undefined;
-        let peer: SameLanePeer | undefined;
-        if (isPortBusyError(err.code, lastTriedPort)) {
-            // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
-            // holder squats the IPv4 bind) as EACCES on an unprivileged port —
-            // classify it like a true EADDRINUSE so it ladders instead of dying
-            // with the misleading privileged-port hint.
-            peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
-            const action = decideEaddrinuse({
-                upgradeReplacement,
-                twinHolds: peer?.kind === "twin",
-                launchToken: launchToken !== undefined,
-                strictPort,
-                attempts: listenAttempts,
-                maxAttempts: MAX_LISTEN_ATTEMPTS,
-                predecessorTicksLeft,
-                predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
-                lastTriedPort,
-            });
-            if (action.kind === "wait-predecessor") {
-                predecessorTicksLeft -= 1;
-                setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
-                return;
-            }
-            if (action.kind === "ladder") {
-                listenAttempts += 1;
-                // #3801: laddering OFF a same-build same-lane holder means it
-                // drifted (a true twin would have failed fast above) — name
-                // the coexistence so the dual-instance state in the logs is
-                // explainable: both run, each serves its own sessions.
-                const driftNote = peer?.kind === "drifted"
-                    ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
-                    : "";
-                log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
-                attemptListen(action.nextPort);
-                return;
-            }
-            busyReason = action.reason;
-        }
-        const hint =
-            isPortBusyError(err.code, lastTriedPort)
-                ? busyReason === "twin-collision"
-                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
-                  : busyReason === "upgrade-replacement"
-                    ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
-                    : busyReason === "strict-port"
-                      ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
-                      : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
-                : err.code === "EACCES"
-                  ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
-                  : "";
-        const listenLine = `listen failed: ${err.code ?? ""} ${err.message}${hint}`;
-        log("error", listenLine);
-        // #3654/#3116: a spawner's failure message points users at the per-port
-        // log, but post-#2864 this child mutes its stderr leg into bili.log —
-        // without this line that file stays 0 bytes and the diagnosis dies there.
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
-        shuttingDown = true;
-        server.close();
-        flushConversations();
-        void flushAllSessions().finally(() => {
-            closeLogger();
-            process.exit(eaddrinuseExitCode(busyReason));
-        });
+        void handleListenError(err);
     });
+    const handleListenError = async (err: NodeJS.ErrnoException): Promise<void> => {
+        try {
+            let busyReason: FailFastReason | undefined;
+            let peer: SameLanePeer | undefined;
+            if (isPortBusyError(err.code, lastTriedPort)) {
+                // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
+                // holder squats the IPv4 bind) as EACCES on an unprivileged port —
+                // classify it like a true EADDRINUSE so it ladders instead of dying
+                // with the misleading privileged-port hint.
+                peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
+                // #4982: a registry twin is only a twin while it still OWNS the
+                // contended socket. The marker is a claim written at announce time;
+                // by now the claimed owner may have entered graceful shutdown
+                // (listener closed, process still draining) and a DIFFERENT
+                // instance may hold the freed port — dying with the adopt signal
+                // there strands the launch behind a cross-lane stranger we are
+                // forbidden to attach to (#1225). Verify the claim against the live
+                // listener first; an unverified claim falls through to the plain
+                // foreign-holder policy below (ladder or fail-fast).
+                let twinHolds = false;
+                if (peer?.kind === "twin") {
+                    const claimed = peer.entry;
+                    twinHolds = await verifyEntryOwnsPort(claimed.origin, { pid: claimed.pid, instanceId: claimed.instanceId });
+                    if (!twinHolds) {
+                        peer = undefined;
+                        log("warn", `port ${lastTriedPort}: registry twin ${claimed.instanceId.slice(0, 8)} (pid ${claimed.pid}) no longer answers as itself — the socket moved on while it drained; treating the port as foreign-held instead of dying twin-collision (#4982)`);
+                    }
+                }
+                // shutdown() may have raced the probe — its own exit path owns
+                // the outcome from here on.
+                if (shuttingDown) return;
+                const action = decideEaddrinuse({
+                    upgradeReplacement,
+                    twinHolds,
+                    launchToken: launchToken !== undefined,
+                    strictPort,
+                    attempts: listenAttempts,
+                    maxAttempts: MAX_LISTEN_ATTEMPTS,
+                    predecessorTicksLeft,
+                    predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
+                    lastTriedPort,
+                });
+                if (action.kind === "wait-predecessor") {
+                    predecessorTicksLeft -= 1;
+                    setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
+                    return;
+                }
+                if (action.kind === "ladder") {
+                    listenAttempts += 1;
+                    // #3801: laddering OFF a same-build same-lane holder means it
+                    // drifted (a true twin would have failed fast above) — name
+                    // the coexistence so the dual-instance state in the logs is
+                    // explainable: both run, each serves its own sessions.
+                    const driftNote = peer?.kind === "drifted"
+                        ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
+                        : "";
+                    log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
+                    attemptListen(action.nextPort);
+                    return;
+                }
+                busyReason = action.reason;
+            }
+            const hint =
+                isPortBusyError(err.code, lastTriedPort)
+                    ? busyReason === "twin-collision"
+                      ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
+                      : busyReason === "upgrade-replacement"
+                        ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
+                        : busyReason === "strict-port"
+                          ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                          : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                    : err.code === "EACCES"
+                      ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
+                      : "";
+            const listenLine = `listen failed: ${err.code ?? ""} ${err.message}${hint}`;
+            log("error", listenLine);
+            // #3654/#3116: a spawner's failure message points users at the per-port
+            // log, but post-#2864 this child mutes its stderr leg into bili.log —
+            // without this line that file stays 0 bytes and the diagnosis dies there.
+            if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+            shuttingDown = true;
+            server.close();
+            flushConversations();
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(eaddrinuseExitCode(busyReason));
+            });
+        } catch (e) {
+            // The listen already failed; a crash here must still end the process
+            // cleanly instead of leaving a dead listener running.
+            log("error", `listen-error handling crashed: ${String(e)}`);
+            shuttingDown = true;
+            server.close();
+            flushConversations();
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(1);
+            });
+        }
+    };
     // Catch stray rejections/throws from background work (compress loops,
     // auto-update, initSessions) that escape the per-request try/catch —
     // Node 20+ aborts the process on these by default. Log loudly and flush.
@@ -1512,6 +1562,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         server.close(() => {
             finishDrain();
         });
+        // #4982: the listener just stopped accepting — withdraw the port
+        // ownership claim NOW instead of at process exit. The drain can outlive
+        // the release by minutes (keep-alive pins), and a stale claim let a
+        // same-lane newcomer misclassify us as its twin and die (#4982).
+        markPortReleased(instanceId);
         // Hard fallback: if connections hang (client never closes), don't
         // block shutdown forever — force-exit after a grace window. #3890:
         // while connections are still ALIVE the window re-arms (bounded by
@@ -2475,6 +2530,20 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // all require usage >= their pct lines). #728 fix: such sessions fall back to
 // the PREVIOUS turn's locally-measured outbound payload upper bound
 // (session.stats.localInputEstimate, recorded in prepare* each turn). The
+// #4805: the meter-side size guard (anchorImpossible below) also requires an ABSOLUTE gap,
+// not just the ratio: on early/small sessions the char-count upper bound is already an order
+// of magnitude above the real token count, so a pure-ratio test would demote healthy small
+// anchors to estimates and lose usage-grade sizing exactly where it is cheapest to keep.
+const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
+// The anchor's OWN request snapshot (lastUsagePayloadUpper, taken at settle)
+// carries the honesty margin: a usage report can legitimately under-report a
+// text-heavy payload by ~8x (#1820 B — char-bound 220k over a 5k report), so the
+// anchor size alone cannot prove pollution; requiring the payload to ALSO tower
+// 8x over the payload of the request that produced the anchor keeps #1820 B's
+// honest anchors on the fast path while #4805's side-lane sample (anchor request
+// ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
+const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
+
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
 // precedence immediately — same invariant as #604's armFailureShrink
@@ -2505,7 +2574,20 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #4383 (both guards): stale-small — a sidecar/side-request sample under
     // the same session id, superseded by later main sends — must not freeze the
     // meter either; fall through to the fresher measurement.
-    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #4805 (size guard): a FRESH tiny anchor can still be lane pollution — a
+    // 2-message side request's usage (5100 tok) overwrote a 1700-message
+    // conversation's anchor and froze compression until the context blew the
+    // window. Time-based staleness cannot catch it (it is seconds old), but the
+    // size dimension can: a usage sample cannot describe a resent history whose
+    // own upper bound is ~an order of magnitude larger. Fall through to the
+    // local estimate then — the nudge sizes the payload it actually sees.
+    const payloadUpperNow = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const anchorImpossible = session.stats.lastInputTokens > 0
+        && (session.stats.lastUsagePayloadUpper ?? 0) > 0
+        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2517,7 +2599,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // reporting upstreams fall back to legacy sizing rather than a frozen meter.
     const anchored = postRebuildAnchorTokens(session);
     if (anchored > 0) return { tokens: anchored, source: "estimate" };
-    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const raw = payloadUpperNow;
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
     // ghosts enter: #1569 first tried min(est, raw) — the char-count upper
@@ -4148,11 +4230,19 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
+// #4528: inbound histories past this size pay an O(messages) synchronous scan
+// pass per turn on the main thread, large enough to starve the event loop and
+// freeze every endpoint on the same listener — warn so a pathological session
+// shows up in the log instead of being found through a frozen UI.
+const SLOW_SESSION_MSG_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
+    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body

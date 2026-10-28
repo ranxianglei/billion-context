@@ -151,10 +151,11 @@ function toolNameOf(wire: Wire, t: ToolShape): string | undefined {
     return typeof t.name === "string" ? t.name : undefined;
 }
 
-// #4252: only the string form is advertised (topic + content). The legacy
-// flat-form fields (startId/endId/startRef/endRef/summary) and array content
-// remain functional in parseCompressInput but are deliberately NOT taught.
-const COMPRESS_FORM_PROPS = ["topic", "content"];
+// #4252, structural since 2026-10-26: exactly one advertised form —
+// content as ONE plain string. Legacy flat-form fields
+// (startId/endId/startRef/endRef/summary/topic) and array content remain
+// functional in parseCompressInput but are deliberately not advertised.
+const COMPRESS_FORM_PROPS = ["content"];
 
 function assertCompressFormsKept(tool: ToolShape | undefined, source: string): void {
     assert.ok(tool, `${source}: compress tool present`);

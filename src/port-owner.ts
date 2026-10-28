@@ -102,6 +102,36 @@ export async function findForeignOwner(
     return undefined;
 }
 
+/** #4982: does the listener on `origin` answer health AS the registry entry's
+ *  claimed owner (exact pid + instance identity)? A registry marker is a CLAIM
+ *  written at announce time, not proof: between the claim and our bind the
+ *  socket can move on — the claimed owner enters graceful shutdown (listener
+ *  closed, process still draining) and a different instance binds the freed
+ *  port. Declaring a twin collision on an unverified claim kills the newcomer
+ *  with the adopt signal over a port it could have laddered off (#4982).
+ *  An ANSWERED probe decides immediately (match or not); only a silent or
+ *  non-bili responder is inconclusive and retried within the standard probe
+ *  budget — a saturated-but-alive twin must not be mistaken for a moved
+ *  socket either. */
+export async function verifyEntryOwnsPort(
+    origin: string,
+    expected: { pid: number; instanceId: string },
+    opts: { attempts?: number; intervalMs?: number; timeoutMs?: number } & ProbeDeps = {},
+): Promise<boolean> {
+    const attempts = Math.max(1, opts.attempts ?? DEFAULT_ATTEMPTS);
+    const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const fetchImpl = opts.fetchImpl ?? probeFetch;
+    const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+    for (let i = 0; i < attempts; i++) {
+        if (i > 0) await sleepImpl(intervalMs);
+        const info = await probeOwnerInfo(origin, fetchImpl, timeoutMs);
+        if (info === undefined) continue; // inconclusive — retry
+        return info.pid === expected.pid && info.instanceId === expected.instanceId;
+    }
+    return false;
+}
+
 type PortClaimOutcome =
     | { kind: "claimed" }
     | { kind: "ladder"; nextPort: number; foreign: OwnerProbeInfo }

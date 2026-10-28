@@ -220,7 +220,7 @@ test("#3701 shedEgressIfOverBudget: WS-lane only, records metadata, honors disab
         assert.ok(logs.some(l => l.includes("[ws-byte-shed]") && l.includes("still over budget")), "protected tail overage is warned, not silent");
 
         const httpOut = await shedEgressIfOverBudget(big, "responses", { sessionId: session.id, session });
-        assert.equal(httpOut.body, big, "HTTP lane (no transport) passes through untouched");
+        assert.equal(httpOut.body, big, "plain relay but body ~2.4 MiB < default 10 MiB http budget (#3909) → still passthrough");
         assert.equal(httpOut.stats.changed, false);
 
         // #3701 Finding 1 regression pin: a MANAGED-but-HTTP transport (the dsh-inline

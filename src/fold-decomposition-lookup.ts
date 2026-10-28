@@ -92,7 +92,6 @@ export function resolveStoredDecompositions(
     let skipped = 0;
     const latestSeq = new Map<string, number>();
     const ordered: { seq: number; m: CoreMessage }[] = [];
-    const orderedIdx = new Map<string, number>();
     for (const row of rows) {
         let parsed: unknown;
         try {
@@ -113,10 +112,17 @@ export function resolveStoredDecompositions(
         const prev = latestSeq.get(row.msgId);
         if (prev !== undefined && prev >= row.seq) continue;
         latestSeq.set(row.msgId, row.seq);
-        const prevIdx = orderedIdx.get(row.msgId);
-        if (prevIdx !== undefined) ordered.splice(prevIdx, 1);
+        // Replace any earlier decomposition of the same msg id in place. The
+        // old index-bookkeeping (splice + cached indices) went stale the
+        // moment one splice shifted later entries — a second duplicate then
+        // removed the WRONG element (or none) and left both copies in.
+        for (let i = ordered.length - 1; i >= 0; i--) {
+            if (ordered[i]!.m.id === m.id) {
+                ordered.splice(i, 1);
+                break;
+            }
+        }
         ordered.push({ seq: row.seq, m });
-        orderedIdx.set(row.msgId, ordered.length - 1);
     }
     if (skipped > 0) loggerLog("debug", `[fold-reconcile] stored decomposition: ${skipped} unparseable row(s) skipped`);
     if (ordered.length === 0) return undefined;

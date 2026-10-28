@@ -30,13 +30,14 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
-import { restampRefsToLedger } from "acp-kernel";
+import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
-import { sha256Hex, type CheckpointRow } from "./storage/store.js";
+import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
+import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -166,6 +167,7 @@ interface PersistedSession {
         // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
         // but are deliberately not restored — see buildSession).
         localInputEstimate?: number;
+        lastUsagePayloadUpper?: number;
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
@@ -1607,8 +1609,53 @@ export class SessionStore {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
             const outcome = restampRefsToLedger(state, seqByRawId);
+            // #4733: the ref restamp alone leaves the CCR content store keyed by
+            // store-time refs — a stored original would sit under a number the
+            // ref map now vends to a DIFFERENT message (misattribution on
+            // retrieve) and consistency gates (plugin fork snapshot) reject the
+            // session. Re-key the store onto the same map, same pass.
+            // #4599: guarded — contentStoreOf MATERIALIZES an empty envelope
+            // for storeless sessions; touching it speculatively here changed
+            // the persisted shape of every full-mode cold load (legacy keeps
+            // undefined) and broke the storage-unified parity pin. Storeless
+            // sessions have nothing to re-key.
+            if (session.contentStore) {
+                const store = contentStoreOf(session);
+                const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
+                if (restampedStore !== store) session.contentStore = restampedStore;
+            }
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
+            } else {
+                // #4797: a converged pass (everything already aligned) must
+                // CLEAR any stale map — the guard keeps consulting the
+                // process-lifetime map, and an empty outcome that leaves an
+                // old map in place keeps refusing live refs forever.
+                delete session.restampSuperseded;
+            }
+            // The token snapshot is keyed by ref (#3488 render-refs): renumbered
+            // refs would otherwise inherit the stale count of whichever message
+            // held the new number pre-alignment — the wire tag then disagrees
+            // with the legacy-restart leg beyond citation renumbering (storage
+            // engine-proofs wire-parity, #4599). Two-pass moves: stage all
+            // (oldRef → newRef → count) first, then delete, then write — a
+            // single-pass swap would lose entries whose newRef is another
+            // move's oldRef.
+            const snap = (state as { tokenSnapshot?: Record<string, number> }).tokenSnapshot;
+            if (snap && outcome.superseded.size > 0) {
+                const byRawNow = state.messageRefs.byRaw;
+                const moves: Array<[oldRef: string, newRef: string, count: number]> = [];
+                for (const [oldRef, rawId] of outcome.superseded) {
+                    const count = snap[oldRef];
+                    const newRef = byRawNow[rawId];
+                    if (count === undefined || newRef === undefined || newRef === oldRef) continue;
+                    moves.push([oldRef, newRef, count]);
+                }
+                if (moves.length > 0) {
+                    for (const [oldRef] of moves) delete snap[oldRef];
+                    for (const [, newRef, count] of moves) snap[newRef] = count;
+                    this.log("info", `[persist] remapped ${moves.length} token-snapshot entries onto ledger-aligned refs for ${session.id} (#4599)`);
+                }
             }
             state.refLedgerAligned = true;
             this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
@@ -1674,6 +1721,14 @@ export class SessionStore {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
+    /** #4804: true only in FULL mode — the one mode whose unified reads
+     *  (unifiedMessageIdRows/unifiedMessageRows/…) actually serve data. In
+     *  shadow mode every read returns null, so read-dependent lanes gate on
+     *  THIS predicate instead of replicasAvailable(). */
+    unifiedReads(): boolean {
+        return this.enabled && this.shadow?.readsUnified === true;
+    }
+
     /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
      *  re-stamp (single-row ids only — multi-generation ids are excluded by
      *  the store). Null when the unified store is unavailable; the re-stamp
@@ -1687,28 +1742,35 @@ export class SessionStore {
         }
     }
 
-    /** #4316 PR3/3: live (non-retired) row count for a session — the fork
-     *  endpoint passes count - 1 as the inclusive throughSeq. -1 when the
-     *  unified store is unavailable (kernel-only fork). */
-    unifiedLiveRowCount(id: string): number {
-        if (!this.shadow) return -1;
+    /** #4730/#4911: highest live (non-retired) seq — the fork endpoint's
+     *  inclusive throughSeq, awaited from the (async) fork lane. NOT count - 1
+     *  from unifiedLiveRowCount: tombstones keep their seq, so a retired
+     *  middle row makes the count shortchange the clone and the child
+     *  silently loses the newest live rows. Network backends cannot serve the
+     *  sync facade — this twin routes through the backend (#4911). Null when
+     *  the unified store is unavailable (kernel-only fork) or no live rows. */
+    unifiedLastLiveSeqAsync(id: string): Promise<number | null> {
+        if (!this.shadow) return Promise.resolve(null);
         try {
-            return this.shadow.liveRowCount(id);
+            return this.shadow.lastLiveSeqAsync(id);
         } catch {
-            return -1;
+            return Promise.resolve(null);
         }
     }
 
-    /** #4316 PR3/3: fork adoption row clone (child keeps the parent's seq
-     *  values so cloned kernel refs keep pointing at the same ledger
-     *  positions). Null when the unified store is unavailable — the fork
-     *  endpoint then proceeds exactly as before (kernel-only clone). */
-    unifiedCloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
-        if (!this.shadow) return false;
+    /** #4316 PR3/3, #4911: fork adoption row clone, awaited from the (async)
+     *  fork lane (child keeps the parent's seq values so cloned kernel refs
+     *  keep pointing at the same ledger positions; on network backends this
+     *  twin routes through the backend — see shadow.cloneSessionRowsAsync).
+     *  False when the unified store is unavailable or the clone failed — the
+     *  fork endpoint then proceeds exactly as before (kernel-only clone).
+     *  Never throws. */
+    unifiedCloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        if (!this.shadow) return Promise.resolve(false);
         try {
-            return this.shadow.cloneSessionRows(parentId, childId, throughSeq);
+            return this.shadow.cloneSessionRowsAsync(parentId, childId, throughSeq);
         } catch {
-            return false;
+            return Promise.resolve(false);
         }
     }
 
@@ -1835,6 +1897,19 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.tailViewRows(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #4738: per-ref message bodies from the unified store — the web fallback
+     *  for hosts whose native compaction pruned the resident window. Null when
+     *  the unified store is unavailable — callers keep their legacy "missing"
+     *  posture and never guess. */
+    unifiedMessageContentByRefs(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageContentByRefNums(sessionId, refNums);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }

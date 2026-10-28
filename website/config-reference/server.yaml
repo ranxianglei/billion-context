@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: billing
+    type: object
+    default: "{}"
+    env: []
+    group: upstream
+    id: tt.billing
+    site_group: up
+    desc_en: "Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only."
+    desc_zh: "按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。"
+    site_en: "<code>billing.prices</code> — per-model USD/Mtok prices feeding the panel's spend + savings views."
+    site_zh: "<code>billing.prices</code> —— 按模型美元/百万 token 单价，驱动面板花费与省钱视图。"
   - key: maskHosts
     type: boolean
     default: "true"

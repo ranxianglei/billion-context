@@ -127,6 +127,39 @@ function mainShaped(kinds: string[]): boolean {
 const skel8 = (kinds: string[]): string =>
     createHash("sha256").update(kinds.join("\u0000")).digest("hex").slice(0, 8);
 
+/** #4778: harness-state roles carry per-turn HOST state (date, budget,
+ *  model banner — dsh NEXT stamps a DIFFERENT system prompt on every turn
+ *  and rewrites prior ones in its own log on goal continuations) and zero
+ *  conversation identifying power. */
+const HARNESS_ROLES = new Set(["system", "developer"]);
+
+/** #4778: longest run of CONSECUTIVE same-index content-fragment agreements
+ *  between two skeletons, compared over CONVERSATION CELLS ONLY — the
+ *  harness-state cells are excluded from both sequences BEFORE alignment,
+ *  because the host inserts/removes/empties them around its own bookkeeping
+ *  and must not shift the content-cell alignment. Exact per-cell sha256
+ *  comparison — no fuzzy similarity (MESSAGE-IDENTITY doctrine); a run of
+ *  CONTINUATION_MIN_RUN agreements is cryptographically impossible between
+ *  two distinct conversations. */
+function maxAlignedFragRun(kindsA: string[], fragsA: string[], kindsB: string[], fragsB: string[]): number {
+    const fa: string[] = [];
+    const fb: string[] = [];
+    for (let i = 0; i < fragsA.length; i++) if (!HARNESS_ROLES.has(kindsA[i])) fa.push(fragsA[i]);
+    for (let j = 0; j < fragsB.length; j++) if (!HARNESS_ROLES.has(kindsB[j])) fb.push(fragsB[j]);
+    const n = Math.min(fa.length, fb.length);
+    let best = 0;
+    let cur = 0;
+    for (let i = 0; i < n; i++) {
+        cur = fa[i] === fb[i] ? cur + 1 : 0;
+        if (cur > best) best = cur;
+    }
+    return best;
+}
+
+/** #4778: minimum same-index agreement run proving that a tag-changed
+ *  history is the SAME conversation with host-side edits, not a stranger. */
+const CONTINUATION_MIN_RUN = 8;
+
 export type SessionOrderResolution = {
     key: string;
     action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
@@ -172,9 +205,12 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  claims; the tag only guards the lanes order alone cannot tell apart:
  *  a tag change on CONTINUING history (model switch / AGENTS.md edit —
  *  kinds prefix-align AND head fragments match) migrates the raw key
- *  (#2241/#2250); a tag change with different content forks onto
- *  `<rawId>|sub:<fp16(tag)>` — byte-identical to the old ladder's fork
- *  keys, so persisted fork lanes keep their sessions across the upgrade. */
+ *  (#2241/#2250); a tag change whose recorded body still sits verbatim at
+ *  its own indices inside the incoming (host-side rewrite of its own log —
+ *  #4778) migrates too; only a tag change with NO positional continuation
+ *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
+ *  old ladder's fork keys, so persisted fork lanes keep their sessions
+ *  across the upgrade. */
 export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
@@ -258,6 +294,26 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // continuing — migrate, exactly like the old #2241 ladder did.
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed on a history that continues the raw key’s persisted chain — anchor migrated (post-restart persona race #2241/#2250)" };
+        }
+        if (
+            mainShaped(kinds) &&
+            kinds.length >= recorded.kinds.length &&
+            maxAlignedFragRun(kinds, incomingFrags, recorded.kinds, recorded.frags) >= CONTINUATION_MIN_RUN
+        ) {
+            // #4778: the host rewrote PART of its own persisted history while
+            // the persona text changed (dsh goal auto-continuation clears the
+            // prior per-turn system messages; the cleared cells break BOTH the
+            // head-fragment rung above and the byte-exact chain rung) — but
+            // the recorded conversation still sits inside the incoming at its
+            // own indices. A long same-index content-fragment agreement run
+            // cannot occur between distinct conversations, so this is the
+            // SAME conversation with host-side edits → migrate, never fork.
+            // Both guards keep the #150/#1916 defenses intact: a self-
+            // contained stranger under a reused id shares no positional
+            // content (overlap ~0), and a STALE shorter replay must not
+            // rewind the live skeleton (the length gate).
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "persona text changed but the recorded history continues inside the incoming — anchor migrated (#4778)" };
         }
         const laneKey = `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);

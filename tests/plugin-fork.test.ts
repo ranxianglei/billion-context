@@ -750,6 +750,10 @@ for (const storageMode of ["legacy", "full"] as const) {
         let child: ReturnType<typeof spawn> | undefined;
         try {
             await compress(h);
+            // The fold settles asynchronously after the tool response (#4599).
+            for (let i = 0; i < 100 && !(resolveConversation("parent").session?.state.blocks?.length ?? 0); i++) {
+                await new Promise((r) => setTimeout(r, 50));
+            }
             const parent = resolveConversation("parent").session!;
             parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
             parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
@@ -758,7 +762,7 @@ for (const storageMode of ["legacy", "full"] as const) {
             // #4316 PR3/3: only a unified cold load runs the one-time ledger
             // alignment; the CI legacy baseline retains the original state.
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (storageMode === "full") persistedState.refLedgerAligned = true;
+            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);

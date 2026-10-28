@@ -5,11 +5,17 @@
  * STATE-level equality between the legacy files and the unified index. This
  * suite pins the seams that audit found unproven:
  *
- *   WIRE PARITY      — full reads match envelope reads plus the documented
- *                      #4316 ledger-ref migration. All post-restart bodies,
- *                      landmarks and final digests agree, even when the
- *                      legacy file is DELETED at restart. Pre-migration
- *                      bodies also match the committed render goldens.
+ *   WIRE PARITY      — BILI_STORAGE_UNIFIED=full must be invisible on the
+ *                      wire: per-turn outbound digests, fold landmarks and
+ *                      the final state digest equal the COMMITTED storage
+ *                      render goldens, both with a mid-conversation restart
+ *                      and with the legacy file DELETED at the restart (the
+ *                      index alone carries the session — the migration's
+ *                      end-state promise). #4316 PR3/3 (380ef4dac): a
+ *                      full-mode cold load additionally re-homes citation
+ *                      numbers once (one-time ledger alignment) — comparisons
+ *                      run modulo that renumbering (citation-normalized
+ *                      digests), which is the ONLY permitted delta.
  *   STALE REJECT     — a multi-instance stale write that the guarded build
  *                      rejects must never reach index.db; the converged disk
  *                      record is what gets ingested.
@@ -43,7 +49,7 @@ import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
 import { rmrf } from "./tmp-rm.ts";
-import { ENGPROOF_CHECKS, spawnCorruptIndexChild, viewDigest, viewStateDigest } from "./corrupt-index-child.ts";
+import { ENGPROOF_CHECKS, spawnCorruptIndexChild, stripOneTimeAlignment, viewDigest, viewStateDigest } from "./corrupt-index-child.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 // #3400: pin the legacy wire shape. This suite proves STORAGE restart
@@ -139,15 +145,16 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
 }
 
 // ---------------------------------------------------------------------------
-// WIRE PARITY: full restart == envelope restart + ledger-ref migration.
+// WIRE PARITY: full mode + mid-conversation restart == committed goldens.
 // ---------------------------------------------------------------------------
 
 for (const wire of WIRES) {
-    test(`storage engine: full-mode ${wire} restart matches legacy reads plus ledger alignment`, { timeout: 240_000 }, async () => {
+    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart / committed goldens, modulo the #4316 one-time citation renumbering)`, { timeout: 240_000 }, async () => {
         const golden = JSON.parse(fs.readFileSync(path.join(RENDER_ROOT, `${wire}.json`), "utf8")) as {
-            turns: Array<{ i: number; sha: string }>;
+            turns: Array<{ i: number; sha: string; shaCiteNorm: string }>;
             foldAt: number; editedAt: number; summaryFrom: number;
             stateDigest: string;
+            stateDigestAligned: string;
             stateShape: Record<string, unknown>;
         };
         // The restart oracle: a legacy-only process restart. One caveat is
@@ -155,28 +162,24 @@ for (const wire of WIRES) {
         // slots (cacheLedger line bs/bl/be pairing, #2131) live in memory, so
         // exactly the first post-restart ledger line loses its bs fields —
         // identically in both legs. Everything else must be byte-equal.
-        // #4316 deliberately renumbers legacy refs at the first unified cold
-        // load. Keep the independent envelope reader as the oracle, applying
-        // only that documented migration against its shadow ledger. Every
-        // post-restart byte still has to match; the old pre-migration golden
-        // remains the oracle for all turns before the restart.
-        const legacy = await driveWire(wire as Wire, `golden-${wire}`, {
-            storageUnified: "shadow", reloadAfterEdit: "keepFile", alignLegacyRefsOnReload: true,
-        });
+        const legacy = await driveWire(wire as Wire, `golden-${wire}`, { reloadAfterEdit: "keepFile" });
         for (const leg of ["keepFile", "dropFile"] as const) {
             const record = await driveWire(wire as Wire, `golden-${wire}`, { storageUnified: "full", reloadAfterEdit: leg });
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
-                assert.equal(record.turns[i]!.sha, legacy.turns[i]!.sha, `${wire}/${leg}: outbound body #${i} digest drift vs legacy restart`);
                 if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
+                // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation
+                // numbers once (one-time ledger alignment) — the ONLY permitted
+                // wire delta. Citation-normalized digests must match turn-for-turn.
+                assert.equal(record.turns[i]!.shaCiteNorm, legacy.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs legacy restart`);
+                assert.equal(record.turns[i]!.shaCiteNorm, golden.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs committed goldens (restart-inherent bs-field loss aside)`);
             }
             assert.equal(record.foldAt, legacy.foldAt, `${wire}/${leg}: fold landmark drifted`);
             assert.equal(record.editedAt, legacy.editedAt, `${wire}/${leg}: edit landmark drifted`);
             assert.equal(record.summaryFrom, legacy.summaryFrom, `${wire}/${leg}: summary carrier landmark drifted`);
-            assert.equal(record.stateDigest, legacy.stateDigest, `${wire}/${leg}: persisted state digest drift vs legacy restart`);
+            assert.equal(record.stateDigestAligned, legacy.stateDigestAligned, `${wire}/${leg}: persisted state drifts beyond the one-time ledger alignment vs legacy restart`);
+            assert.equal(record.stateDigestAligned, golden.stateDigestAligned, `${wire}/${leg}: persisted state drifts beyond the one-time ledger alignment vs committed goldens`);
             assert.deepEqual(record.stateShape, legacy.stateShape, `${wire}/${leg}: state shape drift`);
-            assert.deepEqual(record.sectionDigests, legacy.sectionDigests, `${wire}/${leg}: state section digests drift`);
-            assert.deepEqual(record.stateKeyDigests, legacy.stateKeyDigests, `${wire}/${leg}: state key digests drift`);
         }
     });
 }
@@ -298,6 +301,9 @@ test("storage engine: rollback contract — explicit legacy mode serves the iden
         // (The load-path digest is the stable oracle: an in-memory session vs
         // a loaded one differs benignly by the storageMode stamp + one-time
         // tail normalization, identically under both paths.)
+        // #3818 flip: absent now resolves to FULL, so the legacy read path has
+        // to be spelled out explicitly (the knob's one-line escape hatch) —
+        // merely deleting the env would read unified and vacate this leg.
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(viaFull, "full-mode reload returned null");
@@ -313,7 +319,9 @@ test("storage engine: rollback contract — explicit legacy mode serves the iden
         assert.ok(legacy, "legacy-only reload returned null after rollback");
         // #2960 ⑤: cross-mode equality is on the STATE proper — full mode
         // serves the raw table tail, legacy the envelope's folded view.
-        assert.equal(viewStateDigest(toLegacyLike(legacy)), viewStateDigest(toLegacyLike(viaFull)), "rollback: legacy-only load state digest drift vs full-mode load");
+        // #4316 PR3/3: modulo the one-time ledger alignment (full-side cold
+        // load re-homes citation numbers; legacy keeps counter numbers).
+        assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(legacy))), viewStateDigest(stripOneTimeAlignment(toLegacyLike(viaFull))), "rollback: legacy-only load state digest drift vs full-mode load");
         assert.ok(viaFull.lastMessages && viaFull.lastMessages.length > 0, "⑤: full-mode load serves the table tail");
         assert.ok(legacy.lastMessages && legacy.lastMessages.length > 0, "⑤: rollback keeps the envelope tail");
         const disk = findWrittenRecord(dir, "corpus-folded");
@@ -390,7 +398,10 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         // executed in the child, verified in the parent). The child also runs
         // the #2781 mid-flow rename guard plus a post-close guard, so future
         // handle-leak drift trips there by name instead of at teardown.
-        const stateDigestClean = viewStateDigest(toLegacyLike(viaFull));
+        // #4316 PR3/3: expected digest computed modulo the one-time ledger
+        // alignment — the clean read above already carried it in memory, and
+        // the child's fresh load applies it again; both sides must normalize.
+        const stateDigestClean = viewStateDigest(stripOneTimeAlignment(toLegacyLike(viaFull)));
         const childEnv: NodeJS.ProcessEnv = {
             ...process.env,
             BILI_STORAGE_UNIFIED: "full",
@@ -518,5 +529,5 @@ test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes 
 
 // Engine note: these legs run on the process-default engine; the corpus
 // suites (storage-unified.test.ts) cover BOTH engines at the state level,
-// and the wire legs here assert against the same committed goldens the
-// legacy baseline produced.
+// and the wire legs here assert citation-normalized equality against the same
+// committed goldens the legacy baseline produced.

@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
-import { MAX_REQUEST_BYTES } from "./fetch-util.js";
+import { limitsReceiveBytes } from "./knobs.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { isLoopbackAddress } from "./util.js";
 
@@ -91,7 +91,7 @@ export function installWebSocketBridge(
     /** #300/#3073: this server's per-instance identity for the x-bili-hop chain stamp (see WsBridgeContext.instanceId). */
     instanceId?: string,
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
-    const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
+    const wss = new WebSocketServer({ noServer: true, maxPayload: limitsReceiveBytes(), perMessageDeflate: false });
     const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
     let connectionId = 0;
     const close = server.close.bind(server);

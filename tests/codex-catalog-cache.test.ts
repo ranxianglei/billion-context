@@ -127,13 +127,27 @@ test("malformed/empty/oversized successful catalog is forwarded but never rescue
     }
 });
 
-test("temporary HTTP outages recover; 304 revalidation is a complete 200 catalog", async () => {
+test("temporary HTTP outages recover; a NEGOTIATED 304 revalidation is a complete 200 catalog", async () => {
     const f = createCodexCatalogFetch({ directory: null });
     await send(f, async () => result());
     for (const status of [500, 502, 503, 504]) assert.equal(await (await send(f, async () => result("outage", status))).response.text(), text);
-    const recovered = await send(f, async () => result(null, 304));
+    // The client revalidated (conditional header on the request), so the
+    // 304 replays the cached catalog as a full 200.
+    const conditional = { ...init, headers: { ...init.headers, "if-none-match": '"synthetic-v1"' } };
+    const recovered = await send(f, async () => result(null, 304), url, conditional);
     assert.equal(recovered.response.status, 200);
     assert.deepEqual(await recovered.response.json(), catalog);
+});
+
+test("an UNCONDITIONAL 304 is off-spec: no phantom hit — pass it through and drop the cache", async () => {
+    const f = createCodexCatalogFetch({ directory: null });
+    await send(f, async () => result());
+    // No if-none-match / if-modified-since on the request: nothing was
+    // revalidated, so a 304 from a broken middlebox must not extend
+    // freshness or masquerade as the catalog.
+    const odd = await send(f, async () => result(null, 304));
+    assert.equal(odd.response.status, 304, "the off-spec response is passed through untouched");
+    await assert.rejects(() => send(f, offline), /synthetic offline/, "cache invalidated, no phantom rescue");
 });
 
 test("outage does not renew cache age; expired and cold caches fail honestly", async () => {

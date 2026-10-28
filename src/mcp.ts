@@ -21,6 +21,15 @@
 // to this shim's global conversationId — main/sub-agent threads sharing one
 // MCP process must not clobber each other's binding. Absent or malformed
 // metadata leaves the legacy channels untouched.
+// #4580: a sixth channel, Claude Code ≥2.1.308 — every tools/call carries the
+// originating tool_use id at _meta["claudecode/toolUseId"]. Its Task
+// subagents run through the SAME MCP shim process, so the shim's binding
+// names the parent conversation while the subagent's traffic streams through
+// a different proxy lane. The shim forwards the id as body toolCallId (the
+// field agent/shared.ts's forwardTool already uses) WITHOUT re-routing its
+// binding: the proxy witnessed that exact tool_use in exactly one session's
+// stream and routes the call there (id ring, host-stamped authority); an id
+// the proxy never saw falls back to the existing ladder unchanged.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -151,7 +160,7 @@ function ensureManifest(): Promise<void> {
 // partial note for clients that only render content text.
 export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false, toolCallId: string | undefined = undefined): Promise<McpForwardedToolResult> {
     for (let attempt = 0; ; attempt++) {
         // Recomputed per attempt: an in-loop adoption (#656/#4168) rewrites the
         // global binding, and the retry must carry the NEW id — capturing it
@@ -165,6 +174,12 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             // bindings and model-transcribed ids are NOT flagged — their
             // precedence stays exactly as #1685 wrote it.
             if (nativeCaller && effectiveConversationId) body.nativeCaller = true;
+            // #4580: the host-stamped tool_use id rides alongside whichever id
+            // channel routed this call. The proxy's id ring (populated as it
+            // witnessed outbound tool_use blocks) resolves it to the lane that
+            // actually streamed the call — Task subagents sharing this shim get
+            // routed to their own lane instead of the shim's stale binding.
+            if (toolCallId) body.toolCallId = toolCallId;
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -269,7 +284,7 @@ async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string }; threadId?: unknown };
+        _meta?: { ui?: { sessionId?: string }; threadId?: unknown; "claudecode/toolUseId"?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -369,6 +384,17 @@ async function handleMessage(msg: {
             // deliberately not consumed.
             const metaThreadId = params._meta?.threadId;
             const nativeThreadId = typeof metaThreadId === "string" && metaThreadId.trim().length > 0 ? metaThreadId.trim() : undefined;
+            // #4580: Claude Code (≥2.1.308) stamps the originating tool_use id
+            // on every tools/call via _meta["claudecode/toolUseId"] — including
+            // Task-subagent calls, whose traffic lives in a different proxy
+            // conversation than the one this shim bound at startup. Validated
+            // with the same strict rule as threadId: anything that is not a
+            // non-empty string after trim is treated as ABSENT. Per-call only;
+            // it never touches routing channels (routeOverride) or the global
+            // binding — the proxy resolves the id against its own witness of
+            // the outbound stream.
+            const metaToolUseId = params._meta?.["claudecode/toolUseId"];
+            const hostToolUseId = typeof metaToolUseId === "string" && metaToolUseId.trim().length > 0 ? metaToolUseId.trim() : undefined;
             // A native caller counts as "bound" for the search-target
             // exception (#841 extended by #2024): the call routes to the
             // native thread while args.conversation_id stays the read-only
@@ -383,7 +409,7 @@ async function handleMessage(msg: {
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined);
+                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined, hostToolUseId);
                 // #2752: the business state rides MCP structuredContent (spec
                 // field alongside content; clients predating it ignore it).
                 // isError semantics are unchanged — partial stays non-error.
