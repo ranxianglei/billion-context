@@ -216,7 +216,7 @@ async function waitForStatus(port: number, timeoutMs: number): Promise<boolean> 
     const deadline = Date.now() + timeoutMs;
     for (;;) {
         try {
-            const res = await fetch(`http://127.0.0.1:${port}/__bili/status`);
+            const res = await fetch(`http://127.0.0.1:${port}/__bili/status`, { signal: AbortSignal.timeout(2_000) });
             if (res.status === 200) return true;
         } catch {
             // connection refused while the child is still starting up — expected
@@ -242,8 +242,13 @@ async function killChild(child: ChildProcess): Promise<void> {
  *  EADDRINUSE decision path instead of the pre-bind foreign-owner ladder. */
 function silentTcpListener(port: number): Promise<net.Server> {
     return new Promise((resolve, reject) => {
-        const server = net.createServer(() => {
-            /* accept and hang — never answer HTTP */
+        const server = net.createServer((sock) => {
+            // accept and hang — never answer HTTP; drain the probe's bytes so peer
+            // EOF is actually delivered (a paused socket buffers them and never sees
+            // EOF) and release the connection, or a dead prober pins server.close()
+            // with CLOSE-WAIT sockets
+            sock.resume();
+            sock.on("end", () => sock.destroy());
         });
         server.once("error", reject);
         server.listen(port, "127.0.0.1", () => resolve(server));
@@ -327,9 +332,14 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
     const { stateHome } = sandboxDirs(sandbox);
     const port = await freePort();
     await assertPortDead(port, { label: "4982 drain-test port" });
+    let p1Ref: ReturnType<typeof spawnBili> | null = null;
+    let p2Ref: ReturnType<typeof spawnBili> | null = null;
+    let heldRef: net.Socket | null = null;
+    let squatterRef: net.Server | null = null;
     try {
         // P1: the serving proxy that will enter graceful shutdown.
         const p1 = spawnBili(sandbox, port);
+        p1Ref = p1;
         if (!(await waitForStatus(port, 90_000))) throw new Error(`P1 never became ready:\n${p1.out.value}`);
         const p1Marker = readMarkers(stateHome).find((m) => m.pid === p1.child.pid);
         assert.ok(p1Marker, "P1 must have registered itself");
@@ -341,6 +351,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
             s.once("connect", () => resolve(s));
             s.once("error", reject);
         });
+        heldRef = held;
 
         p1.child.kill("SIGTERM");
         const p1MarkerFile = path.join(stateHome, "billion-context", "instances", `${p1Marker.instanceId}.json`);
@@ -357,9 +368,11 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         // The squatter takes the freed port BEFORE the newcomer starts — but
         // silently, so the newcomer's pre-bind claim probe sees no evidence.
         const squatter = await silentTcpListener(port);
+        squatterRef = squatter;
 
         // P2: same lane, same requested port — the CI victim.
         const p2 = spawnBili(sandbox, port);
+        p2Ref = p2;
         const result = await Promise.race([
             new Promise<"exited">((resolve) => p2.child.once("exit", () => resolve("exited"))),
             (async () => {
@@ -374,13 +387,15 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         const p2Marker = readMarkers(stateHome).find((m) => m.pid === p2.child.pid);
         assert.equal(p2Marker?.lane, "pi");
         assert.equal(p2Marker?.port, result.servedPort);
-        assert.doesNotMatch(p2.out.value, /twin-collision/, "the stale claim must not produce a twin-collision verdict");
-
-        await killChild(p2.child);
-        held.destroy();
-        await killChild(p1.child);
-        await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        assert.doesNotMatch(p2.out.value, /already served by a same-build bili instance/, "the stale claim must not produce a twin-collision verdict");
     } finally {
+        // Cleanup lives in finally so an assertion failure reports its reason
+        // instead of leaking the children + squatter and hanging the runner.
+        if (p2Ref) await killChild(p2Ref.child);
+        heldRef?.destroy();
+        if (p1Ref) await killChild(p1Ref.child);
+        const squatter = squatterRef;
+        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
@@ -390,6 +405,8 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
     const { stateHome } = sandboxDirs(sandbox);
     const port = await freePort();
     await assertPortDead(port, { label: "4982 unverified-twin port" });
+    let p2Ref: ReturnType<typeof spawnBili> | null = null;
+    let squatterRef: net.Server | null = null;
     try {
         // A registry marker claiming `port` with a LIVE pid and full identity
         // match — but NO portReleasedAt stamp (pre-fix build, or a failed
@@ -415,8 +432,10 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
             }) + "\n",
         );
         const squatter = await silentTcpListener(port);
+        squatterRef = squatter;
 
         const p2 = spawnBili(sandbox, port);
+        p2Ref = p2;
         const result = await Promise.race([
             new Promise<"exited">((resolve) => p2.child.once("exit", () => resolve("exited"))),
             (async () => {
@@ -430,11 +449,14 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
         assert.notEqual(result.servedPort, port, "P2 must ladder off the contended port");
         const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
         assert.match(logText, /no longer answers as itself/, "the demotion from twin to foreign-held must be logged");
-        assert.doesNotMatch(logText, /twin-collision/, "an unverified claim must never reach the twin-collision verdict");
-
-        await killChild(p2.child);
-        await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        // The demotion warn above deliberately names "twin-collision" in prose, so pin
+        // the verdict by its unique log marker (shared by the early #4341 and the late
+        // path) instead of that substring.
+        assert.doesNotMatch(logText, /already served by a same-build bili instance/, "an unverified claim must never reach the twin-collision verdict");
     } finally {
+        if (p2Ref) await killChild(p2Ref.child);
+        const squatter = squatterRef;
+        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
