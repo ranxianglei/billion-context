@@ -37,6 +37,8 @@ export interface RunawayVerdict {
         zeroTokenFraction: number;
         maxTextRun: number;
         textRunChar?: string;
+        /** #5036: the threshold this guard instance actually enforced — lets the trip log name the effective knob value. */
+        textRunThreshold?: number;
     };
 }
 
@@ -163,6 +165,7 @@ export function createRunawayGuard(): RunawayGuard {
             maxMonotonicRefRun: maxMonoRun,
             zeroTokenFraction: acpTags > 0 ? zeroTokens / acpTags : 0,
             maxTextRun,
+            textRunThreshold,
         };
         if (textRunChar !== undefined) d.textRunChar = textRunChar;
         return d;
@@ -253,6 +256,17 @@ export function createRunawayGuard(): RunawayGuard {
     };
 
     return { feed, feedGapOnly, feedText };
+}
+
+/** #5036: operator-facing remediation appended to a text-run trip log — names the escape-hatch
+ *  knob + env override + the value this guard actually enforced, so a Gemini-family long-newline
+ *  turn cut mid-stream tells the operator exactly which setting to raise (0 disables the lane).
+ *  Returns "" for every other lane — they have no user-facing knob. */
+export function textRunTripHint(v: RunawayVerdict): string {
+    if (v.reason !== "text-run") return "";
+    const eff = v.detail?.textRunThreshold;
+    const effTxt = eff !== undefined ? String(eff) : "?";
+    return ` [legit long same-char output? raise guardrails.textRunThreshold / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD above ${effTxt} (0 disables this lane)]`;
 }
 
 /** Tee a raw response stream through a runaway guard. Bytes are forwarded BYTE-EXACT;
