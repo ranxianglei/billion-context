@@ -254,6 +254,9 @@ function silentTcpListener(port: number): Promise<{ close(): Promise<void> }> {
             // with CLOSE-WAIT sockets
             sock.resume();
             sock.on("end", () => sock.destroy());
+            // An aborted health probe may reset instead of ending the connection.
+            // Socket errors belong to this silent fixture, not the enclosing test.
+            sock.on("error", () => sock.destroy());
         });
         server.once("error", reject);
         server.listen(port, "127.0.0.1", () => resolve({
@@ -264,6 +267,25 @@ function silentTcpListener(port: number): Promise<{ close(): Promise<void> }> {
         }));
     });
 }
+
+test("silent TCP fixture survives an aborted health probe", { timeout: 5_000 }, async () => {
+    const port = await freePort();
+    const fixture = await silentTcpListener(port);
+    const client = net.connect({ host: "127.0.0.1", port });
+    try {
+        await new Promise<void>((resolve, reject) => {
+            client.once("connect", resolve);
+            client.once("error", reject);
+        });
+        client.write("GET /__bili/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        client.resetAndDestroy();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    } finally {
+        client.destroy();
+        await fixture.close();
+    }
+});
 
 function tcpRefused(port: number): Promise<boolean> {
     return new Promise((resolve) => {
