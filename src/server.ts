@@ -3391,6 +3391,8 @@ interface PreflightRecoveryRecord {
     window: number;
     probeUsed: boolean;
     pending: boolean;
+    /** Usage-grade baseline known when the receipt was written (null = none); a differing later report discharges a spent probe (#496). Absent on receipts predating this field. */
+    seenUsage?: number | null;
 }
 
 function preflightRecoveryFor(session: Session, origin: string, model: string | undefined, window: number): PreflightRecoveryRecord | undefined {
@@ -3407,7 +3409,8 @@ function preflightRecoveryFor(session: Session, origin: string, model: string | 
 }
 
 function notePreflightRecovery(session: Session, origin: string, model: string, window: number, pending: boolean): void {
-    session.metadata.preflightRecovery = { origin, model, window, probeUsed: true, pending } satisfies PreflightRecoveryRecord;
+    session.metadata.preflightRecovery = { origin, model, window, probeUsed: true, pending,
+        seenUsage: session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : null } satisfies PreflightRecoveryRecord;
     markDirty(session);
 }
 
@@ -4030,7 +4033,21 @@ export async function preflightCompressIfNeeded(
     }
     if (limit <= 0 || !model) return prepared;
     const recoveryOrigin = normalizeUpstreamOrigin(route?.upstream ?? opts.upstream) ?? "";
-    const recovery = preflightRecoveryFor(session, recoveryOrigin, model, limit);
+    let recovery = preflightRecoveryFor(session, recoveryOrigin, model, limit);
+    // A spent probe exists only while its question is unanswered: its purpose
+    // (#2313/#496) was to acquire upstream usage evidence. When a proven usage
+    // sample DIFFERENT from the spend-time baseline lands, the upstream has
+    // answered — discharge so the next over-window turn arbitrates afresh
+    // instead of failing fast forever (#488-A steady state). An identical
+    // resend bills identically, sees no change, and stays closed (#5098);
+    // receipts predating seenUsage keep their conservative closure.
+    if (recovery !== undefined && recovery.pending === false && recovery.seenUsage !== undefined
+        && session.stats.lastInputTokensSource === "usage" && session.stats.lastInputTokens > 0
+        && session.stats.lastInputTokens !== recovery.seenUsage) {
+        log("info", `[${session.id}] spent preflight-probe receipt discharged: upstream usage ${session.stats.lastInputTokens} landed after the probe (baseline at probe time: ${recovery.seenUsage}) — re-arbitration allowed again (#496)`);
+        clearPreflightRecovery(session);
+        recovery = undefined;
+    }
     const payloadFitsWindow = (unknownBaseline
         ? outboundContextEstimates(prepared, prepared.body.toString(), opts, forwardUpstreamUrl(req, opts, route)).upperBound
         : calibratedPayload) < limit;
