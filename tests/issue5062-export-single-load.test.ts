@@ -125,6 +125,36 @@ test("#5062 parity: empty store + selector keeps the friendly notice, no throw",
     });
 });
 
+test("#5062 guard: summary facade misses (null) on network backends, serves rows on sqlite", async () => {
+    // Decision table for SessionStore.unifiedSessionSummaries' #5062 guard:
+    // the sync facade's miss value [] must never reach callers as an
+    // authoritative row set (network backends), while the sqlite fast lane
+    // keeps serving real rows untouched.
+    await withMode("full", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5062-facade-"));
+        try {
+            const store = new SessionStore({ dir, enabled: true });
+            const shadow = (store as unknown as {
+                shadow?: { isAsyncBackend: boolean; sessionSummaries(): unknown[] };
+            }).shadow;
+            assert.ok(shadow, "full-mode store must attach a sidecar");
+            const rows = [{ sessionId: "sess-x", hostTitle: null, title: "x", label: null, protocol: "responses", origin: "https://api.example.com/v1", namespace: "", statsJson: "{}", status: "active", updatedAt: 1, blocks: 1, latestBlockAt: 1 }];
+            try {
+                const setAsync = (v: boolean) => Object.defineProperty(shadow, "isAsyncBackend", { get: () => v, configurable: true });
+                shadow.sessionSummaries = () => rows;
+                setAsync(true);
+                assert.equal(store.unifiedSessionSummaries(), null, "async backend: miss wins even when rows would be available");
+                setAsync(false);
+                assert.deepEqual(store.unifiedSessionSummaries(), rows, "sqlite fast lane still serves rows");
+            } finally {
+                store.closeQuietly();
+            }
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
 test("#5062 parity: ambiguous prefix lists the candidates, unknown selector errors", async () => {
     await withMode("full", async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5062-ambig-"));
