@@ -64,10 +64,15 @@ async function runScenario(
     verdict: string | null,
     extraCompress: Record<string, unknown> = {},
     extraBody: Record<string, unknown> = {},
+    sideDelayMs = 0,
 ): Promise<ScenarioResult> {
     const mains: unknown[][] = [];
     const sides: { maxTokens: unknown; lastText: string; reasoningEffort: string | undefined }[] = [];
     const upstream = http.createServer((req, res) => {
+        // #5030 A1: the decision fetch may be aborted mid-delay; writing the
+        // late answer to a dead socket must not crash the test process.
+        req.on("error", () => {});
+        res.on("error", () => {});
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
@@ -78,13 +83,17 @@ async function runScenario(
             // since #5030); the client's own requests carry max_tokens 64_000.
             if (typeof body.max_tokens === "number" && body.max_tokens <= 1024) {
                 sides.push({ maxTokens: body.max_tokens, lastText: textOf(messages[messages.length - 1] ?? {}), reasoningEffort: typeof body.reasoning_effort === "string" ? body.reasoning_effort : undefined });
-                res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({
-                    id: "chatcmpl-decide",
-                    object: "chat.completion",
-                    choices: [{ index: 0, message: { role: "assistant", content: verdict ?? "Let me think about whether we should compress..." }, finish_reason: "stop" }],
-                    usage: { prompt_tokens: 50_000, completion_tokens: 10, total_tokens: 50_010 },
-                }));
+                const reply = () => {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({
+                        id: "chatcmpl-decide",
+                        object: "chat.completion",
+                        choices: [{ index: 0, message: { role: "assistant", content: verdict ?? "Let me think about whether we should compress..." }, finish_reason: "stop" }],
+                        usage: { prompt_tokens: 50_000, completion_tokens: 10, total_tokens: 50_010 },
+                    }));
+                };
+                if (sideDelayMs > 0) setTimeout(reply, sideDelayMs);
+                else reply();
                 return;
             }
             mains.push(messages);
@@ -217,4 +226,23 @@ test("#5030: nudgeDecisionReasoning \"follow\" forwards the host's effort", asyn
     const out = await runScenario("decide-reasoning-follow", true, '{"compress": false}', { nudgeDecisionReasoning: "follow" }, { reasoning_effort: "low" });
     assert.equal(out.sideCalls, 1);
     assert.deepEqual(out.sideReasoningEfforts, ["low"], "side call obeys the host-configured effort");
+});
+
+// #5030 A1: budget below the side call's latency → the decision fetch aborts,
+// the round degrades to "inject nothing" (ladder records the hard failure;
+// the legacy fallback only arms after 3 consecutive failures).
+test("#5030: nudgeDecisionTimeoutMs under the side call's latency fails the decision", async () => {
+    const out = await runScenario("decide-timeout-small", true, '{"compress": true}', { nudgeDecisionTimeoutMs: 100 }, {}, 1000);
+    assert.equal(out.sideCalls, 1, "the side call left the proxy before the abort");
+    assert.equal(out.mainLen, 30, "aborted decision injects nothing this round");
+    assert.ok(!out.mainLastText.includes("[bili-compress-directive]"));
+});
+
+// #5030 A1 control: the same slow side call survives a larger budget — the
+// knob bounds the decision window, it does not disable the lane.
+test("#5030: nudgeDecisionTimeoutMs over the side call's latency lets the decision through", async () => {
+    const out = await runScenario("decide-timeout-large", true, '{"compress": true}', { nudgeDecisionTimeoutMs: 5000 }, {}, 1000);
+    assert.equal(out.sideCalls, 1);
+    assert.equal(out.mainLen, 31, "a slow-but-timely decision still injects the directive");
+    assert.ok(out.mainLastText.includes("[bili-compress-directive]"));
 });
