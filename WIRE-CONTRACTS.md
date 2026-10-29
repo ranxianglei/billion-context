@@ -81,6 +81,7 @@ dialect whose frame names are its own.
 | WC-12f | `token_usage` carries the real counters in the per-request fields; every `*_total` field is always 0. | Usage maps from `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens`; the `*_total` fields are never read. |
 | WC-12g | The wire has no dedicated channel for visibility markers. | Injected markers ride as prose inside an `output` frame's `response`; how they render is host-side policy. |
 | WC-12h | `output.reasoning_content` streams through the same frame type as `response` (no separate reasoning event), and `extra_info` re-delivers reasoning that already streamed. | Reasoning maps to the reasoning channel; `extra_info` is forwarded verbatim (first round) and never re-injected into the rebuilt conversation. |
+| WC-12i | Parallel tool calls in one turn: the capture only pins the single-call framing (`index: 0` on the full-envelope frame, then `arguments`-only increments carrying an empty `id`). How this wire distinguishes a SECOND call in the same turn is uncaptured. | Outbound, `emitToolCall` numbers calls by first appearance (0, 1, …) exactly as `adapter-openai` does — byte-identical to the captured shape while only one call exists, and never colliding on 0 once there are two. Inbound, a frame that reuses an occupied `index` with a DIFFERENT non-empty `id` opens a new call instead of merging into the buffered one: distinct ids are distinct calls by definition. |
 
 ### Envelope mapping (unwrap / rewrap)
 
@@ -94,5 +95,8 @@ dialect whose frame names are its own.
 - Verification boundary: the request/response shapes above come from a real
   capture (#1295). The bili-side round trip is covered by unit tests; a full
   end-to-end replay through a real Trae client (compressed conversation echoed
-  back by the IDE) has NOT been run — that needs a live seat.
+  back by the IDE) has NOT been run — that needs a live seat. The single-call
+  framing is pinned; a parallel-call turn (WC-12i) is the concrete fixture that
+  replay would settle (whether this wire numbers a second call, or reuses
+  `index: 0` with a fresh `id`).
 

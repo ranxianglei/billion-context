@@ -72,6 +72,7 @@ envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型
 | WC-12f | `token_usage` 的真实计数在每请求字段里；所有 `*_total` 字段恒为 0。 | usage 从 `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens` 映射；`*_total` 字段从不读取。 |
 | WC-12g | 该 wire 没有 visibility marker 的专用通道。 | 注入的 marker 以散文形式搭在 `output` 帧的 `response` 里；渲染成什么样由宿主策略决定。 |
 | WC-12h | `output.reasoning_content` 与 `response` 用同一种帧流式下发（没有独立 reasoning 事件），且 `extra_info` 会重复投递已经流过的 reasoning。 | reasoning 走 reasoning 通道；`extra_info` 原样转发（第一轮），绝不重新注入重建后的对话。 |
+| WC-12i | 同一轮内的**并行工具调用**：capture 只钉住了单调用分帧（全信封帧带 `index: 0`，其后只给 `arguments` 增量且 `id` 为空串）。该 wire 如何区分同一轮里的**第二个**调用，尚未捕获。 | 出站方向 `emitToolCall` 按出现顺序编号（0、1 …），与 `adapter-openai` 一致 —— 只有一个调用时与捕获形状逐字节相同，出现两个时不会都撞在 0 上。入站方向：若某帧在已占用的 `index` 上带来**不同的非空 `id`**，则开启一个新调用而不是并入缓冲 —— id 不同即调用不同。 |
 
 ### Envelope 映射（unwrap / rewrap）
 
@@ -83,5 +84,6 @@ envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型
   压缩重发）原样回放。
 - 验证边界：上述请求/响应形状来自真机 capture（#1295）。bili 侧往返有单测覆盖；
   但**没有**跑过「压缩后的对话被真实 Trae 客户端回放」的端到端验证 —— 那需要一个
-  活的账号席位。
+  活的账号席位。单调用分帧已被钉住；并行调用轮（WC-12i）正是该回放要敲定的具体
+  fixture（这条 wire 究竟给第二个调用编号，还是复用 `index: 0` 换一个新 `id`）。
 
