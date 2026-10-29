@@ -160,7 +160,7 @@ The transient `systemPrompt` = `buildCompressSystemPrompt()` (or `buildCompressT
 
 ### recordUsage semantics (reviewer P1 clarification)
 `session.stats.inputTokens` ACCUMULATES across loop rounds (`+=` per round) = total tokens consumed (billing/usage). `session.stats.lastInputTokens` OVERWRITES each round = current context size (used by nudge/compression trigger). Both behaviors are intentional and correct for their respective purposes.
-Run via `node --import tsx --test tests/loop-*.test.ts` (node/npm at /home/dog/.local/bin; npx NOT available, use `npm test`).
+Run via `node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/loop-*.test.ts` (preload mandatory for bare runs, #5116; node/npm at /home/dog/.local/bin; npx NOT available, use `npm test`).
 
 ## Verification gate (must pass before declaring done)
 - `npm run typecheck` (tsc --noEmit) clean.

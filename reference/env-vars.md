@@ -74,16 +74,18 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 
 ## Test-infra escape hatches (scripts/-only, never product knobs)
 
-A small class of env vars exists purely for the local test harness — read by
-`scripts/*`, NEVER by `src/` or `src/knobs.ts`, and therefore NOT config-file
-knobs. They carry no provider/model dimension, are never shipped behavior, and
-stay OUT of CONFIGURATION.md (that surface is for user-facing knobs). They are
-documented HERE instead so the discipline ("document or don't ship") still
-holds without polluting the product config surface.
+A small class of env vars exists purely for the local test harness — read or
+written by `scripts/*` / `tests/*` only, NEVER by `src/` or `src/knobs.ts`,
+and therefore NOT config-file knobs. They carry no provider/model dimension,
+are never shipped behavior, and stay OUT of CONFIGURATION.md (that surface is
+for user-facing knobs). They are documented HERE instead so the discipline
+("document or don't ship") still holds without polluting the product config
+surface.
 
 | Var | Read by | Effect | Default |
 |-----|---------|--------|---------|
 | `BILI_TEST_FORCE` | `scripts/test-suite-lock.mjs` only | Set to `1`/`true`/`yes` to deliberately bypass the per-machine test-suite mutex (#3103) and let a second full `npm test` run share the machine with a live one. Untyped escape hatch for the known limitation the lock cannot cover (orphan daemons from a SIGKILLed suite, cross-clone contention); a normal single run never sets it. | unset = lock enforced |
+| `BILI_TEST_XDG_ROOT` | written by `tests/preload-storage-baseline.mjs` (via `tests/test-sandbox-env.mjs`), read by `tests/test-sandbox-env.test.ts` | Reports the per-process temp root the suite sandbox points the four XDG base dirs at when they were unset/empty (#5116) — where a failed run's session/state/cache/config artifacts live for post-mortems. Never overrides an explicitly set XDG var; never read by product code. | unset outside the suite preload |
 
 `BILI_TEST_FORCE` is the escape door the suite lock points at when a sibling
 run is detected (`[bili:test] a test suite is already running … to proceed

@@ -10,8 +10,27 @@
 ```bash
 npm run build          # tsup bundle (inlines acp-kernel)
 npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
-npm test               # node --import tsx --test tests/*.test.ts
+npm test               # suite lock + preload chain over tests/*.test.ts (see Targeted runs)
 ```
+
+## Targeted runs (single file / subset) — always with the preload (#5116)
+
+A bare `node --import tsx --test tests/foo.test.ts` skips the suite preload:
+every path a suite forgets to pin resolves through your REAL $HOME, so test
+sessions land in `~/.local/share/billion-context` (index.db + envelopes),
+state files in `~/.local/state/billion-context`, and the live
+`~/.config/billion-context` gets read. Always use the same preload chain
+`npm test` uses:
+
+```bash
+node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/<file>.test.ts
+```
+
+The preload pins `BILI_STORAGE_UNIFIED=legacy` AND sandboxes the four XDG base
+dirs into a per-process temp root (`BILI_TEST_XDG_ROOT`, reported for
+post-mortems): unset/empty values only — an explicitly set XDG var still wins,
+and suites that pin their own mkdtemp homes keep working untouched. Pinned by
+`tests/test-sandbox-env.test.ts`.
 
 ## CI: test schedule (#2816)
 
@@ -78,14 +97,14 @@ mechanics: `tests/e2e/README.md`.
 
 ```bash
 # zero-token preflight (codex binary + dist + upstream reachable)
-E2E_CHECK=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+E2E_CHECK=1 node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/e2e/e2e-codex.test.ts
 
 # full run (defaults to local sglang at http://127.0.0.1:8199/v1, zero cost)
 npm run build
-ACP_TEST_E2E=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+ACP_TEST_E2E=1 node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/e2e/e2e-codex.test.ts
 
 # + native-compact interception phase
-ACP_TEST_E2E=1 E2E_FORGE=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+ACP_TEST_E2E=1 E2E_FORGE=1 node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/e2e/e2e-codex.test.ts
 ```
 
 Rules:
@@ -168,7 +187,7 @@ to the older target + persistent restart banner, no ping-pong across cycles
 
 ```bash
 npm run build
-ACP_TEST_REGISTRY=1 node --import tsx --test \
+ACP_TEST_REGISTRY=1 node --import ./tests/preload-storage-baseline.mjs --import tsx --test \
   tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
 ```
 

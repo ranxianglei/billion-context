@@ -14,7 +14,7 @@
 |----------|-----------|
 | Language | TypeScript (strict, ESM) |
 | Build | tsup (bundling; inlines the in-repo kernel `kernel/`) |
-| Test | Node.js built-in: `node --import tsx --test tests/*.test.ts` |
+| Test | Node.js built-in: `node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/*.test.ts` (preload = storage baseline + XDG sandbox, #5116) |
 | Runtime Dep | the in-repo compression kernel (`kernel/`, npm name `acp-kernel`, bundled inline at build time) + `zod` (external, only used by `dist/agent/opencode-native.js` V1 tools; `dist/index.js` stays dependency-free) |
 
 ### Repository Info
@@ -107,7 +107,7 @@ The pi sub-agent surface (`acp_delegate` tools) lives IN THIS REPO under `pi-sub
 ```bash
 npm run build          # builds kernel/ + pi-subagents/ first, then tsup bundle (both inlined)
 npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests; pre-hooks build kernel/ + pi-subagents/)
-npm test               # node --import tsx --test tests/*.test.ts (bili suite; kernel suite: npm --prefix kernel test; pi-subagents suite: npm --prefix pi-subagents test) — LOCAL runs are for TARGETED files only; the FULL-suite verdict is the remote CI `test` lanes on the pushed head (§7.2)
+npm test               # suite lock + preload chain over tests/*.test.ts; targeted single file: `node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/<file>.test.ts` — the preload is MANDATORY for bare runs (#5116: it pins the storage baseline AND sandboxes the XDG dirs, so no test writes your real $HOME); kernel suite: npm --prefix kernel test; pi-subagents suite: npm --prefix pi-subagents test — LOCAL runs are for TARGETED files only; the FULL-suite verdict is the remote CI `test` lanes on the pushed head (§7.2)
 ```
 
 ### Local Testing & Install
@@ -247,7 +247,7 @@ Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release
 ### 7.2 Review Discipline
 
 - **Rebase to CURRENT master before claiming mergeable.** Verify against live master, not the PR's original base; after rebase run typecheck + build locally — the FULL-suite verdict comes from remote CI on the pushed head (next bullet). Stale base is the #1 cause of second-round rework (#425 Aug-31 base, #467 43 commits behind, #517).
-- **Full regression = remote GitHub CI, not a local full-suite run.** The authoritative green/red for the full suite is the GitHub Actions `test` lane on the pushed head (`scripts/run-ci-tests.mjs`, #2816: hermetic runner, pinned concurrency, ubuntu/windows × node 22/24 × 3 balanced shards (#3143)). Workflow: run the TARGETED suites locally for the area you touched (`node --import tsx --test tests/<changed-area>.test.ts`), push the branch / update the PR, then read the check runs. A local `npm test` full run is environment noise, not evidence — live lanes probing firewalled networks, port collisions with a concurrently running bili instance (e.g. claude-native binding 18787, #394), and cross-file interference all produce failures that CI proves green. Never cite a local full-suite result as the merge verdict, and never chase a local full-suite failure before confirming it reproduces on CI (or in that single file run standalone).
+- **Full regression = remote GitHub CI, not a local full-suite run.** The authoritative green/red for the full suite is the GitHub Actions `test` lane on the pushed head (`scripts/run-ci-tests.mjs`, #2816: hermetic runner, pinned concurrency, ubuntu/windows × node 22/24 × 3 balanced shards (#3143)). Workflow: run the TARGETED suites locally for the area you touched (`node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/<changed-area>.test.ts` — preload mandatory for bare runs, #5116), push the branch / update the PR, then read the check runs. A local `npm test` full run is environment noise, not evidence — live lanes probing firewalled networks, port collisions with a concurrently running bili instance (e.g. claude-native binding 18787, #394), and cross-file interference all produce failures that CI proves green. Never cite a local full-suite result as the merge verdict, and never chase a local full-suite failure before confirming it reproduces on CI (or in that single file run standalone).
 - **Watch hot-file contention.** `src/server.ts`, the preflight paths, `src/persist.ts`, and the `src/agent/*` extension types are rewritten by many concurrent PRs — expect semantic (not textual) conflicts; coordinate/sequence, resolve by union of intent, then prove by running tests (#517↔#587, #571↔#558).
 - **One linear commit, clean diff.** No diff-exploding rebases, no incidental whitespace re-alignment; every line relates to the PR's purpose (#571 "diff-爆炸", #467).
 - **Minor flaws found during review get fixed, not filed.** Per the owner rule "小问题直接修" (§4 Issue & Problem Tracking): when your own review of a PR turns up a small, non-semantic flaw (typo, misaligned indent, log wording), push the one-line fix to the PR branch immediately instead of listing it as a caveat — on ANY PR branch, external contributors included.
