@@ -28,6 +28,7 @@ import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import { describeRestorable } from "./image-restore.js";
+import { supersededRefRejection } from "./superseded-refs.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -397,11 +398,25 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
         return toolFail(`[decompress FAILED: startId/endId must be mNNNNN message refs (got "${startRaw}", "${endRaw}") — block ids (bN) are not valid here]`);
     }
-    if (sb.numericId > eb.numericId) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
+    // #5049 item 4: run the endpoints through the SAME resolution ladder as
+    // compress (live-first, then superseded translation, refuse only dead
+    // cites) so a pre-restamp citation restores the same messages instead of
+    // falling into a generic FAILED or silently picking a shifted window.
+    const sup = supersededRefRejection(
+        [{ startRef: `m${String(sb.numericId).padStart(5, "0")}`, endRef: `m${String(eb.numericId).padStart(5, "0")}` }],
+        ctx.session,
+    );
+    if (sup.rejection) {
+        ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: superseded refusal — ${sup.rejection}`);
+        return toolFail(`[decompress FAILED: ${sup.rejection}]`);
+    }
+    const sNum = refNum(sup.translatedRanges[0].startRef) ?? sb.numericId;
+    const eNum = refNum(sup.translatedRanges[0].endRef) ?? eb.numericId;
+    if (sNum > eNum) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
     const state = ctx.session.state;
     const cov = coveredMessages(state, block);
     if (!cov) return toolFail(`[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`);
-    const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
+    const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sNum && num <= eNum).map(({ raw }) => raw));
     if (pickedSet.size === 0) return toolFail(`[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`);
     const parts: string[] = [];
     let restoredFromStore = 0;
