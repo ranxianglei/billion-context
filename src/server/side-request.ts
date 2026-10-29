@@ -77,7 +77,7 @@ const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "js
 /** Whether the body asks for a JSON reply: OpenAI chat `response_format` or
  *  the Responses wire's `text.format`. `{type:"text"}` is plain prose and does
  *  not count. */
-export function requestsStructuredOutput(p: Record<string, unknown>): boolean {
+function requestsStructuredOutput(p: Record<string, unknown>): boolean {
     const text = p.text;
     const format = p.response_format
         ?? (text !== null && typeof text === "object" ? (text as { format?: unknown }).format : undefined);
