@@ -1145,15 +1145,24 @@ function residentBytes(): number {
     return bytes;
 }
 
-/** #3918: can this session's message view survive BETWEEN model requests? The
- * empty-view compress refusal (#3126) self-heals on the next model request ONLY
- * when the reloaded session stays resident afterwards. When the session's
- * last-known live weight plus the other residents exceeds the byte budget,
- * every request cycle ends with it evicted again (releaseInFlight discharge)
- * and the refusal repeats identically forever — the incident's 444 MiB image
- * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
- * Returns the measured pressure so the refusal receipt says so plainly instead
- * of promising a heal that will not come. */
+// #5111: peers with traffic within this window are "active" for permanence
+// accounting — only they can evict a reloaded session back out between requests.
+// Idle peers yield their slot to admission (evictOldest walks by lastSeen), so
+// counting them made the #3918 refusal verdict falsely permanent.
+const PEER_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
+
+/** #3918/#5111: can this session's message view survive BETWEEN model requests?
+ * The empty-view compress refusal (#3126) self-heals on the next model request ONLY
+ * when the reloaded session stays resident afterwards. Admission (makeResidentRoom)
+ * seats any incoming session whose own weight fits the budget by evicting the
+ * OLDEST idle residents first — idle peers do not block recovery. The refusal is
+ * permanent only when (a) the session's last-known live weight alone exceeds the
+ * whole budget (closing others cannot help), or (b) that weight cannot fit alongside
+ * the ACTIVE peers (traffic within PEER_ACTIVE_WINDOW_MS): every request cycle then
+ * ends with it evicted again (releaseInFlight discharge) and the refusal repeats
+ * identically forever — the incident's 444 MiB image session ping-ponged against an
+ * 87.5 MiB peer under the 512 MiB default. Returns the measured pressure so the
+ * refusal receipt says so plainly instead of promising a heal that will not come. */
 interface ResidentPressure {
     /** True when retrying cannot restore a usable view under the CURRENT pool state. */
     permanent: boolean;
@@ -1162,6 +1171,9 @@ interface ResidentPressure {
     weightBytes?: number;
     /** Resident bytes held by all OTHER sessions (this one excluded). */
     otherBytes: number;
+    /** Resident bytes held by OTHER sessions with traffic within
+     * PEER_ACTIVE_WINDOW_MS — the peers that actually compete for the slot. */
+    activeOtherBytes: number;
     residentBytes: number;
     budgetBytes: number;
 }
@@ -1172,10 +1184,17 @@ export function residentPressure(id: string): ResidentPressure {
     const total = residentBytes();
     const known = evictedWeights.get(id);
     const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    const now = Date.now();
+    let activeOtherBytes = 0;
+    for (const s of sessions.values()) {
+        if (s.id !== id && now - s.lastSeen <= PEER_ACTIVE_WINDOW_MS) activeOtherBytes += sessionWeight(s);
+    }
     return {
-        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        permanent: weightBytes !== undefined &&
+            (weightBytes > MAX_RESIDENT_BYTES || weightBytes + activeOtherBytes > MAX_RESIDENT_BYTES),
         weightBytes,
         otherBytes: total - self,
+        activeOtherBytes,
         residentBytes: total,
         budgetBytes: MAX_RESIDENT_BYTES,
     };

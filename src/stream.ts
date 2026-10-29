@@ -772,22 +772,31 @@ export function noVisibleContextRefusal(
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
     // #3918: the "self-heals on the next model request" promise holds ONLY when
     // the reloaded session survives between requests. When this session's
-    // last-known live weight cannot fit alongside the current residents within
+    // last-known live weight cannot fit alongside the ACTIVE residents within
     // the byte budget, every request cycle ends with it evicted again and this
     // exact refusal repeats forever — say so plainly instead of advising an
     // impossible retry (the incident: a ~444 MiB image session ping-ponging
-    // against an ~87.5 MiB peer under the 512 MiB default budget).
+    // against an ~87.5 MiB peer under the 512 MiB default budget). #5111: idle
+    // peers do not break the promise — admission evicts them to seat the
+    // reloaded session — so permanence is judged against active peers only, and
+    // a session too heavy for the WHOLE budget gets its own exit advice (closing
+    // others cannot help there).
     const pressure = residentPressure(ctx.session.id);
+    const selfExceedsBudget = (pressure.weightBytes ?? 0) > pressure.budgetBytes;
     ctx.log(pressure.permanent
-        ? `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — PERMANENT: last-known weight ${formatMiB(pressure.weightBytes)} + other residents ${formatMiB(pressure.otherBytes)} > budget ${formatMiB(pressure.budgetBytes)}; the session cannot stay resident between model requests (#3918)]`
+        ? `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — PERMANENT: last-known weight ${formatMiB(pressure.weightBytes)}${selfExceedsBudget ? " alone exceeds the whole budget" : ` + active other residents ${formatMiB(pressure.activeOtherBytes)} (idle peers excluded)`} > budget ${formatMiB(pressure.budgetBytes)}; the session cannot stay resident between model requests (#3918/#5111)]`
         : `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)]`);
     const specKey = normalizedSpecKey(ranges);
     const repeatGuard = recordCompressFailure(ctx.session, specKey, pressure.permanent
-        ? "This failure repeats until the resident pool can hold this session alongside the others — closing another open session or raising sessions.residentMaxBytes clears it; waiting for the next turn does NOT."
+        ? (selfExceedsBudget
+            ? "This failure repeats until the pool budget can hold this session ALONE — closing other sessions will NOT free room for it; raise sessions.residentMaxBytes above ~the session's footprint and restart bili."
+            : "This failure repeats until the resident pool can hold this session alongside the others — closing another open session or raising sessions.residentMaxBytes clears it; waiting for the next turn does NOT.")
         : "This failure is the proxy's missing in-memory message view, not your refs — it clears on the next model request. Wait for that turn instead of re-issuing.");
     const loopGuard = opts?.loopTracking === false ? "" : noteCompressLoopFailure(ctx, specKey, undefined, "no-visible-context");
     const healClause = pressure.permanent
-        ? ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}) plus the other resident sessions (~${formatMiB(pressure.otherBytes)}) exceed the resident pool budget (${formatMiB(pressure.budgetBytes)}), so every reload of this session is evicted again and no usable view survives between model requests — retrying now or after the next turn fails identically. To recover: finish or close the other open session(s), or raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB((pressure.weightBytes ?? 0) + pressure.otherBytes)} and restart bili.`
+        ? (selfExceedsBudget
+            ? ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}) alone exceeds the resident pool budget (${formatMiB(pressure.budgetBytes)}) — closing other sessions will NOT free room for it, so retrying now or after the next turn fails identically. To recover: raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB(pressure.weightBytes)} and restart bili.`
+            : ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}) plus the other ACTIVE resident sessions (~${formatMiB(pressure.activeOtherBytes)}) exceed the resident pool budget (${formatMiB(pressure.budgetBytes)}), so every reload of this session is evicted again and no usable view survives between model requests — retrying now or after the next turn fails identically. To recover: finish or close the other open session(s), or raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB((pressure.weightBytes ?? 0) + pressure.activeOtherBytes)} and restart bili.`)
         : "Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again.";
     const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem.${healClause} [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
