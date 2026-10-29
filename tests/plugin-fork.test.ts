@@ -1468,7 +1468,12 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         _resetPluginStateForTest();
         const restored = getSession("parent");
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        // #3011: when the restore carries a verifiable UNFOLDED raw tail (unified-store
+        // restore), the endpoint serves it immediately (200) instead of waiting for the
+        // next model request; folded-only restores (legacy/shadow envelopes) still 409.
+        // Both pre-states are valid — the self-heal below is the pinned contract.
+        const pre = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert([409, 200].includes(pre.status), `expected 409 or 200 before self-heal, got ${pre.status}`);
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
@@ -1516,5 +1521,76 @@ test("fork protocol v2: revision is stable across state churn that does not move
         const moved = await h.request("/__bili/plugin/snapshot?conversationId=parent");
         assert.equal(moved.status, 200);
         assert.notEqual(moved.body.parentRevision, before.body.parentRevision, "a snapshot change must flip the v2 revision");
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot serves the recent raw view when no retained copy exists (#3011)", async () => {
+    const h = await harness();
+    try {
+        const session = getSession("parent");
+        assert.ok(session.pluginSnapshot, "the seeded parent retains a raw snapshot");
+        // Simulate the residency gap: LRU evict / host restart loses the
+        // retained copy (persisted only after a fork receipt or explicit
+        // retention) while lastMessages — written by every request and
+        // persisted unconditionally — survives. Stale stored-ref bookkeeping
+        // from the lost view must not veto the tail path.
+        session.pluginSnapshot = undefined;
+        session.metadata.publicSnapshotStoredRefs = ["m99998"];
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.equal(snapshot.body.orderedMessages.length, 3);
+        assert.deepEqual(snapshot.body.messages.map((m) => m.text), h.messages.map((m) => m.content));
+        // A full-prefix fork materializes from the same source view (the old
+        // code crashed here on parent.pluginSnapshot!.slice).
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 3));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot stays unavailable with neither retained copy nor recent raw view (#3011)", async () => {
+    const h = await harness();
+    try {
+        const session = getSession("parent");
+        session.pluginSnapshot = undefined;
+        session.lastMessages = undefined;
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot never serves a folded tail view (#3011)", async () => {
+    const h = await harness();
+    try {
+        const session = getSession("parent");
+        session.pluginSnapshot = undefined;
+        session.lastMessagesFolded = true;
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot prefers the fresh raw view over a stale frozen snapshot (#3011)", async () => {
+    const h = await harness();
+    try {
+        const session = getSession("parent");
+        assert.ok(session.lastMessages && session.lastMessages.length > 0);
+        // A full-cover native compaction froze pluginSnapshot pre-compaction
+        // (zero-overlap guard refuses to shrink it) while the rebase re-issued
+        // the ref space; the next raw request rewrote lastMessages. Serving
+        // the stale head would fail closed on its dead mapping forever — the
+        // head-divergent tail is the freshest raw view the client replays next.
+        const freshHead = { id: hash("fresh-head"), role: "user" as const, contentType: "text" as const, text: "post-compaction opener" };
+        session.state.messageRefs.byRaw[freshHead.id] = "m00099";
+        session.state.messageRefs.byRef["m00099"] = freshHead.id;
+        session.lastMessages = [freshHead, ...session.lastMessages.slice(1)];
+        session.lastMessagesFolded = false;
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.equal(snapshot.body.messages[0].text, freshHead.text);
+        assert.equal(snapshot.body.orderedMessages[0].ref, "m00099");
     } finally { await h.close(); }
 });
