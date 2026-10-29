@@ -15,6 +15,7 @@ import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwarde
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
+import { rewrapTraeBody } from "../trae-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
@@ -37,6 +38,7 @@ import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
 import { createCommandcodeAdapter } from "../loop/adapter-commandcode.js";
+import { createTraeAdapter } from "../loop/adapter-trae.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
@@ -425,6 +427,13 @@ async function forwardCaptured(
             wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
         } catch { /* malformed flat body — pass through unchanged */ }
     }
+    // #1295: same boundary for the trae wire — its envelope keys (function,
+    // config_name, planner limits) live only in the meta captured at unwrap.
+    if (prepared?.traeWire && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapTraeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.traeWire.meta));
+        } catch { /* malformed flat body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -458,7 +467,9 @@ async function forwardCaptured(
     // retry that dropped it would present flat OpenAI where the client's wire
     // expects the CLI envelope.
     const ccMetaForResend = prepared?.commandcode?.meta;
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
+    // #1295: same rule for the trae envelope on re-sent bodies.
+    const traeMetaForResend = prepared?.traeWire?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined || traeMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             let out = b;
             if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
@@ -467,6 +478,7 @@ async function forwardCaptured(
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
             out = v1Active ? wrapV1Internal(out, v1Meta) : out;
             if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            if (traeMetaForResend !== undefined) out = rewrapTraeBody(out, traeMetaForResend);
             return out;
         }
         : undefined;
@@ -1610,7 +1622,7 @@ async function forwardCaptured(
             // longer change, so deliver the upstream failure in-band (protocol error
             // event for streams; verbatim error body under 200 otherwise).
             if (prepared?.stream) {
-                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
+                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.traeWire ? "trae" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
             } else {
                 try { res.end(errBody ?? undefined); } catch { /* client gone */ }
             }
@@ -1726,7 +1738,7 @@ async function forwardCaptured(
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             // #1295: the JSONL wire has no fake-completion shape to detect —
             // its finish event IS the terminal frame.
-            if (prepared.stream && !prepared.commandcode && maxFakeCompletionRetries() > 0) {
+            if (prepared.stream && !prepared.commandcode && !prepared.traeWire && maxFakeCompletionRetries() > 0) {
                 // #1900: retry from wireBody — the exact bytes this request's main
                 // attempt shipped (post wireTransform and any same-request re-send),
                 // never the raw client body: upstream may have rejected those raw
@@ -1880,7 +1892,7 @@ async function forwardCaptured(
     try {
         // #1295: commandcode streams terminate with their own finish event —
         // no fake-completion shape exists to buffer-and-retry (#371 off).
-        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.traeWire && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -2123,6 +2135,8 @@ async function forwardCaptured(
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode
                 ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
+                : prepared.traeWire
+                ? createTraeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
                 : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
@@ -2216,7 +2230,7 @@ async function forwardCaptured(
             }
             res.end();
         } catch (e) {
-            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
+            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.traeWire ? "trae" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;

@@ -54,3 +54,34 @@ JSON 对象，不是 SSE）。
 - 错误：`{"type":"error","error":<code>,"message"}` —— 客户端抛
   `LlmError`；重试策略属于 CLI 的 HTTP 层，所以 bili 的 preflight/stream
   错误帧只携带 code+message。
+## TRAE SOLO wire（`wire: "trae"`）
+
+动机案例：Trae IDE 自带的 SOLO agent 车道 ——
+`POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`；请求 = Trae
+envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型 id 同时写在
+`config_name`，Max 模式完全靠 body 里的 `mode_type` / `context_window_size` /
+`prompt_max_tokens` 表达）；响应 = 帧名自成一派的 SSE 变体。
+
+| ID | 约束 | bili 侧的后果 |
+|----|------|---------------|
+| WC-12a | 对话是 openai-completions 形状，但 message 的 content 恒为 text parts 数组 —— tool 结果也一样。 | unwrap 把 parts 拼回一个字符串；出现非 text part（图片/音频）即判定整个 body 不可转换 → 原样 relay。rewrap 把每条消息还原成单个 text part。 |
+| WC-12b | tool call 保留 OpenAI 外层（`id`、`type: "function"`），但载荷键改名为 `function_call`；带工具调用的 assistant 轮 `content: null`。 | unwrap 改回 `function`；rewrap 改回 `function_call` 并还原工具轮的 `content: null`（`arguments` 按字节语义保真，#1039）。 |
+| WC-12c | 流是 `event:<name>` / `data:<json>`，冒号后没有空格，也没有 `[DONE]`；`done` 帧是终止符。帧序：`metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`。 | 适配器按该方言解析；`emitCompletion` 写 `token_usage` + `done`。只有 `done` 之前的断流才合成 `error` 帧。 |
+| WC-12d | rewrap 绝不允许在转发中途丢内容。 | 该 wire 没有对应槽位的角色（例如 compat-roles 的重写目标）降级为 `user` 文本，而不是被丢弃。 |
+| WC-12e | 上游可能发出 bili 不认识的帧（未来改版风险）。 | 未知帧名、无法解析的 `data:` 载荷一律按字节原样转发 —— 只限第一轮，避免 bili 自己的注入被误当成上游内容。 |
+| WC-12f | `token_usage` 的真实计数在每请求字段里；所有 `*_total` 字段恒为 0。 | usage 从 `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens` 映射；`*_total` 字段从不读取。 |
+| WC-12g | 该 wire 没有 visibility marker 的专用通道。 | 注入的 marker 以散文形式搭在 `output` 帧的 `response` 里；渲染成什么样由宿主策略决定。 |
+| WC-12h | `output.reasoning_content` 与 `response` 用同一种帧流式下发（没有独立 reasoning 事件），且 `extra_info` 会重复投递已经流过的 reasoning。 | reasoning 走 reasoning 通道；`extra_info` 原样转发（第一轮），绝不重新注入重建后的对话。 |
+
+### Envelope 映射（unwrap / rewrap）
+
+- `messages`：text parts → 字符串（还原时每条消息一个 part）。
+- `tools`：标准 OpenAI 形状，原样透传。
+- flat body 装不下的 envelope 键（`function`、`config_name`、`mode_type`、
+  `context_window_size`、`prompt_max_tokens`、`model_selection_strategy`、
+  `model_auto_selection` …）在 unwrap 时逐字记下，于最终转发边界（以及每次循环
+  压缩重发）原样回放。
+- 验证边界：上述请求/响应形状来自真机 capture（#1295）。bili 侧往返有单测覆盖；
+  但**没有**跑过「压缩后的对话被真实 Trae 客户端回放」的端到端验证 —— 那需要一个
+  活的账号席位。
+
