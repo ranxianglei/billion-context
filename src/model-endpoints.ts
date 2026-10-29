@@ -7,13 +7,15 @@
 // arbitrary wires. Each entry maps an absolute URL prefix to a wire family;
 // standard families reuse the existing pipelines untouched, "commandcode" is
 // the first custom family (openai-completions request shape inside a nested
-// CLI envelope + bare-JSONL event-stream response).
+// CLI envelope + bare-JSONL event-stream response), "trae" the second
+// (openai-completions request shape behind Trae's envelope + an SSE dialect
+// whose frame names are its own).
 
 import { readFile } from "node:fs/promises";
 import { configFile } from "./paths.js";
 import type { WireProtocol } from "./util.js";
 
-export const MODEL_ENDPOINT_WIRES = ["anthropic", "openai", "responses", "google", "commandcode"] as const;
+export const MODEL_ENDPOINT_WIRES = ["anthropic", "openai", "responses", "google", "commandcode", "trae"] as const;
 type ModelEndpointWire = (typeof MODEL_ENDPOINT_WIRES)[number];
 
 export interface ModelEndpointPattern {

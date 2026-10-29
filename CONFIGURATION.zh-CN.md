@@ -1238,10 +1238,10 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 
 `modelEndpointPatterns` 用于声明非标路径上的模型端点 —— 路径形状不属于任何内置 wire family 的 URL（例如 `https://api.commandcode.ai/alpha/generate`）。未声明时这类请求逐字节 relay、零压缩（#1290）；声明后两个 gate 对它们达成一致：客户端 fetch patch 认领该请求，代理将其分类到声明的 wire family。
 
-- **类型：** `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" }` 数组
+- **类型：** `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" | "trae" }` 数组
 - **默认值：** `[]`（仅内置路径表）
 - **状态：** ACTIVE
-- **说明：** 每个条目是一个绝对 URL 前缀加要按哪种 wire family 处理。最长匹配前缀优先；匹配要求同 origin 且落在 path 段边界上（`…/alpha/generate` 匹配自身及子路径，不匹配 `…/alpha/generate2`，也绝不匹配其他 origin）。同一份配置同时喂给代理侧协议分类器和所有 native entry 的客户端 fetch 认领逻辑，原先两张硬编码表从此不可能再漂移（#1295）。注意两个 gate 在带路径重写的 provider 上匹配的 URL 不同：客户端认领匹配客户端调用的 URL，代理分类器匹配重写后的 URL —— **请声明请求实际落地的 URL**（配置了 `upstreamPath` 重写时即重写后的路径）。Userinfo（`https://user:pass@host/…`）与 `search`/`hash` 一样在启动时被大声拒绝。基于 body 的消歧仍然生效（#1284）：已声明端点若 body 看起来不是模型对话则原样 relay；不可转换的 `commandcode` body（非流式 CLI 对话等）同样原样 relay（见 WIRE-CONTRACTS.md）。四个标准 family 只改变分类判定，管线本身不变。`commandcode` 是 commandcode CLI wire：嵌套 envelope 包着一个 openai-completions 形状的对话，响应为裸 JSONL 事件流；流式请求走 OpenAI 族循环压缩（proxy 与 plugin 两种模式都支持），非流式降级为原样 relay。声明在进程启动时读取 —— 修改后需重启 bili（以及需要由 fetch patch 认领该端点的 native client）才能生效。条目格式错误会在启动时大声报错，而不是被静默丢弃。
+- **说明：** 每个条目是一个绝对 URL 前缀加要按哪种 wire family 处理。最长匹配前缀优先；匹配要求同 origin 且落在 path 段边界上（`…/alpha/generate` 匹配自身及子路径，不匹配 `…/alpha/generate2`，也绝不匹配其他 origin）。同一份配置同时喂给代理侧协议分类器和所有 native entry 的客户端 fetch 认领逻辑，原先两张硬编码表从此不可能再漂移（#1295）。注意两个 gate 在带路径重写的 provider 上匹配的 URL 不同：客户端认领匹配客户端调用的 URL，代理分类器匹配重写后的 URL —— **请声明请求实际落地的 URL**（配置了 `upstreamPath` 重写时即重写后的路径）。Userinfo（`https://user:pass@host/…`）与 `search`/`hash` 一样在启动时被大声拒绝。基于 body 的消歧仍然生效（#1284）：已声明端点若 body 看起来不是模型对话则原样 relay；不可转换的 `commandcode` body（非流式 CLI 对话等）同样原样 relay（见 WIRE-CONTRACTS.md）。四个标准 family 只改变分类判定，管线本身不变。`commandcode` 是 commandcode CLI wire：嵌套 envelope 包着一个 openai-completions 形状的对话，响应为裸 JSONL 事件流；流式请求走 OpenAI 族循环压缩（proxy 与 plugin 两种模式都支持），非流式降级为原样 relay。`trae` 是 Trae IDE SOLO wire（`…/api/agent/v3/llm_utils_chat`）：同一个 openai-completions 对话包在 Trae 自己的 envelope 里，content 恒为 text parts 数组、tool call 用 `function_call`，响应是帧名自成一派的 SSE 变体；同样在 proxy 与 plugin 两种模式下走 OpenAI 族循环压缩（见 WIRE-CONTRACTS.md WC-12a–h）。声明在进程启动时读取 —— 修改后需重启 bili（以及需要由 fetch patch 认领该端点的 native client）才能生效。条目格式错误会在启动时大声报错，而不是被静默丢弃。
 
   ```jsonc
   {

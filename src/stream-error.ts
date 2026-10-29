@@ -30,7 +30,11 @@ import type http from "node:http";
  * still attempt res.end(). Never throws.
  */
 
-type Protocol = "anthropic" | "openai" | "responses" | "google" | "commandcode";
+type Protocol = "anthropic" | "openai" | "responses" | "google" | "commandcode" | "trae";
+
+function traeFrame(event: string, payload: Record<string, unknown>): string {
+    return `event:${event}\ndata:${JSON.stringify(payload)}\n\n`;
+}
 
 function safeWrite(res: http.ServerResponse, chunk: string): void {
     try {
@@ -59,6 +63,11 @@ function nativeErrorChunk(protocol: Protocol, message: string): string {
     if (protocol === "commandcode") {
         // #1295: bare-JSONL error line — the CLI wire's own error event.
         return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message })}\n`;
+    }
+    if (protocol === "trae") {
+        // #1295: Trae's SSE dialect (WC-12c) — own event name, no space after
+        // the colon. Not in the captured turn set; unverified client tolerance.
+        return traeFrame("error", { message });
     }
     return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "stream_error", message } })}\n\n`;
 }
@@ -103,6 +112,10 @@ function legacyCompletionChunk(protocol: Protocol, visible: string, state?: Lega
     if (protocol === "commandcode") {
         // #1295: the CLI wire has no "completion" disguise — always the native error line.
         return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message: visible })}\n`;
+    }
+    if (protocol === "trae") {
+        // #1295: same rule on the Trae wire — no completion disguise.
+        return traeFrame("error", { message: visible });
     }
     // #2689: strict clients validate the full Anthropic SSE lifecycle — the old
     // bare delta had no numeric index and no owning block (orphan), so
@@ -249,6 +262,10 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
             if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE", ...metaField } })}\n\n`);
+        } else if (protocol === "trae") {
+            // WC-12c: the done frame IS this wire's terminator; only a
+            // mid-flight cut needs an error frame.
+            if (!finished) safeWrite(res, traeFrame("error", { message }));
         } else if (protocol === "commandcode") {
             // The finish event IS this wire's terminator: when delivered there
             // is nothing to synthesize; only a mid-flight cut gets an error line.
@@ -297,6 +314,8 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
         } else if (protocol === "google") {
             safeWrite(res, `data: ${JSON.stringify({ error: { code: error.retryable ? 503 : 500, message: error.message, status: error.retryable ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`);
+        } else if (protocol === "trae") {
+            safeWrite(res, traeFrame("error", { code: err.code, message: err.message }));
         } else if (protocol === "commandcode") {
             safeWrite(res, `${JSON.stringify({ type: "error", error: err.code, message: err.message })}\n`);
         } else {
