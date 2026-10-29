@@ -52,9 +52,12 @@ export function isForeignMembership(m: RequestMembership | null | undefined): bo
 }
 
 export function probeRequestMembership(session: Session, ids: string[], payloadUpper: number): RequestMembership | null {
-    if (ids.length === 0) return null;
     const t = session.transient;
     if (!t) return null;
+    if (ids.length === 0) {
+        delete t.requestMembership;
+        return null;
+    }
     const needle = t.latestKnownMsgId ?? null;
     // First turn (no needle yet) abstains and plants one.
     const member = needle === null || ids.includes(needle);

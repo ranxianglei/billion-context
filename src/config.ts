@@ -587,7 +587,16 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-type PromptCacheRouting = "auto" | "enabled" | "disabled";
+/** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
+ *  (chat-wire conversation-id stamping, Responses-wire identity injection).
+ *  Keys the client/host sent are ALWAYS forwarded verbatim — this switch only
+ *  gates bili's own emission. `"disabled"` (default since #5079) never writes
+ *  one; many upstreams ignore or flat-out reject the field. `"auto"` is the
+ *  pre-#5079 behavior (stamp on the internal plugin lane; inject toward
+ *  api.openai.com on Responses); `"enabled"` injects/stamps wherever the code
+ *  supports it. The #2645 A/B probe-and-remember ablation still withholds the
+ *  key per origin+model once a real 400 proves rejection, in every mode. */
+export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -2909,7 +2918,16 @@ function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
-    return value === "enabled" || value === "disabled" ? value : "auto";
+    // #5079: absent/unknown falls back to "disabled" (was "auto") — self-stamping is opt-in now;
+    // explicit "auto" keeps its pre-#5079 meaning so existing configs migrate unchanged.
+    return value === "auto" || value === "enabled" || value === "disabled" ? value : "disabled";
+}
+
+export function effectivePromptCacheRouting(promptCache: { routing?: string } | undefined): PromptCacheRouting {
+    // Partial ServerOptions (hand-built test harnesses, sub-lane constructions) may omit the
+    // promptCache section entirely — fall back exactly like parsePromptCacheRouting(undefined);
+    // never crash on a missing section mid-request or at startup.
+    return parsePromptCacheRouting(promptCache?.routing);
 }
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {

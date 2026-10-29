@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -588,7 +588,9 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         let nudge: NudgeDecision | undefined;
         try {
             const turn = ctx.core.processTurn({
-                messages: ctx.messages,
+                // #5139: same view-class fix as liveCompressionRanges — outbound-only
+                // markers must not endpoint ranges screened against the apply view.
+                messages: withoutTurnSeparators(ctx.messages),
                 state: ctx.session.state,
                 config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
                 tokenCount: statusInputBaseline(ctx.session),

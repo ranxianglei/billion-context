@@ -130,3 +130,17 @@ dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求
 - **双模式推理** —— 只有插件道(注册 agent / dsh 插件,内部会话头在场)会打戳;纯代理模式双向都是原样透传,逐字节不变。
 
 pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。
+
+### #5079:政策反转 —— 自注入默认关闭,一个开关管住两条 wire
+
+owner 定案(取代 #2649 的默认全盖章裁决):大量服务见到这个字段会直接拒绝请求,而这类服务无法预先枚举 —— 所以 bili 不再主动写自己的 `prompt_cache_key`,除非用户要求。闸门是**既有**的 `promptCache.routing` 开关(`ACP_PROMPT_CACHE_ROUTING`,或 Web UI 快速配置),现在同时管住 bili 在**两条 wire** 上的自注入 —— 不新增任何配置面:
+
+- `"disabled"`(新默认;无法识别的值一律落到这里):bili 任何地方都不写自己的 key。客户端自带的 key 不受此闸门影响 —— 任何模式下都原样转发(上面的 A/B 探测记忆仍会撤掉已被证实拒收该 key 的 origin+model 组合上的客户端 key)。
+- `"auto"`:完全等于 #5079 之前的行为 —— chat wire 每个插件车道请求都盖,Responses wire 仅对 `api.openai.com` 注入。
+- `"enabled"`:所有支持的车道都盖/注(Responses wire:任意 host)。
+
+chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于绑定会话 id 的 key 只可能是 bili 自己的机制回显(让客户端 key 赢得身份绑定的提升机制要求内部会话头缺席),因此算 bili 自注入、`"disabled"` 下被剥掉;其他取值保持客户端所有、原样转发。Responses wire 同理:显式 body key 等于会话 id 且身份未被提升时算 bili 自己打的(omp/dsh 扩展所打);身份已提升则说明是客户端提供的。
+
+升级提示(owner 要求):运行 `"disabled"` 的实例展示一次性提示 —— Web 面板横幅(可关闭,按实例持久化在 state 目录 `upgrade-notices.json`)、`acp_status` 一行、启动日志一行 —— 点名应切回 `"auto"`/`"enabled"` 的人群:workbuddy panel/hub 之类的中转站与号池,缺了这个 key 流量随机路由、前缀缓存亲和下降。直连官方 API 的用户忽略即可。关闭提示不会改动 routing 的值。
+
+测试:`tests/issue5079-pck-default-off.test.ts`(解析兜底、双 wire 矩阵含 bili 回显行、提示模块、默认关/auto 成对的活代理出口断言)+ `tests/issue2218-relay-affinity-signal.test.ts` 的更新矩阵。

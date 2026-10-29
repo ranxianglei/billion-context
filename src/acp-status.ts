@@ -21,11 +21,14 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
+import { loadOptions } from "./config.js";
+import { pckNoticeActive } from "./pck-notice.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
@@ -73,7 +76,10 @@ export function excludeDeadRefRanges<T extends { startRef: string; endRef: strin
 
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
-        messages: ctx.messages,
+        // #5139: the send view's outbound-only ordering markers have no ids in
+        // the apply view — endpoints landing on them die at projection and
+        // their whole units vanish from the offer silently.
+        messages: withoutTurnSeparators(ctx.messages),
         state: ctx.session.state,
         config: ccrLoopConfig(ctx.session, ctx.config),
         tokenCount: statusInputBaseline(ctx.session),
@@ -531,6 +537,22 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
         lines.push("If this destination is your relay/account pool, its prefix-cache affinity for the listed sessions may degrade until restart.");
         extra.push(...lines);
+    }
+    // #5079: bili's own prompt_cache_key stamping is OFF by default now. An
+    // operator upgrading onto a relay/account-pool upstream that routes its
+    // prefix cache by that key must re-enable it explicitly — surface it here
+    // (the /acp channel) while the effective routing is "disabled" and the
+    // notice has not been dismissed for this instance. Read through
+    // loadOptions() so the web switch and ACP_PROMPT_CACHE_ROUTING both show
+    // up without threading opts through the loop ctx; a config-read failure
+    // just hides the line rather than breaking status.
+    try {
+        if (pckNoticeActive(loadOptions().promptCache.routing)) {
+            extra.push("");
+            extra.push("PCK SELF-STAMPING OFF BY DEFAULT (instance-level, #5079): bili no longer adds OpenAI's prompt_cache_key to requests on its own. If your upstream routes prefix cache by this key (relays such as workbuddy panel/hub, account pools), turn it back on: set \"promptCache\": {\"routing\": \"auto\"} in billion-context.json or use the web UI switch (or ACP_PROMPT_CACHE_ROUTING=auto) — otherwise traffic may route randomly and miss the prefix cache. Direct official-API users can ignore this.");
+        }
+    } catch {
+        // config unreadable — hide the line, never break acp_status
     }
     const blind = getBlindTunnelStats();
     if (blind.total > 0) {

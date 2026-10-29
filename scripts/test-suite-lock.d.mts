@@ -24,3 +24,13 @@ export function acquireLock(
 export function releaseLock(lockPath: string, myPid: number): Promise<void>;
 export function releaseLockSync(lockPath: string, myPid: number): void;
 export function listTestFiles(root?: string): string[];
+export function realSuiteArgs(): string[];
+export function resolveProductionSessionsDir(env?: NodeJS.ProcessEnv): string;
+export function leakGuardEnabled(env?: NodeJS.ProcessEnv): boolean;
+export function snapshotSessionsTree(dir: string): Map<string, [number, number]> | null;
+export function diffSnapshots(
+    before: Map<string, [number, number]> | null,
+    after: Map<string, [number, number]> | null,
+): { created: string[]; changed: string[] };
+export function leakFailureMessage(prodDir: string, created: string[]): string;
+export function leakWarningMessage(changed: string[]): string;

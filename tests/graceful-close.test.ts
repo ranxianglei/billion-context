@@ -265,6 +265,7 @@ async function runScenario(attempt: number): Promise<void> {
                 BILI_KEEP_ALIVE_TIMEOUT_MS: "300",
                 BILI_MITM_HANDSHAKE_TIMEOUT_MS: "600",
                 BILI_ADVISORY_CHECK: "0",
+                ACP_LOG_FILE: "off",
             },
             stdio: ["ignore", "pipe", "pipe"],
         });

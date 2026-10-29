@@ -164,9 +164,9 @@ test("#3959 D1: secondProcess stays while the foreign pid lives, self-clears onc
     }
 });
 
-// ---- D2: cross-lane downgrade at store open ----------------------------------
+// ---- D2: coexistence at store open (#5082 semantics) -------------------------
 
-test("#3959 D2: cross-lane registry hit is benign; same lane / registry miss are not", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
+test("#3959/#5082 D2: every live foreign pid is informational — cross-lane, same lane, registry miss alike", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3959-d2-"));
     const logs: string[] = [];
@@ -195,27 +195,31 @@ test("#3959 D2: cross-lane registry hit is benign; same lane / registry miss are
             _resetStorageRuntimeStatusForTest();
             logs.length = 0;
 
-            // same lane: registry entry with lane "pi" === own "pi" → NOT benign
+            // same lane: registry entry with lane "pi" === own "pi" — #5082:
+            // two instances OPENING one db is safe; only same-session dual
+            // writes are the hazard (contested elsewhere) → informational too.
             writeInstanceEntry(path.join(base, "state"), "peer-pi", child.pid!, "pi");
             fs.writeFileSync(path.join(base, "sessions", "b.db.lock"), JSON.stringify({ pid: child.pid }));
             store = UnifiedStore.open(path.join(base, "sessions", "b.db"));
             wire = storageStatusWire();
-            assert.equal(wire.secondProcess?.benign, false, "same-lane peer keeps the loud warning");
+            assert.equal(wire.secondProcess?.benign, true, "same-lane peer is informational too (#5082)");
             assert.equal(wire.secondProcess?.lane, "pi");
-            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing") && l.includes("corrupt")), "same-lane peer logs the corruption error");
+            assert.ok(logs.some((l) => l.startsWith("info ") && l.includes("supported topology")), "same-lane peer logs the shared-topology info line");
+            assert.ok(!logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "same-lane peer does NOT log the old corruption error");
             store.close();
             _resetStorageRuntimeStatusForTest();
             logs.length = 0;
 
-            // registry miss: unknown process → NOT benign, no lane recorded
+            // registry miss: unknown process → still informational, no lane recorded
             fs.rmSync(path.join(base, "state", "billion-context", "instances"), { recursive: true, force: true });
             fs.writeFileSync(path.join(base, "sessions", "c.db.lock"), JSON.stringify({ pid: child.pid }));
             store = UnifiedStore.open(path.join(base, "sessions", "c.db"));
             wire = storageStatusWire();
-            assert.equal(wire.secondProcess?.benign, false, "unknown process keeps the loud warning");
+            assert.equal(wire.secondProcess?.benign, true, "unknown process is informational too (#5082)");
             assert.equal(wire.secondProcess?.lane, undefined);
             assert.equal(wire.secondProcess?.instanceId, undefined);
-            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "registry miss logs the corruption error");
+            assert.ok(!logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "registry miss does NOT log the old corruption error");
+            assert.ok(logs.some((l) => l.startsWith("info ") && l.includes(`pid ${child.pid}`) && l.includes("supported topology")), "registry miss logs the shared-topology info line");
             store.close();
         } finally {
             child.kill("SIGKILL");
@@ -358,13 +362,15 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         assert.ok(WEB_CLIENT.includes('t("sys.split_brain", {'), "client composes the localized sentence");
         assert.ok(WEB_CLIENT.includes('API_ROOT + "/storage/split-brain/ack"'), "dismiss button POSTs the ack endpoint");
         assert.ok(WEB_CLIENT.includes('"btn sm"'), "dismiss button follows the sm button convention");
-        assert.ok(WEB_CLIENT.includes('sp.benign === true'), "benign second-process hits the informational branch");
-        assert.ok(WEB_CLIENT.includes('t("sys.storage_second_process_cross_lane"'), "informational branch uses the cross-lane copy");
+        assert.ok(!WEB_CLIENT.includes('t("sys.storage_second_process",'), "#5082: the corruption-alarm copy is gone from the client");
+        assert.ok(!WEB_CLIENT.includes('storage_second_process_cross_lane'), "#5082: the old cross-lane keys are fully replaced");
+        assert.ok(WEB_CLIENT.includes("#5082"), "client cites #5082 where coexistence is declared supported");
+        assert.ok(WEB_CLIENT.includes('t("sys.storage_second_process_shared"'), "informational branch uses the shared-topology copy");
         assert.ok(WEB_CLIENT.includes('classList.add("info")'), "informational branch swaps to info styling");
         for (const locale of ["zh-CN", "en"] as const) {
             for (const key of [
-                "sys.storage_second_process_cross_lane_title",
-                "sys.storage_second_process_cross_lane",
+                "sys.storage_second_process_shared_title",
+                "sys.storage_second_process_shared",
                 "sys.split_brain_title",
                 "sys.split_brain",
                 "sys.split_brain_lane_undeclared",
