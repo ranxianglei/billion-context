@@ -113,6 +113,11 @@ export function createTraeAdapter(
     notes?: string[],
 ): CompressLoopAdapter {
     const base = createOpenaiAdapter(requestBody, clientSystem, absorbName, notes);
+    // WC-12i: tool_call numbering follows the base openai adapter (first
+    // appearance → 0, 1, …; adapter-openai.ts:172). On the captured single-call
+    // shape this is byte-identical to a constant 0; a second call in the same
+    // turn must not collide on index 0, so the counter lives on the instance.
+    let toolIndex = 0;
     return {
         ...base,
 
@@ -126,6 +131,8 @@ export function createTraeAdapter(
             let toolCallsEmitted = 0;
             let finalFinishReason: string | undefined;
             const pending = new Map<number, ToolBuffer>();
+            /** WC-12i: calls displaced from `pending` by a reused index, kept in arrival order. */
+            const settled: ToolBuffer[] = [];
 
             for await (const frame of iterSseFrames(upstream)) {
                 if (frame.event !== "output" && frame.event !== "token_usage" && frame.event !== "done" && frame.event !== "error") {
@@ -151,7 +158,15 @@ export function createTraeAdapter(
                             if (c === null || typeof c !== "object" || Array.isArray(c)) continue;
                             const tc = c as Record<string, unknown>;
                             const idx = typeof tc.index === "number" ? tc.index : 0;
+                            const callId = typeof tc.id === "string" ? tc.id : "";
                             let buf = pending.get(idx);
+                            if (buf !== undefined && callId.length > 0 && buf.id.length > 0 && buf.id !== callId) {
+                                // WC-12i: a second call reusing an occupied index —
+                                // distinct ids are distinct calls, never merged.
+                                settled.push(buf);
+                                pending.delete(idx);
+                                buf = undefined;
+                            }
                             if (buf === undefined) {
                                 buf = { id: "", name: "", arguments: "" };
                                 pending.set(idx, buf);
@@ -200,18 +215,21 @@ export function createTraeAdapter(
                     yield { kind: "error", message } as ParsedStreamEvent;
                     return;
                 }
+                // WC-12c: `done` is the only event name left after the branches
+                // above — falling through deliberately to the terminator handling.
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     visibleTextChars += tail.length;
                     yield { kind: "text", delta: tail, raw: frameBuf("output", outputPayload({ response: tail })) } as ParsedStreamEvent;
                 }
                 sawRealToolCall = false;
-                for (const tc of pending.values()) {
+                const allCalls = [...settled, ...pending.values()];
+                for (const tc of allCalls) {
                     if (tc.name.length === 0) continue;
                     toolCallsEmitted++;
                     if (!PROXY_TOOL_SET.has(tc.name) && tc.name !== absorbName) sawRealToolCall = true;
                 }
-                for (const tc of pending.values()) {
+                for (const tc of allCalls) {
                     if (tc.name.length === 0) continue;
                     yield { kind: "tool_call", name: tc.name, callId: tc.id, arguments: tc.arguments } as ParsedStreamEvent;
                 }
@@ -245,7 +263,7 @@ export function createTraeAdapter(
         emitToolCall(call: ToolCallEmit): Buffer {
             return frameBuf("output", outputPayload({
                 tool_calls: [{
-                    index: 0,
+                    index: toolIndex++,
                     id: call.callId,
                     type: "function",
                     function_call: {

@@ -130,6 +130,34 @@ test("emit: text, reasoning and tool calls use the trae SSE dialect", () => {
     }]);
 });
 
+test("emit: parallel tool calls are numbered by appearance, not all at index 0", () => {
+    const adapter = createTraeAdapter({ model: "m", messages: [], stream: true });
+    const first = JSON.parse(adapter.emitToolCall({ name: "read", callId: "c1", arguments: "{}" }).toString("utf8").split("data:")[1]);
+    const second = JSON.parse(adapter.emitToolCall({ name: "grep", callId: "c2", arguments: "{}" }).toString("utf8").split("data:")[1]);
+    assert.equal(first.tool_calls[0].index, 0, "the first call keeps the captured index");
+    assert.equal(second.tool_calls[0].index, 1);
+    assert.equal(second.tool_calls[0].id, "c2");
+    assert.equal(second.tool_calls[0].function_call.name, "grep");
+});
+
+test("parseStream: two calls reusing one index but carrying distinct ids stay separate", async () => {
+    const events = await collect(1, [
+        frame("output", {
+            response: "",
+            tool_calls: [{ index: 0, id: "call_a", type: "function", function_call: { name: "read", arguments: "{\"p\":1}" } }],
+        }),
+        frame("output", {
+            response: "",
+            tool_calls: [{ index: 0, id: "call_b", type: "function", function_call: { name: "grep", arguments: "{\"q\":2}" } }],
+        }),
+        frame("done", { finish_reason: "stop" }),
+    ].join(""));
+    const calls = events.filter((e) => e.kind === "tool_call");
+    assert.deepEqual(calls.map((c) => field<string>(c, "callId")), ["call_a", "call_b"]);
+    assert.deepEqual(calls.map((c) => field<string>(c, "name")), ["read", "grep"]);
+    assert.deepEqual(calls.map((c) => field<string>(c, "arguments")), ["{\"p\":1}", "{\"q\":2}"]);
+});
+
 test("emit: completion emits token_usage then done with numeric usage fields", () => {
     const adapter = createTraeAdapter({ model: "m", messages: [], stream: true });
     const out = adapter.emitCompletion({ finishReason: "tool_calls", usage: { inputTokens: 7, outputTokens: 2, cachedTokens: 1 } }).toString("utf8");
