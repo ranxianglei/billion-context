@@ -345,9 +345,9 @@ export async function prepareGoogle(
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
-                const sideBody: Record<string, unknown> = { ...parsed, contents: [...rebuiltContents, { role: "user", parts: [{ text: buildDecisionPrompt(ranges) }] }], tools: toolsOut, systemInstruction, generationConfig: { ...(parsed.generationConfig ?? {}), maxOutputTokens: decide.maxTokens }, ...(decide.timeoutMs !== undefined ? { "bili:decideTimeoutMs": decide.timeoutMs } : {}) };
+                const sideBody: Record<string, unknown> = { ...parsed, contents: [...rebuiltContents, { role: "user", parts: [{ text: buildDecisionPrompt(ranges) }] }], tools: toolsOut, systemInstruction, generationConfig: { ...(parsed.generationConfig ?? {}), maxOutputTokens: decide.maxTokens } };
                 applyDecisionReasoningPolicy("google", sideBody, decide.reasoning ?? "strip");
-                const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log });
+                const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log, timeoutMs: decide.timeoutMs });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {

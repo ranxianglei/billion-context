@@ -530,10 +530,10 @@ export async function prepareAnthropic(
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens, ...(decide.timeoutMs !== undefined ? { "bili:decideTimeoutMs": decide.timeoutMs } : {}) };
+                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 applyDecisionReasoningPolicy("anthropic", sideBody, decide.reasoning ?? "strip");
-                const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
+                const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log, timeoutMs: decide.timeoutMs });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {

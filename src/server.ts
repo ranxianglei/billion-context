@@ -87,10 +87,6 @@ import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClien
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DEFAULT_DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 
-/** #5030: internal transport key the prepare lanes use to pass the resolved
- *  decision timeout into runNudgeDecision (it is not a wire field — peeled
- *  off before the body is serialized). */
-const DECIDE_TIMEOUT_KEY = "bili:decideTimeoutMs";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
@@ -3226,14 +3222,13 @@ export async function runNudgeDecision(args: {
     sideBody: Record<string, unknown>;
     session: Session;
     log: (level: string, msg: string) => void;
+    /** #5030: per-deployment timeout via DecideConfig (three-level cascade,
+     *  default DEFAULT_DECIDE_TIMEOUT_MS = 15 s). Full-context side calls on
+     *  some providers prefill 25–60 s even on a 99.99 % cache hit; a 15 s
+     *  hard wall turns every arm into a timeout ladder climb. */
+    timeoutMs?: number;
 }): Promise<DecisionOutcome> {
-    const { req, opts, protocol, sideBody, session, log } = args;
-    // #5030: per-deployment timeout via DecideConfig (three-level cascade,
-    // default DEFAULT_DECIDE_TIMEOUT_MS = 15 s). Full-context side calls on
-    // some providers prefill 25–60 s even on a 99.99 % cache hit; a 15 s
-    // hard wall turns every arm into a timeout ladder climb.
-    const timeoutMs = typeof sideBody[DECIDE_TIMEOUT_KEY] === "number" ? (sideBody[DECIDE_TIMEOUT_KEY] as number) : DEFAULT_DECIDE_TIMEOUT_MS;
-    delete sideBody[DECIDE_TIMEOUT_KEY];
+    const { req, opts, protocol, sideBody, session, log, timeoutMs } = args;
     let outcome: DecisionOutcome;
     try {
         const route = resolveUpstream(opts, req.url ?? "", req);
@@ -3252,7 +3247,7 @@ export async function runNudgeDecision(args: {
                 log("warn", `[acp-decide] session=${session.id} re-sign failed; sending the previous signature: ${String(err)}`);
             }
         }
-        const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, timeoutMs);
+        const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, timeoutMs ?? DEFAULT_DECIDE_TIMEOUT_MS);
         try {
             if (!response.ok) {
                 outcome = { kind: "failed", detail: `HTTP ${response.status}` };

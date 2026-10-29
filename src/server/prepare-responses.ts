@@ -512,9 +512,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 const stableItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
                     : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
-                const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens, ...(decide.timeoutMs !== undefined ? { "bili:decideTimeoutMs": decide.timeoutMs } : {}) };
+                const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
                 applyDecisionReasoningPolicy("responses", sideBody, decide.reasoning ?? "strip");
-                const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
+                const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log, timeoutMs: decide.timeoutMs });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
