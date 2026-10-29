@@ -2046,7 +2046,7 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | kind | meaning | bili behavior |
 |------|---------|---------------|
 | `client-abort` | downstream client disconnected | nothing (request dead by definition) |
-| `upstream-timeout` | idle budget expired (headers/body) or request-watchdog abort | **not retried** — never stack wait budgets |
+| `upstream-timeout` | watchdog/headers/body timeout, or OS `ETIMEDOUT` whose phase is not established by this category | **not retried** — preserve the conservative policy when delivery is uncertain |
 | `connect-timeout` | TCP handshake never completed (endpoint unreachable/blackholed) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
 | `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
 | `upstream-reset` | same, direct connection (suspect upstream/local network) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
@@ -2054,10 +2054,12 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | `dns` | name resolution failed (DNS server / hostname typo) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
 | `tls` / `unknown` | TLS/handshake failure (CA/MITM) / unclassified transport failure | not retried |
 
+Diagnostics include a masked `causes=` JSON array for nested causes and `AggregateError.errors`, retaining each attempt's code, syscall, address and port. Traversal is capped at 8 levels and 32 visits; omitted entries are marked `[error chain truncated]`. `ETIMEDOUT` alone does not prove that bili's idle budget expired: inspect the nested attempts and elapsed request time before changing timeouts. Classification and retry budgets are unchanged.
+
 Handshake-class resilience is paired with a keep-alive cap for proxied connections (`BILI_PROXY_KEEPALIVE_MAX_MS`, default 55s) so bili stops offering proxies sockets they are about to recycle.
 
 **Four-step checklist** when long sessions show periodic connection failures (from #1249):
-1. Grep `bili.log` for `kind=` — `proxy-reset` clusters implicate the external proxy; `upstream-timeout` implicates upstream health.
+1. Grep `bili.log` for `kind=` — `proxy-reset` clusters implicate the external proxy; for `upstream-timeout`, inspect `code=`, `syscall=` and `causes=` to distinguish connection attempts from read/idle expiry.
 2. Align timestamps of the failing requests with the external proxy's own access log (same host clock) — a recycle entry at the same millisecond closes the case.
 3. Confirm which hop: `proxy=<url>` vs `proxy=direct` in the same line; check request body size (`content-length` of the forwarded request) against the proxy's documented payload cap.
 4. If the proxy is the recycler, either raise its idle timeout or leave bili's 55s reuse cap + one-replay safety net to absorb it.

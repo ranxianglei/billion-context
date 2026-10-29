@@ -2022,7 +2022,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | kind | 含义 | bili 行为 |
 |------|------|-----------|
 | `client-abort` | 下游客户端断连 | 无（请求按定义已死） |
-| `upstream-timeout` | 空闲预算耗尽（headers/body）或请求看门狗中止 | **不重试** —— 绝不叠加等待预算 |
+| `upstream-timeout` | 看门狗/headers/body 超时，或仅凭此分类无法确定阶段的 OS `ETIMEDOUT` | **不重试** —— 请求是否送达不确定时保持保守策略 |
 | `connect-timeout` | TCP 握手未完成（端点不可达/被黑洞） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
 | `proxy-reset` | 经代理的连接在响应前死亡（首要嫌疑：代理空闲回收 / 载荷上限 / 节点轮换） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束（默认共 3 次尝试） |
 | `upstream-reset` | 同上，直连（嫌疑在上游/本地网络） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
@@ -2030,10 +2030,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `dns` | 域名解析失败（DNS 服务器 / 主机名拼写错误） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
 | `tls` / `unknown` | TLS/握手失败（CA/MITM）/ 未分类传输故障 | 不重试 |
 
+诊断通过脱敏的 `causes=` JSON 数组展开嵌套 cause 和 `AggregateError.errors`，保留每次尝试的 code、syscall、address 和 port。遍历上限为 8 层、32 次访问；省略内容以 `[error chain truncated]` 标记。仅有 `ETIMEDOUT` 并不能证明 bili 的空闲预算已耗尽：调整超时前，应检查嵌套尝试和请求实际耗时。分类和重试预算保持不变。
+
 握手类韧性配合代理连接的 keep-alive 上限（`BILI_PROXY_KEEPALIVE_MAX_MS`，默认 55s），让 bili 不再向即将回收套接字的代理提供这些连接。
 
 长会话出现周期性连接故障时的**四步清单**（源自 #1249）：
-1. 在 `bili.log` 中 grep `kind=` —— `proxy-reset` 聚集指向外部代理；`upstream-timeout` 指向上游健康度。
+1. 在 `bili.log` 中 grep `kind=` —— `proxy-reset` 聚集指向外部代理；遇到 `upstream-timeout`，检查 `code=`、`syscall=` 和 `causes=`，区分连接尝试与读取/空闲超时。
 2. 将失败请求的时间戳与外部代理自身的访问日志对齐（同一主机时钟）——同一毫秒的回收条目即可结案。
 3. 确认是哪一跳：同一行里 `proxy=<url>` vs `proxy=direct`；对照代理文档的载荷上限检查转发请求的 `content-length`。
 4. 若代理是回收方，要么调高其空闲超时，要么保留 bili 的 55s 复用上限 + 一次重放安全网来吸收。
