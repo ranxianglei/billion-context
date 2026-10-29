@@ -73,6 +73,13 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #5114: contract test for the storage-baseline preload's XDG dir sandbox;
+    // spawns a bare `node -e` child that only prints env — no ports, no
+    // servers, so the zone band is irrelevant; the entry is for the tripwire
+    "tests/preload-sandbox-dirs.test.ts",
+    // #5012: logger-seam children only (stdio pipes, never bind a port) - the
+    // entry exists for the spawn tripwire alone, like #3890
+    "tests/issue5012-stdout-leg-mute.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

@@ -103,6 +103,25 @@ let stderrDead = false;
 // warnReopenFailed() un-mutes so the stderr fallback still works.
 let stderrMuted = false;
 
+/** #5012: decide whether the stderr tee must be dropped once the file leg is
+ *  PROVEN live (the caller keys this to onFileLegLive; a dead file leg keeps
+ *  the stderr fallback by never firing the hook). Kept ONLY for real terminals
+ *  (isTty === true): a human terminal drains by design, while a pipe's consumer
+ *  may simply stop reading — and Node writes into a pipe are blocking with NO
+ *  error event on a full pipe (#5012: a Windows host that spawned bili,
+ *  captured stderr to a buffer, and stopped draining wedged the proxy's event
+ *  loop forever after ~64KB — no crash, no error line, just silence in the
+ *  file leg until the file died). Launcher children (launch token) keep their
+ *  unconditional mute (#2864): their stderr is a file fd anyway. */
+export function shouldMuteStderrLegAfterFileLive(hasLaunchToken: boolean, stderrIsTty: boolean | undefined): boolean {
+    return hasLaunchToken || stderrIsTty !== true;
+}
+
+/** Test seam (#5012): read the stderr-leg mute state without mutating it. */
+export function isStderrMuted(): boolean {
+    return stderrMuted;
+}
+
 /** #2864: stop writing to stderr (file-only mode). See the state comment. */
 export function muteStderrLeg(): void {
     stderrMuted = true;

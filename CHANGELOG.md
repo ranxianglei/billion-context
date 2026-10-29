@@ -6,12 +6,20 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Fixed
+- **shadow 摘要漂移的单实例成因(#4392 / #4986)**:`canonicalize` 曾按 `Object.entries` 插入序参与哈希,而 live 腿(kernel 状态,`byRef` 按发号顺序)与 replay 腿(`loadLegacyView` 按账本 `ord` 重建 `messageRefs`)对同一份等值状态给出不同键序 → 单进程自我报告 `[diverged: state]`,连续 3 次即冻结本进程的信封写入并清掉入库水位。现在任意深度按键排序(数组保序,Map/Set 形态不变),跳过的键(去掉 `storageMode`/`tailGaps`)集中成 `canonical.ts` 导出的 `DIGEST_SKIPPED_KEYS`,供流式摘要路径共用;升级文案不再断言「多个 bili 实例」。storage-corpus manifest 随摘要定义重钉(只有 10 个摘要值变化,文件清单/格式不动);storage-render 金标无需改动——那套驱动在 harness 侧已先 `sortObjectKeys`,排键只改 shadow 腿与 corpus 摘要。`tests/issue4986-digest-drift-ref-order.test.ts`(取自 #4997)钉住 #4986 的 folded-corpus 面。
 - 出站不变量判官新增 I3 配对不变量（#4862 出口校验缺口）：此前判官只对账入站↔出站连续性（I1/I2），折叠区内完全免检，于是「折叠拆断一对 tool_use/tool_result」的出站体拿到 clean fold verdict 直接放行，直到上游用 400 `tool_use ids were found without tool_result blocks` 说出真相。现在每个 tool-call 必须有同 id 的 tool-result 在其后、每个 tool-result 必须有同 id 的 tool-call 在其前，折叠区不再豁免；归因保持“谁的错”职责（宿主自己发来的断对不计 bili、compress 在途调用豁免、id 重铸不可洗白）。纯检测不拦截，受 diagnostics.invariantJudge 旋钮控制。
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
 - 优雅停机(SIGTERM → dispose)的 writer 标记现在记录 `stoppedAt`:重启流程(杀旧进程→立即重绑)不再对已确认死亡的前任实例误报 [split-brain]——30s 新鲜度回退从此只覆盖无法证明死亡的崩溃场景(#3923;release-gate lane A 代理重启时观察到误报)。
 - Claude Code 子代理的 bili 调用不再路由到父会话:Task 子代理与父线程共用一个 MCP shim,启动时抓的绑定只指向父会话;子代理压缩错对象或永久 409。现在 shim 把 host 盖在每次 tools/call 上的 `_meta["claudecode/toolUseId"]` 转发为 body `toolCallId`,代理用它出站时记下的 id→会话映射直接路由到子代理自己的 lane(10 分钟 TTL);id 未知时行为与从前完全一致(#4580)。
 
 ### Added
+
+### #5079 — `prompt_cache_key` 自注入默认关闭,`promptCache.routing` 一个开关管住两条 wire
+
+- **行为变更(旧→新)**:此前 bili 在插件车道对一切目的地默认给请求体盖 `prompt_cache_key=<会话 id>`(#2218/#2649 定案,Responses wire 仅对 `api.openai.com` 注入)。由于大量服务见到该字段会直接拒绝、且这类服务无法枚举,**默认反转为关闭**:`promptCache.routing` 缺省值从 `"auto"` 变为 `"disabled"`(无法识别的值同样落到 `"disabled"`)。客户端自带的 key 不受影响:任何模式下都原样转发(A/B 探测记忆对已证实拒收的 origin+model 组合照常撤键)。
+- **单一开关**:`promptCache.routing`(env `ACP_PROMPT_CACHE_ROUTING`,或 Web UI 快速配置下拉)现在同时管住两条 wire 上 bili 的自注入——chat wire 插件车道请求体盖章 + Responses wire key 注入。`"disabled"`(新默认)= 从不写自己的 key;`"auto"` = #5079 之前的行为;`"enabled"` = 所有支持的车道都盖/注(Responses wire 任意 host)。插件车道上等于绑定会话 id 的请求体 key 是 bili 自己机制的回显(dsh `PI_CACHE_RETENTION=long` 栈等),按自注入处理;Responses wire 同理(显式 key = 会话 id 且身份未被提升时算 bili 打的)。
+- **升级提示**:运行 `"disabled"` 的实例展示一次性提示 —— Web 面板横幅(可关闭,按实例持久化)、`acp_status` 一行、启动日志一行 —— 点名中转站(workbuddy panel/hub 类)/号池场景应设回 `"auto"` 或 `"enabled"` 以维持前缀缓存亲和,直连官方 API 用户忽略即可。
+- Web UI 快速配置新增 `promptCache.routing` 下拉(disabled/auto/enabled),保存即热生效。
 
 ### D5-5 — 渲染源窗口化 + 判官 tailStart 视图域修复
 

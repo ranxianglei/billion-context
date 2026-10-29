@@ -513,6 +513,20 @@ Settled design = **stamp-by-default + empirical self-heal (probe-and-remember)**
 
 Tests: `tests/issue2645-pck-probe.test.ts` (strict upstream self-heals turn 1, remembers turn 2, lenient pool never probes, poisoned upstream forwards the 400 and learns nothing, client-owned keys drop after ablation, model-granular pairs) + the rewritten matrix in `tests/issue2218-relay-affinity-signal.test.ts`.
 
+### #5079: policy reversal — self-stamping is OFF by default, one knob gates every wire
+
+Owner ruling (supersedes the #2649 stamp-by-default adjudication): MANY services reject a request carrying this field outright, and that population cannot be enumerated up front — so bili no longer writes its own `prompt_cache_key` unless asked. The gate is the EXISTING `promptCache.routing` knob (`ACP_PROMPT_CACHE_ROUTING`, or the web UI quick-config switch), now governing bili's own emission on BOTH wires at once — no new config surface:
+
+- `"disabled"` (NEW DEFAULT; anything unrecognized parses here): bili never writes its own key anywhere. Client-supplied keys are untouched by this gate — they forward verbatim in every mode (the A/B probe-and-remember above still withholds a client key whose origin+model pair has proven to reject it).
+- `"auto"`: exactly the pre-#5079 behavior — chat wire stamps on every plugin-lane request, Responses wire injects only for `api.openai.com`.
+- `"enabled"`: stamp/inject on every supporting lane (Responses wire: any host).
+
+Bili-owned vs client-owned on the chat wire: on a plugin lane a body key equal to the bound conversation id can only be bili's own machinery echoing back (the identity promotion that would make a client key win requires the absence of the internal conversation header), so it counts as bili's own emission and is stripped under `"disabled"`; any other value stays client-owned and forwards. Responses wire mirror: an explicit body key equal to the session id under a non-promoted identity is bili-owned (the omp/dsh extension stamps it); a promoted identity means the client supplied it.
+
+Upgrade notice (owner requirement): instances running `"disabled"` surface a one-time notice — web panel banner (dismissible, persisted per instance in state dir `upgrade-notices.json`), an `acp_status` line, and a startup log line — naming the populations who should flip back on (`"auto"`/`"enabled"`): relays such as workbuddy panel/hub and account pools, whose prefix-cache affinity degrades when traffic routes randomly without the key. Direct official-API users ignore it. Dismissal never changes the routing value.
+
+Tests: `tests/issue5079-pck-default-off.test.ts` (parse fallbacks, both-wire matrices incl. bili-owned echo rows, notice module, live-proxy egress assertions for default-off/auto pairs) + the updated matrix in `tests/issue2218-relay-affinity-signal.test.ts`.
+
 ## Uncovered-history audit — honest minimum verdict (#4331)
 
 The "no compressible ranges remain — the context is already at its minimum" stop signal was structurally unverifiable: it fired whenever the PRE-FOLD OFFER was exhausted (`postCompressTail`, #2404 pinning), but nothing ever compared the union of active-block ranges against the session's ref set. A live ZCode session showed the failure at scale — 138 mid-history refs (~65K tok, ~16% of context) in no active block, largest run `m00312`–`m00411` (100 msgs), while the receipt declared the global minimum three times in a row. The kernel DOES find such spans when they are offered (verified by repro on master); what was missing was a GLOBAL coverage audit plus a verdict that only claims "minimum" when one holds.

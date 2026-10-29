@@ -66,6 +66,7 @@ test("#4899 parseBillingSettings: rejects every invalid shape loudly", () => {
     assert.equal(parseBillingSettings([]), undefined, "array root");
     assert.equal(parseBillingSettings("nope"), undefined, "string root");
     assert.equal(parseBillingSettings({ prices: [] }), undefined, "prices array");
+    assert.equal(parseBillingSettings({ prices: null }), undefined, "prices null");
     assert.equal(parseBillingSettings({ prices: "x" }), undefined, "prices string");
     assert.equal(parseBillingSettings({ prices: { m: "x" } }), undefined, "entry not object");
     assert.equal(parseBillingSettings({ prices: { m: null } }), undefined, "entry null");

@@ -193,3 +193,58 @@ test("runtime status surfaces integrity / secondProcess / backup facts", async (
     assert.equal(wire.backup?.lastPath, "/tmp/x.db");
     assert.equal(wire.backup?.lastBytes, 1024);
 });
+
+test("#5082: a live foreign pid on <db>.lock is informational, never a corruption alarm", async () => {
+    const { setLogCapture } = await import("../src/logger.ts");
+    const { _resetStorageRuntimeStatusForTest, storageStatusWire } = await import("../src/storage/runtime-status.ts");
+    // Repro shape from #5082: the peer is an inline-lane process that never
+    // registers itself, and this process carries no BILI_LAUNCHER_LANE —
+    // exactly the shape the old benign gate misjudged as a corruption risk.
+    delete process.env.BILI_LAUNCHER_LANE;
+    _resetStorageRuntimeStatusForTest();
+    const logs: string[] = [];
+    setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
+    const dir = freshDir();
+    const child = (await import("node:child_process")).spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+    try {
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+        const dbPath = join(dir, "index.db");
+        writeFileSync(`${dbPath}.lock`, JSON.stringify({ pid: child.pid, boot: Date.now() }));
+        const store = UnifiedStore.open(dbPath);
+        store.close();
+        // Negative direction first: the old error line ("two processes on one
+        // index.db corrupt it") must be gone entirely.
+        assert.ok(!logs.some((l) => l.startsWith("error") && l.includes("already writing")), "no error-level corruption alarm for a coexisting pid");
+        assert.ok(!logs.some((l) => l.includes("two processes on one index.db corrupt it")), "the #5082 alarm text is gone");
+        // Positive direction: coexistence is logged info, naming the pid, and
+        // the wire facts are informational.
+        assert.ok(logs.some((l) => l.startsWith("info") && l.includes(`pid ${child.pid}`) && l.includes("supported topology")), "coexistence is logged at info level with the pid");
+        const wire = storageStatusWire();
+        assert.equal(wire.secondProcess?.pid, child.pid);
+        assert.equal(wire.secondProcess?.benign, true, "the banner facts are informational (#5082)");
+        // The coexistence pid never blocked the open: the db exists and works.
+        assert.ok(existsSync(dbPath), "the db was created despite the coexisting lock holder");
+    } finally {
+        setLogCapture(null);
+        child.kill("SIGKILL");
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#5082 negative: no foreign pid on the lock means nothing surfaces", async () => {
+    const { setLogCapture } = await import("../src/logger.ts");
+    const { _resetStorageRuntimeStatusForTest, storageStatusWire } = await import("../src/storage/runtime-status.ts");
+    _resetStorageRuntimeStatusForTest();
+    const logs: string[] = [];
+    setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
+    const dir = freshDir();
+    try {
+        const store = UnifiedStore.open(join(dir, "index.db"));
+        store.close();
+        assert.ok(!logs.some((l) => l.includes("is also using")), "no coexistence log without a foreign pid");
+        assert.equal(storageStatusWire().secondProcess, null, "wire stays clean without a foreign pid");
+    } finally {
+        setLogCapture(null);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
