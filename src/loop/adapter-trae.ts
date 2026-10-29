@@ -215,8 +215,8 @@ export function createTraeAdapter(
                     yield { kind: "error", message } as ParsedStreamEvent;
                     return;
                 }
-                // WC-12c: `done` is the only event name left after the branches
-                // above — falling through deliberately to the terminator handling.
+                // `done` is the only event name left after the branches above —
+                // falling through deliberately to the terminator handling.
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     visibleTextChars += tail.length;
