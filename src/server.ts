@@ -113,7 +113,7 @@ export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEch
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { emitPreflightError } from "./stream-error.js";
+import { emitPreflightError, preflightFailFastBody } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
@@ -3430,27 +3430,29 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
 
 /** #3978: terminate a committed preflight response when bili decides not to
  *  forward. Once #568 has committed early headers, the client holds a 200 and
- *  an open stream; a later no-forward decision cannot writeHead another status
- *  and (previously) wrote nothing — the stream never completed and the client
- *  could not distinguish "bili gave up" from a dead network, so it waited out
- *  its own watchdog. Now: SSE gets an `event: error` frame (a spec-valid custom
- *  event type — consumers waiting on `message` ignore unknown types, those
- *  handling `error` see the failure) and non-streaming JSON gets the error
- *  object appended after the whitespace padding (still one valid JSON
- *  document), followed by end(). The body reuses bili's native fail-fast
- *  shape ({ok:false,error:{message,retryable}}, handle.ts dispatch). No-op
+ *  an open stream; a later no-forward decision cannot writeHead another status.
+ *  Two exits never terminated at all: the abort branch (respond:false
+ *  short-circuits the consumer, which then writes nothing) and the overflow-
+ *  refold re-run (respondFailFast=false suppresses it), after which forward()'
+ *  upstream-400 relay hit ERR_HTTP_HEADERS_SENT on the committed socket. The
+ *  other three exits ARE already terminated by the consumer's in-band branch —
+ *  terminating here instead just moves that one step earlier so every exit has
+ *  ONE termination point. The frames stay the established in-band contract
+ *  (#568/#1455 protocol-native shapes, so client SDKs parse them natively):
+ *  emitPreflightError for SSE, preflightFailFastBody appended after the
+ *  whitespace padding for non-streaming (still one valid JSON document). No-op
  *  unless headers are actually committed and the socket still lives, so
- *  uncommitted exits keep their normal status-code response path. */
-function commitPreflightTerminalFrame(res: http.ServerResponse, prepared: Prepared, message: string, retryable: boolean): boolean {
+ *  uncommitted exits keep their normal status-code response path; after a
+ *  successful frame the existing respond:!writableEnded self-corrects to false. */
+function commitPreflightTerminalFrame(res: http.ServerResponse, prepared: Prepared, message: string, retryable: boolean, log: (level: string, msg: string) => void): boolean {
     if (!res.headersSent || res.destroyed || res.writableEnded) return false;
-    const body = JSON.stringify({ ok: false, error: { message, retryable } });
     try {
         if (prepared.stream) {
-            res.write(`event: error\ndata: ${body}\n\n`);
+            emitPreflightError(res, prepared.protocol, { message, retryable }, (m) => log("warn", m));
         } else {
-            res.write(body);
+            res.write(preflightFailFastBody(message, retryable));
+            res.end();
         }
-        res.end();
         return true;
     } catch {
         return false;
@@ -4106,7 +4108,7 @@ export async function preflightCompressIfNeeded(
             // math, same message, same no-forward behavior — status only.
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            commitPreflightTerminalFrame(res, prepared, doomedMessage, false);
+            commitPreflightTerminalFrame(res, prepared, doomedMessage, false, log);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         if (localRefusalHere) {
@@ -4212,7 +4214,7 @@ export async function preflightCompressIfNeeded(
             shrinkNote +
             ` The over-window payload was NOT forwarded.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
-        commitPreflightTerminalFrame(res, prepared, message, retryable);
+        commitPreflightTerminalFrame(res, prepared, message, retryable, log);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
@@ -4449,7 +4451,7 @@ export async function preflightCompressIfNeeded(
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
     if (clientAbort.signal.aborted || f?.kind === "aborted") {
         const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
-        const frameSent = commitPreflightTerminalFrame(res, prepared, detail, false);
+        const frameSent = commitPreflightTerminalFrame(res, prepared, detail, false, log);
         log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding${frameSent ? "; terminal frame sent, stream ended" : res.headersSent ? "; headers committed, terminal frame not sent (socket gone)" : ""}`);
         return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
     }
@@ -4676,7 +4678,7 @@ export async function preflightCompressIfNeeded(
             const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            commitPreflightTerminalFrame(res, prepared, doomedMessage, false);
+            commitPreflightTerminalFrame(res, prepared, doomedMessage, false, log);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
         if (localRefusalHere) {

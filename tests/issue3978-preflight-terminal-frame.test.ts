@@ -7,14 +7,18 @@ process.env.NODE_ENV = "test";
 
 // #3978 (floor 17/18): once bili has committed early preflight headers (#568
 // grace keep-alive) and then decides NOT to forward, the response must still
-// terminate with an explicit protocol frame — pre-fix the stream simply never
-// completed (writeHead of a later status is impossible; respond:false wrote
-// nothing), so clients held a 200 + open stream and waited out their own
-// watchdog, unable to tell "bili gave up" from a dead network. Now every
-// committed no-forward exit writes one terminal frame ({ok:false,
-// error:{message,retryable}} — bili's native fail-fast shape) and ends():
-// SSE gets `event: error`, non-streaming JSON gets the object appended after
-// the whitespace padding. Uncommitted exits keep the normal status-code path.
+// terminate with an explicit protocol frame. Two exits never terminated at all:
+// the abort branch (respond:false short-circuits the consumer) and the
+// overflow-refold re-run (respondFailFast=false suppresses it), so clients
+// held a 200 + open stream and waited out their own watchdog, unable to tell
+// "bili gave up" from a dead network. Now every committed no-forward exit
+// terminates at the exit itself, in the ESTABLISHED in-band contract (#568/
+// #1455 protocol-native shapes — client SDKs parse them natively): SSE gets
+// emitPreflightError's per-protocol error event (anthropic:
+// {type:"error",error:{type:"server_error",code:"preflight_compress_failed",
+// message}}), non-streaming JSON gets the preflightFailFastBody object
+// appended after the whitespace padding (still one valid JSON document).
+// Uncommitted exits keep the normal status-code path.
 //
 // Scenario: a summary upstream that answers instantly but with a summary too
 // short to accept (< minSummaryLength) makes EVERY fold attempt fail, so
@@ -163,7 +167,7 @@ async function readBodyWithDeadline(res: Response, ms: number, what: string): Pr
     return readAll;
 }
 
-function parseTerminalFrame(body: string): { ok: boolean; error?: { message?: string; retryable?: boolean } } {
+function parseTerminalFrame(body: string): { type?: string; error?: { type?: string; code?: string; message?: string } } {
     const idx = body.indexOf("event: error");
     assert.ok(idx >= 0, `expected an 'event: error' frame, got: ${JSON.stringify(body.slice(0, 300))}`);
     const dataLine = body.slice(idx).split("\n").find((l) => l.startsWith("data: "));
@@ -186,9 +190,10 @@ test("e2e: SSE no-forward exit after committed headers terminates with an error 
         const body = await readBodyWithDeadline(res, 20_000, "SSE");
         const elapsed = Date.now() - t0;
         const frame = parseTerminalFrame(body);
-        assert.equal(frame.ok, false, "terminal frame carries the native fail-fast shape");
+        assert.equal(frame.type, "error", "terminal frame is a protocol-native error event");
+        assert.equal(frame.error?.type, "server_error", "native fail-fast shape");
+        assert.equal(frame.error?.code, "preflight_compress_failed", "carries the preflight code");
         assert.ok(typeof frame.error?.message === "string" && frame.error.message.length > 0, "frame carries a message");
-        assert.equal(typeof frame.error?.retryable, "boolean", "frame carries retryable");
         console.log(`[issue3978-tf] SSE terminated in ${elapsed}ms with terminal frame`);
     } finally {
         delete process.env.BILI_PREFLIGHT_HOLD_MS;
@@ -208,8 +213,9 @@ test("e2e: JSON no-forward exit after committed headers appends a parseable erro
         assert.equal(res.status, 200);
         const raw = await readBodyWithDeadline(res, 20_000, "JSON");
         // Whitespace padding + appended object must still be ONE valid JSON doc.
-        const frame = JSON.parse(raw.trim());
-        assert.equal(frame.ok, false, "appended object carries the native fail-fast shape");
+        const frame = JSON.parse(raw.trim()) as { error?: { type?: string; code?: string; message?: string; retryable?: boolean } };
+        assert.equal(frame.error?.type, "server_error", "appended object carries the native fail-fast shape");
+        assert.equal(frame.error?.code, "preflight_compress_failed", "carries the preflight code");
         assert.ok(typeof frame.error?.message === "string" && frame.error.message.length > 0, "object carries a message");
         assert.equal(typeof frame.error?.retryable, "boolean", "object carries retryable");
     } finally {
