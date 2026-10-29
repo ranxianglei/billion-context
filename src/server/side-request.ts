@@ -74,9 +74,9 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
 
 const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
 
-/** Whether the body asks for a JSON reply: OpenAI chat `response_format` or
- *  the Responses wire's `text.format`. `{type:"text"}` is plain prose and does
- *  not count. */
+/** #5073: whether the body asks for a JSON reply: OpenAI chat `response_format`
+ *  or the Responses wire's `text.format`. `{type:"text"}` is plain prose and
+ *  does not count. */
 function requestsStructuredOutput(p: Record<string, unknown>): boolean {
     const text = p.text;
     const format = p.response_format
@@ -98,10 +98,11 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // gets injected into it. Explicit host intent above still outranks this.
     if (isServerToolUtilityCall(p)) return true;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
-    // A toolless request that demands a structured JSON reply is a utility
-    // call, not an agent turn (memory-extraction daemons such as Hindsight
-    // that inherit the host's HTTPS_PROXY, with a large output budget). Wire
-    // tools injected into it make strict backends reject the pair with a 400.
+    // #5073: a toolless request that demands a structured JSON reply is a
+    // utility call, not an agent turn (memory-extraction daemons such as
+    // Hindsight that inherit the host's HTTPS_PROXY, with a large output
+    // budget). Wire tools injected into it make strict backends reject the
+    // pair with a 400.
     if (requestsStructuredOutput(p)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
