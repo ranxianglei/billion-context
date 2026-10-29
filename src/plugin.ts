@@ -1413,7 +1413,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { request = parseForkRequest(payload); }
     catch (err) { return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: String(err) }); }
     const requestHash = forkHash(request);
-    const replay = (): boolean => {
+    const replay = async (): Promise<boolean> => {
+        await getStore().recoverCompletedFork(request.childConversationId);
         const existing = resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
@@ -1421,7 +1422,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         else forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
         return true;
     };
-    if (replay()) return;
+    try { if (await replay()) return; }
+    catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
@@ -1431,7 +1433,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         // backend on network backends; withSessionLock accepts () => T |
         // Promise<T>, so the lock scope and ordering are unchanged.
         await withSessionLock(parent, async () => {
-            if (replay()) return;
+            if (await replay()) return;
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent); }
@@ -1556,32 +1558,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
-            publishForkSession(child);
+            await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
-            // #4316 PR3/3: clone the parent's unified-store rows so the
-            // child's cloned kernel refs keep pointing at the same ledger
-            // positions (owner decision 2026-10-22: fork copies every number).
-            // Degrades silently to the kernel-only clone when the store has no
-            // parent rows (legacy-only lanes) — the fork itself must never
-            // fail for a storage nicety.
-            try {
-                const store = getStore();
-                // #4730: the inclusive throughSeq is the parent's LAST LIVE SEQ,
-                // not live count - 1. Tombstones keep their seq, so once any
-                // row is retired count < lastLiveSeq + 1 and count - 1 silently
-                // dropped the newest live rows from the cloned child.
-                // #4911: awaited through the async twins — on network backends
-                // (mysql) the sync facades miss by design and these route
-                // through the backend; sqlite delegates to the identical sync
-                // bodies, so behavior there is unchanged.
-                const lastLiveSeq = await store.unifiedLastLiveSeqAsync(parent.id);
-                const throughSeq = lastLiveSeq === null ? -1 : lastLiveSeq;
-                if (throughSeq >= 0 && !(await store.unifiedCloneSessionRowsAsync(parent.id, child.id, throughSeq))) {
-                    loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
-                }
-            } catch (err) {
-                loggerLog("warn", `fork ${request.childConversationId}: row clone skipped (${err instanceof Error ? err.message : String(err)}); kernel-only fork`);
-            }
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the
             // fork-created conversation supersedes it; a lingering entry would

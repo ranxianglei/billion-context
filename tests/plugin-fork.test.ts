@@ -19,6 +19,7 @@ import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
 import { closeServers } from "./server-close-guard.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -126,6 +127,148 @@ test("plain proxy panel snapshots do not change raw-history persistence", { time
         assert.equal(session.pluginSnapshot, undefined);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=plain-panel")).status, 409);
     } finally { await h.close(); }
+});
+
+test("HTTP fork preserves sparse parent ledger before the child's first save", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        await compress(h);
+        for (let i = 0; i < 100 && !(resolveConversation("parent").session!.state.blocks.length); i++) await new Promise((r) => setTimeout(r, 20));
+        const parent = resolveConversation("parent").session!;
+        assert.equal(parent.state.blocks.length, 1);
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const raw = openSqliteDatabase(join(h.dir, "sessions", "index.db"), "node:sqlite");
+        // Model a ledger with retired historical positions: live messages are
+        // at 0, 3, 4, never the snapshot's dense array positions 0, 1, 2.
+        const positions = raw.db.prepare("SELECT seq FROM messages WHERE session_id = ? AND seq > 0 ORDER BY seq DESC").all(parent.id) as { seq: number }[];
+        for (const { seq } of positions) raw.db.prepare("UPDATE messages SET seq = ? WHERE session_id = ? AND seq = ?").run(seq + 2, parent.id, seq);
+        raw.db.close();
+        const ids = parent.pluginSnapshot!.map((m) => m.id);
+        parent.state.messageRefs.byRaw[ids[1]] = "m00004";
+        parent.state.messageRefs.byRaw[ids[2]] = "m00005";
+        parent.state.messageRefs.byRef = { m00001: ids[0], m00004: ids[1], m00005: ids[2] };
+        parent.state.blocks[0].endRef = "m00004";
+        assert(h.store.flushSync(parent));
+        assert.deepEqual(h.store.unifiedMessageIdRows(parent.id)!.filter((m) => ids.includes(m.msgId)).map((m) => m.seq), [0, 3, 4]);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "sparse-child", 3);
+        const fork = await h.request("/__bili/plugin/fork", request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("sparse-child").session!;
+        assert.deepEqual(h.store.unifiedMessageIdRows(child.id)!.filter((m) => ids.includes(m.msgId)), h.store.unifiedMessageIdRows(parent.id)!.filter((m) => ids.includes(m.msgId)), "first child persistence must retain parent ledger positions");
+        assert.deepEqual(child.state.messageRefs, parent.state.messageRefs);
+        assert.deepEqual(child.state.blocks, parent.state.blocks);
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+        assert(h.store.flushSync(child));
+        assert.deepEqual(h.store.loadSync(child.id)!.state.messageRefs, parent.state.messageRefs);
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync(child.id)!.state.blocks)), JSON.parse(JSON.stringify(child.state.blocks)));
+        const verify = openSqliteDatabase(join(h.dir, "sessions", "index.db"), "node:sqlite");
+        try {
+            const bounds = verify.db.prepare("SELECT start_seq, end_seq FROM blocks WHERE session_id = ?").get(child.id) as { start_seq: number; end_seq: number };
+            assert.equal(bounds.start_seq, 0);
+            assert.equal(bounds.end_seq, 3);
+        } finally { verify.db.close(); }
+    } finally {
+        h.store.closeQuietly();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+for (const mode of ["full", "shadow"] as const) {
+    test(`HTTP fork recovers committed receipt after envelope failure (${mode})`, { timeout: 60_000 }, async (t) => {
+        const oldMode = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        const h = await harness(true);
+        let recovered: SessionStore | undefined;
+        try {
+            const parent = resolveConversation("parent").session!;
+            parent.metadata.publicSnapshotRetained = true;
+            assert(h.store.flushSync(parent));
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const request = forkRequest(snapshot, "crash-child", 2);
+            const disk = (h.store as unknown as { store: { flushSync(id: string, build: () => unknown): boolean } }).store;
+            const original = disk.flushSync.bind(disk);
+            const failingWrite = t.mock.method(disk, "flushSync", (id: string, build: () => unknown) => id === "crash-child" ? false : original(id, build));
+            const failed = await h.request("/__bili/plugin/fork", request);
+            assert.equal(failed.status, 503, JSON.stringify(failed.body));
+            failingWrite.mock.restore();
+            assert.equal((await h.store.findSessionFiles("crash-child")).length, 0);
+            h.store.cancelAll();
+            h.store.closeQuietly();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            recovered = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(recovered);
+            const replay = await h.request("/__bili/plugin/fork", request);
+            assert.equal(replay.status, 200, JSON.stringify(replay.body));
+            assert.equal(replay.body.replayed, true);
+            assert((await recovered.findSessionFiles("crash-child")).length > 0);
+            assert.equal((await h.request("/__bili/plugin/fork", { ...request, idempotencyKey: "different" })).status, 409);
+            const child = (await h.request("/__bili/plugin/snapshot?conversationId=crash-child")).body;
+            assert.deepEqual(child.orderedMessages, snapshot.orderedMessages.slice(0, 2));
+            await sendModel(h, "crash-child", [...h.messages.slice(0, 2), { role: "user", content: "continue recovered fork" }]);
+        } finally {
+            recovered?.cancelAll();
+            recovered?.closeQuietly();
+            await h.close();
+            if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = oldMode;
+        }
+    });
+}
+
+test("HTTP fork keeps unified-only JSON writer posture across replay", { timeout: 60_000 }, async () => {
+    const before = { mode: process.env.BILI_STORAGE_UNIFIED, writer: process.env.BILI_STORAGE_JSON_WRITER };
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_STORAGE_JSON_WRITER = "off";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "db-only-child");
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 201);
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+        assert.equal((await h.store.findSessionFiles("db-only-child")).length, 0);
+        assert(h.store.loadSync("db-only-child")!.metadata.publicForkReceipt);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        h.store.closeQuietly();
+        if (before.mode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = before.mode;
+        if (before.writer === undefined) delete process.env.BILI_STORAGE_JSON_WRITER; else process.env.BILI_STORAGE_JSON_WRITER = before.writer;
+    }
+});
+
+test("HTTP fork transaction failure never publishes and same request can retry", { timeout: 60_000 }, async (t) => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "failed-child");
+        const shadow = (h.store as unknown as { shadow: { createForkAsync(): Promise<boolean> } }).shadow;
+        const fault = t.mock.method(shadow, "createForkAsync", async () => { throw new Error("injected clone failure"); });
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 503);
+        assert.equal(h.store.loadSync("failed-child"), null);
+        assert.equal(resolveConversation("failed-child").session, undefined);
+        fault.mock.restore();
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 201);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        h.store.closeQuietly();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
 });
 
 test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { timeout: 60_000 }, async () => {

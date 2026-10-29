@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "billion-context",
-      "version": "0.1.208",
+      "version": "0.1.209",
       "source": {
         "source": "local",
         "path": "./plugins/codex"
