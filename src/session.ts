@@ -1146,6 +1146,7 @@ export function zeroStats(): Session["stats"] {
 }
 
 export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
@@ -1204,12 +1205,20 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
     };
 }
 
-export function publishForkSession(session: Session): void {
+const publishingForks = new Set<string>();
+
+export async function publishForkSession(session: Session, parentId: string): Promise<void> {
+    if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
     if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
-    makeResidentRoom(sessionWeight(session));
-    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
-    session.persisted = getStore().enabled;
-    sessions.set(session.id, session);
+    publishingForks.add(session.id);
+    try {
+        makeResidentRoom(sessionWeight(session));
+        await getStore().persistForkSession(parentId, session);
+        session.persisted = getStore().enabled;
+        sessions.set(session.id, session);
+    } finally {
+        publishingForks.delete(session.id);
+    }
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.

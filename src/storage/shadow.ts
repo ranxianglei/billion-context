@@ -1148,6 +1148,22 @@ export class UnifiedShadow {
         });
     }
 
+    /** Fork publication is strict: clone and initial state land together, or
+     * nothing lands. Unlike shadow mirrors, an error cannot mean success. */
+    createForkAsync(parentId: string, child: LegacySessionLike): Promise<boolean> {
+        if (this.stats.disabled) throw new Error("fork storage unavailable");
+        const initial = planIngest(child);
+        if (this.sync !== null) {
+            const throughSeq = this.sync.lastLiveSeq(parentId);
+            return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial));
+        }
+        return this.enqueue(async () => {
+            if (this.stats.disabled) throw new Error("fork storage unavailable");
+            const throughSeq = await this.backend!.lastLiveSeq(parentId);
+            return this.backend!.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial);
+        });
+    }
+
     getCcrAsync(sessionId: string): Promise<MessageContentStore | null> {
         return this.viaAsync(null, () => this.getCcr(sessionId), () => this.backend!.getCcr(sessionId));
     }

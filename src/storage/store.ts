@@ -792,6 +792,8 @@ export class UnifiedStore {
                     }
                 }
             }
+            // Lineage belongs to the first parent, including its nullable fork
+            // point. Later metadata must not reparent or mix the stored pair.
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
@@ -801,8 +803,8 @@ export class UnifiedStore {
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
                        @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
-                       parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
-                       fork_point_seq = COALESCE(excluded.fork_point_seq, sessions.fork_point_seq),
+                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       fork_point_seq = CASE WHEN sessions.parent_session_id IS NULL THEN excluded.fork_point_seq ELSE sessions.fork_point_seq END,
                        protocol = excluded.protocol,
                        label = excluded.label,
                        title = excluded.title,
@@ -2374,19 +2376,37 @@ export class UnifiedStore {
      *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
      *  parent's last live seq — #4730). Returns false when the parent session
      *  has no row (never mirrored — nothing to clone), true otherwise
-     *  (including zero-row clones and idempotent replays). */
-    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
-        if (this.getSessionRow(parentId) === null) return false;
-        this.db.transaction(() => {
-            const parent = this.getSessionRow(parentId);
-            if (parent === null) return;
+     *  (including zero-row clones and idempotent replays). With initial, the
+     *  child must be new and its snapshot is ingested in this same transaction,
+     *  so neither ledger rows nor a half-initialized child survive failure.
+     *  An unmirrored parent with initial still creates that snapshot and
+     *  returns true, without inventing ledger lineage or copied rows. */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): boolean {
+        if (initial && initial.session.sessionId !== childId) throw new Error("cloneSessionRows: initial session does not match child");
+        if (parentId === childId) throw new Error("cloneSessionRows: conflicting fork lineage (child equals parent)");
+        return this.db.transaction(() => {
             const existing = this.getSessionRow(childId);
+            if (initial && existing !== null) throw new Error("cloneSessionRows: conflicting fork lineage (child already exists)");
+            const parent = this.getSessionRow(parentId);
+            if (parent === null) {
+                // A legacy-only parent has no ledger to clone. Still create
+                // the prepared child atomically rather than falling back to
+                // an unchecked upsert after releasing this transaction.
+                if (!initial) return false;
+                if (!this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+                return true;
+            }
             if (existing !== null) {
-                // Idempotent replay — never duplicate rows on a retried fork.
+                // The pair, not the presence of messages, identifies a replay.
+                // Empty clones are completed clones too; never reparent them.
+                if (existing.parentSessionId !== null || existing.forkPointSeq !== null) {
+                    if (existing.parentSessionId === parentId && existing.forkPointSeq === throughSeq) return true;
+                    throw new Error("cloneSessionRows: conflicting fork lineage");
+                }
                 const already = this.db
                     .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?")
                     .get(childId) as Record<string, unknown>;
-                if ((already.n as number) > 0) return;
+                if ((already.n as number) > 0) throw new Error("cloneSessionRows: conflicting fork lineage (child already has messages)");
             }
             this.db
                 .prepare(
@@ -2435,8 +2455,9 @@ export class UnifiedStore {
                     parentId,
                     throughSeq,
                 );
+            if (initial && !this.ingestSession(initial, undefined, { completeLog: true })) throw new Error("cloneSessionRows: initial child ingest failed");
+            return true;
         });
-        return true;
     }
 
     private putContentRef(hash: string): void {

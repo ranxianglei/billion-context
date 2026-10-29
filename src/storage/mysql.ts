@@ -552,8 +552,17 @@ export class MysqlBackend implements StorageBackend {
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean },
     ): Promise<boolean> {
+        return this.ingestSessionOn(input, delta, opts);
+    }
+
+    private async ingestSessionOn(
+        input: IngestSessionInput,
+        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
+        opts?: { completeLog?: boolean },
+        connection?: PoolConnection,
+    ): Promise<boolean> {
         const s = { ...input.session, tailJson: input.session.tailJson };
-        const ok = await this.tx(async (c): Promise<boolean> => {
+        const ingest = async (c: PoolConnection): Promise<boolean> => {
             let messages: MessageRow[];
             let watermark: number | null;
             if (delta) {
@@ -584,7 +593,9 @@ export class MysqlBackend implements StorageBackend {
                 });
                 watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
             } else {
-                const full = await this.remapPlanToAbsoluteOn(c, input);
+                // Remapping mutates tailJson; persist the same session object
+                // it updates, not the caller's separate plan-space snapshot.
+                const full = await this.remapPlanToAbsoluteOn(c, { ...input, session: s });
                 messages = full.messages;
                 watermark = full.watermark;
                 if (opts?.completeLog === true && !(await this.hasLaneExtOn(c, s.sessionId))) {
@@ -623,14 +634,18 @@ export class MysqlBackend implements StorageBackend {
                     }
                 }
             }
+            // Preserve the established lineage as a pair. MySQL evaluates
+            // assignments left-to-right: inspect the OLD parent for the fork
+            // point before assigning the parent, or first-time lineage loses
+            // its fork point. Later metadata cannot reparent a cloned child.
             await c.query(
                 `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                    status, created_at, updated_at, next_block_id, next_run_id,
                    meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
-                   parent_session_id = COALESCE(VALUES(parent_session_id), parent_session_id),
-                   fork_point_seq = COALESCE(VALUES(fork_point_seq), fork_point_seq),
+                   fork_point_seq = IF(parent_session_id IS NULL, VALUES(fork_point_seq), fork_point_seq),
+                   parent_session_id = COALESCE(parent_session_id, VALUES(parent_session_id)),
                    protocol = VALUES(protocol),
                    label = VALUES(label),
                    title = VALUES(title),
@@ -853,8 +868,8 @@ export class MysqlBackend implements StorageBackend {
                 );
             }
             return true;
-        });
-        return ok;
+        };
+        return connection ? ingest(connection) : this.tx(ingest);
     }
 
     private async hasLaneExtOn(c: PoolConnection, sessionId: string): Promise<boolean> {
@@ -1181,20 +1196,61 @@ export class MysqlBackend implements StorageBackend {
     }
 
     /** #4316 PR3/3 — MySQL twin of UnifiedStore.cloneSessionRows. */
-    async cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
-        const parent = await this.getSessionRow(parentId);
-        if (parent === null) return false;
-        const existing = await this.getSessionRow(childId);
-        if (existing !== null) {
-            const [alreadyRows] = (await this.pool.query(
-                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-                [childId],
-            )) as unknown as Row[][];
-            if (num(alreadyRows[0].n) > 0) return true; // idempotent replay
-        }
+    async cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean> {
+        if (initial && initial.session.sessionId !== childId) throw new Error("cloneSessionRows: initial session does not match child");
+        if (parentId === childId) throw new Error("cloneSessionRows: conflicting fork lineage (child equals parent)");
         const conn = await this.pool.getConnection();
         try {
             await conn.beginTransaction();
+            // Strict initial creation must reserve the child BEFORE checking
+            // for an unmirrored parent: otherwise legacy fallback could write
+            // over an unrelated persisted child. If no parent is mirrored,
+            // initialize the prepared snapshot under this same reservation.
+            const claimChild = async (): Promise<void> => {
+                try {
+                    await conn.query(
+                        `INSERT INTO sessions (session_id, created_at, updated_at)
+                         VALUES (?, ?, ?)${initial ? "" : " ON DUPLICATE KEY UPDATE session_id = VALUES(session_id)"}`,
+                        [childId, Date.now(), Date.now()],
+                    );
+                } catch (err) {
+                    if (initial && (err as { code?: string }).code === "ER_DUP_ENTRY") {
+                        throw new Error("cloneSessionRows: conflicting fork lineage (child already exists)", { cause: err });
+                    }
+                    throw err;
+                }
+            };
+            if (initial) await claimChild();
+            const [parents] = (await conn.query(
+                "SELECT session_id FROM sessions WHERE session_id = ?",
+                [parentId],
+            )) as unknown as Row[][];
+            if (parents.length === 0) {
+                if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
+                await conn.commit();
+                return initial !== undefined;
+            }
+            // The insert/no-op takes the child's unique-key lock even when no
+            // child existed. A competing clone waits, then the locking read
+            // sees the committed pair rather than a repeatable-read snapshot.
+            if (!initial) await claimChild();
+            const [children] = (await conn.query(
+                "SELECT parent_session_id, fork_point_seq FROM sessions WHERE session_id = ? FOR UPDATE",
+                [childId],
+            )) as unknown as Row[][];
+            const existing = children[0];
+            if (existing.parent_session_id != null || existing.fork_point_seq != null) {
+                if (nullableStr(existing.parent_session_id) !== parentId || nullableNum(existing.fork_point_seq) !== throughSeq) {
+                    throw new Error("cloneSessionRows: conflicting fork lineage");
+                }
+                await conn.commit();
+                return true;
+            }
+            const [alreadyRows] = (await conn.query(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            if (num(alreadyRows[0].n) > 0) throw new Error("cloneSessionRows: conflicting fork lineage (child already has messages)");
             await conn.query(
                 `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
                  SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
@@ -1233,6 +1289,7 @@ export class MysqlBackend implements StorageBackend {
                  ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
                 [childId, Date.now(), Date.now(), parentId, throughSeq],
             );
+            if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
             await conn.commit();
             return true;
         } catch (err) {

@@ -2735,6 +2735,48 @@ export class SessionStore {
         return ok;
     }
 
+    async persistForkSession(parentId: string, session: Session): Promise<void> {
+        await this.ready();
+        const record = buildRecord(session, this.liveStorageStamp);
+        // No child ingest may precede this transaction: its first identities
+        // must inherit the parent's absolute ledger, including retired slots.
+        const cloned = await this.shadow?.createForkAsync(parentId, toLegacyLike(session)) ?? false;
+        if (!cloned) {
+            if (!this.flushSync(session)) throw new Error("fork persistence failed");
+            return;
+        }
+        await this.maybeCutForkBaseAsync(session);
+        // A failure here leaves a COMPLETE durable fork receipt in the DB.
+        // The exact retry repairs its envelope; never delete an uncertain commit.
+        if (!this.saveContentStore(session)) throw new Error("fork content persistence failed; retry the same request");
+        this.noteOwnCommit(session.id, record);
+        if (!this.writerOffActive()) {
+            if (!this.store.flushSync(session.id, () => record)) throw new Error("fork envelope persistence failed; retry the same request");
+            this.stampOwnWrite(session.id);
+        }
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+    }
+
+    async recoverCompletedFork(id: string): Promise<void> {
+        await this.ready();
+        if (this.loadEnvelope(id) !== null) return;
+        const view = await this.shadow?.viewForAsync(id);
+        if (!view) return;
+        const record = viewToRecord(view);
+        const receipt = record.metadata?.publicForkReceipt as { requestHash?: unknown; response?: { ok?: unknown; sessionId?: unknown; childConversationId?: unknown } } | undefined;
+        if (typeof receipt?.requestHash !== "string" || receipt.response?.ok !== true || receipt.response.sessionId !== id || receipt.response.childConversationId !== id) return;
+        const session = buildSession(record);
+        if (!this.saveContentStore(session)) throw new Error("fork content recovery failed");
+        this.noteOwnCommit(id, record);
+        if (!this.writerOffActive()) {
+            if (!this.store.flushSync(id, () => record)) throw new Error("fork envelope recovery failed");
+            this.stampOwnWrite(id);
+        }
+        await this.maybeCutForkBaseAsync(session);
+    }
+
     /** Flush all dirty content stores, then pending session writes. Called on
      *  SIGTERM/SIGINT for graceful shutdown. Content stores live outside the
      *  kernel StateStore, so retry them from the resident session list before

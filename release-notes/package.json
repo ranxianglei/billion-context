@@ -9,8 +9,20 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-21",
+    "updated": "2026-10-26",
     "releases": [
+      {
+        "version": "0.1.208",
+        "date": "2026-10-25",
+        "tier": "critical",
+        "summary": "修复 0.1.207 升级后大存储打不开的问题:0.1.207 的 v8 存储迁移一次性把整个库读进内存,大库(数 GB)首次打开内存耗尽,且每次启动都重新失败,表现为卡死或反复崩溃(#4677)。本版改为逐会话迁移、崩溃自动续跑,并打印进度日志。EN: large unified stores bricked by the 0.1.207 v8 migration (whole-store load = OOM on every launch) now migrate one session per transaction, resume after a crash, and log progress. 大存储用户请立即升级;已卡住的用户升级后重启即自动续跑,不要手改 user_version。"
+      },
+      {
+        "version": "0.1.207",
+        "date": "2026-10-24",
+        "tier": "recommended",
+        "summary": "存储可靠性修复(0.1.203–0.1.204 用户请直接升到本版):折叠上下文不再因模型/窗口切换悄悄膨胀直至会话超窗;修复图片会话媒体引用泄漏与存储校验误报(#4390/#4506/#4444)。EN: storage reliability fixes — folded context no longer silently regrows after model/window switches; media-ref leak and false digest drift fixed. v0.1.203–204 users upgrade immediately."
+      },
       {
         "version": "0.1.203",
         "date": "2026-10-21",

@@ -15,7 +15,7 @@ import type { CoreMessage } from "acp-kernel";
 // parentConversationId only). The upsert therefore wrote NULL over the clone's
 // lineage and the child became an orphan in every parent/child query.
 // The fix keeps the stored value when the plan carries no lineage of its own
-// (COALESCE on both backends); a plan that DOES carry lineage still overrides.
+// (existing-first on both backends); an established clone pair is immutable.
 
 function msg(id: string, role: "user" | "assistant"): CoreMessage {
     return { id, role, contentType: "text", text: `body ${id}` };
@@ -94,11 +94,19 @@ test("#4910: the fork child's first save keeps the lineage the clone wrote", () 
         assert.equal(store.getSessionRow(plain)!.parentSessionId, null, "no lineage stays null");
         assert.equal(store.getSessionRow(plain)!.forkPointSeq, null, "no fork point stays null");
 
-        // Negative control 2: a plan that DOES carry lineage still overrides,
-        // so the wire-probe fork path keeps its authoritative write.
+        // #4982: later metadata must not reparent an established fork.
         const other = "sess-4910-other";
-        store.ingestSession(planIngest(session(child, full, other)));
-        assert.equal(store.getSessionRow(child)!.parentSessionId, other, "an explicit derivedFromSessionId still wins");
+        const conflicting = planIngest(session(child, full, other));
+        conflicting.session.forkPointSeq = throughSeq + 100;
+        store.ingestSession(conflicting);
+        assert.equal(store.getSessionRow(child)!.parentSessionId, parent, "established parent wins over later metadata");
+        assert.equal(store.getSessionRow(child)!.forkPointSeq, throughSeq, "the original parent/fork pair stays intact");
+        // A previously unparented session can establish its initial pair.
+        const initial = planIngest(session(plain, full, other));
+        initial.session.forkPointSeq = 123;
+        store.ingestSession(initial);
+        assert.equal(store.getSessionRow(plain)!.parentSessionId, other);
+        assert.equal(store.getSessionRow(plain)!.forkPointSeq, 123);
         store.close();
     } finally {
         cleanup(dir);
