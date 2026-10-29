@@ -35,7 +35,7 @@ import { type Session } from "./session.js";
  *  #5196 onward retire every seat a mover vacates into its own seq+1, so no
  *  freshly stamped number ever names two messages and case 1 can never
  *  mis-engage on such data. */
-export interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
+interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
     translated: number;
