@@ -69,15 +69,12 @@ test("cold load recovers the pre-fix orphan freeze before processing a request",
     assert.equal(recovered.stats.requests, 876);
     assert.equal(recovered.state.nextBlockId, 4);
     assert.deepEqual(recovered.state.blocks.map(b => b.blockId), ["b3"]);
-    // #4316 PR3/3: a full-mode cold load re-homes citation numbers once
-    // (ledger alignment) — pin the content-addressable round-trip, not the
-    // counter-era number, so the assertion holds under any numbering scheme.
-    const alignedRef = recovered.state.messageRefs.byRaw["raw-new"];
-    assert.ok(alignedRef, "raw-new must keep a citation number after recovery");
-    assert.equal(recovered.state.messageRefs.byRef[alignedRef], "raw-new");
-    // The pre-alignment number is recorded as superseded, not silently dropped.
-    assert.equal(alignedRef, "m00001", "the first stored message aligns to seq 0 + 1");
-    assert.equal(recovered.restampSuperseded?.get("m00003"), "raw-new");
+    // Cold load must not renumber issued refs: the recovered raw keeps the
+    // exact number the live session handed out, and no superseded translation
+    // is synthesized.
+    assert.equal(recovered.state.messageRefs.byRaw["raw-new"], "m00003");
+    assert.equal(recovered.state.messageRefs.byRef["m00003"], "raw-new");
+    assert.equal(recovered.restampSuperseded, undefined);
     assert.equal(recovered.lastMessages?.at(-1)?.text, "new turn");
     assert.equal(recovered.metadata.recoveryMarker, "fresh");
     assert.equal(recovered.blockContents.get("b1")?.full.text, "retained original");

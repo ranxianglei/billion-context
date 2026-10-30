@@ -23,7 +23,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
-import type { BlockView } from "../session.js";
+import type { BlockView, RefHistoryCollision } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { renameSync } from "node:fs";
@@ -954,6 +954,20 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         this.assertLive();
         return this.sync.seqByRaw(sessionId);
+    }
+
+    /** Retained ref-history collisions (see UnifiedStore.findRefHistoryCollisions).
+     *  Full-trust only: a stale index could invent or miss a conflict, so a
+     *  degraded/shadow read returns null and the caller must not treat that as
+     *  a clean bill of health. */
+    refHistoryCollisions(sessionId: string): RefHistoryCollision[] | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.findRefHistoryCollisions(sessionId);
+        } catch {
+            return null;
+        }
     }
 
     /** #4316 PR3/3: live (non-retired) message row count. */

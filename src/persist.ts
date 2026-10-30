@@ -29,16 +29,14 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
-import { markDirty } from "./session.js";
+import { hasRefLedgerConflict, markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
-import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
-import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -1132,9 +1130,15 @@ export class SessionStore {
                 this.shadow.importRecord(payload);
             }
             const view = this.shadow.viewFor(id);
-            if (view) return buildSession(viewToRecord(view));
+            if (view) {
+                const session = buildSession(viewToRecord(view));
+                this.markRefLedgerConflicts(session);
+                return session;
+            }
         }
-        return buildSession(payload);
+        const session = buildSession(payload);
+        this.markRefLedgerConflicts(session);
+        return session;
     }
 
     /** #708/#1080 review: boot NEVER rewrites session file CONTENT. The first
@@ -1557,6 +1561,7 @@ export class SessionStore {
                         }
                     }
                     const drifted = buildSession(driftedEnvelope.payload);
+                    this.markRefLedgerConflicts(drifted);
                     // #4323: "drifted" only proves the two copies DIVERGED —
                     // not which side is ahead. With multiple writers sharing a
                     // sessions directory (the 2026-10-22 incident) the INDEX
@@ -1636,6 +1641,7 @@ export class SessionStore {
             // Legacy fallback — same single-build semantics as plain legacy
             // mode (see the note below on why no adapter round-trip here).
             const session = buildSession(envelope.payload);
+            this.markRefLedgerConflicts(session);
             if (hasNegativePersistedTokens(envelope.payload)) {
                 this.scheduleSave(session);
                 this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
@@ -1653,6 +1659,7 @@ export class SessionStore {
         // normalization round-trip and reshape persisted-state bytes (the
         // storage-render goldens catch exactly that).
         const session = buildSession(envelope.payload);
+        this.markRefLedgerConflicts(session);
         if (hasNegativePersistedTokens(envelope.payload)) {
             // #408: sync context — debounce the stale-file rewrite
             // (buildSession already clamped the in-memory value).
@@ -1672,93 +1679,36 @@ export class SessionStore {
     private afterLoad(id: string, view: LegacySessionLike): Session {
         const record = viewToRecord(view);
         const session = buildSession(record);
+        this.markRefLedgerConflicts(session);
         // #4788 D2: a cold load IS a disk proof of this live revision.
         this.noteDurable(id, session.revisionEpoch);
         if (hasNegativePersistedTokens(record)) {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
-        // #4316 layer 3 PR3/3: align the citation space with the unified
-        // ledger exactly once per state, at the ONLY safe moment — cold
-        // load. Mid-conversation alignment would shift refs the client has
-        // already seen (byte-stability contract, snapshot-render D-suite);
-        // a restart boundary has no in-flight compress call, so nothing can
-        // observe a half-renumbered map. Post-load arrivals keep minting
-        // counter refs (fresh numbers, no collision). Envelope-only loads
-        // (no rows) skip honestly.
-        this.maybeRestampToLedger(session);
+        // Issued refs are sealed at cold load. Renumbering them here moved a
+        // number from one raw message to another while old process-lifetime
+        // citations still resolved live-first; a stale compress then folded
+        // the wrong raw. New arrivals are numbered above the historical floor
+        // by the kernel instead.
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
     }
 
-    /** #4316 PR3/3: one-time ref/ledger alignment at cold load. Guards:
-     *  state already aligned, no ref map, unified store unavailable, or no
-     *  rows for this session → no-op. Multi-generation ids (edits) are
-     *  excluded by seqByRaw itself — their legacy refs stay put. */
-    private maybeRestampToLedger(session: Session): void {
-        const state = session.state as (CompressionState & { refLedgerAligned?: boolean });
-        if (state.refLedgerAligned === true) return;
-        if (!state.messageRefs || Object.keys(state.messageRefs.byRaw).length === 0) return;
-        try {
-            const seqByRawId = this.unifiedSeqByRaw(session.id);
-            if (seqByRawId === null || seqByRawId.size === 0) return;
-            const outcome = restampRefsToLedger(state, seqByRawId);
-            // #4733: the ref restamp alone leaves the CCR content store keyed by
-            // store-time refs — a stored original would sit under a number the
-            // ref map now vends to a DIFFERENT message (misattribution on
-            // retrieve) and consistency gates (plugin fork snapshot) reject the
-            // session. Re-key the store onto the same map, same pass.
-            // #4599: guarded — contentStoreOf MATERIALIZES an empty envelope
-            // for storeless sessions; touching it speculatively here changed
-            // the persisted shape of every full-mode cold load (legacy keeps
-            // undefined) and broke the storage-unified parity pin. Storeless
-            // sessions have nothing to re-key.
-            if (session.contentStore) {
-                const store = contentStoreOf(session);
-                const restampedStore = restampContentStore(store, state.messageRefs.byRaw);
-                if (restampedStore !== store) session.contentStore = restampedStore;
-            }
-            if (outcome.superseded.size > 0) {
-                session.restampSuperseded = outcome.superseded;
-            } else {
-                // #4797: a converged pass (everything already aligned) must
-                // CLEAR any stale map — the guard keeps consulting the
-                // process-lifetime map, and an empty outcome that leaves an
-                // old map in place keeps refusing live refs forever.
-                delete session.restampSuperseded;
-            }
-            // The token snapshot is keyed by ref (#3488 render-refs): renumbered
-            // refs would otherwise inherit the stale count of whichever message
-            // held the new number pre-alignment — the wire tag then disagrees
-            // with the legacy-restart leg beyond citation renumbering (storage
-            // engine-proofs wire-parity, #4599). Two-pass moves: stage all
-            // (oldRef → newRef → count) first, then delete, then write — a
-            // single-pass swap would lose entries whose newRef is another
-            // move's oldRef.
-            const snap = (state as { tokenSnapshot?: Record<string, number> }).tokenSnapshot;
-            if (snap && outcome.superseded.size > 0) {
-                const byRawNow = state.messageRefs.byRaw;
-                const moves: Array<[oldRef: string, newRef: string, count: number]> = [];
-                for (const [oldRef, rawId] of outcome.superseded) {
-                    const count = snap[oldRef];
-                    const newRef = byRawNow[rawId];
-                    if (count === undefined || newRef === undefined || newRef === oldRef) continue;
-                    moves.push([oldRef, newRef, count]);
-                }
-                if (moves.length > 0) {
-                    for (const [oldRef] of moves) delete snap[oldRef];
-                    for (const [, newRef, count] of moves) snap[newRef] = count;
-                    this.log("info", `[persist] remapped ${moves.length} token-snapshot entries onto ledger-aligned refs for ${session.id} (#4599)`);
-                }
-            }
-            state.refLedgerAligned = true;
-            this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
-            this.scheduleSave(session);
-        } catch (err) {
-            // Alignment is an optimization of the citation space, never a
-            // load blocker — a failed stamp leaves the legacy refs intact.
-            this.log("warn", `[persist] ref/ledger alignment skipped for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
-        }
+    /** Detects retained old-vs-current ref collisions before this process can
+     *  resolve a ref into a mutation. Read-only: it neither renumbers nor
+     *  deletes anything. An unavailable query cannot clear an earlier
+     *  conflict; missing historical rows cannot establish past uniqueness. */
+    private markRefLedgerConflicts(session: Session): void {
+        const collisions = this.shadow?.refHistoryCollisions(session.id) ?? null;
+        if (collisions === null || collisions.length === 0) return;
+        session.refLedgerConflict = collisions;
+        session.metadata.refLedgerConflict = true;
+        const sample = collisions.slice(0, 5).map((c) => c.ref).join(", ");
+        this.log(
+            "warn",
+            `[persist] ${session.id}: ${collisions.length} retained message ref(s) collide with the current refs ledger (${sample}); ref-resolving mutations are blocked for this session`,
+        );
     }
 
     /** Unified-first view load (full mode). Null on miss. */
@@ -1914,19 +1864,6 @@ export class SessionStore {
      *  THIS predicate instead of replicasAvailable(). */
     unifiedReads(): boolean {
         return this.enabled && this.shadow?.readsUnified === true;
-    }
-
-    /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
-     *  re-stamp (single-row ids only — multi-generation ids are excluded by
-     *  the store). Null when the unified store is unavailable; the re-stamp
-     *  then degrades to legacy refs (honest skip, never a guess). */
-    unifiedSeqByRaw(id: string): Map<string, number> | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.seqByRaw(id);
-        } catch {
-            return null;
-        }
     }
 
     /** #4730/#4911: highest live (non-retired) seq — the fork endpoint's
@@ -2463,6 +2400,10 @@ export class SessionStore {
         const envelope = this.loadEnvelope(incoming.id, incoming.meta);
         if (!envelope) return null;
         const disk = envelope.payload;
+        // Quarantine is monotonic even when the incoming state wins arbitration.
+        if (disk.metadata?.refLedgerConflict === true) {
+            (incoming.metadata ??= {}).refLedgerConflict = true;
+        }
         const diskRequests = disk.stats?.requests ?? disk.requests ?? 0;
         const incRequests = incoming.stats?.requests ?? incoming.requests ?? 0;
         if (incRequests < diskRequests) return disk;
@@ -2580,8 +2521,18 @@ export class SessionStore {
         // the JSON envelope, and the stamp must say legacy for that copy.
         const stamp = this.liveStorageStamp;
         return () => {
+            // The unified record can be newer than its envelope, including
+            // index-only writes. Counter arbitration cannot clear this fact.
+            if (hasRefLedgerConflict(session) || this.shadow?.getSessionMetadata(session.id)?.refLedgerConflict === true) {
+                session.metadata.refLedgerConflict = true;
+            }
             const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
+            if (record.metadata?.refLedgerConflict === true || disk?.metadata?.refLedgerConflict === true) {
+                session.metadata.refLedgerConflict = true;
+                (record.metadata ??= {}).refLedgerConflict = true;
+                if (disk) (disk.metadata ??= {}).refLedgerConflict = true;
+            }
             if (disk === null) {
                 // #3301: external-converter import payload rides exactly ONE
                 // save into the unified index (first-open imports take the
@@ -2628,6 +2579,7 @@ export class SessionStore {
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
             this.shadow?.record(disk);
+            this.markRefLedgerConflicts(session);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);
@@ -3217,8 +3169,10 @@ export class SessionStore {
         const cloned = await this.shadow?.createForkAsync(parentId, toLegacyLike(session)) ?? false;
         if (!cloned) {
             if (!this.flushSync(session)) throw new Error("fork persistence failed");
+            this.markRefLedgerConflicts(session);
             return;
         }
+        this.markRefLedgerConflicts(session);
         await this.maybeCutForkBaseAsync(session);
         // A failure here leaves a COMPLETE durable fork receipt in the DB.
         // The exact retry repairs its envelope; never delete an uncertain commit.

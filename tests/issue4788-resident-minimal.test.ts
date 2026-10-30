@@ -14,7 +14,7 @@
 // Invariants exercised here: #1 frozen routing byte-identical; #5 index-only
 // paths get equivalent drops; #6 CompressionState untouched by any drop.
 
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -50,6 +50,8 @@ process.env.BILI_PERSIST_TAIL_TOKENS = "600";
 // tests (a)-(d) assert behaviorally.
 process.env.BILI_SESSION_RESIDENT_HARD_MAX_BYTES = "4096";
 
+const DEBOUNCE_MS = 50;
+
 function rawTail(n: number): CoreMessage[] {
     const out: CoreMessage[] = [];
     for (let i = 0; i < n; i++) {
@@ -82,11 +84,13 @@ function makeHeavy(id: string, blocks: number): Session {
 
 /** One simulated request against a store: mutate (what markDirty would do),
  * arm the debounced save, wait for it to settle on the kernel chain. */
-async function turn(store: SessionStore, s: Session, midFlight?: boolean): Promise<boolean> {
+async function turn(t: TestContext, store: SessionStore, s: Session, midFlight?: boolean): Promise<boolean> {
     if (midFlight) s.inFlight = 1;
     s.revisionEpoch = (s.revisionEpoch ?? 0) + 1;
     store.scheduleSave(s);
-    const landed = await store.afterNextFlush(s.id);
+    const pendingFlush = store.afterNextFlush(s.id);
+    t.mock.timers.tick(DEBOUNCE_MS);
+    const landed = await pendingFlush;
     if (midFlight) s.inFlight = 0;
     return landed;
 }
@@ -102,16 +106,17 @@ function findEnvelope(dir: string, protocol: string): string | null {
     return files.length > 0 ? path.join(protoDir, files[0]) : null;
 }
 
-test("(a) between-turns drop: every landed request-end boundary discharges droppable fields", async () => {
+test("(a) between-turns drop: every landed request-end boundary discharges droppable fields", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
     const dir = mkdtempSync(path.join(tmpdir(), "bili-bc-4788-a-"));
-    const store = new SessionStore({ dir, debounceMs: 50, enabled: true });
+    const store = new SessionStore({ dir, debounceMs: DEBOUNCE_MS, enabled: true });
     try {
         const s = makeHeavy("rt-a", 40);
         const beforeTotal = sessionWeight(s);
         assert.ok(beforeTotal > 8_000, `seeded session should be heavy, got ${beforeTotal}`);
 
         // Turn 1 ends: save settles, then the boundary spill runs.
-        assert.equal(await turn(store, s), true, "debounced save must land with proof");
+        assert.equal(await turn(ctx, store, s), true, "debounced save must land with proof");
         await store.spillBetweenTurns(s);
         assert.ok(s.blockContents instanceof LazyBlockContents && (s.blockContents as LazyBlockContents).isDropped, "block contents folded to lazy shell");
         assert.ok(isDroppedMetadata(s.metadata), "metadata folded to lazy proxy");
@@ -124,26 +129,28 @@ test("(a) between-turns drop: every landed request-end boundary discharges dropp
         assert.equal(afterA.state > 0, true, "state stays resident");
 
         // Turn 2: the same boundary works repeatedly (idempotent drops).
-        assert.equal(await turn(store, s), true);
+        assert.equal(await turn(ctx, store, s), true);
         await store.spillBetweenTurns(s);
         assert.ok((s.blockContents as LazyBlockContents).isDropped, "still folded after the second boundary");
         assert.ok(isDroppedMetadata(s.metadata));
     } finally {
         store.cancelAll();
+        ctx.mock.timers.reset();
         rmrf(dir);
     }
 });
 
-test("(b) narrow-read reconstruction deepEquals the pre-drop reference", async () => {
+test("(b) narrow-read reconstruction deepEquals the pre-drop reference", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
     const dir = mkdtempSync(path.join(tmpdir(), "bili-bc-4788-b-"));
-    const store = new SessionStore({ dir, debounceMs: 50, enabled: true });
+    const store = new SessionStore({ dir, debounceMs: DEBOUNCE_MS, enabled: true });
     try {
         const s = makeHeavy("rt-b", 30);
         const refBlocks: Record<string, unknown> = {};
         for (const [k, v] of s.blockContents) refBlocks[k] = structuredClone(v);
         const refMeta: Record<string, unknown> = structuredClone({ ...s.metadata });
 
-        assert.equal(await turn(store, s), true);
+        assert.equal(await turn(ctx, store, s), true);
         await store.spillBetweenTurns(s);
         assert.ok((s.blockContents as LazyBlockContents).isDropped);
 
@@ -159,27 +166,29 @@ test("(b) narrow-read reconstruction deepEquals the pre-drop reference", async (
         assert.deepEqual({ ...s.metadata }, refMeta, "metadata rebuilt identically from the narrow read");
 
         // A later save persists the SAME full set again (no thinned erase).
-        await turn(store, s);
+        await turn(ctx, store, s);
         const parsed = JSON.parse(readFileSync(findEnvelope(dir, "openai")!, "utf8")) as { payload?: Record<string, unknown> };
         const rec = (parsed.payload ?? parsed) as Record<string, unknown>;
         assert.equal(Object.keys((rec.blockContents ?? {}) as object).length, Object.keys(refBlocks).length, "full set round-trips through the envelope");
     } finally {
         store.cancelAll();
+        ctx.mock.timers.reset();
         rmrf(dir);
     }
 });
 
-test("(c) hard cap under sustained activity: boundaries drop, in-flight skips, warn throttled", async () => {
+test("(c) hard cap under sustained activity: boundaries drop, in-flight skips, warn throttled", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
     const dir = mkdtempSync(path.join(tmpdir(), "bili-bc-4788-c-"));
     const lines: string[] = [];
-    const store = new SessionStore({ dir, debounceMs: 50, enabled: true, log: (_l, m) => lines.push(m) });
+    const store = new SessionStore({ dir, debounceMs: DEBOUNCE_MS, enabled: true, log: (_l, m) => lines.push(m) });
     try {
         const s = makeHeavy("rt-c", 40);
         assert.ok(sessionWeight(s) > Number(process.env.BILI_SESSION_RESIDENT_HARD_MAX_BYTES), "session must exceed the (tiny) cap");
 
         // Three consecutive busy turns: mid-flight the spill must NOT run…
         for (let t = 1; t <= 3; t++) {
-            assert.equal(await turn(store, s, true), true, `turn ${t} save lands`);
+            assert.equal(await turn(ctx, store, s, true), true, `turn ${t} save lands`);
             // Mid-response (still streaming): the spill must decline.
             s.inFlight = 1;
             await store.spillBetweenTurns(s);
@@ -204,6 +213,7 @@ test("(c) hard cap under sustained activity: boundaries drop, in-flight skips, w
         }
     } finally {
         store.cancelAll();
+        ctx.mock.timers.reset();
         rmrf(dir);
     }
 });

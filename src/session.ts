@@ -236,6 +236,19 @@ export type PendingRetrieval = {
     ccr?: boolean;
 };
 
+/** A persisted message row was issued `ref` at some point, but the current
+ *  refs ledger binds that same number to a different raw message. This is the
+ *  residue of the retired cold-load re-stamp: old `messages.ref` values and
+ *  the current `refs` table disagree. Any compress that resolves refs would
+ *  be ambiguous, so the session-level guard refuses ref-resolving mutations
+ *  while keeping raw rows, blocks, and the ledger intact. */
+export interface RefHistoryCollision {
+    ref: string;
+    refNum: number;
+    oldRawId: string;
+    currentRawId: string;
+}
+
 export type Session = {
     /** 派生缓存随会话释放，供驻留字节计量遍历；不进入持久化投影或 wire。 */
     transient?: {
@@ -544,6 +557,12 @@ export type Session = {
      *  the message that now owns the number). A fresh process that never
      *  re-stamped has no map and every ref behaves normally. */
     restampSuperseded?: Map<string, string>;
+    /** Detectable old-vs-current ref collisions found at cold load. Diagnostic
+     *  rows stay transient; metadata.refLedgerConflict preserves known
+     *  ambiguity when adoption cannot carry the parent's historical rows.
+     *  Detection cannot be universal: pruned, null, BLOCKED, or orphaned
+     *  historical rows may leave no trace. */
+    refLedgerConflict?: RefHistoryCollision[];
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when
@@ -667,6 +686,10 @@ type AnonymousPrefixAffinityStamp = {
     /** #2879: first-writer provenance of the mint request (see anon-provenance.ts). */
     producer?: AnonymousProvenance;
 };
+
+export function hasRefLedgerConflict(session: Session): boolean {
+    return session.metadata.refLedgerConflict === true || (session.refLedgerConflict?.length ?? 0) > 0;
+}
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
 // model compress settings + self-heal + output headroom), while the plugin

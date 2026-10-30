@@ -73,20 +73,57 @@ export interface AssignRefsOptions {
   nextIndex: number;
   isProtected?: (message: CoreMessage) => boolean;
   shouldSkip?: (message: CoreMessage) => boolean;
+  /** Refs that belonged to pruned messages. They are never handed out again. */
+  deadRefs?: readonly string[];
+}
+
+function reservedRefIndices(deadRefs: readonly string[] | undefined): Set<number> {
+  const reserved = new Set<number>();
+  for (const ref of deadRefs ?? []) {
+    const index = refToIndex(ref);
+    if (index !== null) reserved.add(index);
+  }
+  return reserved;
+}
+
+/** Highest numeric number present on either side of the map. byRef can hold
+ *  orphans whose byRaw owner is gone; those numbers are still issued. */
+function highestIssuedIndex(map: MessageRefMap): number {
+  let highest = highestUsedIndex(map);
+  for (const ref of Object.keys(map.byRef)) {
+    const index = refToIndex(ref);
+    if (index !== null && index > highest) highest = index;
+  }
+  return highest;
 }
 
 export function assignRefs(
   messages: CoreMessage[],
   options: AssignRefsOptions,
 ): AssignRefsResult {
+  const existingByRaw = options.existing?.byRaw ?? {};
+  const existingByRef = options.existing?.byRef ?? {};
   const map: MessageRefMap = {
-    byRaw: { ...options.existing.byRaw },
-    byRef: { ...options.existing.byRef },
+    byRaw: { ...existingByRaw },
+    byRef: { ...existingByRef },
   };
-  let cursor =
+  const reserved = reservedRefIndices(options.deadRefs);
+  // The high-water mark is the highest ref this map or its tombstones have
+  // ever carried. A caller-supplied cursor below it must not reopen that
+  // range: a low ledgerSeq or a counter restart would otherwise reissue a
+  // number whose previous owner is gone from byRef.
+  let historicalHighWater = highestIssuedIndex({ byRaw: existingByRaw, byRef: existingByRef });
+  for (const index of reserved) {
+    if (index > historicalHighWater) historicalHighWater = index;
+  }
+  const requestedCursor =
     Number.isInteger(options.nextIndex) && options.nextIndex >= MIN_INDEX
       ? options.nextIndex
       : MIN_INDEX;
+  if (requestedCursor - 1 > historicalHighWater) {
+    historicalHighWater = requestedCursor - 1;
+  }
+  let cursor = Math.max(requestedCursor, historicalHighWater + 1);
   let newlyAssigned = 0;
   const migratedIds: string[] = [];
 
@@ -140,7 +177,15 @@ export function assignRefs(
       ledgerSeq <= MAX_INDEX
     ) {
       const text = indexToRef(ledgerSeq);
-      if (!map.byRef[text]) {
+      // A ledger stamp only proves identity when it lands above every ref
+      // already issued for this state and outside the dead-ref tombstones.
+      // Below the high-water mark the sequence was reused or reset; trusting
+      // seq+1 there would mint a collision with a historical owner.
+      if (
+        ledgerSeq > historicalHighWater &&
+        !map.byRef[text] &&
+        !reserved.has(ledgerSeq)
+      ) {
         map.byRaw[message.id] = text;
         map.byRef[text] = message.id;
         newlyAssigned++;
@@ -149,7 +194,7 @@ export function assignRefs(
       }
     }
 
-    const ref = allocateFreeRef(map, cursor);
+    const ref = allocateFreeRef(map, cursor, reserved);
     cursor = ref.index + 1;
     map.byRaw[message.id] = ref.text;
     map.byRef[ref.text] = message.id;
@@ -162,11 +207,12 @@ export function assignRefs(
 function allocateFreeRef(
   map: MessageRefMap,
   start: number,
+  reserved: ReadonlySet<number> = new Set(),
 ): { text: string; index: number } {
   let candidate = Math.max(start, MIN_INDEX);
   while (candidate <= MAX_INDEX) {
     const text = indexToRef(candidate);
-    if (!map.byRef[text]) {
+    if (!map.byRef[text] && !reserved.has(candidate)) {
       return { text, index: candidate };
     }
     candidate++;
@@ -235,10 +281,15 @@ export function restampRefsToLedger(
   const byRef: Record<string, string> = { ...refs.byRef };
   const scratch: MessageRefMap = { byRaw, byRef };
   const displaced: string[] = [];
+  const reserved = reservedRefIndices(state.deadRefs);
   // MessageRefMap carries no cursor field — the caller recomputes it from the
   // highest used index (compress.ts:1047 pattern). We still track a local
-  // cursor for free-number allocation during this pass.
-  let nextIndex = highestUsedIndex(refs) + 1;
+  // cursor for free-number allocation during this pass. Tombstoned refs are
+  // part of the historical floor even though no byRef key survives for them.
+  let nextIndex = highestIssuedIndex(refs) + 1;
+  for (const index of reserved) {
+    if (index + 1 > nextIndex) nextIndex = index + 1;
+  }
 
   for (const [rawId, seq] of seqByRawId) {
     const current = byRaw[rawId];
@@ -273,7 +324,7 @@ export function restampRefsToLedger(
     const held = byRaw[rawId];
     if (held === undefined) continue;
     if (byRef[held] === rawId) continue;
-    const free = allocateFreeRef(scratch, nextIndex);
+    const free = allocateFreeRef(scratch, nextIndex, reserved);
     out.superseded.set(held, rawId);
     byRaw[rawId] = free.text;
     byRef[free.text] = rawId;
