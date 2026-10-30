@@ -367,6 +367,13 @@ entries:
     group: process
     desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
     desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+  - key: sessions.hardMaxBytes
+    type: number
+    default: "(same as `sessions.residentMaxBytes`)"
+    env: BILI_SESSION_RESIDENT_HARD_MAX_BYTES
+    group: process
+    desc_en: "Per-SESSION hard cap on estimated resident bytes (#4788, decision #4792 D1-A). Unlike the pool soft cap — which can only evict OTHER cold sessions and never touches a sole-active session — this bounds ONE session: over the cap at a request-end boundary, its droppable fields (folded-block originals, metadata ledger, the raw tail beyond the bounded view) are forced back to disk even for a pool-exempt session, and the next turn transparently re-reads what it needs via narrow disk reads. Safe drops run at every request boundary as long as the last save has provably landed; the cap adds the per-session call-out (warn, throttled to 60 s). `0` disables the cap check."
+    desc_zh: "单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。"
   - key: sessions.gc.enabled
     type: boolean
     default: "false"
