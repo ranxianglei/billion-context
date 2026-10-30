@@ -1885,8 +1885,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `sessions.residentMaxBytes`) |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
-| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `BILI_SESSION_RESIDENT_MAX_BYTES`) |
 | `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
 | `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
