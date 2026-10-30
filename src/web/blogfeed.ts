@@ -105,11 +105,14 @@ export function _setBlogRootForTest(root: string | null): void {
 
 /** Mirror of the website tools' frontmatter parser (key: value between --- fences). */
 function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
+    // Windows checkouts use CRLF; parse and render the same Markdown on every platform.
+    text = text.replace(/\r\n/g, "\n");
     const fm: Record<string, string> = {};
-    let body = text;
-    // Git-for-Windows autocrlf checks .md posts out with CRLF; normalize so
-    // the exact-match fences below survive Windows checkouts (#4599).
-    const src = text.startsWith("---\r\n") ? text.replace(/\r\n/g, "\n") : text;
+    // Git-for-Windows autocrlf checks .md posts out with CRLF; normalize
+    // UNCONDITIONALLY so the exact-match fences survive Windows checkouts
+    // (#4599) and non-frontmatter bodies cannot leak \r into rendered HTML.
+    const src = text.replace(/\r\n/g, "\n");
+    let body = src;
     if (src.startsWith("---\n")) {
         const end = src.indexOf("\n---\n", 4);
         if (end !== -1) {
