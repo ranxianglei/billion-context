@@ -40,6 +40,8 @@ export interface SqliteDatabase {
     prepare(sql: string): SqliteStatement;
     /** Runs fn inside BEGIN/COMMIT; rolls back on throw (including nested calls via savepoints). */
     transaction<T>(fn: () => T): T;
+    /** Deferred snapshot: readers do not reserve the writer lock. */
+    readTransaction<T>(fn: () => T): T;
     close(): void;
     readonly open: boolean;
 }
@@ -76,6 +78,26 @@ interface OpenedDatabase {
     readonly source: SqliteEngineSource;
 }
 
+/** #4949: better-sqlite3's own wrapper runs ROLLBACK after ANY inner failure;
+ *  when BEGIN or COMMIT itself failed there was nothing left to roll back, and
+ *  its "cannot rollback - no transaction is active" REPLACES the real error
+ *  (commonly disk full / SQLITE_FULL) before it reaches us. Name the masking
+ *  at our seam so operators see the likely cause. Both lock modes go through
+ *  it — the wrapper masks identically in deferred mode. */
+function surfaceMaskedRollbackError<T>(run: (fn: () => T) => T): (fn: () => T) => T {
+    return (fn) => {
+        try {
+            return run(fn);
+        } catch (err) {
+            const msg = String(err);
+            if (/cannot rollback|no transaction is active/i.test(msg)) {
+                throw new SqliteDriverError(`${msg} — masked by better-sqlite3's automatic rollback after a failed BEGIN/COMMIT; the original error no longer survives (disk full / SQLITE_FULL is the common cause)`, "better-sqlite3");
+            }
+            throw err;
+        }
+    };
+}
+
 function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
     return {
         exec: (sql) => void db.exec(sql),
@@ -86,23 +108,8 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
         // a write lock mid-flight — SQLITE_BUSY_SNAPSHOT, which busy_timeout
         // cannot resolve. Taking the write lock up front makes concurrent
         // writers queue on busy_timeout instead (#2690 review blocking 5).
-        transaction: (fn) => {
-            try {
-                return db.transaction(fn).immediate();
-            } catch (err) {
-                // #4949: better-sqlite3's own wrapper runs ROLLBACK after ANY
-                // inner failure; when BEGIN or COMMIT itself failed there was
-                // nothing left to roll back, and its "cannot rollback - no
-                // transaction is active" REPLACES the real error (commonly
-                // disk full / SQLITE_FULL) before it reaches us. Name the
-                // masking at our seam so operators see the likely cause.
-                const msg = String(err);
-                if (/cannot rollback|no transaction is active/i.test(msg)) {
-                    throw new SqliteDriverError(`${msg} — masked by better-sqlite3's automatic rollback after a failed BEGIN/COMMIT; the original error no longer survives (disk full / SQLITE_FULL is the common cause)`, "better-sqlite3");
-                }
-                throw err;
-            }
-        },
+        transaction: surfaceMaskedRollbackError((fn) => db.transaction(fn).immediate()),
+        readTransaction: surfaceMaskedRollbackError((fn) => db.transaction(fn).deferred()),
         close: () => void db.close(),
         get open() {
             return db.open;
@@ -133,40 +140,42 @@ function openNodeSqlite(path: string): SqliteDatabase {
               return new DatabaseSync(path);
           })();
     let depth = 0;
-    const begin = () => db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT sp${depth}`); // IMMEDIATE at top level: multi-process SQLITE_BUSY_SNAPSHOT guard (see openBetterSqlite3)
+    const begin = (readOnly: boolean) => db.exec(depth === 0 ? (readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE") : `SAVEPOINT sp${depth}`);
     const commit = () => db.exec(depth === 1 ? "COMMIT" : `RELEASE sp${depth - 1}`);
     const rollback = () => db.exec(depth === 1 ? "ROLLBACK" : `ROLLBACK TO sp${depth - 1}`);
+    const transaction = <T>(fn: () => T, readOnly: boolean): T => {
+        if (db.getAutoCommit?.() === false && depth === 0) {
+            // Already inside an outer transaction driven directly by
+            // DatabaseSync — just run inline; the outer COMMIT covers us.
+            return fn();
+        }
+        begin(readOnly);
+        depth++;
+        try {
+            const out = fn();
+            commit();
+            return out;
+        } catch (err) {
+            // #4949: a failed BEGIN/COMMIT can leave NO transaction active
+            // (SQLite auto-aborts on I/O-class failures such as disk full);
+            // the follow-up ROLLBACK then throws "cannot rollback - no
+            // transaction is active" and would MASK the original failure.
+            // The original error below is always authoritative.
+            try {
+                rollback();
+            } catch {
+                /* secondary rollback failure — original error wins (#4949) */
+            }
+            throw err;
+        } finally {
+            depth--;
+        }
+    };
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => adaptNodeSqliteStatement(db.prepare(sql)),
-        transaction: <T>(fn: () => T): T => {
-            if (db.getAutoCommit?.() === false && depth === 0) {
-                // Already inside an outer transaction driven directly by
-                // DatabaseSync — just run inline; the outer COMMIT covers us.
-                return fn();
-            }
-            begin();
-            depth++;
-            try {
-                const out = fn();
-                commit();
-                return out;
-            } catch (err) {
-                // #4949: a failed BEGIN/COMMIT can leave NO transaction active
-                // (SQLite auto-aborts on I/O-class failures such as disk full);
-                // the follow-up ROLLBACK then throws "cannot rollback - no
-                // transaction is active" and would MASK the original failure.
-                // The original error below is always authoritative.
-                try {
-                    rollback();
-                } catch {
-                    /* secondary rollback failure — original error wins (#4949) */
-                }
-                throw err;
-            } finally {
-                depth--;
-            }
-        },
+        transaction: (fn) => transaction(fn, false),
+        readTransaction: (fn) => transaction(fn, true),
         close: () => void db.close(),
         get open() {
             return db.open;

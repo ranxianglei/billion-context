@@ -2846,6 +2846,12 @@ async function handleRequest(
             }
         } finally {
             releaseInFlight(session);
+            // #4788 D2: request-end boundary — nothing in this process holds
+            // session state anymore, so run the durable-revision-gated idle
+            // spill here (it self-verifies every invariant and skips silently
+            // when unsafe). Fire-and-forget on purpose: idle upkeep must never
+            // delay or perturb the response path.
+            void getStore().spillBetweenTurns(session).catch(() => { /* idle upkeep */ });
         }
     }
     if (!prepared && !forwarded) {
