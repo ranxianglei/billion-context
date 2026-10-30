@@ -615,3 +615,84 @@ test("activeBlockCoveredIds: union of ACTIVE blocks only; undefined when nothing
   const set = activeBlockCoveredIds(s1);
   assert.deepEqual([...(set ?? [])].sort(), ["x", "y"]);
 });
+
+// --- #4401 review follow-ups: cap bounding + MCP-dialect name parity --------
+// The exemption ledger counts every riding pair (2 msgs) as carrier volume; a
+// steady session with >64 active blocks legally exceeds the raw cap of 128 and
+// must stay green via the host-state ceiling, while unbounded fake-carrier
+// volume must still trip it. Name recognition must cover the MCP-dialect form
+// (mcp__bili__compress) exactly like I3 does, or that lane keeps the same storm.
+
+test("#4401 follow-up: 86-pair steady state (reporter's session shape) stays green under the cap", () => {
+  const head = mk("user", "text", "preamble");
+  const tail = mk("user", "text", "new question");
+  const entry: CoreMessage[] = [head];
+  const exit: CoreMessage[] = [head];
+  const coveredIds = new Set<string>();
+  for (let k = 0; k < 86; k++) {
+    const c1 = mk("assistant", "text", `covered-a ${k} lorem padding`);
+    const c2 = mk("user", "text", `covered-b ${k} lorem padding`);
+    entry.push(c1, c2, ...compressPair(`call_k${k}`));
+    coveredIds.add(c1.id);
+    coveredIds.add(c2.id);
+    exit.push(...compressPair(`call_k${k}`));
+  }
+  entry.push(tail);
+  exit.push(tail);
+  const v = judgeInboundOutbound(entry, exit, { coveredIds });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  // 86 pairs x 2 halves ride as carrier volume — far past the old raw cap of
+  // 128; only the two cells ahead of the first riding call are walked (both
+  // excused), everything behind the first fold point is free I2 territory.
+  assert.equal(v.exempt?.carrier, 172);
+  assert.equal(v.covered, 2);
+});
+
+test("#4401 follow-up teeth: unbounded fake-carrier volume still trips with host state present", () => {
+  const head = mk("user", "text", "preamble");
+  const tail = mk("user", "text", "new question");
+  const entry: CoreMessage[] = [head];
+  const exit: CoreMessage[] = [head];
+  const coveredIds = new Set<string>();
+  for (let k = 0; k < 64; k++) {
+    const c1 = mk("assistant", "text", `covered ${k} lorem padding`);
+    entry.push(c1, ...compressPair(`call_f${k}`));
+    coveredIds.add(c1.id);
+    exit.push(...compressPair(`call_f${k}`));
+  }
+  for (let k = 0; k < 130; k++) {
+    exit.push(mk("user", "text", `\x3cbili-chain n=${k}\x3e`));
+  }
+  entry.push(tail);
+  exit.push(tail);
+  const v = judgeInboundOutbound(entry, exit, { coveredIds });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "exemption-overflow"));
+});
+
+test("#4401 follow-up: MCP-dialect pair (mcp__bili__compress) marks the regime like the bare form", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const pair = [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "mcp__bili__compress", toolCallId: "call_d1" }),
+    mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "mcp__bili__compress", toolCallId: "call_d1" }),
+  ];
+  const v = judgeInboundOutbound([head, c1, ...pair], [head, ...pair], { coveredIds: new Set([c1.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.covered, 1);
+});
+
+test("#4401 follow-up: refused dialect receipt folds nothing (regime NOT marked)", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const pair = [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "mcp__bili__compress", toolCallId: "call_r1" }),
+    mk("tool", "tool-result", "[Compression FAILED: range outside the compressible window]", { toolName: "mcp__bili__compress", toolCallId: "call_r1" }),
+  ];
+  const v = judgeInboundOutbound([head, c1, ...pair], [head, ...pair], { coveredIds: new Set([c1.id]) });
+  assert.equal(v.ok, false);
+  assert.equal(v.folded, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop"));
+});

@@ -50,7 +50,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
-import { COMPRESS_TOOL_NAME, parseStoredPlaceholder, type CompressionState, type CoreMessage } from "acp-kernel";
+import { parseStoredPlaceholder, type CompressionState, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
@@ -117,9 +117,10 @@ interface JudgeOptions {
   maxCarrierGap?: number;
   // #3842 named exemptions are COUNT-BOUNDED: carrier/reasoning/crush volume
   // beyond this per request is itself a violation signal (a defect dressing up
-  // as exemptions), even when every stable message matched. Default 128 — a
-  // steady folded session stays far under it (≈ one carrier per live block +
-  // one reasoning item per reasoning turn).
+  // as exemptions), even when every stable message matched. Default 128 — with
+  // host coverage state, legitimate riding-pair volume is bounded out of the
+  // ledger by 2 x |coveredIds| (see the exemption ledger below), so only
+  // unbounded carrier/reasoning/crush volume reaches this cap.
   maxExempt?: number;
   // #4241: when set (a finite number >= 0), THIS turn's outbound prefix was
   // server-rendered (snapshot-render lane) — the raw inbound prefix is NOT a
@@ -152,9 +153,12 @@ function isReasoning(m: CoreMessage): boolean {
 
 // #4401: the re-sent compress pair (KDD#7 plugin-lane carrier) is exempt volume
 // like any injected artifact — the call half rides as client history, the
-// successful result half marks the folded regime.
+// successful result half marks the folded regime. Name recognition reuses
+// isCompressToolName (bare + MCP-dialect, lockstep with I3 / hideConsumed):
+// a plugin lane that folds through the MCP shell re-sends its pair under
+// mcp__bili__compress, and the carrier regime must read it like the bare form.
 function isCompressToolMsg(m: CoreMessage): boolean {
-  return (m.contentType === "tool-call" || m.contentType === "tool-result") && m.toolName === COMPRESS_TOOL_NAME;
+  return (m.contentType === "tool-call" || m.contentType === "tool-result") && isCompressToolName(m.toolName);
 }
 
 function isCompressReceipt(m: CoreMessage): boolean {
@@ -465,16 +469,27 @@ export function judgeInboundOutbound(
   // envelopes), independent of matching — a defect mass-producing exempt-
   // looking elements surfaces even when every stable message matched.
   const carrierExempt = exit.filter(isCarrier).length;
+  // #4401 review follow-up: riding compress pairs are structurally bounded by
+  // host state — one pair per active block, each active block covers >= 1
+  // message, so 2 x |coveredIds| is a safe ceiling for legitimate pair volume
+  // (a steady session with dozens of active blocks legally carries >128
+  // carrier msgs). Only EXCESS pair volume counts toward the cap; without
+  // host coverage state the full pair volume counts (safe direction: may
+  // over-warn, never under-warns), so a defect mass-producing fake carriers
+  // still trips the guard.
+  const pairVolume = exit.filter(isCompressToolMsg).length;
+  const pairCeiling = coveredIds ? 2 * coveredIds.size : pairVolume;
+  const pairExcess = Math.max(0, pairVolume - pairCeiling);
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
   const ccrExempt = exit.filter(isCcrStoredResult).length;
   const truncateExempt = exit.filter(isTruncationExit).length;
-  const exemptTotal = carrierExempt + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
+  const exemptTotal = (carrierExempt - pairVolume) + pairExcess + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
   if (exemptTotal > maxExempt) {
     violations.push({
       kind: "exemption-overflow",
       index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} pairExcess=${pairExcess} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
     });
   }
 
