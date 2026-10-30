@@ -66,6 +66,10 @@ Read-only roles receive a restricted tool allowlist plus ACP context tools so th
 - **Compact tool blocks (TUI)**: when the host supports custom tool rendering (pi-coding-agent ≥ 0.62; borderless self-shell since 0.67.3), `acp_delegate*` calls render as compact blocks — the call line shows agent + first task line, the result line shows a status icon, exit label, duration and up to 3 preview lines of the run's output (`Ctrl+O` expands to 40). The preview is screen-only: the model-facing text is unchanged (task title + file path). Older hosts ignore the renderers and show the default tool output.
 - **Resumable runs**: a run can be resumed from its saved session (`.session.jsonl` next to the result file) — earlier tool calls are restored instead of replayed.
 
+### Prompt text injected into the main agent
+
+The model-visible text this package injects — the `acp_delegate` tool description, its snippet and guidelines, and the `ACP_DELEGATE NOTIFICATIONS` system-prompt appendix — describes **capabilities and contracts only**: what each role can do, how async/sync runs behave, timeouts, failure notifications, resuming. It deliberately contains **no delegation strategy** — no preference for delegating, no task-type routing table, no parallelism guidance (#5237). Whether and when to delegate is your call: put your own delegation policy in your `AGENTS.md` (or the host equivalent) if you want one. The `delegatePrompt` key replaces or removes the notifications appendix; the tool descriptions themselves are package-owned.
+
 ## Configuration
 
 Same file convention as billion-context-pi: `~/.pi/acp.json` (global) and `<project>/.pi/acp.json` (project overrides global). This package reads only the keys below; all other keys in the same file belong to other packages and are ignored here.

@@ -723,7 +723,7 @@ export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof Delega
   return {
     name: "acp_delegate",
     label: "ACP Delegate",
-    description: `Hand a self-contained task to a fresh sub-agent running in a clean context (its own pi process). Use to get focused review/investigation/implementation without polluting the main context, or to run several tasks concurrently.
+    description: `Hand a self-contained task to a fresh sub-agent running in a clean context (its own pi process).
 
 Agents (pick by name):
 ${AGENT_NAMES.map(agentListLine).join("\n")}
@@ -741,16 +741,9 @@ Failure & resume:
 
 The delegate runs in its own clean pi process — it does NOT see this conversation's context. Give it everything it needs (paths, goals, constraints). Full results always go to a file so the chat context stays small.`,
     promptSnippet:
-      'acp_delegate({ agent: "reviewer", task: "Review src/index.ts for race conditions" })',
+      'acp_delegate({ agent: "<one of: reviewer, researcher, worker, planner, oracle>", task: "<self-contained task>" })',
     promptGuidelines: [
-      "Delegate to get a focused result in a clean context, or to parallelize independent work.",
       "The sub-agent has NO access to this conversation — write a fully self-contained task.",
-      "Prefer async=true and launch several; results arrive back automatically when each finishes.",
-      "A FAILED notification (⚠️) means that task produced no usable result — read the excerpt and the output files, then decide whether to re-dispatch it before wrapping up.",
-      "A failed/cancelled run keeps its output files and can be resumed with resumeFrom: \"<runId>\" — prefer resuming over re-dispatching when the earlier work is worth keeping.",
-      "For changes you must apply yourself, delegate read-only investigation (reviewer/researcher/oracle) and keep the main context as the sole writer.",
-      "Route by task kind: review/audit code → reviewer (never use worker to review), explore unfamiliar code → researcher, plan multi-step work → planner, questions/advice → oracle, making changes → worker.",
-      "A delegate's findings live in its result file — read that file instead of re-running exploration a child already did.",
     ],
     parameters: DelegateParams,
     renderShell: "self",
