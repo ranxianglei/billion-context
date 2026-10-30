@@ -40,6 +40,12 @@ export interface NativeLaneSpec {
     publish: (origin: string) => void;
     /** Drop the published origin (spawn fallback unfreezes the preset env). */
     unpublish: () => void;
+    /** Fallback-branch state clear. Default (when omitted): the shared
+     *  lifecycle writes `state.origin = undefined` directly. omp overrides
+     *  this so its publishOrigin() test-pin guard (a suite-pinned probe base
+     *  must survive a mid-suite attach verify / respawn landing — see
+     *  _setOmpOriginForTest) stays in command of state.origin writes. */
+    clearOrigin?: () => void;
     /** Lane event sink (logHostEvent / persistClientEvent). */
     onEvent: NativeLaneEventHandler;
 }
@@ -124,7 +130,8 @@ export async function verifyAttachAndRecover(spec: NativeLaneSpec, attachOrigin:
     spec.onEvent("error", `bili-native(${spec.lane}): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     spec.unpublish();
     state.attach = false;
-    state.origin = undefined;
+    if (spec.clearOrigin !== undefined) spec.clearOrigin();
+    else state.origin = undefined;
     const start = singleFlight(spec.spawnForTest() ?? spec.bootstrap);
     state.respawn = start;
     // Publish whatever origin lands on BOTH the shared state and the env —
