@@ -487,28 +487,28 @@ export function completeBlockContents(
     return out;
 }
 
-export function loadLegacyView(
-    rows: {
-        session: {
-            sessionId: string;
-            createdAt: number;
-            updatedAt: number;
-            nextBlockId: number;
-            nextRunId: number;
-            metaJson: string;
-            statsJson: string;
-            metadataJson: string;
-            kstateJson: string;
-            tailJson: string;
-            ccrJson: string | null;
-            orphansJson?: string | null;
-        };
-        messages: { seq: number; msgId: string; ref: string | null; content: string }[];
-        blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
-        deadRefs: { ord: number; ref: string }[];
-        refs: { ord: number; rawId: string; ref: string }[];
-    },
-): {
+interface LegacyViewRows {
+    session: {
+        sessionId: string;
+        createdAt: number;
+        updatedAt: number;
+        nextBlockId: number;
+        nextRunId: number;
+        metaJson: string;
+        statsJson: string;
+        metadataJson: string;
+        kstateJson: string;
+        tailJson: string;
+        ccrJson: string | null;
+        orphansJson?: string | null;
+    };
+    messages: { seq: number; msgId: string; ref: string | null; content: string }[];
+    blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
+    deadRefs: { ord: number; ref: string }[];
+    refs: { ord: number; rawId: string; ref: string }[];
+}
+
+interface LegacyView {
     id: string;
     createdAt: number;
     lastSeen: number;
@@ -523,105 +523,147 @@ export function loadLegacyView(
     contentStore?: LegacySessionLike["contentStore"];
     /** #4390: tail/pluginSnapshot pointers whose backing row is missing. */
     tailGaps?: number;
-} {
-    const s = rows.session;
-    const kstate = JSON.parse(s.kstateJson) as Record<string, unknown>;
-    const tail = JSON.parse(s.tailJson) as {
-        pluginSnapshotSeqs: number[] | null;
-        tailSeqs: number[] | null;
-        tailFolded: boolean;
-    };
+}
 
-    // messageRefs rebuilt from the ref ledger verbatim: ord preserves the
-    // persisted map's key order (digest-sensitive), and ghost ids survive
-    // even though no message row backs them (#2362 Kernel Contract).
-    const byRaw: Record<string, string> = {};
-    const byRef: Record<string, string> = {};
-    for (const r of rows.refs) {
-        byRaw[r.rawId] = r.ref;
-        // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
-        // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
-        // mints a key the persisted state never had (#2671 soak: sub-agent
-        // sessions with protected messages drifted on every save).
-        if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
-    }
+type BlockContents = LegacyView["blockContents"];
 
-    const state: Record<string, unknown> = {};
-    for (const field of MERGE_STATE_FIELDS) {
-        switch (field) {
-            case "blocks":
-                state.blocks = rows.blocks.map((b) => JSON.parse(b.payloadJson));
-                break;
-            case "messageRefs":
-                state.messageRefs = { byRaw, byRef };
-                break;
-            case "deadRefs":
-                state.deadRefs = rows.deadRefs.length > 0 ? rows.deadRefs.map((d) => d.ref) : undefined;
-                break;
-            case "nextBlockId":
-                state.nextBlockId = s.nextBlockId;
-                break;
-            case "nextRunId":
-                state.nextRunId = s.nextRunId;
-                break;
-            default:
-                if (kstate[field] !== undefined) state[field] = kstate[field];
-                break;
-        }
-    }
-
-    const blockContents = new Map<string, { one: BlockView | null; full: BlockView }>();
-    for (const b of rows.blocks) {
-        blockContents.set(b.blockId, {
+/** Shared by full-view and resident-field reads; each page is released after parsing. */
+export function appendBlockContents(contents: BlockContents, rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[]): void {
+    for (const b of rows) {
+        contents.set(b.blockId, {
             one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
             full: JSON.parse(b.summary) as BlockView,
         });
     }
-    // #3841 reap journal: journal'd orphan contents (reaped blocks) ride
-    // blockContents so the derived-decompress fallback survives restarts —
-    // WITHOUT resurrecting state.blocks (the reaped entries stay reaped).
-    if (s.orphansJson !== null && s.orphansJson !== undefined && s.orphansJson !== "") {
+}
+
+export function mergeOrphanBlockContents(contents: BlockContents, orphansJson: string | null | undefined): void {
+    // Reaped originals survive without resurrecting their state.blocks rows.
+    if (orphansJson !== null && orphansJson !== undefined && orphansJson !== "") {
         try {
-            const orphans = JSON.parse(s.orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
+            const orphans = JSON.parse(orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
             for (const [blockId, view] of Object.entries(orphans)) {
-                if (!blockContents.has(blockId)) blockContents.set(blockId, view);
+                if (!contents.has(blockId)) contents.set(blockId, view);
             }
         } catch {
             // corrupt journal → skip; the JSON envelope still carries the text
         }
     }
+}
 
-    const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));
-    // #4390: a tail pointer whose row is gone used to be silently filtered
-    // out — the view shrank with no trace. Count the gaps so callers can
-    // warn (persist logs them); the surviving members still load.
-    let tailGaps = 0;
-    const resolveSeqs = (seqs: number[]): CoreMessage[] => {
-        const out: CoreMessage[] = [];
-        for (const seq of seqs) {
-            const m = messagesBySeq.get(seq);
-            if (m === undefined) tailGaps++;
-            else out.push(m);
+/** Incremental cold-load assembly keeps raw CAS strings to one page at a time. */
+export class LegacyViewBuilder {
+    readonly messageSeqs: number[];
+    private readonly tail: {
+        pluginSnapshotSeqs: number[] | null;
+        tailSeqs: number[] | null;
+        tailFolded: boolean;
+    };
+    private readonly state: Record<string, unknown> = {};
+    private readonly blocks: unknown[] = [];
+    private readonly blockContents: BlockContents = new Map();
+    private readonly messagesBySeq = new Map<number, CoreMessage>();
+
+    constructor(
+        private readonly session: LegacyViewRows["session"],
+        refs: LegacyViewRows["refs"],
+        deadRefs: LegacyViewRows["deadRefs"],
+    ) {
+        const kstate = JSON.parse(session.kstateJson) as Record<string, unknown>;
+        this.tail = JSON.parse(session.tailJson);
+        this.messageSeqs = [...new Set([...(this.tail.tailSeqs ?? []), ...(this.tail.pluginSnapshotSeqs ?? [])])];
+
+        // messageRefs rebuilt from the ref ledger verbatim: ord preserves the
+        // persisted map's key order (digest-sensitive), and ghost ids survive
+        // even though no message row backs them (#2362 Kernel Contract).
+        const byRaw: Record<string, string> = {};
+        const byRef: Record<string, string> = {};
+        for (const r of refs) {
+            byRaw[r.rawId] = r.ref;
+            // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
+            // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
+            // mints a key the persisted state never had (#2671 soak: sub-agent
+            // sessions with protected messages drifted on every save).
+            if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
         }
-        return out;
-    };
-    const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
-    const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
 
-    const out: ReturnType<typeof loadLegacyView> = {
-        id: s.sessionId,
-        createdAt: s.createdAt,
-        lastSeen: s.updatedAt,
-        tailGaps,
-        meta: JSON.parse(s.metaJson),
-        stats: JSON.parse(s.statsJson),
-        metadata: JSON.parse(s.metadataJson),
-        state,
-        blockContents,
-        lastMessages,
-        lastMessagesFolded: tail.tailFolded,
-    };
-    if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-    if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
-    return out;
+        const state = this.state;
+        for (const field of MERGE_STATE_FIELDS) {
+            switch (field) {
+                case "blocks":
+                    state.blocks = this.blocks;
+                    break;
+                case "messageRefs":
+                    state.messageRefs = { byRaw, byRef };
+                    break;
+                case "deadRefs":
+                    state.deadRefs = deadRefs.length > 0 ? deadRefs.map((d) => d.ref) : undefined;
+                    break;
+                case "nextBlockId":
+                    state.nextBlockId = session.nextBlockId;
+                    break;
+                case "nextRunId":
+                    state.nextRunId = session.nextRunId;
+                    break;
+                default:
+                    if (kstate[field] !== undefined) state[field] = kstate[field];
+                    break;
+            }
+        }
+    }
+
+    addBlocks(rows: LegacyViewRows["blocks"]): void {
+        for (const b of rows) this.blocks.push(JSON.parse(b.payloadJson));
+        appendBlockContents(this.blockContents, rows);
+    }
+
+    addMessages(rows: LegacyViewRows["messages"]): void {
+        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+    }
+
+    finish(): LegacyView {
+        const s = this.session;
+        const tail = this.tail;
+        mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        // #4390: a tail pointer whose row is gone used to be silently filtered
+        // out — the view shrank with no trace. Count the gaps so callers can
+        // warn (persist logs them); the surviving members still load.
+        let tailGaps = 0;
+        const resolveSeqs = (seqs: number[]): CoreMessage[] => {
+            const out: CoreMessage[] = [];
+            for (const seq of seqs) {
+                const m = this.messagesBySeq.get(seq);
+                if (m === undefined) tailGaps++;
+                else out.push(m);
+            }
+            return out;
+        };
+        const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
+        const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
+
+        const out: LegacyView = {
+            id: s.sessionId,
+            createdAt: s.createdAt,
+            lastSeen: s.updatedAt,
+            tailGaps,
+            meta: JSON.parse(s.metaJson),
+            stats: JSON.parse(s.statsJson),
+            metadata: JSON.parse(s.metadataJson),
+            state: this.state,
+            blockContents: this.blockContents,
+            lastMessages,
+            lastMessagesFolded: tail.tailFolded,
+        };
+        if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
+        if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
+        return out;
+    }
+}
+
+/** Compatibility wrapper for callers that already hold all rows. */
+export function loadLegacyView(rows: LegacyViewRows): LegacyView {
+    const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
+    builder.addBlocks(rows.blocks);
+    builder.addMessages(rows.messages);
+    return builder.finish();
 }
