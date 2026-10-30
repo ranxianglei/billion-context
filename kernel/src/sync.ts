@@ -103,6 +103,11 @@ export function syncBlocks(
         )
       : undefined,
     viewLatchConfigDigest: state.viewLatchConfigDigest,
+    // #4797: the one-time ledger-alignment gate MUST survive the sync clone —
+    // dropping it re-arms restampRefsToLedger on every turn, re-populating
+    // the host's superseded map forever (the "one-time" restamp stops being
+    // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
+    refLedgerAligned: state.refLedgerAligned,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

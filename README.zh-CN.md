@@ -50,7 +50,8 @@
 
 QQ群:
 1056132097(已满)
-1108730198(未满)
+1108730198(已满)
+1129868472(未满)
 
 ---
 
@@ -285,7 +286,7 @@ bili --version
 
 **`/acp` 显示什么?** 带原生插件的客户端(opencode、dsh)里,`/acp` 直接从代理取当前会话的 ACP 状态面板(会话、块、可压缩区间、用量);首个模型请求到来前显示空闲提示。`/acp-cache [full]` 打印上面的缓存报告。
 
-**能用网页查会话和配置吗?** 能 —— 打开 [http://localhost:8787](http://localhost:8787):总览仪表盘、会话列表(含逐会话详情)、实时日志、配置编辑器、上游连通性测试。「博客」页还在面板内直接渲染几篇随装内置的发布笔记与长文(离线可看;完整文库在 GitHub Pages)。其余功能同样以纯 JSON 提供(`/__bili/stats`、`/__bili/sessions`、`/__bili/config`、…),方便脚本化。
+**能用网页查会话和配置吗?** 能 —— 打开 [http://localhost:8787](http://localhost:8787):总览仪表盘、会话列表(含逐会话详情)、实时日志、配置编辑器、上游连通性测试。「博客」页还在面板内直接渲染发布笔记与长文——随装内置,在线时后台自动从 GitHub master 拉取新文章(约 1 小时节流,离线时回退到内置旧内容),完整文库也在 GitHub Pages。其余功能同样以纯 JSON 提供(`/__bili/stats`、`/__bili/sessions`、`/__bili/config`、…),方便脚本化。
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
@@ -482,6 +483,8 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
 ```
 
 `archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
+
+**大库上 full vacuum 是离线操作(#4612)。** `--vacuum full`(默认)会在独占写锁下重写整个 index.db —— O(库大小),多 GB 的库要几分钟到几十分钟,且没有中间进度(SQLite 的 VACUUM 是原子操作,拆不开)。在有代理正从同一会话目录服务时跑它,会把那个代理的写入饿死到其存储层降级为止,所以 `storage gc --vacuum full` **在另一个存活进程持有该数据库时会拒绝启动**(`index.db.lock` pid 纪律,#4175):CLI 以退出码 1 给出可操作提示,面板端点返回 HTTP 409。先停掉另一个实例(或等它退出)再重试;要在线安全地缩库用 `--vacuum incremental`,它以短事务回收空闲页、不拿独占锁。零引用删除清扫无论哪种模式都分批执行并逐批打印进度。
 
 ## 状态
 

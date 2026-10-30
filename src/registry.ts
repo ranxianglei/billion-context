@@ -12,7 +12,13 @@ import bundledSnapshot from "./registry-snapshot.json" with { type: "json" };
 // all; the per-model $/Mtok cost rows live nested under
 // providers.<host>.models.<id>.cost in catalog.json (#1279 follow-up).
 const REGISTRY_URL = "https://models.dev/catalog.json";
-const CACHE_FILE = path.join(cacheDir(), "models-dev.json");
+// Resolved per call, not at module scope: #4916 put this module into the
+// static import graph of config (config→billing→registry), so it can be
+// evaluated before a test redirects XDG_*; a module-scope path would bind the
+// loader to the ambient cache dir and silently skip the fetch under test.
+function cacheFilePath(): string {
+    return path.join(cacheDir(), "models-dev.json");
+}
 const TTL_MS = 24 * 60 * 60 * 1000;
 
 type ModelEntry = { limit?: { context?: number; output?: number } };
@@ -21,8 +27,8 @@ type RegistryShape = Record<string, ModelEntry>;
 // providers.<host>.models.<id>.cost ($/Mtok). Only rows with a usable input
 // price are stored — without an input anchor there is nothing to normalize
 // against, and half-inventing a profile would misprice every fold.
-type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
-type CostsShape = Record<string, CostRow>;
+export type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
+export type CostsShape = Record<string, CostRow>;
 type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 
 let cache: RegistryShape | null = null;
@@ -110,7 +116,7 @@ function parse(raw: string): LoadedRegistry | null {
 
 async function readDiskCache(): Promise<LoadedRegistry | null> {
     try {
-        const raw = await readFile(CACHE_FILE, "utf8");
+        const raw = await readFile(cacheFilePath(), "utf8");
         return parse(raw);
     } catch {
         return null;
@@ -119,17 +125,19 @@ async function readDiskCache(): Promise<LoadedRegistry | null> {
 
 async function writeDiskCache(data: LoadedRegistry): Promise<void> {
     try {
-        await mkdir(path.dirname(CACHE_FILE), { recursive: true });
-        await writeFile(CACHE_FILE, JSON.stringify({ models: data.reg, costs: data.costs }), "utf8");
+        const file = cacheFilePath();
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, JSON.stringify({ models: data.reg, costs: data.costs }), "utf8");
     } catch {
         // best-effort
     }
 }
 
 function diskCacheFresh(): boolean {
-    if (!existsSync(CACHE_FILE)) return false;
+    const file = cacheFilePath();
+    if (!existsSync(file)) return false;
     try {
-        const { mtimeMs } = statSync(CACHE_FILE);
+        const { mtimeMs } = statSync(file);
         return Date.now() - mtimeMs < TTL_MS;
     } catch {
         return false;
@@ -280,11 +288,12 @@ async function pickFallback(): Promise<{ reg: RegistryShape; costs: CostsShape |
     const snap = bundledSnapshotRegistry();
     let disk: LoadedRegistry | null = null;
     let diskMs = 0;
-    if (existsSync(CACHE_FILE)) {
+    const file = cacheFilePath();
+    if (existsSync(file)) {
         disk = await readDiskCache();
         if (disk) {
             try {
-                diskMs = statSync(CACHE_FILE).mtimeMs;
+                diskMs = statSync(file).mtimeMs;
             } catch {
                 diskMs = 0;
             }
@@ -392,7 +401,26 @@ export function peekRegistryOutputLimit(model: string, host?: string): number | 
  *  prices are not comparable across deployments. User config at any level
  *  wins wholesale at the stamp site; this is only the unconfigured default. */
 export function peekRegistryPriceProfile(model: string | undefined, host?: string): PriceProfile | undefined {
-    const costs = costCache;
+    return costCache !== null ? scanRegistryCostRow(costCache, model, host)?.profile : undefined;
+}
+
+export function peekRegistryCostRow(model: string | undefined, host?: string): CostRow | undefined {
+    return costCache !== null ? scanRegistryCostRow(costCache, model, host)?.row : undefined;
+}
+
+/** #4899: the shared cost-row scan behind both price faces (the economics
+ *  profile and billing). Takes the table as a parameter so the billing
+ *  overrides table (`billing.prices`) resolves through the SAME name
+ *  matching (roots/variants/case-fold/host provider namespace) as the
+ *  registry snapshot. Returns the first row with a usable input price plus
+ *  its precomputed profile; `conflictHint` names the override surface in
+ *  the conflict warning when scanning a non-registry table. */
+export function scanRegistryCostRow(
+    costs: CostsShape,
+    model: string | undefined,
+    host?: string,
+    opts?: { conflictHint?: string },
+): { row: CostRow; key: string; profile: PriceProfile } | undefined {
     if (!costs || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
     const roots = [model];
@@ -411,11 +439,11 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
             let row: CostRow | undefined = costs[key];
             if (!row) row = idx.byLower.get(key.toLowerCase())?.value;
             const profile = priceProfileFromRow(row);
-            if (profile) return profile;
+            if (profile) return { row: row as CostRow, key, profile };
         }
         if (provider === undefined) {
             const suffix = `/${name.toLowerCase()}`;
-            let chosen: PriceProfile | undefined;
+            let chosen: { row: CostRow; key: string; profile: PriceProfile } | undefined;
             const seen = new Set<string>();
             const parts: string[] = [];
             for (const { lower, key, value: row } of idx.entries) {
@@ -427,12 +455,12 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
                     seen.add(sig);
                     parts.push(`${key}=in:${profile.w}/out:${profile.q}`);
                 }
-                if (!chosen) chosen = profile;
+                if (!chosen) chosen = { row, key, profile };
             }
             if (chosen !== undefined) {
                 if (seen.size > 1 && !warnedPriceConflicts.has(name)) {
                     warnedPriceConflicts.add(name);
-                    loggerLog("warn", `[acp-registry] conflicting prices for "${name}" (${parts.join(", ")}) — using the first listing; set compress.priceProfile to override`);
+                    loggerLog("warn", `[acp-registry] conflicting prices for "${name}" (${parts.join(", ")}) — using the first listing; set ${opts?.conflictHint ?? "compress.priceProfile"} to override`);
                 }
                 return chosen;
             }

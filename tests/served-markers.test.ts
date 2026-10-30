@@ -111,6 +111,34 @@ test("dead-pid peer counts while its marker is fresh, stops counting once stale"
     assert.equal(found.length, 0, "dead pid + stale mtime = gone");
 });
 
+test("graceful dispose records stoppedAt and never contests a fresh predecessor (#4982 gate restart)", () => {
+    const dir = writerMarkerDir(freshDir("bili-3923-stop-"));
+    const logs: Array<[string, string]> = [];
+    // predecessor committed sess-a, then shut down gracefully (SIGTERM → dispose)
+    const pred = createServedMarkerWriter({ ...PEER }, dir, () => {});
+    pred.noteServed("sess-a");
+    pred.__flushForTest();
+    pred.dispose();
+    const body = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(typeof body.stoppedAt, "number", "dispose records a graceful stop");
+    // successor rebinds seconds later and commits the same session — the
+    // predecessor's marker is still FRESH, but a known-dead instance must not
+    // raise an alarm
+    const w = createServedMarkerWriter(SELF, dir, (level, msg) => logs.push([level, msg]));
+    w.noteServed("sess-a");
+    assert.equal(logs.length, 0, "a gracefully-stopped predecessor is not a concurrent writer");
+    w.dispose();
+});
+
+test("stoppedAt skips even when the peer pid is alive", () => {
+    const dir = writerMarkerDir(freshDir("bili-3923-stopped-pid-"));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "peer-1.json"), JSON.stringify({
+        v: 1, ...PEER, servedAt: { "sess-x": Date.now() - 1_000 }, stoppedAt: Date.now() - 2_000,
+    }));
+    assert.deepEqual(findContestedWriters(dir, SELF.instanceId, "sess-x", Date.now()), [], "stoppedAt outranks liveness — a recorded stop is positively-known death");
+});
+
 test("malformed or foreign-shape marker files are skipped, never fatal", () => {
     const dir = writerMarkerDir(freshDir("bili-3923-malformed-"));
     fs.mkdirSync(dir, { recursive: true });

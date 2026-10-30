@@ -61,11 +61,11 @@ test("legacy named-route config fails with an actionable migration error", () =>
     }
 });
 
-test("prompt-cache routing accepts the tri-state and defaults invalid values to auto", () => {
+test("prompt-cache routing accepts the tri-state and defaults invalid values to disabled (#5079)", () => {
     assert.equal(parsePromptCacheRouting("enabled"), "enabled");
     assert.equal(parsePromptCacheRouting("disabled"), "disabled");
     assert.equal(parsePromptCacheRouting("auto"), "auto");
-    assert.equal(parsePromptCacheRouting("unknown"), "auto");
+    assert.equal(parsePromptCacheRouting("unknown"), "disabled");
 });
 
 test("lookupContextLimit returns known windows", () => {

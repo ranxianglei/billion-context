@@ -10,6 +10,7 @@ import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
@@ -417,7 +418,11 @@ function recordUsage(
     // #4128: thread the upstream's billing_usage declaration so the anthropic
     // lane does not double-count an inclusive relay's input_tokens.
     const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens, usage.declaredInclusive);
-    if (typeof out === "number") ctx.session.stats.outputTokens += out;
+    if (typeof out === "number") {
+        ctx.session.stats.outputTokens += out;
+        // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+        billOutputUsage(ctx.session, out);
+    }
     const hitPct =
         reportedCached !== null && total > 0 ? Math.round((reportedCached / total) * 100) : 0;
     if (reportedCached !== null) warnCacheCollapse(ctx.session, total, reportedCached);
@@ -427,7 +432,7 @@ function recordUsage(
         `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
     if (total > 0 || reportedCached !== null) {
-        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin });
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined });
     }
 }
 

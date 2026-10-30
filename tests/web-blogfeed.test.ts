@@ -4,16 +4,17 @@
  * every gate: dated/undated ordering, bilingual pairing, frontmatter titles,
  * XSS-escaped rendering, image rewrite vs drop (incl. traversal refs),
  * GFM tables, asset route (png allowed / md denied / traversal / encoding /
- * missing), malformed manifest degradation, absent-root empty feed, and the
+ * missing / sandbox+nosniff on every asset response #4958), malformed
+ * manifest degradation, absent-root empty feed, and the
  * real-tree probe finding the repository's website/blog/posts.
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerResponse } from "node:http";
-import { getBlogFeed, handleBlogGet, handleBlogAssetGet, _setBlogRootForTest } from "../src/web/blogfeed.ts";
+import { getBlogFeed, handleBlogGet, handleBlogAssetGet, registerRemoteBlogFeed, _setBlogRootForTest } from "../src/web/blogfeed.ts";
 
 let pkgRoot = "";
 let outsideDir = "";
@@ -93,6 +94,21 @@ test("rendering is escape-first: script tags survive only escaped; tables become
     assert.ok(alpha.html.includes("<td>two</td>"));
 });
 
+test("CRLF markdown preserves bilingual frontmatter and rendered content", () => {
+    const expected = getBlogFeed();
+    for (const relative of [
+        "website/blog/posts/2026-10-08_demo.md",
+        "website/blog/posts/2026-10-08_demo.zh.md",
+        "paper/a.md",
+        "paper/b.md",
+    ]) {
+        const file = join(pkgRoot, relative);
+        writeFileSync(file, readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
+    }
+    _setBlogRootForTest(pkgRoot);
+    assert.deepEqual(getBlogFeed(), expected);
+});
+
 test("image refs: shipped files reroute to the panel asset prefix; traversal/unshipped refs drop silently", () => {
     const data = getBlogFeed();
     const demo = data.items.find((i) => i.id === "demo")!;
@@ -126,6 +142,37 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     assert.equal(md.status, 404);
 });
 
+test("asset responses pin sandbox CSP + nosniff on every path (#4958): remote overlay, disk fallback, 404", () => {
+    // Remote overlay: a GitHub-master .svg with an embedded <script> is served
+    // same-origin as image/svg+xml — the sandbox header is what keeps direct
+    // navigation from running that script on the panel origin.
+    const evilSvg = "<svg><script>alert(1)</script></svg>";
+    registerRemoteBlogFeed({ items: [], assets: new Map([["paper/figures/remote.svg", { buf: Buffer.from(evilSvg), type: "image/svg+xml" }]]) });
+    const overlay = fakeRes();
+    handleBlogAssetGet(overlay.res, "/__bili/blog-assets/paper/figures/remote.svg");
+    assert.equal(overlay.status, 200);
+    assert.equal(overlay.headers["content-security-policy"], "sandbox");
+    assert.equal(overlay.headers["x-content-type-options"], "nosniff");
+    assert.match(String(overlay.headers["content-type"]), /^image\/svg\+xml/);
+    assert.equal(overlay.body, evilSvg, "body bytes unchanged by the header fix");
+
+    // On-disk fallback branch keeps the same pair with its bytes/type intact.
+    const disk = fakeRes();
+    handleBlogAssetGet(disk.res, "/__bili/blog-assets/paper/figures/p.png");
+    assert.equal(disk.status, 200);
+    assert.equal(disk.headers["content-security-policy"], "sandbox");
+    assert.equal(disk.headers["x-content-type-options"], "nosniff");
+    assert.match(String(disk.headers["content-type"]), /^image\/png/);
+    assert.equal(disk.body, "PAPERPNG");
+
+    // 404s from the asset route carry the pair too — every response of the route.
+    const miss = fakeRes();
+    handleBlogAssetGet(miss.res, "/__bili/blog-assets/paper/figures/nope.png");
+    assert.equal(miss.status, 404);
+    assert.equal(miss.headers["content-security-policy"], "sandbox");
+    assert.equal(miss.headers["x-content-type-options"], "nosniff");
+});
+
 test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-only", () => {
     const warm = fakeRes();
     handleBlogGet(warm.res);
@@ -137,6 +184,15 @@ test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-o
     _setBlogRootForTest(pkgRoot); // clears the cache
     const data = getBlogFeed();
     assert.ok(data.items.every((i) => i.kind === "post"));
+});
+
+test("the sandbox/nosniff pair stays scoped to the asset route — the blog feed JSON route does not gain it (#4958)", () => {
+    const feed = fakeRes();
+    handleBlogGet(feed.res);
+    assert.equal(feed.status, 200);
+    assert.equal(feed.headers["content-security-policy"], undefined);
+    assert.equal(feed.headers["x-content-type-options"], undefined);
+    assert.match(String(feed.headers["content-type"]), /^application\/json/);
 });
 
 test("a root without content degrades to an empty list instead of throwing", () => {

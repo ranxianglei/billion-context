@@ -249,6 +249,16 @@ export type Session = {
          *  bili's rebuild. */
         inBody?: InboundSlot;
         settledInBody?: InboundSlot;
+        /** #4805: the conversation's latest ADMITTED message id — the single
+         *  needle the settle-side membership probe tests each resent history
+         *  against. Updated only by member / first-turn / main-scale
+         *  requests, so a foreign payload can neither pass nor hijack it.
+         *  In-memory only; a restart replants it on the first turn. */
+        latestKnownMsgId?: string;
+        needlePayloadUpper?: number;
+        /** #4805: the in-flight request's probe verdict ({member, needle}),
+         *  recorded at prepare and consumed by settleUsageReport. */
+        requestMembership?: { member: boolean; needle: string | null };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -290,6 +300,11 @@ export type Session = {
      *  one upstream usage report. Persisted; survives restart. */
     stats: {
         requests: number;
+        /** #4899: cumulative USD spend ledger (input / cacheRead / cacheWrite /
+         *  output), billed at the per-request stamped price
+         *  (metadata.billingPrice). Absent while no price resolves — the UI
+         *  shows tokens only, never fabricated dollars. */
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
         /** Approximate tokens saved by compression (legacy/rough — kept for
          *  backward compat with old session files, not shown in UI). */
         tokensSaved: number;
@@ -396,6 +411,11 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #4805: the payload upper estimate of the request whose usage report
+         *  wrote the current usage-grade anchor — the meter-side size guard
+         *  compares it against the payload at hand to refuse anchors that
+         *  cannot describe this conversation (side-lane pollution). */
+        lastUsagePayloadUpper?: number;
         /** #2117: billing-caliber estimate of the CURRENT outbound request —
          *  estimateCoreMessages + wire overhead, k̂-scaled only where the
          *  factor's route+model provenance matches (#1933 F1 / #2117 B), plus
@@ -980,7 +1000,10 @@ function deepSizeOf(value: unknown): number {
     return size(value);
 }
 
-function sessionWeight(session: Session): number {
+/** #4788 D1-A: exported so SessionStore's per-session hard-cap gate can reuse
+ * the SAME estimate as __bili/memory (single source of truth for "how heavy
+ * is this resident session right now"). */
+export function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
@@ -1126,6 +1149,7 @@ export function zeroStats(): Session["stats"] {
 }
 
 export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
@@ -1184,12 +1208,20 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
     };
 }
 
-export function publishForkSession(session: Session): void {
+const publishingForks = new Set<string>();
+
+export async function publishForkSession(session: Session, parentId: string): Promise<void> {
+    if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
     if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
-    makeResidentRoom(sessionWeight(session));
-    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
-    session.persisted = getStore().enabled;
-    sessions.set(session.id, session);
+    publishingForks.add(session.id);
+    try {
+        makeResidentRoom(sessionWeight(session));
+        await getStore().persistForkSession(parentId, session);
+        session.persisted = getStore().enabled;
+        sessions.set(session.id, session);
+    } finally {
+        publishingForks.delete(session.id);
+    }
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.
@@ -1751,7 +1783,7 @@ export function foldCoverage(
 // — the storage seam needs them without session.ts's built-acp-kernel import;
 // the doc comments live there now). Re-exported so existing consumers keep the
 // session.js import path.
-export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds, withoutTurnSeparators } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the

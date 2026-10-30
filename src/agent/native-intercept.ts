@@ -116,6 +116,21 @@ export interface NativeInterceptState {
      *                     cannot parse it; the host's retry re-runs the full
      *                     decision (re-probe, re-plan) from scratch. */
     prepareDirectSend?: (url: string, input: string | URL | Request, init: RequestInit | undefined) => DirectSendPrep | Promise<DirectSendPrep>;
+    /** #4894: the model context window for requests that carry NO
+     *  x-bili-plugin-context-window header on their degraded direct path —
+     *  consulted by directSendOrRefuse AFTER the header lookup, at EVERY
+     *  fall-back site (not-ready, respawn give-up, unattributed direct):
+     *  the header is stamped only by the proxy branch, so a request that
+     *  finds no live proxy carries none and the shared oversize arm (#4516)
+     *  stays disarmed in exactly the state where an uncompressed egress is
+     *  most likely to blow the window (dsh slow boot past the spawn budget,
+     *  #4609 → direct-for-process-lifetime → prompt_too_long storm). Lanes
+     *  arm it with their per-request session-model resolution (the same one
+     *  their gate's oversize arm uses); it answers synchronously and may
+     *  return undefined — the arm then fails open, byte-identical to today.
+     *  A wrong model's window is worse than none: resolve per request or
+     *  stay silent. */
+    declaredWindowForDirect?: () => number | undefined;
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
@@ -460,7 +475,15 @@ async function dshCompactionMarkerInBody(input: string | URL | Request, init?: R
     }
     if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
         const bytes = body instanceof ArrayBuffer ? body : new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
-        return new TextDecoder().decode(bytes).includes(marker);
+        try {
+            return new TextDecoder().decode(bytes).includes(marker);
+        } catch {
+            // #4912: undecodable buffer (e.g. >V8-max-string-length, where
+            // decode throws RangeError) — fail OPEN like every other
+            // unreadable form above; the probe must never throw out of the
+            // intercept (it runs on EVERY POST, proxy up or down).
+            return false;
+        }
     }
     return false;
 }
@@ -573,9 +596,18 @@ async function directSendBodyMeasure(input: string | URL | Request, init: Reques
     if (size !== undefined) {
         const body: unknown = init?.body;
         let raw: string | undefined;
-        if (typeof body === "string") raw = body;
-        else if (body instanceof Uint8Array) raw = new TextDecoder().decode(body);
-        else if (body instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(body));
+        try {
+            if (typeof body === "string") raw = body;
+            else if (body instanceof Uint8Array) raw = new TextDecoder().decode(body);
+            else if (body instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(body));
+        } catch {
+            // #4912: undecodable buffer (>V8-max-string-length throws
+            // RangeError) → raw unknown; bodyProvablyOverWindow then bills
+            // ALL bytes as core text (media=0) — the conservative refusal
+            // direction, same convention as the Request branch below
+            // returning undefined for unreadable bodies.
+            raw = undefined;
+        }
         return { bytes: size.bytes, raw };
     }
     if (input instanceof Request) {
@@ -600,8 +632,12 @@ function fallbackOversizeRefusal(
     doom: { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number },
     reason?: UnavailableReason,
 ): Response {
+    // #4824: "send-failed" reads as died here too — the proxy WAS live and
+    // died mid-session; the give-up reason slot keeps the branch name for the
+    // fire-time consumer (#4125), while this steady-state wording cares only
+    // about died-vs-never-came-up-vs-busy.
     const why =
-        reason === "dead"
+        reason === "dead" || reason === "send-failed"
             ? "the bili proxy died and no replacement came up"
             : reason === "busy-exhausted"
               ? "the bili proxy is alive but unresponsive within the wait budget (#3654)"
@@ -1150,18 +1186,22 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 logHostEvent("error", "[native-client]", `bili-native: no usable proxy and the request carries a lane-only payload — failing locally instead of sending it to the provider; retry the turn (#3304): ${dispatchUrl}`);
                 throw new TypeError("billion-context: proxy unavailable — the request payload is lane-specific (incremental turn) and cannot be forwarded to the provider directly; retry the turn (#3304)");
             }
-            // #4516: without a live proxy the raw history rides straight to
-            // the provider — refuse LOCALLY what provably cannot fit the
-            // model's own window (declared via x-bili-plugin-context-window,
-            // stamped by every plugin lane): the upstream rejects it and every
-            // retry re-sends the same oversized history, so the turn can never
-            // succeed while the proxy stays down. No header → skip measuring
-            // entirely (the doom check is undefined by construction, and
-            // headerless lanes must not clone/buffer the body — up to 5 GiB —
-            // per degraded direct send for nothing); unreadable body / body
-            // that fits once media is excluded → fail open, exactly like the
-            // gate arms.
-            const declaredWindow = declaredWindowFromHeaders(defaultInput, init);
+            // #4516/#4894: without a live proxy the raw history rides straight
+            // to the provider — refuse LOCALLY what provably cannot fit the
+            // model's own window: the upstream rejects it and every retry
+            // re-sends the same oversized history, so the turn can never
+            // succeed while the proxy stays down. The window comes from the
+            // stamped header first (request-specific; every plugin lane stamps
+            // it on proxy-bound requests), then from the lane's per-request
+            // resolution (#4894: declaredWindowForDirect) — the header is
+            // absent on precisely the not-ready path where the proxy branch
+            // never ran, which is where an uncompressed egress most needs the
+            // guard. Neither source → skip measuring entirely (the doom check
+            // is undefined by construction, and windowless lanes must not
+            // clone/buffer the body — up to 5 GiB — per degraded direct send
+            // for nothing); unreadable body / body that fits once media is
+            // excluded → fail open, exactly like the gate arms.
+            const declaredWindow = declaredWindowFromHeaders(defaultInput, init) ?? state.declaredWindowForDirect?.();
             const measured = declaredWindow === undefined
                 ? undefined
                 : prep.outcome === "restored"
@@ -1295,7 +1335,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 }
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
+                // #4125/#4824: no trailing "dead" stomp here — the give-up
+                // consumer (dsh client-event line) reads this slot AFTER the
+                // callback to name the branch that fired; overwriting it with
+                // the steady-state verdict rewrites history. Steady-state
+                // degraded-mode visibility is #4516's dispatch-mode tracker's
+                // job (noteDispatchMode below), not this slot's.
                 return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init, "no live proxy — model requests go direct (uncompressed)");
             }
         }
@@ -1502,7 +1547,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // state.
                 state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
-                state.lastUnavailableReason = "dead";
+                // #4125/#4824: same as the routed branch — the branch reason
+                // stays readable after the fire; the degraded-mode tracker
+                // carries the steady-state visibility.
                 return directSendOrRefuse(url, input, init, "proxy respawn failed — model requests go direct (uncompressed)");
             }
             throw err;

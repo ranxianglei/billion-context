@@ -361,7 +361,12 @@ protected lane described above):**
 
 **Emergency fallback:** a manual `workflow_dispatch` run against an explicitly chosen
 ref (picked in the Actions UI) still works and runs every guard above — for when the
-PR dance is slower than the fire.
+PR dance is slower than the fire. It also carries the emergency FAST valve (#3613,
+restored 2026-10-28 after the #4718 removal): ticking `fast` AND typing exactly
+`FAST PUBLISH CONFIRMED` into `confirm_fast` skips the full-CI dispatch/gate and the
+local full test while keeping every version guard + npm ci + typecheck + build;
+any partial or default input silently keeps the normal slow path (the typed phrase
+is the anti-misfire guard from #4718).
 
 **Label publish: DECOMMISSIONED (2026-10-25).** The former `backport-ship`
 label path (a single label made CI publish WITHOUT any merge decision) is

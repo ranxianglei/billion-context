@@ -56,8 +56,9 @@ test("loadRegistry clears its memo after a failed load so the next call retries"
     let calls = 0;
     let reg: typeof import("../src/registry.ts") | undefined;
     try {
-        // Import AFTER the env redirect: CACHE_FILE is resolved at module load,
-        // so a warm developer cache cannot short-circuit the failure path.
+        // Import AFTER the env redirect: the cache path resolves against the
+        // current XDG env at load time, so a warm developer cache cannot
+        // short-circuit the failure path.
         reg = await import("../src/registry.ts");
         reg._resetForTest();
         reg._setRegistryFetchForTest(async () => {

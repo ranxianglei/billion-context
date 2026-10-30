@@ -4,10 +4,12 @@ import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-ker
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
+import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -37,6 +39,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -205,9 +208,16 @@ export async function prepareOpenai(
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
         reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        // #4528: processTurn is the largest single synchronous pass over the
+        // resent history; yield before it so UI/API requests that queued during
+        // this turn are served, not frozen behind the whole turn.
+        await yieldToEventLoop();
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #4528: split the kernel pass from its post-processing scan passes so
+        // each is a bounded synchronous stretch rather than one long block.
+        await yieldToEventLoop();
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
@@ -449,17 +459,18 @@ export async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
-    // #2218/#2645: body-only relay affinity for plugin hosts. dsh desktop's
-    // only identity signal is the bili-internal x-bili-plugin-conversation
-    // header (already forwarded as x-session-id by buildForwardTarget);
-    // body-keyed relays (workbuddy panel) can't read headers, so stamp the
-    // conversation id into prompt_cache_key too. Stamping is default-on for
-    // EVERY destination shape (#2645 probe-and-remember — the old
-    // loopback/rewritten-route gate silently dropped the affinity key on the
-    // big remote pool populations): strict APIs that reject the field are
-    // found out at egress (the 400 A/B seam withholds the key per origin+
-    // model until proxy restart) instead of by a destination-shape guess.
-    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, modelIdOf(parsed));
+    // #2218/#2645/#5079: body-only relay affinity for plugin hosts. dsh
+    // desktop's only identity signal is the bili-internal
+    // x-bili-plugin-conversation header (already forwarded as x-session-id by
+    // buildForwardTarget); body-keyed relays (workbuddy panel) can't read
+    // headers, so stamping writes the conversation id into prompt_cache_key.
+    // #5079 gated the stamp behind promptCache.routing (default now DISABLED —
+    // most upstreams neither use nor tolerate the field): auto/enabled keep
+    // the #2645 default-on-for-every-destination behavior with the egress 400
+    // A/B seam as the rejection backstop; disabled never emits a bili-owned
+    // key but still forwards genuine client keys verbatim (and still honors
+    // an A/B ablation against them).
+    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
     if (pckDecision === "stamp") {
         rebuilt.prompt_cache_key = session.id;
     } else if (pckDecision === "drop") {
@@ -494,6 +505,10 @@ export async function prepareOpenai(
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
         if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
+        // #4805: id-membership evidence for the settle gate (see the
+        // anthropic-lane counterpart) — chat wire has no msgid envelope, so
+        // evidence is the tool-call ids resent in the history.
+        probeRequestMembership(session, collectRequestIds(undefined, processedMessages.length > 0 ? processedMessages : originalMessages), session.stats.localInputEstimate ?? 0);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

@@ -354,6 +354,51 @@ test("loop usage: protocol='responses' → cached NOT double-counted (input_toke
     assert.equal(ctx.session.stats.cacheSamples, 1);
 });
 
+for (const completion of ["text", "tool"] as const) {
+    for (const placement of ["empty-delta-tail", "empty-choices-tail", "finish"] as const) {
+        test(`#4943: OpenAI ${completion} ${placement} usage settles once and replaces the stale anchor`, async () => {
+            const ctx = makeCtx([], "openai");
+            ctx.session.stats.lastInputTokens = 1000;
+            ctx.session.stats.lastUsageGradeTokens = 1000;
+            const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+            const frame = (value: unknown): string => `data: ${JSON.stringify(value)}\n\n`;
+            let totalInput = 0;
+            for (let turn = 1; turn <= 2; turn++) {
+                const prompt = 50000 * turn;
+                const usage = { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10, prompt_tokens_details: { cached_tokens: 4096 } };
+                const delta = completion === "tool"
+                    ? { tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "{}" } }] }
+                    : { content: "hello world" };
+                const finishReason = completion === "tool" ? "tool_calls" : "stop";
+                const finish = frame({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }], ...(placement === "finish" ? { usage } : {}) });
+                const tail = placement === "finish" ? "" : frame({ choices: placement === "empty-choices-tail" ? [] : [{ index: 0, delta: {} }], usage });
+                const raw = frame({ choices: [{ index: 0, delta }] }) + finish + tail + "data: [DONE]\n\n";
+                const chunks: Buffer[] = [];
+                for await (const part of runCompressLoop(
+                    new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+                    createOpenaiAdapter(body), buildCompressSystemPrompt(),
+                )) chunks.push(part);
+                totalInput += prompt;
+                assert.equal(ctx.session.stats.lastInputTokens, prompt);
+                assert.equal(ctx.session.stats.lastUsageGradeTokens, prompt);
+                assert.equal(ctx.session.stats.inputTokens, totalInput);
+                assert.equal(ctx.session.stats.outputTokens, 10 * turn);
+                assert.equal(ctx.session.stats.cachedTokens, 4096 * turn);
+                assert.equal(ctx.session.stats.cacheSamples, turn);
+                const output = Buffer.concat(chunks).toString("utf8");
+                if (completion === "tool") {
+                    const usageFrame = tail || finish;
+                    assert.equal(output.split(usageFrame).length - 1, 1, "client receives the original usage frame exactly once");
+                    assert.ok(output.indexOf(usageFrame) < output.indexOf("data: [DONE]"));
+                    if (tail) assert.ok(output.indexOf(tail) > output.indexOf(finish));
+                } else {
+                    assert.ok(output.includes("hello world"));
+                }
+            }
+        });
+    }
+}
+
 test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
     const ctx = makeCtx();
     await drain(

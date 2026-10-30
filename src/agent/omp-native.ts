@@ -135,6 +135,21 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
     try {
         if (init === undefined || typeof init.body !== "string") { return; }
         sweepStale(incPendingOmp, INC_PENDING_TTL_MS);
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
+        let inflight = false;
+        for (const pending of incPendingOmp.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) { return; }
         let parsed: unknown;
         try {
             parsed = JSON.parse(init.body);
@@ -151,17 +166,6 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
         if (!(await probeIncrementalTurns(base))) { return; }
         const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]) });
         if (plan.mode === "skip") { return; }
-        // #3378 single-flight (kept over #3329's removal per the rebase
-        // decision): while a marker'd request for this URL is still awaiting
-        // its ack, later requests ride the normal pipeline. Pending entries
-        // are keyed by turn id (#3329), so the guard scans for a live entry
-        // stashed on THIS url (sweepStale above already aged out the stale
-        // ones — an aged entry must not block a fresh conversion).
-        let inflight = false;
-        for (const pending of incPendingOmp.values()) {
-            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
-        }
-        if (inflight) { return; }
         const turnId = newIncrementalTurnId();
         // #3304: stash the pre-swap body under this turn's id — if the proxy
         // dies before the send lands, the direct-send guard restores these

@@ -1,7 +1,13 @@
 import http from "node:http";
+import type { ResponsesRequestBody } from "acp-kernel/wire";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
-import { MAX_REQUEST_BYTES, fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
+import { fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
+import { limitsReceiveBytes } from "./knobs.js";
+import { featureEnabled } from "./rollout.js";
+import { getStore } from "./persist.js";
+import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
+import { identitySig, SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
@@ -139,11 +145,41 @@ interface Checkpoint {
     id: string;
     request: JsonObject;
     output: unknown[];
+    /** #4804: prior checkpoint this one continued — steady-state deltas stay
+     *  O(1) memory; expand() walks the chain only on the legacy fallback. */
+    base?: Checkpoint;
+    /** #4804: identitySig of the last core message of `request`'s conversion —
+     *  pins the transcript's last row to this exact turn body. */
+    tailSig?: string;
+    /** #4804: this turn's NEW input items only. A level with a tail carried an
+     *  augmented (partial) body; a level WITHOUT one (legacy full-replay turn)
+     *  carries the complete reconstruction in request.input and re-baselines
+     *  the chain for every level after it. */
+    tail?: unknown[];
+}
+
+/** #4804: output item types that are also LEGAL response.input items — the
+ *  only shapes the delta lane may echo into the next body. Anything else
+ *  (search calls, image_gen, …) takes that turn down the legacy path. */
+const ECHOABLE_OUTPUT_ITEM_TYPES = new Set(["message", "function_call", "custom_tool_call", "reasoning"]);
+
+/** #4804: identitySig of the LAST core message of a converted body (null when
+ *  it converts to nothing or fails — the next delta then takes the legacy
+ *  path). The same converter runs on the stored-row side, so parity is exact. */
+function computeTailSig(body: JsonObject): string | null {
+    try {
+        const { msgs } = responsesToCoreWithToolImages(body as ResponsesRequestBody);
+        const last = msgs[msgs.length - 1];
+        return last ? identitySig(last) : null;
+    } catch {
+        return null;
+    }
 }
 
 class ResponsesWsOutput {
     private items = new Map<number, { item: JsonObject; bytes: number }>();
     private bytes = 0;
+    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
 
     observe(frame: JsonObject): JsonObject | undefined {
         if (frame.type === "response.created") {
@@ -154,7 +190,7 @@ class ResponsesWsOutput {
             const index = frame.output_index as number;
             const bytes = Buffer.byteLength(JSON.stringify(frame.item));
             this.bytes += bytes - (this.items.get(index)?.bytes ?? 0);
-            if (this.bytes > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket checkpoint buffer limit exceeded");
+            if (this.bytes > this.limitBytes) throw new Error("Responses WebSocket checkpoint buffer limit exceeded");
             this.items.set(index, { item: frame.item, bytes });
         }
         if (frame.type !== "response.completed" || !object(frame.response)) return undefined;
@@ -174,6 +210,7 @@ class ResponsesWsOutput {
 
 export class ResponsesWsHistory {
     private checkpoint?: Checkpoint;
+    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
 
     expand(frame: JsonObject): JsonObject {
         const { type: _type, previous_response_id: previous, ...request } = frame;
@@ -181,13 +218,32 @@ export class ResponsesWsHistory {
         if (!Array.isArray(request.input)) throw new Error("response.create requires an input array");
         if (previous !== undefined && previous !== null) {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
-            const prior = this.checkpoint;
-            if (!prior || !Array.isArray(prior.request.input)) throw new Error("previous_response_not_found");
+            // Walk the checkpoint chain oldest→newest. The base level always
+            // carries a complete reconstruction in request.input; every later
+            // level contributes only its own tail + output (its augmented body
+            // would double-count the echoed previous output otherwise).
+            const levels: Checkpoint[] = [];
+            let cursor: Checkpoint | undefined = this.checkpoint;
+            while (cursor) {
+                levels.unshift(cursor);
+                cursor = cursor.base;
+            }
+            const base = levels[0];
+            if (!base || !Array.isArray(base.request.input)) throw new Error("previous_response_not_found");
+            // Per-level contribution in conversation order: the base's complete
+            // input, then each later level's own tail followed by its output.
+            let input: unknown[] = [];
+            for (let i = 0; i < levels.length; i++) {
+                const level = levels[i];
+                if (i === 0 && Array.isArray(level.request.input)) input = [...input, ...level.request.input];
+                else if (Array.isArray(level.tail)) input = [...input, ...level.tail];
+                input = [...input, ...level.output];
+            }
             // #2966: generate is a per-request action control, not conversation
             // state — a prewarm's generate:false must not leak into a continuation
             // that omits the field (the upstream would then refuse to generate).
-            const { generate: _priorGenerate, ...priorRequest } = prior.request;
-            return { ...priorRequest, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
+            const { generate: _priorGenerate, ...topRequest } = levels[levels.length - 1].request;
+            return { ...topRequest, ...request, input: [...input, ...request.input] };
         }
         return request;
     }
@@ -204,13 +260,30 @@ export class ResponsesWsHistory {
         return { ...fields, input: items.slice(baseline.length), previous_response_id: prior.id };
     }
 
-    commit(request: JsonObject, response: unknown): void {
+    current(): Checkpoint | undefined {
+        return this.checkpoint;
+    }
+
+    commit(request: JsonObject, response: unknown, opts?: { tailSig?: string; continuedId?: string; tail?: unknown[] }): void {
         if (!object(response) || response.status !== "completed" || typeof response.id !== "string" || !Array.isArray(response.output)) return;
-        if (Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response.output)) > MAX_REQUEST_BYTES) {
+        if (Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response.output)) > this.limitBytes) {
             this.clear();
             return;
         }
-        this.checkpoint = { id: response.id, request, output: response.output };
+        // #4804: chain onto the prior checkpoint when this request continued IT.
+        // continuedId comes from the CALLER because the committed body has its
+        // previous_response_id stripped (the provider sees a full input).
+        const contId = opts?.continuedId ?? (typeof request.previous_response_id === "string" ? request.previous_response_id : undefined);
+        const prior = this.checkpoint;
+        const chained = contId !== undefined && prior !== undefined && contId === prior.id;
+        this.checkpoint = {
+            id: response.id,
+            request,
+            output: response.output,
+            ...(chained && prior ? { base: prior } : {}),
+            ...(opts?.tailSig ? { tailSig: opts.tailSig } : {}),
+            ...(opts?.tail ? { tail: [...opts.tail] } : {}),
+        };
     }
 
     clear(): void {
@@ -235,7 +308,7 @@ export class ResponsesWsUpstream {
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES, private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -420,7 +493,7 @@ export class ResponsesWsUpstream {
             const message = (event: { data: unknown }): void => {
                 if (ended) return;
                 try {
-                    if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_REQUEST_BYTES) throw new Error("Invalid or oversized Responses WebSocket frame");
+                    if (typeof event.data !== "string" || Buffer.byteLength(event.data) > this.requestBytes) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
                     receivedEvents++;
@@ -506,6 +579,7 @@ class ResponsesWsResponse extends http.ServerResponse {
     private sent = false;
     private buffer = "";
     private readonly decoder = new TextDecoder();
+    private readonly limitBytes = limitsReceiveBytes();
     private readonly output = new ResponsesWsOutput();
     response?: JsonObject;
     restoredOutputItems = 0;
@@ -524,11 +598,11 @@ class ResponsesWsResponse extends http.ServerResponse {
         this.sent = true;
         const cb = typeof encoding === "function" ? encoding : callback;
         this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
-        if (this.buffer.length > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket output buffer limit exceeded");
+        if (this.buffer.length > this.limitBytes) throw new Error("Responses WebSocket output buffer limit exceeded");
         this.buffer = normalizeSseLineEndings(this.buffer);
         this.drainSse();
         cb?.();
-        if (this.peer.bufferedAmount > MAX_REQUEST_BYTES) {
+        if (this.peer.bufferedAmount > this.limitBytes) {
             this.peer.close(1013, "Output buffer limit exceeded");
             this.destroy();
         }
@@ -589,9 +663,10 @@ class ResponsesWsResponse extends http.ServerResponse {
 // transport with its continuation checkpoints, and the SSE response sink that
 // re-frames pipeline output for the client.
 
-class ResponsesWsSession implements WsBridgeSession {
+export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
     private readonly history = new ResponsesWsHistory();
+    private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
 
@@ -613,20 +688,58 @@ class ResponsesWsSession implements WsBridgeSession {
             peer.send(errorFrame(code, message, status));
         };
         let body: JsonObject;
+        let wire = "";
+        let anchoredTailSig: string | undefined;
+        // #4804: set ONLY on the delta short-circuit — legacy full-replay turns
+        // commit flat (their body is already a complete reconstruction; chaining
+        // below it would double-count history).
+        let deltaContinuation: { id: string; tail: unknown[] } | undefined;
         try {
-            const frame: unknown = JSON.parse(data.toString());
-            if (!object(frame) || frame.type !== "response.create") {
-                refuse("invalid_request", `expected a response.create frame, got ${describeEventType(frame)}`, 400);
+            const rawFrame: unknown = JSON.parse(data.toString());
+            if (!object(rawFrame) || rawFrame.type !== "response.create") {
+                refuse("invalid_request", `expected a response.create frame, got ${describeEventType(rawFrame)}`, 400);
                 return;
             }
+            const frame = rawFrame as JsonObject;
             const unsupported = unsupportedTransportOptions(frame, this.context.codec.allowStreamFlag);
             if (unsupported.length > 0) {
                 refuse("invalid_request", `response.create carries unsupported transport option(s): ${unsupported.join(", ")}`, 400);
                 return;
             }
-            body = { ...this.history.expand(frame), stream: true };
-            if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) {
-                refuse("request_too_large", `response.create exceeds the ${Math.round(MAX_REQUEST_BYTES / (1024 * 1024))} MiB request limit`, 413);
+            // #4804 delta continuation: when the client continues OUR own last
+            // committed turn, skip the O(full-history) reconstruction — the body
+            // carries only the server-committed previous output plus the new
+            // input tail, and prepare renders the prefix from the unified
+            // transcript (anchored snapshot render), verifying the seam against
+            // the checkpoint's tailSig. Every miss degrades to the legacy path
+            // below or the 400 the client answers with a full replay.
+            const cp = this.history.current();
+            const continuedId = typeof frame.previous_response_id === "string" ? frame.previous_response_id : undefined;
+            const deltaEligible =
+                featureEnabled("wsDeltaContinuation") &&
+                !this.context.source.headers["x-bili-plugin"] &&
+                cp !== undefined &&
+                continuedId !== undefined &&
+                continuedId === cp.id &&
+                Array.isArray(frame.input) &&
+                cp.tailSig !== undefined &&
+                getStore()?.unifiedReads() === true &&
+                cp.output.every((item) => object(item) && ECHOABLE_OUTPUT_ITEM_TYPES.has(String(item.type)));
+            if (deltaEligible) {
+                const { type: _type, previous_response_id: _prev, ...requestFields } = frame;
+                const { generate: _priorGenerate, ...priorRequest } = cp.request;
+                body = { ...priorRequest, ...requestFields, input: [...cp.output, ...(frame.input as unknown[])], stream: true };
+                anchoredTailSig = cp.tailSig;
+                deltaContinuation = { id: continuedId!, tail: frame.input as unknown[] };
+            } else {
+                // One serialization per turn (#4804 part A): admission measures the same wire
+                // string the envelope pushes below, against the receive budget knob
+                // instead of the fixed 100 MiB cap that killed long sessions pre-dispatch.
+                body = { ...this.history.expand(frame), stream: true };
+            }
+            wire = JSON.stringify(body);
+            if (Buffer.byteLength(wire) > this.budget) {
+                refuse("request_too_large", `response.create exceeds the ${Math.round(this.budget / (1024 * 1024))} MiB request limit`, 413);
                 return;
             }
         } catch (error) {
@@ -675,7 +788,7 @@ class ResponsesWsSession implements WsBridgeSession {
                         const { done, value } = await reader.read();
                         if (done) break;
                         buffer += decoder.decode(value, { stream: true });
-                        if (buffer.length > MAX_REQUEST_BYTES) throw new Error("Warmup output buffer limit exceeded");
+                        if (buffer.length > this.budget) throw new Error("Warmup output buffer limit exceeded");
                         for (;;) {
                             const index = buffer.indexOf("\n\n");
                             if (index < 0) break;
@@ -721,7 +834,10 @@ class ResponsesWsSession implements WsBridgeSession {
         req.url = source.url;
         Object.assign(req.headers, handshakeHeaders);
         req.headers["content-type"] = "application/json";
-        req.push(Buffer.from(JSON.stringify(body)));
+        if (anchoredTailSig !== undefined) {
+            Object.defineProperty(req, WS_ANCHORED_REQ_PROP, { value: { tailSig: anchoredTailSig }, enumerable: false });
+        }
+        req.push(Buffer.from(wire));
         req.push(null);
         const res = new ResponsesWsResponse(req, peer);
         res.on("error", () => {});
@@ -732,10 +848,25 @@ class ResponsesWsSession implements WsBridgeSession {
             try {
                 await this.context.dispatch(req, res);
                 if (res.response) {
-                    this.history.commit(body, res.response);
+                    this.history.commit(body, res.response, {
+                        tailSig: computeTailSig(body) ?? undefined,
+                        continuedId: deltaContinuation?.id,
+                        tail: deltaContinuation?.tail,
+                    });
                     if (res.restoredOutputItems > 0) this.context.log("debug", `checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof SnapshotAnchorFallbackError) {
+                    // #4804: the anchored render could not verify the transcript
+                    // seam — answer with the client's standard recovery (full
+                    // replay) and drop the checkpoint chain so the replay
+                    // re-anchors fresh. Never guess a view.
+                    this.history.clear();
+                    this.context.log("warn", `delta continuation rejected reason=${error.reason} — requesting full replay`);
+                    this.active?.destroy();
+                    if (peer.readyState === WebSocket.OPEN) peer.send(errorFrame("previous_response_not_found", "Send full input without previous_response_id", 400));
+                    return;
+                }
                 this.context.log("warn", `exchange failed phase=dispatch terminal=${res.terminal}`);
                 if (!res.writableEnded) res.end();
             } finally {
@@ -771,9 +902,11 @@ export const responsesCodec: WsBridgeCodec = {
 // `responses_websockets`) swaps its HTTP SSE lane for a WebSocket that speaks
 // the same Responses event vocabulary, one JSON text frame per event, with
 // sequential `response.create` requests over one connection (first a probe
-// with `input: []` + `generate: false`, then one full-history-replay request
-// per turn — codex never sends previous_response_id). Captured from a real
-// 0.147.0 client: handshake carries `openai-beta: responses_websockets=…`,
+// with `input: []` + `generate: false`, then one request per turn). Captured
+// from a real 0.147.0 client, which sent a full-history replay every turn and
+// never previous_response_id; other builds send previous_response_id with a
+// tiny input tail instead (#4804 real capture) — both shapes are live
+// production traffic. Handshake carries `openai-beta: responses_websockets=…`,
 // `session-id`/`thread-id`, and `x-codex-turn-metadata`; the body carries
 // `store: false`, `stream: true`, `include: [reasoning.encrypted_content]`,
 // `prompt_cache_key`, and `client_metadata`, all of which ride the envelope

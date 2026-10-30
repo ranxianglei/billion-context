@@ -60,15 +60,17 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
+import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
+import { billOutputUsage } from "./billing.js";
 import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
-import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
+import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
 import { incomingCoreMessages } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
@@ -113,6 +115,15 @@ const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
 const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
+/** #4855: per-request compression-channel override, only honored from an announced plugin
+ *  (same gate as window/model above). A host that registers the ACP tools natively but keeps them
+ *  OUT of the outgoing request — Hermes defers every plugin toolset behind tool_search — still
+ *  needs its identity and budget bound to the plugin conversation. Stamping "proxy" says exactly
+ *  that: keep the plugin identity, but serve compression through the proxy's wire channel (inject
+ *  the tools, execute compress server-side) instead of suppressing injection for a caller that
+ *  cannot run the tools. Without it the request falls back to anonymous proxy mode (pfa-* fork id,
+ *  default window, no /acp binding), which is the defect it exists for. */
+const PLUGIN_COMPRESSION_HEADER = "x-bili-plugin-compression";
 /** #1102/#1106: stamped "1" by plugins whose host mints one conversation id per
  *  persona (opencode: subagents get their own child session ids). Since the
  *  instructions fingerprint became an allowlist (#1106 — exempt is the
@@ -251,6 +262,13 @@ export function pluginReportedModel(headers: Record<string, string | string[] | 
 export function pluginRequestAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     if (pluginAgentHeader(headers) === undefined) return undefined;
     return headerValue(headers, PLUGIN_REQUEST_AGENT_HEADER);
+}
+
+/** #4855: the plugin asks the proxy to serve compression on this request (identity + budget stay
+ *  plugin-bound). Gated on the agent marker so a plain client cannot flip the channel by name. */
+export function pluginCompressionProxyHeader(headers: Record<string, string | string[] | undefined>): boolean {
+    if (pluginAgentHeader(headers) === undefined) return false;
+    return headerValue(headers, PLUGIN_COMPRESSION_HEADER) === "proxy";
 }
 
 /** #956 hardening: per-request plugin window/max-output headers describe the
@@ -959,7 +977,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
             openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
             responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
         },
-        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
+        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, compression: PLUGIN_COMPRESSION_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
@@ -1154,9 +1172,95 @@ function sessionRevisionOf(session: Session): string {
     return revision;
 }
 
-function forkSnapshot(session: Session) {
-    const messages = session.pluginSnapshot;
-    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
+/** #5140 item 4: a non-retained parent cold-restored in shadow mode loses its
+ *  resident pluginSnapshot (persist.ts retention gate) even though index.db
+ *  still holds the independently recorded unfolded raw tail. Rebuild that tail
+ *  through its LOGICAL tailSeqs projection (never append-log order, never the
+ *  folded envelope) and prove it IS this session's complete ordered history
+ *  before it may stand in for the snapshot: every seq resolves (zero gaps), ids
+ *  equal state.lastPassIds in exact order, and it sits under the UTF-8 byte cap.
+ *  Pure — never mutates the session. Any miss returns null so callers fail
+ *  closed exactly as before. */
+// #5140 CI-red follow-up: every reconstruction miss records WHICH gate fired,
+// so a 409 SNAPSHOT_UNAVAILABLE is diagnosable from server logs and the
+// client-visible error instead of being one silent null among five.
+const reconMissGate = new Map<string, { gate: string; at: number }>();
+const reconMissLastLogMs = new Map<string, number>();
+
+function reconMiss(session: Session, gate: string, detail?: string): null {
+    const why = detail ? `${gate} ${detail}` : gate;
+    const key = `${session.id}:${gate}`;
+    const now = Date.now();
+    if (now - (reconMissLastLogMs.get(key) ?? 0) >= 10_000) {
+        reconMissLastLogMs.set(key, now);
+        loggerLog("warn", `[plugin] raw-tail reconstruction unavailable for ${session.id} (${why}) — snapshot/fork falls back to the legacy path`);
+    }
+    reconMissGate.set(session.id, { gate: why, at: now });
+    return null;
+}
+
+function reconMissReason(sessionId: string): string | undefined {
+    const hit = reconMissGate.get(sessionId);
+    return hit && Date.now() - hit.at < 30_000 ? hit.gate : undefined;
+}
+
+// #5188 round 3: #5140's flake was a timing race — the ctor's first sidecar open
+// died on a transient disk spike under shard load, the resource cleared
+// milliseconds later, and the cold-restore snapshot request arrived before any
+// post-spike recovery attempt had fired. When reconstruction is actually needed
+// and the sidecar is merely MISSING (recoverable without restart), the two
+// user-visible 409 paths wait a bounded moment for that self-recovery instead
+// of racing it. Latched-disabled never waits — waiting cannot help there. The
+// pre-lock read of pluginSnapshot/lastPassIds is fine for gating: a stale answer
+// only costs one unnecessary wait or skips one (same immediate 409 as before).
+async function waitForReconstructionReplicas(session: Session): Promise<void> {
+    if (session.pluginSnapshot !== undefined) return;
+    const expected = session.state.lastPassIds;
+    if (!expected || expected.length === 0) return;
+    const store = getStore();
+    if (store.replicasAvailable()) return;
+    if (store.sidecarDownReason() !== "sidecar-missing") return;
+    await store.waitForReplicas();
+}
+
+function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
+    const expected = session.state.lastPassIds;
+    if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
+    const store = getStore();
+    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable", store.sidecarDownReason());
+    const seqs = store.unifiedTailSeqs(session.id);
+    if (!seqs || seqs.length === 0) return reconMiss(session, "empty-tailSeqs", `expected=${expected.length}`);
+    const rows = store.unifiedTailViewRows(session.id);
+    if (!rows) return reconMiss(session, "null-tailViewRows", `seqs=${seqs.length}`);
+    const bySeq = new Map<number, string>();
+    for (const row of rows) bySeq.set(row.seq, row.content);
+    const out: CoreMessage[] = [];
+    for (const seq of seqs) {
+        const content = bySeq.get(seq);
+        if (content === undefined) return reconMiss(session, "gap-tailRow", `seq=${seq}/${seqs.length} rows=${rows.length}`); // gap: a logical seq has no stored row
+        let msg: CoreMessage;
+        try { msg = JSON.parse(content) as CoreMessage; } catch { return reconMiss(session, "unparseable-row", `seq=${seq}`); }
+        if (typeof msg.id !== "string" || typeof msg.role !== "string") return reconMiss(session, "bad-row-shape", `seq=${seq}`);
+        out.push(msg);
+    }
+    if (out.length !== expected.length) return reconMiss(session, "length-mismatch", `rows=${out.length} expected=${expected.length}`);
+    for (let i = 0; i < out.length; i += 1) if (out[i]!.id !== expected[i]) return reconMiss(session, "id-mismatch", `index=${i}`);
+    const cap = publicSnapshotCapBytes();
+    if (Buffer.byteLength(stableJson(out), "utf8") > cap) return reconMiss(session, "cap-exceeded");
+    reconMissGate.delete(session.id);
+    return out;
+}
+
+function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
+    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    if (!messages) {
+        const capped = session.metadata.publicSnapshotCapped === true;
+        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
+        // the capped base names the refusal itself; a gate recorded under it is
+        // incidental (reconstruction may bail before reaching the cap check)
+        const why = capped ? undefined : reconMissReason(session.id);
+        throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
+    }
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
@@ -1348,6 +1452,7 @@ export async function handlePluginSnapshot(conversationId: string, res: ServerRe
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
+        await waitForReconstructionReplicas(session); // #5188 round 3: don't race self-recovery into a 409
         await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
     } catch (err) {
         forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
@@ -1395,7 +1500,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { request = parseForkRequest(payload); }
     catch (err) { return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: String(err) }); }
     const requestHash = forkHash(request);
-    const replay = (): boolean => {
+    const replay = async (): Promise<boolean> => {
+        await getStore().recoverCompletedFork(request.childConversationId);
         const existing = resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
@@ -1403,17 +1509,25 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         else forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
         return true;
     };
-    if (replay()) return;
+    try { if (await replay()) return; }
+    catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
-        await withSessionLock(parent, () => {
-            if (replay()) return;
+        await waitForReconstructionReplicas(parent); // #5188 round 3: don't race self-recovery into a 409
+        // #4911: async callback — the unified row clone below awaits the
+        // backend on network backends; withSessionLock accepts () => T |
+        // Promise<T>, so the lock scope and ordering are unchanged.
+        await withSessionLock(parent, async () => {
+            if (await replay()) return;
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+            // #5140 item 4: a cold non-retained parent has no resident snapshot;
+            // stand in with the verified unified raw tail (no fresh model call).
+            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
-            try { snapshot = forkSnapshot(parent); }
+            try { snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
             if (snapshot.parentRevision !== request.parentRevision) {
                 // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
@@ -1483,7 +1597,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount));
+            child.pluginSnapshot = structuredClone(source!.slice(0, request.branchPoint.messageCount));
             const forkView = prune(child.pluginSnapshot, child.state);
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
@@ -1524,30 +1638,19 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // takes precedence immediately (#728 invariant), and every prepare*
             // overwrites it with the measured outbound each turn.
             child.stats.localInputEstimate = child.stats.contextTokens;
+            // #4805: the child inherits the parent's membership needle — its
+            // resent history IS the parent's, so the probe must not
+            // cold-start (an auxiliary persona striking the fork child first
+            // would sail through an unplanted needle and pollute the fresh
+            // anchor before any guard has evidence).
+            if (parent.transient?.latestKnownMsgId) {
+                (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
+                child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
+            }
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
-            publishForkSession(child);
+            await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
-            // #4316 PR3/3: clone the parent's unified-store rows so the
-            // child's cloned kernel refs keep pointing at the same ledger
-            // positions (owner decision 2026-10-22: fork copies every number).
-            // Degrades silently to the kernel-only clone when the store has no
-            // parent rows (legacy-only lanes) — the fork itself must never
-            // fail for a storage nicety.
-            try {
-                const store = getStore();
-                // #4730: the inclusive throughSeq is the parent's LAST LIVE SEQ,
-                // not live count - 1. Tombstones keep their seq, so once any
-                // row is retired count < lastLiveSeq + 1 and count - 1 silently
-                // dropped the newest live rows from the cloned child.
-                const lastLiveSeq = store.unifiedLastLiveSeq(parent.id);
-                const throughSeq = lastLiveSeq === null ? -1 : lastLiveSeq;
-                if (throughSeq >= 0 && !store.unifiedCloneSessionRows(parent.id, child.id, throughSeq)) {
-                    loggerLog("debug", `fork ${request.childConversationId}: no unified rows to clone for ${parent.id} (kernel-only fork)`);
-                }
-            } catch (err) {
-                loggerLog("warn", `fork ${request.childConversationId}: row clone skipped (${err instanceof Error ? err.message : String(err)}); kernel-only fork`);
-            }
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the
             // fork-created conversation supersedes it; a lingering entry would
@@ -1561,6 +1664,10 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // lazily-persisted parent would drop its snapshot on disk and the next
             // restart would 409. Flush eagerly (publishForkSession precedent) so
             // the flag and the snapshot land in one write.
+            // #5140 item 4: only a SUCCESSFUL fork retains the verified source —
+            // materialize the reconstructed tail on the parent so the flushSync
+            // below persists the real raw copy for continuity (GET never does).
+            if (source && source !== parent.pluginSnapshot) parent.pluginSnapshot = structuredClone(source);
             parent.metadata.publicSnapshotRetained = true;
             if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
             forkReply(res, 201, response);
@@ -1823,6 +1930,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     } else {
         warmChangelogOnce(); // once per process; never throws
     }
+    // #4906: same fire-and-forget cadence as the changelog warm above — one
+    // GitHub-master blog pull when this process starts out COLD (no live
+    // master overlay yet); processes that already hold a master overlay keep
+    // the status path network-free. Internal guard; never throws.
+    warmBlogRefreshOnce();
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
@@ -1889,6 +2001,19 @@ export async function handlePluginTool(
     // remain authoritative. Id-less calls use a unique witness, then a single
     // fresh conversation, or fail loudly without guessing (#1685).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
+    // #4580: Claude Code (≥2.1.308) stamps every MCP tools/call with the
+    // originating tool_use id (the shim reads _meta["claudecode/toolUseId"]
+    // and forwards it as toolCallId). A shared shim's process-wide binding
+    // cannot tell the main thread from its Task subagents — the id can: the
+    // proxy witnessed that exact tool_use in exactly one session's stream,
+    // recorded in the #4580 id ring at settle time. Host-stamped, so a live
+    // mapping outranks both the body id and the witness hash ladder (same
+    // authority class as #2024 native callers). An id the ring does not know
+    // (never streamed here, TTL expiry, proxy restart) changes nothing: the
+    // existing ladder decides, fail-closed semantics untouched.
+    const routedCallId = typeof parsed.toolCallId === "string" ? parsed.toolCallId : "";
+    const toolUseLaneId = routedCallId ? lookupToolUseIdSession(routedCallId) : undefined;
+    const toolUseSession = toolUseLaneId ? peekSession(toolUseLaneId) : undefined;
     // #2024/#2072: true only when the caller PROVES the body id is host-stamped
     // per-call metadata — the MCP shim's _meta.threadId, or a host-native agent's
     // own session-manager id (pi / dsh / opencode). Model-transcribed ids and
@@ -1899,7 +2024,16 @@ export async function handlePluginTool(
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
     let routedBy: "witness" | "body" | "arb" | "native" = "body";
-    if (conversationId) {
+    if (toolUseSession) {
+        // #4580: the host's own per-call id named this lane. Note it: routing
+        // by call id is new behavior and the log line is the fastest way to
+        // confirm it in the wild (or rule it out).
+        session = toolUseSession;
+        const cid = conversationIdForSession(session.id);
+        entry = cid ? conversations.get(cid) : undefined;
+        routedBy = "native";
+        deps.log("info", `[plugin] tool "${tool}": routed by host call id (#4580) to "${session.id}"`);
+    } else if (conversationId) {
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
@@ -2291,9 +2425,13 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
     }
-    if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
+    if (sample.outputTokens !== undefined) {
+        session.stats.outputTokens += sample.outputTokens;
+        // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+        billOutputUsage(session, sample.outputTokens);
+    }
 }
 
 /** Merge an SSE event's usage fields into the per-response accumulator.
@@ -2536,6 +2674,10 @@ export async function pipePluginChatWithStrip(
         for (const tc of seenToolCalls.values()) {
             if (tc.name.length === 0) continue;
             recordToolWitness(session.id, tc.name, tc.args);
+            // #4580: the same observation carries the host's tool_use id —
+            // ring it so a later tools/call stamped with that id routes to
+            // THIS lane even when the shared MCP shim is bound elsewhere.
+            if (tc.id.length > 0) recordToolUseId(tc.id, session.id);
         }
     };
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
@@ -3698,9 +3840,14 @@ export async function pipePluginResponsesWithStrip(
     const witnessedCalls = new Map<string, { name: string; args: string; named: boolean }>();
     const settleWitnesses = () => {
         if (!session) return;
-        for (const wc of witnessedCalls.values()) {
+        for (const [itemId, wc] of witnessedCalls) {
             if (!wc.named || wc.name.length === 0) continue;
             recordToolWitness(session.id, wc.name, wc.args);
+            // #4580: the map key is the output item's id (fc_…), i.e. the
+            // host's per-call id — ring it for id-stamped tools/call routing.
+            // Synthetic fallback keys ("oi:<index>") are never host-stamped;
+            // skip them so cross-session index keys can't shadow real ids.
+            if (itemId.length > 0 && !itemId.startsWith("oi:")) recordToolUseId(itemId, session.id);
         }
     };
     let sawReasoning = false;
@@ -4559,6 +4706,9 @@ function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown
                 if (b["type"] !== "tool_use") continue;
                 if (typeof b["name"] !== "string" || b["name"].length === 0) continue;
                 recordToolWitness(sessionId, b["name"], b["input"] !== null && b["input"] !== undefined ? b["input"] as Record<string, unknown> : "");
+                // #4580: anthropic tool_use ids are the ids Claude Code stamps
+                // on its MCP tools/call — ring them for routing.
+                if (typeof b["id"] === "string" && b["id"].length > 0) recordToolUseId(b["id"], sessionId);
             }
             return;
         }
@@ -4571,6 +4721,9 @@ function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown
                 if (o["type"] !== "function_call") continue;
                 if (typeof o["name"] !== "string" || o["name"].length === 0) continue;
                 recordToolWitness(sessionId, o["name"], typeof o["arguments"] === "string" ? o["arguments"] : "");
+                // #4580: responses function_call ids double as per-call ids.
+                const rcId = o["call_id"] ?? o["id"];
+                if (typeof rcId === "string" && rcId.length > 0) recordToolUseId(rcId, sessionId);
             }
             return;
         }
@@ -4609,6 +4762,9 @@ function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown
                 const f = fn as Record<string, unknown>;
                 if (typeof f["name"] !== "string" || f["name"].length === 0) continue;
                 recordToolWitness(sessionId, f["name"], typeof f["arguments"] === "string" ? f["arguments"] : "");
+                // #4580: chat-completions tool_calls ids double as per-call ids.
+                const tcId = (tc as Record<string, unknown>)["id"];
+                if (typeof tcId === "string" && tcId.length > 0) recordToolUseId(tcId, sessionId);
             }
         }
     } catch {

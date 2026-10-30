@@ -11,6 +11,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { yieldToEventLoop } from "./yield-loop.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -1658,6 +1659,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    // #4288: set when the round-top fit exit fired — the walk ended in a
+    // forward decision, and no later verdict may override it (see the final
+    // failure stamp below).
+    let fitExitForward = false;
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
@@ -2039,6 +2044,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             break;
         }
         if (poolQueueDrop) break;
+        // #4528: each round re-runs the full O(messages) kernel pass over the
+        // resent history; yield between rounds so UI/API requests on the same
+        // listener are served instead of queueing behind the whole compression
+        // run.
+        await yieldToEventLoop();
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -2131,6 +2141,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // roundText path.
         const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
         if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+            // #4288: the walk ends in a fit-forward — the caller's gate judges
+            // on the same floorless payloadEstimate and forwards. The final
+            // verdict below must not stamp an exhausted/failure verdict over
+            // this exit just because the STALE-floored currentTokens still
+            // reads over-limit.
+            fitExitForward = true;
             if (baselineFloor >= textTarget && !armedBaseline) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
             }
@@ -3091,7 +3107,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
-    if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
+    // #4288: a fit-forward exit outranks the stale-floored currentTokens —
+    // the payload fits by its own estimate and the caller forwards it; an
+    // exhausted verdict here would report a marathon that did not happen.
+    if ((currentTokens >= limit && !fitExitForward) || failure?.kind === "aborted") result.failure = failure;
     // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
     // char-count upper bound was the trigger arm, never the reject-forward gate.
     result.fitsWindow = result.payloadEstimate < limit;

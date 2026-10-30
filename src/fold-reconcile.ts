@@ -132,6 +132,9 @@
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
+// Deep kernel import (same convention as src/storage/ingest.ts): the thinking
+// forms live in ONE place — kernel/src/wire/demoted-thinking.ts FORMS.
+import { FORMS as THINKING_MERGE_FORMS } from "../kernel/src/wire/demoted-thinking.js";
 import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
@@ -540,16 +543,11 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
 }
 
 /** #3301: split tagged thinking-merge text (host metadata refresh re-serializes
- *  split-form turns as tagged reasoning spliced into content). MIRRORS
- *  kernel/src/wire/demoted-thinking.ts FORMS + splitDemotedThinking in lockstep
- *  (not exported from the kernel root) — keep both lists in sync. Offset-0 tag
- *  start is the only position demotion renderers produce. Auxiliary evidence
- *  for turn-key derivation ONLY — never identity minting. */
-const THINKING_MERGE_FORMS: readonly { open: string; close: string }[] = [
-    { open: "\x3cthink\x3e\n", close: "\n\x3c/think\x3e" },
-    { open: "\x3cthinking\x3e\n", close: "\n\x3c/thinking\x3e" },
-    { open: "```thinking\n", close: "\n```" },
-];
+ * split-form turns as tagged reasoning spliced into content). The form list
+ * is the kernel's single source (THINKING_MERGE_FORMS import above) — no
+ * local copy to keep in sync. Offset-0 tag start is the only position
+ * demotion renderers produce. Auxiliary evidence for turn-key
+ * derivation ONLY — never identity minting. */
 
 export function extractThinkingMerge(text: string | undefined): { reasoning: string; text: string } | null {
     if (text === undefined || text === "") return null;

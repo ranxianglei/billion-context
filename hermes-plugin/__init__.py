@@ -123,6 +123,10 @@ _state: Dict[str, Any] = {
     "stop_event": threading.Event(),
     "warned_direct": False,
     "snapshot_warned": False,
+    # #4855: header name the proxy advertised for the per-request compression-channel override
+    # (manifest headers.compression). Empty/None on an older proxy — then a request whose tool
+    # snapshot lacks the ACP tools stays unstamped, exactly as before.
+    "compression_header": None,
     # #4644 self-healing: watchdog_gen invalidates a previous generation's watchdog thread on
     # load/unload; recovering marks an origin-death recovery in flight (single-flight guard);
     # env_backup holds what apply_env overwrote so _unroute_env RESTORES it instead of deleting it.
@@ -158,6 +162,7 @@ def _reset_for_test() -> None:
         _state["stop_event"] = threading.Event()
         _state["warned_direct"] = False
         _state["snapshot_warned"] = False
+        _state["compression_header"] = None
         _state["watchdog_gen"] = 0
         _state["watchdog_thread"] = None
         _state["recovering"] = False
@@ -1458,6 +1463,13 @@ def _bootstrap(sidecar: Dict[str, str], ctx: Any, skip_register: bool = False) -
             else:
                 manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
                 tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
+                # #4855: the proxy names the header that flips compression to its own channel for a
+                # request whose tool snapshot lacks the native tools. Absent on older proxies.
+                declared = manifest.get("headers") if isinstance(manifest, dict) else None
+                compression_header = declared.get("compression") if isinstance(declared, dict) else None
+                _state["compression_header"] = (_stampable_header_value(compression_header)
+                                                if isinstance(compression_header, str) and compression_header
+                                                else None)
                 if not isinstance(tools, list) or not tools:
                     if attempt < max_attempts and _sleep_backoff(attempt):
                         logger.warning("billion-context: proxy manifest had no tool definitions "
@@ -1599,16 +1611,30 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
                 logger.warning("billion-context: proxy not ready — this process's model traffic goes "
                                "direct (uncompressed); see the bootstrap warning above")
             return None
-        if not _plugin_tools_visible(request):
+        visible = _plugin_tools_visible(request)
+        if not visible:
+            compression_header = _state.get("compression_header")
+            if not compression_header:
+                # Older proxy: it would suppress wire injection on the marker alone, so an invisible
+                # tool snapshot must stay unstamped (anonymous proxy mode).
+                if not _state.get("snapshot_warned"):
+                    _state["snapshot_warned"] = True
+                    logger.info("billion-context: native tools are not in this session's tool list — "
+                                "compressing in proxy mode until a new session")
+                return None
+            # #4855: Hermes defers every plugin toolset behind tool_search, so the tools exist but
+            # never reach the outgoing request. Keep the plugin identity + budget (that is what
+            # /acp and the window header read) and hand compression to the proxy explicitly.
             if not _state.get("snapshot_warned"):
                 _state["snapshot_warned"] = True
                 logger.info("billion-context: native tools are not in this session's tool list — "
-                            "compressing in proxy mode until a new session")
-            return None
+                            "keeping the plugin identity and compressing in proxy mode")
         headers = request.get("extra_headers")
         merged = dict(headers) if isinstance(headers, dict) else {}
         merged["x-bili-plugin"] = AGENT_NAME
         merged["x-bili-plugin-conversation"] = str(session_id)
+        if not visible:
+            merged[_state["compression_header"]] = "proxy"
         model = context.get("model")
         if model:
             model_header = _stampable_header_value(model)

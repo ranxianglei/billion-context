@@ -33,6 +33,12 @@ interface WriterMarkerFile {
     origin: string;
     version: string;
     lane?: string;
+    /** Set only by a graceful dispose(): this instance recorded its FINAL
+     *  marker and will never commit again. Peers skip such markers outright —
+     *  a positively-known dead predecessor is not a concurrent writer, even
+     *  while its file is fresh (restart flows kill + immediately rebind).
+     *  Markers from older builds carry none and stay valid. */
+    stoppedAt?: number;
     /** sessionId → last commit time (ms epoch). */
     servedAt: Record<string, number>;
 }
@@ -68,7 +74,8 @@ const MAX_TRACKED_SESSIONS = 128;
 const VERDICT_TTL_MS = 60_000;
 /** A peer counts as live when its pid is alive OR its marker was written
  *  within this window (covers platforms where the pid check cannot see the
- *  peer process). */
+ *  peer process). Gracefully-stopped peers are excluded upstream via
+ *  stoppedAt — this fallback only ever rescues CRASHED peers. */
 const PEER_FILE_FRESH_MS = 30_000;
 /** reapStaleWriterMarkers removes files whose pid is dead AND whose mtime is
  *  older than this. */
@@ -113,6 +120,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     let lastFlushAt = 0;
     let disposed = false;
+    let stoppedAt: number | undefined;
 
     const prune = (now: number): void => {
         for (const [id, at] of [...servedAt]) {
@@ -137,6 +145,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             origin: identity.origin,
             version: identity.version,
             ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
+            ...(stoppedAt === undefined ? {} : { stoppedAt }),
             servedAt: Object.fromEntries(servedAt),
         };
         try {
@@ -189,7 +198,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             disposed = true;
             if (flushTimer !== undefined) clearTimeout(flushTimer);
             // final write (bypasses the disposed guard): peers should still be
-            // able to attribute this instance's last commits after shutdown
+            // able to attribute this instance's last commits after shutdown.
+            // stoppedAt marks the stop as GRACEFUL so peers never flag this
+            // predecessor in a split-brain contest — the freshness fallback
+            // must only rescue crashed peers whose death we cannot prove.
+            stoppedAt = Date.now();
             writeMarker();
         },
         __flushForTest(): void {
@@ -202,8 +215,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
 }
 
 /** Peer marker files that record a commit of `sessionId` inside the contest
- *  window by a LIVE foreign instance (pid alive or file fresh). Malformed or
- *  tearing files are skipped silently — a marker is observability, not data. */
+ *  window by a LIVE foreign instance (pid alive or file fresh). Markers
+ *  carrying stoppedAt (graceful shutdown) are skipped unconditionally — a
+ *  restart flow's predecessor died seconds ago and must not raise an alarm.
+ *  Malformed or tearing files are skipped silently — a marker is
+ *  observability, not data. */
 export function findContestedWriters(dir: string, selfInstanceId: string, sessionId: string, now: number): Array<WriterIdentity & { servedAt: number }> {
     let entries: fs.Dirent[];
     try {
@@ -218,6 +234,7 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
             if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) continue;
+            if (typeof raw.stoppedAt === "number") continue;
             const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
             if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) continue;
             const mtimeMs = fs.statSync(file).mtimeMs;
