@@ -19,6 +19,7 @@ import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { recordNetProgressBaseline } from "./net-progress-guard.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -1292,9 +1293,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // This-fold ratio only: lastCompress, the degenerate-fold gate and the
         // staged-compress note all judge ONE rewrite, never the session (#4227).
-        // #3307: keep the raw-inbound total alongside (log-only) so one capture
-        // shows the view-factor collapse — V=live vs Vraw=inbound — separating it
-        // from the residual chars/4-vs-BPE estimator factor without a second trip.
+        // #3307: keep the raw-inbound total alongside (log + the #5058
+        // net-progress baseline below) so one capture shows the view-factor
+        // collapse — V=live vs Vraw=inbound — separating it from the residual
+        // chars/4-vs-BPE estimator factor without a second trip.
         let rawViewTokens = 0;
         for (const m of ctx.compressMessages ?? ctx.messages) rawViewTokens += countMessageTokens(m);
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
@@ -1337,6 +1339,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (shrinkRatio >= DEGENERATE_FOLD_COVERAGE) {
             ctx.log(`[warn: degenerate-fold] [acp-compress-obs] covers ${Math.round(shrinkRatio * 100)}% of the live context (~${r.tokensCompressed}/${viewTokens} tok) leaving ${activeBlockCount} active block(s), anchor≈${anchorTok} tok — the whole prefix rewrites and the prefix cache restarts from scratch on the next request`);
         }
+        // #5058: cross-round net-progress baseline — later rounds are measured
+        // against THIS inbound-resend level, the SAME array class the round
+        // check counts (src/server/handle.ts over prepared.originalMessages);
+        // folds that never bring the resent context back below it arm the
+        // per-session nudge quiet-down. The rendered live view (viewTokens)
+        // must NOT feed this pair: proxy-mode resends never shrink under bili
+        // folds, and mixing spaces would distort the bar by the reasoning-drop
+        // delta on heavy-reasoning hosts.
+        recordNetProgressBaseline(ctx.session, rawViewTokens, postCtx);
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
         const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));

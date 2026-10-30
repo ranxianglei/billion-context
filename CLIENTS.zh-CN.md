@@ -22,6 +22,22 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 TECHNICAL-NOTES.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**长会话会撞上一堵没有任何自动恢复能触及的墙(#5058)。** plugin 模式下 dsh 自己保留一份完整的本地会话日志,dsh 发送前的超窗守卫量的是**这份本地日志** —— 不是 bili 渲染上线的内容。bili 持有泳道期间 dsh 原生压缩按设计撤下(见上),于是长寿命会话(几百轮、跨天,例如 QQ 桥接陪伴)的本地日志一路涨到超过模型窗口;此后 dsh 在**发送前**拒绝每一条请求。没有 provider 报错,dsh 自己的 overflow 恢复(等 provider 回 `CONTEXT_WINDOW_EXCEEDED`)永远等不到信号;又因为什么都没发出去,bili 也收不到任何流量:nudge 驱动的压缩、手动 `/compact`、以及一切以 provider 错误为触发条件的宿主侧兜底全部够不着。会话从此永久不可用,唯一出路是删掉重建 —— 对陪伴类场景这意味着对话记忆清零,所以**持久记忆要放在上下文之外**(角色卡、日记、记忆文件)。报告案例里本地日志涨到 30 MB / 24,051 条事件,而整条生命周期内 dsh 原生压缩一次都没跑过。一点澄清:压缩动作在**模型侧**的开销是有界的 —— 重发的 compress 调用在线上被截成每段约 200 字符 —— 无界增长的是宿主的本地存储。
+
+已知拒发文案(供宿主侧检测正则使用,#5058 报告时的版本):
+
+> payload core text alone is ~… bytes … that is >= ~… tokens vs the model
+> window …; no upstream can accept it, so it was NOT forwarded even for
+> evidence.
+
+陪伴类 / 常驻会话的缓解手段:
+
+- **定期换会话**(例如每天一次),持久记忆放文件里,不押在上下文长度上。
+- **调大 `compress.nudgeGrowthTokens`**(如 `500000`)或对这类会话直接关掉 nudge,别让压缩节奏追着会话自身的增长跑。
+- **盯会话文件大小**(`~/.dsh/sessions/…/session.v4.jsonl.zstd`)—— 压缩后几个 MB 就是预警,远早于窗口撑满。
+- 本构建起 bili 的**净进展守卫**会在连续折叠不再缩小会话时停发压缩 nudge(Web UI 徽标 "swelling"、代理日志 `[net-progress]` 行、10 分钟墙钟上限)。它打断的是压缩动作自我放大的正反馈,不能替 dsh 裁剪本地存储。
+- 逐会话「仅传输不压缩」设置见 [#5052](https://github.com/ranxianglei/billion-context/issues/5052)。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:

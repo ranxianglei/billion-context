@@ -205,6 +205,51 @@ the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
 
+**Long-running sessions can hit a wall that no automatic recovery reaches
+(#5058).** In plugin mode dsh keeps its own full local session log, and dsh's
+pre-send overflow guard measures THAT local log — not what bili renders onto
+the wire. While bili owns the lane, dsh's native compaction is stood down by
+design (above), so in a long-lived session (hundreds of turns, days — e.g. a
+QQ-bridge companion) the local log grows until it exceeds the model window;
+from then on dsh refuses every request BEFORE sending it. No provider error
+ever happens, so dsh's overflow recovery (which waits for the provider's
+`CONTEXT_WINDOW_EXCEEDED`) never fires, and — because nothing is sent — no
+traffic reaches bili either: nudge-driven compression, manual `/compact`, and
+any host-side fallback keyed on provider errors are all unreachable. The
+session is permanently unusable; the only exit is deleting it and starting a
+fresh one (in companion scenarios that means losing the conversation memory —
+keep durable memory OUTSIDE the context: character card, journal, memory
+files). In the reported case the local log reached 30 MB / 24,051 events and
+dsh's native compaction had never run once in that session's life. One
+clarification: the compress action cost on the MODEL-facing side is bounded —
+re-sent compress calls ride the wire stubbed to ~200 chars per range entry —
+what grows unboundedly is the host's local store.
+
+Known refusal wording (for host-side detection regexes, as of the #5058
+report):
+
+> payload core text alone is ~… bytes … that is >= ~… tokens vs the model
+> window …; no upstream can accept it, so it was NOT forwarded even for
+> evidence.
+
+Mitigations for companion / always-on sessions:
+
+- **Rotate the session periodically** (e.g. daily) and keep persistent memory
+  in files, not in context length.
+- **Raise `compress.nudgeGrowthTokens`** (e.g. `500000`) or turn nudging off
+  for such sessions, so the compression cadence does not chase the session's
+  own growth.
+- **Watch the session file size** (`~/.dsh/sessions/…/session.v4.jsonl.zstd`)
+  — several MB of compressed events is a warning long before the window
+  fills.
+- Since this build, bili's **net-progress guard** stops sending compression
+  nudges once consecutive folds stop shrinking the session (Web UI badge
+  "swelling", `[net-progress]` lines in the proxy log, 10-minute wall cap).
+  It breaks the compress-action feedback loop that accelerates the approach to
+  the wall; it cannot trim dsh's local store itself.
+- A per-session "transport only, no compression" setting is tracked in
+  [#5052](https://github.com/ranxianglei/billion-context/issues/5052).
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart

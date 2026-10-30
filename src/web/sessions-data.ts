@@ -15,6 +15,7 @@ import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
 type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
+import { netProgressState } from "../net-progress-guard.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
@@ -946,6 +947,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         && typeof (amfRaw as Record<string, unknown>)["lastAt"] === "number"
         ? { count: (amfRaw as Record<string, unknown>)["count"] as number, lastAt: (amfRaw as Record<string, unknown>)["lastAt"] as number, ...(typeof (amfRaw as Record<string, unknown>)["lastVariant"] === "string" ? { lastVariant: (amfRaw as Record<string, unknown>)["lastVariant"] as string } : {}) }
         : undefined;
+    // #5058: armed net-progress latch (folds stop shrinking this session —
+    // nudge suppressed) — process-local by design (never persisted), so it is
+    // visible only while the live session object carries it; disk rows simply
+    // don't badge. Surface only while latched so the list can badge it.
+    const npSt = netProgressState(s);
+    const netProgress = npSt !== undefined && npSt.armedAt !== undefined
+        ? { baseline: npSt.baseline, expectedFloor: npSt.expectedFloor, strikes: npSt.strikes, since: npSt.armedAt }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -981,6 +990,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
+        ...(netProgress ? { netProgress } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
         ...(keepalive ? { keepalive } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),

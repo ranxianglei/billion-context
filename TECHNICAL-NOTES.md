@@ -384,6 +384,68 @@ remove <client>` best-effort queries the live proxy (instance file →
 `GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
 when sessions of that client were active within the last **10 minutes**.
 
+## Net-progress guard — stop compressing when folding stops shrinking (#5058)
+
+D1 above only arms when reductions STOP landing — it is blind to the opposite
+failure: folds keep committing while the session keeps GROWING. That is the
+companion-session spiral (#5058): every nudge round ends in a successful
+compress whose own action cost (tool-call args, receipts, reasoning — all
+re-sent next round) outweighs what the fold removed, so the flat-50K growth
+gate re-arms forever and the session walks past its window with no guard
+firing. The net-benefit gate (#2748/#3322) checks each commit in isolation;
+it cannot see the cross-round trajectory.
+
+`src/net-progress-guard.ts` adds the trajectory view:
+
+- **Lane scope** — plugin lanes only (`session.metadata.pluginAgent` bound).
+  Only a plugin host persists and re-sends the compression action itself, so
+  only there does the resent payload shrink when a fold works. Proxy-mode
+  clients keep their full local history and re-send it verbatim every turn —
+  once folded coverage exceeds the margin the raw resend structurally never
+  drops below pre-fold-minus-margin, so an unscoped latch would arm on every
+  mature proxy session and silence the flat-50K cadence without defending
+  anything.
+- **Baseline** — recorded at every successful fold commit in `src/stream.ts`:
+  `recordNetProgressBaseline(session, rawViewTokens, postCtx)`. The baseline
+  is the INBOUND RESEND total (same array class as the round check's
+  observation, #1911 same-space discipline); postCtx stays the rendered
+  post-fold estimate (diagnostic only). The rendered live view must not feed
+  this pair — mixing spaces would distort the bar by the reasoning-drop delta
+  on heavy-reasoning hosts. Each new fold opens a fresh evidence window;
+  strikes reset.
+- **Round check** — once per request on nudge-carrying lanes (inside the same
+  `!selfHealRoundDone && prepared.nudge !== undefined` block as D1/D2),
+  `evaluateNetProgressRound(session, observedTokens, log)` compares the
+  inbound resend size (`countMessageTokens` over `prepared.originalMessages`)
+  against the baseline: `observed < baseline − NET_PROGRESS_MARGIN_TOKENS`
+  (25_000 — half the flat step; large enough to absorb estimator noise and
+  the one-round materialization lag where the post-compress re-request still
+  carries the unfolded history, #252) counts as progress and resets;
+  otherwise it is a strike. `NET_PROGRESS_STRIKE_LIMIT` (2) consecutive
+  non-progress rounds arm the latch.
+- **Remedy** — suppress the nudge at all four `willInjectNudge` gates via
+  `nudgeInjectionBlocked(session)` (the D1 predicate OR'd with this one); the
+  decide ladder's fallback escape still punches through ONE legacy advisory
+  while suppressed (same #3004 deadlock guard as D1). Latch state
+  `{ baseline, expectedFloor, strikes, armedAt }` lives PROCESS-LOCAL in a
+  WeakMap keyed by the session object — persist serializes session.metadata
+  into the state file, and this guard fires on every successful fold commit,
+  so a persisted latch would drift the byte-for-byte storage goldens on every
+  long session (#4790 precedent); an evicted-and-reloaded session re-seeds
+  silently, which is harmless because wall expiry reuses
+  `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) so a latched session is never silent
+  past that without fresh evidence; any real reduction lifts it early; and a
+  fresh arm needs one more successful fold commit followed by at most
+  `NET_PROGRESS_STRIKE_LIMIT` non-progress rounds. Evaluate MUST run while
+  suppressed or recovery could never be observed (the #3004 circular-wait trap).
+
+Observability: armed state is exposed in `/__bili/sessions` (`netProgress`,
+live sessions only) and badged in the web UI ("swelling"); arm/recovery/
+expiry each log one `[net-progress]` line with the observed vs baseline
+numbers and the rotate-to-fresh-session advice. No config surface — constants
+by design (same precedent as #2155); operators who want a lazier cadence set
+`compress.nudgeGrowthTokens`.
+
 ## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
 
 When a native lane's proxy is unavailable, model traffic falls back to direct

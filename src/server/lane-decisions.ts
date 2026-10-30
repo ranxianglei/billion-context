@@ -215,9 +215,10 @@ export interface NudgeGateInputs {
     readonly compressSurfaceOn: boolean;
     /** responses: hasCompactionTrigger(parsed.input); others: false. */
     readonly compactionTrigger: boolean;
-    /** !nudgeSuppressed(session) || decideFallbackOverride — the decide
-     * ladder's fallback is the ONE exception that punches through the
-     * suppression latch (#3004 dead-lock guard). */
+    /** !nudgeInjectionBlocked(session) || decideFallbackOverride — the decide
+     * ladder's fallback is the ONE exception that punches through BOTH
+     * suppression latches (#2155 self-heal, #5058 net-progress; #3004
+     * dead-lock guard). */
     readonly suppressionBypassed: boolean;
     /** compressBreakerArmed(session). */
     readonly breakerArmed: boolean;
