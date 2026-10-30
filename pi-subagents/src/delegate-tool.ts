@@ -18,7 +18,15 @@ import type {
 import { debug, logError, logInfo, logWarn } from "./log.js";
 import { DEFAULT_DELEGATE_POLICY, type DelegatePolicy, type DelegateRoleConfig } from "./config.js";
 import { attachWatchdogs } from "./delegate-watchdog.js";
-import { parseEventLine, activityLines, newPortion, ThinkingCollector, type Usage } from "./delegate-events.js";
+import {
+  parseEventLine,
+  activityLines,
+  newPortion,
+  ThinkingCollector,
+  type Usage,
+  type AssistantTerminalInfo,
+  type EmptyReplyDiagnostics,
+} from "./delegate-events.js";
 import { isPiHost } from "./host.js";
 import {
   exitLabel,
@@ -499,6 +507,9 @@ export interface EventApplier {
   /** omp fallback: `-p` prints the plain reply as raw stdout; append it
    *  straight through (no event parsing). */
   appendRaw(text: string): void;
+  /** Terminal state of the last assistant message_end (#4359); undefined when
+   *  none was observed (print-mode hosts, kills before any message_end). */
+  getEmptyReplyDiagnostics(): EmptyReplyDiagnostics | undefined;
 }
 
 /** Applies parsed delegate JSON-event lines to the live reply/activity files.
@@ -517,6 +528,8 @@ export function makeEventApplier(
   let msgWritten = 0;
   const lastToolText = new Map<string, string>();
   const thinking = new ThinkingCollector(opts.showThinking);
+  let lastTerminal: AssistantTerminalInfo | undefined;
+  let lastUsage: Usage | undefined;
   const flushThinking = (): void => {
     const line = thinking.flush();
     if (line) writers.activity?.write(line);
@@ -525,7 +538,11 @@ export function makeEventApplier(
     const ev = parseEventLine(line);
     if (!ev) return;
     if (ev.kind === "usage-update") {
-      opts.onUsage?.(ev.usage);
+      if (ev.usage) {
+        opts.onUsage?.(ev.usage);
+        lastUsage = ev.usage;
+      }
+      if (ev.terminal) lastTerminal = ev.terminal;
       return;
     }
     if (ev.kind === "thinking-delta") {
@@ -580,6 +597,18 @@ export function makeEventApplier(
     appendRaw(text: string) {
       replyText += text;
       writers.reply.write(text);
+    },
+    getEmptyReplyDiagnostics(): EmptyReplyDiagnostics | undefined {
+      if (!lastTerminal) return undefined;
+      return {
+        stopReason: lastTerminal.stopReason,
+        rawStopReason: lastTerminal.rawStopReason,
+        errorMessage: lastTerminal.errorMessage,
+        textBlocks: lastTerminal.textBlocks,
+        thinkingBlocks: lastTerminal.thinkingBlocks,
+        usageIn: lastUsage?.input,
+        usageOut: lastUsage?.output,
+      };
     },
   };
 }
@@ -1189,7 +1218,7 @@ function withUndeliveredNotice<T>(result: AgentToolResult<T>): AgentToolResult<T
  *  once via this tool result). Returns null when the run was NOT injected,
  *  in which case the caller delivers the full payload via formatRunResult(). */
 export function injectedWaitMessage(
-  run: { injected?: boolean; readSuppressed?: boolean; result?: { file: string } },
+  run: { injected?: boolean; readSuppressed?: boolean; result?: { file?: string } },
   runId: string,
   remainingLine: string,
 ): string | null {
@@ -1617,6 +1646,7 @@ async function runDelegate(
             body = output || "(no output)";
           } else if (noOutput) {
             const parts: string[] = [NO_FINAL_OUTPUT_BODY];
+            parts.push(formatEmptyReplyDiagnostics(applier.getEmptyReplyDiagnostics()) || NO_FINAL_OUTPUT_DIAG_UNKNOWN);
             const err = stderrText.trim();
             if (err) parts.push(`stderr:\n${err}`);
             const tail = activityStream ? await readActivityTail(activityFile) : "";
@@ -1657,21 +1687,22 @@ async function runDelegate(
             if (output === "") {
               if (noOutput) {
                 const err = stderrText.trim();
-                await appendFile(file, `${NO_FINAL_OUTPUT_BODY}\n${err ? `\n${err}` : ""}\n`);
+                const diag = formatEmptyReplyDiagnostics(applier.getEmptyReplyDiagnostics()) || NO_FINAL_OUTPUT_DIAG_UNKNOWN;
+                await appendFile(file, `${NO_FINAL_OUTPUT_BODY}\n${diag}${err ? `\n${err}` : ""}\n`);
               } else {
                 const fallback = stderrText.trim();
                 await appendFile(file, fallback ? `${fallback}\n` : "(no output)\n");
               }
             }
-            // EOF-watchdog finalize has no exit code; if the output was delivered,
-            // treat it as a completed result (the process is killed afterwards).
-            const effectiveCode = effectiveExitCode(code, output, stderrText);
+            // Watchdog/EOF finalizes arrive with code === null; classification
+            // decides completed vs failed from exit state + settle evidence
+            // (#4359) — see classifyDelegateOutcome.
             // Atomically flip status + result together: until this point the run
             // is still "running" to any observer, so a concurrent wait cannot
             // see "finished but result missing".
             run.result = { code, file, body };
-            run.status = effectiveCode === 0 && !noOutput ? "completed" : "failed";
-            if (noOutput) logWarn("delegate", { event: "no-final-output", runId, agent: args.agent, code });
+            run.status = classifyDelegateOutcome(code, Boolean(run.timedOut), Boolean(run.agentSettled), output, stderrText);
+            if (noOutput) logWarn("delegate", { event: "no-final-output", runId, agent: args.agent, code, terminal: formatEmptyReplyDiagnostics(applier.getEmptyReplyDiagnostics()) || "unknown" });
             run.finishedAt = Date.now();
             // If a wait is parked on this run, wake it — it owns the result now
             // (and marks consumed so we don't double-deliver by injecting).
@@ -1816,7 +1847,7 @@ async function runDelegate(
     body = result.stderr.trim() || "(no stderr)";
   } else if (syncNoOutput) {
     const err = result.stderr.trim();
-    body = err ? `${NO_FINAL_OUTPUT_BODY}\n\nstderr:\n${err}` : NO_FINAL_OUTPUT_BODY;
+    body = err ? `${NO_FINAL_OUTPUT_BODY}\n${NO_FINAL_OUTPUT_DIAG_PRINT}\n\nstderr:\n${err}` : `${NO_FINAL_OUTPUT_BODY}\n${NO_FINAL_OUTPUT_DIAG_PRINT}`;
   } else {
     body = result.stdout;
   }
@@ -2031,29 +2062,79 @@ export function formatSyncResult(agent: string, runId: string, task: string, r: 
   if (r.code === 0 && !r.timedOut && !noOutput) {
     return formatPayload(header, file, task);
   }
-  const body = r.timedOut ? "(timed out)" : r.code === 0 ? NO_FINAL_OUTPUT_BODY : (r.stderr.trim() || "(no stderr)");
+  const body = r.timedOut ? "(timed out)" : r.code === 0 ? `${NO_FINAL_OUTPUT_BODY}\n${NO_FINAL_OUTPUT_DIAG_PRINT}` : (r.stderr.trim() || "(no stderr)");
   return formatPayload(header, file, task, body);
 }
 
 /** Exit-0 runs that produced no final reply text did not deliver anything
- *  actionable (#506): a thinking-only stop (thinking budget exhausted) or a
- *  silent no-op termination must not be announced as a plain completion — the
- *  parent would trust the notification and never re-dispatch the task. Real
- *  non-zero exits and watchdog kills (code null / timedOut) are handled by the
- *  existing failure paths and stay excluded here. */
+ *  actionable (#506/#4359): a thinking-only stop, a silent no-op termination,
+ *  or an upstream error/incomplete response must not be announced as a plain
+ *  completion — the parent would trust the notification and never re-dispatch
+ *  the task. Real non-zero exits and watchdog kills are handled by the failure
+ *  paths; the appended "upstream terminal state" line separates the causes. */
 export function genuineNoOutput(code: number | null, timedOut: boolean, output: string): boolean {
   return !timedOut && code === 0 && output.trim().length === 0;
 }
 
 export const NO_FINAL_OUTPUT_BODY =
-  "child exited 0 but produced NO final reply text — likely a thinking-only stop (thinking budget exhausted) " +
-  "or a no-op termination. Treat the task as NOT delivered: inspect the activity log and session file, then re-dispatch if needed.";
+  "child exited 0 but produced NO final reply text. Treat the task as NOT delivered: inspect the activity log and session file, then re-dispatch if needed.";
+
+/** Diagnostic line for empty-reply failures when no terminal state was ever
+ *  observed in the event stream (killed before any message_end, or a host
+ *  without json event mode). #4359 */
+export const NO_FINAL_OUTPUT_DIAG_UNKNOWN =
+  "upstream terminal state: unknown (no terminal assistant message observed)";
+
+/** Same line for sync/print runs, which have no event stream at all. #4359 */
+export const NO_FINAL_OUTPUT_DIAG_PRINT =
+  "upstream terminal state: unavailable (print mode — no event stream)";
+
+/** Render the captured upstream terminal state as the empty-reply diagnostic
+ *  line (#4359): distinguishes an upstream error/incomplete stop from a
+ *  completed-but-empty response. Unobserved fields render as unknown. "" when
+ *  nothing was observed — callers substitute their own unavailable-note. */
+export function formatEmptyReplyDiagnostics(d: EmptyReplyDiagnostics | undefined): string {
+  if (!d) return "";
+  const bits: string[] = [];
+  bits.push(`stopReason=${d.stopReason ?? "unknown"}`);
+  if (d.rawStopReason !== undefined) bits.push(`rawStopReason=${d.rawStopReason}`);
+  if (d.errorMessage !== undefined) bits.push(`errorMessage=${JSON.stringify(d.errorMessage)}`);
+  bits.push(`text_blocks=${d.textBlocks}`, `thinking_blocks=${d.thinkingBlocks}`);
+  if (d.usageIn !== undefined || d.usageOut !== undefined) {
+    bits.push(`last_turn_usage(in=${d.usageIn ?? "?"}, out=${d.usageOut ?? "?"})`);
+  }
+  return `upstream terminal state: ${bits.join(", ")}`;
+}
 
 /** Watchdog/EOF finalize arrives with code === null (the child was killed or
  *  never exited). If a result was delivered (non-empty reply or stderr), the
  *  run counts as completed (0); otherwise it stays null = genuine failure. */
 export function effectiveExitCode(code: number | null, output: string, stderr: string): number | null {
   return code ?? (output || stderr ? 0 : null);
+}
+
+/** Terminal status of a finished async delegate run (#4359). "completed"
+ *  requires BOTH a successful effective exit AND positive completion evidence:
+ *  a real (non-null) exit code without a watchdog timeout, OR the agent having
+ *  settled (agent_settled observed). A watchdog kill records timedOut ONLY
+ *  while the agent has not settled (the onKill/onEofGrace callbacks gate on
+ *  agentSettled), so a timed-out non-settled run is a FAILURE regardless of
+ *  partial progress text or stderr — those prove the agent was cut off
+ *  mid-work, they are not a delivered result. Null-code closes without settle
+ *  evidence (external kills, spawn errors) fail too. The settled exception
+ *  keeps its old semantics: delivered output whose process hung in teardown/EOF
+ *  (code null, settled) still counts completed. With agentSettled=false this
+ *  rule projects exactly onto the sync ternary, keeping async/sync aligned. */
+export function classifyDelegateOutcome(
+  code: number | null,
+  timedOut: boolean,
+  agentSettled: boolean,
+  output: string,
+  stderr: string,
+): "completed" | "failed" {
+  const noOutput = genuineNoOutput(code, timedOut, output);
+  const effectiveCode = effectiveExitCode(code, output, stderr);
+  return effectiveCode === 0 && !noOutput && (agentSettled || (!timedOut && code !== null)) ? "completed" : "failed";
 }
 
 /** Pure read-after-finish predicate: should the completion notification be
