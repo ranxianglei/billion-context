@@ -1000,7 +1000,10 @@ function deepSizeOf(value: unknown): number {
     return size(value);
 }
 
-function sessionWeight(session: Session): number {
+/** #4788 D1-A: exported so SessionStore's per-session hard-cap gate can reuse
+ * the SAME estimate as __bili/memory (single source of truth for "how heavy
+ * is this resident session right now"). */
+export function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
@@ -1780,7 +1783,7 @@ export function foldCoverage(
 // — the storage seam needs them without session.ts's built-acp-kernel import;
 // the doc comments live there now). Re-exported so existing consumers keep the
 // session.js import path.
-export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds, withoutTurnSeparators } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the

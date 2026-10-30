@@ -1343,11 +1343,13 @@ const emergencyTruncateNode: PipelineNode = {
     // content-bound, so an edited message misses its entry and re-judges from
     // scratch; entries whose messages left the view retire; the whole latch
     // resets on the next successful fold (applyCompression).
-    const latch = io.state.emergencyTruncateLatch ?? [];
+    const storedLatch = io.state.emergencyTruncateLatch ?? [];
+    // BLOCKED is shared by protected messages, not a message identity (#5101).
+    const latch = storedLatch.filter((entry) => entry.ref !== BLOCKED_REF);
     const liveRefs = new Set<string>();
     for (const m of io.messages) {
       const ref = io.state.messageRefs.byRaw[m.id];
-      if (ref !== undefined) liveRefs.add(ref);
+      if (ref !== undefined && ref !== BLOCKED_REF) liveRefs.add(ref);
     }
     const latchLive = latch.filter((e) => liveRefs.has(e.ref));
     let messages = io.messages;
@@ -1356,7 +1358,8 @@ const emergencyTruncateNode: PipelineNode = {
       const byRef = new Map(latch.map((e) => [e.ref, e.text]));
       messages = io.messages.map((m) => {
         const ref = io.state.messageRefs.byRaw[m.id];
-        const clipped = ref !== undefined ? byRef.get(ref) : undefined;
+        const clipped =
+          ref !== undefined && ref !== BLOCKED_REF ? byRef.get(ref) : undefined;
         if (clipped === undefined || clipped === m.text) return m;
         replaySaved += Math.max(
           0,
@@ -1366,7 +1369,7 @@ const emergencyTruncateNode: PipelineNode = {
       });
     }
     if (usage < ctx.config.truncate.threshold) {
-      if (latch.length === 0 && prevStreak === 0) return io;
+      if (storedLatch.length === 0 && prevStreak === 0) return io;
       return {
         ...io,
         messages,
@@ -1435,7 +1438,11 @@ const emergencyTruncateNode: PipelineNode = {
     for (const id of trunc.truncatedIds ?? []) {
       const ref = io.state.messageRefs.byRaw[id];
       const clippedMsg = trunc.messages.find((m) => m.id === id);
-      if (ref !== undefined && clippedMsg?.text !== undefined) {
+      if (
+        ref !== undefined &&
+        ref !== BLOCKED_REF &&
+        clippedMsg?.text !== undefined
+      ) {
         clips.push({ ref, text: clippedMsg.text });
       }
     }

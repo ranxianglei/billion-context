@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -59,6 +59,7 @@ import { getSession, hasProcessedState, listSessions, peekSession, type PendingR
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
+import { pckNoticeActive } from "./pck-notice.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
     coreToGoogle,
@@ -94,13 +95,14 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
-import { mayClobberPointer, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
+import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
+import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -495,15 +497,21 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // %TEMP%/bili-proxy-<port>.log (raw append fd, no rotation) — with the
     // file leg live that pipe is a pure unbounded duplicate of bili.log
     // (31.7MB/5 days observed, other sessions' traces included). Mute it:
-    // the port log degrades to a pre-logger crash sink only. Manual starts
-    // (no launch token) keep the terminal tee; a dead file leg keeps the
-    // stderr fallback. #3857: the decision waits for the file leg to be
-    // PROVEN live (onFileLegLive) — liveness means the first byte was
-    // DELIVERED, not merely opened: on win32 (observed node 22) some paths
-    // hand out an fd whose writes then always fail, and at startup the stream
-    // is only pending anyway; deciding on either muted stderr over a dead leg
-    // and every line vanished with zero trace.
-    if (process.env.BILI_LAUNCH_TOKEN?.trim()) {
+    // the port log degrades to a pre-logger crash sink only. #3857: the
+    // decision waits for the file leg to be PROVEN live (onFileLegLive) —
+    // liveness means the first byte was DELIVERED, not merely opened: on win32
+    // (observed node 22) some paths hand out an fd whose writes then always
+    // fail, and at startup the stream is only pending anyway; deciding on
+    // either muted stderr over a dead leg and every line vanished with zero
+    // trace. #5012: the same reasoning extends beyond launcher children to ANY
+    // non-terminal stderr — a host that spawns bili and captures stderr into a
+    // buffer without draining it fills the ~64KB pipe; Node pipe writes are
+    // blocking and a full pipe NEVER emits an error event, so the proxy's
+    // event loop wedged mid-write: no crash, no error line, silent file leg,
+    // the "App frozen" symptom class. A terminal (isTTY) drains by design and
+    // keeps the tee; everything else gets the durable bili.log only (a dead
+    // file leg still restores the stderr fallback, warnReopenFailed).
+    if (shouldMuteStderrLegAfterFileLive(Boolean(process.env.BILI_LAUNCH_TOKEN?.trim()), process.stderr.isTTY)) {
         onFileLegLive(() => muteStderrLeg());
     }
     const core = createCore();
@@ -640,6 +648,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
         modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
     };
+    // #4762: arm the event-loop wedge detector as EARLY as startServer runs —
+    // startup phases (twin probes, engine/storage init, hydrate) carry their
+    // own sync-I/O hotspots and a stderr-pipe wedge (#5012 class) can arrive
+    // any time logging flows, so arming only after markBootReady left those
+    // windows unwatched. configureLogger here mirrors the early-twin path
+    // below (idempotent — createEngineContext re-configures the same path);
+    // plugin-injection mode never calls startServer, so the host process can
+    // still never trip the self-exit.
+    const watchLogFile = configureLogger(opts.logFile ?? defaultLogFile());
+    armEventLoopWatchdog({
+        logFile: watchLogFile,
+        version: VERSION,
+        onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
+    });
+
     const earlyTwin = await findVerifiedSameLaneTwin(
         listInstances(),
         opts.port,
@@ -649,14 +672,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
         // createEngineContext has not run yet, so its configureLogger call
         // has not happened either — open the file leg here (mirroring it) so
         // the adopt line lands in bili.log like the late-path twin line, gate
         // on opts.log like every other startServer line, and drain the stream
         // before exiting or the buffered line can be lost with the process.
         configureLogger(opts.logFile ?? defaultLogFile());
+        // #4762: the twin verdict above rested on ONE health probe during
+        // classification — a wedged zombie drains probes intermittently, so
+        // re-probe at the moment of death and say which case we actually hit.
+        const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, opts.port), knownPid: earlyTwin.pid });
+        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`;
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
         logMsg(opts, "error", listenLine);
         if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
         await closeLogger();
@@ -1256,6 +1283,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : "")
                 + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : ""),
         );
+        // #4994 rung 2: the spawner's timeout adoption parses THIS child's
+        // pid-tagged listen line out of the per-port log when it laddered off
+        // the preferred port — but post-#2864 the muted stderr leg means the
+        // banner above never reaches that file (same explicit-write pattern
+        // as the listen-failed paths below; the line names the actual bound
+        // origin while the file stays keyed on the preferred port).
+        if (launchToken !== undefined) {
+            writeSpawnPortLog(
+                opts.port,
+                `${logTimestamp()} [info] acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}`,
+            );
+        }
         if (opts.passthrough) {
             log(
                 "warn",
@@ -1264,6 +1303,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     (opts.passthroughSource === "env"
                         ? "Unset ACP_PASSTHROUGH (or drop --passthrough) and restart to re-enable compression."
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
+            );
+        }
+        // #5079: first upgrade onto the default-off pck switch — tell relay /
+        // account-pool users their affinity signal is off until they opt back in.
+        if (pckNoticeActive(effectivePromptCacheRouting(opts.promptCache))) {
+            log(
+                "info",
+                `[pck] prompt_cache_key self-stamping is OFF by default now (#5079). ` +
+                    "Upstreams that route prefix cache by this key (relays like workbuddy panel/hub, account pools) need it ON — set promptCache.routing=auto (or ACP_PROMPT_CACHE_ROUTING=auto) or use the web UI switch; direct official-API users can ignore this.",
             );
         }
         // #2090 plan A: signed requests refused earlier that the user has not
@@ -1333,6 +1381,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
+        // The event-loop watchdog was armed at startServer entry (#4762):
+        // arming only here would leave startup-phase wedges unwatched.
         engine.markBootReady();
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
@@ -1479,6 +1529,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // log, but post-#2864 this child mutes its stderr leg into bili.log —
             // without this line that file stays 0 bytes and the diagnosis dies there.
             if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+            // #4762: terminal port-busy decisions die with a hint written from
+            // REGISTRY evidence alone (pid alive => "serving"). Re-probe the
+            // holder once before exiting so a wedged zombie is named as such -
+            // bounded by HOLDER_PROBE_TIMEOUT_MS on a process that is dying anyway.
+            if (busyReason !== undefined) {
+                const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, lastTriedPort), knownPid: peer?.entry.pid });
+                const diagLine = `[eaddrinuse-diag] ${holderFragment}`;
+                log("error", diagLine);
+                if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${diagLine}`);
+            }
             shuttingDown = true;
             server.close();
             flushConversations();
@@ -1617,32 +1677,72 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let lastStaleHb: number[] = [];
         // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
         const deadStreak = new Map<number, number>();
+        // #5152: the stale-heartbeat reading is taken on THIS event loop, so it
+        // is only trustworthy while this loop can run at all. A long synchronous
+        // turn starves the /__bili/watcher handler AND this ticker equally, so
+        // the pause is blindness that must not be charged to the owner. Measured
+        // from the ticker's OWN scheduling drift (the timer is armed for
+        // WATCHER_TICK_MS; any excess is the loop being unable to run) — a
+        // parallel sampling timer would be starved by the very stall it is
+        // supposed to report, and reads 0.
+        let prevTickAt: number | null = null;
+        const observedLoopLagMs = (tickAt: number): number => {
+            const lag = prevTickAt === null ? 0 : tickAt - prevTickAt - WATCHER_TICK_MS;
+            prevTickAt = tickAt;
+            return lag;
+        };
+        // #4994: consecutive stale-while-alive readings per pid (see WATCHER_HEARTBEAT_CONFIRM_TICKS).
+        const hbStreaks = new Map<number, number>();
         const watcher = setInterval(() => {
             const dead: number[] = [];
             const staleByHeartbeat: number[] = [];
             const tickNow = Date.now();
+            const heartbeatGraceMs = effectiveHeartbeatGrace(WATCHER_HEARTBEAT_GRACE_MS, observedLoopLagMs(tickNow));
             for (const pid of proxyWatchers) {
                 const probe = probePid(pid);
+                const lastSeenAt = watcherLastSeen.get(pid);
                 // #3544: heartbeat-opted owners ALSO die by liveness-proof
                 // expiry — kill(pid,0) is an existence check, identity-blind
                 // under Windows pid reuse. Legacy pids (no heartbeat on record)
                 // keep kill-0-only semantics. #3890: a failed kill-0 must be
                 // CONFIRMED over consecutive ticks before it removes the pid —
                 // one transient OpenProcess failure used to be enough to kill
-                // the whole proxy while its parent lived on.
-                const decision = tickWatchedPid(probe, watcherLastSeen.get(pid), tickNow, deadStreak.get(pid), { heartbeatGraceMs: WATCHER_HEARTBEAT_GRACE_MS, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS });
+                // the whole proxy while its parent lived on. #4994: the same
+                // confirmation now guards the heartbeat branch — that reading
+                // is taken across the proxy's OWN event loop, so one stale
+                // snapshot from a busy turn used to commit suicide mid-turn
+                // while the parent lived on.
+                const decision = tickWatchedPid(probe, lastSeenAt, tickNow, deadStreak.get(pid), hbStreaks.get(pid), { heartbeatGraceMs, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS, heartbeatConfirmTicks: WATCHER_HEARTBEAT_CONFIRM_TICKS });
                 if (decision.removed) {
                     proxyWatchers.delete(pid);
                     watcherLastSeen.delete(pid);
                     deadStreak.delete(pid);
+                    hbStreaks.delete(pid);
                     dead.push(pid);
-                    if (decision.staleHeartbeat) staleByHeartbeat.push(pid);
+                    if (decision.staleHeartbeat) {
+                        staleByHeartbeat.push(pid);
+                        // #4994: attribute the killing branch here — the [stale-heartbeat]
+                        // suffix below survives to shutdown only when this very tick also
+                        // empties the set, so most heart-death episodes were invisible.
+                        log("warn", `[watchdog] pid ${pid} stale-heartbeat confirmed after ${WATCHER_HEARTBEAT_CONFIRM_TICKS} consecutive ticks (last beat ${Math.max(0, tickNow - (lastSeenAt ?? tickNow))}ms ago, pid still reads alive) — removing (#3544/#4994)`);
+                    } else {
+                        log("warn", `[watchdog] pid ${pid} dead confirmed after ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failed kill-0 probes (last code=${probe.errCode ?? "?"}) — removing (#3890)`);
+                    }
                     continue;
                 }
                 if (probe.alive) {
                     if ((deadStreak.get(pid) ?? 0) > 0) {
                         deadStreak.delete(pid);
                         log("info", `[watchdog] pid ${pid} alive again after failed kill-0 probe(s) — clearing death streak (#3890)`);
+                    }
+                    if (decision.staleHeartbeat) {
+                        if ((hbStreaks.get(pid) ?? 0) === 0) {
+                            log("info", `[watchdog] heartbeat stale for pid ${pid} (${Math.max(0, tickNow - (lastSeenAt ?? tickNow))}ms since last beat, pid still reads alive) — requiring ${WATCHER_HEARTBEAT_CONFIRM_TICKS} consecutive stale ticks before believing it (#4994)`);
+                        }
+                        hbStreaks.set(pid, decision.hbStreak);
+                    } else if ((hbStreaks.get(pid) ?? 0) > 0) {
+                        hbStreaks.delete(pid);
+                        log("info", `[watchdog] pid ${pid} heartbeating again — clearing stale-heartbeat streak (#4994)`);
                     }
                 } else {
                     if (decision.streak === 1) {
@@ -1653,6 +1753,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) — requiring ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failures before believing it (#3890)`);
                     }
                     deadStreak.set(pid, decision.streak);
+                    // #4994: a kill-0-failing tick DISAGREES with the heartbeat axis and must
+                    // break its run — otherwise a flapping probe (Windows OpenProcess) lets
+                    // stale ticks accumulate across the gap and confirm without N CONSECUTIVE
+                    // alive-stale readings. The pure function already reports hbStreak 0 here;
+                    // persist it (mirrors the alive branch clearing deadStreak).
+                    if ((hbStreaks.get(pid) ?? 0) > 0) {
+                        hbStreaks.delete(pid);
+                        log("info", `[watchdog] pid ${pid} kill-0 probe failing — clearing stale-heartbeat streak (#4994)`);
+                    }
                 }
             }
             if (dead.length > 0) lastDead = dead;
@@ -1670,7 +1779,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 if (lastStaleHb.length > 0) reason += ` [stale-heartbeat pids: ${lastStaleHb.join(", ")}]`;
                 shutdown(reason);
             }
-        }, 2_000);
+        }, WATCHER_TICK_MS);
         watcher.unref?.();
     }
     return server;
@@ -1947,6 +2056,13 @@ export function resolveKnownOutputCeiling(
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
+// How often the watchdog re-probes every watched pid. Named because the tick
+// interval is also the BASELINE for #5152's lag measurement: a tick that
+// arrives WATCHER_TICK_MS later than its predecessor was a tick the event loop
+// could not run — that excess is the proxy's own blindness, not evidence about
+// the owner.
+const WATCHER_TICK_MS = 2_000;
+
 // #3544: how long a heartbeat-opted owner may go silent before the watchdog
 // counts it dead even though its pid still exists (recycled). 3 missed beats
 // at the 5s client interval, tolerant of scheduler skew on a busy host.
@@ -1961,6 +2077,28 @@ const WATCHER_HEARTBEAT_GRACE_MS = 15_000;
 export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowMs: number, heartbeatGraceMs: number): boolean {
     if (!alive) return true;
     return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
+}
+
+/** #5152: widen the heartbeat grace by the event-loop lag the watchdog itself
+ *  observed. The stale-heartbeat reading is taken on the proxy's OWN loop, so
+ *  when the loop could not run for N ms, an age that grew by N ms carries no
+ *  information about the owner: the honest window is `grace + N`.
+ *
+ *  Deliberately UNCAPPED. A 2-minute cap was the obvious first instinct, but it
+ *  is wrong for the failure it targets — #5138 records a ~19 MINUTE full-loop
+ *  block, and any cap below the real stall reintroduces exactly the false death
+ *  the change exists to stop. No cap is needed for safety: the extension is not
+ *  sticky. Every tick takes a FRESH measurement, so once the loop recovers the
+ *  window snaps back to the constant and a genuinely recycled pid (#3544) is
+ *  removed normally — the guarantee is delayed only by the duration of a stall
+ *  the proxy itself suffered, which is precisely the time it could not have
+ *  observed anything.
+ *
+ *  Unknown, zero or nonsensical lag falls through to the historical constant,
+ *  preserving pre-fix behavior bit-for-bit whenever no measurement exists. */
+export function effectiveHeartbeatGrace(heartbeatGraceMs: number, loopLagMs: number | undefined): number {
+    if (loopLagMs === undefined || !Number.isFinite(loopLagMs) || loopLagMs <= 0) return heartbeatGraceMs;
+    return heartbeatGraceMs + loopLagMs;
 }
 
 // #3890: the shutdown backstop window, and how many times it may RE-ARM while
@@ -1981,6 +2119,21 @@ const SHUTDOWN_DRAIN_MAX_PASSES = 10;
 // genuinely dead parent still exits promptly.
 const WATCHER_DEAD_CONFIRM_TICKS = 3;
 
+// #4994: how many CONSECUTIVE stale-while-alive ticks must agree before the
+// watchdog believes a heartbeat-opted owner has died. Pre-fix, ONE stale
+// reading removed the pid immediately — but that reading is taken on the
+// proxy's OWN event loop: a long synchronous turn (big compression, big
+// forward) starves the /__bili/watcher handler while the parent lives on, so
+// a busy-but-alive owner read dead ~grace into the stall and the proxy
+// committed suicide mid-turn (16 parent-gone events in 24h on Linux, where
+// kill-0 never lies — #4994 floor 6). Five ticks (~8s) rather than the
+// kill-0 shape's three: the window must span one full 5s beat interval plus
+// tick alignment, else the worst case (first stale tick at t0, next live beat
+// lands t0+5s and is processed t0+6s) is still a false death at t0+4s. A
+// truly recycled pid (#3544's reason for the branch) now exits ~8s later
+// than before — the anti-reuse guarantee holds, only slower.
+const WATCHER_HEARTBEAT_CONFIRM_TICKS = 5;
+
 interface WatcherTickDecision {
     /** Remove this pid from the watcher set on this tick. */
     removed: boolean;
@@ -1988,19 +2141,31 @@ interface WatcherTickDecision {
     staleHeartbeat: boolean;
     /** Failed-probe streak after this tick (0 when alive or removed). */
     streak: number;
+    /** Stale-while-alive streak after this tick (0 when the beat is fresh or removed). #4994. */
+    hbStreak: number;
 }
 
-/** #3890: pure per-pid death-streak step. A live probe resets the streak; a
- *  failed probe increments it and only removes the pid once the streak reaches
- *  confirmTicks. Heartbeat expiry stays immediate (it is a time-based liveness
- *  proof, not an existence probe — #3544 semantics). */
-export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number }): WatcherTickDecision {
+/** #3890/#4994: pure per-pid death-streak step. Each axis confirms
+ *  independently over CONSECUTIVE agreeing ticks: a failed kill-0 probe
+ *  increments its streak and only removes at confirmTicks; a stale-while-alive
+ *  reading increments the heartbeat streak and only removes at
+ *  heartbeatConfirmTicks. A live probe resets the kill-0 axis, a fresh beat
+ *  resets the heartbeat axis, and a tick that disagrees with an axis breaks
+ *  THAT axis's run (episodes never accumulate across interruptions). Legacy
+ *  pids (no heartbeat record) keep kill-0-only semantics (#3544). */
+export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, prevHbStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number; heartbeatConfirmTicks: number }): WatcherTickDecision {
     if (probe.alive) {
         const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
-        return { removed: staleHeartbeat, staleHeartbeat, streak: 0 };
+        if (!staleHeartbeat) return { removed: false, staleHeartbeat: false, streak: 0, hbStreak: 0 };
+        const hbStreak = (prevHbStreak ?? 0) + 1;
+        return hbStreak >= opts.heartbeatConfirmTicks
+            ? { removed: true, staleHeartbeat: true, streak: 0, hbStreak: 0 }
+            : { removed: false, staleHeartbeat: true, streak: 0, hbStreak };
     }
     const streak = (prevStreak ?? 0) + 1;
-    return streak >= opts.confirmTicks ? { removed: true, staleHeartbeat: false, streak: 0 } : { removed: false, staleHeartbeat: false, streak };
+    return streak >= opts.confirmTicks
+        ? { removed: true, staleHeartbeat: false, streak: 0, hbStreak: 0 }
+        : { removed: false, staleHeartbeat: false, streak, hbStreak: 0 };
 }
 
 
@@ -2587,6 +2752,21 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #5135: pending compress credit proves THIS session executed its own fold
+    // since the last settle — applyRanges (stream.ts) already netted the
+    // savings out of lastInputTokens while lastUsageGradeTokens still carries
+    // the pre-fold report. Until processTurn materializes the fold and clears
+    // the credit, the resent history still contains the covered originals, so
+    // the raw inbound upper bound legitimately towers over the last OUTBOUND
+    // snapshot on long sessions — letting anchorImpossible stand would refuse
+    // this session's own honest anchor and hand the meter the stale pre-fold
+    // grade (false pressure-T2 right after a successful T1). Credit can only
+    // be minted by this conversation's own folds (foreign usage samples write
+    // none), so it exempts exactly this window; the #4805/#4849 anchor-
+    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
+    // still wins (#4383: newer unreported sends ride their own measurements);
+    // zero is a valid drained reading (kernel treats 0 as unknown).
+    if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,

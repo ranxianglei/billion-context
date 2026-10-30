@@ -116,7 +116,11 @@ function writeScript(root: string, name: string, body: string): string {
 
 async function waitForFile(file: string, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
-    while (!fs.existsSync(file)) {
+    let lastSize = -1;
+    for (;;) {
+        const size = fs.existsSync(file) ? fs.statSync(file).size : -1;
+        if (size > 0 && size === lastSize) return;
+        lastSize = size;
         if (Date.now() > deadline) throw new Error(`timed out waiting for ${file}`);
         await new Promise((resolve) => setTimeout(resolve, 50));
     }

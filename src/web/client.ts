@@ -392,6 +392,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
+    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
+    // self-stamping is off by default now. Server decides active (effective
+    // routing "disabled" && not dismissed); pure builder, same test-seam
+    // convention as the banners above.
+    function bili_pckNoticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -1298,18 +1309,14 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
-                // the machine-global sessions dir is the supported topology —
-                // informational styling, not a corruption alarm.
-                if (sp.benign === true) {
-                    spb.classList.remove("warn");
-                    spb.classList.add("info");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
-                } else {
-                    spb.classList.remove("info");
-                    spb.classList.add("warn");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
-                }
+                // #5082: several instances opening one index.db is the
+                // supported topology — informational styling, never a
+                // corruption alarm. The real hazard (two instances writing
+                // the SAME session) has its own banner via the #3923
+                // split-brain contest.
+                spb.classList.remove("warn");
+                spb.classList.add("info");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_shared_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_shared", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
@@ -1504,6 +1511,36 @@ function changelogCatOf(rawLine) {
                 hb.hidden = true;
                 hb.classList.remove("show");
                 hb.innerHTML = "";
+            }
+        }
+        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
+        // server-side (POST /__bili/notices/dismiss) so one close silences
+        // every browser; the banner re-renders from the refetched overview.
+        const nb = $("pck-notice-banner");
+        if (nb) {
+            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
+            if (pn && pn.active === true) {
+                nb.hidden = false;
+                nb.classList.add("show");
+                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
+                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
+                            toast(t("pckoff.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                nb.hidden = true;
+                nb.classList.remove("show");
+                nb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -3801,6 +3838,22 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             packSel.value = pv;
             updatePackNote();
+            const pcv = (draft.promptCache && typeof draft.promptCache === "object" && !Array.isArray(draft.promptCache) && typeof draft.promptCache.routing === "string") ? draft.promptCache.routing : "disabled";
+            while (pckSel.options.length > 0) pckSel.removeChild(pckSel.lastChild);
+            PCK_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                pckSel.appendChild(o);
+            });
+            if (!PCK_VALUES.includes(pcv)) {
+                const o = document.createElement("option");
+                o.value = pcv;
+                o.textContent = pcv + " *";
+                pckSel.appendChild(o);
+            }
+            pckSel.value = pcv;
+            updatePckNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -3936,6 +3989,38 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         packSel.addEventListener("change", () => commit((d) => {
             if (!compressOf(d)) d.compress = {};
             if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
+        // #5079: prompt_cache_key self-stamping switch — the single knob that
+        // decides whether bili writes its own prompt_cache_key on egress.
+        // Values map 1:1 onto the config file (promptCache.routing), so this
+        // control and the raw JSON editor below stay in sync through commit().
+        const PCK_VALUES = ["disabled", "auto", "enabled"];
+        const pckSel = document.createElement("select");
+        pckSel.className = "field-input mono";
+        qCtrls.push(pckSel);
+        const pkw = document.createElement("div");
+        pkw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const pklab = document.createElement("label");
+        pklab.htmlFor = "quick-pck";
+        pklab.style.cssText = "flex:0 1 auto;max-width:520px";
+        pklab.textContent = t("cfg.q_pck");
+        pckSel.id = "quick-pck";
+        pkw.appendChild(pklab);
+        pkw.appendChild(pckSel);
+        box.appendChild(pkw);
+        const pckNote = document.createElement("div");
+        pckNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePckNote() {
+            if (pckSel.value === "disabled") pckNote.textContent = t("cfg.q_pck_disabled_desc");
+            else if (pckSel.value === "auto") pckNote.textContent = t("cfg.q_pck_auto_desc");
+            else if (pckSel.value === "enabled") pckNote.textContent = t("cfg.q_pck_enabled_desc");
+            else pckNote.textContent = t("cfg.q_pck_custom");
+        }
+        box.appendChild(pckNote);
+        pckSel.addEventListener("change", () => commit((d) => {
+            const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
+            if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
+            if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";

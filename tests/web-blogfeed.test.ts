@@ -10,7 +10,7 @@
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerResponse } from "node:http";
@@ -92,6 +92,21 @@ test("rendering is escape-first: script tags survive only escaped; tables become
     const alpha = data.items.find((i) => i.id === "alpha")!;
     assert.ok(alpha.html.includes('<table class="data">'));
     assert.ok(alpha.html.includes("<td>two</td>"));
+});
+
+test("CRLF markdown preserves bilingual frontmatter and rendered content", () => {
+    const expected = getBlogFeed();
+    for (const relative of [
+        "website/blog/posts/2026-10-08_demo.md",
+        "website/blog/posts/2026-10-08_demo.zh.md",
+        "paper/a.md",
+        "paper/b.md",
+    ]) {
+        const file = join(pkgRoot, relative);
+        writeFileSync(file, readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
+    }
+    _setBlogRootForTest(pkgRoot);
+    assert.deepEqual(getBlogFeed(), expected);
 });
 
 test("image refs: shipped files reroute to the panel asset prefix; traversal/unshipped refs drop silently", () => {

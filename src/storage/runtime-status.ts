@@ -44,9 +44,10 @@ interface RuntimeState {
      *  foreign pid holds the db lockfile. */
     integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
     /** #4175/#3959: live foreign pid holding <db>.lock at open. Self-cleared
-     *  at status read once the pid dies (never freezes). benign=true when the
-     *  pid maps to a KNOWN bili instance of a DIFFERENT lane (#3923 shared
-     *  topology — informational, not an alarm). */
+     *  at status read once the pid dies (never freezes). #5082: coexistence
+     *  on one index.db is the supported topology, ALWAYS informational;
+     *  `benign` is kept for wire-shape compat and is always true from the
+     *  store path. */
     secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
     /** #3923/#3959: latest surfaced split-brain contest (newest wins; cleared
      *  via the ack endpoint, which pins the acknowledged peer servedAt). */
@@ -90,7 +91,8 @@ export function recordIntegrityOutcome(dbPath: string, ok: boolean, durationMs: 
 }
 
 /** #4175: a live foreign pid holds <db>.lock. `info` adds the registry facts
- *  (cross-lane downgrade, #3923/#3959). */
+ *  (pid/lane naming). #5082: purely informational, never an alarm; the
+ *  same-session hazard is reported by the split-brain contest instead. */
 export function recordSecondProcessOwner(pid: number, info?: { lane?: string; instanceId?: string; benign: boolean }): void {
     state.secondProcess = { pid, at: Date.now(), benign: false, ...(info ?? {}) };
 }

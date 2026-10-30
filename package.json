@@ -30,9 +30,9 @@
     "pretest": "node scripts/test-suite-lock.mjs gate && node scripts/ci-pretest-cache.mjs",
     "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",
-    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
-    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
-    "test:e2e:image": "node --import tsx --test tests/e2e/e2e-image-billing.test.ts",
+    "test:e2e": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-codex.test.ts",
+    "test:e2e:fake": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
+    "test:e2e:image": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-image-billing.test.ts",
     "gate:local": "node scripts/release-gate-local.mjs"
   },
   "keywords": [
