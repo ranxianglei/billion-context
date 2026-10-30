@@ -62,6 +62,7 @@ import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
+import { armNativeLane } from "./native-attach.js";
 import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
@@ -767,7 +768,23 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  or undefined when nothing came up (register left base-less; maybeRetry
  *  keeps re-probing through the respawn hook). Exported for tests, like the
  *  omp/pi/opencode lanes' twins: the pinned-attach version decision (#3544) is
- *  driven hermetically against a version-controllable resident. */
+ *  driven hermetically against a version-controllable resident.
+ *
+ *  #5241 phase 1 (PR-1d) — deliberate split, do not "finish" the migration:
+ *  pi/omp/opencode ride the shared thin lifecycle in native-attach.ts; THIS
+ *  lane keeps its own function. The thick variant is not a parameterization
+ *  of the thin one: #3616 world-generation checks sit at different points per
+ *  branch (landings check giveUpSeq, the spawn landing checks ONLY the gen —
+ *  #983/#1783 self-heal requires a late spawn landing to re-base a given-up
+ *  register), #3544 rotation emits client events before any staleness check,
+ *  and the register — not the env — is dsh's publish surface. Branch-hook
+ *  transposition would spread one coherent state machine across two files
+ *  with subtly mismatched check points. What IS shared: the armNativeLane
+ *  guard (armed in apply()), the #1365 precedence chain (explicit > routed
+ *  > planned — kept in lockstep by the phase-0 stakes), and the probe/wait
+ *  primitives.
+ *  The divergence is frozen by tests/issue3544-stale-proxy-rotation.test.ts
+ *  and tests/contract-v2-stake-verify-attach.test.ts. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     const seqAtEntry = register.giveUpSeq;
     // #3616: capture this flight's world — an apply() re-arm (or a test reset)
@@ -1770,6 +1787,11 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+    // #5241 phase 1: one native lane per process — a second, different lane
+    // would overwrite this lane's BILLION_CONTEXT_PROXY and fetch intercept
+    // (see native-attach.ts). dsh's arm point is this apply(): the plugin
+    // lifecycle owns the lane, and re-activation (same lane) stays legal.
+    armNativeLane("dsh");
     // #3616: a fresh activation is a fresh origin world — in-flight recoveries
     // from the previous world are superseded here (their late landings must not
     // write this world's register/state). Off-mode arms nothing and bumps
