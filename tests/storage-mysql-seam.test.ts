@@ -16,8 +16,11 @@ import type {
     RefRow,
     CcrEntryRow,
     SessionSummaryRow,
+    StorageReadView,
+    SessionViewRows,
 } from "../src/storage/backend.ts";
 import { sha256 } from "../src/storage/canonical.ts";
+import { viewPointerSeqs } from "../src/storage/store.ts";
 
 /**
  * #4942: the async reload seam on network storage backends — hermetic twin of
@@ -116,19 +119,43 @@ class StubMysqlBackend implements StorageBackend {
     cloneSessionRows(): Promise<boolean> {
         return Promise.resolve(true);
     }
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]> {
         const rows = this.rows.get(sessionId)?.messages ?? [];
-        return Promise.resolve(rows.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })));
+        const live = opts?.seqs ? rows.filter((r) => opts.seqs!.includes(r.seq)) : rows;
+        return Promise.resolve(live.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })));
     }
-    getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+    getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         const rows = this.rows.get(sessionId)?.blocks ?? [];
-        return Promise.resolve(rows.map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })));
+        const start = opts?.offset ?? 0;
+        const slice = opts ? rows.slice(start, start + opts.limit) : rows;
+        return Promise.resolve(slice.map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })));
     }
     getDeadRefs(sessionId: string): Promise<IngestSessionInput["deadRefs"]> {
         return Promise.resolve(this.rows.get(sessionId)?.deadRefs ?? []);
     }
     getRefs(sessionId: string): Promise<RefRow[]> {
         return Promise.resolve(this.rows.get(sessionId)?.refs ?? []);
+    }
+    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
+        const row = this.rows.get(sessionId);
+        if (!row) return Promise.resolve(null);
+        const pointers = new Set(viewPointerSeqs(row.session.tailJson));
+        return Promise.resolve({
+            session: row.session,
+            messages: row.messages.filter((r) => pointers.has(r.seq)).map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })),
+            blocks: row.blocks.map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
+            deadRefs: row.deadRefs,
+            refs: row.refs,
+        });
+    }
+    readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T> {
+        return read({
+            getSessionRow: (id) => this.getSessionRow(id),
+            getMessages: (id, opts) => this.getMessages(id, opts),
+            getBlocks: (id, opts) => this.getBlocks(id, opts),
+            getDeadRefs: (id) => this.getDeadRefs(id),
+            getRefs: (id) => this.getRefs(id),
+        });
     }
     getCcr(): Promise<null> {
         return Promise.resolve(null);

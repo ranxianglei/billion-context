@@ -1294,8 +1294,9 @@ const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
 async function loadSessionById(id: string): Promise<{ session: Session; live: boolean } | null> {
     const live = listSessions().find((s) => s.id === id);
     if (live) return { session: live, live: true };
-    // #4942: async seam — DB-only sessions are invisible to the sync facade.
-    const synced = await getDiskStore().loadAsync(id);
+    // #4942: async seam — DB-only sessions are invisible to the sync facade
+    // (rides the persist process singleton per #4990).
+    const synced = await getStore().loadAsync(id);
     if (synced) return { session: synced, live: false };
     const files = await ensureIndex();
     const abs = byId?.get(id);
