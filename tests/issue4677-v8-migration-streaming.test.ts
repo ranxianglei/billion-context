@@ -99,7 +99,7 @@ test("#4677 backfill sets identities and drops wireIndex-split duplicates (lowes
     const { from, to } = migrateSchema(db);
 
     assert.equal(from, 7);
-    assert.equal(to, 8);
+    assert.equal(to, 9);
     const identity = identityOfStoredContent(storedMessage("stripped", "hello"));
     assert.equal(identityOf(db, "s1", 1), identity);
     // the later duplicate row is gone and its content CAS ref handed back
@@ -109,7 +109,7 @@ test("#4677 backfill sets identities and drops wireIndex-split duplicates (lowes
     );
     assert.equal(refcountOf(db, a2), 0);
     assert.equal(refcountOf(db, a1), 1);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
     db.close();
 });
 
@@ -129,7 +129,7 @@ test("#4677 crash resume: sessions that already carry identities are skipped, no
 
     assert.equal(identityOf(db, "s-done", 1), "stale-planted");
     assert.equal(identityOf(db, "s-pending", 1), identityOfStoredContent(storedMessage("pending", "still fresh")));
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
     db.close();
 });
 
@@ -150,7 +150,7 @@ test("#4677 rows without content bytes terminate with the ABSENT marker instead 
     assert.equal(identity, "absent:");
     // second run is a no-op — the marker is not identity = '', so the
     // session is not selected again
-    assert.equal(migrateSchema(db).from, 8);
+    assert.equal(migrateSchema(db).from, 9);
     assert.equal(identityOf(db, "s-ghost", 1), "absent:");
     db.close();
 });
@@ -188,12 +188,12 @@ test("#4677 dedup groups span page boundaries (keeper head, duplicate past the 5
     db.close();
 });
 
-test("#4677 empty store migrates to v8 untouched", () => {
+test("#4677 empty store migrates to the schema head untouched", () => {
     const { db } = tmpDb();
     downgradeToV7(db);
     const { from, to } = migrateSchema(db);
     assert.equal(from, 7);
-    assert.equal(to, 8);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
+    assert.equal(to, 9);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
     db.close();
 });
