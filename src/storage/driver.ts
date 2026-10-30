@@ -40,6 +40,8 @@ export interface SqliteDatabase {
     prepare(sql: string): SqliteStatement;
     /** Runs fn inside BEGIN/COMMIT; rolls back on throw (including nested calls via savepoints). */
     transaction<T>(fn: () => T): T;
+    /** Deferred snapshot: readers do not reserve the writer lock. */
+    readTransaction<T>(fn: () => T): T;
     close(): void;
     readonly open: boolean;
 }
@@ -87,6 +89,7 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
         // cannot resolve. Taking the write lock up front makes concurrent
         // writers queue on busy_timeout instead (#2690 review blocking 5).
         transaction: (fn) => db.transaction(fn).immediate(),
+        readTransaction: (fn) => db.transaction(fn).deferred(),
         close: () => void db.close(),
         get open() {
             return db.open;
@@ -104,31 +107,33 @@ function openNodeSqlite(path: string): SqliteDatabase {
     };
     const db = new DatabaseSync(path);
     let depth = 0;
-    const begin = () => db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT sp${depth}`); // IMMEDIATE at top level: multi-process SQLITE_BUSY_SNAPSHOT guard (see openBetterSqlite3)
+    const begin = (readOnly: boolean) => db.exec(depth === 0 ? (readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE") : `SAVEPOINT sp${depth}`);
     const commit = () => db.exec(depth === 1 ? "COMMIT" : `RELEASE sp${depth - 1}`);
     const rollback = () => db.exec(depth === 1 ? "ROLLBACK" : `ROLLBACK TO sp${depth - 1}`);
+    const transaction = <T>(fn: () => T, readOnly: boolean): T => {
+        if (db.getAutoCommit?.() === false && depth === 0) {
+            // Already inside an outer transaction driven directly by
+            // DatabaseSync — just run inline; the outer COMMIT covers us.
+            return fn();
+        }
+        begin(readOnly);
+        depth++;
+        try {
+            const out = fn();
+            commit();
+            return out;
+        } catch (err) {
+            rollback();
+            throw err;
+        } finally {
+            depth--;
+        }
+    };
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => adaptNodeSqliteStatement(db.prepare(sql)),
-        transaction: <T>(fn: () => T): T => {
-            if (db.getAutoCommit?.() === false && depth === 0) {
-                // Already inside an outer transaction driven directly by
-                // DatabaseSync — just run inline; the outer COMMIT covers us.
-                return fn();
-            }
-            begin();
-            depth++;
-            try {
-                const out = fn();
-                commit();
-                return out;
-            } catch (err) {
-                rollback();
-                throw err;
-            } finally {
-                depth--;
-            }
-        },
+        transaction: (fn) => transaction(fn, false),
+        readTransaction: (fn) => transaction(fn, true),
         close: () => void db.close(),
         get open() {
             return db.open;

@@ -1000,7 +1000,10 @@ function deepSizeOf(value: unknown): number {
     return size(value);
 }
 
-function sessionWeight(session: Session): number {
+/** #4788 D1-A: exported so SessionStore's per-session hard-cap gate can reuse
+ * the SAME estimate as __bili/memory (single source of truth for "how heavy
+ * is this resident session right now"). */
+export function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
