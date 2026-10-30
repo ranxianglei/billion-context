@@ -58,11 +58,12 @@ import {
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
-import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
+import { applyOmpFirstEventTimeout, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
+import { classifyStartupFailure } from "./startup-failure-page.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
@@ -170,12 +171,17 @@ type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" 
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
-const SPAWN_WAIT_MS = 20000;
+// Env knobs (envMillis contract, #1365): large stores (whole-DB pre-bind open,
+// #4939) and two lanes sharing one index.db (write-lock contention on cold
+// start) have been observed exhausting the fixed budget, kill-spawn looping
+// into the same contention. Widen via env instead of patching dist; bad
+// values fall back to the defaults.
+const SPAWN_WAIT_MS = envMillis(process.env, "BILI_SPAWN_WAIT_MS", 20000);
 // #2187: grace beyond the initial wait for a LIVE child still starting.
 // Spawn-window startups have been observed taking 26-45s on slow Windows
 // machines (AV / first-run disk activity); the one-shot 20s budget misread
 // that as failure and left the lane degraded for the whole session.
-const SLOW_START_GRACE_MS = 40_000;
+const SLOW_START_GRACE_MS = envMillis(process.env, "BILI_SLOW_START_GRACE_MS", 40_000);
 // Total wait for a live child: initial window + grace. A child that EXITS or
 // fails to spawn still fails fast (the poll loop breaks on exit/error).
 export const SPAWN_BUDGET_MS = SPAWN_WAIT_MS + SLOW_START_GRACE_MS;
@@ -302,6 +308,16 @@ export interface LauncherDeps {
      *  made "why did we spawn instead of attach" undiagnosable. Default tees
      *  to bili.log + stderr. */
     attachDiag?: (msg: string) => void;
+    /** #5167: drain-aware liveness probe for the #3544 stale rotation wait.
+     *  Keep-alive POOLED probes cannot see a drain — the resident closes its
+     *  LISTENER within milliseconds of accepting the shutdown (that is the
+     *  port-release signal) but keeps answering pooled sockets while it
+     *  drains (worst case (1+10)×10s post-#3890). Polling with Connection:
+     *  close opens a FRESH connection each round, so "answers" once again
+     *  means "the listener still accepts" — exactly the condition the spawned
+     *  child needs before its bind can succeed.
+     *  Default hits the real endpoint; tests stub it. */
+    fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
     requestInstanceShutdown?: (origin: string) => Promise<boolean>;
@@ -3953,9 +3969,16 @@ interface HealthInfo {
     watchdog?: { armed: boolean; watchers?: number[] };
 }
 
-async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
+async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boolean }): Promise<HealthInfo | undefined> {
     try {
-        const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        // #5167: noKeepAlive sends Connection: close so the probe rides a FRESH
+        // connection — used by the rotation wait, where a pooled socket would
+        // keep being answered by a resident that already closed its listener
+        // and is merely draining its keep-alive connections (false "alive").
+        const res = await fetch(healthUrl(origin), {
+            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+            ...(opts?.noKeepAlive ? { headers: { connection: "close" } } : {}),
+        });
         if (!res.ok) return undefined;
         const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
@@ -4652,7 +4675,14 @@ export function rotatePortLogIfNeeded(logPath: string): void {
 // "永远更新不了". Before spawning we ask such a resident to drain+exit and wait
 // for the port; on ANY doubt (unverifiable version, no endpoint, refusal,
 // timeout) we fall back to the historical spawn behavior untouched.
-const STALE_ROTATION_WAIT_MS = 12_000; // > the responder's 10s force-exit backstop
+// #5167: the budget only needs to cover the shutdown REQUEST being processed
+// (a wedged loop never closes the listener) — NOT the responder's drain: the
+// port-release signal is the LISTENER closing, which happens milliseconds
+// after the POST is accepted, and the wait below polls with Connection: close
+// so a resident that only answers pooled keep-alive sockets while draining
+// still reads as released. The process itself may take up to (1+10)×10s to
+// fully exit post-#3890; that is fine — the child binds the freed port.
+const STALE_ROTATION_WAIT_MS = 12_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
@@ -4661,7 +4691,10 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            // #5167: one-shot connection — the target closes its listener on
+            // accepting this request; leaving a pooled keep-alive socket behind
+            // would only extend the drain it is about to run.
+            headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
             signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
         });
@@ -4688,7 +4721,7 @@ async function rotateStalePredecessor(
     opts: LaunchOptions,
     attachUrl: string | undefined,
     foreignLanes: readonly string[],
-    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    fetchHealthInfoNoReuse: (origin: string) => Promise<HealthInfo | undefined>,
     now: () => number,
     sleep: (ms: number) => Promise<void>,
     requestShutdown: (origin: string) => Promise<boolean>,
@@ -4723,10 +4756,16 @@ async function rotateStalePredecessor(
     }
     const deadline = now() + STALE_ROTATION_WAIT_MS;
     for (;;) {
-        const h = await fetchHealthInfo(candidate.inst.origin);
+        // #5167: poll on a FRESH connection (Connection: close). The resident
+        // closes its LISTENER within milliseconds of accepting the shutdown
+        // above but keeps answering POOLED keep-alive sockets while it drains
+        // (by design, ≤110s post-#3890) — a pooled probe here would read a
+        // draining resident as alive and falsely time out, sending the caller
+        // into the spawn ladder / attach-anyway while the port is actually free.
+        const h = await fetchHealthInfoNoReuse(candidate.inst.origin);
         if (!h?.ok) break;
         if (now() >= deadline) {
-            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still answers healthy; falling back to the normal spawn ladder`);
+            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still accepts fresh connections (listener open); falling back to the normal spawn ladder`);
             return;
         }
         await sleep(HEALTH_POLL_INTERVAL_MS);
@@ -4985,6 +5024,28 @@ export async function ensureProxyRunning(
         // port would strand every request.
         return attachTo(existing);
     }
+    // #5103: an explicit attachUrl target that discovery FOUND but every gate
+    // rejected was silent before — only an info-level skip diag per poll tick,
+    // so the user set the field, saw nothing, and waited hours for their own
+    // child. Name the target, the exact rejection reason, and the remedy once
+    // per bring-up, on both the visible channel and the durable log.
+    if (attachUrl !== undefined && existing === undefined) {
+        const target = probed.find((c) => normalizeOrigin(c.inst.origin) === normalizeOrigin(attachUrl));
+        let msg: string;
+        if (target !== undefined) {
+            const reason = instanceCompatible(target.inst, opts, codeFingerprint, foreignLanes);
+            const remedy = reason === "code-fingerprint-mismatch"
+                ? "the target runs different bili bytes than this lane (typical: global install vs host-managed copy right after an update) — restart the host once its copy converges to the same version, or stop the target"
+                : reason !== undefined
+                    ? `config shape mismatch (${reason}) — align the target's launch config with this lane's, or stop the target`
+                    : "it passes compatibility but fails the lifecycle gate (no armed watchdog) — set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway";
+            msg = `bili: explicit attach target ${attachUrl} (pid ${target.inst.pid}) is not attachable: ${reason ?? "lifecycle gate"} — ${remedy}`;
+        } else {
+            msg = `bili: no live instance registered at the explicit attach target ${attachUrl} — the proxy there never published an instance record or its owner pid is dead; check its startup log`;
+        }
+        console.error(msg);
+        attachDiag(msg);
+    }
     // #3544: nothing attachable above — but a strictly-older generation may
     // still hold our canonical port (its fingerprint differs by definition, so
     // it was never attachable). Rotate it instead of letting the update sit
@@ -5003,7 +5064,7 @@ export async function ensureProxyRunning(
             opts,
             attachUrl,
             foreignLanes,
-            fetchHealthInfo,
+            deps?.fetchHealthInfoNoReuse ?? ((origin: string) => fetchHealthInfoDefault(origin, { noKeepAlive: true })),
             now,
             sleepImpl,
             deps?.requestInstanceShutdown ?? requestInstanceShutdown,
@@ -5225,6 +5286,60 @@ export async function ensureProxyRunning(
                 return "";
             }
         };
+        // #5096: the fatal line of a startup crash sits at the END of this
+        // spawn's output — the head sample above (#4811) can quote nothing but
+        // the first warnings and actively hide it. Sample the tail too, but
+        // only when this spawn wrote enough that the tail is not the head
+        // again (and never quote a pre-spawn remnant as this child's tail).
+        const logTailSample = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                if (size >= spawnLogOffset && size - spawnLogOffset <= 256) return "";
+                const start = size < spawnLogOffset ? Math.max(0, size - 256) : Math.max(spawnLogOffset, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
+                    if (s.length > 200) s = `…${s.slice(s.length - 200)}`;
+                    return ` — child output tail: "${s}"`;
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
+        // #5096: turn the sampled bytes into a human cause when the signature
+        // is known (EPERM/EACCES/… on the bili data dir) — the field case had
+        // users staring at a truncated EPERM head with no idea what to do.
+        const failureHint = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                // #5096 review follow-up: classify THIS spawn's bytes only
+                // (#4811 discipline) — a stale permission signature from an
+                // earlier spawn would misattribute this failure; a shrunken
+                // file means rotation happened, so everything left is ours.
+                const start = size < spawnLogOffset ? Math.max(0, size - 1024) : Math.max(spawnLogOffset, size - 1024);
+                const len = Math.min(1024, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    const hint = classifyStartupFailure(buf.subarray(0, n).toString("utf8"));
+                    return hint ? ` (${hint})` : "";
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
@@ -5242,7 +5357,7 @@ export async function ensureProxyRunning(
                 const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
                 if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
                 if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
-                return `, ${size} bytes${rotated}${logHeadSample()}`;
+                return `, ${size} bytes${rotated}${logHeadSample()}${logTailSample()}`;
             } catch {
                 return "";
             }
@@ -5267,7 +5382,10 @@ export async function ensureProxyRunning(
             if (info?.ok) {
                 return selfHealthy
                     ? { text: `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`, selfHealthy }
-                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`, selfHealthy: false };
+                    // #5103: name the remedy, not just the fact — a foreign holder
+                    // (often a manually started proxy) deadlocks every retry of
+                    // this lane until someone acts on this line.
+                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it. Kill that process (kill ${info.pid ?? "?"}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it instead`, selfHealthy: false };
             }
             // A 200 that is not bili's health payload (foreign dev servers
             // answer ANY path with their index page) must not fall into the
@@ -5359,8 +5477,12 @@ export async function ensureProxyRunning(
                     // #3575: self-recovering progress diagnostic — host-safe
                     // channel only; a raw console.* here lands on the TUI
                     // screen itself in native lanes (see agent/host-log.ts).
+                    // #5103: carry the remedy in the same line — when the child
+                    // never binds (e.g. it dies earlier on EPERM), THIS line is
+                    // all the user sees for hours, and "waiting" alone gives no
+                    // exit from the deadlock.
                     attachDiag(
-                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
+                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin; if that never happens, kill pid ${info.pid ?? "?"} or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead`,
                     );
                 }
             }
@@ -5431,7 +5553,7 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
         }
         // #4994: where THIS child says it bound, parsed from its own log
         // segment ([spawnLogOffset..end] — no other spawn's lines can answer;
@@ -5506,7 +5628,7 @@ export async function ensureProxyRunning(
         console.error(
             `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
