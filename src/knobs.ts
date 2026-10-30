@@ -430,6 +430,17 @@ export function sessionResidentMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
 }
 
+/** BILI_SESSION_RESIDENT_HARD_MAX_BYTES > sessions.hardMaxBytes > pool soft cap
+ *  (#4788 D1-A): per-session HARD byte cap on estimated resident weight. Unlike
+ *  the pool soft cap (which evicts OTHER cold sessions and exempts the only
+ *  active one — structural blind spot #4788), this bounds ONE session and
+ *  triggers the between-turns field drops even for an exempt/only-active
+ *  session. `0` disables the cap check entirely. */
+export function sessionResidentHardMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_HARD_MAX_BYTES", loadConfigFile().sessions?.hardMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
+}
+
 interface GcSettings {
     enabled: boolean;
     maxAgeMs: number;
