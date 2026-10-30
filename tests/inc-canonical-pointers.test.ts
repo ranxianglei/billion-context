@@ -102,8 +102,10 @@ test("cold canonical rebuild: identical resync keeps the shared prefix; delta as
         assert.equal(resync.status, 200);
         assert.equal(resync.appliedSeq, 3);
         await __incrementalPtrChainForTests("conv-ptrs");
-
-        // Cold: drop the resident caches, keep SQLite.
+        // #5155: the wrap-up defers the durable flush (debounced) — let the
+        // rows settle before dropping the resident caches, or the cold
+        // rebuild reads a one-turn-stale table and honestly 409s.
+        await new Promise((resolve) => setTimeout(resolve, 20));
         __resetIncrementalLaneForTests();
 
         const delta = await h.turn({ sinceSeq: 3, messages: [core("u4", "four")] });
@@ -132,6 +134,8 @@ test("cold canonical rebuild: edited-tail resync keeps the shared prefix, drops 
         // one-turn-stale pointers.
         await h.turn({ sinceSeq: 0, resync: true, messages: [core("u1", "one"), core("u2", "two-EDITED")] });
         await __incrementalPtrChainForTests("conv-ptrs");
+        // #5155: settle the debounced flush before the cold reset (see above).
+        await new Promise((resolve) => setTimeout(resolve, 20));
         __resetIncrementalLaneForTests();
         const delta = await h.turn({ sinceSeq: 2, messages: [core("u3", "three")] });
         assert.equal(delta.status, 200);
