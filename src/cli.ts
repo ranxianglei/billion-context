@@ -26,6 +26,7 @@
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer, restartForceCloseOf } from "./server.js";
+import { serveStartupFailurePage } from "./startup-failure-page.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
@@ -722,7 +723,16 @@ export async function main(): Promise<void> {
         resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
     });
     recordEngineBootstrap(bootstrapOutcome);
-    const server = await startServer(opts);
+    let server: Awaited<ReturnType<typeof startServer>>;
+    try {
+        server = await startServer(opts);
+    } catch (err) {
+        // #5096: a launcher-spawned child that dies pre-listen holds the
+        // port with a failure page instead of leaving the web UI unreachable;
+        // resolves immediately (rethrow, normal exit-1 path) when manual.
+        await serveStartupFailurePage(opts, err);
+        throw err;
+    }
 
     // #3754: config-file edits don't hot-reload — this process holds whatever
     // loadOptions() resolved at startup until restart. Log the effective

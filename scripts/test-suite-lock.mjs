@@ -43,7 +43,7 @@
 
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -228,14 +228,132 @@ export function listTestFiles(root = ROOT) {
         .map((f) => `tests/${f}`);
 }
 
-/** The exact invocation the old `test` script ran, relocated here verbatim. */
-function realSuiteArgs() {
+/** The exact invocation the `test` script runs (exported: the regression test
+ *  pins that both preload hooks stay wired). */
+export function realSuiteArgs() {
     return [
         "--import", "./tests/preload-storage-baseline.mjs",
+        "--import", "./tests/preload-test-env.mjs",
         "--import", "tsx",
         "--test",
         ...listTestFiles(),
     ];
+}
+
+// ---- #5107: production-sessions leak guard ---------------------------------
+//
+// The suite must never write into the developer's REAL sessions tree
+// (~/.local/share/billion-context/sessions + index.db). tests/preload-test-env.mjs
+// makes that structurally impossible for in-process tests and inherited-env
+// children; this guard is the backstop for whatever slips past (explicit env
+// objects in spawned children, future regressions): snapshot the production
+// dir before the run, diff after — NEW files fail the suite, modified
+// pre-existing files only warn (a concurrently LIVE bili instance can touch
+// its own sessions mid-run without any test fault).
+
+/** The PRODUCTION sessions dir as seen by this wrapper (pre-isolation env),
+ *  mirroring src/paths.ts sessionsDir(): BILI_SESSIONS_DIR first, then
+ *  $XDG_DATA_HOME/billion-context/sessions, then ~/.local/share/.... */
+export function resolveProductionSessionsDir(env = process.env) {
+    const explicit = env.BILI_SESSIONS_DIR;
+    if (typeof explicit === "string" && explicit.length > 0) return path.resolve(explicit);
+    const xdg = typeof env.XDG_DATA_HOME === "string" && env.XDG_DATA_HOME.length > 0
+        ? path.resolve(env.XDG_DATA_HOME)
+        : path.join(homedir(), ".local", "share");
+    return path.join(xdg, "billion-context", "sessions");
+}
+
+/** Escape hatch: BILI_TEST_LEAK_GUARD=0/false/no/off disables the guard
+ *  (documented in reference/env-vars.md next to BILI_TEST_FORCE). A live bili
+ *  instance starting a brand-new session during a long local run is the
+ *  expected false-positive that motivates it. */
+export function leakGuardEnabled(env = process.env) {
+    const v = String(env.BILI_TEST_LEAK_GUARD ?? "").trim().toLowerCase();
+    return !(v === "0" || v === "false" || v === "no" || v === "off");
+}
+
+/** Snapshot every regular file under dir as relpath → [mtimeMs, size].
+ *  null when dir is absent/unreadable. Symlinks are skipped (no loop risk, no
+ *  following out of the tree). Unreadable entries are skipped, not fatal —
+ *  the guard must degrade to "no evidence", never crash the run. mtimeMs (not
+ *  mtimeNs): every Node build exposes the ms getters; the ns ones are missing
+ *  from at least one patched distro build seen in the field. A same-millisecond
+ *  rewrite still shows up via the size check unless bytes match exactly. */
+export function snapshotSessionsTree(dir) {
+    const out = new Map();
+    const record = (p) => {
+        try {
+            const st = statSync(p);
+            // posix-normalize the relpath key: Windows path.relative yields '\\',
+            // and the diff, banner and tests all compare '/'-separated paths (#4599).
+            out.set(path.relative(dir, p).split(path.sep).join("/"), [st.mtimeMs, st.size]);
+        } catch {
+            /* vanished mid-walk — skip */
+        }
+    };
+    const walk = (d) => {
+        let entries;
+        try {
+            entries = readdirSync(d, { withFileTypes: true });
+        } catch {
+            return false; // absent or unreadable root — nothing to protect yet
+        }
+        for (const e of entries) {
+            const p = path.join(d, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) record(p);
+        }
+        return true;
+    };
+    if (!walk(dir)) return null;
+    return out;
+}
+
+/** created = files present in `after` but not `before` (the leak signal);
+ *  changed = present in both with mtime/size drift (warn-only). Absent-before
+ *  (null) counts every after-file as created: the suite materializing the
+ *  production tree at all is already a violation. */
+export function diffSnapshots(before, after) {
+    const created = [];
+    const changed = [];
+    const b = before ?? new Map();
+    for (const [rel, meta] of after ?? new Map()) {
+        const prev = b.get(rel);
+        if (!prev) created.push(rel);
+        else if (prev[0] !== meta[0] || prev[1] !== meta[1]) changed.push(rel);
+    }
+    return { created: created.sort(), changed: changed.sort() };
+}
+
+const LEAK_LIST_CAP = 10;
+function leakListLine(paths) {
+    const shown = paths.slice(0, LEAK_LIST_CAP);
+    const more = paths.length - shown.length;
+    return shown.map((p) => `   ${p}`).join("\n") + (more > 0 ? `\n   …and ${more} more` : "");
+}
+
+/** The failure banner (stderr) when NEW files appeared in the production dir. */
+export function leakFailureMessage(prodDir, created) {
+    const lines = [
+        `✋ Test-suite leak guard (#5107): ${created.length} NEW file(s) appeared in the production sessions dir during the run:`,
+        prodDir,
+        leakListLine(created),
+        "",
+        "   The suite must stay hermetic (tests/preload-test-env.mjs redirects the ambient data roots).",
+        "   A new file means a test bypassed the isolation — or a LIVE bili instance on this machine",
+        "   started a brand-new session while the suite ran. Rerun once settled, or disable:",
+        "   BILI_TEST_LEAK_GUARD=0 npm test",
+    ];
+    return lines.join("\n");
+}
+
+/** The warn-only line for modified pre-existing files. */
+export function leakWarningMessage(changed) {
+    return [
+        `⚠️  Leak guard (#5107): ${changed.length} pre-existing session file(s) were modified during the run`,
+        "(a concurrently live bili instance can do this; only NEW files fail the guard):",
+        leakListLine(changed),
+    ].join("\n");
 }
 
 /**
@@ -319,11 +437,26 @@ async function main() {
         return 1;
     }
     process.on("exit", () => releaseLockSync(lockPath, process.pid));
+    // #5107: snapshot the PRODUCTION sessions dir before the run. Resolved from
+    // THIS wrapper's env (pre-isolation): the preload hook only rewrites the
+    // test processes' env, so this is exactly the tree a leaking test would hit.
+    const guardOn = leakGuardEnabled();
+    const prodDir = guardOn ? resolveProductionSessionsDir() : null;
+    const before = prodDir !== null ? snapshotSessionsTree(prodDir) : null;
     let code;
     try {
         code = await runSuite();
     } finally {
         await releaseLock(lockPath, process.pid);
+    }
+    if (prodDir !== null) {
+        const after = snapshotSessionsTree(prodDir);
+        const { created, changed } = diffSnapshots(before, after);
+        if (changed.length > 0) console.error(leakWarningMessage(changed));
+        if (created.length > 0) {
+            console.error(leakFailureMessage(prodDir, created));
+            code = code === 0 ? 1 : code; // runSuite always resolves a number
+        }
     }
     return code;
 }

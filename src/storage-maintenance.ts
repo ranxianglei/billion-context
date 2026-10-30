@@ -212,6 +212,21 @@ async function runGc(store: SessionStore, days: number | undefined, vacuum: "ful
         if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
         return { code: 0, text: `${text}\ndry-run: nothing executed\n` };
     }
+    // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
+    // write lock with no intermediate progress — running it while another live
+    // process (e.g. a running proxy) writes the same db starves that process
+    // until its storage layer degrades. Refuse with an actionable message;
+    // incremental / no-vacuum sweeps are short transactions and stay allowed.
+    if (vacuumMode === "full") {
+        const writer = store.unifiedActiveWriter();
+        if (writer !== null) {
+            data.refused = true;
+            data.writerPid = writer;
+            const reason = `refused: another process (pid ${writer}) is actively writing index.db — 'storage gc --vacuum full' rewrites the whole database under an exclusive write lock (minutes on large dbs, no intermediate progress) and would starve the other instance's writes until its storage layer degrades. Stop the other process (or wait for it to exit) and retry, or use --vacuum incremental for an online-safe shrink.`;
+            if (json) return { code: 1, text: `${JSON.stringify(data, null, 2)}\n` };
+            return fail(`${text}\n${reason}`, json, data);
+        }
+    }
     const dbBefore = indexDbSize(store.dir);
     // Same facade call the HTTP endpoint makes (admin.ts POST /__bili/storage/gc)
     // — results are therefore comparable lane-for-lane.
