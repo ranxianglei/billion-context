@@ -169,6 +169,9 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
         ...process.env,
         BILI_SESSIONS_DIR: sessionsDir,
         XDG_STATE_HOME: stateDir,
+        // #5012: non-TTY pipes now mute once the file leg proves live; this
+        // suite asserts the overlap warn over stderr by design - "off" pins the tee
+        ACP_LOG_FILE: "off",
         BILI_PERSIST_DEBOUNCE_MS: "30",
         BILI_UPDATE_CHECK_INTERVAL_MS: String(60 * 60 * 1000),
         MI_NOP: String(p),

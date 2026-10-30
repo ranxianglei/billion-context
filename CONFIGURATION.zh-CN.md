@@ -123,7 +123,7 @@
 | `dsh.contextTab` | boolean | true | BILI_DSH_CONTEXT_TAB | 是否注册 DSH 顶栏「上下文」会话标签页（#3862/#4237）：false 只移除该标签页——压缩、设置页一节及其余所有入口不受影响。隐藏绝不关闭压缩；账本仍可从设置页（会话子页）、插件 bundle 配置面、Web UI 与 /acp 命令查看。下次页面加载 / dsh 重启生效（槽位注册发生在页面加载时）；默认 true = 现状不变。 |
 | `dsh.contextTabLabel` | string | unset (built-in 「上下文」/「Context」) | — | DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为"压缩账本"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
-| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
+| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | disabled | ACP_PROMPT_CACHE_ROUTING | bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。 |
 | `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。 |
 | `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | 作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。 |
 | `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | 单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。 |
@@ -677,9 +677,9 @@
 ### `promptCache`
 
 - **类型：** `{ routing?: "auto" | "enabled" | "disabled" }`
-- **默认值：** `{ routing: "auto" }`（无法识别的值一律解析为 `"auto"`）
+- **默认：** `{ routing: "disabled" }`（#5079 起；无法识别的值一律按 `"disabled"` 解析，#5079 之前默认是 `"auto"`）
 - **状态：** ACTIVE
-- **说明：** Responses wire `prompt_cache_key` 盖章的路由策略。客户端显式提供的 `prompt_cache_key` 永远原样优先；否则 bili 按模式决定是否加盖自己从会话身份派生的稳定 key：`"enabled"` = 总是盖，`"disabled"` = 从不盖，`"auto"`（默认）= 仅当上游 host 恰好是 `api.openai.com` 时盖。可由 `ACP_PROMPT_CACHE_ROUTING` 覆盖。
+- **说明：** bili 自己出网写 `prompt_cache_key` 的总开关，两条 wire 同时管住：chat wire 插件车道请求体盖章 + Responses wire key 注入。客户端自带的 `prompt_cache_key` 不归 bili 管：任何模式下都原样转发（出网 A/B 探测记忆仍会对已证实拒绝该 key 的 origin+model 组合撤掉它）。插件车道上请求体里等于绑定会话 id 的 key 是 bili 自己的机制回显（例如 dsh 的 `PI_CACHE_RETENTION=long` 栈），算 bili 自注入。模式：`"disabled"`（默认）= bili 从不写自己的 key；`"auto"` = #5079 之前的行为（chat wire 每个插件车道请求都盖；Responses wire 仅当上游 host 恰好是 `api.openai.com` 时注入）；`"enabled"` = 所有支持的车道都盖/注（Responses wire 任意 host）。可通过本文件、`ACP_PROMPT_CACHE_ROUTING` 或 Web UI 快速配置开关设置。升级到以该 key 做前缀缓存路由的中转站/号池上游的用户应设为 `"auto"`（或 `"enabled"`）——否则流量可能随机路由、频繁不命中前缀缓存；直连官方 API 的用户保持默认即可。
 
 ### `cacheKeepalive`
 
@@ -1772,7 +1772,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | false |
 | `ACP_PASSTHROUGH` | `passthrough` | false |
 | `ACP_PORT` | `port` | 8787 |
-| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | auto |
+| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | disabled |
 | `ACP_PROVIDERS` | `providersPath` | unset |
 | `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | <state dir>/raw |
 | `ACP_RENDER_NONE` | `diagnostics.renderNone` | false |
@@ -2455,3 +2455,23 @@ billion-context 把每个会话的压缩状态持久化为会话目录（默认 
 2. **不要同步该目录。** 确认 OneDrive（或 Dropbox / Google Drive 等）没有同步 `%USERPROFILE%\.local\share\billion-context\`。若它位于同步文件夹下，用 `BILI_SESSIONS_DIR` 把它迁到非同步路径。
 
 高频 persist 写入否则会在每一轮反复触发实时扫描 —— 这正是产生 `EPERM` 写失败的原因。目录加入排除项后，告警即止。
+
+### Windows:node 运行时被打了 Low 完整性标签(NTFS mandatory integrity)(#5154)
+
+上面各节都假设问题出在*文件*上。#5154 发现了相反的形态:**Node 运行时本身**(`node.exe`)带着 **Low 强制完整性标签**,进程因此是 Low 完整性级别,*对 Medium 级文件的每一次写入*——CA bundle 重建、`index.db`、会话信封——都以 `EPERM` 失败,而所有 ACL 检查全部通过。标签通常靠**继承**而来:某个父目录曾被 `icacls <dir> /setintegritylevel "(OI)(CI)Low" /T` 之类的命令打过 Low `(OI)(CI)` 标签,之后放进该目录的每个文件都会被盖上 Low,且重启不消失。这正是「崩溃循环但看不到原因」一类启动故障的机制(#5096)。
+
+bili 启动时会对自身运行时探测一次标签(对 `process.execPath` 跑 `icacls`),发现 Low/Untrusted 就打一条醒目的 `[integrity]` 告警——不阻断,代理继续运行。
+
+手工检查与修复(用管理员权限运行;务必用**绝对路径**——某些 PowerShell/cmd 环境下 `icacls` 的 PATH 解析会失败):
+
+```bat
+:: 找 "Mandatory Label\Low Mandatory Level" 这一行(没有 Mandatory Label 行 = 无标签 = 正常)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe"
+
+:: 把运行时恢复为 Medium(这就是修复;再用上一条命令验证)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe" /setintegritylevel Medium
+```
+
+若标签带 `(I)`(继承)标记,说明**父目录**才是源头:只修目录**根、不递归**——`icacls "<目录>" /setintegritylevel Medium`,**不加 `/T`**。新建/重建的子项会继承出「(no label)」并收敛;`/T` 只是白扫几千个文件。不确定时先用 `icacls "<目录>" /save acl.txt` 备份当前 ACL。
+
+**不要**用「把 billion-context 数据目录打成 Low」来修——方向反了,只会更糟(对比 #3823 与 #5154:文件变成只有 Low 进程可写,到处撞完整性天花板)。

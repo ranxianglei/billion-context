@@ -9,7 +9,8 @@
 //     renderMessages / block detail)
 //   - host extras:    src/acp-status.ts (BILLED INPUT, breaker, STORE (CCR),
 //     RETRIEVAL QUALITY, BLOCK SPANS, STORAGE, PRE-COMPACTION ARCHIVE,
-//     CRITICAL ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS)
+//     CRITICAL ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS,
+//     PCK SELF-STAMPING OFF BY DEFAULT)
 //   - conflict view:  src/conflict-watch.ts (COMPRESSION CONFLICTS, Fix (…))
 // tests/marker-render-contract.test.ts covers both emitted and legacy shapes.
 
@@ -45,6 +46,7 @@ const SECTION_HEADS: readonly string[] = [
     "CRITICAL UPDATE AVAILABLE (instance-level): ",
     "UNDECRYPTED TRAFFIC (instance-level): ",
     "UNRECOGNIZED PATHS (instance-level): ",
+    "PCK SELF-STAMPING OFF BY DEFAULT (instance-level, #5079): ",
     "Last failures were attributed to ",
     "The Compressible-ranges list above was re-derived",
     "Nudge: ",

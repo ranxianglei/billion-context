@@ -53,20 +53,35 @@ export const VERIFY_EVERY_INGESTS = 20;
  *  every save, and the first clean sample re-admits the session. */
 export const DRIFT_ESCALATE_STREAK = 3;
 
-/** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
- * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
- * placeholder files under the profile dir, a path past MAX_PATH, or a
- * restricted/sandboxed process whose writes Windows integrity control refuses
- * (#3823 field report: a DSH-launched child at low integrity hit exactly this
- * class on its CA bundle) — NOT a corrupt index.db, so the generic "delete
- * the file" recovery advice misleads for that class; name the real suspects
- * instead. Empty elsewhere: every field instance of this failure domain is
- * win32-x64 (#3338/#3385/#3788/#3823), and Linux/macOS CANTOPEN causes
- * (permissions, disk full) are too varied to hint at usefully. */
+/** #3823 + #4614: on win32 two open-time error strings are OS-level refusals,
+ * not a corrupt index.db, so the generic "delete the file" recovery advice
+ * misleads for that class — name the real suspects instead:
+ *  - "unable to open database file" (SQLITE_CANTOPEN): antivirus/Defender
+ *    holding the dir, OneDrive placeholder files, a path past MAX_PATH, or a
+ *    restricted/sandboxed process (#3823 field report: a DSH-launched child at
+ *    low integrity hit exactly this class on its CA bundle);
+ *  - "attempt to write a readonly database" (SQLITE_READONLY family): the
+ *    EXISTING index.db opened fine but the first write was refused — the
+ *    #3823 mechanism surfacing differently once the file already exists
+ *    (Windows integrity control / MIC No-Write-Up: a process launched at lower
+ *    integrity than the file's label cannot write it; AV lock; exclusive
+ *    concurrent writer). Deleting the file here is worse than useless: in
+ *    unified-full mode it may hold the only copy of recent session state.
+ * Empty elsewhere: every field instance of this failure domain is win32-x64
+ * (#3338/#3385/#3788/#3823/#4614), and Linux/macOS causes (permissions, disk
+ * full) are too varied to hint at usefully.
+ * #5103: also applied to INGEST-time failures (noteIngestFailure) — the same
+ * OS-refusal class surfaces after a successful open, so those warnings carry
+ * this hint too. */
 export function sqliteOpenFailureHint(err: string): string {
     if (process.platform !== "win32") return "";
-    if (!/unable to open database file/i.test(err)) return "";
-    return " (win32: the OS refused to open the file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
+    if (/unable to open database file/i.test(err)) {
+        return " (win32: the OS refused to open the file — check the Node runtime's integrity label FIRST (icacls \"<path-to-node.exe>\"; a Low label is refused by Windows integrity control even with correct ACLs, #5154), then antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, or a path over 260 chars; if the label is clean, exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning; deleting the file will not clear a lock)";
+    }
+    if (/attempt to write a readonly database/i.test(err)) {
+        return " (win32: 'attempt to write a readonly database' on an EXISTING index.db = the file opened read-only and the first write was refused by the OS — most often Windows integrity control (a process running at Low integrity cannot write Medium-labeled files, and a DSH-spawned node.exe can itself carry a Low label, e.g. after a stray 'icacls /setintegritylevel Low' — #5154), less often antivirus/Defender or another bili/dsh process holding the files; check the PROCESS side first — run icacls on your node.exe and if it reports a Low label restore it with 'icacls <path-to-node.exe> /setintegritylevel Medium' — do NOT relabel the sessions dir Low to match (that cements the mislabel and drags every file down with it); do NOT delete the file — in unified-full mode it may hold the only copy of recent session state)";
+    }
+    return "";
 }
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
@@ -139,16 +154,38 @@ export class UnifiedShadow {
      *  implicitly serialized inside one event-loop turn. */
     private queueTail: Promise<void> = Promise.resolve();
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
+    /** #5103: the sqlite file behind this shadow (null on network backends).
+     *  Ingest-failure warnings must name it — "staying legacy-only" without a
+     *  path left users hunting %TEMP% logs for which file said what. */
+    private readonly dbPath: string | null;
     private consecutiveFailures = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
 
-    private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend) {
+    private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend, dbPath?: string) {
         this.mode = mode;
         this.sync = store;
         if (store === null) this.backend = backend ?? null;
         this.legacyLoad = legacyLoad;
+        this.dbPath = dbPath ?? null;
+    }
+
+    /** #5103: one ingest failure recorded — the FIRST failure of a streak now
+     *  warns with the file named (before, strikes one and two were silent and
+     *  the user learned of the degradation from missing features, not logs);
+     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before. */
+    private noteIngestFailure(err: unknown): void {
+        this.consecutiveFailures++;
+        const errStr = String(err);
+        this.stats.lastError = errStr;
+        if (this.consecutiveFailures === 1) {
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
+        }
+        if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            this.stats.disabled = true;
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} disabled after ${this.consecutiveFailures} consecutive failures (last: ${errStr})${sqliteOpenFailureHint(errStr)} — staying legacy-only`);
+        }
     }
 
     /** #3931 step 3: true when this shadow rides a network backend (mysql).
@@ -241,11 +278,16 @@ export class UnifiedShadow {
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
-            // node:sqlite nor a loadable better-sqlite3) — that advice only fits a genuine open
-            // failure; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
+            // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
+            // session state in unified-full mode). The delete advice fits only a genuine corrupt
+            // file; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : `${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`;
+                : hint !== ""
+                    ? hint
+                    : "; delete the file to reset the index";
             loggerLog(
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
@@ -253,7 +295,7 @@ export class UnifiedShadow {
             recordSidecarOpenFailure(errStr);
             return null;
         }
-        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, `${dir}/index.db`);
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
@@ -401,13 +443,15 @@ export class UnifiedShadow {
                     this.driftedSessions.add(legacy.id);
                     // #4323: count CONSECUTIVE sampled drifts — membership alone
                     // caps at "repeat yes/no" and cannot distinguish 3+ samples.
-                    // N in a row proves structural divergence (multi-writer
-                    // #394): escalate ONCE at the threshold with a loud WARN
-                    // naming both sides' fold counts, then freeze THIS
-                    // process's envelope writes for the session so the ping-
-                    // pong stops churning the file copy (persist.ts consults
-                    // envelopeFrozen on every save route; the unified store
-                    // keeps receiving every save either way).
+                    // N in a row marks a STRUCTURAL divergence: the watermark
+                    // clear healed nothing. Note the drift can be a single-
+                    // instance artifact (#4392 — digest shape), not only the
+                    // multi-writer #394 case; escalate ONCE at the threshold
+                    // with a loud WARN naming both sides' fold counts, then
+                    // freeze THIS process's envelope writes for the session so
+                    // the ping-pong stops churning the file copy (persist.ts
+                    // consults envelopeFrozen on every save route; the unified
+                    // store keeps receiving every save either way).
                     const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
                     this.driftStreaks.set(legacy.id, streak);
                     if (streak === DRIFT_ESCALATE_STREAK) {
@@ -420,7 +464,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. This usually means MULTIPLE bili instances share one sessions dir (#394 anti-pattern; second-instance detection: #4177). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering) and only then a second writer: a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177) is one cause among others (#4392). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -462,12 +506,7 @@ export class UnifiedShadow {
             }
             this.consecutiveFailures = 0;
         } catch (err) {
-            this.consecutiveFailures++;
-            this.stats.lastError = String(err);
-            if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                this.stats.disabled = true;
-                loggerLog("warn", `[storage] unified shadow disabled after ${this.consecutiveFailures} consecutive failures (last: ${String(err)})`);
-            }
+            this.noteIngestFailure(err);
         }
     }
 
@@ -980,12 +1019,7 @@ export class UnifiedShadow {
                 }
                 this.consecutiveFailures = 0;
             } catch (err) {
-                this.consecutiveFailures++;
-                this.stats.lastError = String(err);
-                if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    this.stats.disabled = true;
-                    loggerLog("warn", `[storage] unified shadow disabled after ${this.consecutiveFailures} consecutive failures (last: ${String(err)})`);
-                }
+                this.noteIngestFailure(err);
             }
         });
     }

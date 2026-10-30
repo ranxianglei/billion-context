@@ -1458,7 +1458,7 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
     } finally { await h.close(); }
 });
 
-test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", { timeout: 60_000 }, async () => {
+test("HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140)", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1468,7 +1468,9 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         _resetPluginStateForTest();
         const restored = getSession("parent");
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        // #5140: the intact raw tail is reconstructable from the unified index, so the cold
+        // parent is servable immediately — no model call needed to recover stored source.
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);

@@ -123,7 +123,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `dsh.contextTab` | boolean | true | BILI_DSH_CONTEXT_TAB | Registers the DSH top-bar 「上下文」/「Context」 conversation tab at all (#3862/#4237): false removes ONLY that tab — compression, the settings section and every other surface keep working. Hiding never disables compression; the ledger stays reachable via the settings section (会话 subpage), the plugin bundle config face, the Web UI and the /acp command. Takes effect on the next page load / dsh restart (slot registration happens at page load); default true = today's behavior unchanged. |
 | `dsh.contextTabLabel` | string | unset (built-in 「上下文」/「Context」) | — | Custom display name for the DSH top-bar Context tab (#4237), e.g. "压缩账本" when another plugin (dsh-context) owns the name 「上下文」. Trimmed non-empty string wins over the built-in label; blank or absent falls back to the built-in. File-only tier (display preference, no env knob per #2030). Default unset = built-in label unchanged. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
-| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
+| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | disabled | ACP_PROMPT_CACHE_ROUTING | Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim. |
 | `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Master switch for idle prompt-cache keepalive on the Anthropic wire (#3376): while a session goes idle, bili replays the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; hits are verified via usage.cache_read_input_tokens; stops on miss/429/error-streak/duration cap. Also settable per provider route and per model. |
 | `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | Cadence factor applied to the detected/assumed cache TTL tier (ping interval = tier x factor; 0.9 gives roughly one ping per 4.5 min on the 5-min tier and per 54 min on the 1-hour tier). Must be in (0, 1]. |
 | `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | Per-session keepalive lifetime cap, measured from the session's last real request (default 24 h); past it, keepalive disarms even while still hitting. |
@@ -677,9 +677,9 @@ Top-level keys that control how the proxy listens and behaves globally.
 ### `promptCache`
 
 - **Type:** `{ routing?: "auto" | "enabled" | "disabled" }`
-- **Default:** `{ routing: "auto" }` (anything unrecognized parses as `"auto"`)
+- **Default:** `{ routing: "disabled" }` since #5079 (anything unrecognized parses as `"disabled"`; before #5079 the default was `"auto"`)
 - **Status:** ACTIVE
-- **Description:** Routing for Responses-wire `prompt_cache_key` stamping. An explicit client-supplied `prompt_cache_key` always wins untouched; otherwise bili stamps its own stable conversation-derived key subject to the mode: `"enabled"` = always stamp, `"disabled"` = never stamp, `"auto"` (default) = stamp only when the upstream host is exactly `api.openai.com`. Overridden by `ACP_PROMPT_CACHE_ROUTING`.
+- **Description:** The single switch for bili's OWN `prompt_cache_key` emission on egress — it governs both wires at once: the chat wire's plugin-lane body stamp and the Responses wire's key injection. A client-supplied `prompt_cache_key` is never bili's to decide: it forwards verbatim in every mode (the egress A/B probe-and-remember still withholds it where a specific origin+model has proven to reject it). On the plugin lane, a body key equal to the bound conversation id is bili's own machinery echoing back (e.g. dsh's `PI_CACHE_RETENTION=long` stack) and counts as bili's own emission. Modes: `"disabled"` (default) = bili never writes its own key; `"auto"` = the pre-#5079 behavior (chat wire stamps on every plugin-lane request; Responses wire injects only when the upstream host is exactly `api.openai.com`); `"enabled"` = stamp/inject on every supporting lane (Responses wire any host). Set it via this file, `ACP_PROMPT_CACHE_ROUTING`, or the web UI quick-config switch. Upgrades onto a relay/account-pool upstream that routes prefix cache by this key should set `"auto"` (or `"enabled"`) — otherwise traffic may route randomly and miss the prefix cache; direct official-API users can leave the default.
 
 ### `cacheKeepalive`
 
@@ -1789,7 +1789,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | false |
 | `ACP_PASSTHROUGH` | `passthrough` | false |
 | `ACP_PORT` | `port` | 8787 |
-| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | auto |
+| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | disabled |
 | `ACP_PROVIDERS` | `providersPath` | unset |
 | `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | <state dir>/raw |
 | `ACP_RENDER_NONE` | `diagnostics.renderNone` | false |
@@ -2487,3 +2487,23 @@ To stop the failures at the root, add the sessions dir to your antivirus exclusi
 2. **Do not sync this directory.** Make sure OneDrive (or Dropbox / Google Drive / similar) is not syncing `%USERPROFILE%\.local\share\billion-context\`. If it lives under a synced folder, relocate it with `BILI_SESSIONS_DIR` to a non-synced path.
 
 High-frequency persist writes otherwise re-trigger the real-time scan on every turn — which is what produces the `EPERM` write failures. Once the directory is excluded, the alerts stop.
+
+### Windows: node runtime labeled Low (NTFS mandatory integrity) (#5154)
+
+Everything above assumes the *files* are the problem. #5154 found the opposite shape: the **Node runtime itself** (`node.exe`) carried a **Low mandatory-integrity label**, so the process was Low-integrity and *every write to a Medium-labeled file* — the CA bundle rebuild, `index.db`, session envelopes — failed with `EPERM` while every ACL check passed. The label usually arrives by **inheritance**: a parent directory once labeled `Low (OI)(CI)` (for example by a stray `icacls <dir> /setintegritylevel "(OI)(CI)Low" /T`) stamps the Low label onto every file placed inside it, and it survives reboots. This is the mechanism behind whole "crash loop with no visible cause" startup classes (#5096).
+
+bili probes its own runtime's label once at startup (`icacls` on `process.execPath`) and logs a loud `[integrity]` warning when it finds Low/Untrusted — non-blocking, the proxy keeps running.
+
+To check and fix manually (run elevated; use the **absolute path** — `icacls` PATH resolution fails under some PowerShell/cmd profiles):
+
+```bat
+:: look for a "Mandatory Label\Low Mandatory Level" line (no Mandatory Label line = no label = fine)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe"
+
+:: restore the runtime to Medium (this is the fix; verify with the command above)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe" /setintegritylevel Medium
+```
+
+If the label shows an `(I)` (inherited) marker, a **parent directory** is the source: fix the directory **root only, non-recursive** — `icacls "<dir>" /setintegritylevel Medium` with **no `/T`**. New and re-created children then inherit "(no label)" and converge; `/T` would touch thousands of files for nothing. Back up current ACLs first with `icacls "<dir>" /save acl.txt` if unsure.
+
+Do **not** "fix" this by relabeling the billion-context data dir Low — that direction makes things worse (see #3823 vs #5154: files writable only by Low processes, integrity ceiling everywhere).
