@@ -80,21 +80,41 @@ export function codexWindowForModel(model: string): number {
     return entry ? resolvedWindow(entry) : CODEX_FALLBACK_CONTEXT_WINDOW;
 }
 
+/** Which source determined a codex client's aligned window — surfaced in the
+ *  clamp/warn log lines so triage sees what actually won (#5246 piece 3). */
+export type CodexWindowSource =
+    | "client-report"          // a fresher client report (plugin/runtime/launcher)
+    | "catalog-json"           // config.toml model_catalog_json live table
+    | "models-cache"           // <CODEX_HOME>/models_cache.json live table
+    | "config-context-window"  // no live table — sized from config.toml model_context_window
+    | "bundled-snapshot"       // release-time bundled model table entry
+    | "flat-fallback";         // CODEX_FALLBACK_CONTEXT_WINDOW (unknown model)
+
+interface LiveResolution {
+    window: number;
+    source: "catalog-json" | "models-cache" | "config-context-window";
+}
+
 let liveTable: { key: string; models: CodexModelEntry[] } | undefined;
 
 function positiveWindow(value: unknown): number | undefined {
     return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
-/** 本机 Codex 的缓存比发布时的模型表更新；只读模型元数据，不读取认证或会话。 */
-export function readCodexModelWindow(model: string, codexHome: string): number | undefined {
-    const file = path.join(codexHome, "models_cache.json");
+function nonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0;
+}
+
+/** Parse ONE live codex model-table file into slim entries. Returns null when
+ *  the file is absent/unreadable/malformed — leaving any prior cached table
+ *  intact so a transient bad write never reuses stale entries (#2593). */
+function parseLiveTable(file: string): CodexModelEntry[] | null {
     try {
         const stat = fs.statSync(file);
         const key = `${file}|${stat.ino}|${stat.mtimeMs}|${stat.ctimeMs}|${stat.size}`;
         if (liveTable?.key !== key) {
             const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-            if (!parsed || typeof parsed !== "object" || !("models" in parsed) || !Array.isArray(parsed.models)) return undefined;
+            if (!parsed || typeof parsed !== "object" || !("models" in parsed) || !Array.isArray(parsed.models)) return null;
             const models: CodexModelEntry[] = [];
             for (const value of parsed.models) {
                 if (!value || typeof value !== "object" || typeof value.slug !== "string" || !value.slug) continue;
@@ -107,26 +127,87 @@ export function readCodexModelWindow(model: string, codexHome: string): number |
             }
             liveTable = { key, models };
         }
-        const entry = lookupModel(model, liveTable.models);
-        if (!entry) return undefined;
-        const configured = positiveWindow(readCodexConfig(codexHome).contextWindow);
-        const window = configured === undefined ? resolvedWindow(entry) : Math.min(configured, entry.maxContextWindow ?? configured);
-        return Math.floor(window * (entry.effectiveContextWindowPercent ?? 95) / 100);
+        return liveTable.models;
     } catch {
-        return undefined;
+        return null;
     }
 }
 
+/** The running codex's perceived window for a model, mirroring codex's own
+ *  budget math. The live table beats the release-time snapshot — resolved from
+ *  config.toml `model_catalog_json` when set, else `<CODEX_HOME>/models_cache.json`
+ *  (#5246: custom-catalog installs have NO models_cache.json, which is why they
+ *  fell through to the flat 272K floor). A base `model_context_window` override
+ *  caps the entry's max_context_window. When NO live table is readable but
+ *  config.toml declares model_context_window, size from that capped by the
+ *  codex-known ceiling (bundled max_context_window, else the 272K unknown-model
+ *  fallback) — never above what codex itself would perceive (#292 discipline).
+ *  Read-only model metadata; never touches auth/sessions. */
+function resolveLiveCodexWindow(model: string, codexHome: string): LiveResolution | null {
+    const cfg = readCodexConfig(codexHome);
+    const catalogRaw = cfg.modelCatalogJson;
+    const catalogPath = nonEmptyString(catalogRaw)
+        ? path.resolve(codexHome, catalogRaw)
+        : path.join(codexHome, "models_cache.json");
+    const catalogSource: "catalog-json" | "models-cache" = nonEmptyString(catalogRaw) ? "catalog-json" : "models-cache";
+    const models = parseLiveTable(catalogPath);
+    if (models) {
+        const entry = lookupModel(model, models);
+        if (entry) {
+            const configured = positiveWindow(cfg.contextWindow);
+            const window = configured === undefined ? resolvedWindow(entry) : Math.min(configured, entry.maxContextWindow ?? configured);
+            return { window: Math.floor(window * (entry.effectiveContextWindowPercent ?? 95) / 100), source: catalogSource };
+        }
+    }
+    const configured = positiveWindow(cfg.contextWindow);
+    if (configured !== undefined) {
+        const bundled = lookupModel(model, TABLE);
+        const ceiling = bundled?.maxContextWindow ?? CODEX_FALLBACK_CONTEXT_WINDOW;
+        const total = Math.min(configured, ceiling);
+        return { window: Math.floor(total * (bundled?.effectiveContextWindowPercent ?? 95) / 100), source: "config-context-window" };
+    }
+    return null;
+}
+
+/** 本机 Codex 的活表窗口（含 config.toml 兜底）；只读模型元数据，不读取认证或会话。 */
+export function readCodexModelWindow(model: string, codexHome: string): number | undefined {
+    return resolveLiveCodexWindow(model, codexHome)?.window;
+}
+
+/** Detailed alignment: the aligned limit PLUS the source that won, so the
+ *  caller can log what actually determined the value (#5246 piece 3). */
+export function codexAlignedWindowDetailed(
+    limit: number,
+    model: string,
+    headers: Record<string, string | string[] | undefined>,
+    clientWindow?: number,
+): { limit: number; clamped: boolean; source: CodexWindowSource | null } {
+    if (!isCodexClient(headers)) return { limit, clamped: false, source: null };
+    const cw = positiveWindow(clientWindow);
+    if (cw !== undefined) {
+        const clamped = limit > cw;
+        return { limit: clamped ? cw : limit, clamped, source: "client-report" };
+    }
+    const live = resolveLiveCodexWindow(model, resolveCodexHome(process.env));
+    if (live) {
+        const clamped = limit > live.window;
+        return { limit: clamped ? live.window : limit, clamped, source: live.source };
+    }
+    const bundled = lookupModel(model, TABLE);
+    const w = bundled ? resolvedWindow(bundled) : CODEX_FALLBACK_CONTEXT_WINDOW;
+    const clamped = limit > w;
+    return { limit: clamped ? w : limit, clamped, source: bundled ? "bundled-snapshot" : "flat-fallback" };
+}
+
+/** Backward-compatible shape (pre-#5246): the aligned limit + clamp flag only. */
 export function codexAlignedWindow(
     limit: number,
     model: string,
     headers: Record<string, string | string[] | undefined>,
     clientWindow?: number,
 ): { limit: number; clamped: boolean } {
-    if (!isCodexClient(headers)) return { limit, clamped: false };
-    const w = positiveWindow(clientWindow) ?? readCodexModelWindow(model, resolveCodexHome(process.env)) ?? codexWindowForModel(model);
-    if (limit > w) return { limit: w, clamped: true };
-    return { limit, clamped: false };
+    const d = codexAlignedWindowDetailed(limit, model, headers, clientWindow);
+    return { limit: d.limit, clamped: d.clamped };
 }
 
 /** Test hook: replace the bundled table (mirrors registry._setForTest). */

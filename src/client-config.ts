@@ -60,6 +60,8 @@ export interface CodexConfig {
     model?: string;
     /** Top-level `model_context_window` override (if set). */
     contextWindow?: number;
+    /** Top-level `model_catalog_json` — path to the live model catalog (#5246). */
+    modelCatalogJson?: string;
     /** Top-level `model_auto_compact_token_limit` override (if set). */
     autoCompactLimit?: number;
     /** Top-level `model_max_output_tokens` override (if set) (#971). */
@@ -698,6 +700,7 @@ export function parseCodexToml(text: string): CodexConfig {
     let curProvider: string | null = null;
     let codexModel: string | undefined;
     let codexContextWindow: number | undefined;
+    let codexCatalogJson: string | undefined;
     let codexAutoCompactLimit: number | undefined;
     let codexMaxOutput: number | undefined;
     for (const rawLine of text.split(/\r?\n/)) {
@@ -723,6 +726,7 @@ export function parseCodexToml(text: string): CodexConfig {
                 if (key === "model_provider") result.modelProvider = val;
                 else if (key === "openai_base_url") result.openaiBaseUrl = val;
                 else if (key === "model") codexModel = val;
+                else if (key === "model_catalog_json") codexCatalogJson = val;
             } else if (curProvider && key === "base_url") {
                 result.providers[curProvider].baseUrl = val;
             }
@@ -734,6 +738,7 @@ export function parseCodexToml(text: string): CodexConfig {
     }
     if (codexModel) result.model = codexModel;
     if (codexContextWindow) result.contextWindow = codexContextWindow;
+    if (codexCatalogJson) result.modelCatalogJson = codexCatalogJson;
     if (codexAutoCompactLimit) result.autoCompactLimit = codexAutoCompactLimit;
     if (codexMaxOutput) result.maxOutput = codexMaxOutput;
     const win = toModelWindow(codexModel, codexContextWindow, codexMaxOutput);
