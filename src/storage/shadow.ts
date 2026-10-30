@@ -47,6 +47,28 @@ interface ResidentFields {
     blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
 }
 
+/** #5188: ingest errors meaning "the resource was briefly unavailable",
+ *  not "the storage is broken" — a concurrent lock held past busy_timeout,
+ *  a momentary disk-full or fd spike, an EBUSY from the OS. These ride
+ *  plain WAL/resource churn under load (CI shards hammering one runner),
+ *  and counting them toward the permanent disable latch turned ordinary
+ *  spikes into whole-process degradations. The companion half of #5188
+ *  (SessionStore.tryRecoverSidecar, src/persist.ts) heals the other end:
+ *  a FIRST open that dies on such a spike is retried on a cooldown instead
+ *  of staying absent for the process lifetime. Contention-class errors here
+ *  refresh stats.lastError for observability only — the very next save
+ *  retries and succeeds automatically, so nothing else needs to happen.
+ *  Breakage-class errors (corruption, schema violations, readonly refusal,
+ *  'file is not a database') stay the real evidence and keep striking.
+ *  NOTE: 'unable to open database file' (CANTOPEN) is deliberately counted
+ *  as transient-at-ingest: at write time it is the fd-exhaustion / bad-share
+ *  signature, and a persistently failing store keeps its lastError visible
+ *  plus the per-read fallback warns (#3933 viewFor degrade lines). */
+export function isTransientContentionError(err: unknown): boolean {
+    const s = String(err);
+    return /\bSQLITE_BUSY\b|\bSQLITE_LOCKED\b|database is busy|database is locked|table .*locked|\bEBUSY\b|\bENOSPC\b|database or disk is full|\bSQLITE_FULL\b|too many open files|\bE(M)?FILE\b|unable to open database file|\bSQLITE_IOERR\b/i.test(s);
+}
+
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
@@ -184,11 +206,18 @@ export class UnifiedShadow {
     /** #5103: one ingest failure recorded — the FIRST failure of a streak now
      *  warns with the file named (before, strikes one and two were silent and
      *  the user learned of the degradation from missing features, not logs);
-     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before. */
+     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before.
+     *  #5188: "briefly unavailable" contention (lock held by a concurrent
+     *  save, disk full) never strikes — see isTransientContentionError; it
+     *  refreshes lastError so the panels stay honest while it settles, and a
+     *  latch that already tripped stops re-warning on every save after.
+     *  Breakage-class failures keep the byte-for-byte old behavior. */
     private noteIngestFailure(err: unknown): void {
-        this.consecutiveFailures++;
         const errStr = String(err);
         this.stats.lastError = errStr;
+        if (isTransientContentionError(errStr)) return;
+        if (this.stats.disabled) return;
+        this.consecutiveFailures++;
         if (this.consecutiveFailures === 1) {
             loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
         }

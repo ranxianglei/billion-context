@@ -113,6 +113,36 @@ import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN
  */
 
 const PERSIST_VERSION = 3;
+// #5188: wall-clock cooldown between sidecar reopen attempts driven by the
+// SAVE path (see tryRecoverSidecar). A fixed constant — no config surface
+// (#5140): 30 s of spacing bounds the retry cost while still healing an
+// fd-spike-class outage within one agent turn. The READ path
+// (replicasAvailable) paces itself much faster below, because a read asking
+// "are replicas available?" must get a fresh answer instead of waiting for
+// the next write (#5140's cold-restore snapshot 409 arrived milliseconds
+// after construction, before any save could trigger a retry).
+const SHADOW_REOPEN_COOLDOWN_MS = 30_000;
+const SHADOW_REOPEN_READ_CHECK_MS = 100;
+// #5188 round 3: patient-wait budget for the user-visible 409 paths
+// (snapshot/fork) when the sidecar is missing after a transient first-open
+// failure. The read-check slot above drives the recovery ATTEMPTS; this only
+// bounds how long a request waits for that recovery before failing closed
+// exactly as before. Latched-disabled never waits (nothing brings it back
+// without a restart), so the wait can never mask structural breakage.
+const RECON_REPLICAS_WAIT_MS = 750;
+const RECON_REPLICAS_POLL_MS = 50;
+let shadowReopenCooldownMsOverride: number | null = null;
+let shadowReopenReadCheckMsOverride: number | null = null;
+
+/** Test seam: shrink/restore the #5188 sidecar-reopen save-path cooldown (null = default).
+ *  Mirrors setSqliteEnginesUnavailableForTests — always reset by the tests. */
+export function setShadowReopenCooldownMsForTests(ms: number | null): void {
+    shadowReopenCooldownMsOverride = ms;
+}
+/** Test seam: shrink/restore the #5188 read-path availability-check interval (null = default). */
+export function setShadowReopenReadCheckMsForTests(ms: number | null): void {
+    shadowReopenReadCheckMsOverride = ms;
+}
 /** Dotfile (invisible to the kernel's .json walk): written after the first
  *  successful #286 migration pass so later boots skip the scan entirely. */
 const MIGRATION_MARKER = ".bili-migration-286.done";
@@ -308,6 +338,14 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
 export class SessionStore {
+    /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
+     *  and failed, the save path retries maybeOpen on a cooldown; intentional
+     *  opt-outs (persistence off, encryption active) and the mysql async attach
+     *  never record args, so they keep their documented one-shot posture. */
+    private readonly syncSidecarOpen: { legacyLoad: (rec: unknown) => LegacySessionLike | null } | null = null;
+    private sidecarReopenNextAttemptAt = 0;
+    private sidecarReadCheckNextAttemptAt = 0;
+
     readonly enabled: boolean;
     private readonly sessionsDir: string;
     private readonly store: StateStore<PersistedSession>;
@@ -527,9 +565,20 @@ export class SessionStore {
             });
             this.shadow = undefined;
         } else {
-            this.shadow = this.enabled && !unifiedBlockedByEncryption
-                ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
-                : undefined;
+            if (this.enabled && !unifiedBlockedByEncryption) {
+                // #5188: remember the open args when this sync attempt actually
+                // runs, so a failure here can be retried. Deliberately NO
+                // cooldown stamp at construction: the first RETRY must be
+                // immediately eligible on first need. A transient load spike
+                // (EMFILE/BUSY under CI-shard load) clears in milliseconds, and
+                // #5140's cold-restore read arrives before any save would have
+                // triggered a paced retry — stamping here kept that read failing
+                // closed for a full cooldown window.
+                this.syncSidecarOpen = { legacyLoad };
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            } else {
+                this.shadow = undefined;
+            }
         }
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -1816,8 +1865,47 @@ export class SessionStore {
         }
     }
 
+    /** Which half of replicasAvailable() is down — diagnostic for the fork
+     *  raw-tail gate (#5188): missing sidecar (transient open failure,
+     *  recoverable without restart) vs latched-disabled sidecar (structural
+     *  breakage, stays down by design). */
+    sidecarDownReason(): "sidecar-missing" | "sidecar-disabled" {
+        return this.shadow === undefined ? "sidecar-missing" : "sidecar-disabled";
+    }
+
     replicasAvailable(): boolean {
+        // #5188: a false answer must mean "unavailable right now". When the
+        // first sync open died on a transient OS error, save-path hooks alone
+        // leave READ-only consumers failing closed until the next write —
+        // #5140's cold-restore snapshot 409 fired milliseconds after
+        // construction, before any save. Demand-driven recheck on the read
+        // path: paced by its own short interval (one maybeOpen per slot),
+        // steady state costs two field reads.
+        if (this.syncSidecarOpen !== null && this.shadow === undefined) {
+            const now = Date.now();
+            if (now >= this.sidecarReadCheckNextAttemptAt) {
+                this.sidecarReadCheckNextAttemptAt = now + (shadowReopenReadCheckMsOverride ?? SHADOW_REOPEN_READ_CHECK_MS);
+                this.tryRecoverSidecar(true);
+            }
+        }
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #5188 round 3: bounded patient wait for user-visible 409 paths. A first
+     *  open that died on a transient spike recovers on its own (the read-check
+     *  slot inside replicasAvailable() drives the attempts); #5140's flake was
+     *  a request racing that recovery — arriving before the first post-spike
+     *  slot could fire. Healthy returns immediately, latched-disabled returns
+     *  false immediately (waiting cannot help there), and a still-gone resource
+     *  costs at most `timeoutMs` of latency before failing closed as before. */
+    async waitForReplicas(timeoutMs = RECON_REPLICAS_WAIT_MS, pollMs = RECON_REPLICAS_POLL_MS): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (this.replicasAvailable()) return true;
+            if (this.sidecarDownReason() !== "sidecar-missing") return false;
+            if (Date.now() >= deadline) return false;
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
     }
 
     /** #4804: true only in FULL mode — the one mode whose unified reads
@@ -2726,6 +2814,7 @@ export class SessionStore {
             return;
         }
         if (!this.enabled) return;
+        this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
         this.saveBuilders.set(id, this.guardedBuild(session));
         const existing = this.saveTimers.get(id);
@@ -3043,6 +3132,31 @@ export class SessionStore {
         session.blockContents = lazy;
     }
 
+    /** #5188: recover a sidecar whose FIRST synchronous open died on a
+     *  transient OS error (fd exhaustion under test/CI load, momentary
+     *  disk-full, a spike of EBUSY). Before this, one failure at
+     *  construction time degraded the whole process for its lifetime and the
+     *  fork raw-tail rebuild failed closed at replicasAvailable() (#5140's
+     *  409s). Two triggers share this attempt: the save path (the natural
+     *  "this store is still wanted" signal), gated by the long cooldown, and
+     *  replicasAvailable() (read path), which bypasses the cooldown but paces
+     *  itself on its own short interval — a read deserves a fresh availability
+     *  answer. MaybeOpen itself never throws (it warns and returns null), so
+     *  this cannot break the never-throw save contract. */
+    private tryRecoverSidecar(force = false): void {
+        const args = this.syncSidecarOpen;
+        if (!args || this.shadow !== undefined) return;
+        const now = Date.now();
+        if (!force && now < this.sidecarReopenNextAttemptAt) return;
+        const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
+        this.sidecarReopenNextAttemptAt = now + cooldown;
+        this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+        if (this.shadow !== undefined) {
+            this.log("info", "[storage] unified sidecar recovered after a transient open failure — unified surfaces resume without a restart (#5188)");
+            return;
+        }
+    }
+
     /** Synchronous flush for a single session. Used on memory eviction so a
      *  dirty evicted session is not lost. Sync because eviction runs in the
      *  sync getSession path; a single small write is acceptable.
@@ -3050,6 +3164,7 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
+        this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
