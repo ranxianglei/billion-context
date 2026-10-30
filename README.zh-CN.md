@@ -484,6 +484,8 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
 
 `archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
 
+**大库上 full vacuum 是离线操作(#4612)。** `--vacuum full`(默认)会在独占写锁下重写整个 index.db —— O(库大小),多 GB 的库要几分钟到几十分钟,且没有中间进度(SQLite 的 VACUUM 是原子操作,拆不开)。在有代理正从同一会话目录服务时跑它,会把那个代理的写入饿死到其存储层降级为止,所以 `storage gc --vacuum full` **在另一个存活进程持有该数据库时会拒绝启动**(`index.db.lock` pid 纪律,#4175):CLI 以退出码 1 给出可操作提示,面板端点返回 HTTP 409。先停掉另一个实例(或等它退出)再重试;要在线安全地缩库用 `--vacuum incremental`,它以短事务回收空闲页、不拿独占锁。零引用删除清扫无论哪种模式都分批执行并逐批打印进度。
+
 ## 状态
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。

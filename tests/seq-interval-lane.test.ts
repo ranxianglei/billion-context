@@ -35,6 +35,7 @@ interface Harness {
     forwarded: Record<string, unknown>[];
     blockRows: () => { blockId: string; startSeq: number; endSeq: number; payloadJson: string }[];
     rows: () => { seq: number; msgId: string }[];
+    settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
@@ -47,7 +48,7 @@ async function harness(): Promise<Harness> {
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 15 });
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
@@ -118,7 +119,7 @@ async function harness(): Promise<Harness> {
             db.close();
         }
     };
-    return { turn, callTool, forwarded, rows, blockRows, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { turn, callTool, forwarded, rows, blockRows, settle: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const big = (text: string) => text.repeat(600);
@@ -174,6 +175,7 @@ test("seq interval lane flow: stamps ride the body, fold records the interval, o
         // the unified blocks table must carry BOTH interval forms:
         // row-space bounds (0-based store seqs, from the ingest-side mapping)
         // and the kernel payload's ledger-space bounds (1-based stamps).
+        await h.settle();
         const blocks = h.blockRows();
         assert.equal(blocks.length, 1, `one block recorded: ${JSON.stringify(blocks.map((b) => b.blockId))}`);
         assert.equal(blocks[0]!.startSeq, 1, "store row bounds start at the second covered row (0-based)");

@@ -63,7 +63,7 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-export const STORAGE_SCHEMA_VERSION = 8;
+export const STORAGE_SCHEMA_VERSION = 9;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -368,6 +368,19 @@ export function migrateSchema(db: {
             // the same transaction, every subsequent open re-ran the whole
             // migration and re-OMM'd: permanently unopenable stores (#4677).
             needV8Backfill = true;
+        }
+        if (from < 9) {
+            // v9 zero-ref collection index (#4796): gc()'s sweep and the
+            // dry-run count address content BY refcount — without this index
+            // every run full-scans the CAS table. Field report: 766K rows /
+            // ~20 GB, one uncommitted `DELETE ... WHERE refcount <= 0` ran
+            // 8 hours with zero committed rows, its WAL frames could never
+            // checkpoint, and the held write lock starved live proxies. The
+            // index makes candidate selection an index range scan; building
+            // it once on an already-bloated db costs about what open-time
+            // quick_check pays on EVERY open (#4175). Idempotent CREATE so a
+            // dev-window lib that already carried it re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
         }
     });
     if (needV8Backfill) migrateV8Identities(db);
