@@ -774,6 +774,14 @@ export class UnifiedShadow {
         return this.sync.gcPlan(archiveAfterDays, now);
     }
 
+    /** #4612: live foreign writer on the unified db (#4175 lock discipline) —
+     *  the gc full-vacuum preflight signal. Null when unavailable or nobody
+     *  else is provably writing. */
+    activeForeignWriter(): number | null {
+        if (this.sync === null) return null;
+        return this.sync.activeForeignWriter();
+    }
+
     rawMessages(sessionId: string): { seq: number; content: string }[] {
         if (this.sync === null) return [];
         this.assertLive();

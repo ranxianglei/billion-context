@@ -64,7 +64,10 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-const MYSQL_SCHEMA_VERSION = 8;
+/** v9 (#4796): zero-ref collection index. Existing stamped-v8 libraries
+ *  re-enter the probe-first DDL block below exactly once on first open;
+ *  migrateV8Identities() is a no-op there (no identity='' rows left). */
+const MYSQL_SCHEMA_VERSION = 9;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -82,6 +85,18 @@ const MIGRATION_LOCK_POLL_S = 30;
 /** PR #4725 N3 (mirror of store.ts): covered-seq span point queries chunk the
  *  msg_id IN (…) list at the same 500 batch size for cross-backend parity. */
 const SEQ_SPAN_QUERY_BATCH = 500;
+
+/** #4796: rows per batch of gc()'s zero-ref CAS sweep (mysql counterpart of
+ *  GC_ZERO_REF_BATCH_SIZE in store.ts): one giant DELETE holds every row
+ *  lock and all undo until commit; LIMIT-bound autocommit batches commit
+ *  independently, so a crash resumes and the lock/undo footprint stays
+ *  bounded to one batch. */
+const MYSQL_GC_ZERO_REF_BATCH = 2000;
+
+/** #4796 follow-up: statement size of the lifecycle-scoped zero-ref sweep
+ *  (collectZeroRefIn) — same rationale as the sqlite twin; chunked so each
+ *  IN-list stays a comfortable parameter count. */
+const MYSQL_ZERO_REF_SWEEP_CHUNK = 500;
 
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
@@ -121,7 +136,8 @@ CREATE TABLE IF NOT EXISTS content (
     byte_len BIGINT NOT NULL,
     refcount BIGINT NOT NULL DEFAULT 0,
     algo     VARCHAR(16) NOT NULL DEFAULT 'sha256',
-    bytes    LONGTEXT NOT NULL
+    bytes    LONGTEXT NOT NULL,
+    KEY idx_content_refcount (refcount)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -308,6 +324,18 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("retired_at")) {
                     await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+                }
+                // #4796 (v9): zero-ref collection index — gc()'s sweep and the
+                // dry-run count address content BY refcount; without this index
+                // every run full-scans the CAS table (field: 766K rows / ~20 GB).
+                // Same probe-first pattern as the v8 columns above; fresh
+                // installs pick the key up from the CREATE TABLE DDL.
+                const [idxRows] = (await conn.query(
+                    "SELECT INDEX_NAME AS idx FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'content'",
+                )) as unknown as Row[][];
+                const haveIdx = new Set((idxRows as unknown as { idx?: unknown }[]).map((r) => String(r.idx ?? "")));
+                if (!haveIdx.has("idx_content_refcount")) {
+                    await conn.query("ALTER TABLE content ADD INDEX idx_content_refcount (refcount)");
                 }
                 // MySQL DDL commits implicitly, so the ALTERs above are
                 // already durable when the data step starts. It streams one
@@ -1129,7 +1157,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
             for (const hash of refs) await this.releaseContent(c, hash);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection over this session's own
+            // released hashes (see collectZeroRefIn) — never the whole table.
+            await this.collectZeroRefIn(c, refs);
         });
     }
 
@@ -1546,9 +1576,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
-            const [zero] = (await c.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
-            contentRowsDeleted = num(zero[0].n);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection (see collectZeroRefIn) —
+            // the reported count is what THIS archive collected.
+            contentRowsDeleted = await this.collectZeroRefIn(c, rel);
         });
         loggerLog("info", `[#3931] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1683,8 +1713,8 @@ export class MysqlBackend implements StorageBackend {
         }
         const [zero] = (await this.pool.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
         if (num(zero[0].n) > 0) {
-            await this.pool.query("DELETE FROM content WHERE refcount <= 0");
-            contentRowsDeleted += num(zero[0].n);
+            loggerLog("info", `[#4796] gc: collecting ${num(zero[0].n)} zero-ref content rows in batches of ${MYSQL_GC_ZERO_REF_BATCH}`);
+            contentRowsDeleted += await this.collectZeroRefContent(MYSQL_GC_ZERO_REF_BATCH);
         }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3931] gc: running OPTIMIZE TABLE (mysql counterpart of the sqlite full VACUUM)");
@@ -1693,6 +1723,54 @@ export class MysqlBackend implements StorageBackend {
             await this.pool.query("OPTIMIZE TABLE content");
         }
         return { archived, contentRowsDeleted };
+    }
+
+    /** #4796: batched zero-ref CAS collection — mysql counterpart of
+     *  UnifiedStore.collectZeroRefContent. Each DELETE is a standalone
+     *  autocommit statement re-filtering `refcount <= 0` under its own
+     *  latest state: a row concurrently re-referenced between batches is
+     *  skipped, not deleted. */
+    private async collectZeroRefContent(batchSize: number): Promise<number> {
+        let deleted = 0;
+        let batchNo = 0;
+        for (;;) {
+            const [result] = (await this.pool.query(
+                "DELETE FROM content WHERE refcount <= 0 LIMIT ?",
+                [batchSize],
+            )) as unknown as Array<{ affectedRows?: number }>;
+            const changes = num(result.affectedRows ?? 0);
+            if (changes === 0) break;
+            batchNo += 1;
+            deleted += changes;
+            if (batchNo % 10 === 0 || changes < batchSize) {
+                loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
+            }
+        }
+        return deleted;
+    }
+
+    /** #4796 follow-up (PR #4800 review): lifecycle-scoped zero-ref
+     *  collection — mysql counterpart of UnifiedStore.collectZeroRefIn.
+     *  deleteSession/archiveSession/deleteCheckpoint used to finish with a
+     *  full-table `DELETE ... WHERE refcount <= 0` inside their lifecycle
+     *  transaction (the same giant-commit pathology as the old gc sweep on
+     *  a bloated store). Their own releases already went through
+     *  releaseContent's delete-on-zero, so this only re-asserts the
+     *  invariant over the operation's released-hash set — bounded work,
+     *  atomicity kept. Orphans from other sources stay for gc(). */
+    private async collectZeroRefIn(c: PoolConnection | Pool, hashes: string[]): Promise<number> {
+        const list = [...new Set(hashes)];
+        let deleted = 0;
+        for (let i = 0; i < list.length; i += MYSQL_ZERO_REF_SWEEP_CHUNK) {
+            const chunk = list.slice(i, i + MYSQL_ZERO_REF_SWEEP_CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            const [result] = (await c.query(
+                `DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`,
+                chunk,
+            )) as unknown as Array<{ affectedRows?: number }>;
+            deleted += num(result.affectedRows ?? 0);
+        }
+        return deleted;
     }
 
     async contentRefCountOfBody(needle: string): Promise<number> {
@@ -1780,7 +1858,7 @@ export class MysqlBackend implements StorageBackend {
             if (rows.length === 0) return false;
             await c.query("DELETE FROM checkpoints WHERE cp_id = ?", [cpId]);
             await this.releaseContent(c, str(rows[0].state_hash));
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            await this.collectZeroRefIn(c, [str(rows[0].state_hash)]);
             return true;
         });
     }

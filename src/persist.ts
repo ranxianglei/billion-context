@@ -1826,6 +1826,18 @@ export class SessionStore {
         }
     }
 
+    /** #4612: live foreign writer on the unified db (#4175 lock discipline) —
+     *  the gc full-vacuum preflight signal for the CLI/HTTP surfaces. Null when
+     *  the unified store is unavailable or nobody else is provably writing. */
+    unifiedActiveWriter(): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.activeForeignWriter();
+        } catch {
+            return null; // sidecar degraded mid-call: no evidence of a writer
+        }
+    }
+
     /** #3901/#3463: restore an archived session from its export file. */
     unifiedRestoreArchived(sessionId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
@@ -3352,4 +3364,14 @@ export function getStore(): SessionStore {
 export function _setStoreForTest(store: SessionStore): void {
     _store = store;
     if (globalSessionCommitListener !== undefined) store.setSessionCommitListener(globalSessionCommitListener);
+}
+
+/** Test hook: close and drop the singleton so the next getStore() re-resolves
+ *  env/config (BILI_SESSIONS_DIR, storage mode, persist.enabled). Closes first
+ *  — in unified modes the store holds an index.db handle that would leak past
+ *  rmSync on Windows (the #2690 review-4 class). #4990: the web read surface
+ *  now rides this singleton, so its test reset funnels through here. */
+export function _resetStoreForTest(): void {
+    _store?.closeQuietly();
+    _store = null;
 }

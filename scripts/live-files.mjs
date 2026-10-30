@@ -96,6 +96,9 @@ export const LIVE_FILES = [
     // state lives under a per-run tmpdir, and each test uses its own receiver +
     // origin, so the refcounted-worker table never sees cross-test collisions.
     "tests/issue5152-owner-beat-survives-host-stall.test.ts",
+    // #4612: spawns an idle node child as the "other live process" fixture;
+    // binds no ports, mkdtemp-isolated per test
+    "tests/issue4612-gc-online-guard.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

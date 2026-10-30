@@ -378,6 +378,8 @@
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
+| `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。 |
+| `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | 对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
 | `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
