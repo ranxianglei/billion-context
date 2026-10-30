@@ -1476,27 +1476,38 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
     } finally { await h.close(); }
 });
 
-test("HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140)", { timeout: 60_000 }, async () => {
-    const h = await harness(true);
-    try {
-        const parent = resolveConversation("parent").session!;
-        assert(h.store.flushSync(parent));
-        h.store.cancelAll();
-        _resetSessionsForTest();
-        _resetPluginStateForTest();
-        const restored = getSession("parent");
-        assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        // #5140: the intact raw tail is reconstructable from the unified index, so the cold
-        // parent is servable immediately — no model call needed to recover stored source.
-        // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
-        // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
-        const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
-        assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
-        await sendModel(h, "parent", h.messages);
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
-        assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
-    } finally { await h.close(); }
-});
+for (const mode of ["full", "shadow"] as const) {
+    test(`HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140, ${mode})`, { timeout: 60_000 }, async () => {
+        // Pin the mode explicitly: the broad-corpus CI baseline
+        // (preload-storage-baseline.mjs) runs this file under legacy, where the
+        // unified index — and thus this recovery path — does not exist.
+        const oldMode = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        const h = await harness(true);
+        try {
+            const parent = resolveConversation("parent").session!;
+            assert(h.store.flushSync(parent));
+            h.store.cancelAll();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            const restored = getSession("parent");
+            assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
+            // #5140: the intact raw tail is reconstructable from the unified index, so the cold
+            // parent is servable immediately — no model call needed to recover stored source.
+            // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
+            // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
+            const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
+            await sendModel(h, "parent", h.messages);
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+            assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+        } finally {
+            await h.close();
+            if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = oldMode;
+        }
+    });
+}
 
 test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
     const h = await harness();
