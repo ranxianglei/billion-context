@@ -22,8 +22,8 @@
  *   IMPORT GUARD     — a hand-aged legacy file (older savedAt than the
  *                      index watermark) must not re-import over newer index
  *                      state on load.
- *   ROLLBACK         — unset the env after running full → the legacy file
- *                      loads with the exact digest.
+ *   ROLLBACK         — explicitly select legacy after persisting the full
+ *                      load's migration → the file loads the exact digest.
  *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
  *                      back to legacy; the legacy file stays readable.
  *   CORRUPT INDEX    — a corrupt index.db degrades the store to legacy-only
@@ -167,6 +167,7 @@ for (const wire of WIRES) {
             const record = await driveWire(wire as Wire, `golden-${wire}`, { storageUnified: "full", reloadAfterEdit: leg });
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
+                if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
                 // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation
                 // numbers once (one-time ledger alignment) — the ONLY permitted
                 // wire delta. Citation-normalized digests must match turn-for-turn.
@@ -281,10 +282,10 @@ test("storage engine: load-side import guard skips a hand-aged legacy file (inde
 });
 
 // ---------------------------------------------------------------------------
-// ROLLBACK: full → unset env → legacy file authoritative, digest exact.
+// ROLLBACK: full → explicit legacy → legacy file authoritative, digest exact.
 // ---------------------------------------------------------------------------
 
-test("storage engine: rollback contract — unset the env and the legacy read path serves the identical state", async () => {
+test("storage engine: rollback contract — explicit legacy mode serves the identical persisted state", async () => {
     const dir = tmpdir("bili-engproof-rollback-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -305,8 +306,10 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         // merely deleting the env would read unified and vacate this leg.
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        storeFull.closeQuietly();
         assert.ok(viaFull, "full-mode reload returned null");
+        // Persist the one-time cold-load alignment before exercising rollback.
+        await storeFull.writeNow(viaFull);
+        storeFull.closeQuietly();
         const digestFull = viewDigest(toLegacyLike(viaFull));
 
         process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -378,8 +381,10 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         // fallback must reproduce exactly from the legacy file.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
+        // Both replicas must contain the migration before corrupting the index.
+        await clean.writeNow(viaFull);
+        clean.closeQuietly();
 
         // #4338: everything past this point (corrupt the header → degrade
         // construction → fallback read → rename guards → write → close) runs

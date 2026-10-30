@@ -566,6 +566,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             const qVacuum = (() => { try { return new URL(req.url!, "http://localhost").searchParams.get("vacuum"); } catch { return null; } })();
             const vacuum = qVacuum === "full" || qVacuum === "incremental" ? qVacuum : parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
+            // #4612: full VACUUM refuses to start while another live process
+            // writes the same db (exclusive write lock across the whole
+            // O(db-size) rewrite) — same preflight as the CLI lane.
+            if (vacuum === "full") {
+                const writer = store.unifiedActiveWriter();
+                if (writer !== null) {
+                    res.writeHead(409, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: `another process (pid ${writer}) is actively writing index.db — full VACUUM holds the exclusive write lock across the whole rewrite; stop the other process first or use ?vacuum=incremental`, writerPid: writer }));
+                    return;
+                }
+            }
             const result = await store.unifiedGc({
                 archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
                 vacuum,
