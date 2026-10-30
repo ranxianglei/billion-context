@@ -1,0 +1,105 @@
+name: CI Run Janitor
+
+# 2026-10-30 incident: 29 queued/in-progress runs starved for 8 hours behind
+# zombies — runs from deleted branches, stale schedule runs, and hung
+# in-progress jobs. Nothing ever reaped them, so every live check (including
+# PR required checks) sat behind the pile. This lane sweeps hourly and cancels:
+#   - queued runs older than QUEUE_MAX (default 120 min) — a queued GitHub
+#     hosted job starts within seconds of capacity; 2h queued means the run
+#     is starved, not slow
+#   - in_progress runs older than PROGRESS_MAX (default 240 min) — the slowest
+#     legit lane (windows test shard) measured ~21 min; 4h running is a hang
+#   - any queued/in_progress pull_request run whose head branch no longer
+#     exists (deleted-branch zombies), regardless of age
+# master's own push runs are NEVER cancelled (they are the head's only
+# required checks — cancelling would delete that signal for good); a starving
+# master run is reported as a workflow warning instead.
+
+on:
+  schedule:
+    # hourly at :57 — just ahead of the :03/:33 CI crons so a sweep clears
+    # the queue before the next scheduled burst lands
+    - cron: '57 * * * *'
+  workflow_dispatch:
+    inputs:
+      queuedMaxMinutes:
+        description: "Cancel queued runs older than this many minutes"
+        default: "120"
+        required: false
+      progressMaxMinutes:
+        description: "Cancel in_progress runs older than this many minutes"
+        default: "240"
+        required: false
+      dryRun:
+        description: "Log what would be cancelled without cancelling"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ci-run-janitor
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Cancel starved CI runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SELF_ID: ${{ github.run_id }}
+          QUEUE_MAX: ${{ inputs.queuedMaxMinutes || '120' }}
+          PROGRESS_MAX: ${{ inputs.progressMaxMinutes || '240' }}
+          DRY_RUN: ${{ inputs.dryRun && '1' || '' }}
+        run: |
+          set -euo pipefail
+          now=$(date +%s)
+          cancelled=0
+          warned=0
+
+          collect() {
+            gh api --paginate --jq '.workflow_runs[] | [.id, .status, .created_at, .event, (.head_branch // "")] | @tsv' \
+              "repos/$REPO/actions/runs?status=$1&per_page=100"
+          }
+          { collect queued; collect in_progress; } | sort -u > /tmp/janitor-runs.tsv
+          while IFS=$'\t' read -r id status created event branch; do
+            if [ "$id" = "$SELF_ID" ]; then continue; fi
+            age_min=$(( (now - $(date -d "$created" +%s)) / 60 ))
+
+            if [ "$event" = "push" ] && [ "$branch" = "master" ]; then
+              echo "::warning::master push run $id ($status, ${age_min}m old) is starved — not cancelling (head's required checks)"
+              warned=$((warned + 1))
+              continue
+            fi
+
+            reason=""
+            if [ "$event" = "pull_request" ] && [ -n "$branch" ]; then
+              if ! gh api "repos/$REPO/branches/$branch" >/dev/null 2>&1; then
+                reason="head branch '$branch' deleted"
+              fi
+            fi
+            if [ -z "$reason" ]; then
+              limit=$([ "$status" = "queued" ] && echo "$QUEUE_MAX" || echo "$PROGRESS_MAX")
+              if [ "$age_min" -ge "$limit" ]; then
+                reason="$status ${age_min}m >= ${limit}m"
+              fi
+            fi
+            if [ -z "$reason" ]; then
+              continue
+            fi
+
+            echo "cancel run $id ($event, branch '$branch'): $reason"
+            if [ -n "$DRY_RUN" ]; then
+              continue
+            fi
+            if ! gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1; then
+              echo "::warning::cancel of $id failed (run may have just transitioned)"
+            fi
+            cancelled=$((cancelled + 1))
+          done
+          echo "janitor sweep done (cancelled=$cancelled master_warned=$warned dry_run=${DRY_RUN:-no})"
