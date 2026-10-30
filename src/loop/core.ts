@@ -1573,16 +1573,27 @@ export async function* runCompressLoop(
                 // append the recovery receipt as a plain assistant message —
                 // bytes identical to what emitMarker already streamed to the
                 // client this round (same order, same dedup: seenMarkers holds
-                // exactly what went out). Falls through to the normal
-                // re-request path below.
+                // exactly what went out). When dedup suppressed EVERY marker of
+                // this round (a byte-identical failure already went out earlier
+                // in this request), nothing client-visible anchors a receipt —
+                // pushing one would ride upstream as an empty assistant text
+                // block (illegal on strict wires) that vanishes from the
+                // client's next request: the seam #4186 forbids. Re-request the
+                // unchanged body instead — the model already saw the failure,
+                // and the breaker + round limit above still bound the loop.
+                // Falls through to the normal re-request path below.
                 const dropIds = new Set<string>();
                 for (const pr of failedMutating) {
                     dropIds.add(`acp_loop_r${round}_asst_tc_${pr.callId}`);
                     dropIds.add(`acp_loop_r${round}_tool_${pr.callId}`);
                 }
                 coreMessages.splice(0, coreMessages.length, ...coreMessages.filter((m) => !dropIds.has(m.id)));
-                ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
-                coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
+                if (streamedMarkers.length > 0) {
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
+                    coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
+                } else {
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; every marker deduped this request — re-requesting without a receipt (an empty one would ride upstream) (#5220)`);
+                }
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);

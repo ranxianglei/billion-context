@@ -119,9 +119,9 @@ test("#252: post-compress re-request usage is netted by the compress credit", as
 test("#252: failed compress accrues no credit", async () => {
     const ctx = makeCompressibleCtx();
     // Sub-viability range (kernel minCompressRange) → compress FAILS. Under #5220
-// such a round re-requests with a recovery receipt (round 2 below carries no
-// usage report) — and the point still stands: NO credit may be netted off the
-// turn's only real usage figure.
+    // such a round re-requests with a recovery receipt (round 2 below carries no
+    // usage report) — and the point still stands: NO credit may be netted off the
+    // turn's only real usage figure.
     const badArgs = JSON.stringify({ content: [{ startId: "m00007", endId: "m00007", summary: "s" }] });
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),

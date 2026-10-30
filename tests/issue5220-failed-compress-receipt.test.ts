@@ -28,6 +28,11 @@ import type { CoreMessage } from "acp-kernel";
 //     no re-request) — otherwise the receipt would be server-invisible bytes
 //     upstream, exactly the seam #4186 forbids.
 //  5. failedCallSignature: argument order must not defeat repeat detection.
+//  6. dedup edge: when #1029 marker dedup suppresses EVERY marker of a round
+//     (a byte-identical failure already went out earlier in this request),
+//     nothing client-visible anchors a receipt — no empty assistant text may
+//     ride upstream; the loop re-requests the unchanged body instead and the
+//     breaker + round limit still bound it.
 
 function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -208,6 +213,57 @@ test("#5220 T4: DIFFERENT failing args every round → no breaker, runs to MAX_L
         );
         assert.equal(n, MAX_LOOP_ROUNDS - 1, "every round carries a first-seen signature; only the round limit bounds the turn");
         assert.ok(/event: response\.completed/.test(out), "graceful completion at the limit (not degenerate empty)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// Valid-shape compress against a nonexistent ref: kernel-level failure whose
+// text does NOT embed the ref — byte-identical across distinct refs, so #1029
+// marker dedup suppresses every marker after round 1 while each round carries
+// a fresh signature (never stuck). The probe family (#3302) shape.
+function unknownRefRound(ref: string): string {
+    return [
+        sse("response.created", { response: { id: `resp_${ref}`, status: "in_progress" } }),
+        fcEvents(0, `call_${ref}`, "compress", JSON.stringify({ content: [{ startId: ref, endId: ref, summary: "s" }] })),
+        COMPLETED,
+    ].join("");
+}
+
+test("#5220 T6 dedup edge: every marker suppressed → no receipt pushed, no empty assistant text rides upstream; loop stays bounded", async () => {
+    let n = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        n++;
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(unknownRefRound(`m${900 + n}`), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const ctx = withRefs(makeCtx([textMsg("u1", "user", "task")]));
+        const out = await drain(
+            new Response(unknownRefRound("m900"), { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(n, MAX_LOOP_ROUNDS - 1, "fresh signature every round → only the round limit bounds the turn");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion at the limit (not degenerate empty)");
+        for (const b of bodies) {
+            const parsed = JSON.parse(b) as { input?: Array<{ role?: string; content?: unknown }> };
+            for (const item of parsed.input ?? []) {
+                const c = item.content;
+                if (typeof c === "string") {
+                    assert.ok(item.role !== "assistant" || c.length > 0, "no empty assistant message rides upstream (an unanchored receipt would be a #4186 seam + illegal on strict wires)");
+                    continue;
+                }
+                if (!Array.isArray(c)) continue;
+                for (const part of c) {
+                    const p = part as { type?: string; text?: string };
+                    assert.ok(p.type !== "output_text" || (p.text ?? "").length > 0, "no empty output_text rides upstream (an unanchored receipt would be a #4186 seam + illegal on strict wires)");
+                }
+            }
+        }
     } finally {
         globalThis.fetch = orig;
     }
