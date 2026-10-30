@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue, normalizeMessageRole } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -775,10 +775,18 @@ export class MysqlBackend implements StorageBackend {
             const batchTs = Date.now(); // #4313: one sample per save batch
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
-                const [res] = (await c.query(
-                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs],
-                )) as unknown as [{ affectedRows: number }, unknown];
+                let res;
+                try {
+                    [res] = (await c.query(
+                        "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [s.sessionId, m.seq, m.msgId, m.ref ?? null, m.refNum ?? null, normalizeMessageRole(m.role), m.kind ?? "message", hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs],
+                    )) as unknown as [{ affectedRows: number }, unknown];
+                } catch (err) {
+                    // #4407: rethrow with the row identity so the degrade relay
+                    // names which session/seq/msg_id failed (the raw driver
+                    // error is under-determined).
+                    throw new Error(`messages insert failed session_id=${s.sessionId} seq=${m.seq} msg_id=${m.msgId}: ${err instanceof Error ? err.message : String(err)}`);
+                }
                 if (res.affectedRows === 0) {
                     await this.releaseContent(c, hash);
                     // #4506: tombstone reactivation — restore media mappings
@@ -1907,7 +1915,7 @@ export class MysqlBackend implements StorageBackend {
                 const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
                 await c.query(
                     "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null, typeof m.ts === "number" ? m.ts : null],
+                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, normalizeMessageRole(m.role), m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null, typeof m.ts === "number" ? m.ts : null],
                 );
             }
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {
@@ -2346,7 +2354,7 @@ export class MysqlBackend implements StorageBackend {
             checks++;
             const parsed = JSON.parse(m.content) as { id?: string; role?: string; contentType?: string };
             if (parsed.id !== m.msgId) return fail(`messages[${m.seq}].msg_id`, `${m.msgId} vs ${String(parsed.id)}`);
-            if (parsed.role !== m.role) return fail(`messages[${m.seq}].role`, `${m.role} vs ${String(parsed.role)}`);
+            if (normalizeMessageRole(parsed.role) !== m.role) return fail(`messages[${m.seq}].role`, `${m.role} vs ${String(parsed.role)}`);
             if ((parsed.contentType ?? "message") !== m.kind) {
                 return fail(`messages[${m.seq}].kind`, `${m.kind} vs ${String(parsed.contentType)}`);
             }
