@@ -33,10 +33,11 @@ import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { armNativeLane, verifyAttachAndRecover as verifyAttachAndRecoverShared, type NativeLaneSpec } from "./native-attach.js";
 import { installInlineTransport } from "./pi-inline.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
-import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
+import { fetchProxyVersion, fetchStatus } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
@@ -160,75 +161,28 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
     _spawnForTest = fn;
 }
 
-/** #1135/#1365: the attached origin can go stale — at startup (the owning
- *  launcher exited before this process started) or at runtime (it exits while
- *  this session still rides the shared proxy, #1130). Probe before trusting
- *  it: healthy → keep attaching (a transient blip costs nothing — the session
- *  never migrates). DEAD + routed-channel evidence (#1365: /bili/-baked model
- *  traffic was observed at some origin) → the session's context lives at THAT
- *  origin, so wait for the pinned target to come back (bounded by
- *  BILI_ATTACH_HEALTH_DEADLINE_MS) instead of spawning — a second instance
- *  would serve tools while the model channel stays pinned elsewhere and every
- *  bili tool call 404s against it (unrecoverable split); the env is preserved
- *  so the user's target stays declared. DEAD with no evidence after the grace
- *  window (BILI_ATTACH_EVIDENCE_GRACE_MS) → unfreeze the preset env and fall
- *  back to spawning our own proxy, re-arming respawn as a pure spawn. Resolves
- *  to the origin the client should use — the (recovered) attach origin, the
- *  fallback origin, or undefined when nothing came up. */
+/** #1135/#1365: shared since #5241 phase 1 — the lifecycle itself lives in
+ *  native-attach.ts (one implementation for all lanes, behavior frozen by
+ *  tests/contract-v2-stake-verify-attach.test.ts). This lane spec is the
+ *  pi-specific surface: publish = shared state + BILLION_CONTEXT_PROXY. */
+const laneSpec: NativeLaneSpec = {
+    lane: "pi",
+    state,
+    spawnForTest: () => _spawnForTest,
+    bootstrap,
+    publish: (origin) => {
+        state.origin = origin;
+        process.env.BILLION_CONTEXT_PROXY = origin;
+    },
+    unpublish: () => {
+        delete process.env.BILLION_CONTEXT_PROXY;
+    },
+    onEvent: (level, message) => logHostEvent(level, "[native-client]", message),
+};
+
+/** Doc comment moved to native-attach.ts#verifyAttachAndRecover. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
-    // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should. An
-    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
-    // endpoint directly, and a routed model origin may be a plain model-only
-    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
-    const explicitAttachOrigin = nativeAttachOrigin(process.env);
-    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
-    const version = await fetchProxyVersion(home).catch(() => undefined);
-    if (version !== undefined) {
-        // Restore the readyOrigin short-circuit — a runtime recovery clears
-        // state.origin before re-probing, and a transient blip must not leave
-        // it dangling.
-        state.origin = home;
-        process.env.BILLION_CONTEXT_PROXY = home;
-        return home;
-    }
-    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
-    if (pinned !== undefined) {
-        const back = await waitForProxyVersion(pinned);
-        if (back !== undefined) {
-            state.origin = back;
-            process.env.BILLION_CONTEXT_PROXY = back;
-            logHostEvent("info", "[native-client]", `bili-native(pi): attach target ${pinned} is healthy again — attached, no second instance spawned`);
-            return back;
-        }
-        logHostEvent(
-            "error",
-            "[native-client]",
-            explicitAttachOrigin !== undefined
-                ? `bili-native(pi): explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
-                : `bili-native(pi): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
-        );
-        state.origin = undefined;
-        return undefined;
-    }
-    logHostEvent("error", "[native-client]", `bili-native(pi): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
-    delete process.env.BILLION_CONTEXT_PROXY;
-    state.attach = false;
-    state.origin = undefined;
-    const start = singleFlight(_spawnForTest ?? bootstrap);
-    state.respawn = start;
-    // Publish whatever origin lands on BOTH the shared state and the env —
-    // env readers (compaction reporter, /acp status) must never disagree with
-    // what the route resolves, whoever produced the origin.
-    const landed = start().then((o) => {
-        if (o !== undefined) {
-            state.origin = o;
-            process.env.BILLION_CONTEXT_PROXY = o;
-        }
-        return o;
-    });
-    state.ready = landed;
-    return landed;
+    return verifyAttachAndRecoverShared(laneSpec, attachOrigin);
 }
 
 const plan = planNativePi(process.env, loadConfigFile().pi?.inline);
@@ -239,6 +193,10 @@ const plan = planNativePi(process.env, loadConfigFile().pi?.inline);
  *  spawn mode stays test-guarded because bootstrap forks a real proxy. */
 export function armNativePi(p: typeof plan): void {
     if (p.mode === "off") return;
+    // #5241 phase 1: one native lane per process — a second, different lane
+    // would overwrite this lane's BILLION_CONTEXT_PROXY and fetch intercept
+    // (see native-attach.ts).
+    armNativeLane("pi");
     markNativeHost(process.env, "pi");
     if (p.mode === "attach") {
         state.attach = true;
