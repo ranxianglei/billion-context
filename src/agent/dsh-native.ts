@@ -780,8 +780,9 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  and the register — not the env — is dsh's publish surface. Branch-hook
  *  transposition would spread one coherent state machine across two files
  *  with subtly mismatched check points. What IS shared: the armNativeLane
- *  guard above, the #1365 precedence chain (explicit > routed > planned —
- *  kept in lockstep by the phase-0 stakes), and the probe/wait primitives.
+ *  guard (armed in apply()), the #1365 precedence chain (explicit > routed
+ *  > planned — kept in lockstep by the phase-0 stakes), and the probe/wait
+ *  primitives.
  *  The divergence is frozen by tests/issue3544-stale-proxy-rotation.test.ts
  *  and tests/contract-v2-stake-verify-attach.test.ts. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
