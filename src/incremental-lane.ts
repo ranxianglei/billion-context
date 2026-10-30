@@ -874,8 +874,11 @@ export async function handleIncrementalTurn(
         const msgsBefore = entry.msgs.length;
         // #4867: pre-turn snapshot for the rollback below. `msgs` keeps the old
         // array reference (applyTurn assigns a NEW array); `marks` must be
-        // CLONED — applyTurn mutates the map in place.
-        const preTurn = { msgs: entry.msgs, marks: new Map(entry.marks), boundary: entry.boundary, system: entry.system, systemSet: entry.systemSet };
+        // CLONED — applyTurn mutates the map in place. `renderPrefix`/
+        // `marksVersion` (#5155) ride along too: the turn refreshes the prefix
+        // cache over the NEW history, and a rollback that left it would let a
+        // later turn splice rejected-branch bytes into an accepted body.
+        const preTurn = { msgs: entry.msgs, marks: new Map(entry.marks), boundary: entry.boundary, system: entry.system, systemSet: entry.systemSet, renderPrefix: entry.renderPrefix, marksVersion: entry.marksVersion };
         const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload, deltaIds, retouch);
         if (!applied.ok) {
             touchCache(conversationId, entry);
@@ -1011,6 +1014,8 @@ export async function handleIncrementalTurn(
             entry.boundary = preTurn.boundary;
             entry.system = preTurn.system;
             entry.systemSet = preTurn.systemSet;
+            entry.renderPrefix = preTurn.renderPrefix;
+            entry.marksVersion = preTurn.marksVersion;
             touchCache(conversationId, entry);
             log("warn", `[incremental] ${conversationId}: forward did not land — canonical rolled back from ${String(appliedSeq)} to ${String(preTurn.msgs.length)}; the client can retry the same delta (#4867)`);
         };
