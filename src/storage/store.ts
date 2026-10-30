@@ -41,6 +41,19 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
 
+/** #4796: rows per batch of gc()'s zero-ref CAS sweep. Sized so one batch's
+ *  page churn stays modest even when the store is dominated by multi-MB
+ *  blobs (~22 KB field-measured orphan average → ~44 MB/batch): each batch
+ *  commits and checkpoints independently, bounding its WAL growth and
+ *  write-lock hold to one batch instead of the whole table. */
+const GC_ZERO_REF_BATCH_SIZE = 2000;
+
+/** #4796 follow-up: statement size of the lifecycle-scoped zero-ref sweep
+ *  (collectZeroRefIn) — well under SQLite's variable-count limit; a
+ *  session's distinct released hashes exceed it only pathologically, and
+ *  the loop simply continues with the next chunk. */
+const ZERO_REF_SWEEP_CHUNK = 500;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -324,6 +337,20 @@ export class StorageIntegrityError extends Error {
     }
 }
 
+/** #4612: human-readable byte sizing for vacuum start/finish logs.
+ *  */
+function formatDbSize(bytes: number): string {
+    if (bytes < 0) return "?";
+    const units = ["B", "KiB", "MiB", "GiB"];
+    let v = bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+        v /= 1024;
+        i++;
+    }
+    return i === 0 ? `${v} B` : `${v.toFixed(1)} ${units[i]}`;
+}
+
 /** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
 function processAlive(pid: number): boolean {
     try {
@@ -521,6 +548,40 @@ export class UnifiedStore {
     /** #4175: the live foreign pid seen holding <db>.lock at open, or null. */
     lockHolder(): { pid: number } | null {
         return this.foreignLockHolder;
+    }
+
+    /** #4612: a live pid besides ours currently writing this db — the union of
+     *  two evidence sources: (1) the foreign holder captured at open, re-validated
+     *  for liveness (it may have exited since); (2) a fresh read of <db>.lock
+     *  pointing at another live pid — every opener overwrites the lockfile with
+     *  its own pid on open, so this catches an instance that started AFTER us.
+     *  Null when no live foreign writer is provably present; an unreadable
+     *  lockfile means "no evidence" (fail-open) — callers need proof of
+     *  liveness to refuse, not certainty of absence. */
+    activeForeignWriter(): number | null {
+        if (this.foreignLockHolder !== null && processAlive(this.foreignLockHolder.pid)) {
+            return this.foreignLockHolder.pid;
+        }
+        if (this.lockPath !== null) {
+            try {
+                if (existsSync(this.lockPath)) {
+                    const parsed = JSON.parse(readFileSync(this.lockPath, "utf8")) as { pid?: unknown };
+                    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                    if (pid !== null && pid !== process.pid && processAlive(pid)) return pid;
+                }
+            } catch {
+                /* unreadable lockfile: no evidence of a writer */
+            }
+        }
+        return null;
+    }
+
+    private dbFileSize(): number {
+        try {
+            return statSync(this.dbPath).size;
+        } catch {
+            return -1;
+        }
     }
 
     /**
@@ -1531,8 +1592,9 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
-            // CAS rows at zero refcount are unreferenced garbage — collect.
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // #4796 follow-up: scoped collection over this session's own
+            // released hashes (see collectZeroRefIn) — never the whole table.
+            this.collectZeroRefIn(refs);
         });
     }
 
@@ -1738,9 +1800,9 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
             for (const hash of rel) this.releaseContent(hash);
-            const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
-            contentRowsDeleted = zero.n;
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // #4796 follow-up: scoped collection (see collectZeroRefIn) —
+            // the reported count is what THIS archive collected.
+            contentRowsDeleted = this.collectZeroRefIn(rel);
         });
         loggerLog("info", `[#3901] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1847,6 +1909,19 @@ export class UnifiedStore {
      *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
      *  databases created before that pragma). */
     gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
+        // write lock with no intermediate progress. Running it against a db that
+        // another live process is writing starves that process until its storage
+        // layer degrades (field report: shadow 3-strike during a 14-min run on a
+        // 14 GB db). Refuse up front with an actionable error instead of silently
+        // contending. Incremental / no-vacuum sweeps are short transactions — the
+        // existing busy_timeout handling covers them.
+        if (opts.vacuum === "full") {
+            const writer = this.activeForeignWriter();
+            if (writer !== null) {
+                throw new Error(`[#4612] gc full VACUUM refused: another process (pid ${writer}) is actively writing this database — the rewrite holds the exclusive write lock across the whole pass and would starve the peer's writes until its storage layer degrades; stop the other process (or wait for it to exit) and retry, or use vacuum:"incremental"`);
+            }
+        }
         const now = opts.now ?? Date.now();
         let archived = 0;
         let contentRowsDeleted = 0;
@@ -1861,18 +1936,94 @@ export class UnifiedStore {
         }
         const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
         if (zero.n > 0) {
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
-            contentRowsDeleted += zero.n;
+            loggerLog("info", `[#4796] gc: collecting ${zero.n} zero-ref content rows in batches of ${GC_ZERO_REF_BATCH_SIZE}`);
+            contentRowsDeleted += this.collectZeroRefContent(GC_ZERO_REF_BATCH_SIZE);
         }
         if (opts.vacuum === "full") {
-            loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
+            const sizeBefore = this.dbFileSize();
+            let walPart = "";
+            try {
+                walPart = `, ${formatDbSize(statSync(`${this.dbPath}-wal`).size)} WAL`;
+            } catch {
+                /* no WAL file present */
+            }
+            loggerLog("info", `[#4612] gc: full VACUUM starting — ${formatDbSize(sizeBefore)} main file${walPart}; atomic rewrite holding the exclusive write lock until done (no intermediate progress)`);
+            const startedAt = Date.now();
             // #4390: delegate to vacuum() — a bare VACUUM leaves the compacted
             // image in the WAL; only the TRUNCATE checkpoint shrinks the files.
             this.vacuum("full");
+            loggerLog("info", `[#4612] gc: full VACUUM finished in ${((Date.now() - startedAt) / 1000).toFixed(1)} s — ${formatDbSize(sizeBefore)} -> ${formatDbSize(this.dbFileSize())}`);
         } else if (opts.vacuum === "incremental") {
             this.vacuum("incremental");
         }
         return { archived, contentRowsDeleted };
+    }
+
+    /** #4796: batched zero-ref CAS collection — the working half of the fix
+     *  (the other half is schema v9's idx_content_refcount). One giant
+     *  `DELETE FROM content WHERE refcount <= 0` never commits on a bloated
+     *  store: uncommitted deletes stay invisible to every other connection
+     *  (field: "ran 8 hours, zero rows changed"), the uncommitted tx's WAL
+     *  frames cannot checkpoint (journal_size_limit applies to committed
+     *  frames only), and the exclusive write lock is held until the process
+     *  dies. Batching turns the sweep into small autocommit statements —
+     *  each batch commits and checkpoints independently, so progress
+     *  survives a crash (the next run resumes where this one died) and the
+     *  write lock is held per batch, not per table.
+     *
+     *  Deliberately NOT wrapped in an explicit transaction: an explicit tx
+     *  pins the read snapshot at the SELECT, so a concurrent writer that
+     *  re-references a row between select and delete would be invisible to
+     *  us and we would delete freshly-referenced bytes. Each statement runs
+     *  in autocommit mode against the latest committed state, and the DELETE
+     *  re-filters `refcount <= 0` under its own snapshot — a row that got a
+     *  reference back between the two statements is skipped, not deleted. */
+    private collectZeroRefContent(batchSize: number): number {
+        let deleted = 0;
+        let batchNo = 0;
+        for (;;) {
+            const hashes = this.db
+                .prepare("SELECT hash FROM content WHERE refcount <= 0 ORDER BY hash LIMIT ?")
+                .all(batchSize) as Array<{ hash: string }>;
+            if (hashes.length === 0) break;
+            batchNo += 1;
+            const ph = hashes.map(() => "?").join(", ");
+            const r = this.db.prepare(`DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`).run(...hashes.map((h) => h.hash));
+            deleted += Number(r.changes);
+            // Best-effort shrink between batches: committed frames move into
+            // the main db and the WAL file truncates back to the cap
+            // (#3250 discipline). A busy checkpoint loses nothing — the next
+            // batch retries.
+            try {
+                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch { /* best-effort; retried by the next batch */ }
+            if (batchNo % 10 === 0 || hashes.length < batchSize) {
+                loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
+            }
+        }
+        return deleted;
+    }
+
+    /** #4796 follow-up (PR #4800 review): lifecycle-scoped zero-ref
+     *  collection. deleteSession/archiveSession/deleteCheckpoint used to
+     *  finish with a full-table `DELETE ... WHERE refcount <= 0` — on a
+     *  bloated store that re-created the exact pathology of the old gc
+     *  sweep (one giant commit inside the lifecycle transaction: unbounded
+     *  WAL growth, long write-lock hold) while adding nothing these ops
+     *  need: every hash they release already went through releaseContent's
+     *  delete-on-zero. This collects only within the operation's own
+     *  released-hash set — bounded work, same-transaction atomicity kept —
+     *  which also catches a pre-existing orphan row the op happens to
+     *  touch. Orphans from other sources stay for gc(). */
+    private collectZeroRefIn(hashes: Iterable<string>): number {
+        const list = [...new Set(hashes)];
+        let deleted = 0;
+        for (let i = 0; i < list.length; i += ZERO_REF_SWEEP_CHUNK) {
+            const chunk = list.slice(i, i + ZERO_REF_SWEEP_CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            deleted += Number(this.db.prepare(`DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`).run(...chunk).changes);
+        }
+        return deleted;
     }
 
     /** Test/ops helper: refcount of the content row whose serialized body
@@ -2060,7 +2211,7 @@ export class UnifiedStore {
             if (!row) return false;
             this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cpId);
             this.releaseContent(row.state_hash);
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            this.collectZeroRefIn([row.state_hash]);
             return true;
         });
     }

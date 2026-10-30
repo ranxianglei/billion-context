@@ -378,6 +378,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
+| `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait. |
+| `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two. |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
 | `BILI_MCP_PROXY` | string | unset | — | Spawn channel: MCP proxy target for plugin-hosted tools. |
@@ -2000,6 +2002,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_INHERITED_HTTP_PROXY` / `BILI_INHERITED_HTTPS_PROXY` / `BILI_INHERITED_ALL_PROXY` / `BILI_INHERITED_NO_PROXY` | Not user-facing — set automatically by the launcher when it spawns the proxy (#1012). The launcher strips the shell's proxy vars from both the client and the proxy child (clients must send to bili; the proxy must not have its model egress hijacked by a shell proxy), but it forwards the user's pre-strip proxy under these names so the proxy's **auxiliary egress** (MITM blind tunnels — client-side MCP/web traffic) can still ride the user's VPN. They feed only the blind-tunnel fallback tier: explicit routes / global `proxy` / `BILI_UPSTREAM_PROXY` / explicit `"upstreamProxyMode": "direct"` all still win, and a value pointing at bili's own port is dropped. Model egress is unaffected (stays direct unless explicitly configured). |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | Health-wait deadline (ms) for dsh/opencode attach verification when the attach target is down but this process's model channel is **pinned** to it (routed `/bili/…` model traffic was observed against it): bili waits for the target to come back instead of spawning a second instance — a spawn would split the session (model traffic stays pinned, bili tools would 404 against the other instance). When the deadline elapses it fails loudly and keeps re-checking on every model request until the target returns (default `15000`). See #1365. |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | Grace window (ms) during which a dsh/opencode attach verification probing a dead target waits for routed-channel evidence to appear before falling back to the legacy spawn path (covers the decision-before-first-request race: the probe fails at t≈0 while the first model request lands at t≈1s) (default `5000`). See #1365. |
+| `BILI_SPAWN_WAIT_MS` | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher logs `still starting up` and extends the wait (default `20000`). Widen it when the proxy's pre-bind open path runs long: a large `index.db` opens whole-DB before bind (integrity check, WAL recovery — see #4939), and two lanes sharing one store cold-starting together contend for the SQLite write lock (observed 28s+ to first log line, 60s+ with zero output, on Windows with a 1.7 GiB store). Non-numeric or non-positive values fall back to the default (same `envMillis` contract as #1365). |
+| `BILI_SLOW_START_GRACE_MS` | Slow-start grace (ms) beyond `BILI_SPAWN_WAIT_MS` for a spawned child that is still ALIVE and starting (#2187: Windows spawn windows of 26-45s from AV / first-run disk activity; a large or contended shared store can push total pre-bind time past 60s). The total spawn budget is the sum of the two knobs; a child that EXITS still fails fast (default `40000`). |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
 | `BILI_PERSIST_TAIL_TOKENS` | Token budget for the persisted conversation snapshot (#401). The disk record stores the **folded view** (block summaries in place of compressed ranges) truncated to the newest messages within this budget — never the raw full history. Default `16384`; `0` disables message persistence entirely (block summaries and compressed originals still persist; `bili export` falls back to block-only rendering). Live in-memory sessions are unaffected — `bili export` of a live session is always complete. |
@@ -2485,3 +2489,23 @@ To stop the failures at the root, add the sessions dir to your antivirus exclusi
 2. **Do not sync this directory.** Make sure OneDrive (or Dropbox / Google Drive / similar) is not syncing `%USERPROFILE%\.local\share\billion-context\`. If it lives under a synced folder, relocate it with `BILI_SESSIONS_DIR` to a non-synced path.
 
 High-frequency persist writes otherwise re-trigger the real-time scan on every turn — which is what produces the `EPERM` write failures. Once the directory is excluded, the alerts stop.
+
+### Windows: node runtime labeled Low (NTFS mandatory integrity) (#5154)
+
+Everything above assumes the *files* are the problem. #5154 found the opposite shape: the **Node runtime itself** (`node.exe`) carried a **Low mandatory-integrity label**, so the process was Low-integrity and *every write to a Medium-labeled file* — the CA bundle rebuild, `index.db`, session envelopes — failed with `EPERM` while every ACL check passed. The label usually arrives by **inheritance**: a parent directory once labeled `Low (OI)(CI)` (for example by a stray `icacls <dir> /setintegritylevel "(OI)(CI)Low" /T`) stamps the Low label onto every file placed inside it, and it survives reboots. This is the mechanism behind whole "crash loop with no visible cause" startup classes (#5096).
+
+bili probes its own runtime's label once at startup (`icacls` on `process.execPath`) and logs a loud `[integrity]` warning when it finds Low/Untrusted — non-blocking, the proxy keeps running.
+
+To check and fix manually (run elevated; use the **absolute path** — `icacls` PATH resolution fails under some PowerShell/cmd profiles):
+
+```bat
+:: look for a "Mandatory Label\Low Mandatory Level" line (no Mandatory Label line = no label = fine)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe"
+
+:: restore the runtime to Medium (this is the fix; verify with the command above)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe" /setintegritylevel Medium
+```
+
+If the label shows an `(I)` (inherited) marker, a **parent directory** is the source: fix the directory **root only, non-recursive** — `icacls "<dir>" /setintegritylevel Medium` with **no `/T`**. New and re-created children then inherit "(no label)" and converge; `/T` would touch thousands of files for nothing. Back up current ACLs first with `icacls "<dir>" /save acl.txt` if unsure.
+
+Do **not** "fix" this by relabeling the billion-context data dir Low — that direction makes things worse (see #3823 vs #5154: files writable only by Low processes, integrity ceiling everywhere).
