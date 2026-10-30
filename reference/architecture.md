@@ -33,7 +33,8 @@ billion-context/
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
-│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941)
+│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
+│   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)

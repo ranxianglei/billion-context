@@ -6,6 +6,7 @@ import tls from "node:tls";
 import test from "node:test";
 import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, osStoreExecOptions, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
 import { resolveCombinedCaPath } from "../src/launcher.js";
+import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 let _tmpHome: string | undefined;
@@ -164,4 +165,61 @@ test("#1807: combined bundle reused while fresh, rebuilt when stale or CA-missin
     fs.utimesSync(file, freshButWrong, freshButWrong);
     ensureRootCA();
     assert.ok(fs.readFileSync(file, "utf8").includes(mitmRoot), "fresh file missing the MITM CA is rebuilt");
+});
+
+// #5103: a forced power loss left the DSH child dying on EPERM at the combined
+// bundle rewrite (the file was >24h old, so every startup re-merged it). The
+// rebuild must degrade to REUSING an existing valid bundle instead of bricking
+// the whole proxy — but only when that bundle still carries our root CA.
+
+test("#5103: write-refused rebuild reuses an existing bundle that carries the MITM root", (t) => {
+    if (process.getuid?.() === 0) {
+        t.skip("root bypasses permission bits — cannot simulate the OS write refusal");
+        return;
+    }
+    ensureRootCA();
+    const file = combinedCaPath();
+    const before = fs.readFileSync(file, "utf8");
+    const stale = new Date(Date.now() - 25 * 3600e3);
+    fs.utimesSync(file, stale, stale); // force the rebuild branch
+    fs.chmodSync(file, 0o444); // EACCES on POSIX / EPERM on win32 at open-for-write
+    const captured: Array<{ level: string; msg: string }> = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    let threw: unknown;
+    try {
+        try { ensureRootCA(); } catch (err) { threw = err; }
+        assert.equal(threw, undefined, "a usable existing bundle must absorb the write refusal");
+        assert.equal(fs.readFileSync(file, "utf8"), before, "the existing bundle is left untouched");
+        const warn = captured.find((c) => c.level === "warn" && c.msg.includes("cannot rebuild"));
+        assert.ok(warn, "the reuse must be announced loudly (not silent degradation)");
+        assert.ok(warn!.msg.includes("continuing with the EXISTING bundle"), warn.msg);
+        assert.ok(warn!.msg.includes("antivirus"), "must point at the AV-exclusion remedy");
+    } finally {
+        setLogCapture(null);
+        fs.chmodSync(file, 0o644);
+    }
+});
+
+test("#5103: write-refused rebuild with NO usable bundle still fails fast", (t) => {
+    if (process.getuid?.() === 0) {
+        t.skip("root bypasses permission bits — cannot simulate the OS write refusal");
+        return;
+    }
+    ensureRootCA();
+    const file = combinedCaPath();
+    fs.writeFileSync(file, "-----BEGIN CERTIFICATE-----\n" + Buffer.from("junk").toString("base64") + "\n-----END CERTIFICATE-----\n");
+    const stale = new Date(Date.now() - 25 * 3600e3);
+    fs.utimesSync(file, stale, stale);
+    fs.chmodSync(file, 0o444);
+    let threw: unknown;
+    try {
+        try { ensureRootCA(); } catch (err) { threw = err; }
+    } finally {
+        fs.chmodSync(file, 0o644);
+    }
+    assert.ok(threw instanceof Error, "no reusable bundle — the refusal must stay fatal");
+    const code = (threw as NodeJS.ErrnoException).code;
+    assert.match(String(code ?? ""), /EACCES|EPERM/, `expected a permission errno, got ${String(code)}`);
+    // leave the shared tmp home in a healthy state for any later test
+    ensureRootCA();
 });
