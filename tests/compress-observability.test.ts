@@ -169,8 +169,8 @@ test("#349: empty compress args → actionable no-valid-ranges message (missing-
     const ctx = makeCompressibleCtx();
     const out = runApply(ctx, {});
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
-    assert.ok(out.includes("non-empty 'content' array"), `steers to a content array: ${out}`);
-    assert.ok(out.includes("startId, endId, summary"), `names the required fields: ${out}`);
+    assert.ok(out.includes("ONE non-empty 'content' string"), `steers to the single-string form (#5080): ${out}`);
+    assert.ok(out.includes("mNNNNN–mNNNNN optional topic"), `names the header-line shape: ${out}`);
     assert.ok(!out.includes("Check your startId/endId parameters"), "old misleading hint removed");
 });
 
@@ -182,7 +182,7 @@ test("#1366: truly-empty call gets the targeted no-re-issue receipt (no loop bai
     assert.ok(out.includes("kind=missing-content"), out);
     assert.ok(out.includes("Do NOT re-issue an empty call"), out);
     assert.ok(!out.includes("Re-issue the compress call with a valid content array"), "old loop-bait tail gone: " + out);
-    assert.ok(out.includes("non-empty 'content' array") && out.includes("{startId, endId, summary}"), "#349 steering kept");
+    assert.ok(out.includes("ONE non-empty 'content' string") && out.includes("mNNNNN–mNNNNN optional topic"), "#349 steering kept (#5080: single-string form)");
 });
 
 test("#1366: empty-string arguments get the same targeted receipt (kind=empty-input)", () => {
@@ -205,7 +205,7 @@ test("#1366/#362: shape drift ({ranges: …}) keeps the format lecture — re-is
     const ctx = makeCompressibleCtx();
     const out = runApply(ctx, { ranges: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
     assert.ok(out.includes("kind=missing-content"), out);
-    assert.ok(out.includes("Re-issue the compress call with a valid content array"), "lecture retained: " + out);
+    assert.ok(out.includes("Re-issue the compress call as ONE 'content' string covering those eligible refs"), "lecture retained (#5080 single-string form): " + out);
     assert.ok(!out.includes("carried no content at all"), "not mislabeled as empty: " + out);
 });
 

@@ -275,7 +275,7 @@ function substrateDestructionPauseParagraph(n: number): string {
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE plain string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary markdown, using mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 /** #2146: record one total compress failure (any spec) and return "" while
@@ -968,15 +968,18 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put ONE non-empty 'content' string in that SAME single call — each range as a 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object whose 'content' is ONE non-empty string holding every range (each block: 'mNNNNN–mNNNNN optional topic' header line, then that block's summary markdown).${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
-        const retry = recovery.canRetry ? " Re-issue the compress call with a valid content array using those eligible refs." : "";
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        const retry = recovery.canRetry ? " Re-issue the compress call as ONE 'content' string covering those eligible refs." : "";
+        // #5080: teach ONLY the advertised single-string form (#4252) — the parser
+        // still salvages legacy object/array shapes, but re-teaching them after
+        // the narrowing steered models back into schema-rejected hybrids.
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress takes exactly ONE argument shape: 'content' = a single non-empty string holding ALL ranges — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary markdown; batch every range into this one call and do not send object or array entries. Refs are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).

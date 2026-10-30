@@ -67,24 +67,24 @@ test("#4812: parse-failure receipts collapse to a short refusal once the breaker
 
     const f1 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(f1.startsWith("[Compression FAILED:"), `failure 1 (got: ${f1.slice(0, 120)})`);
-    assert.match(f1, /compress requires a non-empty 'content' array/, "failure 1 carries the full format lecture");
+    assert.match(f1, /compress takes exactly ONE argument shape/, "failure 1 carries the full format lecture");
     assert.ok(!f1.includes("CIRCUIT BREAKER"), "failure 1 not armed");
 
     const f2 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
-    assert.match(f2, /compress requires a non-empty 'content' array/, "failure 2 still carries the lecture");
+    assert.match(f2, /compress takes exactly ONE argument shape/, "failure 2 still carries the lecture");
     assert.ok(!f2.includes("CIRCUIT BREAKER"), "failure 2 not armed");
 
     const f3 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.match(f3, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "arm moment keeps its verbatim paragraph");
-    assert.match(f3, /compress requires a non-empty 'content' array/, "arm-moment receipt keeps the full lecture (unchanged)");
+    assert.match(f3, /compress takes exactly ONE argument shape/, "arm-moment receipt keeps the full lecture (unchanged)");
 
     const f4 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(f4.startsWith("[Compression refused:"), `failure 4 collapses (got: ${f4.slice(0, 120)})`);
     assert.match(f4, /still armed \(4 consecutive failures\)/, "names the armed count");
-    assert.doesNotMatch(f4, /compress requires a non-empty 'content' array/, "no full lecture past the arm moment");
+    assert.doesNotMatch(f4, /compress takes exactly ONE argument shape/, "no full lecture past the arm moment");
     assert.doesNotMatch(f4, /COMPRESS CIRCUIT BREAKER: 4 consecutive/, "no repeated verbatim paragraph either");
     assert.doesNotMatch(f4, /acp_status/, "no contradictory order beside the loop-noise stop (#2360)");
-    assert.match(f4, /\{startId, endId, summary\}/, "keeps a one-line format reminder");
+    assert.match(f4, /ONE plain string holding every range/, "keeps a one-line format reminder");
     assert.match(f4, /disarms on one successful fold or 10 minutes/, "states the disarm conditions");
     assert.ok(f4.length < 700, `short refusal stays small (got ${f4.length} chars)`);
 
@@ -108,7 +108,7 @@ test("#4812: preflight lane (loopTracking:false) parse failures never arm and ne
     for (let i = 0; i < 5; i++) {
         const out = applyRanges(parseCompressInput(malformedArgs()), ctx, { loopTracking: false }).text;
         assert.ok(out.startsWith("[Compression FAILED:"), "internal lane keeps the full failure receipt");
-        assert.match(out, /compress requires a non-empty 'content' array/, "no collapse — internal lane never arms");
+        assert.match(out, /compress takes exactly ONE argument shape/, "no collapse — internal lane never arms");
     }
     assert.equal(ctx.session.metadata["compressFailStreak"], undefined, "streak untouched across 5 internal failures");
 });
@@ -118,7 +118,7 @@ test("#4812: after 10 min quiet the next parse failure restarts teaching (full l
     ctx.session.metadata["compressFailStreak"] = { n: 5, lastAt: Date.now() - 11 * 60 * 1000 };
     const out = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), "decayed streak restarts at n=1");
-    assert.match(out, /compress requires a non-empty 'content' array/, "full lecture returned after quiet");
+    assert.match(out, /compress takes exactly ONE argument shape/, "full lecture returned after quiet");
     assert.ok(!out.includes("CIRCUIT BREAKER"), "not re-armed on the first post-decay failure");
     const streak = ctx.session.metadata["compressFailStreak"] as { n: number };
     assert.equal(streak.n, 1, "metadata restarted at n=1");
