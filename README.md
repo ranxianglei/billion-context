@@ -669,6 +669,8 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
 
 `archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
 
+**Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
+
 ## Status
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
