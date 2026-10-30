@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.207",
+  "version": "0.1.209",
   "description": "Context-compression plugin for Codex — small context windows (100K is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and high compression quality.",
   "author": {
     "name": "ranxianglei"

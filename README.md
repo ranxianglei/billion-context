@@ -50,7 +50,8 @@
 
 QQ Group:
 1056132097 (full)
-1108730198 (open)
+1108730198 (full)
+1129868472 (open)
 
 ---
 
@@ -378,10 +379,11 @@ report above.
 **Can I query sessions and config over the web?** Yes — open
 [http://localhost:8787](http://localhost:8787): an overview dashboard, session
 list with per-session detail, live logs, a config editor, and an upstream
-connectivity test. A Blog view renders a few bundled notes and long-form
-articles inside the panel itself (offline-readable; the full always-fresh
-library lives on GitHub Pages). Everything else is also plain JSON for scripting
-(`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
+connectivity test. A Blog view renders notes and long-form articles inside the
+panel itself — bundled with the install, refreshed from GitHub master on a
+~1-hour throttle while online (fail-soft to the bundled copy when offline);
+the full library also lives on GitHub Pages. Everything else is also plain JSON
+for scripting (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context
 tools are called by the model as context grows, gentle growth nudges
@@ -666,6 +668,8 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
 ```
 
 `archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+
+**Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
 
 ## Status
 

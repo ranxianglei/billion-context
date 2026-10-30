@@ -248,6 +248,12 @@ export function classifySameLanePeer(
     for (const e of entries) {
         if (e.port !== port || e.lane !== lane) continue;
         if (!isPidAlive(e.pid)) continue;
+        // #4982: a draining instance stamped portReleasedAt when its listener
+        // closed — its pid still lives but the socket no longer does, so it
+        // cannot be the EADDRINUSE holder even though every other identity cell
+        // matches. This is exactly the stale-twin misclassification that killed
+        // #4982's CI child while a cross-lane instance owned the freed port.
+        if (e.portReleasedAt !== undefined) continue;
         if (e.codeFingerprint !== ownFingerprint) continue;
         return { kind: sameShape(e) ? "twin" : "drifted", entry: e };
     }
@@ -482,6 +488,14 @@ export interface RegistryEntry {
     modelMaxOutputs?: Record<string, number>;
     lane?: string;
     codeFingerprint?: string;
+    /** #4982: set when this instance released its listening socket (graceful
+     *  shutdown start). The process can stay alive for seconds-to-minutes while
+     *  it drains keep-alive connections and flushes state — during that window
+     *  it CANNOT be the EADDRINUSE holder of `port` anymore, so consumers that
+     *  judge PORT OWNERSHIP (classifySameLanePeer) must skip marked entries,
+     *  while consumers that wait for the process to EXIT (findSameLanePredecessor
+     *  → wait-predecessor) keep counting them. */
+    portReleasedAt?: number;
 }
 
 /** Cross-instance liveness registry (#394/#527): one marker file per instance
@@ -549,6 +563,7 @@ function coerceEntry(value: unknown): RegistryEntry | undefined {
         ...(Object.keys(maxOutputs).length > 0 ? { modelMaxOutputs: maxOutputs } : {}),
         ...(typeof o.lane === "string" && o.lane !== "" ? { lane: o.lane } : {}),
         ...(typeof o.codeFingerprint === "string" && o.codeFingerprint !== "" ? { codeFingerprint: o.codeFingerprint } : {}),
+        ...(typeof o.portReleasedAt === "number" && Number.isFinite(o.portReleasedAt) ? { portReleasedAt: o.portReleasedAt } : {}),
     };
 }
 
@@ -702,5 +717,23 @@ export function discoverLiveInstances(): ProxyInstanceFile[] {
 export function unregisterInstance(instanceId: string): void {
     try {
         fs.unlinkSync(registryEntryFile(instanceId));
+    } catch {}
+}
+
+/** #4982: withdraw the port-ownership claim the moment the listening socket
+ *  closes (graceful shutdown start). The drain can outlive the release by
+ *  minutes (keep-alive pins, slow flushes), and during that window a stale
+ *  "I hold port N" marker let a same-lane newcomer misclassify us as its twin
+ *  and die with the adopt signal while a cross-lane instance owned the freed
+ *  socket (#4982). Rewrites ONLY our own marker file with the stamp —
+ *  per-instance files mean no cross-process read-modify-write. Best-effort:
+ *  a failed mark degrades to the pre-#4982 behavior, where the health
+ *  verification in the EADDRINUSE path still catches the stale claim. */
+export function markPortReleased(instanceId: string): void {
+    try {
+        const file = registryEntryFile(instanceId);
+        const entry = coerceEntry(safeReadJson(file));
+        if (!entry || entry.portReleasedAt !== undefined) return;
+        atomicWriteJson({ ...entry, portReleasedAt: Date.now() }, file);
     } catch {}
 }

@@ -18,6 +18,8 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
+import { isForeignMembership } from "./request-membership.js";
+import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -653,7 +655,21 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") { cred = v; break; }
+            if (v !== "") {
+                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+                // re-signed EVERY request (Signature is an HMAC over the
+                // per-request date + body hash), so hashing the raw line
+                // yields a per-request-unique identity — downstream that
+                // meant the 429 governor's holds never matched (#4204 never
+                // throttled on the APIG lane it was built for), the #3376
+                // keepalive snapshot deleted itself after every forward, and
+                // #2131 cache-sample attribution fragmented into one bucket
+                // per request. The STABLE credential on that line is the
+                // Access key id — fingerprint only that.
+                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                break;
+            }
         }
     }
     if (cred === undefined) return undefined;
@@ -1783,13 +1799,30 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4899: USD spend ledger — input/cache-read/cache-write billed at the
+        // per-request stamped price, in lockstep with the token counters above
+        // (foreign #4805 payloads bill too: the tokens were really spent, the
+        // gate only protects this conversation's anchor family).
+        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+        // #4805: id-membership gate — a report produced by a request whose
+        // message ids do not join this session's known id family is foreign
+        // billing data under a colliding session key (auxiliary host personas
+        // stamp the host conversation id on their own tiny payloads). It
+        // still counts toward cumulative usage, but it is not this
+        // conversation's truth and must not touch the anchor family. Abstain
+        // paths (no evidence / first turns / #2821 re-mints) settle exactly
+        // as before: the gate only ever refuses the clearly-foreign.
+        if (isForeignMembership(session.transient?.requestMembership)) {
+            const m = session.transient!.requestMembership!;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
+        } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
@@ -1799,6 +1832,7 @@ export function settleUsageReport(
         // never by estimate-grade samples or arming paths; dropped at native-
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
+        session.stats.lastUsagePayloadUpper = session.stats.localInputEstimate ?? 0;
         session.stats.lastInputTokensSource = "usage";
         // #3148: a real usage report supersedes the failed-round arm — drop the
         // visibility marker so acp_status stops advertising a stale emergency state.
@@ -1835,6 +1869,7 @@ export function settleUsageReport(
         // re-arms both in one event).
         delete session.stats.overflowArmTokens;
         delete session.stats.overflowArmCompletionReserve;
+        }
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane

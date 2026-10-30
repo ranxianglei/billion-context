@@ -53,6 +53,16 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
     // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
     pluginIncrementalTurns: { percent: 0 },
+    // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
+    // previous_response_id checkpoint stop reconstructing full history on every
+    // turn — the session augments the delta with the server-committed previous
+    // output and the outbound prefix renders from the unified transcript
+    // (anchored snapshot render). Every verification miss degrades to the
+    // legacy full-reconstruction path or the 400 the client answers with a
+    // full replay (lossless). Requires storage.unified=full (reads); default
+    // 0% — force on with `rollout.features.wsDeltaContinuation: true` or
+    // `BILI_ROLLOUT_WS_DELTA_CONTINUATION=1`.
+    wsDeltaContinuation: { percent: 0 },
     // #2926 anthropic Threads reforge: when the mirrored thread history
     // crosses the window on a `continue`, swap it for a fresh `create`
     // carrying [summary, tail ring, delta]. Default 0% — threads traffic

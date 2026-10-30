@@ -17,6 +17,14 @@
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
+//   I3 (egress pairing, #4862): the exit body must be protocol-SOUND on its
+//     own — every tool-call answered by a same-id tool-result after it, every
+//     tool-result preceded by a same-id tool-call. I1/I2 only reconcile
+//     entry↔exit continuity, so a fold that eats ONE half of a pair used to
+//     judge clean (the folded region is a free zone) right before the upstream
+//     answered 400. I3 is exit-internal, fold-split agnostic, and
+//     attribution-scoped (a half-pair the client itself sent broken is the
+//     host's defect, not bili's).
 //
 // Single-request independence: the inbound core IS the client ground truth, so
 // the judge needs no cross-request state — structurally avoiding the process-
@@ -57,7 +65,9 @@ type ViolationKind =
   | "mid-insertion"
   | "fold-boundary-drift"
   | "carrier-drift"
-  | "exemption-overflow";
+  | "exemption-overflow"
+  | "unpaired-tool-call"
+  | "unpaired-tool-result";
 
 interface Violation {
   kind: ViolationKind;
@@ -189,6 +199,80 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
   if (isTruncatedTwin(a, b)) return true; // #4186 G3
   return normText(a) === normText(b);
+}
+
+// Lockstep with isMcpBiliCompress (src/config.ts, #2970/#3222): canonical bare
+// form + MCP dialect form only. Inlined (not imported) so the judge stays a
+// leaf — pure, no I/O, no config dependency.
+function isCompressToolName(toolName: string | undefined): boolean {
+  return toolName === "compress" || toolName === "mcp__bili__compress";
+}
+
+interface PairingState {
+  /** ids declared by a tool-call but never answered by a later same-id result. */
+  unansweredCallIds: Set<string>;
+  /** ids carried by a tool-result but never declared by an earlier same-id call. */
+  unopenedResultIds: Set<string>;
+}
+
+// Directional pairing walk, kernel-parity (kernel/src/prune.ts
+// stripOrphanedToolResults / stripOrphanedToolCalls, #3046): a result is valid
+// iff some call with the same id sits EARLIER; a call is valid iff some result
+// with the same id sits LATER. Precedence-only — one call answers any number of
+// same-id results and vice versa (Agent Teams `name:index` id reuse).
+function pairingState(msgs: readonly CoreMessage[]): PairingState {
+  const opened = new Set<string>();
+  const unopenedResultIds = new Set<string>();
+  for (const m of msgs) {
+    if (m.contentType === "tool-call" && m.toolCallId) opened.add(m.toolCallId);
+    else if (m.contentType === "tool-result" && m.toolCallId && !opened.has(m.toolCallId)) unopenedResultIds.add(m.toolCallId);
+  }
+  const answered = new Set<string>();
+  const unansweredCallIds = new Set<string>();
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]!;
+    if (m.contentType === "tool-result" && m.toolCallId) answered.add(m.toolCallId);
+    else if (m.contentType === "tool-call" && m.toolCallId && !answered.has(m.toolCallId)) unansweredCallIds.add(m.toolCallId);
+  }
+  return { unansweredCallIds, unopenedResultIds };
+}
+
+// #4862 I3: egress pairing — see header. Exit-internal, so it applies to every
+// mode (legacy full-inbound, render-lane tail) and every lane (main first-send,
+// loop rounds 2+): no prefix, rendered or frozen, is exempt from protocol
+// soundness. Attribution scoping via the entry pairing state keeps the judge's
+// "whose fault" charter: ids the client held paired (or never sent — id
+// re-minting renames BOTH halves, #2821, so a re-minted half-pair still fires)
+// become bili's the moment the exit ships one side of them alone.
+function egressPairingViolations(entry: readonly CoreMessage[], exit: readonly CoreMessage[]): Violation[] {
+  const client = pairingState(entry);
+  const egress = pairingState(exit);
+  const out: Violation[] = [];
+  const countUnanswered = (msgs: readonly CoreMessage[], st: PairingState): number =>
+    msgs.filter((m) => m.contentType === "tool-call" && m.toolCallId && st.unansweredCallIds.has(m.toolCallId) && !isCompressToolName(m.toolName)).length;
+  // Volume guard (#2821): a host that itself ships a half-pair and then has
+  // the id re-minted on projection produces exit-unpaired ids the entry never
+  // named — per-id indistinguishable from a re-minted pair bili broke. Volume
+  // arbitrates: bili can only be at fault for the EXCESS of unanswered calls it
+  // ships over the ones the client sent.
+  if (countUnanswered(exit, egress) > countUnanswered(entry, client)) {
+    exit.forEach((m, i) => {
+      if (m.contentType !== "tool-call" || !m.toolCallId || !egress.unansweredCallIds.has(m.toolCallId)) return;
+      if (isCompressToolName(m.toolName)) return; // kernel parity: hideConsumedCompressCalls owns these results
+      if (client.unansweredCallIds.has(m.toolCallId)) return; // host-sent broken, not ours to flag
+      out.push({ kind: "unpaired-tool-call", index: i, detail: `outbound[${i}] tool-call #${m.toolCallId}${m.toolName ? ` (${m.toolName})` : ""} has no same-id tool-result after it — upstream rejects half-pairs with a 400 (#4862)` });
+    });
+  }
+  const countUnopened = (msgs: readonly CoreMessage[], st: PairingState): number =>
+    msgs.filter((m) => m.contentType === "tool-result" && m.toolCallId && st.unopenedResultIds.has(m.toolCallId)).length;
+  if (countUnopened(exit, egress) > countUnopened(entry, client)) {
+    exit.forEach((m, i) => {
+      if (m.contentType !== "tool-result" || !m.toolCallId || !egress.unopenedResultIds.has(m.toolCallId)) return;
+      if (client.unopenedResultIds.has(m.toolCallId)) return; // host-sent broken, not ours to flag
+      out.push({ kind: "unpaired-tool-result", index: i, detail: `outbound[${i}] tool-result #${m.toolCallId} has no same-id tool-call before it — upstream rejects half-pairs with a 400 (#4862)` });
+    });
+  }
+  return out;
 }
 
 /**
@@ -347,6 +431,10 @@ export function judgeInboundOutbound(
     });
   }
 
+  // #4862 I3: egress pairing is exit-internal and fold-split agnostic — the
+  // folded region stops being a free zone for protocol structure.
+  violations.push(...egressPairingViolations(entry, exit));
+
   return {
     ok: violations.length === 0,
     folded,
@@ -415,7 +503,10 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
     const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
     if (!v.ok) {
       const head = v.violations[0];
-      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
+      // #4862: label by the invariant that actually fired — an I3 pairing
+      // violation on a non-folded request must not read as "I1".
+      const inv = head.kind === "unpaired-tool-call" || head.kind === "unpaired-tool-result" ? 3 : v.folded ? 2 : 1;
+      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
       loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }

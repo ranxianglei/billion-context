@@ -186,12 +186,7 @@ const LEAN_TOOL_PROMPTS: ToolPrompts = {
       "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).",
     paramDescriptions: {
       content:
-        "ONE JSON-escaped string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown; object entries in the content array also accepted.",
-      startId: "Inclusive first mNNNNN or bN ref.",
-      endId: "Inclusive last mNNNNN or bN ref.",
-      summary: "Self-contained replacement preserving exact technical details.",
-      topic: "Short label; a per-range label overrides the top-level fallback.",
-      summaryMaxChars: "Optional summary length limit override.",
+        "ONE JSON-escaped string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown.",
     },
   },
   decompress: {

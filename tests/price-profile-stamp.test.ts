@@ -102,6 +102,14 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         { q: 1.5 },
         "runPrepare stamped the effective priceProfile on the session",
     );
+    // #4899 follow-up: no registry row for claude-test → no input-price anchor
+    // → the user ratio stays verbatim, flagged NON-absolute so dollar views
+    // stay tokens-only instead of assuming $1/Mtok input.
+    assert.equal(
+        (stamped.metadata as Record<string, unknown>).cachePriceProfileAbs,
+        false,
+        "unanchored user ratio is stamped non-absolute",
+    );
 
     // Same conversation through a lane WITHOUT priceProfile: latest-wins must
     // CLEAR the stamp (server.ts deletes on empty), not leave the stale one.
@@ -115,6 +123,11 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         (stamped.metadata as Record<string, unknown>).cachePriceProfile,
         undefined,
         "unstamped lane clears the session priceProfile stamp",
+    );
+    assert.equal(
+        (stamped.metadata as Record<string, unknown>).cachePriceProfileAbs,
+        undefined,
+        "the absolute-flag clears with the profile it qualifies",
     );
 
     } finally {
@@ -156,6 +169,7 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             { w: 2, r: 0.2, q: 8 },
             "unconfigured session stamped with the registry's absolute $/Mtok profile",
         );
+        assert.equal(sa.metadata.cachePriceProfileAbs, true, "registry stamps are absolute $/Mtok");
 
         const beforeB = new Set(listSessions().map((s) => s.id));
         const rb = await post("claude-noreg", "pp-registry-b");
@@ -185,11 +199,18 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             assert.equal(rc.status, 200, "user-config lane served");
             const sc = listSessions().find((s) => !beforeC.has(s.id));
             assert.ok(sc, "session created for the user-config lane");
+            // #4899 follow-up: the user ratio {q:1.5} still wins WHOLESALE over
+            // the registry listing and is stamped VERBATIM (dimensionless) —
+            // the unit system rides in the companion flag instead of being
+            // baked into the values, so every pre-existing token-report
+            // consumer reads byte-identical metadata; the panel anchors the
+            // ratio at read time against the session's billing price.
             assert.deepEqual(
                 sc.metadata.cachePriceProfile,
                 { q: 1.5 },
                 "route-level priceProfile overrides the registry listing wholesale",
             );
+            assert.equal(sc.metadata.cachePriceProfileAbs, false, "user-config profile is stamped as a ratio");
         } finally {
             if (proxyCfg) await new Promise<void>((r) => proxyCfg!.close(() => r()));
         }

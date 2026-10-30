@@ -121,6 +121,7 @@
 | `BILI_SESSION_GC` | 会话 GC 总开关（`=1/true/on` 启用，默认 off；启用后下面三个参数生效） |
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
@@ -161,6 +162,7 @@
 | `BILI_ZONE_PORT` | USER zone 基址覆盖（#1660） |
 | `BILI_CLAUDE_NATIVE_PORT` / `BILI_ZCODE_PORT` | 显式 zone 端口覆盖（strict-port 语义，#1660） |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` / `BILI_ATTACH_HEALTH_DEADLINE_MS` | native attach 证据宽限窗 / 健康截止窗 |
+| `BILI_SPAWN_WAIT_MS` / `BILI_SLOW_START_GRACE_MS` | launcher spawn 初始健康等待窗 / LIVE 子进程慢启动宽限；总 spawn 预算 = 两者之和（#4947） |
 | `BILI_DSH_BIN` / `BILI_PI_BIN` | dsh / pi 可执行文件覆盖 |
 | `BILI_PLUGIN_AGENT` | `--plugin` 目标 agent 选择（默认 claude） |
 | `BILI_LOG_MASK_HOSTS` | 日志主机名掩码（默认开；`=0` 本地调试退出） |

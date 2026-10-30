@@ -32,8 +32,8 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC via the async twins; export too). Wins over the file tier."
-    desc_zh: "storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。"
+    desc_en: "Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC/fork via the async twins (#4911); export too). Wins over the file tier."
+    desc_zh: "storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。"
   - key: BILI_MYSQL_DSN
     type: string
     default: "unset"
@@ -186,6 +186,22 @@ entries:
     group: envonly
     desc_en: "Deadline for attach health checks when joining an external daemon."
     desc_zh: "挂接外部守护进程时健康检查的截止时间。"
+  - key: BILI_SPAWN_WAIT_MS
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait."
+    desc_zh: "新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。"
+  - key: BILI_SLOW_START_GRACE_MS
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two."
+    desc_zh: "对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。"
   - key: BILI_ATTACH_EVIDENCE_GRACE_MS
     type: number
     default: "(built-in)"

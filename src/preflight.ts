@@ -11,6 +11,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { yieldToEventLoop } from "./yield-loop.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -2043,6 +2044,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             break;
         }
         if (poolQueueDrop) break;
+        // #4528: each round re-runs the full O(messages) kernel pass over the
+        // resent history; yield between rounds so UI/API requests on the same
+        // listener are served instead of queueing behind the whole compression
+        // run.
+        await yieldToEventLoop();
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
