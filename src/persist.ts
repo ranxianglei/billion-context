@@ -2855,7 +2855,14 @@ export class SessionStore {
                 this.drainFlushWaiters(id, this.lastSaveLanded.get(id) === true);
             });
         }, this.debounceMs);
-        timer.unref?.();
+        // #4788: the debounce timer is host-owned periodic upkeep and must not
+        // pin a process open on its own -- so it is unref'd. But `afterNextFlush`
+        // makes it a HOST: a caller that awaits a verdict has no other handle
+        // guaranteed to fire, and an unref'd timer is not a reason for Node to
+        // stay alive. Awaiting then exits the loop with the promise unresolved
+        // (`Promise resolution is still pending but the event loop has already
+        // resolved`). Keep the timer referenced exactly while someone waits.
+        if (!this.flushWaiters.has(id)) timer.unref?.();
         this.saveTimers.set(id, timer);
     }
 
@@ -2876,6 +2883,10 @@ export class SessionStore {
             const ws = this.flushWaiters.get(sessionId) ?? [];
             ws.push((ok: boolean): void => { resolve(ok); });
             this.flushWaiters.set(sessionId, ws);
+            // #4788: the timer was armed unref'd (no waiter existed then). The
+            // waiter now holds the promise open, so the timer must hold the loop
+            // open too -- otherwise the process drains and the verdict is lost.
+            this.saveTimers.get(sessionId)?.ref?.();
         });
     }
 
