@@ -53,6 +53,7 @@ import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
 import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
+import { isReasoningEchoForbiddenReject } from "../strict-echo.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
@@ -1552,9 +1553,23 @@ async function forwardCaptured(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
+            // #5260: mirror image of the learn below — a 4xx that rejects the echo
+            // field AS EXTRA proves this gateway's schema does not accept the very
+            // field bili injected (Mistral serving deepseek-named models: static
+            // detection #1027 matched the model id, but the message schema answers
+            // extra_forbidden on every tool-call turn). Veto strict echo for the
+            // session so the retry goes out clean; opposite-direction evidence
+            // (the demand-class learn below) clears the veto again.
+            if (isReasoningEchoForbiddenReject(upstream.status, errText)) {
+                if (s.metadata.strictReasoningEchoVeto !== true) {
+                    s.metadata.strictReasoningEchoVeto = true;
+                    markDirty(s);
+                    log("warn", `[${s.id}] upstream ${upstream.status} rejects the reasoning echo field as extra — vetoed strictReasoningEcho for this session (#5260); blank-echo injection disabled until opposite evidence`);
+                }
+            } else if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
+                    delete s.metadata.strictReasoningEchoVeto;
                     markDirty(s);
                     log("warn", `[${s.id}] upstream 400 mentions a reasoning echo field — learned strictReasoningEcho for this session (#684/#762/#2169); reasoning-drop disabled`);
                 }

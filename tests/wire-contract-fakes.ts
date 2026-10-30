@@ -81,6 +81,15 @@ export const WIRE_RULES: readonly WireRule[] = [
             'live probe 2026-10-20 (pi 1.3.0 + pi-subagents 0.79.2, api.anthropic.com, claude-haiku-5-5) through a master b156c02f proxy: pi declares tools activated mid-session as tool_addition blocks inside a mid-conversation role:"system" message; #3410\'s unknown-block passthrough kept the blocks but coreToAnthropic re-emitted the message as role:"user" → upstream 400 "messages.2.content: \'tool_addition\'/\'tool_removal\' blocks are only permitted within `role: "system"` messages". On v0.1.202 the blocks were silently dropped instead (tools never reached the model). Repair: kernel/src/wire/anthropic.ts keeps each wire system message whole on the rawAnthropicMessage sidecar and re-emits it verbatim.',
     },
     {
+        id: "WC-023",
+        wire: "openai-chat",
+        lane: "mistral",
+        summary:
+            "Mistral's /v1/chat/completions message schema forbids unknown fields — a strict-echo blank reasoning_content on an assistant tool-call message 422s with extra_forbidden; such gateways must never receive the injected field, and their own rejection of it is bili's veto evidence",
+        provenance:
+            "bili #5260 production 422 (pi 1.4.0 plugin-native through api.mistral.ai, model deepseek-v4-1-flash-1017, bili 0.1.209): the static /deepseek/i detection (#1027) made normalizeStrictEchoReasoning inject reasoning_content:'' on every assistant tool-call message; Mistral rejected the whole body with {\"type\":\"extra_forbidden\",\"loc\":[\"body\",\"messages\",5,\"assistant\",\"reasoning_content\"],\"msg\":\"Extra inputs are not permitted\"} on every tool-call turn, while the same session succeeded immediately after switching to mistral-large-4 (no name match). Repair: learn-on-failure veto in src/strict-echo.ts (isReasoningEchoForbiddenReject + session.metadata.strictReasoningEchoVeto), mirroring the #684/#762 positive learning.",
+    },
+    {
         id: "WC-016",
         wire: "anthropic",
         summary:
@@ -571,7 +580,7 @@ export interface CapturedRequest {
 
 /** Lane-scoped fakes: a constraint that holds only on one client's or endpoint's lane lives in that lane's own
  *  fake, not in the wire's shared VALIDATOR (WC-017's rule-scoping precedent). */
-type FakeLane = "vertex-anthropic";
+type FakeLane = "vertex-anthropic" | "mistral";
 
 interface FakeUpstream {
     wire: Wire;
@@ -742,6 +751,27 @@ export function vertexErrorEnvelope(streaming: boolean, message: string): { stat
     return { status: 400, body: streaming ? JSON.stringify([err]) : JSON.stringify(err) };
 }
 
+/** WC-023, lane-scoped: Mistral's message schema has no reasoning_content field — bili's strict-echo blank
+ *  injection on assistant tool-call messages 422s with extra_forbidden (#5260). The shared openai-chat
+ *  VALIDATOR must not carry this clause: OpenAI itself accepts the field on thinking models. */
+export function validateMistralChatBody(body: unknown): string[] {
+    const out: string[] = [];
+    if (!isPlainObject(body)) return out;
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return out;
+    messages.forEach((m, i) => {
+        if (isPlainObject(m) && "reasoning_content" in m)
+            out.push(`WC-023 messages[${i}]: reasoning_content is not a field of Mistral's message schema — 422 extra_forbidden "Extra inputs are not permitted" (#5260)`);
+    });
+    return out;
+}
+
+/** WC-023 lane: Mistral answers FastAPI-style 422 with a detail array — the exact envelope shape of the #5260
+ *  rejection (loc generalized to ["body"]; the field name rides in msg so the relay's veto predicate can read it). */
+export function mistralErrorEnvelope(message: string): { status: number; body: string } {
+    return { status: 422, body: JSON.stringify({ detail: [{ type: "extra_forbidden", loc: ["body"], msg: message, input: "" }] }) };
+}
+
 const PATH_MATCHERS: Record<Wire, (url: string) => boolean> = {
     anthropic: (u) => u.startsWith("/v1/messages"),
     "openai-chat": (u) => u.startsWith("/v1/chat/completions"),
@@ -755,7 +785,7 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string;
     const lane = opts?.lane;
     const requests: CapturedRequest[] = [];
     const violations: string[] = [];
-    const validate = lane === "vertex-anthropic" ? validateVertexAnthropicBody : VALIDATORS[wire];
+    const validate = lane === "vertex-anthropic" ? validateVertexAnthropicBody : lane === "mistral" ? validateMistralChatBody : VALIDATORS[wire];
     const pathOk = lane === "vertex-anthropic" ? (u: string) => vertexAnthropicPathInfo(u) !== null : PATH_MATCHERS[wire];
 
     const server = http.createServer((req, res) => {
@@ -785,7 +815,9 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string;
                 const env =
                     lane === "vertex-anthropic"
                         ? vertexErrorEnvelope(streaming === true, `wire-contract violation(s): ${found.join("; ")}`)
-                        : errorEnvelope(wire, `wire-contract violation(s): ${found.join("; ")}`);
+                        : lane === "mistral"
+                            ? mistralErrorEnvelope(`wire-contract violation(s): ${found.join("; ")}`)
+                            : errorEnvelope(wire, `wire-contract violation(s): ${found.join("; ")}`);
                 res.writeHead(env.status, { "content-type": "application/json" });
                 res.end(env.body);
                 return;
