@@ -25,8 +25,14 @@ export type NativeLaneEventHandler = (level: "info" | "error", message: string) 
  *  as additional optional hooks when that lane migrates — never silently
  *  unified. */
 export interface NativeLaneSpec {
-    /** Lane tag for log lines (`bili-native(<lane>): …`). */
+    /** Lane tag for defaults and diagnostics; see `tag` for the exact log
+     *  prefix. */
     lane: string;
+    /** Exact `bili-native…` prefix for the lifecycle's host-event lines.
+     *  Defaults to `bili-native(<lane>)`. pi/omp use the default;
+     *  opencode historically emits `bili-native-opencode…` (hyphen, no
+     *  parens) and a pure transposition keeps that byte-for-byte. */
+    tag?: string;
     /** The lane's module-level intercept state singleton. */
     state: NativeInterceptState;
     /** Test seam, read at CALL time so `_setSpawnForTest` after arming still
@@ -95,6 +101,7 @@ export function _resetArmedLaneForTest(): void {
  *  came up. */
 export async function verifyAttachAndRecover(spec: NativeLaneSpec, attachOrigin: string): Promise<string | undefined> {
     const { state } = spec;
+    const tag = spec.tag ?? `bili-native(${spec.lane})`;
     // #1365: routed evidence outranks the planned origin — probe where the
     // model channel actually points, not where the env says it should. An
     // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
@@ -115,19 +122,19 @@ export async function verifyAttachAndRecover(spec: NativeLaneSpec, attachOrigin:
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
             spec.publish(back);
-            spec.onEvent("info", `bili-native(${spec.lane}): attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            spec.onEvent("info", `${tag}: attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
         spec.onEvent(
             "error",
             explicitAttachOrigin !== undefined
-                ? `bili-native(${spec.lane}): explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
-                : `bili-native(${spec.lane}): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
+                ? `${tag}: explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
+                : `${tag}: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
         );
         state.origin = undefined;
         return undefined;
     }
-    spec.onEvent("error", `bili-native(${spec.lane}): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    spec.onEvent("error", `${tag}: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     spec.unpublish();
     state.attach = false;
     if (spec.clearOrigin !== undefined) spec.clearOrigin();
