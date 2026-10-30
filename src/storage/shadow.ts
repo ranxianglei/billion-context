@@ -22,20 +22,52 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
-import { canonicalize, sha256 } from "./canonical.ts";
+import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
+const VERIFY_BATCH_SIZE = 32;
+
+/** Bound transient CAS strings during normal cold loads, not the retained history. */
+const VIEW_READ_BATCH_SIZE = 32;
+
+interface ResidentFields {
+    header: { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number };
+    metadata?: Record<string, unknown>;
+    blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
+}
+
+/** #5188: ingest errors meaning "the resource was briefly unavailable",
+ *  not "the storage is broken" — a concurrent lock held past busy_timeout,
+ *  a momentary disk-full or fd spike, an EBUSY from the OS. These ride
+ *  plain WAL/resource churn under load (CI shards hammering one runner),
+ *  and counting them toward the permanent disable latch turned ordinary
+ *  spikes into whole-process degradations. The companion half of #5188
+ *  (SessionStore.tryRecoverSidecar, src/persist.ts) heals the other end:
+ *  a FIRST open that dies on such a spike is retried on a cooldown instead
+ *  of staying absent for the process lifetime. Contention-class errors here
+ *  refresh stats.lastError for observability only — the very next save
+ *  retries and succeeds automatically, so nothing else needs to happen.
+ *  Breakage-class errors (corruption, schema violations, readonly refusal,
+ *  'file is not a database') stay the real evidence and keep striking.
+ *  NOTE: 'unable to open database file' (CANTOPEN) is deliberately counted
+ *  as transient-at-ingest: at write time it is the fd-exhaustion / bad-share
+ *  signature, and a persistently failing store keeps its lastError visible
+ *  plus the per-read fallback warns (#3933 viewFor degrade lines). */
+export function isTransientContentionError(err: unknown): boolean {
+    const s = String(err);
+    return /\bSQLITE_BUSY\b|\bSQLITE_LOCKED\b|database is busy|database is locked|table .*locked|\bEBUSY\b|\bENOSPC\b|database or disk is full|\bSQLITE_FULL\b|too many open files|\bE(M)?FILE\b|unable to open database file|\bSQLITE_IOERR\b/i.test(s);
+}
 
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
@@ -174,11 +206,18 @@ export class UnifiedShadow {
     /** #5103: one ingest failure recorded — the FIRST failure of a streak now
      *  warns with the file named (before, strikes one and two were silent and
      *  the user learned of the degradation from missing features, not logs);
-     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before. */
+     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before.
+     *  #5188: "briefly unavailable" contention (lock held by a concurrent
+     *  save, disk full) never strikes — see isTransientContentionError; it
+     *  refreshes lastError so the panels stay honest while it settles, and a
+     *  latch that already tripped stops re-warning on every save after.
+     *  Breakage-class failures keep the byte-for-byte old behavior. */
     private noteIngestFailure(err: unknown): void {
-        this.consecutiveFailures++;
         const errStr = String(err);
         this.stats.lastError = errStr;
+        if (isTransientContentionError(errStr)) return;
+        if (this.stats.disabled) return;
+        this.consecutiveFailures++;
         if (this.consecutiveFailures === 1) {
             loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
         }
@@ -419,20 +458,18 @@ export class UnifiedShadow {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const rows = {
-                    session: sessionRow,
-                    messages: this.sync.getMessages(legacy.id),
-                    blocks: this.sync.getBlocks(legacy.id),
-                    deadRefs: this.sync.getDeadRefs(legacy.id),
-                    refs: this.sync.getRefs(legacy.id),
-                };
-                const replayed = loadLegacyView(rows);
-                warnTailGaps(legacy.id, replayed);
-                const expectView = { ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) };
-                const gotView = { ...replayed, blockContents: orderedBlockContents(replayed.blockContents) };
-                const expect = shadowDigest(expectView);
-                const got = shadowDigest(gotView);
-                if (got !== expect) {
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+                for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
+                    const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
+                    verifier.addBlocks(rows);
+                    if (rows.length < VERIFY_BATCH_SIZE) break;
+                }
+                for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
+                    verifier.addMessages(this.sync.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
+                }
+                const verified = verifier.finish();
+                warnTailGaps(legacy.id, verified);
+                if (!verified.matches) {
                     this.stats.verifyDrift++;
                     // #3919: membership from BEFORE this add is the repeat
                     // signal — two consecutive sampled drifts mean the views
@@ -458,8 +495,8 @@ export class UnifiedShadow {
                         this.frozenEnvelopeIds.add(legacy.id);
                         let sides = "";
                         try {
-                            const envBlocks = expectView.state.blocks.filter((b) => b.active).length;
-                            const idxBlocks = (gotView.state.blocks as { active?: boolean }[] | null | undefined)?.filter((b) => b.active === true).length ?? 0;
+                            const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
+                            const idxBlocks = verified.activeBlocks;
                             sides = ` [envelope ${envBlocks} active block(s) vs index ${idxBlocks}]`;
                         } catch {
                             // counts must never break the heal path
@@ -485,7 +522,7 @@ export class UnifiedShadow {
                     // The line prefix stays byte-identical for existing greps.
                     let diagnosis = "";
                     try {
-                        diagnosis = formatDriftDiagnostics(describeViewDivergence(expectView, gotView));
+                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
                     } catch {
                         // diagnostics must never break the heal path
                     }
@@ -555,26 +592,64 @@ export class UnifiedShadow {
     /** Loads the unified view of one session (full mode read path).
      *  Returns null on miss — the caller falls back to the legacy file. */
     viewFor(id: string): LegacySessionLike | null {
-        if (this.sync === null) return null;
+        const store = this.sync;
+        if (store === null) return null;
         if (this.stats.disabled) return null;
         try {
-            const sessionRow = this.sync.getSessionRow(id);
-            if (!sessionRow) return null;
-            const rows = {
-                session: sessionRow,
-                messages: this.sync.getMessages(id),
-                blocks: this.sync.getBlocks(id),
-                deadRefs: this.sync.getDeadRefs(id),
-                refs: this.sync.getRefs(id),
-            };
-            // The view's `state` object carries every MERGE_STATE_FIELDS key by
-            // construction; the declared Record<string, unknown> just needs a
-            // widening cast to reach LegacySessionLike.
-            const unified = loadLegacyView(rows) as LegacySessionLike;
+            const unified = store.readSnapshot(() => {
+                const sessionRow = store.getSessionRow(id);
+                if (!sessionRow) return null;
+                const builder = new LegacyViewBuilder(sessionRow, store.getRefs(id), store.getDeadRefs(id));
+                for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                    const blocks = store.getBlocks(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                    builder.addBlocks(blocks);
+                    if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                }
+                for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
+                    builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
+                }
+                // The builder preserves every MERGE_STATE_FIELDS key; its
+                // generic state declaration only needs widening here.
+                return builder.finish() as LegacySessionLike;
+            });
+            if (!unified) return null;
             warnTailGaps(id, unified as unknown as { tailGaps?: number });
             return unified;
         } catch (err) {
             loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
+            return null;
+        }
+    }
+
+    /** Lazy resident fields share the same source header without rebuilding a session. */
+    readResidentFieldsFor(id: string, fields: { metadata?: boolean; blockContents?: boolean }): ResidentFields | null {
+        const store = this.sync;
+        if (store === null || this.stats.disabled) return null;
+        try {
+            return store.readSnapshot(() => {
+                const header = store.getLoadHeader(id);
+                if (!header) return null;
+                const result: ResidentFields = { header };
+                if (fields.metadata) {
+                    const json = store.getMetadataJson(id);
+                    if (json === null) return null;
+                    result.metadata = JSON.parse(json) as Record<string, unknown>;
+                }
+                if (fields.blockContents) {
+                    const contents: NonNullable<ResidentFields["blockContents"]> = new Map();
+                    for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                        const page = store.getBlockContents(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                        const blocks = Array.isArray(page) ? page : [];
+                        appendBlockContents(contents, blocks);
+                        if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    mergeOrphanBlockContents(contents, store.getOrphansJson(id));
+                    result.blockContents = contents;
+                }
+                return result;
+            });
+        } catch (err) {
+            loggerLog("warn", `[storage] resident field load failed for ${id} (${String(err)}) — falling back to the legacy file`);
             return null;
         }
     }
@@ -782,10 +857,10 @@ export class UnifiedShadow {
         return this.sync.activeForeignWriter();
     }
 
-    rawMessages(sessionId: string): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
         if (this.sync === null) return [];
         this.assertLive();
-        return this.sync.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
@@ -842,6 +917,33 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         this.assertLive();
         return this.sync.getCcr(sessionId);
+    }
+
+    /** #4739: narrow single-column metadata read for lazy-field restore.
+     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
+     *  gate on readsUnified; network backends degrade to null (the caller
+     *  falls back to the envelope, exactly like today's sync loadSync). */
+    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getSessionMetadata(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #4739: narrow blockContents read for lazy-field restore (block rows +
+     *  orphans journal, no message rows). Same trust/degrade contract as
+     *  getSessionMetadata. */
+    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
+        if (this.sync === null) return null;
+        if (this.stats.disabled) return null;
+        try {
+            return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
+        } catch {
+            return null;
+        }
     }
 
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
@@ -1004,17 +1106,18 @@ export class UnifiedShadow {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const rows = {
-                        session: sessionRow,
-                        messages: await backend.getMessages(legacy.id),
-                        blocks: await backend.getBlocks(legacy.id),
-                        deadRefs: await backend.getDeadRefs(legacy.id),
-                        refs: await backend.getRefs(legacy.id),
-                    };
-                    const loaded = loadLegacyView(rows);
-                    const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
-                    const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
-                    if (got !== expect) {
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id));
+                    for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
+                        const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
+                        verifier.addBlocks(rows);
+                        if (rows.length < VERIFY_BATCH_SIZE) break;
+                    }
+                    for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
+                        verifier.addMessages(await backend.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
+                    }
+                    const verified = verifier.finish();
+                    warnTailGaps(legacy.id, verified);
+                    if (!verified.matches) {
                         this.stats.verifyDrift++;
                         this.driftedSessions.add(legacy.id);
                         this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -1041,15 +1144,21 @@ export class UnifiedShadow {
             if (this.stats.disabled) return null;
             try {
                 const backend = this.backend!;
-                const sessionRow = await backend.getSessionRow(id);
-                if (!sessionRow) return null;
-                const loaded = loadLegacyView({
-                    session: sessionRow,
-                    messages: await backend.getMessages(id),
-                    blocks: await backend.getBlocks(id),
-                    deadRefs: await backend.getDeadRefs(id),
-                    refs: await backend.getRefs(id),
-                }) as LegacySessionLike;
+                const loaded = await backend.readSnapshot(async (reader) => {
+                    const sessionRow = await reader.getSessionRow(id);
+                    if (!sessionRow) return null;
+                    const builder = new LegacyViewBuilder(sessionRow, await reader.getRefs(id), await reader.getDeadRefs(id));
+                    for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                        const blocks = await reader.getBlocks(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                        builder.addBlocks(blocks);
+                        if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
+                        builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
+                    }
+                    return builder.finish() as LegacySessionLike;
+                });
+                if (!loaded) return null;
                 warnTailGaps(id, loaded as unknown as { tailGaps?: number });
                 return loaded;
             } catch (err) {
@@ -1283,14 +1392,7 @@ function warnTailGaps(id: string, view: { tailGaps?: number }): void {
 }
 
 function shadowDigest(view: unknown): string {
-    return sha256(JSON.stringify(canonicalize(view)));
-}
-
-// #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
-// the expect leg keeps the live Map's order (completeBlockContents appends synthesized
-// entries at the end) while the got leg lays blocks out in state.blocks array order.
-function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
-    return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+    return canonicalDigest(view);
 }
 
 interface DriftSlotFingerprint {
@@ -1305,6 +1407,126 @@ interface DriftDiagnostics {
     keys: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
     tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
+}
+
+/** Compare the replay by component, retaining only message fingerprints across batches. */
+class BatchedViewVerification {
+    readonly messageSeqs: number[];
+    private readonly tail: { tailSeqs: number[] | null; pluginSnapshotSeqs: number[] | null };
+    private readonly remainingContents: LegacySessionLike["blockContents"];
+    private readonly orphans: LegacySessionLike["blockContents"];
+    private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
+    private readonly keys = new Set<string>();
+    private drift = false;
+    private blockCount = 0;
+    private activeBlocks = 0;
+    private tailGaps = 0;
+    private tailSlot: DriftDiagnostics["tailSlot"];
+
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[]) {
+        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] });
+        this.orphans = header.blockContents;
+        this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
+        this.tail = JSON.parse(session.tailJson);
+        this.messageSeqs = [...new Set([...(this.tail.tailSeqs ?? []), ...(this.tail.pluginSnapshotSeqs ?? [])])];
+        const withoutBulk = (view: LegacySessionLike | typeof header) => ({
+            ...view,
+            state: { ...view.state, blocks: [] },
+            blockContents: new Map(),
+            lastMessages: view.lastMessages === undefined ? undefined : [],
+            pluginSnapshot: view.pluginSnapshot === undefined ? undefined : [],
+        });
+        const expect = withoutBulk(legacy);
+        const got = withoutBulk(header);
+        if (shadowDigest(expect) !== shadowDigest(got)) {
+            this.drift = true;
+            try {
+                for (const key of describeViewDivergence(expect, got).keys) this.keys.add(key);
+            } catch {
+                // Diagnostic detail must not suppress a proven drift.
+            }
+        }
+    }
+
+    addBlocks(rows: BlockRow[]): void {
+        for (const row of rows) {
+            const payload = JSON.parse(row.payloadJson);
+            if (payload?.active === true) this.activeBlocks++;
+            if (this.blockCount >= this.legacy.state.blocks.length || shadowDigest(payload) !== shadowDigest(this.legacy.state.blocks[this.blockCount])) this.changed("state");
+            this.blockCount++;
+            this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
+            // A current block wins over an identically named journal entry.
+            this.orphans.delete(row.blockId);
+        }
+    }
+
+    addMessages(rows: MessageRow[]): void {
+        for (const row of rows) this.messages.set(row.seq, messageSignature(JSON.parse(row.content)));
+    }
+
+    private changed(key: string): void {
+        this.drift = true;
+        this.keys.add(key);
+    }
+
+    private compareContents(id: string, view: unknown): void {
+        if (!this.remainingContents.has(id) || shadowDigest(this.remainingContents.get(id)) !== shadowDigest(view)) this.changed("blockContents");
+        this.remainingContents.delete(id);
+    }
+
+    private compareMessages(key: "lastMessages" | "pluginSnapshot", seqs: number[] | null): void {
+        const expected = this.legacy[key];
+        let index = 0;
+        for (const seq of seqs ?? []) {
+            const got = this.messages.get(seq);
+            if (!got) {
+                this.tailGaps++;
+                continue;
+            }
+            const want = expected && index < expected.length ? messageSignature(expected[index]) : undefined;
+            if (!want || want.digest !== got.digest) {
+                this.changed(key);
+                if (key === "lastMessages" && expected && !this.tailSlot) {
+                    this.tailSlot = { index, expect: want?.slot ?? missingSlot(), got: got.slot };
+                }
+            }
+            index++;
+        }
+        if (seqs && expected && index < expected.length) {
+            this.changed(key);
+            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index, expect: messageSignature(expected[index]).slot, got: missingSlot() };
+        }
+    }
+
+    finish(): { matches: boolean; activeBlocks: number; tailGaps: number; diagnostics: DriftDiagnostics } {
+        if (this.blockCount !== this.legacy.state.blocks.length) this.changed("state");
+        for (const [id, view] of this.orphans) this.compareContents(id, view);
+        if (this.remainingContents.size > 0) this.changed("blockContents");
+        this.compareMessages("lastMessages", this.tail.tailSeqs);
+        this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
+        const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
+        if (this.tailSlot) diagnostics.tailSlot = this.tailSlot;
+        return { matches: !this.drift, activeBlocks: this.activeBlocks, tailGaps: this.tailGaps, diagnostics };
+    }
+}
+
+function missingSlot(): DriftSlotFingerprint {
+    return { id: "-", role: "-", length: 0, sha8: "-" };
+}
+
+function messageSignature(value: unknown): { digest: string; slot: DriftSlotFingerprint } {
+    const json = JSON.stringify(canonicalize(value)) ?? "null";
+    const digest = sha256(json);
+    const message = value as { id?: unknown; role?: unknown } | null;
+    return {
+        digest,
+        slot: !message || typeof message !== "object" ? missingSlot() : {
+            id: typeof message.id === "string" ? message.id : "-",
+            role: typeof message.role === "string" ? message.role : "-",
+            length: json.length,
+            sha8: digest.slice(0, 8),
+        },
+    };
 }
 
 // #3919: which dimensions disagree when the sampled verify detects drift —
