@@ -537,7 +537,7 @@ test("#4666 mysql: concurrent boots serialize on the migration lock",
             assert.equal(Number(released[0].ok), 1, "lock released exactly once");
             locker.release();
             await migrating;
-            assert.equal(await H.stamp(), "8", "migration completed after the lock freed");
+            assert.equal(await H.stamp(), "9", "migration completed after the lock freed");
             const s1 = await H.q("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(s1.map((r) => Number(r.seq)), [1, 2, 3, 5], "fixture collapsed exactly once — no double-delete");
             const sLock = await H.q("SELECT seq, identity FROM messages WHERE session_id = 's_lock' ORDER BY seq");

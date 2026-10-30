@@ -99,11 +99,15 @@ function stats(shadow: UnifiedShadow): ShadowStatsView {
 }
 
 /** Adapter over a REAL DatabaseSync: while unhealthy, write-control
- *  statements fail with a disk-full-shaped error exactly where the engine
- *  would (BEGIN/COMMIT/savepoint/row writes). Reads stay alive — a full disk
- *  does not make the database unreadable. ROLLBACK is deliberately NOT
- *  gated: the real engine answers it, which is what makes the pre-fix mask
- *  ("cannot rollback - no transaction is active") observable. */
+ *  statements fail with a BREAKAGE-class error ('file is not a database')
+ *  exactly where the engine would (BEGIN/COMMIT/savepoint/row writes). The
+ *  class matters since #5188: contention-class errors (disk full, locks,
+ *  fd exhaustion) refresh lastError but never strike the disable latch, so
+ *  only breakage-class evidence can trip the breaker this test drives.
+ *  Reads stay alive — a corrupt database file is still readable as bytes.
+ *  ROLLBACK is deliberately NOT gated: the real engine answers it, which is
+ *  what makes the pre-fix mask ("cannot rollback - no transaction is active")
+ *  observable. */
 class FlakyHandle implements NodeSqliteDatabase {
     unhealthy = false;
     beginAttempts = 0;
@@ -112,7 +116,7 @@ class FlakyHandle implements NodeSqliteDatabase {
         const t = sql.trim();
         if (this.unhealthy && /^(BEGIN|SAVEPOINT|INSERT|UPDATE|DELETE|COMMIT)\b/i.test(t)) {
             if (/^BEGIN\b/i.test(t)) this.beginAttempts++;
-            throw new Error("SQLITE_FULL: database or disk is full");
+            throw new Error("SQLITE_NOTADB: file is not a database");
         }
         return this.real.exec(sql);
     }
@@ -296,7 +300,7 @@ test("#4949 B: disabled sidecar recovers via cooldown-gated writability probe", 
             }
             assert.equal(stats(shadow).disabled, true, "three consecutive failures disable the sidecar");
             const lastErr = stats(shadow).lastError ?? "";
-            assert.match(lastErr, /disk is full/, `status wire must carry the real cause: ${lastErr}`);
+            assert.match(lastErr, /file is not a database/, `status wire must carry the real cause: ${lastErr}`);
             assert.doesNotMatch(lastErr, /cannot rollback/, `masked error reached the status wire: ${lastErr}`);
             const beginsAfterDisable = flaky.beginAttempts;
             assert.ok(beginsAfterDisable >= 3, "each failed record attempted a real BEGIN");
@@ -310,9 +314,9 @@ test("#4949 B: disabled sidecar recovers via cooldown-gated writability probe", 
             assert.equal(flaky.beginAttempts, beginsAfterDisable + 1, "further saves stay quiet inside the cooldown window");
             assert.equal(stats(shadow).disabled, true, "failed probe keeps the breaker armed");
 
-            // Operator frees space: the store heals. The next save after the
-            // window elapses probes once, succeeds, re-enables — and the
-            // triggering record ingests immediately.
+            // Operator restores a valid database file: the store heals. The
+            // next save after the window elapses probes once, succeeds,
+            // re-enables — and the triggering record ingests immediately.
             (shadow as unknown as { nextReenableProbeAt: number }).nextReenableProbeAt = 0;
             flaky.unhealthy = false;
             const ingestsBefore = stats(shadow).ingests;
