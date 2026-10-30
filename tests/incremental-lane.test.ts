@@ -36,10 +36,11 @@ interface Harness {
     markerRaw: (reqPath: string, anthropicBody: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
     dir: string;
+    settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; debounceMs?: number } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";
@@ -47,7 +48,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: opts.debounceMs ?? 60000 });
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
@@ -106,7 +107,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, body };
     };
-    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
@@ -169,10 +170,14 @@ test("incremental lane: seq mismatch answers 409 with the server's seq; resync r
 });
 
 test("incremental lane: cold rebuild after restart serves the next delta from the unified table", async () => {
-    const h = await harness("full");
+    const h = await harness("full", { debounceMs: 20 });
     try {
         const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1)] });
         assert.equal(seed.status, 200);
+        // #5155: the wrap-up schedules a DEBOUNCED save, so the rows settle
+        // a moment later — let the flush land before simulating the restart.
+        await h.settle();
+        _resetSessionsForTest();
         // Simulate a process restart: session pool + warm caches dropped. The
         // canonical prefix must rebuild from the unified messages table.
         _resetSessionsForTest();
@@ -187,7 +192,7 @@ test("incremental lane: cold rebuild after restart serves the next delta from th
 });
 
 test("incremental lane: divergent resync survives a cold restart without a 409 loop", async () => {
-    const h = await harness("full");
+    const h = await harness("full", { debounceMs: 20 });
     try {
         const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1, "old branch one"), assistantTurn(1), userTurn(2, "old branch two")] });
         assert.equal(seed.status, 200);
@@ -195,6 +200,8 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1, "edited branch")] });
         assert.equal(resync.status, 200);
         assert.equal(resync.headers.get("x-bili-applied-seq"), "1");
+        // #5155: debounced save — let the new branch's rows settle first.
+        await h.settle();
         // Cold restart: the canonical must rebuild from the CURRENT branch
         // only — the rejected branch's rows stay in the table (append-only)
         // but the served history slices past them (baseSeq epoch).
