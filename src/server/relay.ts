@@ -192,31 +192,49 @@ function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, bu
     return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
-// #3434: upstream accepted the request then sent no bytes — the log shows
+// #3434/#5164: upstream accepted the request then sent no bytes — the log shows
 // nothing between `forward …` and the outcome (client disconnect / idle-watchdog
 // abort), so an upstream stall reads as proxy-side. Arm a one-shot first-byte
-// watchdog around the initial fetch: headers not arrived by the threshold → ONE
-// warn naming target+method+lane. Additive logging only — deliberately NO
-// fast-fail (would truncate long prefills, cf. #1706/#1714) and NO new config
-// surface (code constant + test seam).
+// watchdog around the initial fetch: headers not arrived by the threshold → a
+// warn naming session+target+method+lane (+ how long it has actually been
+// pending — under a post-wedge late fire that far exceeds the threshold and is
+// exactly the number triage needs). Additive logging only — deliberately NO
+// fast-fail (would truncate long prefills, cf. #1706/#1714; the fail-fast
+// variant is an owner-gated decision, #5164/#5262) and NO new config surface
+// (code constants + test seams).
 const UPSTREAM_FIRST_BYTE_WARN_MS = 30_000;
 let firstByteWarnMs = UPSTREAM_FIRST_BYTE_WARN_MS;
 export function _setFirstByteWarnMsForTest(ms?: number): void {
     firstByteWarnMs = ms ?? UPSTREAM_FIRST_BYTE_WARN_MS;
 }
-// Dedupe once per origin per process (windowSourceLogged pattern) so a
-// long-prefill local model logs at most one line, not one per slow request.
-// Claimed at FIRE time (not arm time) so a fast request never suppresses a
-// later genuine stall on the same origin.
-const firstByteWarnedOrigins = new Set<string>();
-export function _resetFirstByteWarnedOriginsForTest(): void {
-    firstByteWarnedOrigins.clear();
+// #5164: warn cadence is per (origin, session) with a COOLDOWN, replacing the
+// old once-per-origin-per-process dedupe. The permanent Set burned its single
+// warn on the first post-wedge fire and then silenced every later stalled turn
+// for the rest of the process life — the diagnostic surface went to zero while
+// the incident was still ongoing (#5139 Phase 2). The cooldown keeps #3434's
+// anti-spam intent: a pathological fast stall loop on one origin+session logs
+// at most one line per window instead of one per request.
+const FIRST_BYTE_WARN_COOLDOWN_MS = 60_000;
+let firstByteWarnCooldownMs = FIRST_BYTE_WARN_COOLDOWN_MS;
+export function _setFirstByteWarnCooldownMsForTest(ms?: number): void {
+    firstByteWarnCooldownMs = ms ?? FIRST_BYTE_WARN_COOLDOWN_MS;
+}
+// Last-warn epoch per `${origin}\u0000${sessionId}`. Entries older than the
+// cooldown are dead weight (they allow a warn anyway) and are swept at set
+// time so a long-lived process cannot grow the map unboundedly.
+const firstByteWarnLastAt = new Map<string, number>();
+const FIRST_BYTE_WARN_MAP_CAP = 4096;
+export function _resetFirstByteWarnStateForTest(): void {
+    firstByteWarnLastAt.clear();
 }
 /**
- * #3434: arm a one-shot watchdog logging ONE warn if the fetch behind `signal`
- * is still pending after `firstByteWarnMs`. Returns the timer handle (the caller
- * clears it when the fetch settles) or undefined when disarmed (threshold
- * disabled, origin already warned, or signal already aborted).
+ * #3434/#5164: arm a one-shot watchdog logging a warn if the fetch behind
+ * `signal` is still pending after `firstByteWarnMs`. Returns the timer handle
+ * (the caller clears it when the fetch settles) or undefined when disarmed
+ * (threshold disabled or signal already aborted). The cooldown is checked at
+ * FIRE time, never at arm time — a request armed inside the cooldown window
+ * may settle before firing, and disarming it would suppress a genuine later
+ * stall (same claim-at-fire discipline as the original dedupe, #3434).
  */
 export function armFirstByteWatchdog(o: {
     url: string;
@@ -228,20 +246,29 @@ export function armFirstByteWatchdog(o: {
 }): ReturnType<typeof setTimeout> | undefined {
     const threshold = firstByteWarnMs;
     if (!Number.isFinite(threshold) || threshold <= 0) return undefined;
+    if (o.signal.aborted) return undefined;
     let origin: string;
     try {
         origin = new URL(o.url).origin;
     } catch {
         origin = o.url;
     }
-    if (firstByteWarnedOrigins.has(origin)) return undefined;
-    if (o.signal.aborted) return undefined;
+    const key = `${origin}\u0000${o.sessionId}`;
     const seconds = Math.round(threshold / 1000);
+    const armedAt = Date.now();
     const fire = (): void => {
-        // First-to-fire claims the origin; concurrent same-origin timers stay silent.
-        if (firstByteWarnedOrigins.has(origin)) return;
-        firstByteWarnedOrigins.add(origin);
-        o.log("warn", `[${o.sessionId}] upstream awaiting first byte ≥${seconds}s: ${o.method} ${maskUrlForLog(o.url)} (lane=${o.lane})`);
+        const now = Date.now();
+        const last = firstByteWarnLastAt.get(key);
+        if (last !== undefined && now - last < firstByteWarnCooldownMs) return;
+        if (firstByteWarnLastAt.size >= FIRST_BYTE_WARN_MAP_CAP) {
+            for (const [k, t] of firstByteWarnLastAt) {
+                if (now - t >= firstByteWarnCooldownMs) firstByteWarnLastAt.delete(k);
+            }
+            if (firstByteWarnLastAt.size >= FIRST_BYTE_WARN_MAP_CAP) firstByteWarnLastAt.clear();
+        }
+        firstByteWarnLastAt.set(key, now);
+        const heldSeconds = Math.round((now - armedAt) / 1000);
+        o.log("warn", `[${o.sessionId}] upstream awaiting first byte ≥${seconds}s (pending ${heldSeconds}s): ${o.method} ${maskUrlForLog(o.url)} (lane=${o.lane})`);
     };
     const timer = setTimeout(fire, threshold);
     timer.unref();
