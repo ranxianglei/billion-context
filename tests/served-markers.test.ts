@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createServedMarkerWriter, findContestedWriters, reapStaleWriterMarkers, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
+import { createServedMarkerWriter, findContestedWriters, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
 
 // #3923: per-session writer markers — session-level split-brain visibility.
 // Two live bili processes sharing one sessions directory already warn at
@@ -167,4 +167,37 @@ test("reapStaleWriterMarkers removes dead+stale files, keeps live and recent one
     reapStaleWriterMarkers(dir, Date.now());
     assert.equal(fs.existsSync(deadFile), false, "provably-dead + beyond reap horizon → removed");
     assert.equal(fs.existsSync(liveFile), true, "live pid → kept regardless of age");
+});
+
+test("container restart with same PID (pid 1) does not falsely contest prior generation", () => {
+    const dir = writerMarkerDir(freshDir("bili-container-pid1-"));
+    // Anchor to THIS process's boot so the assertion holds no matter how long
+    // the test process has been alive (a fixed offset from Date.now() only
+    // works while uptime stays under ~29 s).
+    const selfBoot = processStartMs(Date.now());
+    const priorPeer: WriterIdentity = {
+        instanceId: "prior-container-gen",
+        pid: process.pid,
+        origin: "http://127.0.0.1:8787",
+        version: "0.1.204",
+        startedAt: selfBoot - 30_000,
+    };
+    writePeerMarker(dir, priorPeer, { "sess-container": Date.now() - 5000 });
+    const found = findContestedWriters(dir, SELF.instanceId, "sess-container", Date.now());
+    assert.equal(found.length, 0, "prior container generation with same PID is not a live peer");
+});
+
+test("same-PID peer that booted after this process still contests (generation gate is one-way)", () => {
+    const dir = writerMarkerDir(freshDir("bili-container-pid1-young-"));
+    const selfBoot = processStartMs(Date.now());
+    const youngerTwin: WriterIdentity = {
+        instanceId: "younger-twin-gen",
+        pid: process.pid,
+        origin: "http://127.0.0.1:8788",
+        version: "0.1.204",
+        startedAt: selfBoot + 5_000,
+    };
+    writePeerMarker(dir, youngerTwin, { "sess-container": Date.now() - 5000 });
+    const found = findContestedWriters(dir, SELF.instanceId, "sess-container", Date.now());
+    assert.equal(found.length, 1, "a same-PID twin that booted later than us is still a live peer");
 });
