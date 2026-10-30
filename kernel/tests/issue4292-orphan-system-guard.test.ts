@@ -208,11 +208,12 @@ test("system separated from a later anchor by a user core is healed too", () => 
 
 test("sidecar system before an assistant and a later anchor stays verbatim", () => {
   const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
     { id: "s1", role: "system", contentType: "text", text: "mid", rawAnthropicMessage: sys("mid") },
     { id: "a0", role: "assistant", contentType: "text", text: "ok" },
     anchor("a1", "[Compressed conversation section] x"),
   ] as never);
-  assert.equal(rebuilt[0]!.role, "system");
+  assert.equal(rebuilt[1]!.role, "system");
 });
 
 test("anchor with no preceding systems re-voices nothing", () => {

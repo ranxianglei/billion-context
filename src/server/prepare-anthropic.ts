@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
-import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
+import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, healAnthropicSystemPositions, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -524,7 +524,7 @@ export async function prepareAnthropic(
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions([...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }]), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
@@ -581,6 +581,9 @@ export async function prepareAnthropic(
     snapshotMessages(session, originalMessages);
     markDirty(session);
 
+    // #4570: notes, nudges and the retrieval note append AFTER coreToAnthropic's
+    // heal, so the position rule is enforced again on the array actually sent.
+    rebuiltMessages = healAnthropicSystemPositions(rebuiltMessages);
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     warnAnthropicThinkingPairs(parsed.messages, rebuiltMessages, log, sessionId);
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's

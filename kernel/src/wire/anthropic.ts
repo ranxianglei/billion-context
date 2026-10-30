@@ -377,58 +377,109 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   );
 }
 
-// #4457: Anthropic accepts a mid-conversation system only immediately
-// before an assistant message or at the end of the array — any other
-// position 400s the whole request, permanently killing the session (a run
-// of consecutive systems is judged by the run's first non-system follower:
-// Pi's trailing tool-delta + effort-marker runs are legal at array end).
+// #4457/#4570: Anthropic's mid-conversation system rule has two halves. A
+// non-directive system must FOLLOW a user message or an assistant message
+// ending in a server tool result, and must PRECEDE an assistant message or
+// end the array (a leading system at index 0 is rejected too). Each half is
+// judged across a run of consecutive systems: the run's nearest non-system
+// neighbours count. Any other position 400s the whole request, permanently
+// killing the session.
 // The fold layer keeps sidecar systems OUT of folds (kernel/src/protected.ts
 // never-fold carve): their tool deltas are FUNCTIONAL under Anthropic's
 // mid-conversation-tool-changes contract — tools[] stays static for cache
 // stability and the deltas control which tools are offered (defer_loading
 // surfacing, by-value definitions, removals, MCP toolsets) — so folding them
 // would silently alter the effective tool set. Orphans still arise when a
-// fold covers the assistant that legitimized one; this position-based
-// backstop heals whatever still arrives illegal: sessions folded by older
-// builds and positionally-illegal client input. Demotion re-voices to user
-// with tool_addition/tool_removal blocks stripped first (WC-022 forbids them
-// outside system) and drops the entry when nothing remains; a
-// directive-only system (empty content + output_config) is accepted at ANY
-// position, so it is never healed. Fresh objects only — sidecars stay
-// intact for future verbatim emission once re-legitimized.
+// fold covers the turn that legitimized one, and hosts append ephemeral user
+// notes after a legal trailing system (#4570); this position-based backstop
+// heals whatever still arrives illegal on the FINAL wire array.
+// A system with an illegal predecessor moves forward past the next user
+// message when one follows: it then follows a user, and every assistant
+// still sees the same systems before it (this also keeps it out of the
+// tool_use → tool_result adjacency). Otherwise it is demoted: re-voiced to
+// user with tool_addition/tool_removal blocks stripped first (WC-022 forbids
+// them outside system), dropped when nothing remains. A directive-only
+// system (empty content + output_config) is accepted at ANY position, so it
+// is never healed. Fresh objects only — sidecars stay intact for future
+// verbatim emission once re-legitimized.
 function isToolUpdateBlock(b: { type?: unknown }): boolean {
   return b.type === "tool_addition" || b.type === "tool_removal";
 }
 
+function endsInServerToolResult(m: AnthropicWireMessage): boolean {
+  if (m.role !== "assistant" || !Array.isArray(m.content)) return false;
+  const last = m.content[m.content.length - 1] as { type?: unknown } | undefined;
+  return (
+    typeof last?.type === "string" &&
+    last.type !== "tool_result" &&
+    last.type.endsWith("_tool_result")
+  );
+}
+
+function legalSystemPredecessor(m: AnthropicWireMessage | undefined): boolean {
+  return m !== undefined && (m.role === "user" || endsInServerToolResult(m));
+}
+
+function demoteSystemAt(out: AnthropicWireMessage[], j: number): boolean {
+  const e = out[j] as AnthropicSystemMessage;
+  if (typeof e.content === "string") {
+    // An empty string demoted to user would mint an empty-content user
+    // message, which 400s on its own — drop instead.
+    if (e.content === "") {
+      out.splice(j, 1);
+      return false;
+    }
+    out[j] = { role: "user", content: e.content };
+    return true;
+  }
+  const kept = e.content.filter(
+    (b) => !isToolUpdateBlock(b as { type?: unknown }),
+  );
+  if (kept.length === 0) {
+    out.splice(j, 1);
+    return false;
+  }
+  out[j] = { role: "user", content: kept };
+  return true;
+}
+
 function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  const moved = new Set<AnthropicWireMessage>();
   for (let j = 0; j < out.length; j++) {
     const e = out[j];
     if (!e || e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    let p = j - 1;
+    while (p >= 0 && out[p]!.role === "system") p--;
     let k = j + 1;
     while (k < out.length && out[k]!.role === "system") k++;
     const next = out[k];
-    if (!next || next.role === "assistant") continue;
-    if (typeof e.content === "string") {
-      // An empty string demoted to user would mint an empty-content user
-      // message, which 400s on its own — drop instead.
-      if (e.content === "") {
+    if (!legalSystemPredecessor(out[p])) {
+      if (next?.role === "user") {
         out.splice(j, 1);
+        let at = k;
+        while (at < out.length && moved.has(out[at]!)) at++;
+        out.splice(at, 0, e);
+        moved.add(e);
         j--;
-      } else {
-        out[j] = { role: "user", content: e.content };
+        continue;
       }
+      if (!demoteSystemAt(out, j)) j--;
       continue;
     }
-    const kept = e.content.filter(
-      (b) => !isToolUpdateBlock(b as { type?: unknown }),
-    );
-    if (kept.length === 0) {
-      out.splice(j, 1);
-      j--;
-      continue;
-    }
-    out[j] = { role: "user", content: kept };
+    if (!next || next.role === "assistant") continue;
+    if (!demoteSystemAt(out, j)) j--;
   }
+}
+
+/** #4570: the position backstop as a standalone pass over a FINAL Anthropic
+ *  messages array — hosts that append messages after coreToAnthropic (notes,
+ *  nudges, side-call prompts) run it on the array they actually send. */
+export function healAnthropicSystemPositions(
+  messages: readonly AnthropicWireMessage[],
+): AnthropicWireMessage[] {
+  const out = [...messages];
+  healIllegalSystemPositions(out);
+  return out;
 }
 
 export function coreToAnthropic(

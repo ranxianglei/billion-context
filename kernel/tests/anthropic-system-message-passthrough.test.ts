@@ -241,8 +241,8 @@ test("host-stamped mark lands on the last block; client marks stay put", () => {
       TOOL_ADDITION,
     ],
   };
-  const flat = anthropicToCore({ messages: [pre] } as never);
-  assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[0], pre);
+  const flat = anthropicToCore({ messages: [{ role: "user", content: "hi" }, pre] } as never);
+  assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[1], pre);
 });
 
 test("control-plane system cores are never folded; other cores still are", () => {

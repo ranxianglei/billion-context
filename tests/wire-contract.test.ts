@@ -94,6 +94,24 @@ test("WC-022 tool_addition/tool_removal blocks are only valid inside role:system
     })[0], /WC-022/);
 });
 
+test("WC-023 a mid-conversation system must follow a user (or server-tool-result assistant) and precede an assistant or end the array", () => {
+    const u = { role: "user", content: "u" };
+    const a = { role: "assistant", content: [{ type: "text", text: "a" }] };
+    const s = { role: "system", content: [{ type: "text", text: "s" }] };
+    const dir = { role: "system", content: [], output_config: { effort: "high" } };
+    const serverResult = { role: "assistant", content: [{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} }, { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [] }] };
+    for (const messages of [[u, s, a, u], [u, a, u, s], [u, s, s, a, u], [u, dir, s, a, u], [u, a, dir, a, u], [u, serverResult, s, a, u]])
+        assert.deepEqual(VALIDATORS.anthropic({ messages }), [], JSON.stringify(messages));
+    // #4570: a host note appended after a legal trailing system.
+    assert.match(VALIDATORS.anthropic({ messages: [u, s, u] })[0], /WC-023 messages\.1: .*must precede/);
+    assert.match(VALIDATORS.anthropic({ messages: [u, s, s, u] }).join("\n"), /WC-023 messages\.2: .*must precede/);
+    // The compress-loop shape: a system right after an assistant turn.
+    assert.match(VALIDATORS.anthropic({ messages: [u, a, s, a, u] })[0], /WC-023 messages\.2: .*must follow/);
+    assert.match(VALIDATORS.anthropic({ messages: [u, a, s] })[0], /WC-023 messages\.2: .*must follow/);
+    assert.match(VALIDATORS.anthropic({ messages: [u, a, dir, s, a, u] })[0], /WC-023 messages\.3: .*must follow/);
+    assert.match(VALIDATORS.anthropic({ messages: [s, a, u] })[0], /WC-023 messages\.0: .*must follow/);
+});
+
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
     // #2648 shape: unmarked tools render ahead of a global system block.
     assert.match(VALIDATORS.anthropic({
@@ -190,6 +208,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             },
             // WC-022: a pi mid-conversation system message re-emitted as user.
             { messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }] },
+            // WC-023: the #4570 shape — a host note appended after a trailing system.
+            { messages: [{ role: "user", content: "q" }, { role: "system", content: "s" }, { role: "user", content: "note" }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },

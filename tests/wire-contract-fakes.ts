@@ -81,6 +81,14 @@ export const WIRE_RULES: readonly WireRule[] = [
             'live probe 2026-10-20 (pi 1.3.0 + pi-subagents 0.79.2, api.anthropic.com, claude-haiku-5-5) through a master b156c02f proxy: pi declares tools activated mid-session as tool_addition blocks inside a mid-conversation role:"system" message; #3410\'s unknown-block passthrough kept the blocks but coreToAnthropic re-emitted the message as role:"user" → upstream 400 "messages.2.content: \'tool_addition\'/\'tool_removal\' blocks are only permitted within `role: "system"` messages". On v0.1.202 the blocks were silently dropped instead (tools never reached the model). Repair: kernel/src/wire/anthropic.ts keeps each wire system message whole on the rawAnthropicMessage sidecar and re-emits it verbatim.',
     },
     {
+        id: "WC-023",
+        wire: "anthropic",
+        summary:
+            'a mid-conversation role:"system" message in messages[] must FOLLOW a user message or an assistant message ending in a server tool result, and must PRECEDE an assistant message or end the array; a run of consecutive systems is judged by its nearest non-system neighbours, index 0 is rejected, and only the directive-only form (content: [] with output_config) is exempt',
+        provenance:
+            'production 400s on v0.1.206 (Claude Code 2.1.308, claude-opus-5-5): "messages.35: role \'system\' must precede an \'assistant\' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position" (#4570: host notes/nudges appended after coreToAnthropic\'s heal) and, from the compress-loop re-request, "messages.8: role \'system\' must follow a \'user\' message or an \'assistant\' message ending in a server tool result". Live A/B 2026-10-25 against api.anthropic.com: [U,S,A,U] 200, [U,A,U,S] 200, [U,S,S,A,U] 200, [U,A,Sdir,A,U] 200; [U,S,U] / [U,S,S,U] 400 must precede; [U,A,S,A,U] / [U,A,S] / [U,A,Sdir,S,A,U] 400 must follow; [S,A,U] 400 messages.0 "use the top-level \'system\' parameter". Repair: kernel/src/wire/anthropic.ts heals both halves; hosts re-run healAnthropicSystemPositions on the final array.',
+    },
+    {
         id: "WC-016",
         wire: "anthropic",
         summary:
@@ -257,10 +265,41 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022 on an Anthropic /v1/messages body. Returns violation strings. */
+function isAnthropicDirectiveOnlySystem(m: unknown): boolean {
+    return isPlainObject(m) && m.role === "system" && Array.isArray(m.content) && m.content.length === 0 && m.output_config != null;
+}
+
+function legalAnthropicSystemPredecessor(m: unknown): boolean {
+    if (!isPlainObject(m)) return false;
+    if (m.role === "user") return true;
+    if (m.role !== "assistant" || !Array.isArray(m.content)) return false;
+    const last: unknown = m.content[m.content.length - 1];
+    return isPlainObject(last) && typeof last.type === "string" && last.type !== "tool_result" && last.type.endsWith("_tool_result");
+}
+
+/** WC-023: both halves of the mid-conversation system position rule. */
+function anthropicSystemPositionViolations(messages: unknown[]): string[] {
+    const out: string[] = [];
+    messages.forEach((m, i) => {
+        if (!isPlainObject(m) || m.role !== "system" || isAnthropicDirectiveOnlySystem(m)) return;
+        let p = i - 1;
+        while (p >= 0 && isPlainObject(messages[p]) && (messages[p] as Record<string, unknown>).role === "system") p--;
+        let k = i + 1;
+        while (k < messages.length && isPlainObject(messages[k]) && (messages[k] as Record<string, unknown>).role === "system") k++;
+        if (!legalAnthropicSystemPredecessor(messages[p]))
+            out.push(`WC-023 messages.${i}: role 'system' must follow a 'user' message or an 'assistant' message ending in a server tool result`);
+        const next = messages[k];
+        if (next !== undefined && !(isPlainObject(next) && next.role === "assistant"))
+            out.push(`WC-023 messages.${i}: role 'system' must precede an 'assistant' message or end the array`);
+    });
+    return out;
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (Array.isArray(body.messages)) out.push(...anthropicSystemPositionViolations(body.messages));
     if (Array.isArray(body.messages))
         body.messages.forEach((m, i) => {
             if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) return;
