@@ -2148,12 +2148,19 @@ type FileConfig = {
      *  `warmMax` caps how many most-recently-saved sessions boot hydrates
      *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
      *  over the budget is never warmed), `residentMaxBytes` the soft target for
-     *  estimated resident session bytes (active/in-flight state stays pinned). */
+     *  estimated resident session bytes (the process-wide POOL ceiling — evicts
+     *  whole cold sessions, active/in-flight state stays pinned), and
+     *  `hardMaxBytes` the per-SESSION hard cap (#4788 D1-A): when ONE session's
+     *  estimated resident weight exceeds it, the next request-end boundary
+     *  force-drops its droppable fields back to disk — including sessions exempt
+     *  from pool eviction. Surviving bytes re-materialize via narrow disk reads.
+     *  Default: same value as `residentMaxBytes` above. */
     sessions?: {
         max?: number;
         warmMax?: number;
         warmMaxBytes?: number;
         residentMaxBytes?: number;
+        hardMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw

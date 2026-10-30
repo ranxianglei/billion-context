@@ -217,7 +217,27 @@ function writeCombinedBundle(): void {
     for (const pem of tls.rootCertificates) add(pem);
     add(rootCertPem!);
     const body = [...byFingerprint.values()].map((pem) => (pem.endsWith("\n") ? pem : pem + "\n")).join("");
-    fs.writeFileSync(file, body, { mode: 0o644 });
+    try {
+        fs.writeFileSync(file, body, { mode: 0o644 });
+    } catch (err) {
+        // #5103: an OS-level write refusal (AV/Defender holding the dir,
+        // Windows integrity control on a low-integrity launcher, boot-time
+        // components still initializing — the #3823 class) must not brick the
+        // whole proxy when a functionally valid bundle already sits on disk:
+        // it carries the current root CA, which is what MITM needs; the merged
+        // public roots are freshness, not correctness. Reuse it and warn loud;
+        // the next startup retries the rebuild. No usable bundle (fresh
+        // install, or one missing our root) still fails fast as before.
+        let reusable = false;
+        try {
+            reusable = fs.readFileSync(file, "utf8").includes(rootCertPem!.trim());
+        } catch { /* absent or unreadable file — nothing to reuse */ }
+        if (!reusable) throw err;
+        loggerLog(
+            "warn",
+            `[ca] cannot rebuild ${file} (${String(err).slice(0, 200)}) — continuing with the EXISTING bundle (it still carries the current root CA). This is an OS-level write refusal, not a code fault — on Windows check the Node runtime's integrity label FIRST (icacls \"<path-to-node.exe>\"; a Low label is refused for Medium-labeled files even with correct ACLs, #5154), then antivirus/Defender exclusions for %USERPROFILE%\\.local\\share\\billion-context\\ (#3823); the rebuild retries on the next startup.`,
+        );
+    }
 }
 
 function generateRootCA(): { cert: string; key: string } {
