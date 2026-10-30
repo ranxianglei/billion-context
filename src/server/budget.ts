@@ -46,6 +46,15 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // host-side: renderNudgeText does not depend on shouldInject.
 const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
 
+// #5232: resolve the host-side escalation line off a resolved kernel config.
+// The value rides the ResolvedKernelConfig rail (host-only, never sent to the
+// kernel); an absent or non-positive value keeps the 0.7 default, so behavior
+// is byte-identical to pre-#5232 unless a level sets compress.nudgeEscalationPct.
+export function resolveNudgeEscalationPct(config: unknown): number {
+    const v = (config as { nudgeEscalationPct?: unknown } | null | undefined)?.nudgeEscalationPct;
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : EMERGENCY_NUDGE_ESCALATION_PCT;
+}
+
 /** #2391: a budget view only; never forward this projection. OpenAI tool search
  * defers individual function schemas, while namespace descriptions stay visible.
  * https://developers.openai.com/api/docs/guides/tools-tool-search */
@@ -399,8 +408,9 @@ export function emergencyNudgeArmed(
     minCompressRange: number,
     tokenCount: number,
     growthStep?: number,
+    escalationPct?: number,
 ): boolean {
-    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    if (!emergencyNudge(nudge, escalationPct, minCompressRange)) return false;
     const now = Date.now();
     const key = reductionKeyOf(session);
     const raw = session.metadata["emergencyNudgeGate"];

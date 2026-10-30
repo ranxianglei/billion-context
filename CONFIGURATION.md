@@ -259,6 +259,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 |-----|------|---------|-----|-------------|
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | Effective context window (tokens or N%): denominator of the usage ratio and a hard preflight wall; highest-priority window source. |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | Forced-compression nudge threshold: once history passes this share of the window the nudge fires immediately, bypassing growth gates. Not a hard cap. |
+| `compress.nudgeEscalationPct` | number \| "N%" | 0.7 | — | Host-side escalation-nudge line: injects a compression nudge once usage crosses this ratio even while the kernel cadence stays silent (covers the climb below maxContextLimit). Host-only; if set at/above maxContextLimit the kernel pressure band takes over first. |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
@@ -1348,6 +1349,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `"75%"`
 - **Status:** ACTIVE
 - **Description:** Context-usage threshold that triggers **forced compression** nudges. Once usage crosses this ratio, the engine fires a nudge that bypasses the growth-gate and cadence checks. Accepts a ratio (`0.75`) or a percent string (`"75%"`). Lower values compress earlier. Maps to the kernel field `nudge.maxContextLimitPct`.
+
+#### `nudgeEscalationPct`
+
+- **Type:** `number | string`
+- **Default:** `0.7`
+- **Status:** ACTIVE (host-only)
+- **Description:** Host-side escalation-nudge line, expressed as a ratio of the context window. Once usage crosses this ratio the proxy injects a compression nudge on that turn even while the kernel's own cadence stays silent — it covers the climb between the kernel's growth-driven nudges and the forced band at `maxContextLimit`. This is now the configurable form of what used to be the hardcoded `EMERGENCY_NUDGE_ESCALATION_PCT` constant (0.7), which previously had no config surface (#5232). Accepts a ratio (`0.85`) or a percent string (`"85%"`). Host-only: it never reaches the kernel and maps to no kernel field. If set at or above `maxContextLimit`, the kernel pressure band fires first at its lower line, so this one effectively never arms. An absent or non-positive value keeps the `0.7` default byte-for-byte. Merged per field across global → provider → model like every other compress field.
 
 #### `emergencyThresholdPercent`
 

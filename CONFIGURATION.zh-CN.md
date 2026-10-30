@@ -259,6 +259,7 @@
 |-----|------|---------|-----|-------------|
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。 |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | 强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。 |
+| `compress.nudgeEscalationPct` | number \| "N%" | 0.7 | — | 宿主侧升级提醒线：使用率越过该比例时，即使内核节奏仍静默也注入一次压缩提醒（覆盖 maxContextLimit 之下的爬升段）。仅宿主侧；若设到 >= maxContextLimit，内核压力带会先触发。 |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
@@ -1351,6 +1352,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** `"75%"`
 - **状态：** ACTIVE
 - **说明：** 触发**强制压缩** nudge 的上下文使用率阈值。一旦使用率越过该比例，引擎就会触发一个绕过 growth-gate 与节奏检查的 nudge。接受比例值（`0.75`）或百分比字符串（`"75%"`）。值越小，压缩越早。映射到内核字段 `nudge.maxContextLimitPct`。
+
+#### `nudgeEscalationPct`
+
+- **类型：** `number | string`
+- **默认值：** `0.7`
+- **状态：** ACTIVE（仅宿主侧）
+- **说明：** 宿主侧升级提醒线，以上下文窗口的比例表示。使用率一旦越过该比例，代理就会在这一轮注入一次压缩 nudge——即使内核自身的节奏仍保持静默。它覆盖内核增长驱动 nudge 与 `maxContextLimit` 强制带之间的爬升段。这正是过去硬编码常量 `EMERGENCY_NUDGE_ESCALATION_PCT`（0.7）的可配置化形式，此前它没有任何配置面（#5232）。接受比例值（`0.85`）或百分比字符串（`"85%"`）。仅宿主侧：不会传到内核，也不映射到任何内核字段。若设到 >= `maxContextLimit`，内核压力带会在更低的线上先触发，因此这一项实际不会生效。缺省或非正值保持 `0.7` 默认（逐字节不变）。与其他 compress 字段一样跨全局 → provider → model 按**字段**合并。
 
 #### `emergencyThresholdPercent`
 
