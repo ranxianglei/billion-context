@@ -620,7 +620,7 @@ test("watermark: v4 database migrates to v8 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 8, "open() migrates v4 → v8");
+            assert.equal(ver.user_version, 9, "open() migrates v4 → v9");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -647,18 +647,18 @@ test("watermark: v4 database migrates to v8 additively; newer user_version no-op
             store.close();
         }
 
-        // Version-gate no-op: a v7 DB rolled FORWARD past the code's target
+        // Version-gate no-op: a DB stamped at the current schema head
         // (an older build opening a newer file) must open without error and
         // leave user_version alone — the additive-column contract. The
-        // probe version sits ABOVE the current schema head (v7 + 1) so the
-        // no-op branch still exercises after future bumps.
+        // probe version sits AT the current schema head so the no-op branch
+        // still exercises after future bumps.
         const fwd = new DatabaseSync(dbPath);
-        fwd.exec("PRAGMA user_version = 8");
+        fwd.exec("PRAGMA user_version = 9");
         fwd.close();
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 8, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 9, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();
