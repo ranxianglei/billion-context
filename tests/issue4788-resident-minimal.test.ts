@@ -86,7 +86,19 @@ async function turn(store: SessionStore, s: Session, midFlight?: boolean): Promi
     if (midFlight) s.inFlight = 1;
     s.revisionEpoch = (s.revisionEpoch ?? 0) + 1;
     store.scheduleSave(s);
-    const landed = await store.afterNextFlush(s.id);
+    // The debounced-save timer is unref'd by design (persist.ts: a pending save
+    // must not hold the process open at shutdown), so this await keeps NOTHING
+    // else alive: in a node:test child whose only surviving handles are unref'd
+    // sockets the event loop drains before the 50 ms debounce fires and
+    // afterNextFlush never settles (born-flake, §7.2 no environmental luck).
+    // A ref'd keep-alive makes the settle deterministic regardless of host.
+    const keepAlive = setInterval((): void => {}, 25);
+    let landed: boolean;
+    try {
+        landed = await store.afterNextFlush(s.id);
+    } finally {
+        clearInterval(keepAlive);
+    }
     if (midFlight) s.inFlight = 0;
     return landed;
 }
