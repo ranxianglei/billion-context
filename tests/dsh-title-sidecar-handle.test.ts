@@ -40,6 +40,9 @@ async function harness() {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     mkdirSync(join(dir, "billion-context", "sessions"), { recursive: true });
+    // the injected store below points at dir/sessions — it must exist, else the
+    // web walk stays loud on the missing dir (#1937) and the listing 500s (#4990)
+    mkdirSync(join(dir, "sessions"), { recursive: true });
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetToolRingForTest();
@@ -80,7 +83,11 @@ async function harness() {
         const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify(body) });
         assert.equal(response.status, 200, await response.text());
     };
-    const sessionIds = async () => ((await (await fetch(origin + "/__bili/sessions")).json()) as { sessions: { id: string }[] }).sessions.map((s) => s.id);
+    const sessionIds = async () => {
+        const body = (await (await fetch(origin + "/__bili/sessions")).json()) as { sessions?: { id: string }[] };
+        assert.ok(Array.isArray(body.sessions), `/__bili/sessions returned no list: ${JSON.stringify(body)}`);
+        return body.sessions.map((s) => s.id);
+    };
     const subSessions = async (prefix: string) => (await sessionIds()).filter((id) => id.startsWith(prefix + "|sub:"));
     const status = async (conversationId: string) => (await (await fetch(`${origin}/__bili/plugin/status?conversationId=${conversationId}`)).json()) as { contextTokens: number | null; inputTokens: number };
     return { forwarded, dshSend, dshSendAnthropic, subSessions, status, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };

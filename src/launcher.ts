@@ -58,7 +58,7 @@ import {
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
-import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
+import { applyOmpFirstEventTimeout, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
@@ -171,12 +171,17 @@ type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" 
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
-const SPAWN_WAIT_MS = 20000;
+// Env knobs (envMillis contract, #1365): large stores (whole-DB pre-bind open,
+// #4939) and two lanes sharing one index.db (write-lock contention on cold
+// start) have been observed exhausting the fixed budget, kill-spawn looping
+// into the same contention. Widen via env instead of patching dist; bad
+// values fall back to the defaults.
+const SPAWN_WAIT_MS = envMillis(process.env, "BILI_SPAWN_WAIT_MS", 20000);
 // #2187: grace beyond the initial wait for a LIVE child still starting.
 // Spawn-window startups have been observed taking 26-45s on slow Windows
 // machines (AV / first-run disk activity); the one-shot 20s budget misread
 // that as failure and left the lane degraded for the whole session.
-const SLOW_START_GRACE_MS = 40_000;
+const SLOW_START_GRACE_MS = envMillis(process.env, "BILI_SLOW_START_GRACE_MS", 40_000);
 // Total wait for a live child: initial window + grace. A child that EXITS or
 // fails to spawn still fails fast (the poll loop breaks on exit/error).
 export const SPAWN_BUDGET_MS = SPAWN_WAIT_MS + SLOW_START_GRACE_MS;
