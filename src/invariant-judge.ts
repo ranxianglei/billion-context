@@ -26,6 +26,30 @@
 //     attribution-scoped (a half-pair the client itself sent broken is the
 //     host's defect, not bili's).
 //
+// Fold-coverage awareness (#4408): an inbound cell whose id sits in the
+// session's LIVE fold coverage set is exempt from the frozen-prefix presence
+// rule — a fold replaces covered cells with their summary carrier, so their
+// absence from the outbound IS the fold working, not a drop. The exemption is
+// keyed on ground truth (session state, re-keyed onto THIS inbound pass by
+// fold-reconcile), never wire-shape sniffing. The plugin lane's carrier is
+// recognized explicitly: bili renders the compress pair itself on the wire
+// (synthetic plugin_<ts> call id, #1567) and the receipt text shape is pinned
+// (isPluginFoldCarrier), so the pair anchors the fold point there too. The
+// CLIENT's own pair bytes are exempted as pair cells (isFoldPairCell, gated
+// on a folded session) because their wire representation belongs to bili.
+// Where NEITHER shape rides the wire at all (anchor stripped, pair not
+// rendered), `folded` stays true via the coverage disjunction so verdicts
+// label I2, not I1. Walk geometry still keys off the CARRIER: a carrier-less
+// fold declares NO free zone, so real tail drops are never masked. A second
+// boundary artifact is fixed geometrically: when unconsumable exempt elements
+// sit between the matched prefix and the carrier, the walk pointer lags below
+// freezeEnd while the remaining live cells already belong to the post-fold
+// tail (their twins sit past the carrier) — a confirmation scan downstream of
+// the carrier recognizes that case as "free zone reached" (break, standard
+// I2) instead of flagging a phantom drop. Uncovered cells whose twin is NOWHERE
+// downstream keep full teeth. The render-lane tail (#4241) validates only the
+// live tail, which is structurally uncovered — no exemption needed there.
+//
 // Single-request independence: the inbound core IS the client ground truth, so
 // the judge needs no cross-request state — structurally avoiding the process-
 // local seam pairing's restart blindness (#2773).
@@ -108,6 +132,14 @@ interface JudgeOptions {
   // entry[renderTailStart..] against the outbound; the rendered prefix is exempt
   // from the frozen-prefix requirement. Absent ⇒ legacy full inbound-vs-outbound.
   renderTailStart?: number;
+  // #4408: ids the session's LIVE fold blocks cover (coveredRealHistoryIds of
+  // state.blocks at send time; fold-reconcile has re-keyed them onto THIS
+  // inbound pass). An inbound cell whose id is covered may be absent from the
+  // outbound — the fold replaces it with its summary carrier. Exempted from
+  // the frozen-prefix presence rule (its content rides in the summary block,
+  // not on the wire); a covered cell that DOES appear still matches normally.
+  // Absent ⇒ pre-#4408 behavior (byte-identical verdicts).
+  coveredIds?: ReadonlySet<string>;
 }
 
 function normText(m: CoreMessage): string {
@@ -127,13 +159,33 @@ function isReasoning(m: CoreMessage): boolean {
 function isCarrier(m: CoreMessage): boolean {
   if (m.summaryOfBlockId !== undefined) return true;
   const t = m.text ?? "";
-  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER);
+  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER) || isPluginFoldCarrier(m);
 }
 
 function isSummaryCarrier(m: CoreMessage): boolean {
   if (m.summaryOfBlockId !== undefined) return true;
   const t = m.text ?? "";
-  return t.includes(SUMMARY_MARKER) || m.id.startsWith("acp_summary");
+  return t.includes(SUMMARY_MARKER) || m.id.startsWith("acp_summary") || isPluginFoldCarrier(m);
+}
+
+// #4408: the plugin lane's fold carrier is the compress tool pair. On the exit
+// side bili renders it itself — synthetic plugin_<ts> tool-call id (#1567,
+// isPluginFoldCallId; the marker lives on the PAIRING KEY, the core id stays a
+// content hash), normalized args — so the client's pair bytes are not what
+// rides the wire. The receipt text shape mirrors src/stream.ts:1356; the
+// anchored m-prefix keeps ordinary prose from reading as a carrier.
+const FOLD_RECEIPT_RE = /^\[Compressed m\d+/;
+function isPluginFoldCarrier(m: CoreMessage): boolean {
+  if (m.contentType === "tool-result") return FOLD_RECEIPT_RE.test(m.text ?? "");
+  return m.contentType === "tool-call" && (m.toolCallId ?? "").startsWith("plugin_");
+}
+
+// Entry-side twin of the above, any call id (host-stamped or synthetic): in a
+// folded session the pair's wire representation belongs to bili, so its
+// absence from the outbound is not a loss.
+function isFoldPairCell(m: CoreMessage): boolean {
+  if (m.contentType === "tool-result") return FOLD_RECEIPT_RE.test(m.text ?? "");
+  return m.contentType === "tool-call" && isCompressToolName(m.toolName);
 }
 
 function isCrushedToolResult(m: CoreMessage): boolean {
@@ -294,8 +346,16 @@ export function judgeInboundOutbound(
   // The fold point is the first summary carrier; everything before it is the
   // frozen prefix (must match), everything from it on is the fold/tail (free).
   const sumIdx = exit.findIndex(isSummaryCarrier);
-  const folded = sumIdx !== -1;
-  const freezeEnd = folded ? sumIdx : exit.length;
+  // #4408: live fold coverage makes a session folded EVEN WHEN the outbound
+  // carries no recognized summary carrier (plugin lane: the client-resent
+  // compress pair IS the carrier; #1567 stripped the in-place anchor and the
+  // receipt text carries no marker). The disjunction feeds the VERDICT LABEL
+  // only — walk geometry below still keys off carrierFolded, so a carrier-less
+  // fold declares no free zone and can never mask a real tail drop.
+  const carrierFolded = sumIdx !== -1;
+  const covered = opts.coveredIds;
+  const folded = carrierFolded || (covered !== undefined && covered.size > 0);
+  const freezeEnd = carrierFolded ? sumIdx : exit.length;
   let foldStart = -1;
 
   // #4241 render-lane tail-fidelity: when THIS turn's outbound prefix was
@@ -332,7 +392,12 @@ export function judgeInboundOutbound(
         scanned++;
         if (scanned > cap) break;
         if (stableEqual(e, x)) { found = k; break; }
-        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
+        // #4408: toolName joins the twin fingerprint — same role/contentType
+        // with a DIFFERENT tool is a drop + unrelated call, not a rewrite
+        // (stableEqual itself already gates on toolName, L197). Label-only.
+        if (x.role === e.role && x.contentType === e.contentType &&
+            (e.contentType !== "tool-call" || !e.toolName || !x.toolName || x.toolName === e.toolName) &&
+            (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
       if (found < 0) {
         violations.push({ kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop", index: i, detail: `tail inbound[${i}] ${fp(e)} absent from outbound` });
@@ -358,7 +423,7 @@ export function judgeInboundOutbound(
     for (let i = 0; i < entry.length; i++) {
       const e = entry[i];
       if (isReasoning(e)) continue;
-      if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
+      if (carrierFolded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
       total++;
 
       // Stateful hosts re-send previously-injected carriers in their inbound
@@ -377,22 +442,60 @@ export function judgeInboundOutbound(
         scanned++;
         if (scanned > maxGap) break;
         if (stableEqual(e, x)) { found = k; break; }
-        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
+        // #4408: toolName joins the twin fingerprint — same role/contentType
+        // with a DIFFERENT tool is a drop + unrelated call, not a rewrite
+        // (stableEqual itself already gates on toolName, L197). Label-only.
+        if (x.role === e.role && x.contentType === e.contentType &&
+            (e.contentType !== "tool-call" || !e.toolName || !x.toolName || x.toolName === e.toolName) &&
+            (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
 
       if (found < 0) {
-        violations.push({
-          kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
-          index: i,
-          detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
-        });
-        j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        // #4408: a covered cell missing from the outbound is the fold working —
+        // its content rides in the summary block, not on the wire. Exempt it
+        // WITHOUT advancing j so the next real cell resumes the scan where the
+        // walk left off; only uncovered misses stay hard findings.
+        const coveredCell = covered !== undefined && e.id !== undefined && covered.has(e.id);
+        // #4408: in a folded session the client's compress pair is the summary
+        // carrier itself — bili renders its own copy on the wire, so the
+        // client bytes' absence is expected, not a loss. Gated on `folded` so
+        // a dropped compress call in an UNFOLDED session still fires.
+        const pairCell = folded && isFoldPairCell(e);
+        if (!coveredCell && !pairCell) {
+          // #4408: the pointer may lag below freezeEnd while the remaining LIVE
+          // cells already belong to the post-fold tail — unconsumable exempt
+          // elements between the matched prefix and the fold carrier push the
+          // carrier back, so those cells' twins sit PAST the carrier, outside
+          // this scan window. A confirmation scan downstream of the carrier
+          // separates "reached the free zone" (break — standard I2, no finding)
+          // from a genuine mid-history loss (twin nowhere downstream). Role/
+          // contentType pre-filter keeps it cheap. A byte-identical downstream
+          // copy of a truly dropped cell reads as tail: the content is present
+          // (position lost — prefix instability is seamLcp's, #2131).
+          if (carrierFolded) {
+            for (let k = freezeEnd; k < exit.length; k++) {
+              const x = exit[k];
+              if (isReasoning(x) || isCarrier(x)) continue;
+              if (x.role !== e.role || x.contentType !== e.contentType) continue;
+              if (stableEqual(e, x)) { foldStart = i; break; }
+            }
+            if (foldStart >= 0) break; // remainder is the post-fold live tail
+          }
+          violations.push({
+            kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
+            index: i,
+            detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
+          });
+          j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        }
         continue;
       }
 
       for (let k = j; k < found; k++) {
         const x = exit[k];
-        if (!isCarrier(x) && !isReasoning(x)) {
+        // #4408: in a folded session the compress pair may sit inside the span
+        // between two matched cells — fold machinery, not an insertion.
+        if (!isCarrier(x) && !isReasoning(x) && !(folded && isFoldPairCell(x))) {
           violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
         }
       }
@@ -401,11 +504,14 @@ export function judgeInboundOutbound(
     }
 
     // Carrier pinning (I2): a non-carrier element sitting before the fold carrier
-    // that exceeds the matched frozen prefix means the anchor drifted.
-    if (folded && sumIdx > matched) {
+    // that exceeds the matched frozen prefix means the anchor drifted. #4408:
+    // the plugin lane's compress pair RIDES immediately before the rendered
+    // carrier (bili forwards the client call verbatim) — fold machinery, not
+    // drift, so pair cells are skipped like carriers here.
+    if (carrierFolded && sumIdx > matched) {
       for (let k = matched; k < sumIdx; k++) {
         const x = exit[k];
-        if (!isCarrier(x) && !isReasoning(x)) {
+        if (!isCarrier(x) && !isReasoning(x) && !isFoldPairCell(x)) {
           violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
           break;
         }
@@ -465,6 +571,11 @@ interface InvariantJudgeInput {
    *  the first client index of the live tail; the judge then validates only that
    *  suffix against the outbound (the rendered prefix is exempt). Absent ⇒ legacy. */
   renderTailStart?: number;
+  /** #4408: the session's LIVE fold coverage (coveredRealHistoryIds of
+   *  state.blocks at send time) — inbound cells whose id is here are exempt from
+   *  the frozen-prefix presence rule (the fold replaced them with their summary
+   *  carrier). Absent ⇒ pre-#4408 behavior. */
+  coveredIds?: ReadonlySet<string>;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -534,7 +645,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, coveredIds: input.coveredIds });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).

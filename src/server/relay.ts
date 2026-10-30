@@ -44,7 +44,7 @@ import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, 
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
-import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
+import { coveredRealHistoryIds, diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
@@ -766,6 +766,16 @@ async function forwardCaptured(
         const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
+        // #4408: the session's LIVE fold coverage is the judge's ground truth
+        // for which inbound cells are legitimately ABSENT from the outbound —
+        // a fold replaces them with their summary carrier. Without it the
+        // judge reads every covered cell as a mid-history drop: the plugin
+        // lane's steady state carries zero recognized carriers (the client-
+        // resent compress pair IS the carrier; #1567 stripped the in-place
+        // anchor), so heavily folded sessions flooded warn lines and drowned
+        // real signals (#4401: 1104/day). Active blocks only; fold-reconcile
+        // has already re-keyed their ids onto THIS inbound pass.
+        const foldCover = coveredRealHistoryIds(prepared.session.state.blocks);
         maybeRunInvariantJudge({
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
@@ -779,6 +789,7 @@ async function forwardCaptured(
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            ...(foldCover.size > 0 ? { coveredIds: foldCover } : {}),
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
