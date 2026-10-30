@@ -326,6 +326,9 @@ const ORIGIN_FORM_MODEL_PATH = /^\/(?:v\d+\/)?(?:messages|chat\/completions|llm_
 export function isModelTrafficOriginFormPath(path: string): boolean {
     const p = path.split("?", 2)[0];
     if (ORIGIN_FORM_MODEL_PATH.test(p)) return true;
+    // Anthropic /v1/messages/count_tokens: first-class model traffic per
+    // isCountTokensRequest; NOT covered by ORIGIN_FORM_MODEL_PATH above.
+    if (/^\/(?:v\d+\/)?messages\/count_tokens\/?$/.test(p)) return true;
     if (/^\/(?:v\d+\/)?models\/?$/.test(p)) return true;
     if (googlePathKind(p) !== null) return true;
     return vertexAnthropicModelFromPath(p) !== undefined;

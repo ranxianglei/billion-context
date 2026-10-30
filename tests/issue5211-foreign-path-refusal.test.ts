@@ -23,6 +23,7 @@ import { rmrf } from "./tmp-rm.ts";
 
 for (const p of [
     "/v1/messages", "/messages", "/messages/", "/v2/messages", "/v1/messages?beta=1",
+    "/v1/messages/count_tokens", "/messages/count_tokens",
     "/v1/chat/completions", "/chat/completions",
     "/llm_raw_chat", "/v1/llm_raw_chat",
     "/v1/responses", "/responses", "/responses/compact",
