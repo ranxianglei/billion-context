@@ -329,12 +329,12 @@ export class UnifiedShadow {
                     : "; delete the file to reset the index";
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
+                `[storage] unified sidecar failed to open ${path.join(dir, "index.db")} (${errStr}) — staying legacy-only${tail}`,
             );
             recordSidecarOpenFailure(errStr);
             return null;
         }
-        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, `${dir}/index.db`);
+        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, path.join(dir, "index.db"));
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
