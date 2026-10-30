@@ -186,6 +186,9 @@ function degradeReason(): string {
         if (/no SQLite engine available/i.test(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
         }
+        if (/refusing second long-lived writer/i.test(state.sidecarOpenError)) {
+            return "a second bili process owns the sessions index.db — unified storage degraded to legacy-only; isolate installs with BILI_SESSIONS_DIR + BILI_CONFIG_FILE";
+        }
         return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
     }
     const b = state.bootstrap;

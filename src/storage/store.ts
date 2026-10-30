@@ -324,6 +324,21 @@ export class StorageIntegrityError extends Error {
     }
 }
 
+/** #5064/B: raised when a long-lived open finds a LIVE foreign process already
+ *  writing the same index.db. Unlike a corrupt file there is nothing to fix by
+ *  deleting — the remedy is isolating the installs (BILI_SESSIONS_DIR +
+ *  BILI_CONFIG_FILE). The caller (UnifiedShadow.maybeOpen) catches it and degrades
+ *  this proxy to legacy-only via the #2771 shape; the DB is NOT corrupt, so the
+ *  "delete the file" hint must never be attached to this error. Ephemeral
+ *  CLI/export opens leave rejectForeignWriter unset and so never raise this —
+ *  they keep the report-only behavior. */
+export class StorageForeignWriterError extends Error {
+    constructor(public readonly dbPath: string, public readonly holderPid: number) {
+        super(`[storage] refusing second long-lived writer on ${dbPath} (live foreign pid ${holderPid}); degrade to legacy-only — isolate installs with BILI_SESSIONS_DIR + BILI_CONFIG_FILE (#5064/#3923/#3633)`);
+        this.name = "StorageForeignWriterError";
+    }
+}
+
 /** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
 function processAlive(pid: number): boolean {
     try {
@@ -363,7 +378,7 @@ export class UnifiedStore {
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; rejectForeignWriter?: boolean },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -437,16 +452,30 @@ export class UnifiedStore {
                         .reduce<RegistryEntry | undefined>((best, e) => (best === undefined || (e.startedAt ?? 0) > (best.startedAt ?? 0) ? e : best), undefined);
                     const ownLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
                     const benign = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
+                    recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign });
                     if (benign) {
                         loggerLog("info", `[storage] process (pid ${pid}, lane ${peer?.lane}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — different lanes sharing one sessions directory is the supported topology (#3923/#3959); informational only.`);
+                    } else if (opts?.rejectForeignWriter) {
+                        // #5064/B: a long-lived second writer must not co-reside on one index.db —
+                        // two writers corrupt it. Refuse here so the caller's #2771 open-failure
+                        // path degrades THIS proxy to legacy-only (availability preserved, no
+                        // double-write) instead of continuing RW. Ephemeral CLI/export opens leave
+                        // rejectForeignWriter unset and keep the report-only behavior below.
+                        loggerLog("error", `[storage] another bili process (pid ${pid}) already owns ${path} — a second long-lived writer on one index.db would corrupt it (#3923/#3959/#3633), so this proxy refuses unified storage and degrades to legacy-only: sessions keep working from the JSON store, but unified-storage features (fast load / GC / vacuum / checkpoints) are unavailable until isolated. Fix: give each install its own sessions dir + config file — set BILI_SESSIONS_DIR=<dir> AND BILI_CONFIG_FILE=<file> per install, then restart both.`);
+                        db.close();
+                        throw new StorageForeignWriterError(path, pid);
                     } else {
                         loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} — two processes on one index.db corrupt it (#3923/#3959). One session dir must have exactly one instance (#3633); this lane keeps running but the condition is reported.`);
                     }
-                    recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign });
                 }
             }
             writeFileSync(lockPath, JSON.stringify({ pid: process.pid, boot: Date.now() }));
         } catch (err) {
+            // #5064/B: the deliberate refuse-to-co-reside signal must escape this
+            // guard (which exists only to make lockfile read/write hiccups
+            // non-fatal) — otherwise it is swallowed and the open proceeds onto a
+            // closed handle.
+            if (err instanceof StorageForeignWriterError) throw err;
             loggerLog("warn", `[storage] lockfile discipline skipped for ${path}: ${String(err)}`);
         }
         try {

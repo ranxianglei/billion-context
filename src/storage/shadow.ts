@@ -25,7 +25,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, StorageForeignWriterError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -192,7 +192,7 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, rejectForeignWriter: true });
             } catch (err) {
                 // #4175: quick_check failed — the file set is provably corrupt.
                 // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
@@ -227,7 +227,7 @@ export class UnifiedShadow {
                     "error",
                     `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
                 );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, rejectForeignWriter: true });
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -235,6 +235,14 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
+            // #5064/B: a live second long-lived writer — the DB is NOT corrupt, so skip the
+            // #2771 "delete the file" hint (it would advise destroying a healthy shared index);
+            // the actionable isolation recipe was already logged at error level by store.open.
+            if (err instanceof StorageForeignWriterError) {
+                loggerLog("warn", `[storage] unified sidecar degraded to legacy-only: another bili process already owns ${dir}/index.db — isolate the installs with BILI_SESSIONS_DIR + BILI_CONFIG_FILE to restore unified storage (#5064/#3923/#3633)`);
+                recordSidecarOpenFailure(err.message);
+                return null;
+            }
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
             // construction. No auto-delete: the index may hold pinned checkpoint
