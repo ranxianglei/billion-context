@@ -205,7 +205,7 @@ async function turn(h: Harness, label: string, messages: Array<{ role: string; c
 }
 
 function refOf(s: string): number {
-    const m = /<acp tokens="\d+" type="text">m(\d{5})<\/acp>/.exec(s);
+    const m = /<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m(\d{5})<\/acp>/.exec(s);
     return m ? Number(m[1]) : 0;
 }
 
@@ -235,7 +235,7 @@ test("S2: snapshot-render prefix refs equal the ledger positions (ref = indexToR
             const all = JSON.parse(body).messages as Array<{ role?: unknown; content?: unknown }>;
             return all
                 .filter((m) => m.role !== "system" && typeof m.content === "string")
-                .map((m) => (m.content as string).match(/<acp tokens="\d+" type="text">m\d{5}<\/acp>/)?.[0] ?? "")
+                .map((m) => (m.content as string).match(/<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m\d{5}<\/acp>/)?.[0] ?? "")
                 .filter((s) => s.length > 0);
         };
         const refs3 = refsOf(out3);

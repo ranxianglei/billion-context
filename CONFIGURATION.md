@@ -282,6 +282,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
+| `compress.messageTimestamps` | boolean | false | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. Default off keeps every byte identical to pre-feature master (#4313, PR #5236). |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
@@ -1622,6 +1623,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Since #913, `false` also drops the #862 silence clause from the marker-integrity note appended to nudges and the injected compress prompt — an invisible deployment has no marker for the model to imitate or narrate around, so the clause is pure noise there. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
 
+#### `messageTimestamps`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Opt-in message timestamps (#4313, PR #5236): when on, bili mints each message one immutable local-time stamp at first sight and shows it — a `time="yyyy-MM-dd HH:mm:ss"` attribute on every `<acp>` compression tag on the wire, a `[start – end]` coverage span appended to each compress-receipt fingerprint line, and an Occurred line in rendered block summaries. Cost is about 8 tokens per message when visible; off is the default and keeps every outbound byte identical to pre-feature master (including the prompt defaults). Storage still records the stamps either way, so flipping the flag later surfaces them without data loss. Resolution is env (`BILI_MESSAGE_TIMESTAMPS`; `0` forces off, any other value forces on, same convention as BILI_RESIGN) over the config file, resolved once per proxy instance — changing the flag needs a restart.
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
@@ -1848,6 +1856,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | false |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
