@@ -1891,6 +1891,31 @@ export function foldCoverage(
     return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
 }
 
+// #4920: last observed fold-coverage drift, surfaced by acp_status — the
+// [acp-drift] warn lands in logs users never open; the panel is the surface
+// agents actually look at (same reasoning as the #1206 conflict section).
+const METADATA_LAST_FOLD_DRIFT = "lastFoldDrift";
+
+export function noteFoldDrift(session: Pick<Session, "metadata">, gap: { expected: number; matched: number }): void {
+    if (!(gap.expected > gap.matched)) return;
+    // Epoch ms like savedAt/lastSeen — canonicalize masks wall-clock numbers
+    // (__TS__) so storage digests stay stable across saves (#2671).
+    session.metadata[METADATA_LAST_FOLD_DRIFT] = { matched: gap.matched, expected: gap.expected, at: Date.now() };
+}
+
+export function foldDriftOf(session: Pick<Session, "metadata">): { matched: number; expected: number; at: string } | undefined {
+    const v = session.metadata?.[METADATA_LAST_FOLD_DRIFT];
+    if (!v || typeof v !== "object") return undefined;
+    const d = v as Record<string, unknown>;
+    if (typeof d.matched !== "number" || typeof d.expected !== "number" || typeof d.at !== "number") return undefined;
+    if (!(d.expected > d.matched)) return undefined;
+    return { matched: d.matched, expected: d.expected, at: new Date(d.at).toISOString() };
+}
+
+export function clearFoldDrift(session: Pick<Session, "metadata">): void {
+    delete session.metadata[METADATA_LAST_FOLD_DRIFT];
+}
+
 // #2627 turn-separator helpers moved to ./turn-separator.ts (zero-dependency leaf
 // — the storage seam needs them without session.ts's built-acp-kernel import;
 // the doc comments live there now). Re-exported so existing consumers keep the

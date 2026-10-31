@@ -23,7 +23,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
-import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
+import { foldDriftOf, preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
@@ -481,6 +481,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // the model can relay per-client steps without digging out the docs.
         extra.push("");
         extra.push(...formatConflictSection(cevents, Date.now(), conflictClientOf(ctx.session)));
+    }
+    // #4920: lost fold coverage must be visible where agents actually look —
+    // the [acp-drift] warn alone lives in logs users never open, and a silently
+    // unfolded session is exactly how the provider-switch incident went dead.
+    const drift = foldDriftOf(ctx.session);
+    if (drift) {
+        extra.push("");
+        extra.push(`FOLD DRIFT (session-level): only ${drift.matched}/${drift.expected} covered message id(s) are back on the resent wire — ${drift.expected - drift.matched} covered id(s) missing since ${drift.at} (#4920): their folded content rides the wire raw again until coverage re-anchors; see the [acp-drift] lines in the bili log.`);
     }
     const adv = getAdvisoryState();
     if (adv.active) {

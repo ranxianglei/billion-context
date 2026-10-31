@@ -137,7 +137,7 @@ import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { FORMS as THINKING_MERGE_FORMS } from "../kernel/src/wire/demoted-thinking.js";
 import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
-import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
+import { clearFoldDrift, coveredRealHistoryIds, isResponsesTurnSeparatorId, noteFoldDrift } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -2154,6 +2154,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
+        // #4920: fully aligned pass — drop any stale lost-coverage record so
+        // acp_status reflects the re-anchored reality, not a past episode.
+        clearFoldDrift(session);
         return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
@@ -2188,6 +2191,12 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire)${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} of them have an inbound twin with identical normalized content under a different toolCallId — consistent with the host rewriting authoritative tool-call ids across provider projections (host contract: keep tool-call ids byte-stable per conversation, #2396)` : ""} (#1921)${driftTok}`);
         }
     }
+    // #4920: surface the TRULY-lost coverage (the unmatched tail — claims were
+    // re-anchored onto churned bytes, their folds live on) on the session so
+    // acp_status can show it; recording here (not in the lanes' post-reconcile
+    // snapshots) covers every verdict class, including mutation passes that
+    // deactivate the drifted blocks before the lane snapshot runs.
+    if (plan.unmatched.length > 0) noteFoldDrift(session, { expected: covered.size, matched: covered.size - plan.unmatched.length });
     return {
         kind: plan.claims.size > 0 ? (mode === "repair" ? "reanchored" : "unmatched") : "unmatched",
         missing: plan.claims.size + plan.unmatched.length,

@@ -3805,8 +3805,31 @@ export async function preflightCompressIfNeeded(
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
-        if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-            const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+        const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+        const overDoomBar = coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN);
+        // #4920: an over-bar RAW payload is not terminal while a multi-round
+        // convergence campaign is already in flight — this session HAS FOLD
+        // HISTORY (it has been compressed before) and compressible ranges still
+        // remain visible. The budget-exhaustion 502 promises "the ranges folded
+        // this turn persist — the next attempt starts from a smaller baseline"
+        // (#3918), and keeping that promise requires this gate to keep walking
+        // instead of refusing. As shipped, the gate priced the RAW inbound
+        // bytes instead of the post-fold payload, so the very request after a
+        // progress-continues 502 died here with a terminal 413 and the campaign
+        // could never converge (field incident: 80K-tok session → provider
+        // switch → 6M raw resend → one 31-round fold pass saved 2.5M tok → next
+        // attempt 413 → dead). The check is on fold HISTORY, not ACTIVE blocks:
+        // coverage drift deactivates the drifted blocks during prepare — before
+        // this gate runs — yet that is exactly the moment a re-fold on the new
+        // history ("a fresh fold starts a new epoch") is needed. Fresh
+        // sessions without any fold history keep the immediate 413
+        // (#2490/#2847) — there is no campaign to continue there. Falling out
+        // of this block enters the fold-first regime below; the post-fold doom
+        // check still guards every actual forward.
+        const multiRoundInFlight = overDoomBar
+            && session.state.blocks.length > 0
+            && (prepared.nudge?.compressibleRanges ?? []).length > 0;
+        if (overDoomBar && !multiRoundInFlight) {
             log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             // #2847: the rejection is mathematically deterministic, so the STATUS
@@ -3822,7 +3845,12 @@ export async function preflightCompressIfNeeded(
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
-        if (localRefusalHere) {
+        if (multiRoundInFlight) {
+            // #4920: fall out of the probe block into the fold-first regime below —
+            // do NOT forward the raw payload (that is the bet this bar exists to
+            // prevent), and do NOT refuse (the campaign continues).
+            log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) and the raw payload is past the doom bar (~${coreTextBytes} B ≈ ≥~${byteFloorTokens} tok; ${describeCoreTextDuplication(prepared.processedMessages)}) — continuing the multi-round convergence walk instead of refusing: active fold state plus compressible range(s) still visible, so folding can still close the gap (#4920); the post-fold doom check guards the actual forward`);
+        } else if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
