@@ -139,6 +139,35 @@ test("stoppedAt skips even when the peer pid is alive", () => {
     assert.deepEqual(findContestedWriters(dir, SELF.instanceId, "sess-x", Date.now()), [], "stoppedAt outranks liveness — a recorded stop is positively-known death");
 });
 
+test("#4626 gracefully-shutdown peer (disposedAt stamp) never contests, even with fresh mtime", () => {
+    const dir = writerMarkerDir(freshDir("bili-4626-disposed-"));
+    const deadPeer: WriterIdentity = { ...PEER, pid: DEAD_PID };
+    fs.mkdirSync(dir, { recursive: true });
+    // The exact shape dispose() leaves behind: dead pid, mtime ≈ death time,
+    // a commit inside the window seconds earlier.
+    const file = path.join(dir, `${deadPeer.instanceId}.json`);
+    fs.writeFileSync(file, JSON.stringify({ v: 1, ...deadPeer, servedAt: { "sess-h": Date.now() - 1000 }, disposedAt: Date.now() - 9000 }));
+    backdate(file, 8000);
+    assert.deepEqual(findContestedWriters(dir, SELF.instanceId, "sess-h", Date.now()), [], "handover tombstone is attribution-only — no false split-brain verdict");
+});
+
+test("#4626 e2e: graceful rotation — successor commits the same session without a verdict", () => {
+    const dir = writerMarkerDir(freshDir("bili-4626-handover-"));
+    const logs: Array<[string, string]> = [];
+    const outgoing = createServedMarkerWriter(PEER, dir, (level, msg) => logs.push([level, msg]));
+    outgoing.noteServed("sess-rot");
+    outgoing.__flushForTest();
+    const mid = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(mid.disposedAt, undefined, "periodic flushes carry no disposedAt stamp");
+    outgoing.dispose();
+    const final = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(typeof final.disposedAt, "number", "the final shutdown write is stamped disposedAt");
+    const incoming = createServedMarkerWriter(SELF, dir, (level, msg) => logs.push([level, msg]));
+    incoming.noteServed("sess-rot");
+    assert.equal(logs.length, 0, "sequential handover inside the 10m window raises no [split-brain] line");
+    incoming.dispose();
+});
+
 test("malformed or foreign-shape marker files are skipped, never fatal", () => {
     const dir = writerMarkerDir(freshDir("bili-3923-malformed-"));
     fs.mkdirSync(dir, { recursive: true });
