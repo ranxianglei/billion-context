@@ -4,7 +4,7 @@ import { defaultCountTokens, renderNudgeText, viableRanges } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
-import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
+import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -610,8 +610,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     const promptCacheKey = resolvePromptCacheKey(
         rebuilt.prompt_cache_key,
         identity,
-        opts.promptCache.routing,
+        effectivePromptCacheRouting(opts.promptCache),
         upstreamOrigin,
+        sessionId,
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // #3813: mirror the OpenAI lane's #2645 ablation consult — once an egress
@@ -832,8 +833,18 @@ export function resolvePromptCacheKey(
     identity: ConversationIdentity,
     routing: ProxyOptions["promptCache"]["routing"],
     upstream: string | undefined,
+    sessionId?: string,
 ): string | undefined {
-    if (explicit?.trim()) return explicit;
+    if (explicit?.trim()) {
+        // #5079: a body key echoing the conversation id whose binding did NOT
+        // come from that very field is bili's own emission (PI_CACHE_RETENTION=
+        // long clients, hermes' codex transport) — subject to the routing
+        // switch. A key that IS the binding (promoted identity) is client-
+        // owned and always forwards.
+        const biliOwned = sessionId !== undefined && identity.source !== "prompt-cache-key" && explicit.trim() === sessionId;
+        if (biliOwned && routing === "disabled") return undefined;
+        return explicit;
+    }
     if (!identity.clientProvided || !shouldInjectPromptCacheKey(routing, upstream)) return undefined;
     return identity.value;
 }

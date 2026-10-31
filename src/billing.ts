@@ -60,7 +60,7 @@ export function parseBillingSettings(value: unknown): BillingSettings | undefine
         for (const k of Object.keys(root)) if (k !== "prices") return undefined;
         return { prices: {} };
     }
-    if (typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
+    if (root["prices"] === null || typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
     const prices: Record<string, BillingPrice> = {};
     for (const [key, entry] of Object.entries(root["prices"] as Record<string, unknown>)) {
         if (!key || key.length > 256) return undefined;

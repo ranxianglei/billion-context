@@ -1,4 +1,4 @@
-import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
+import { activeBlocks, blockById, coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
@@ -8,6 +8,7 @@ import {
   isMessageLatestProtected,
   isMessageProtected,
   collectAgedCompressCallIds,
+  lastUserAnchor,
 } from "./protected.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
@@ -303,10 +304,17 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
         },
       });
     }
+    const anchorMsg = lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
+    const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    const anchorNote =
+      anchorRef && anchorRef !== "BLOCKED"
+        ? ` Last-user anchor: ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
         ", ",
       )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.` +
+        anchorNote +
         (truncatedAfter > 0
           ? ` Range truncated at that boundary — ${truncatedAfter} later message(s) (including replies to the protected message) stay visible too, so no summary can land above the question it answers (#3953).`
           : ""),

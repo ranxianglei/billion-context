@@ -18,7 +18,7 @@ import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
@@ -33,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -1101,12 +1101,17 @@ async function handleRequest(
                        // continuity-aware order resolver so a history-disjoint
                        // ride forks onto its own |sub:<fp> lane while a
                        // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944).
+                       // order+content evidence (#2944). #5095 D1-C: when the
+                       // bili SubagentStart hook's token rides the first user
+                       // message, the resolver keys the dispatch per-TOKEN —
+                       // parallel same-type dispatches stop merging on the
+                       // persona fingerprint.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
                            (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
                            pluginReportedModel(req.headers),
+                           claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
@@ -1386,7 +1391,9 @@ async function handleRequest(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
+        // #4942: async seam — on network storage backends a memory miss must
+        // be able to reload from the DB instead of starting a fresh session.
+        const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
@@ -1489,7 +1496,7 @@ async function handleRequest(
         // inventory even when adoption is disabled (the #629 measurement).
         if (anonAffinity?.via === "new" && anonAffinity.lineage?.reason === "forked" && session.stats.requests === 0) {
             try {
-                maybeAdoptForkBlocks({
+                await maybeAdoptForkBlocks({
                     session,
                     parentId: anonAffinity.lineage.parents[0]!,
                     protocol,
@@ -2846,6 +2853,12 @@ async function handleRequest(
             }
         } finally {
             releaseInFlight(session);
+            // #4788 D2: request-end boundary — nothing in this process holds
+            // session state anymore, so run the durable-revision-gated idle
+            // spill here (it self-verifies every invariant and skips silently
+            // when unsafe). Fire-and-forget on purpose: idle upkeep must never
+            // delay or perturb the response path.
+            void getStore().spillBetweenTurns(session).catch(() => { /* idle upkeep */ });
         }
     }
     if (!prepared && !forwarded) {

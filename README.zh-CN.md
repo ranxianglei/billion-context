@@ -50,7 +50,8 @@
 
 QQ群:
 1056132097(已满)
-1108730198(未满)
+1108730198(已满)
+1129868472(未满)
 
 ---
 
@@ -189,7 +190,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与该时期的 CLI 行为一致——注意新版构建(CC 2.1.301 起)在 CLI 上会遵守 `HTTPS_PROXY`,这正是 `bili claude` 走 `/bili/` base-URL 改写的原因——launcher 不再为该 lane 设置代理、也不再设置 CA,而自带代理的子进程会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`,确保无论子进程的代理行为如何,这一腿都保持直连(#3446)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与该时期的 CLI 行为一致——注意新版构建(CC 2.1.301 起)在 CLI 上会遵守 `HTTPS_PROXY`,这正是 `bili claude` 走 `/bili/` base-URL 改写的原因——launcher 不再为该 lane 设置代理、也不再设置 CA,而自带代理的子进程会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`,确保无论子进程的代理行为如何,这一腿都保持直连(#3446)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。#5095 起受管块还会安装一个 `SubagentStart` hook(`node <root>/dist/claude-subagent-hook.js`),给每次子代理派发铸一个随机 lane token 注入其上下文:骑着父会话 id 且无 agent-id 头的子代理(VS Code 扩展构建,#4352)按 `<id>|sub:…:t:<token>` 键控各自的压缩车道,并行同型派发不再合流(首条消息被折叠后 token 消失,后续请求回落到指纹车道)。卸载时随受管块一并移除。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
 - `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
@@ -464,6 +465,10 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
+### 单机多安装共存（#5046）
+
+同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存）时，各自的代理默认都解析到**同一个** XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。开了统一存储（`storage.unified` = shadow/full）后，两个进程会双写同一个 `index.db`：日志出现 `[instances] another bili instance is running …`，lane 重叠时还有 `[storage] … two processes on one index.db corrupt it` 级别的 error；SQLite 写锁争用（`SQLITE_BUSY` / `database is locked`）会让整轮模型请求直接失败，持续双写还有损坏风险。正确做法是**隔离**：给每份安装设独立的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。隔离后两份可正常并存，`[instances]` 提示会自动降为 info 级（目录不同 ⇒ 无共享状态）。
+
 ### 会话文件清理（#1082）
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
@@ -482,6 +487,8 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
 ```
 
 `archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
+
+**大库上 full vacuum 是离线操作(#4612)。** `--vacuum full`(默认)会在独占写锁下重写整个 index.db —— O(库大小),多 GB 的库要几分钟到几十分钟,且没有中间进度(SQLite 的 VACUUM 是原子操作,拆不开)。在有代理正从同一会话目录服务时跑它,会把那个代理的写入饿死到其存储层降级为止,所以 `storage gc --vacuum full` **在另一个存活进程持有该数据库时会拒绝启动**(`index.db.lock` pid 纪律,#4175):CLI 以退出码 1 给出可操作提示,面板端点返回 HTTP 409。先停掉另一个实例(或等它退出)再重试;要在线安全地缩库用 `--vacuum incremental`,它以短事务回收空闲页、不拿独占锁。零引用删除清扫无论哪种模式都分批执行并逐批打印进度。
 
 ## 状态
 

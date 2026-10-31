@@ -1,6 +1,8 @@
 import { pckKeyAbated } from "./pck-probe.js";
 import { isCodexClient } from "./codex-compact.js";
+import { claudeLaneTokenIn } from "./claude-lane-token.js";
 import { resolveWireClientProfile } from "./server/lane-decisions.js";
+import type { PromptCacheRouting } from "./config.js";
 
 export type ConversationIdentity = {
     value: string;
@@ -171,6 +173,38 @@ export function claudeAnthropicPersonaOrderApplies(headers: Record<string, strin
     return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
 }
 
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's messages. The hook injects the token into the dispatch's FIRST
+ *  user message, so the scan stops at the first user message — a marker
+ *  pasted by the user into a LATER message must never fork the main
+ *  conversation off its raw key. Content shapes: bare string, or a block
+ *  array where only `type:"text"` blocks are scanned (the hook context may
+ *  sit inside a <system-reminder> wrapper; the marker is matched as a
+ *  substring, so the wrapper shape does not matter). Returns undefined when
+ *  absent — the overwhelmingly common case (main turns, other hosts,
+ *  un-upgraded installs) keeps resolution byte-identical to before. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (const msg of messages) {
+        if (msg === null || typeof msg !== "object") continue;
+        const m = msg as { role?: unknown; content?: unknown };
+        if (m.role !== "user") continue;
+        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
+        if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+                if (block === null || typeof block !== "object") continue;
+                const b = block as { type?: unknown; text?: unknown };
+                if (b.type === "text" && typeof b.text === "string") {
+                    const tok = claudeLaneTokenIn(b.text);
+                    if (tok !== undefined) return tok;
+                }
+            }
+        }
+        return undefined;
+    }
+    return undefined;
+}
+
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system
  *  hash, "hash 不一样自动分裂") should participate in the compression-session
  *  key for THIS request. Allowlist by plugin agent, evidence-per-client — the
@@ -264,20 +298,28 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
  * the workbuddy panel read the body only and would otherwise fall to a
  * content digest) and the client sent no key of its own (client value wins).
  *
- * #2645 probe-and-remember (replaces the old destination-shape gate): stamping
- * is ON BY DEFAULT for every destination shape — loopback pools, docker/LAN/
- * VPS pools, plain remote relays alike all keep their affinity signal (the
- * static loopback/rewritten-route heuristics hurt the two big pool
- * populations while trying to protect strict direct APIs). The protection now
- * comes from the egress A/B seam (src/server/relay.ts + src/pck-probe.ts):
- * when an egress carrying the key 400s, the identical request is re-sent once
- * without it — accepted ⇒ causation confirmed and this exact origin+model
- * pair stops being stamped for the process lifetime (in-memory, restart
- * resets, surfaced via log/acp_status/web panel); still failing ⇒ inconc-
- * lusive, nothing learned. Client-supplied keys pass through verbatim UNTIL
- * their pair is A/B-ablated, after which they are withheld too (otherwise
- * every turn re-paid the 400 round trip); that withholding is likewise
- * in-memory and visible on the same surfaces.
+ * #2645 probe-and-remember (replaces the old destination-shape gate): under
+ * `routing` auto/enabled, stamping applies to every destination shape —
+ * loopback pools, docker/LAN/VPS pools, plain remote relays alike all keep
+ * their affinity signal (the static loopback/rewritten-route heuristics hurt
+ * the two big pool populations while trying to protect strict direct APIs).
+ * The protection comes from the egress A/B seam (src/server/relay.ts +
+ * src/pck-probe.ts): when an egress carrying the key 400s, the identical
+ * request is re-sent once without it — accepted ⇒ causation confirmed and this
+ * exact origin+model pair stops being stamped for the process lifetime
+ * (in-memory, restart resets, surfaced via log/acp_status/web panel); still
+ * failing ⇒ inconclusive, nothing learned. Client-supplied keys pass through
+ * verbatim UNTIL their pair is A/B-ablated, after which they are withheld too
+ * (otherwise every turn re-paid the 400 round trip); that withholding is
+ * likewise in-memory and visible on the same surfaces. The A/B seam works in
+ * EVERY routing mode, including disabled (it still guards client keys).
+ *
+ * #5079 routing switch: `routing === "disabled"` (the default) never stamps —
+ * bili writes no prompt_cache_key of its own at all. A key echoing the
+ * conversation id back on the plugin lane (`sessionId`) is bili's own prior
+ * emission (dsh PI_CACHE_RETENTION / the omp/dsh extension stamp), not a
+ * client value, so it is dropped too; any other client value stays
+ * client-owned and passes through even under disabled.
  */
 type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
 
@@ -286,13 +328,21 @@ export function resolveRelayAffinityPck(
     clientPck: unknown,
     egressUrl: string | undefined,
     upstreamOrigin: string,
+    routing: PromptCacheRouting,
+    sessionId?: string,
     modelId?: unknown,
 ): RelayAffinityPckDecision {
     const ablated = pckKeyAbated(egressUrl, upstreamOrigin, modelId);
     const internalLane = identityHeaderName === "x-bili-plugin-conversation";
-    if (clientPck === undefined && internalLane && !ablated) return "stamp";
-    if (ablated) return "drop";
-    return "keep-client";
+    const raw = typeof clientPck === "string" ? clientPck.trim() : "";
+    // #5079: the plugin lane's identity always derives from the bili-internal
+    // header (pck promotion only fires without one), so a body key equal to
+    // the session id here can only be bili's own machinery echoing back.
+    const biliOwned = internalLane && raw.length > 0 && sessionId !== undefined && raw === sessionId;
+    if (clientPck !== undefined && !biliOwned) return ablated ? "drop" : "keep-client";
+    if (ablated || !internalLane) return "drop";
+    if (routing === "disabled") return "drop";
+    return "stamp";
 }
 
 /**
