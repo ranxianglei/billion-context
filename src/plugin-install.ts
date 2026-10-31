@@ -591,6 +591,19 @@ export function unwrapBiliBaseUrl(value: string): string | undefined {
     return m ? m[1] : undefined;
 }
 
+/** #5369: upstream to bake at INSTALL time. An explicit BILI_CLAUDE_UPSTREAM
+ *  override wins — return undefined so claudeNativeBaseUrlForOrigin's default
+ *  resolution picks the env relay up (documented override semantics). Without
+ *  the override, preserve what an earlier install or the user already pointed
+ *  at: the relay wrapped into the current value, or a plain http(s) relay. */
+export function claudeInstallUpstream(existingBaseUrl: unknown, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const relay = env.BILI_CLAUDE_UPSTREAM?.trim();
+    if (relay !== undefined && relay.length > 0) return undefined;
+    const raw = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : undefined;
+    if (!raw) return undefined;
+    return unwrapBiliBaseUrl(raw) ?? (raw.startsWith("http") ? raw : undefined);
+}
+
 /** #1660: SessionStart drift-repair — repin the managed block's
  *  ANTHROPIC_BASE_URL to `origin` (the lane's live zone port, which the +1
  *  ladder may have drifted off the last install's baked port). The wrapped
@@ -672,6 +685,14 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         } else {
             notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
         }
+    } else if (dac === "1") {
+        // Pre-fix installs wrote DISABLE_AUTO_COMPACT=1 even when the URL stayed
+        // foreign, so an upgrade alone would keep native auto-compaction OFF while
+        // bili is bypassed — the original deadlock survives. The key is bili-owned
+        // (remove strips it), so drop only the harmful sticky value and say so;
+        // .bili-bak keeps it restorable.
+        delete env.DISABLE_AUTO_COMPACT;
+        notes.push(`env.DISABLE_AUTO_COMPACT removed (leftover "1" from a pre-fix install — bili bypasses this session, so native auto-compaction is restored; restore from .bili-bak if you set it yourself)`);
     } else {
         notes.push(`env.DISABLE_AUTO_COMPACT left untouched (bili proxy bypassed — foreign ANTHROPIC_BASE_URL)`);
     }
@@ -949,11 +970,9 @@ function claudeInstall(): string {
     // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
     const managedOrigin = claudeNativeOrigin();
     const existingBaseUrl = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
-    const rawUrl = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : undefined;
-    const existingUpstream = rawUrl ? (unwrapBiliBaseUrl(rawUrl) ?? (rawUrl.startsWith("http") ? rawUrl : undefined)) : undefined;
     const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, existingUpstream),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, claudeInstallUpstream(existingBaseUrl)),
         hookCommand,
         subagentHookCommand,
         ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
