@@ -14,6 +14,37 @@ import {
 
 const plainTheme: InspectorTheme = { fg: (_c, t) => t, bold: (t) => t, bg: (_c, t) => t };
 
+// SGR-emitting theme matching the host contract: fg/bg are attribute OPENERS with no internal reset
+// (the TUI appends one full reset at end-of-line). A mid-line \x1b[0m therefore deactivates the active
+// background for every cell that follows it — exactly what #4385's unpainted ellipsis is.
+const sgrTheme: InspectorTheme = {
+  fg: (_c, t) => `\x1b[38;5;7m${t}`,
+  bold: (t) => `\x1b[1m${t}`,
+  bg: (_c, t) => `\x1b[48;5;236m${t}`,
+};
+
+// Count visible cells rendered WITHOUT an active explicit background (48;5/48;2). A correct full-width
+// bar row paints every cell, so this must be 0. Width-approximate (counts chars) — fine for ASCII rows.
+function unpaintedCells(line: string): number {
+  let painted = false;
+  let n = 0;
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "\x1b") {
+      const m = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
+      if (!m) { i++; continue; }
+      const params = m[0].slice(2, -1);
+      if (params === "" || params === "0") painted = false;
+      else if (params.includes("48;5") || params.includes("48;2")) painted = true;
+      i += m[0].length;
+      continue;
+    }
+    if (!painted) n++;
+    i++;
+  }
+  return n;
+}
+
 function mkView(over: Record<string, unknown> = {}): any {
   return {
     runId: "del_x", agent: "worker", task: "do the thing", cwd: "/tmp/proj",
@@ -301,4 +332,46 @@ test("renderTranscriptBlocks renders assistant text as markdown (heading/list)",
   assert.ok(lines.some((l) => l.includes("Summary")), "heading text present");
   assert.ok(!lines.some((l) => l.trim().startsWith("#")), "markdown heading marker stripped");
   assert.ok(lines.some((l) => l.includes("first point")), "list item present");
+});
+
+// ─── #4385: CRLF display normalization + painted truncation ellipsis ─────────
+
+test("#4385 CRLF tool output renders byte-identically to LF (no CR cursor artifacts)", () => {
+  const mk = (sep: string): TranscriptBlock[] => [
+    { kind: "toolCall", name: "read", text: "", args: {} },
+    { kind: "toolResult", name: "read", text: `short${sep}123456789012345${sep}${sep}tail${sep}`, isError: false },
+  ];
+  const lf = renderTranscriptBlocks(mk("\n"), plainTheme, 40);
+  const crlf = renderTranscriptBlocks(mk("\r\n"), plainTheme, 40);
+  assert.deepStrictEqual(crlf, lf, "CRLF result must render identically to LF result");
+  for (const l of crlf) assert.ok(!l.includes("\r"), `display row carries stray CR: ${JSON.stringify(l)}`);
+});
+
+test("#4385 bash command preview treats CRLF as one separator", () => {
+  assert.strictEqual(formatToolLabel("bash", { command: "echo hi\r\nthere" }), "bash echo hi there");
+  assert.strictEqual(formatToolLabel("bash", { command: "echo hi\nthere" }), "bash echo hi there");
+});
+
+test("#4385 truncated tool output paints the ellipsis inside the background span", () => {
+  const blocks: TranscriptBlock[] = [
+    { kind: "toolCall", name: "bash", text: "", args: {} },
+    { kind: "toolResult", name: "bash", text: "x".repeat(200), isError: false },
+  ];
+  const lines = renderTranscriptBlocks(blocks, sgrTheme, 21);
+  const row = lines[lines.length - 1];
+  assert.ok(visibleWidth(row) <= 21, `row exceeds width: ${visibleWidth(row)}`);
+  assert.ok(row.includes("..."), "expected truncation ellipsis on overflow");
+  assert.strictEqual(unpaintedCells(row), 0, `bar row has unpainted cells: ${JSON.stringify(row)}`);
+});
+
+test("#4385 CJK truncation stays exactly within width and shows the ellipsis", () => {
+  const blocks: TranscriptBlock[] = [
+    { kind: "toolCall", name: "bash", text: "", args: {} },
+    { kind: "toolResult", name: "bash", text: "界".repeat(100), isError: false },
+  ];
+  const lines = renderTranscriptBlocks(blocks, sgrTheme, 21);
+  const row = lines[lines.length - 1];
+  assert.strictEqual(visibleWidth(row), 21, `row width ${visibleWidth(row)} != 21`);
+  assert.ok(row.includes("..."), "CJK overflow must still show the ellipsis");
+  assert.strictEqual(unpaintedCells(row), 0, `CJK bar row has unpainted cells: ${JSON.stringify(row)}`);
 });
