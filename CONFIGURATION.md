@@ -1492,7 +1492,25 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `string` (pack name, e.g. `"lean"`)
 - **Default:** `default` *(unset is equivalent — identity surface, kernel defaults everywhere)*
 - **Status:** ACTIVE
-- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the host's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **shipped** (`chat`) → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Built-in `chat` (#5319) rewrites only the compress philosophy and how-to-compress prose for long-term companionship / multi-session memory use; every other surface piece stays at the host defaults, and a same-name user or project file overrides it. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66.
+- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the host's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **shipped** (`chat`) → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Built-in `chat` (#5319) rewrites only the compress philosophy and how-to-compress prose for long-term companionship / multi-session memory use; every other surface piece stays at the host defaults, and a same-name user or project file overrides it. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66. The settings panel can manage the user-dir files directly — New/Edit/Delete for packs under `<configDir>/packs/` (the picker knows each entry's provenance; builtins and shipped packs stay read-only there, override them with a same-named user pack instead).
+
+**Pack file format.** Each `<dir>/<name>.json` holds one pack object. Unknown fields are dropped by the same sanitizer used on every load path (`sanitizePackSurface`), so extra metadata is harmless:
+
+```json
+{
+  "name": "my-pack",          // optional — defaults to the file name without .json
+  "version": "1.0.0",         // optional — shown by `bili pack list` and the panel
+  "description": "…",         // optional
+  "promptSections": {
+    "philosophy": "…",        // replace a whole system-prompt section; JSON null keeps the default
+    "howToCompress": "…"      // start from the tuned texts in src/chat-pack.ts
+  }
+}
+```
+
+Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`, `toolPrompts`, and `adapters` (host-specific extras, e.g. `"pi": { "promptSections": { … } }`). At least one recognized field must survive sanitizing or the file is refused when written.
+
+**Installing other people's packs.** Any npm package whose root contains a `bili-pack.json` (the pack object above) is installable: `bili pack install <pkg>` — also accepts `name@version`, scoped names, git URLs and `.tgz` paths (it delegates to your local `npm`, so registry auth behaves normally). Files land in `<configDir>/packs/` by default (`--project` targets `./.billion-context/packs/`; `--force` replaces an existing pack instead of refusing). Afterwards manage them from the settings panel, or via `bili pack remove <name>` / `bili pack list`.
 
 #### `reconcile`
 

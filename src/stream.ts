@@ -841,7 +841,11 @@ export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionS
         if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
         let parsed: ReturnType<typeof parseCompressInput>;
         try {
-            parsed = parseCompressInput(m.text);
+            // #5161: quiet — this scan re-parses past calls on every fold; in
+            // external-summary mode their summary-less entries are schema-legal,
+            // so per-call rejection warns were pure false noise (the scan only
+            // needs the summaries that DO parse).
+            parsed = parseCompressInput(m.text, undefined, { quiet: true });
         } catch {
             continue;
         }

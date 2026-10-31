@@ -1483,7 +1483,25 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `string`（包名，如 `"lean"`）
 - **默认值：** `default`（未设置等同——恒等表面，全部使用内核默认值）
 - **状态：** ACTIVE
-- **说明：** 选择一个具名 prompt pack —— 一套策划好的表面预设，覆盖工具描述、压缩系统提示词段落、nudge 段落 —— 从宿主侧的包解析链解析：**项目** `./.billion-context/packs/<name>.json` → **用户** `<configDir>/packs/<name>.json` → **随包附带**（`chat`）→ **内核内置**（`default`、`lean`）。内置 `lean` 把四个 ACP 工具描述换成单行版（无 snippet/guideline 包装），压缩规则保持默认。内置 `chat`（#5319）只替换压缩哲学段与 how-to-compress 规则段，面向长期陪伴 / 多会话记忆场景；其余表面全部保持宿主默认，同名的用户/项目文件会覆盖它。未知包名回退到恒等表面并记录一次警告。与其他字段一样三级级联合并；包的表面覆盖（工具/段落）直接生效，不经 `acknowledgePromptsRisk` 门控——该门控只管内联 `compress.prompts` 的规则文本覆盖。注意：包文件里的 `prompts` 块会被本代理忽略，规则文本只能经内联 `compress.prompts` 设置。需要 `acp-kernel` >= 0.0.66。
+- **说明：** 选择一个具名 prompt pack —— 一套策划好的表面预设，覆盖工具描述、压缩系统提示词段落、nudge 段落 —— 从宿主侧的包解析链解析：**项目** `./.billion-context/packs/<name>.json` → **用户** `<configDir>/packs/<name>.json` → **随包附带**（`chat`）→ **内核内置**（`default`、`lean`）。内置 `lean` 把四个 ACP 工具描述换成单行版（无 snippet/guideline 包装），压缩规则保持默认。内置 `chat`（#5319）只替换压缩哲学段与 how-to-compress 规则段，面向长期陪伴 / 多会话记忆场景；其余表面全部保持宿主默认，同名的用户/项目文件会覆盖它。未知包名回退到恒等表面并记录一次警告。与其他字段一样三级级联合并；包的表面覆盖（工具/段落）直接生效，不经 `acknowledgePromptsRisk` 门控——该门控只管内联 `compress.prompts` 的规则文本覆盖。注意：包文件里的 `prompts` 块会被本代理忽略，规则文本只能经内联 `compress.prompts` 设置。需要 `acp-kernel` >= 0.0.66。设置面板可以直接管理用户目录里的包文件——对 `<configDir>/packs/` 下的包 新建/编辑/删除（选择器知道每个条目的来源；内置与 shipped 包在那里只读，要用同名用户包覆盖）。
+
+**包文件格式。** 每个 `<dir>/<name>.json` 是一个 pack 对象。未识别的字段会被与所有加载路径相同的 sanitize 器丢弃（`sanitizePackSurface`），所以多写元数据无害：
+
+```json
+{
+  "name": "my-pack",          // 可选 —— 缺省用文件名（去 .json）
+  "version": "1.0.0",         // 可选 —— `bili pack list` 与面板会显示
+  "description": "……",       // 可选
+  "promptSections": {
+    "philosophy": "……",       // 替换整段系统提示词；JSON null = 保留默认文本
+    "howToCompress": "……"     // 可直接从 src/chat-pack.ts 里调好的全文起步
+  }
+}
+```
+
+可选的表面块：`prompts`（内联规则文本覆盖）、`nudgeSections`、`toolPrompts`、`adapters`（宿主专属附加，如 `"pi": { "promptSections": { … } }`）。至少一个字段在 sanitize 后存活，否则写入时会被拒绝。
+
+**安装别人的包。** 任何根目录带 `bili-pack.json`（即上面的 pack 对象）的 npm 包都可安装：`bili pack install <pkg>`——也接受 `name@version`、带 scope 名、git URL、`.tgz` 路径（底层委托本机 `npm`，所以 registry 鉴权行为与普通 npm 一致）。默认落到 `<configDir>/packs/`（`--project` 指向 `./.billion-context/packs/`；已存在同名包时默认拒绝，`--force` 才替换）。之后可用设置面板管理，或 `bili pack remove <name>` / `bili pack list`。
 
 #### `reconcile`
 

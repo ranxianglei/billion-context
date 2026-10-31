@@ -1,8 +1,9 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { configFile } from "../paths.js";
+import { configDir, configFile } from "../paths.js";
+import { isValidPackName, sanitizePackSurface, type PromptPackFile } from "acp-kernel";
 import {
     collectNamedProviders,
     loadNamedProviders,
@@ -97,6 +98,78 @@ function atomicWriteConfig(config: ConfigShape): void {
         try { unlinkSync(tempPath); } catch { }
         throw error;
     }
+}
+
+// ---------------------------------------------------------------------------
+// #5328: user-dir prompt-pack management. These are the ONLY routes that
+// write under <configDir>/packs/ — the web editor's 新建/编辑/删除 buttons hit
+// them so users never have to touch a terminal or file path. Builtin and
+// shipped packs are read-only by construction (they live in code, not files);
+// the client shows "override with a same-named file" guidance for them.
+// Names arrive pre-shaped by the /__bili/ route regex; re-validate here so
+// the handlers stay safe for any future caller.
+
+function userPackFile(name: string): string {
+    return join(configDir(), "packs", `${name}.json`);
+}
+
+export function packSurfaceHasContent(surface: ReturnType<typeof sanitizePackSurface>): boolean {
+    return Object.entries(surface).some(([, value]) =>
+        value !== undefined &&
+        (typeof value !== "object" || value === null ? true : Object.keys(value).length > 0));
+}
+
+export async function handleUserPackGet(res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const file = userPackFile(name);
+    if (!existsSync(file)) return sendError(res, 404, `no user pack named "${name}"`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ name, path: file, json: readFileSync(file, "utf8") }));
+}
+
+export async function handleUserPackPut(req: IncomingMessage, res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof (raw as Record<string, unknown>).json !== "string")
+        return sendError(res, 400, 'expected { "json": "<pack JSON text>" }');
+    let parsed: unknown;
+    try { parsed = JSON.parse((raw as Record<string, unknown>).json as string); }
+    catch (error) { return sendError(res, 400, `pack json is not valid JSON: ${String(error)}`); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return sendError(res, 400, "pack top level must be a JSON object");
+    // Sanitize exactly like dir-pack loading (createDirPackSource): nonsense
+    // values are dropped at save time instead of biting at resolution time,
+    // and a pack that resolves to an empty surface is refused rather than
+    // silently written.
+    if (!packSurfaceHasContent(sanitizePackSurface(parsed as PromptPackFile)))
+        return sendError(res, 400, "no recognized pack fields (promptSections / prompts / nudgeSections / toolPrompts / adapters)");
+    const file = userPackFile(name);
+    mkdirSync(dirname(file), { recursive: true });
+    const tempPath = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+        descriptor = openSync(tempPath, "wx", 0o644);
+        writeFileSync(descriptor, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+        fsyncSync(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        renameSync(tempPath, file);
+    } catch (error) {
+        if (descriptor !== undefined) closeSync(descriptor);
+        try { unlinkSync(tempPath); } catch { }
+        return sendError(res, 500, `failed to write user pack: ${String(error)}`);
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, path: file }));
+}
+
+export async function handleUserPackDelete(res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const file = userPackFile(name);
+    if (!existsSync(file)) return sendError(res, 404, `no user pack named "${name}"`);
+    unlinkSync(file);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
 }
 
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
