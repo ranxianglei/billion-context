@@ -119,32 +119,38 @@ test("retrying a sub-range of a fresh T1 block names the covering block, not a s
     }),
   });
 
+  // #4521: the consumed-slice retry is the idempotent no-op — same #470
+  // guidance (names b1, no block-id retry advice), now in warnings[] on a
+  // success-shaped result instead of a FAILED receipt the model re-sent.
   assert.equal(retry.result.blocksCreated, 0);
-  assert.equal(retry.result.errors.length, 1);
+  assert.equal(retry.result.errors.length, 0);
+  assert.equal(retry.result.noop, true);
+  const w = retry.result.warnings.join(" ");
   assert.match(
-    retry.result.errors[0]!,
+    w,
     /Requested range\(s\) already compressed \(e\.g\. m00018\.\.m00020\)/,
   );
   assert.match(
-    retry.result.errors[0]!,
+    w,
     /its content is already summarized in active block\(s\) b1/,
   );
   assert.match(
-    retry.result.errors[0]!,
+    w,
     /use search_context or decompress b1 if you need details from it/,
   );
   assert.match(
-    retry.result.errors[0]!,
+    w,
     /Nothing new to compress in that window/,
   );
-  assert.match(retry.result.errors[0]!, /Continue the task/);
+  assert.match(w, /Continue the task/);
+  assert.match(w, /do not resend these ranges/);
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    w,
     /retry with startId\/endId set to active block IDs/,
   );
-  assert.doesNotMatch(retry.result.errors[0]!, /Current active blocks span/);
+  assert.doesNotMatch(w, /Current active blocks span/);
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    w,
     /Tier distillation is actionable/,
   );
 });
@@ -177,8 +183,12 @@ test("gate error offers tier distillation only once the trigger count is reached
   });
 
   assert.equal(retry.result.blocksCreated, 0);
+  // #4521: consumed-slice retry = no-op; the tier-distillation offer rides
+  // warnings[] alongside the do-not-resend note.
+  assert.equal(retry.result.errors.length, 0);
+  assert.equal(retry.result.noop, true);
   assert.match(
-    retry.result.errors[0]!,
+    retry.result.warnings.join(" "),
     /Tier distillation is actionable now: compress\(\{ content: \[\{ startId: "b1", endId: "b5", summary: "\.\.\.", topic: "\.\.\." \}\] \}\) merges those tier-1 blocks into one tier-2 block/,
   );
 });
@@ -269,17 +279,21 @@ test("gate error falls back to stale-ref wording when no active block covers the
   });
 
   assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.result.errors.length, 1);
+  // #4521: stale consumed-block retry = the no-op class; the stale-ref
+  // wording survives in warnings[].
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
+  const w = result.result.warnings.join(" ");
   assert.match(
-    result.result.errors[0]!,
+    w,
     /Requested range\(s\) already compressed \(e\.g\. b2\.\.b110\)/,
   );
   assert.match(
-    result.result.errors[0]!,
+    w,
     /its refs no longer point to directly compressible content \(stale block ref\(s\) distilled or consumed by higher-tier blocks\)/,
   );
   assert.doesNotMatch(
-    result.result.errors[0]!,
+    w,
     /already summarized in active block/,
   );
 });

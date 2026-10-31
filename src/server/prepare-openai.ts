@@ -24,7 +24,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -339,10 +339,10 @@ export async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         let acpStandingPushed = false;
-        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-            const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
+            const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
             if (tagsOnly) { sysParts.push(tagsOnly); acpStandingPushed = true; }
         }
         // #4305: standing generation-boundary note — rides the ACP standing block,
@@ -428,6 +428,12 @@ export async function prepareOpenai(
             }
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
+        }
+        // #4521: armed-but-silent window — same carrier + rationale as the
+        // anthropic lane (ephemeral trailing user message, current refs
+        // instead of model-guessed ones).
+        if (turn.statusLine) {
+            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
