@@ -2142,6 +2142,26 @@ async function handleRequest(
         const dshReviewSidecar = requestAgent !== "main" && isDshAutoReviewRequest(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
+        // #4634: owner direction — dsh auto-review traffic is BLOCKED by default:
+        // every review call re-sends a self-contained snapshot of the main
+        // conversation and bills it in full (steady-state O(history) miss; a
+        // model switch re-bills the whole accumulated lane at once — the
+        // incident measured ~728K one-shot). Answer locally with the minimal
+        // legal low-risk verdict instead of forwarding (zero usage; the payload
+        // shape is constrained by dsh's fail-closed reviewer parser — see
+        // src/server/dsh-auto-review-block.ts). Same evidence gate as the #4438
+        // lane above; opt-out: dsh.autoReviewBlock=false / BILI_DSH_AUTOREVIEW_BLOCK=0.
+        if (dshReviewSidecar && protocol !== null && dshAutoReviewBlockEnabled()) {
+            const blocked = buildAutoReviewEmptyBody(protocol, (parsed as { stream?: unknown }).stream === true);
+            if (blocked) {
+                recordAutoReviewBlock(inboundBytes / 4);
+                log("warn", `dsh auto-review BLOCKED locally (#4634 default-on): ~${Math.round(inboundBytes / 4)} tokens NOT forwarded upstream; answered with the minimal low-risk verdict (zero usage). Disable: dsh.autoReviewBlock=false or BILI_DSH_AUTOREVIEW_BLOCK=0; root fix: turn off dsh auto-review.`);
+                res.writeHead(200, { "content-type": blocked.contentType });
+                res.end(blocked.body);
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
+                return;
+            }
+        }
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
