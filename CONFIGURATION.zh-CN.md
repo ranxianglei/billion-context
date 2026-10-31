@@ -282,7 +282,7 @@
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
-| `compress.messageTimestamps` | boolean | false | BILI_MESSAGE_TIMESTAMPS | 为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time="…" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认关闭，线上字节与特性前 master 逐字节一致（#4313，PR #5236）。 |
+| `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | 为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time="…" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。 |
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
@@ -1635,9 +1635,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 #### `messageTimestamps`
 
 - **类型：** `boolean`
-- **默认值：** `false`
+- **默认值：** `true`
 - **状态：** ACTIVE
-- **说明：** 可选的消息时间戳（#4313，PR #5236）：开启后，bili 在每条消息首次出现时铸一个不可变的本地时间戳并展示出来——线上每条 `<acp>` 压缩标签带上 `time="yyyy-MM-dd HH:mm:ss"` 属性、每次 compress 回执的指纹行追加 `[start – end]` 覆盖跨度、渲染出的块摘要带 Occurred 行。可见成本约每条消息 8 token；默认关闭时每一条出站字节都与特性前 master 完全一致（包括提示词默认文案）。存储层无论开关都会记录时间戳，所以之后翻开开关即可浮现、无需丢数据。解析顺序：env（`BILI_MESSAGE_TIMESTAMPS`；`0` 强制关，其他任何值强制开，约定同 BILI_RESIGN）＞配置文件，且在每个代理实例启动时一次性解析——改开关需要重启实例。
+- **说明：** 消息时间戳（#4313，PR #5236；缓存审计跟进后改为默认开）：bili 在每条消息首次出现时铸一个不可变的本地时间戳并渲染出来——线上每条 `<acp>` 压缩标签带上 `time="yyyy-MM-dd HH:mm:ss"` 属性、每次 compress 回执的指纹行追加 `[start – end]` 覆盖跨度、渲染出的块摘要带 Occurred 行。可见成本约每条消息 8 token。存戳是确定性渲染输入（只读存储值、不读墙钟），历史重发逐轮字节稳定——生产会话审计显示开关前后提示词缓存命中率相同。设为 `false` 可精确复现特性前（pre-#4313）的线上字节（无 time 属性、原提示词文案、无指纹跨度）。存储层无论开关都会记录时间戳，之后翻开开关即可浮现全史、无需丢数据。标志首次解析为开的那个重启，每个活跃会话付一次冻结前缀缓存重写。解析顺序：env（`BILI_MESSAGE_TIMESTAMPS`；`0` 强制关，其他任何值强制开，约定同 BILI_RESIGN）＞配置文件，且在每个代理实例启动时一次性解析——改开关需要重启实例。
 
 ### 注入开关（仅全局生效）
 
@@ -1857,7 +1857,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
-| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | false |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |

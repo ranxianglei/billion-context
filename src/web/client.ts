@@ -3868,6 +3868,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -4017,6 +4018,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");

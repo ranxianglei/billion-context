@@ -200,6 +200,9 @@ test("checkTunnelDestination: public destinations pass for any client; unresolva
         clientLoopback: true,
         allowlist: [],
         localIps,
+        // #5222: exercise the legacy exhaustion path only — the worker-fallback
+        // stage is covered by tests/tunnel-guard-worker-fallback.test.ts.
+        workerFallback: false,
         resolveHost: async () => {
             throw new Error("ENOTFOUND");
         },
@@ -238,6 +241,7 @@ test("checkTunnelDestination: persistent resolution failure stays unresolvable w
         clientLoopback: true,
         allowlist: [],
         localIps,
+        workerFallback: false, // #5222: legacy exhaustion path only (see tunnel-guard-worker-fallback.test.ts)
         resolveHost: dead,
         resolveBackoffMs: 1,
     });
@@ -300,6 +304,7 @@ test("checkTunnelDestination: proxied egress STILL enforces IP-literal self/meta
 test("checkTunnelDestination: unresolvable surfaces the raw resolver code + remediation hint (#2124)", async () => {
     const v = await checkTunnelDestination("https://no-such-host.invalid/v1", {
         selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        workerFallback: false, // #5222: legacy exhaustion path only (see tunnel-guard-worker-fallback.test.ts)
         resolveHost: async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
     });
     assert.equal(v.ok, false);

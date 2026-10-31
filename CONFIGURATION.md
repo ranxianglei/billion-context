@@ -282,7 +282,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
-| `compress.messageTimestamps` | boolean | false | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. Default off keeps every byte identical to pre-feature master (#4313, PR #5236). |
+| `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly. |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
@@ -1644,9 +1644,9 @@ Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`
 #### `messageTimestamps`
 
 - **Type:** `boolean`
-- **Default:** `false`
+- **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** Opt-in message timestamps (#4313, PR #5236): when on, bili mints each message one immutable local-time stamp at first sight and shows it — a `time="yyyy-MM-dd HH:mm:ss"` attribute on every `<acp>` compression tag on the wire, a `[start – end]` coverage span appended to each compress-receipt fingerprint line, and an Occurred line in rendered block summaries. Cost is about 8 tokens per message when visible; off is the default and keeps every outbound byte identical to pre-feature master (including the prompt defaults). Storage still records the stamps either way, so flipping the flag later surfaces them without data loss. Resolution is env (`BILI_MESSAGE_TIMESTAMPS`; `0` forces off, any other value forces on, same convention as BILI_RESIGN) over the config file, resolved once per proxy instance — changing the flag needs a restart.
+- **Description:** Message timestamps (#4313, PR #5236; ON by default since the leak-audit follow-up): bili mints each message one immutable local-time stamp at first sight and renders it — a `time="yyyy-MM-dd HH:mm:ss"` attribute on every `<acp>` compression tag on the wire, a `[start – end]` coverage span appended to each compress-receipt fingerprint line, and an Occurred line in rendered block summaries. Cost is about 8 tokens per message when visible. Stamps are deterministic render inputs (rendered from stored values, never wall clock), so re-rendered history stays byte-stable turn over turn; live-session audits showed identical prompt-cache hit rates with the flag on vs off. Set `false` to reproduce the pre-#4313 bytes exactly (no time attribute, original prompt texts, no fingerprint span). Storage records the stamps either way, so opting in later surfaces full history without data loss. The first restart after which the flag resolves true pays one frozen-prefix cache rewrite per active session. Resolution is env (`BILI_MESSAGE_TIMESTAMPS`; `0` forces off, any other value forces on, same convention as BILI_RESIGN) over the config file, resolved once per proxy instance — changing the flag needs a restart.
 
 ### Injection toggles (global only)
 
@@ -1874,7 +1874,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
-| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | false |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |

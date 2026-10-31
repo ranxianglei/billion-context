@@ -40,3 +40,14 @@ process.env.XDG_CONFIG_HOME = path.join(root, "config");
 // must point at dirs that exist. An existing EMPTY dir is the normal
 // "no sessions yet" state the read paths already handle.
 for (const name of ["sessions", "data", "state", "cache", "config"]) mkdirSync(path.join(root, name), { recursive: true });
+// #4313 default-on follow-up: the PRODUCTION default for message-timestamp
+// display is now ON (src/config.ts resolveMessageTimestamps), so an unpinned
+// ambient would flip every byte-comparing baseline in the suite into
+// time-stamped wire bytes. Pin the display gate OFF here — same unconditional-
+// assignment discipline as the XDG roots above: byte-stable pre-feature
+// baselines everywhere by default. Suites exercising the ON path set
+// BILI_MESSAGE_TIMESTAMPS / compress.messageTimestamps explicitly (see
+// tests/issue4313-message-timestamp-toggle.test.ts and
+// tests/message-timestamps-default-on.test.ts). Storage-layer stamping runs
+// regardless of this flag.
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
