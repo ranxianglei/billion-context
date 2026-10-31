@@ -48,6 +48,7 @@
 // openai tool list, src/compress-tool.ts) because reload-based refresh is not
 // available on all observed surfaces.
 
+import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
@@ -55,8 +56,8 @@ import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Under the cap, panels go to description verbatim;
-// over it, fitNoticeDescription hoists the Web UI deep link to line one and keeps whole leading lines (#1602) —
-// the full panel stays reachable through that link.
+// over it, fitNoticeDescription hoists the Web UI deep link and keeps whole leading lines (#1602).
+// Body-rendering clients also receive the full report, excluded from outgoing context by its message ID.
 const V2_SYNTHETIC_VISIBLE_MAX = 1024;
 // /acp-cache renders a report the user explicitly asked to read — unlike the
 // status panel whose leading lines carry the essence, its tail (LINE ITEMS)
@@ -70,6 +71,7 @@ interface V2Headers {
 }
 
 export interface V2HttpRequestEvent {
+    messages?: Array<{ id?: string; role?: string; content?: unknown }>;
     sessionID?: unknown;
     agent?: unknown;
     model?: { providerID?: unknown; id?: unknown };
@@ -110,7 +112,7 @@ interface V2CatalogModelEntry {
 export interface V2PluginContext {
     session?: {
         hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => V2Registration | void | Promise<V2Registration | undefined>;
-        synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
+        synthetic?: (input: { id?: string; sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
         transform?: (cb: (editor: V2ToolEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
@@ -517,6 +519,34 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         });
         if (toolReg) registrations.push(toolReg);
 
+        let reportFiltering = false;
+        try {
+            if (ctx.session?.hook) {
+                for (const name of ["context", "compaction", "title", "generate"]) {
+                    const reg = await ctx.session.hook(name, (event) => {
+                        if (!event.messages) return;
+                        const kept = event.messages.filter((message) => !(
+                            message.role === "user" && /^msg_bili_report_[0-9a-f]{32}$/.test(message.id ?? "")
+                        ));
+                        event.messages.splice(0, event.messages.length, ...kept);
+                    });
+                    if (reg) registrations.push(reg);
+                }
+                reportFiltering = true;
+            }
+        } catch (err) {
+            logHostEvent("warn", "[native-client]", `[bili-opencode] report context hooks unavailable; retaining compact notices: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const renderReport = async (sid: string, text: string, description: string): Promise<void> => {
+            await ctx.session?.synthetic?.({
+                ...(reportFiltering ? { id: `msg_bili_report_${randomUUID().replaceAll("-", "")}` } : {}),
+                sessionID: sid,
+                text: reportFiltering ? `\`\`\`text\n${text}\n\`\`\`` : V2_SYNTHETIC_TEXT,
+                description,
+                resume: false,
+            });
+        };
+
         // /acp status command (#809): registered via the V2 command editor where
         // supported (2.0.x stable; inert-safe otherwise) and rendered as a
         // synthetic non-model-turn message; TUI-only (`run` dispatches no slash cmds).
@@ -577,20 +607,15 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         try {
                             // resume:false — OpenCode V2 defaults to delivery "steer" + execution.wake(), which would
                             // start a model turn on every /acp invocation with no user input (spurious empty turns).
-                            // Short panels become the visible description verbatim; long ones lead with the Web UI
-                            // deep link (full panel stays reachable there) and keep their leading whole lines, so
-                            // the model-facing body never repeats the whole panel (#1602).
+                            // Keep the capped notice for TUI clients; body-rendering clients receive the full report.
                             const description = fitNoticeDescription(text, V2_SYNTHETIC_VISIBLE_MAX, "panel", webUrl);
-                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
+                            await renderReport(sid, text, description);
                         } catch (err) {
                             console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
                     },
                 });
-                // #1146: human entry point for the cache-reconciliation feature —
-                // same report as the acp_cache tool above. The model-facing body
-                // stays the inert one-liner (V2_SYNTHETIC_TEXT), so no proxy-side
-                // stripping wrap is needed here (unlike the V1 ignored-message path).
+                // #1146: human entry point for the same report as the acp_cache tool.
                 editor.add({
                     name: "acp-cache",
                     description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool). Usage: /acp-cache [full]",
@@ -622,7 +647,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         }
                         try {
                             const description = fitNoticeDescription(text, V2_CACHE_REPORT_VISIBLE_MAX, "report");
-                            await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
+                            await renderReport(sid, text, description);
                         } catch (err) {
                             console.error(`[bili-opencode] /acp-cache render failed: ${err instanceof Error ? err.message : String(err)}`);
                         }
