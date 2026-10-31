@@ -26,7 +26,7 @@ import type { SessionStore } from "./persist.js";
 import type { Session } from "./session.js";
 import { log as loggerLog } from "./logger.js";
 
-export interface OrphanBlockFinding {
+interface OrphanBlockFinding {
     sessionId: string;
     blockId: string;
     coveredCount: number;
@@ -34,7 +34,7 @@ export interface OrphanBlockFinding {
     coveredSample: string[];
 }
 
-export interface OrphanSweepPlan {
+interface OrphanSweepPlan {
     storageMode: "full" | "shadow" | "legacy";
     /** True only when --fix can durably apply (full unified storage). */
     performable: boolean;
