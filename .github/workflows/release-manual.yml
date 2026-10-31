@@ -516,7 +516,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER="${{ steps.version.outputs.version }}"
-          LAST="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
+          LAST="$(git describe --match 'v*' --exclude "v$VER*" --tags --abbrev=0 2>/dev/null || echo "")"
           NOTES="$RUNNER_TEMP/release-notes.md"
           if [ -n "$LAST" ] && [ "$LAST" != "v$VER" ]; then
             {
