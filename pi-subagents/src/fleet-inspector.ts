@@ -1,6 +1,6 @@
 import { openSync, fstatSync, readSync, closeSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, Markdown, matchesKey, truncateToWidth, wrapTextWithAnsi, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { Key, Markdown, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
 import { OUT_DIR, fleetRunsSnapshot, type FleetRunView } from "./delegate-tool.js";
 
@@ -172,7 +172,7 @@ export function formatToolLabel(name: string, args: unknown): string {
     case "write": return `write ${s(a.path ?? a.file_path)}`;
     case "edit": return `edit ${s(a.path ?? a.file_path)}`;
     case "bash": {
-      const cmd = s(a.command).replace(/[\n\t]/g, " ").trim();
+      const cmd = s(a.command).replace(/\r?\n|\t/g, " ").trim();
       return `bash ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}`;
     }
     case "grep": return `grep /${s(a.pattern)}/ in ${s(a.path ?? ".")}`;
@@ -270,8 +270,10 @@ function buildMarkdownTheme(theme: InspectorTheme): MarkdownTheme {
 export function renderTranscriptBlocks(blocks: TranscriptBlock[], theme: InspectorTheme, innerW: number): string[] {
   const out: string[] = [];
   const wrapW = Math.max(10, innerW);
-  // Full-width background bar; truncateToWidth pads to innerW (ANSI + CJK aware) so the bg spans the row.
-  const bar = (bgColor: string, content: string): string => theme.bg(bgColor, truncateToWidth(content, innerW, undefined, true));
+  const bar = (bgColor: string, content: string): string => {
+    const clipped = truncateToWidth(content, innerW, theme.bg(bgColor, "..."));
+    return theme.bg(bgColor, clipped) + theme.bg(bgColor, " ".repeat(Math.max(0, innerW - visibleWidth(clipped))));
+  };
   let i = 0;
   while (i < blocks.length) {
     const b = blocks[i];
@@ -329,7 +331,7 @@ function pushToolGroup(out: string[], bar: (bg: string, c: string) => string, th
   const label = formatToolLabel(name, args);
   if (label) out.push(bar(bgc, theme.fg("dim", label)));
   if (result) {
-    const rawLines = result.text.replace(/\n+$/, "").split("\n");
+    const rawLines = result.text.replace(/\r\n/g, "\n").replace(/\n+$/, "").split("\n");
     const shown = rawLines.slice(0, MAX_RESULT_LINES);
     for (const l of shown) out.push(bar(bgc, theme.fg("toolOutput", l)));
     if (rawLines.length > shown.length) out.push(bar(bgc, theme.fg("dim", `… +${rawLines.length - shown.length} more`)));
