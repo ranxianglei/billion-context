@@ -143,7 +143,7 @@ test("#4975: evicted panel recovers the stored view — byte-identical to the re
             await store.writeNow(makeStoredSession(id, MESSAGES));
 
             const r0 = mockRes();
-            handlePluginStatus(id, r0.res, DEPS);
+            await handlePluginStatus(id, r0.res, DEPS);
             assert.equal(r0.status(), 200, "resident status answered");
             assert.ok(!r0.body().includes("LIVE VIEW UNREADABLE"), "resident panel carries no marker");
 
@@ -152,7 +152,7 @@ test("#4975: evicted panel recovers the stored view — byte-identical to the re
             session.transient = undefined;
 
             const r1 = mockRes();
-            handlePluginStatus(id, r1.res, DEPS);
+            await handlePluginStatus(id, r1.res, DEPS);
             assert.equal(r1.status(), 200, "evicted status answered");
             assert.ok(!r1.body().includes("LIVE VIEW UNREADABLE"), "recoverable view must not read as unreadable");
             // contextView.at is a wall-clock stamp — normalize it, everything
@@ -180,7 +180,7 @@ test("#4975: evicted panel with no readable store copy → LIVE VIEW UNREADABLE 
         session.transient = undefined;
 
         const r = mockRes();
-        handlePluginStatus(id, r.res, DEPS);
+        await handlePluginStatus(id, r.res, DEPS);
         assert.equal(r.status(), 200);
         const json = JSON.parse(r.body()) as { compressibleRanges: unknown; panel: string | null };
         assert.equal(json.compressibleRanges, null, "no ranges derivable from a missing view");
