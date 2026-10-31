@@ -53,6 +53,7 @@
 | `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | #4788 phase 2（c8d7a802） | idle-fold 逃生口：`=1/true` 让每会话 CCR content store（{byRef}/{byHash} 原文）常驻内存、save 落盘后不折叠（默认折叠；读点 src/knobs.ts:451，store 可从 unified ccr mirror 或 .content-store.json sidecar 重新物化） | #4788 phase 2 idle-fold 生产站稳后评估退役（owner 拍板） | 在用（默认 fold） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -78,6 +79,7 @@
 | `BILI_NON_HTTP_PROVIDERS` | #1392 非 http(s) baseUrl provider 白名单传递 |
 | `BILI_PROVIDER_REWRITES` | #535 provider 改写 manifest JSON（存在即关 zcode native） |
 | `BILI_UPGRADE_REPLACEMENT` | #3044 self-restart 替换进程交接标记（UPGRADE_REPLACEMENT_ENV） |
+| `BILI_SPAWN_FINGERPRINT` | #4125 spawner 侧入口脚本 sha256 指纹（SPAWN_FINGERPRINT_ENV，src/instance.ts:343），spawn 时注入供子进程记录自身指纹，避免 auto-update 窗口内 re-hash 漂移 |
 
 ### 2.3 网络调优（#2030 迁移家族：env > 文件 network.* > 默认）
 
