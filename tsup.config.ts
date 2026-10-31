@@ -4,7 +4,7 @@ import { defineConfig } from "tsup";
 
 export default [
 defineConfig({
-    entry: ["src/index.ts", "src/mcp.ts", "src/claude-mcp-entry.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/agent/dsh-compaction-gate.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
+    entry: ["src/index.ts", "src/mcp.ts", "src/claude-mcp-entry.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
     format: ["esm"],
     target: "node20",
     platform: "node",
@@ -95,5 +95,25 @@ defineConfig({
     footer: {
         js: "\nreturn module.exports;\n}});",
     },
+}),
+// #4627: the compaction gate ships under its OWN package identity — the nested
+// dist/agent/dsh-gate/ dir carries a package.json (written by
+// scripts/write-build-info.mjs) declaring NO dsh.client, so dsh >= 0.2's
+// ClientModuleRegistry.reconcilePackage never sees two active Loader rows on
+// the billion-context client package. Object entry form: tsup's array path
+// cannot mix string and object entries. No clean here: this runs after the
+// main config above. Its module tree has no bare imports, so none of the
+// main config's banner/noExternal machinery applies.
+defineConfig({
+    entry: { "agent/dsh-gate/index": "src/agent/dsh-compaction-gate.ts" },
+    format: ["esm"],
+    target: "node20",
+    platform: "node",
+    outDir: "dist",
+    clean: false,
+    sourcemap: false,
+    splitting: false,
+    shims: false,
+    minifyWhitespace: true,
 }),
 ];

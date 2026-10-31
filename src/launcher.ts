@@ -3446,6 +3446,11 @@ export function prepareCodexHome(opts: {
  *  built-in deepseek route). Returns the patch file path (undefined when it
  *  could not be written — dsh then just boots without the plugin). */
 const DSH_BARE_ENTRY = "billion-context";
+// #4627: the compaction gate's OWN bare specifier / shim package name. It
+// resolves to a package that declares NO dsh.client, so dsh >= 0.2.0-rc.x
+// (ClientModuleRegistry.reconcilePackage) never sees two active Loader rows
+// on the billion-context client package.
+const DSH_GATE_BARE_ENTRY = "billion-context-dsh-gate";
 
 /** #1590: shim package making the bare `billion-context` root resolvable from the two
  *  anchors dsh uses at runtime, without touching dsh's own tree:
@@ -3457,14 +3462,9 @@ const DSH_BARE_ENTRY = "billion-context";
  *  `dsh.client` declaration the scanner reads plus two SYMLINKS into bili's
  *  live dist — an auto-update that moves dist self-heals on the next launch.
  *  Returns false when nothing was written (existing shims stay untouched). */
-export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string, gateBundle?: string): boolean {
+export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string): boolean {
     try {
         if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle)) return false;
-        // #3662: the always-on gate entry rides the same shim (a dangling
-        // symlink would break its load, so it joins only when present).
-        const hasGate = gateBundle !== undefined && fs.existsSync(gateBundle);
-        const exportsMap: Record<string, string> = { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" };
-        if (hasGate) exportsMap["./dsh-compaction-gate"] = "./gate.js";
         fs.rmSync(shimDir, { recursive: true, force: true });
         fs.mkdirSync(shimDir, { recursive: true });
         fs.writeFileSync(
@@ -3473,13 +3473,42 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: exportsMap,
+                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
         fs.symlinkSync(hostBundle, path.join(shimDir, "index.js"));
         fs.symlinkSync(clientBundle, path.join(shimDir, "bundle.js"));
-        if (hasGate) fs.symlinkSync(gateBundle, path.join(shimDir, "gate.js"));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** #4627: the gate's OWN shim package beside the billion-context shim in the
+ *  same node_modules dir. dsh >= 0.2.0-rc.x resolves every Loader row to its
+ *  nearest package.json and hard-fails when ONE client package has more than
+ *  one active source (ClientModuleRegistry.reconcilePackage) — riding the
+ *  gate on the billion-context shim gave two rows resolving to the same
+ *  dsh.client-declaring package and bricked dsh web boot. This package
+ *  deliberately carries NO dsh.client declaration: the scanner ignores it,
+ *  and each client package keeps exactly one active Loader row. Returns false
+ *  when nothing was written (existing shims stay untouched). */
+export function writeDshGateShimFiles(shimDir: string, gateBundle: string, version: string): boolean {
+    try {
+        if (!fs.existsSync(gateBundle)) return false;
+        fs.rmSync(shimDir, { recursive: true, force: true });
+        fs.mkdirSync(shimDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(shimDir, "package.json"),
+            `${JSON.stringify({
+                name: DSH_GATE_BARE_ENTRY,
+                version,
+                type: "module",
+                exports: { ".": "./index.js", "./package.json": "./package.json" },
+            })}\n`,
+        );
+        fs.symlinkSync(gateBundle, path.join(shimDir, "index.js"));
         return true;
     } catch {
         return false;
@@ -3497,7 +3526,10 @@ export function writeDshClientShim(dshHome: string): boolean {
     try {
         version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
     } catch {}
-    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
+    const nm = path.join(dshHome, "node_modules");
+    const okHost = writeDshClientShimFiles(path.join(nm, "billion-context"), hostBundle, clientBundle, version);
+    const okGate = writeDshGateShimFiles(path.join(nm, DSH_GATE_BARE_ENTRY), selfDistFile("agent/dsh-gate/index.js"), version);
+    return okHost && okGate;
 }
 
 /** #1590: entry name for the launcher's --patch overlay. The BARE package
@@ -3527,7 +3559,11 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     // subpath through the shim; file URL otherwise) — dropping it would leave
     // the preset inject rows below pending forever whenever bili-native does
     // not run.
-    const gateUrl = pluginUrl === DSH_BARE_ENTRY ? `${DSH_BARE_ENTRY}/dsh-compaction-gate` : pathToFileURL(selfDistFile("agent/dsh-compaction-gate.js")).href;
+    // #4627: the gate resolves into its OWN package identity in both lanes
+    // (own shim package / nested dist package.json — neither declares
+    // dsh.client) — dsh >= 0.2.0-rc.x rejects two Loader rows on one client
+    // package, which the old shared-billion-context layout tripped.
+    const gateUrl = pluginUrl === DSH_BARE_ENTRY ? DSH_GATE_BARE_ENTRY : pathToFileURL(selfDistFile("agent/dsh-gate/index.js")).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
