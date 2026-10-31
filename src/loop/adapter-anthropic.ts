@@ -152,14 +152,6 @@ function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: stri
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
-// The loop's own early ends say "length", OpenAI's word; Anthropic has no
-// such stop reason, and Claude Code stops mid-task on one it does not know.
-// "max_tokens" makes it resume the turn instead (#5179).
-function anthropicStopReason(reason: string | undefined): string {
-    if (!reason) return "end_turn";
-    return reason === "length" ? "max_tokens" : reason;
-}
-
 function buildTextDeltaEvent(index: number, text: string): Buffer {
     return Buffer.from(
         `event: content_block_delta\n` +
@@ -746,8 +738,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {
+            const stopReason = opts?.finishReason ?? "end_turn";
             return buildTerminal(
-                anthropicStopReason(opts?.finishReason),
+                stopReason,
                 opts?.usage?.outputTokens ?? 0,
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,

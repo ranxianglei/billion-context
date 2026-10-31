@@ -216,6 +216,28 @@ function resolveAnchorIndex(
       // hole (pruned or skipped) and must not be read as cross-session.
       const highest = highestUsedIndex(state.messageRefs);
       if (boundary.numericId > highest) {
+        // #4521: an endId above the highest allocated ref is the model aiming
+        // at "the newest tail" without knowing where it ends — the single most
+        // common compress failure on long sessions (it cannot see refs minted
+        // after the last banner). START anchors keep the hard refusal (a
+        // cross-generation start ref is a real targeting error), but the END
+        // anchor clamps down to the highest visible message: the range still
+        // folds everything the model meant ("up to now"), and the snapped note
+        // teaches the correct ceiling for next time.
+        if (endpoint === "end") {
+          const neighbor = snapToNeighborVisible(
+            state,
+            indexByMessageId,
+            boundary.numericId,
+            endpoint,
+          );
+          if (neighbor !== null) {
+            return {
+              index: neighbor,
+              snapped: `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet). The range folds up to the last visible message.`,
+            };
+          }
+        }
         throw new BoundaryNotFoundError(
           "unknown",
           endpoint,
