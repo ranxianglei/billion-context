@@ -275,7 +275,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
 | `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
-| `compress.promptPack` | string (builtin: "default", "lean", "chat") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → shipped pack → builtin; not gated by acknowledgePromptsRisk. |
+| `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
