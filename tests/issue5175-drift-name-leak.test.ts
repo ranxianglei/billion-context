@@ -142,8 +142,6 @@ test("#5175 A: the signed-thinking channel is never rewritten by the drift rule"
     assert.equal(stripAcpTags(echo), "", "visible text channel is filtered");
     // The verbatim channel's rule is identity, so an echo riding there is
     // expected to survive — that is the invariant, not a leak.
-    const identity = (x: string): string => x;
-    assert.equal(identity(echo), echo);
 });
 
 test("#5175 A: the kernel's OWN protocol tags are never read as drift", () => {
