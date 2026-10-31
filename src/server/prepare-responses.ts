@@ -25,7 +25,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -430,13 +430,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
-            ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
+            ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, messageTimestampSections(surface?.promptSections, responsesTextProtocol ? "hybrid" : "function"))
             : "";
         // #4305: standing generation-boundary note — byte-stable once detected;
         // never on a compaction-trigger passthrough (renderTags="none" there).
         const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
-            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
+            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
@@ -677,10 +677,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // Compaction-trigger requests are the compression mechanism itself — no
     // incremental decision hangs off them, so don't leave a stale reading.
     if (!isCompactionTrigger) {
+        // One tree walk shared by both calibers (see the anthropic lane).
+        const imageReserve = imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above. #4166: mid-history sys/dev
         // items are cores now, so both estimators see the same wire set the
@@ -688,7 +690,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
@@ -696,6 +698,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     markDirty(session);
     return {
         body: JSON.stringify(rebuilt),
+        parsedBody: rebuilt,
         session,
         processedMessages,
         originalMessages,

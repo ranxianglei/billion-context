@@ -282,6 +282,7 @@
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
+| `compress.messageTimestamps` | boolean | false | BILI_MESSAGE_TIMESTAMPS | 为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time="…" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认关闭，线上字节与特性前 master 逐字节一致（#4313，PR #5236）。 |
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
@@ -363,7 +364,7 @@
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
-| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——JSON 信封始终是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 第二写者 / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（或留空）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。 |
+| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——JSON 信封始终是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底（活的第二写者已于 2026-10-31 移出该拒绝清单：多进程共享一个本地盘 index.db 是受支持拓扑，只提示、永不阻断启动）；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（或留空）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
@@ -771,7 +772,7 @@
 - **类型：** `boolean`
 - **默认值：** `true`
 - **状态：** ACTIVE
-- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的 `<session>\|sub:<fp>` 车道，不再摧毁父会话的折叠基底。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
+- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的车道：首条 user 消息上带 bili SubagentStart hook token 时按派发铸键（`<session>\|sub:<fp>:t:<token>`），否则用本 run 首条 user 消息片段作兼底（`<session>\|sub:<fp>:<userFp>`），同一父 id 下反复派发的同型子代理不再共用一条压缩会话（#5095）；既无有效 token、又无可用 user 文本的借道保留两段式 `<session>\|sub:<fp>` 形态。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
 
 ### `forkAdoption`
 
@@ -1613,6 +1614,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 控制代理执行 proxy 工具调用（`compress` / `decompress` / `search_context` / `acp_status`）后输出的 📦/❌ ACP 可见标记。开启时，每次执行会在响应流中追加一行标记，并/或把标记消息重新注入该轮重建后的历史，让模型在后续回合看到发生了什么。设为 `false` 可完全抑制这两类产物 —— 适用于模型会模仿或围绕标记进行旁白的部署场景（自行输出确认行或中文旁白；见 issue #862）。工具执行本身不受影响：调用照常执行、成对的 tool-call/tool-result 消息照常记录，只是省略标记行/标记消息。与其他字段相同的三级合并。#717 对模型伪造标记的防伪造剥离逻辑独立于本开关，始终生效。
 
+#### `messageTimestamps`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** ACTIVE
+- **说明：** 可选的消息时间戳（#4313，PR #5236）：开启后，bili 在每条消息首次出现时铸一个不可变的本地时间戳并展示出来——线上每条 `<acp>` 压缩标签带上 `time="yyyy-MM-dd HH:mm:ss"` 属性、每次 compress 回执的指纹行追加 `[start – end]` 覆盖跨度、渲染出的块摘要带 Occurred 行。可见成本约每条消息 8 token；默认关闭时每一条出站字节都与特性前 master 完全一致（包括提示词默认文案）。存储层无论开关都会记录时间戳，所以之后翻开开关即可浮现、无需丢数据。解析顺序：env（`BILI_MESSAGE_TIMESTAMPS`；`0` 强制关，其他任何值强制开，约定同 BILI_RESIGN）＞配置文件，且在每个代理实例启动时一次性解析——改开关需要重启实例。
+
 ### 注入开关（仅全局生效）
 
 这两个开关只在**全局**层级生效。在按 provider 或按模型的 `compress` 块中设置它们无效。
@@ -1831,6 +1839,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | false |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |

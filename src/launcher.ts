@@ -51,6 +51,7 @@ import {
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
+    SPAWN_FINGERPRINT_ENV,
     writeZonePort,
     type ProxyInstanceFile,
     type ProxyStartingMarker,
@@ -4084,6 +4085,29 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     return Object.keys(wantMax).every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
 }
 
+/** #4125: UPWARD ADOPTION — a resident that reports a build STRICTLY NEWER
+ *  than ours is safe to ride even though its code fingerprint differs:
+ *  #1225's bytes-equality rule protects us from STALE content, and a newer
+ *  build is never stale. Every other guard stays intact — cross-lane remains
+ *  forbidden regardless of version (#1225/#2905), user-zone instances stay
+ *  user-managed (#1660), config shape still has to match (instanceShapeMismatch
+ *  is checked by the callers) — but without the fp veto, an out-of-band updated
+ *  copy wedged onto our lane's port deadlocks the older generation forever:
+ *  attach rejects its foreign bytes, #3544 rotation only reaches strictly OLDER
+ *  residents, and every new spawn dies twin-collision behind it until someone
+ *  manually kills the holder. The version claim must come from the resident's
+ *  own live health answer — a busy/silent holder proves nothing. */
+export function isNewerSameLaneHolder(
+    inst: { lane?: string },
+    optsLane: string | undefined,
+    healthVersion: string | undefined,
+    ownVersion: string,
+    userZone: boolean,
+): boolean {
+    if (userZone || optsLane === undefined || healthVersion === undefined) return false;
+    return inst.lane === optsLane && isVersionNewer(healthVersion, ownVersion);
+}
+
 function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
     if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
     return instanceShapeMismatch(inst, opts, foreignLanes);
@@ -4217,7 +4241,27 @@ function pickAttachable(
             diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not the explicit attachUrl target`);
             continue;
         }
-        const incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
+        let incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
+        // #4125: fingerprint drift alone doesn't veto a resident that PROVES
+        // itself a strictly newer same-lane build (live health version) —
+        // upward adoption closes the two-install deadlock; every other guard
+        // below stays intact.
+        if (incompatible === "code-fingerprint-mismatch" && c.health?.version !== undefined
+                && isNewerSameLaneHolder(c.inst, opts.lane, c.health.version, VERSION, isUserZoneInstance(c.inst))) {
+            // #4125: upward adoption lifts the fingerprint veto ONLY — the
+            // config-shape guard still applies. instanceCompatible reports the
+            // fp reason first, so a shape drift on a foreign-bytes holder would
+            // otherwise ride along invisibly once the veto is cleared (the
+            // adoptServingTwin path re-checks shape explicitly; mirror it here).
+            const adoptedShape = instanceShapeMismatch(c.inst, opts, foreignLanes);
+            if (adoptedShape === undefined) {
+                diag?.(`native-attach: adopt ${c.inst.origin} (pid ${c.inst.pid}): foreign bytes but self-reported v${c.health.version} is strictly NEWER than this lane's v${VERSION} — riding the newer build instead of deadlocking behind it (#4125)`);
+                incompatible = undefined;
+            } else {
+                diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): reports v${c.health.version} (newer) but its config shape differs (${adoptedShape}) — shape guards survive upward adoption (#4125)`);
+                incompatible = adoptedShape;
+            }
+        }
         if (incompatible !== undefined) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): incompatible (${incompatible})`); continue; }
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }
         const sameLane = opts.lane !== undefined && c.inst.lane === opts.lane;
@@ -4439,6 +4483,10 @@ const INHERITED_LAUNCHER_CHANNELS = [
     "BILI_LAUNCHER_MODEL_WINDOWS",
     "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
     "BILI_STRICT_PORT",
+    // #4125/#2195: the spawner→child fingerprint channel must never LEAK in
+    // from ambient environment either — an inherited digest would be some
+    // other bring-up's hash.
+    SPAWN_FINGERPRINT_ENV,
 ];
 
 function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -5035,7 +5083,7 @@ export async function ensureProxyRunning(
         if (target !== undefined) {
             const reason = instanceCompatible(target.inst, opts, codeFingerprint, foreignLanes);
             const remedy = reason === "code-fingerprint-mismatch"
-                ? "the target runs different bili bytes than this lane (typical: global install vs host-managed copy right after an update) — restart the host once its copy converges to the same version, or stop the target"
+                ? "the target runs different bili bytes than this lane (typical: global install vs host-managed copy right after an update). A target that reports a STRICTLY NEWER build attaches automatically — reaching this message means it reports the same or an older build: align the two installs (restart the host once its copy converges), or stop the target"
                 : reason !== undefined
                     ? `config shape mismatch (${reason}) — align the target's launch config with this lane's, or stop the target`
                     : "it passes compatibility but fails the lifecycle gate (no armed watchdog) — set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway";
@@ -5214,6 +5262,12 @@ export async function ensureProxyRunning(
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
                         ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
+                        // #4125: hand the child the digest of the very script we exec'd,
+                        // so it records the identity WE saw — an auto-update swapping
+                        // dist between our hash and the child's own re-hash would fork
+                        // one bring-up into two identities (spawner gates keyed on X,
+                        // child registry saying Y).
+                        ...(codeFingerprint !== undefined ? { [SPAWN_FINGERPRINT_ENV]: codeFingerprint } : {}),
                     },
                 },
             );
@@ -5504,11 +5558,28 @@ export async function ensureProxyRunning(
         // path (watcher + heartbeat included).
         const adoptServingTwin = async (): Promise<ProxyHandle | undefined> => {
             const candidates = (deps.listAdoptCandidates ?? discoverLiveInstances)()
-                .filter((inst) => isPidAlive(inst.pid) && instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined)
+                .filter((inst) => isPidAlive(inst.pid))
                 .sort((a, b) => Number(b.port === port) - Number(a.port === port) || b.startedAt - a.startedAt);
             for (const inst of candidates) {
+                let compatible = instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined;
+                // #4125: the adoption signal also covers a STRICTLY NEWER holder
+                // whose registry marker discovery couldn't judge (its bytes differ
+                // by definition across trees) — verify the version it REPORTS from
+                // a live health answer before riding it.
+                let adoptedNewerVersion: string | undefined;
+                if (!compatible) {
+                    const reported = await fetchHealthInfo(inst.origin);
+                    if (reported !== undefined && isNewerSameLaneHolder(inst, opts.lane, reported.version, VERSION, isUserZoneInstance(inst))
+                            && instanceShapeMismatch(inst, opts, foreignLanes) === undefined) {
+                        compatible = true;
+                        adoptedNewerVersion = reported.version;
+                    }
+                }
+                if (!compatible) continue;
                 if (!(await (deps.isConnectable ?? tcpConnectable)(inst.origin))) continue;
-                attachDiag(`bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
+                attachDiag(adoptedNewerVersion !== undefined
+                    ? `bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — reports v${adoptedNewerVersion}, strictly NEWER than this lane's v${VERSION}: the older generation yields so this spawn rides the newer build instead of deadlocking behind it (#4125)`
+                    : `bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
                 return attachTo(inst);
             }
             return undefined;

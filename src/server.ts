@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
-import { detectStaleInstall } from "./update.js";
+import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { pckNoticeActive } from "./pck-notice.js";
@@ -98,11 +98,12 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
+import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -514,7 +515,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     if (shouldMuteStderrLegAfterFileLive(Boolean(process.env.BILI_LAUNCH_TOKEN?.trim()), process.stderr.isTTY)) {
         onFileLegLive(() => muteStderrLeg());
     }
-    const core = createCore();
+    // #4313 toggle (PR #5236): resolved ONCE per instance — stamping/rendering
+    // are baked into the pipeline nodes, so changing the flag needs a restart.
+    const core = createCore(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : undefined);
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound
@@ -645,9 +648,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
-    // a rebuild; different clients cross-wrote one shared proxy).
+    // a rebuild; different clients cross-wrote one shared proxy). The digest
+    // itself comes from our spawner when we have one (#4125): re-hashing under
+    // our own feet diverges from every attach/rotate gate the spawner already
+    // ran on the script it exec'd.
     const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    const ownFingerprint = resolveOwnFingerprint(process.env[SPAWN_FINGERPRINT_ENV], process.argv[1]);
     // #3801: our config shape EXACTLY as the registration below will record
     // it — the byte-stable pair for judging whether a contended-port holder
     // is a true duplicate or a config-drifted predecessor.
@@ -673,8 +679,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
     });
 
+    const instances = listInstances();
+    /** Both pre-persistence twin exits below share this tail: createEngineContext
+     *  has not run yet, so its configureLogger call has not happened either —
+     *  open the file leg here (mirroring it) so the twin line lands in bili.log
+     *  like the late-path twin line, gate on opts.log like every other
+     *  startServer line, and drain the stream before exiting or the buffered
+     *  line can be lost with the process. */
+    const exitBeforePersistence = async (hint: string): Promise<never> => {
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    };
     const earlyTwin = await findVerifiedSameLaneTwin(
-        listInstances(),
+        instances,
         opts.port,
         launcherLane,
         ownFingerprint,
@@ -682,22 +703,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        // createEngineContext has not run yet, so its configureLogger call
-        // has not happened either — open the file leg here (mirroring it) so
-        // the adopt line lands in bili.log like the late-path twin line, gate
-        // on opts.log like every other startServer line, and drain the stream
-        // before exiting or the buffered line can be lost with the process.
-        configureLogger(opts.logFile ?? defaultLogFile());
         // #4762: the twin verdict above rested on ONE health probe during
         // classification — a wedged zombie drains probes intermittently, so
         // re-probe at the moment of death and say which case we actually hit.
         const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, opts.port), knownPid: earlyTwin.pid });
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
-        logMsg(opts, "error", listenLine);
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
-        await closeLogger();
-        process.exit(eaddrinuseExitCode("twin-collision"));
+        await exitBeforePersistence(` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`);
+    }
+    // #4977: the verified path above only adopts an occupant that PROVES itself
+    // healthy. The complement case — same-build twin marker whose socket still
+    // accepts connections but whose health probe is silent (dying or
+    // event-loop-wedged, #3654) — used to fall through into persistence init
+    // and open index.db under the zombie before the listen failed EADDRINUSE
+    // (two-writer window #3923/#3959). Same outcome, decided earlier: once the
+    // bind proved the port busy, the late policy classified this exact registry
+    // evidence and fail-fast-exited with the identical code.
+    // #5018 decision (owner, 2026-10-31): option A — the early adopt-exit wins
+    // over #5016's late ladder for this unstamped same-lane corner; the
+    // cross-lane squatter form stays ladder-off (lane matching excludes it).
+    const presentTwin = await findPresentUnverifiedSameLaneTwin(
+        instances,
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+        (origin) => tcpConnectable(origin),
+    );
+    if (presentTwin !== undefined) {
+        await exitBeforePersistence(` — port ${opts.port} is still held by a same-build bili instance (pid ${presentTwin.pid}, lane ${launcherLane}) whose health probe is silent while its socket accepts connections: it is dying or event-loop-wedged (#3654), not serving — exiting before persistence initialization instead of opening index.db under it (#3923/#3959 two-writer window); the spawner reads this exit as an adopt signal and retries once the port frees (#4811/#4977).`);
     }
 
     const engine = await createEngineContext(opts);
@@ -1159,6 +1192,43 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const PREDECESSOR_WAIT_MS = 500;
     let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
     let predecessorWaitAnnounced = false;
+    // #4125: a strictly NEWER same-lane build holding our target port is not
+    // a "predecessor being replaced by an upgrade" — nothing is draining there,
+    // and laddering would fork the lane into a dual instance behind a port
+    // nobody routes to anymore (the two-install deadlock: the spawner's attach
+    // gate rejects the holder's foreign bytes, #3544 rotation only reaches
+    // strictly OLDER residents, and every new spawn loses the bind race). On
+    // confirmation the child exits with the #3654 adoption signal so the
+    // spawner rides the newer build. Probed once PER PORT and then cached
+    // (confirmed = {pid, version}, denied = null): a denial on port N says
+    // nothing about port N+1. Manual starts (no launch token) keep their legacy
+    // ladder semantics — only a spawner honors the adoption exit code — and so
+    // does an upgrade-replacement (its spawner owns the drain wait, never an
+    // adoption).
+    const newerHolderByPort = new Map<number, { pid: number; version: string } | null>();
+    const findNewerSameLaneHolder = async (port: number): Promise<{ pid: number; version: string } | null> => {
+        const cached = newerHolderByPort.get(port);
+        if (cached !== undefined) return cached;
+        let found: { pid: number; version: string } | null = null;
+        if (launchToken !== undefined && !upgradeReplacement && launcherLane !== undefined && ownFingerprint !== undefined) {
+            for (const entry of listInstances()) {
+                if (entry.port !== port || entry.lane !== launcherLane) continue;
+                if (entry.portReleasedAt !== undefined || !isPidAlive(entry.pid)) continue;
+                if (entry.codeFingerprint === ownFingerprint) continue; // twin/drifted paths own those
+                if (!sameInstanceShape(entryShape(entry), ownShape)) continue;
+                // Positive proof only: the live listener must answer health as
+                // EXACTLY the registry entry's claimed pid AND report a build
+                // strictly newer than ours (#4982 discipline).
+                const info = await probeOwnerInfo(entry.origin);
+                if (info?.pid === entry.pid && info.version !== undefined && isVersionNewer(info.version, VERSION)) {
+                    found = { pid: entry.pid, version: info.version };
+                    break;
+                }
+            }
+        }
+        newerHolderByPort.set(port, found);
+        return found;
+    };
     // #3923: per-session writer marker (session-level split-brain visibility) —
     // wired in announceListening, disposed on graceful shutdown.
     let servedWriter: ServedMarkerWriter | undefined;
@@ -1483,6 +1553,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             let busyReason: FailFastReason | undefined;
             let peer: SameLanePeer | undefined;
+            // #4125: set on the first contended-port check when that port was
+            // proven held by a strictly newer same-lane build (see hint below).
+            let newerHolds: { pid: number; version: string } | null | undefined;
             if (isPortBusyError(err.code, lastTriedPort)) {
                 // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
                 // holder squats the IPv4 bind) as EACCES on an unprivileged port —
@@ -1510,9 +1583,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 // shutdown() may have raced the probe — its own exit path owns
                 // the outcome from here on.
                 if (shuttingDown) return;
+                // #4125: before judging the EADDRINUSE, check whether the
+                // contended port holds a STRICTLY NEWER same-lane build — the
+                // upward-adoption verdict (registry claim + answered health
+                // agreeing on pid, version strictly above ours).
+                newerHolds = await findNewerSameLaneHolder(lastTriedPort);
+                if (shuttingDown) return;
                 const action = decideEaddrinuse({
                     upgradeReplacement,
                     twinHolds,
+                    newerHolderHolds: newerHolds !== null,
                     launchToken: launchToken !== undefined,
                     strictPort,
                     attempts: listenAttempts,
@@ -1544,7 +1624,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const hint =
                 isPortBusyError(err.code, lastTriedPort)
                     ? busyReason === "twin-collision"
-                      ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
+                      ? newerHolds !== undefined && newerHolds !== null
+                        ? ` — port ${lastTriedPort} holds a STRICTLY NEWER bili build v${newerHolds.version} (pid ${newerHolds.pid}, lane ${launcherLane}) than this v${VERSION} — exiting instead of hopping: nothing over there is draining, the older generation yields when the resident proves itself newer, and our spawner reads this exit as an adopt signal and rides the newer build instead of deadlocking behind it (#4125/#3544/#3654).`
+                        : ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
                       : busyReason === "upgrade-replacement"
                         ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
                         : busyReason === "strict-port"
@@ -1817,6 +1899,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
 
 export type Prepared = {
     body: string | Buffer;
+    /** The pre-serialization form of `body` when the lane built it as an
+     *  object (every prepare-* does: `body` is JSON.stringify(rebuilt)).
+     *  Consumers that would re-parse the string (image walk, overhead
+     *  estimate) read this instead — JSON round-trips are structurally
+     *  equal, and one full-body parse per consumer per turn is pure CPU
+     *  (#2078 seam rationale applied to the prepared body). */
+    parsedBody?: unknown;
     session: Session;
     processedMessages: CoreMessage[];
     /** Original CoreMessages from the protocol conversion, BEFORE processTurn
@@ -3402,13 +3491,13 @@ export function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.parsedBody ?? prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
     const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const textEstimate = estimateCoreMessages(msgs);
-    const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
+    const overheadEstimate = estimateWireOverhead(prepared.protocol, (prepared.parsedBody as Record<string, unknown> | undefined) ?? prepared.body);
     // #1498-F1: the arm value is not only a preflight floor — the kernel's
     // tool-result truncation loop consumes it as its remaining-depth input, so
     // an optimistic text estimate (chars/4 undercounts dense JSON/code by up to

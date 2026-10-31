@@ -604,22 +604,26 @@ export async function prepareAnthropic(
     // above failed, processedMessages is empty and the forwarded body is the
     // UNPROCESSED projection — measure that instead so the fallback isn't
     // blinded to a system+tools-only floor.
+    // Unprocessed projection — measure that instead so the fallback isn't
+    // blinded to a system+tools-only floor. The image reserve is shared by
+    // both calibers below (one tree walk instead of two).
+    const imageReserve = imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        + imageReserve;
     // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
     // char-count upper bound) — settleUsageReport pairs it with this turn's
     // usage report to learn the per-route estimate-calibration factor k̂.
     session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        + imageReserve;
     // #4805: id-membership evidence for the settle gate — the envelope ids
     // when the lane sends them (any rollout state), else the tool-call ids
     // resent in the history. Placed after the payload row above so the
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's
