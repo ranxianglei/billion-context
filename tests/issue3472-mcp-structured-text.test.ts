@@ -7,7 +7,9 @@
 // structuredContent self-contained: it carries the full report itself
 // (structured.text = out.text, byte-identical to content[0].text) alongside
 // the machine fields. Pinned here through the REAL shim over stdio JSON-RPC:
-//   1. success envelopes (acp_status / acp_cache / search_context / decompress):
+//   1. success envelopes (acp_status / acp_cache / search_context / decompress
+//      / acp_retrieve — #4836 added retrieve; its export pointer was the last
+//      unlisted carrier of the same bare-{outcome} loss):
 //      structuredContent.text === content[0].text byte-for-byte, outcome kept;
 //   2. compress applied/partial: the #2752 machine fields are unchanged, the
 //      text is present and byte-stable (partial incl. the marker line);
@@ -33,6 +35,7 @@ const STATUS_REPORT = [
 const CACHE_REPORT = "GRAND LEDGER:\ntotal input 1,000,000 · cached 960,000 (96.0%)\nFOLD ECONOMICS:\nb1 net saved 12,000 — paid back";
 const SEARCH_REPORT = 'Found 2 block(s) for "auth":\n\n[b2] "Auth System Exploration" — m00010–m00050';
 const DECOMPRESSED_BODY = "[decompress b1 m00001–m00010: restored 10 item(s) — full content follows]\n<original bytes>";
+const RETRIEVE_RECEIPT = "[acp-retrieved #m00013 · tool_result · 7,093 tok · 120 lines]\nOriginal exported to /state/billion-context/retrieve/m00013.txt — read it with your file tool.";
 const APPLIED_TEXT = "[Compressed m00001–m00100 → 2 block(s), ~5000 tokens saved.]";
 const PARTIAL_TEXT = "[Compressed m00001–m00200 → 1 block(s), ~4000 tokens saved. Errors: m00101–m00200: unknown ref]";
 const REFUSED_TEXT = "[Compression FAILED: requested range(s) resolved to no messages]";
@@ -138,6 +141,7 @@ describe("#3472: structuredContent carries the full report for structured-prefer
         proxy.canned.set("acp_cache", { ok: true, result: CACHE_REPORT, outcome: "success" });
         proxy.canned.set("search_context", { ok: true, result: SEARCH_REPORT, outcome: "success" });
         proxy.canned.set("decompress", { ok: true, result: DECOMPRESSED_BODY, outcome: "success" });
+        proxy.canned.set("acp_retrieve", { ok: true, result: RETRIEVE_RECEIPT, outcome: "success" });
         proxy.canned.set("compress", { ok: true, result: APPLIED_TEXT, outcome: "applied", blocksCreated: 2 });
         client = new WireShimClient({ ...process.env, BILI_MCP_PROXY: proxy.origin, BILI_CONVERSATION_ID: "conv-wire-3472" });
         await client.init();
@@ -177,6 +181,14 @@ describe("#3472: structuredContent carries the full report for structured-prefer
             assert.equal(r.content?.[0]?.text, body, `${name}: content text byte-stable`);
             assert.deepEqual(r.structuredContent, { text: body, outcome: "success" }, `${name}: structured carries the full body`);
         }
+    });
+
+    it("acp_retrieve success (#4836): the export pointer rides structuredContent too", async () => {
+        const r = await call("acp_retrieve", { ref: "m00013" });
+        assert.notEqual(r.isError, true);
+        assert.equal(r.content?.[0]?.text, RETRIEVE_RECEIPT);
+        assert.deepEqual(r.structuredContent, { text: RETRIEVE_RECEIPT, outcome: "success" },
+            "a host that renders only structuredContent must still see the retrieval pointer");
     });
 
     it("compress applied: the #2752 machine fields stay intact, text rides alongside", async () => {
