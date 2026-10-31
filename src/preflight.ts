@@ -2762,9 +2762,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     // regime-independent — coverage-based, they hold under the #330 relax flip
                     // too, so the span is skipped for the rest of this invocation and
                     // remembered across invocations. Zone/min-gate/length verdicts can clear
-                    // mid-invocation (relax, newer messages) and stay retryable. Raw errors,
-                    // not the truncated verdict: the named-block list must survive intact.
-                    const named = parseStructuralEmptyVerdict(preview.result.errors.join("\n"));
+                    // mid-invocation (relax, newer messages) and stay retryable. #4521 moved
+                    // the structural-empty verdicts from FAILED errors to success warnings
+                    // ("folded nothing — ..."); raw errors AND warnings, not a truncated
+                    // rendering: the named-block list must survive intact.
+                    const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
                     if (named !== null) {
                         skipSet.add(skipKey);
                         recordDeadRange(deps.session, startRef, endRef, named);
