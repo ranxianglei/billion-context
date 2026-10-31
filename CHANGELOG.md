@@ -22,6 +22,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - Claude Code 子代理的 bili 调用不再路由到父会话:Task 子代理与父线程共用一个 MCP shim,启动时抓的绑定只指向父会话;子代理压缩错对象或永久 409。现在 shim 把 host 盖在每次 tools/call 上的 `_meta["claudecode/toolUseId"]` 转发为 body `toolCallId`,代理用它出站时记下的 id→会话映射直接路由到子代理自己的 lane(10 分钟 TTL);id 未知时行为与从前完全一致(#4580)。
 
 ### Added
+- **消息时间戳渲染默认开启（#4313 后续）**:此前 `compress.messageTimestamps` 为可选特性（默认关，线上字节与特性前逐字节一致）。生产会话的缓存审计（同会话开关前后命中率均 95.0%、无一条时间戳导致的前缀重写 miss、全部异常可归因上游 TTL 驱逐）证实存戳渲染跨轮逐字节稳定，故默认翻转为**开**：`time=` 压缩标签属性、回执指纹行 `[起 – 止]` 覆盖跨度、摘要 Occurred 行对所有人默认可见（每条消息首次出现时铸一次不可变墙钟戳，渲染只读存戳不读墙钟）。关闭方式不变：文件 `compress.messageTimestamps: false` 或 `BILI_MESSAGE_TIMESTAMPS=0`，关闭后每个出站字节与 pre-#4313 master 一致。升级用户的一次性代价：标志首次解析为开的那个重启后，每个活跃会话付一次冻结前缀缓存重写（旧消息补上 time= 属性 + 提示词变体切换），之后稳定。测试基线：tests/preload-test-env.mjs 整套件 pin 显示门控关，字节对比型金标保持特性前形态；issue4313 toggle 套件按新契约翻转并新增 message-timestamps-default-on.test.ts 钉住生产默认路径。
 
 ### #5079 — `prompt_cache_key` 自注入默认关闭,`promptCache.routing` 一个开关管住两条 wire
 
