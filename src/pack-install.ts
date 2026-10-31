@@ -31,7 +31,7 @@ export const PACK_ENTRY_FILE = "bili-pack.json";
 
 const NPM_TIMEOUT_MS = 120_000;
 
-export interface PackInstallOptions {
+interface PackInstallOptions {
     /** Target `./.billion-context/packs/` instead of the user-dir default. */
     project?: boolean;
     /** Replace an existing pack file (refused otherwise). */
