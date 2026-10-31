@@ -791,3 +791,96 @@ test("#5175 A: the anthropic wire leaves genuine markup and prose alone", async 
         );
     }
 });
+
+// ---------- #5175 defect A on the GOOGLE (Gemini) wire ----------
+
+// `processGoogle` is a THIRD independent fast path with its own gate, so passing
+// openai-chat and responses says nothing about it either. Measured on pristine
+// master (`e209109bf`): the reported paragraph forwards with refs=3 openers=3 at
+// every chunk size, and DRIFTED forwards whole with refs=1 openers=1; on this
+// branch both are zero at every size. Same tripwire role as the anthropic block
+// above — without it the Gemini gate has no end-to-end coverage.
+function googleFrame(parts: Array<Record<string, unknown>>, finishReason?: string): string {
+    const candidate: Record<string, unknown> = { index: 0, content: { role: "model", parts } };
+    if (finishReason) candidate["finishReason"] = finishReason;
+    return `data: ${JSON.stringify({ modelVersion: "gemini-test", candidates: [candidate] })}\n\n`;
+}
+
+function driveGoogleOnce(pieces: string[]): Promise<string> {
+    const evs = pieces.map((p, i) =>
+        googleFrame([{ text: p }], i === pieces.length - 1 ? "STOP" : undefined),
+    );
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_goog_" + Math.random().toString(36).slice(2),
+        protocol: "google",
+    } as unknown as Session;
+    return pipePluginChatWithStrip(
+        streamOfLocal(evs),
+        res as unknown as import("node:http").ServerResponse,
+        "google",
+        session,
+        undefined,
+        undefined,
+    ).then(() => {
+        let acc = "";
+        for (const line of writes.join("").split("\n")) {
+            const t = line.trim();
+            if (!t.startsWith("data:")) continue;
+            const body = t.slice(5).trim();
+            if (body.length === 0 || body === "[DONE]") continue;
+            let ev: Record<string, unknown>;
+            try {
+                ev = JSON.parse(body) as Record<string, unknown>;
+            } catch {
+                continue;
+            }
+            const cands = ev["candidates"];
+            if (!Array.isArray(cands)) continue;
+            for (const c of cands as Array<Record<string, unknown>>) {
+                const content = c["content"] as Record<string, unknown> | undefined;
+                const parts = content?.["parts"];
+                if (!Array.isArray(parts)) continue;
+                for (const p of parts as Array<Record<string, unknown>>) {
+                    if (typeof p["text"] === "string") acc += p["text"];
+                }
+            }
+        }
+        return acc;
+    });
+}
+
+for (const [name, text] of [
+    ["the reported paragraph", REPORTED],
+    ["a drifted unit with a non-enum close", DRIFTED],
+] as Array<[string, string]>) {
+    test(`#5175 A: the google wire never carries the drift residue (${name})`, async () => {
+        for (const size of [1000, 40, 7, 1]) {
+            const got = await driveGoogleOnce(chunked(text, size));
+            assert.equal(
+                (got.match(/m\d{4,}/g) ?? []).length,
+                0,
+                `a kernel ref reached the google client at size=${size}: ${JSON.stringify(got)}`,
+            );
+            assert.ok(
+                !/<(?:acpt|apct|acct|acad|acme|accent|actp)\b/i.test(got),
+                `a drifted render-opener reached the google client at size=${size}: ${JSON.stringify(got)}`,
+            );
+        }
+    });
+}
+
+test("#5175 A: the google wire leaves genuine markup and prose alone", async () => {
+    const html = 'The formula is x<sup>2</sup> and <span class="a">z</span> is the label.';
+    for (const size of [1000, 7, 1]) {
+        const got = await driveGoogleOnce(chunked(html, size));
+        assert.equal(got, html, `genuine markup must survive the google lane verbatim at size=${size}`);
+    }
+    for (const size of [1000, 7, 1]) {
+        const prose = "Here is the report. That is all.";
+        const got = await driveGoogleOnce(chunked(prose, size));
+        assert.equal(got, prose, `prose must survive the google lane verbatim at size=${size}`);
+    }
+});
