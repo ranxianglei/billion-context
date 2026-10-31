@@ -14,6 +14,7 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    contentStorePinned,
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
@@ -32,7 +33,7 @@ import { createInitialState, defaultCountTokens, prune, type CompressionState, t
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedMetadata, lazyMetadata, peekSession, sessionWeight } from "./session.js";
+import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
@@ -645,25 +646,35 @@ export class SessionStore {
         ]);
     }
 
-    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
-        if (!this.enabled) return null;
-        // #3399/#3765: probe the winning source's CCR BEFORE rels[0]. Adoption
-        // rewrites meta.upstreamOrigin to the requesting route during loadSync,
-        // so rels[0] targets that route's sidecar — a degraded current-route twin
-        // with a valid-but-incomplete CCR would otherwise shadow the winning
-        // ledger's originals (missing refs → DIGEST DRIFT). A .fb.json fallback
-        // source keeps its canonical <base>.content-store.json name.
+    /** #4788 phase 2: candidate on-disk locations of id's content-store
+     *  envelope, in probe order — the winning source's canonical sidecar
+     *  (#3399/#3765: first, because adoption rewrites meta.upstreamOrigin to
+     *  the requesting route during loadSync, so rels[0] targets that route's
+     *  sidecar and a degraded current-route twin with a valid-but-incomplete
+     *  CCR would otherwise shadow the winning ledger's originals → DIGEST
+     *  DRIFT; a .fb.json fallback source keeps its <base>.content-store.json
+     *  name), then the rel-path candidates, then every .json file on disk
+     *  whose name matches the id. BOTH consumers must go through this —
+     *  readContentStoreRels (parse) and contentStoreLanded (existence proof)
+     *  — so the drop gate can never go positive on a path the reader would
+     *  not consult. */
+    private candidateContentStorePaths(id: string, rels: string[]): string[] {
         const source = this.sourceFiles.get(id);
         const sourceCcr = source
             ? (source.endsWith(".fb.json")
                 ? `${source.slice(0, -".fb.json".length)}.content-store.json`
                 : `${source.slice(0, -".json".length)}.content-store.json`)
             : null;
-        const paths = [...(sourceCcr ? [sourceCcr] : []),
+        return [...new Set([
+            ...(sourceCcr ? [sourceCcr] : []),
             ...rels.map(rel => path.join(this.sessionsDir, rel)),
             ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
-                .map(file => file.replace(/\.json$/, ".content-store.json"))];
-        for (const file of new Set(paths)) {
+                .map(file => file.replace(/\.json$/, ".content-store.json"))])];
+    }
+
+    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
+        if (!this.enabled) return null;
+        for (const file of this.candidateContentStorePaths(id, rels)) {
             let buf: Buffer;
             try {
                 buf = readFileSync(file);
@@ -2955,9 +2966,10 @@ export class SessionStore {
      *      stays a small proxy).
      *  D1-A hard cap: exceeding BILI_SESSION_RESIDENT_HARD_MAX_BYTES forces
      *  this same discharge even for sessions exempt from pool eviction and
-     *  warns once per 60 s. The non-droppable remainder (state/contentStore/
-     *  transient) is out of scope here — per-field discharge for those is a
-     *  second stage TODO(owner). Errors are swallowed by design: this is idle
+     *  warns once per 60 s. The non-droppable remainder (state/transient) is
+     *  out of scope here — state is hot every turn; transient is a separate
+     *  TODO(owner). The content store became droppable in phase 2
+     *  (dropResidentContentStore). Errors are swallowed by design: this is idle
      *  upkeep at a request boundary, never caller-critical. */
     async spillBetweenTurns(session: Session): Promise<void> {
         if (session.inFlight > 0) return;
@@ -2974,7 +2986,7 @@ export class SessionStore {
             const now = Date.now();
             if (now - (this.capWarnAt.get(session.id) ?? 0) >= 60_000) {
                 this.capWarnAt.set(session.id, now);
-                this.log("warn", `[persist] ${session.id}: resident estimate ${sessionWeight(session)} B exceeds the per-session hard cap ${cap} B (#4788 D1-A) — discharging droppable fields back to disk now, including pool-exempt sessions; remainder (state/contentStore/transient) is non-droppable`);
+                this.log("warn", `[persist] ${session.id}: resident estimate ${sessionWeight(session)} B exceeds the per-session hard cap ${cap} B (#4788 D1-A) — discharging droppable fields back to disk now, including pool-exempt sessions; remainder (state/transient) is non-droppable`);
             }
         }
         this.runIdleSpill(session);
@@ -2995,7 +3007,7 @@ export class SessionStore {
     private runIdleSpill(session: Session): void {
         if (session.inFlight > 0) return;
         // Disk-proof gate: durableRevision EQUAL to the live epoch means every
-        // markDirty since the last disk proof has itself landed, so all three
+        // markDirty since the last disk proof has itself landed, so all four
         // fields are reconstructable from disk via their narrow-read loaders;
         // anything newer keeps them resident until its own save settles.
         // (convergeToDisk and the drop internals are untouched — invariant #3:
@@ -3004,6 +3016,7 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
     }
 
     /** #4788 D2/D1-A: stamp that the disk copy of id now covers the given
@@ -3044,6 +3057,7 @@ export class SessionStore {
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
             return;
         }
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
@@ -3061,6 +3075,7 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
         this.drainFlushWaiters(session.id, true);
     }
 
@@ -3177,6 +3192,58 @@ export class SessionStore {
         session.blockContents = lazy;
     }
 
+    /** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): the CCR
+     *  content store folds away too — by the time this runs its last growth has
+     *  provably landed (durableRevision gate above + contentStoreDirty veto,
+     *  because adoptContentStore marks dirty exactly when refs appear), so the
+     *  non-empty originals live in the unified ccr mirror and/or the
+     *  .content-store.json sidecar (payload-first write order, #2674). The proxy
+     *  is never undefined while held: saveContentStore, the ingest's ccr_json /
+     *  ccr_entries, fork records and publicSnapshotStoredRefs all see the full
+     *  set transparently — only RAM goes quiet, one narrow read per burst.
+     *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
+     *  behavior for operators who want it. */
+    private dropResidentContentStore(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        if (isDroppedContentStore(session.contentStore)) return;
+        if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
+        if (contentStorePinned()) return;     // owner escape hatch
+        const store = session.contentStore;
+        if (!store || Object.keys(store.byRef).length === 0) return; // nothing to fold
+        const meta = session.meta ?? undefined;
+        if (!this.contentStoreLanded(session.id, meta)) {
+            // No provably-landed copy on disk — folding would make the next
+            // touch throw where a resident set still exists. Fork children are
+            // the canonical case: their store rides in the ENVELOPE's
+            // forkContentStore with no sidecar of their own; staying resident
+            // costs a few KB at fork time. The lazy loader below has exactly
+            // these two sources, so prove one of them before dropping RAM.
+            return;
+        }
+        session.contentStore = lazyContentStore(session.id, (id) =>
+            this.unifiedCcrFor(id)
+            ?? this.contentStoreById(id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }));
+    }
+
+    /** #4788 phase 2, landing proof for dropResidentContentStore: mirrors the
+     *  lazy loader's candidate set (unified ccr mirror first, then the same
+     *  sidecar paths readContentStoreRels probes) and answers "will the next
+     *  touch find data?" WITHOUT parsing — the mirror read is one narrow index
+     *  fetch, the rest is pure existence checks. Conservative by design: any
+     *  uncertainty keeps the store resident. */
+    private contentStoreLanded(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): boolean {
+        if (this.unifiedCcrFor(id) !== null) return true;
+        // Same candidate set the lazy loader probes (candidateContentStorePaths);
+        // existence checks only, no parsing.
+        for (const p of this.candidateContentStorePaths(id, [
+            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
+            contentStoreRelPathFor(id),
+        ])) {
+            try { if (existsSync(p)) return true; } catch { /* probe only */ }
+        }
+        return false;
+    }
+
     /** #5188: recover a sidecar whose FIRST synchronous open died on a
      *  transient OS error (fd exhaustion under test/CI load, momentary
      *  disk-full, a spike of EBUSY). Before this, one failure at
@@ -3243,6 +3310,7 @@ export class SessionStore {
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
             return true;
         }
         // Mirror the kernel flushSync contract: a sync commit supersedes any
@@ -3263,6 +3331,7 @@ export class SessionStore {
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
         }
         return ok;
     }
@@ -3289,6 +3358,7 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
     }
 
     async recoverCompletedFork(id: string): Promise<void> {
