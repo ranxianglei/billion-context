@@ -8,25 +8,23 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { rmrf } from "./tmp-rm.ts";
 
-// Two LIVE proxy instances over one sessions dir (#394 shape, end-to-end).
-//
-// What is proven here — the documented contract only, not multi-writer
-// coherence (src/persist.ts deliberately rejects an election/lock):
-//   1. both instances keep serving through interleaved turns on the SAME
-//      session id (no crash, no head-of-line poisoning across processes);
-//   2. the on-disk record stays a valid envelope at EVERY observed moment
-//      (atomic tmp+rename) while two processes write it;
-//   3. stats.requests on disk NEVER decreases (the #405 monotonic-counter
-//      guard holds under real traffic, not just unit-shaped writes);
-//   4. a stale resident's write is rejected AND the resident converges to the
-//      newer disk lineage (#2401) — observable as: A's post-convergence write
-//      is accepted and continues the DISK counter, not A's stale one;
-//   5. the late-starting instance warns about the overlap (#394) at
-//      registration.
-//
-// NOT proven (documented residuals, pinned separately in
-// tests/multi-instance-persist.test.ts): tie passthrough, counter catch-up
-// re-clobber, content-store last-writer-wins.
+// One LIVE proxy instance serving a session, plus a SECOND instance whose
+// boot over the SAME sessions dir must be REFUSED (owner decision chain
+// #5046 -> 2026-10-30 "no degradation in any case"). End-to-end proof that:
+//   1. the surviving instance (A) keeps serving through real traffic and the
+//      on-disk record stays a valid envelope at EVERY observed moment
+//      (atomic tmp+rename), with stats.requests NEVER decreasing (#405
+//      monotonic-counter guard under real traffic);
+//   2. the late-starting instance B dies at boot with ONE actionable error
+//      (isolate via BILI_SESSIONS_DIR / BILI_CONFIG_FILE) and a non-zero
+//      exit code — NOT the old legacy-degraded coexistence. The old
+//      serve-guard-converge interleave (#394/#2401, former phases 2-4) is
+//      unreachable by construction now: the double-writer never starts. Its
+//      envelope guards remain pinned at unit level in
+//      tests/multi-instance-persist.test.ts and stay reachable through manual
+//      file edits. Cross-lane sharing (distinct lanes, one dir) stays SUPPORTED
+//      (#5082/#5091) and is pinned in
+//      tests/issue5046-second-writer-degrade.test.ts.
 
 const SESSION = "mi-live-session";
 const MODEL = "claude-sonnet-4-5";
@@ -52,6 +50,49 @@ interface Child {
     proc: ReturnType<typeof spawn>;
     port: number;
     stderr: string[];
+}
+
+interface Refusal {
+    exitCode: number | null;
+    stderr: string;
+}
+
+/** Spawns a child that is expected to DIE AT BOOT (no MI_READY) and collects
+ *  its exit code + full stderr — the refusal-policy counterpart of
+ *  spawnChild's success path. */
+async function spawnChildRefusing(upstreamPort: number | string, env: NodeJS.ProcessEnv): Promise<Refusal> {
+    const proc = spawn(process.execPath, ["--import", "tsx", join(import.meta.dirname, "fixtures/multi-instance-child.ts"), String(upstreamPort)], {
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    let ready = false;
+    let stdoutBuf = "";
+    const stderrChunks: string[] = [];
+    proc.stdout!.setEncoding("utf8");
+    proc.stdout!.on("data", (c: string) => {
+        stdoutBuf += c;
+        if (stdoutBuf.includes("MI_READY")) ready = true;
+    });
+    proc.stderr!.setEncoding("utf8");
+    proc.stderr!.on("data", (c: string) => stderrChunks.push(c));
+    const code = await new Promise<number | null>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("child did not refuse within 30s")), 30_000);
+        proc.on("exit", (c) => {
+            clearTimeout(timer);
+            resolve(c);
+        });
+        // A child that DID become ready violated the expectation — fail fast.
+        const poll = setInterval(() => {
+            if (ready) {
+                clearInterval(poll);
+                clearTimeout(timer);
+                proc.kill("SIGTERM");
+                reject(new Error("child became READY — expected a boot refusal"));
+            }
+        }, 100);
+        proc.on("exit", () => clearInterval(poll));
+    });
+    return { exitCode: code, stderr: stderrChunks.join("") };
 }
 
 async function spawnChild(upstreamPort: number | string, env: NodeJS.ProcessEnv): Promise<Child> {
@@ -167,6 +208,12 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
 
     const childEnv = (p: number): NodeJS.ProcessEnv => ({
         ...process.env,
+        // The global baseline preload pins BILI_STORAGE_UNIFIED=legacy process-wide;
+        // spread into every child it would keep them BOTH legacy — A would never
+        // write the sidecar lockfile and B would have nothing to refuse over
+        // (boot-refusal needs a live foreign writer holding the shared index.db).
+        // Pin the production default so the refusal contract runs like a real boot.
+        BILI_STORAGE_UNIFIED: "full",
         BILI_SESSIONS_DIR: sessionsDir,
         XDG_STATE_HOME: stateDir,
         // #5012: non-TTY pipes now mute once the file leg proves live; this
@@ -200,44 +247,31 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
         const warmed = await waitFor(sessionsDir, (v) => v.requests >= 3, "A's 3 turns persisted");
         assert.equal(warmed.requests, 3, "each turn must count exactly once");
 
-        // Phase 2 — instance B boots over the SAME dir (boot-hydrates the
-        // session), serves 2 turns. B's writes must be fresh (accepted).
-        children.push(await spawnChild(upstreamPort, childEnv(2)));
-        const B = children[1]!;
-        await turn(B, 4);
-        await turn(B, 5);
-        await waitFor(sessionsDir, (v) => v.requests >= 5, "B's turns persisted (fresh lineage accepted)");
+        // Phase 2 (rewritten 2026-10-30, owner chain "#5046 -> no degradation
+        // in any case"): instance B booting over the SAME sessions dir now
+        // REFUSES TO START — exit 1 with the actionable isolation error —
+        // instead of the old serve-legacy-degraded coexistence. Consequence:
+        // the former Phase 3/4 stale-write + converge/tie interleave below is
+        // UNREACHABLE BY CONSTRUCTION (the second writer never runs); those
+        // envelope guards stay pinned at unit level in
+        // tests/multi-instance-persist.test.ts and remain reachable through
+        // manual/multi-process file edits. Cross-LANE sharing (distinct
+        // BILI_LAUNCHER_LANE) remains the supported shared topology (#5082/
+        // #5091, pinned in tests/issue5046-second-writer-degrade.test.ts).
+        const b = await spawnChildRefusing(upstreamPort, childEnv(2));
+        assert.equal(b.exitCode, 1, "instance B must die at boot, not serve degraded");
+        assert.ok(
+            b.stderr.includes("unified storage REFUSED") && b.stderr.includes("REFUSES TO START"),
+            `B's death must carry the actionable refusal (stderr tail: ${b.stderr.slice(-400)})`,
+        );
+        assert.ok(b.stderr.includes("BILI_SESSIONS_DIR"), "refusal names the fix");
 
-        // B registered last: it must have seen A and warned (#394).
-        const bErr = B.stderr.join("");
-        assert.ok(bErr.includes("#394"), "late starter must warn about the overlapping instance");
-        assert.ok(bErr.includes("another bili instance"), `unexpected warn text: ${bErr.slice(-400)}`);
-
-        // Phase 3 — the STALE resident: A never re-read the file (its pool
-        // entry is resident), so A's counter (3+1=4) is behind disk (5). Its
-        // write must be REJECTED (#405) and A must converge (#2401).
-        await turn(A, 6);
-        await new Promise((r) => setTimeout(r, 300));
-        const aErr1 = A.stderr.join("");
-        assert.ok(aErr1.includes("rejected stale snapshot"), `stale write must be rejected (stderr tail: ${aErr1.slice(-500)})`);
-
-        // Phase 4 — A's next write continues from the CONVERGED (disk)
-        // counter: 5+1=6, accepted; disk must show exactly 6.
-        await turn(A, 7);
-        const converged = await waitFor(sessionsDir, (v) => v.requests >= 6, "A's post-convergence write accepted");
-        assert.equal(converged.requests, 6, "converged resident must continue the DISK counter, not its stale one");
-
-        // End-state: the session still serves through BOTH instances. B is now
-        // itself behind (its resident counter is 5, disk is 6 after A's accepted
-        // write), so B's turn lands on the documented TIE: equal request
-        // counters + equal nextBlockId → staleDiskPayload returns null → the
-        // write passes through (last-writer-wins on ties, persist.ts:76-87).
-        // Either way the file must stay valid and the counter non-decreasing —
-        // the reader loop below is the real teeth for that.
-        await turn(B, 8);
-        const final2 = await waitFor(sessionsDir, (v) => v.requests >= 6, "B serves after A's convergence");
-        assert.equal(final2.requests, 6, "disk counter reflects the last accepted lineage (B tie-passthrough at 6)");
-
+        // A is UNAFFECTED by B's refused boot: it keeps serving fresh turns
+        // and the on-disk counter advances exactly as before.
+        await turn(A, 4);
+        await turn(A, 5);
+        const servedAfterRefusal = await waitFor(sessionsDir, (v) => v.requests >= 5, "A kept serving through B's refused boot");
+        assert.equal(servedAfterRefusal.requests, 5, "A's turns count exactly once each");
         // Reader loop verdict.
         clearInterval(reader);
         assert.ok(reads > 10, `reader loop ran (reads=${reads})`);
