@@ -177,23 +177,20 @@ test("#3818 ② disabled persistence reports intentionalOptOut with no degraded 
 // 3. The storageMode stamp tells the truth when the sidecar cannot open
 // ---------------------------------------------------------------------------
 
-test("#3818 ③ stamp says legacy when the sidecar failed to open (#3135 ③)", async () => {
+test("#3818 ③ an unopenable full-mode sidecar refuses to start (#3135 ③)", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
-    _setStoreForTest(new SessionStore({ enabled: false, dir: tmpDir("stamp-ref") }));
     try {
         const dir = tmpDir("stamp-dead");
-        // index.db-as-directory makes the sidecar open fail -> shadow undefined
+        // index.db-as-directory makes the sidecar open fail — under the
+        // no-degradation policy (#5213) that is a startup refusal, not a
+        // silent legacy stamp against a dead sidecar.
         fs.mkdirSync(path.join(dir, "index.db"), { recursive: true });
-        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
-        const session = makeSession("stamp-dead-session");
-        store.scheduleSave(session);
-        await settle();
-        const found = findStateFile(dir, "stamp-dead-session");
-        assert.ok(found, "the JSON envelope is written when the sidecar is dead");
-        const metadata = found.payload.metadata as Record<string, unknown>;
-        assert.equal(metadata.storageMode, "legacy", "stamp must describe the mode that actually holds data (no index.db copy exists)");
-        store.closeQuietly();
+        assert.throws(
+            () => new SessionStore({ enabled: true, dir, debounceMs: 0 }),
+            (err: unknown) => err instanceof Error && /unable to open database file|refus/i.test(err.message),
+            "an unopenable sidecar must refuse to start instead of degrading to legacy stamps",
+        );
         rmrf(dir);
     } finally {
         delete process.env.BILI_STORAGE_UNIFIED;
@@ -332,7 +329,7 @@ test("#3818 ⑤ bounded boot warms pure-index sessions (#3135 ⑥)", async () =>
 // 6. A sidecar 3-striking mid-build still lands the JSON write that tick
 // ---------------------------------------------------------------------------
 
-test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the same tick (#3135 ①)", async () => {
+test("#3818 ⑥ writerOff mid-build disable no longer writes an envelope: index-only IS the contract (#3135 ①, breaker removed)", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "0";
@@ -340,8 +337,11 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
         const dir = tmpDir("threestrike");
         const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         const session = makeSession("threestrike-session");
-        // Flip the sidecar to disabled DURING the build (exactly what the
-        // 3rd consecutive record failure does inside shadow.record).
+        // Flip the legacy 3-strike "disabled" flag DURING the build. The breaker
+        // and its same-tick JSON safety valve were removed (owner policy
+        // 2026-10-30): jsonWriter=off accepts index-only persistence and failed
+        // index writes are retried on every save — so this stub now proves
+        // nothing changes: no envelope appears, and the data lands in the index.
         const sh = (store as unknown as { shadow?: { record(r: unknown): void; stats: { disabled: boolean } } }).shadow;
         assert.ok(sh, "full mode opens a sidecar");
         const realRecord = sh.record.bind(sh);
@@ -352,13 +352,13 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
             sh.stats.disabled = true;
         };
         store.scheduleSave(session);
-        // windows-latest load can delay the debounce tick + fs visibility past the old fixed 400ms settle (#4161); poll for the envelope within a 15s budget instead —
-        // the same-tick guarantee under test lives in the code path (the disabled-mid-build branch writes JSON synchronously), not in the sleep length, and a
-        // genuinely dead fallback path still fails after the budget.
-        const envelopeLanded = await pollFor(() => findStateFile(dir, "threestrike-session") !== null, 15000);
+        // Short poll window: the envelope must STAY absent under writerOff.
+        const appeared = await pollFor(() => findStateFile(dir, "threestrike-session") !== null, 1500);
         sh.record = realRecord;
         assert.ok(calls >= 1, "the writerOff build reached the sidecar");
-        assert.ok(envelopeLanded, "the disabling tick must land a JSON write — no window where the save exists on neither copy");
+        assert.equal(appeared, false, "no JSON envelope under writerOff — the removed breaker's same-tick valve stays gone");
+        const served = store.loadSync("threestrike-session", { protocol: "openai", upstreamOrigin: "https://api.openai.com" });
+        assert.ok(served, "the save lives in the index (index-only persistence is the contract)");
         store.closeQuietly();
         rmrf(dir);
     } finally {

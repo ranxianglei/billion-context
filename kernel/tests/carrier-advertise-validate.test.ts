@@ -169,8 +169,9 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     }
   }
 
-  // Negative control: the OLD advertised dead spans still fail on apply —
-  // proving they were dead, so screening them out changes behavior.
+  // Negative control: the OLD advertised dead spans still fold nothing on
+  // apply — #4521 renders them as the covered no-op (0 blocks, 0 errors,
+  // warning naming the covering block), proving they were dead just the same.
   const deadSpan = core.applyCompression({
     ranges: [{ startRef: "m00017", endRef: "m00022", summary: "dead span" }],
     messages,
@@ -178,9 +179,12 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     config: cfg,
   });
   assert.equal(deadSpan.result.blocksCreated, 0);
-  assert.ok(
-    deadSpan.result.errors.some((e) => /contains no (new )?compressible messages/.test(e)),
-    deadSpan.result.errors.join("; "),
+  assert.equal(deadSpan.result.errors.length, 0);
+  assert.equal(deadSpan.result.noop, true);
+  assert.match(
+    deadSpan.result.warnings.join(" "),
+    /already covered by active block\(s\)|protected or filtered/,
+    deadSpan.result.warnings.join("; "),
   );
   const loneCarrier = core.applyCompression({
     ranges: [{ startRef: "m00007", endRef: "m00007", summary: "lone carrier" }],
@@ -189,10 +193,8 @@ test("selector never advertises spans the apply side structurally rejects (#2638
     config: cfg,
   });
   assert.equal(loneCarrier.result.blocksCreated, 0);
-  assert.ok(
-    loneCarrier.result.errors.some((e) => /contains no compressible messages/.test(e)),
-    loneCarrier.result.errors.join("; "),
-  );
+  assert.equal(loneCarrier.result.errors.length, 0);
+  assert.equal(loneCarrier.result.noop, true, "lone carrier folds nothing, as the no-op class");
 });
 
 test("buildCompressibleRanges treats a live carrier as a boundary; stale carriers fold", () => {

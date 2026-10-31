@@ -1,33 +1,33 @@
 /**
- * #5140/#5188 (strike-side half of the fix): the unified sidecar's 3-strike
- * disable latch used to count every ingest error equally. Under machine load
- * (CI shards: many test processes sharing one disk) sqlite surfaces
- * resource-class errors at write time — a lock held past the 5s busy_timeout,
- * a momentary disk-full, fd spikes ("briefly unavailable" signals that settle
- * on their own), NOT storage breakage. Counting them alongside corruption
- * turned ordinary load spikes into whole-process legacy-only degradations —
- * in the #5140 failure every CI red ended with exactly that state
- * (in-process probe evidence: "gateB-replicasUnavailable ... disj=disabled:
- * lastError=SQLITE_BUSY: database is busy"), and the fork raw-tail rebuild
- * fails closed at replicasAvailable() with HTTP 409 SNAPSHOT_UNAVAILABLE.
+ * #5140/#5188 strike-side — re-pinned to the FINAL owner policy (2026-10-30):
+ * there is NO circuit breaker at all. The old 3-strike latch (and #5188's
+ * transient-vs-structural classification, isTransientContentionError) was
+ * removed because "refusing to write" risks data loss in situations nobody
+ * can enumerate ("real life has a hundred causes; you only handle three") —
+ * so every ingest failure, whatever its shape, is recorded loudly (one warn
+ * per DISTINCT error message — no per-save spam for a stuck failure mode)
+ * and the NEXT save retries the index write unconditionally; recovery is
+ * instant once the cause clears. The JSON envelope keeps serving meanwhile
+ * either way, so no turn ever lands somewhere unsafe.
  *
- * Two gates ship here, both directions pinned (#3617 discipline):
- *  - isTransientContentionError: classification truth table;
- *  - noteIngestFailure through the REAL record() machinery: contention-class
- *    evidence never latches, structural evidence latches once and warns once,
- *    one healthy save resets the streak.
+ * Pinned both directions (#3617 discipline): resource-class evidence AND
+ * structural-class evidence both stay non-latching through the REAL
+ * record() machinery, lastError stays observable, healing is immediate, and
+ * the source itself contains no breaker machinery left behind.
  *
- * The open-side half of #5188 (a first synchronous open that dies transiently
- * is retried from the save path) has its own suite:
- * tests/issue5188-sidecar-recoverable-open.test.ts
+ * The open-side half of #5188 (demand-driven reopen from the save/read
+ * paths) is tested in tests/issue5188-sidecar-recoverable-open.test.ts; note
+ * it now only applies mid-process — a first open failure at boot refuses to
+ * start instead (round 3), and a proven-corrupt index is alarm-only with an
+ * operator hand-fix, never auto-retried (hadIntegrityQuickCheckFailure).
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { UnifiedShadow, isTransientContentionError } from "../src/storage/shadow.ts";
+import os from "node:os";
+import { UnifiedShadow } from "../src/storage/shadow.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 
@@ -83,41 +83,13 @@ function installFault(shadow: UnifiedShadow, message: string): () => void {
 const BUSY = "SQLITE_BUSY: database is busy";
 const NOTADB = "SQLITE_NOTADB: file is not a database";
 
-test("isTransientContentionError: truth table (#5140/#5188)", () => {
-    // resource class: real CI/engine strings — must NOT count toward the latch
-    assert.equal(isTransientContentionError(new Error(BUSY)), true);
-    assert.equal(isTransientContentionError(new Error("database is busy")), true, "wording alone");
-    assert.equal(isTransientContentionError(new Error("SQLITE_LOCKED: database table is locked")), true);
-    assert.equal(isTransientContentionError(new Error("table sessions is locked")), true);
-    assert.equal(isTransientContentionError(new Error("EBUSY: resource busy or owner died")), true, "Node errno toString shape");
-    assert.equal(isTransientContentionError(new Error("ENOSPC: no space left or device")), true);
-    assert.equal(isTransientContentionError(new Error("database or disk is full")), true);
-    assert.equal(isTransientContentionError(new Error("SQLITE_FULL: database or disk is full")), true);
-    assert.equal(isTransientContentionError(new Error("EMFILE: too many open files")), true);
-    assert.equal(isTransientContentionError(new Error("too many open files")), true, "fd-exhaustion wording alone");
-    assert.equal(isTransientContentionError(new Error("EFILE: file table overflow")), true);
-    assert.equal(
-        isTransientContentionError(new Error("unable to open database file")),
-        true,
-        "#3823 field signature: AV/OneDrive/MAX_PATH/sandbox lock-out at CANTOPEN",
-    );
-    assert.equal(isTransientContentionError(new Error("SQLITE_IOERR: disk I/O error")), true);
-    // structural / operator-evidence class: must keep counting toward the latch
-    assert.equal(isTransientContentionError(new Error("SQLITE_CORRUPT: database disk image is malformed")), false);
-    assert.equal(isTransientContentionError(new Error("database disk image is malformed")), false, "corruption wording alone");
-    assert.equal(isTransientContentionError(new Error(NOTADB)), false);
-    assert.equal(isTransientContentionError(new Error("file is not a database")), false, "NOTADB wording alone");
-    assert.equal(isTransientContentionError(new Error("attempt to write a readonly database")), false, "#4614 readonly evidence stays loud");
-    assert.equal(isTransientContentionError(new Error("session row missing after ingest: s1")), false, "internal invariant breach");
-});
-
-test("contention-class failures through record() never latch, then recover", () => {
+test("resource-class failures never latch — retries continue, then recover (#5140 final policy)", () => {
     const shadow = mkShadow();
     try {
         const off = installFault(shadow, BUSY);
         for (let i = 0; i < 6; i++) shadow.record(fix());
         off();
-        assert.equal(shadow.stats.disabled, false, "six contention-class failures stay non-latching");
+        assert.equal(shadow.stats.disabled, false, "six load-spike failures change nothing");
         assert.match(String(shadow.stats.lastError), /SQLITE_BUSY/, "evidence still observable in lastError");
         const before = shadow.stats.ingests;
         shadow.record(fix());
@@ -128,7 +100,7 @@ test("contention-class failures through record() never latch, then recover", () 
     }
 });
 
-test("structural failures latch exactly once with one warn line", () => {
+test("structural failures ALSO never latch — one warn, every save retries, instant heal (#5140 final policy)", () => {
     const shadow = mkShadow();
     const lines: string[] = [];
     setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
@@ -136,58 +108,23 @@ test("structural failures latch exactly once with one warn line", () => {
         const off = installFault(shadow, NOTADB);
         for (let i = 0; i < 4; i++) shadow.record(fix());
         off();
-        assert.equal(shadow.stats.disabled, true, "three structural strikes latch the sidecar");
-        assert.match(String(shadow.stats.lastError), /NOTADB|file is not a database/);
-        const disables = lines.filter((l) => /disabled after 3 consecutive failures/.test(l));
-        assert.equal(disables.length, 1, "latch warn fires exactly once (no per-save spam after)");
-        assert.equal(lines.filter((l) => /failed to ingest/.test(l)).length, 1, "first-failure warn also fires exactly once");
+        assert.equal(shadow.stats.disabled, false, "structural evidence must NOT disable anything any more");
+        assert.match(String(shadow.stats.lastError), /NOTADB|file is not a database/, "evidence stays observable");
+        assert.equal(lines.filter((l) => /failed to ingest/.test(l)).length, 1, "same message warns exactly once (no per-save spam)");
+        const before = shadow.stats.ingests;
         shadow.record(fix());
-        assert.equal(lines.filter((l) => /disabled after/.test(l)).length, 1, "still one after a later save");
+        assert.equal(shadow.stats.disabled, false);
+        assert.ok(shadow.stats.ingests > before, "healing is immediate once the cause clears — no probe/cooldown wait");
     } finally {
         setLogCapture(null);
         shadow.close();
     }
 });
 
-test("mixed contention + structural converges to the latch", () => {
-    const shadow = mkShadow();
-    try {
-        let off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // strike 1
-        off();
-        off = installFault(shadow, BUSY);
-        shadow.record(fix()); // ignored — contention
-        off();
-        off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // strike 2
-        off();
-        off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // strike 3 -> latch
-        off();
-        assert.equal(shadow.stats.disabled, true, "interleaved contention does not dilute structural evidence");
-    } finally {
-        shadow.close();
-    }
-});
-
-test("one healthy save resets the structural streak", () => {
-    const shadow = mkShadow();
-    try {
-        let off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // 1
-        off();
-        off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // 2
-        off();
-        shadow.record(fix()); // healthy -> counter back to 0
-        off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // 1 again
-        off();
-        off = installFault(shadow, NOTADB);
-        shadow.record(fix()); // 2 again — two, not four
-        off();
-        assert.equal(shadow.stats.disabled, false, "streak reset by the healthy save (no latch)");
-    } finally {
-        shadow.close();
-    }
+test("no breaker machinery remains in the source (#5188 classifier withdrawn)", () => {
+    const src = fs.readFileSync(path.join(import.meta.dirname ?? ".", "..", "src", "storage", "shadow.ts"), "utf8");
+    assert.doesNotMatch(src, /isTransientContentionError/, "transient/structural classifier is gone");
+    assert.doesNotMatch(src, /MAX_CONSECUTIVE_FAILURES/, "strike count is gone");
+    assert.doesNotMatch(src, /nextReenableProbeAt|REENABLE_PROBE_COOLDOWN_MS/, "re-enable probe is gone");
+    assert.match(src, /NEVER gives up on index writes/, "final policy is documented where it lives");
 });

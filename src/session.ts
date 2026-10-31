@@ -198,6 +198,73 @@ export function lazyMetadata(
     return proxy;
 }
 
+/** #4788 phase 2: proxies for CCR content stores currently folded away. */
+const droppedContentStoreProxies = new WeakSet<object>();
+
+/** True when the record is a lazy content-store proxy currently folded away. */
+export function isDroppedContentStore(value: unknown): boolean {
+    return typeof value === "object" && value !== null && droppedContentStoreProxies.has(value);
+}
+
+/** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): a session's
+ *  MessageContentStore that folded away after its save landed and re-materializes
+ *  on first touch — the exact shape contentStoreOf restores on a cold load.
+ *  Transparent Proxy over the plain-store shape ({version, byHash, byRef}): no
+ *  call-site changes; saveContentStore / ingest ccr_json+ccr_entries / fork /
+ *  publicSnapshotStoredRefs all walk it like any store and pay ONE narrow read
+ *  per burst. An unrecoverable drop throws on access instead of ever letting a
+ *  save write an EMPTY record where a non-empty one was proven durable (#2674
+ *  payload-first discipline, applied to discharge). */
+export function lazyContentStore(
+    sessionId: string,
+    loader: (id: string) => MessageContentStore | null,
+): MessageContentStore {
+    const target: Record<string, unknown> = {};
+    let dropped = true;
+    const ensure = (): void => {
+        if (!dropped) return;
+        const record = loader(sessionId);
+        if (!record || typeof record !== "object" || !("byRef" in record) || Object.keys(record.byRef as Record<string, unknown>).length === 0) {
+            throw new Error(`[persist] resident content store for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        Object.assign(target, record);
+        dropped = false;
+        droppedContentStoreProxies.delete(proxy);
+    };
+    const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+            ensure();
+            return Reflect.get(t, prop, receiver);
+        },
+        has(t, prop) {
+            ensure();
+            return Reflect.has(t, prop);
+        },
+        ownKeys(t) {
+            ensure();
+            return Reflect.ownKeys(t);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            ensure();
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        set(t, prop, value, receiver) {
+            ensure();
+            return Reflect.set(t, prop, value, receiver);
+        },
+        deleteProperty(t, prop) {
+            ensure();
+            return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+            ensure();
+            return Reflect.defineProperty(t, prop, desc);
+        },
+    });
+    droppedContentStoreProxies.add(proxy);
+    return proxy as unknown as MessageContentStore;
+}
+
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
  *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
@@ -1148,23 +1215,26 @@ export function zeroStats(): Session["stats"] {
     return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
-    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
-    const existing = sessions.get(id);
-    if (existing) {
-        existing.lastSeen = Date.now();
-        existing.restored = false;
-        // Fill in protocol/upstream/label meta on an existing session if the caller
-        // now knows it (e.g. a session was created by loadAll without meta).
-        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
-        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
-        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
-        return existing;
-    }
-    // Memory miss: try reload from disk (e.g. after LRU eviction).
-    const store = getStore();
-    makeResidentRoom();
-    const reloaded = store.loadSync(id, meta);
+type SessionMeta = { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string };
+
+/** #4942 single-flight dedupe: the async reload seam opens a race window the
+ *  sync getSession never had — two concurrent first-touches of the same
+ *  evicted/DB-only session must build ONE resident entry, not two. */
+const pendingSessionLoads = new Map<string, Promise<Session>>();
+
+function stampExisting(existing: Session, meta?: SessionMeta): void {
+    existing.lastSeen = Date.now();
+    existing.restored = false;
+    // Fill in protocol/upstream/label meta on an existing session if the caller
+    // now knows it (e.g. a session was created by loadAll without meta).
+    if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+    if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+    if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
+}
+
+/** Shared tail of getSession / getSessionAsync: adopt the reloaded session
+ *  into the resident pool, or create a fresh one under the cap guard. */
+function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Session | null): Session {
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
         // activity, not the restored-from-disk state (#404).
@@ -1190,6 +1260,46 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     return session;
 }
 
+export function getSession(id: string, meta?: SessionMeta): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
+    const store = getStore();
+    makeResidentRoom();
+    return adoptOrCreate(id, meta, store.loadSync(id, meta));
+}
+
+/** #4942: async twin of getSession for the request path — on network storage
+ *  backends (mysql) the sync facade cannot read session state back, so a
+ *  memory miss must be able to fall to the DB row (store.loadAsync) instead
+ *  of silently starting a fresh session and losing every folded block at each
+ *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
+ *  Concurrent first-touches of the same id share ONE load (single-flight). */
+export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+    // #5044 publication race ported to the async seam: a request landing on a
+    // child id while its fork is mid-publication must fail loudly instead of
+    // adopting a fresh empty session that would wedge the publication.
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    const store = getStore();
+    makeResidentRoom();
+    let pending = pendingSessionLoads.get(id);
+    if (!pending) {
+        pending = (async () => adoptOrCreate(id, meta, await store.loadAsync(id, meta)))()
+            .finally(() => { pendingSessionLoads.delete(id); });
+        pendingSessionLoads.set(id, pending);
+    }
+    return pending;
+}
+
 export function createSession(id: string, meta?: Session["meta"]): Session {
     return {
         id,
@@ -1210,9 +1320,11 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 const publishingForks = new Set<string>();
 
+// #4942: async — the existence probe must reach the DB on network storage
+// backends, or a fork could silently clobber a DB-only child row.
 export async function publishForkSession(session: Session, parentId: string): Promise<void> {
     if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
-    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
     publishingForks.add(session.id);
     try {
         makeResidentRoom(sessionWeight(session));
