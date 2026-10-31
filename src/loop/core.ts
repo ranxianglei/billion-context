@@ -46,7 +46,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -1094,6 +1094,18 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // #2303 / #3905: classify the terminal tail shape. Both shapes are
+                // non-converged handoffs — visible prose with no tool call — and share
+                // the budget, the openai/anthropic framing boundary and the #2612
+                // exemption below.
+                const stalledTail: "draft" | "announce" | null =
+                    assistantText.length === 0 || calls.length > 0
+                        ? null
+                        : endsWithDraftClose(assistantText)
+                          ? "draft"
+                          : endsWithAnnouncement(assistantText)
+                            ? "announce"
+                            : null;
                 // #2303: a terminal turn that DID deliver visible prose but ends with a
                 // compression-draft closing tag (summary/analysis close forms) and no
                 // tool call — the model wrote a handoff/compression draft in prose
@@ -1119,7 +1131,7 @@ export async function* runCompressLoop(
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
-                    endsWithDraftClose(assistantText) &&
+                    (stalledTail === "draft" || stalledTail === "announce") &&
                     // #2612: the client's own compaction request instructs the
                     // model to answer with a plain-text summary block and no
                     // tool call — that compliant reply is a draft tail by
@@ -1129,8 +1141,13 @@ export async function* runCompressLoop(
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
-                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    if (stalledTail === "announce") {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with continuation nudge (#3905)`);
+                        loggerLog("warn", `[acp-loop] announcement-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    } else {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                        loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    }
                     const nudge: CoreMessage = {
                         id: `acp_draft_tail_retry_r${round}`,
                         role: "user",
@@ -1150,11 +1167,11 @@ export async function* runCompressLoop(
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
                         } else {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
                         }
-                        loggerLog("warn", `[acp-loop] draft-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                        loggerLog("warn", `[acp-loop] stalled-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
                 break;
