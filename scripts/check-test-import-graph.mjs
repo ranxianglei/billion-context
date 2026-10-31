@@ -52,6 +52,7 @@ const ENTRY_FILES = new Set([
     "src/zcode/mcp-entry.ts",
     "src/zcode/bootstrap-hook.ts",
     "src/agent/dsh-native-client.ts",
+    "src/salvage.ts",
 ]);
 
 // Intentionally-unreachable modules a test MAY import without a marker.
