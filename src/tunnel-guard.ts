@@ -1,5 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { networkInterfaces } from "node:os";
+import { Worker } from "node:worker_threads";
+import { log as loggerLog } from "./logger.js";
 import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js";
 
 /**
@@ -37,6 +39,16 @@ import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js"
  * be indistinguishable from a genuinely dead name — and the caller answers a
  * resolution failure with 5xx (transport-class), never 403 (permission-class),
  * so clients keep their retry logic alive while the resolver recovers.
+ *
+ * #5222: when those retries exhaust, ONE more probe runs in a throwaway worker
+ * thread with its own fresh libuv thread pool. A long-lived process can wedge
+ * its OWN resolver state permanently (observed on WSL2 after TUN/VPN switches:
+ * every main-pool getaddrinfo times out forever while other processes on the
+ * same machine resolve the same names fine). The worker probe distinguishes
+ * that process-local wedge (worker succeeds → admit using the worker's answer,
+ * which flows through the SAME range classification below, and log loudly that
+ * restarting the process fully restores resolution) from a machine-wide DNS
+ * outage (worker fails too → the existing unresolvable verdict, unchanged).
  */
 
 // #1686: admission-resolution budget. Per-attempt timeout because a dead OS
@@ -45,6 +57,15 @@ import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js"
 const RESOLVE_MAX_ATTEMPTS = 3;
 const RESOLVE_BACKOFF_MS = 250;
 const RESOLVE_TIMEOUT_MS = 2000;
+
+// #5222: worker-thread fallback budget. One-shot, only after the main pool
+// exhausted every attempt; inner < outer so the worker's own verdict message
+// lands before the outer timer terminates it.
+const WORKER_LOOKUP_TIMEOUT_MS = 3000;
+const WORKER_INNER_TIMEOUT_MS = 2500;
+// Loud-log cadence for a confirmed wedge: once per episode window; any
+// main-pool success starts a new episode (the next wedge logs again).
+const WEDGE_LOG_INTERVAL_MS = 5 * 60 * 1000;
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
@@ -119,6 +140,69 @@ const dnsResolveHost: ResolveHost = async (host) => {
     }
 };
 
+type WorkerProbe = (host: string) => Promise<string[]>;
+
+// Runs in a throwaway worker thread: its libuv thread pool is brand new, so a
+// stuck main-pool getaddrinfo state cannot follow it in (#5222). workerData
+// carries host + inner deadline; the first postMessage wins.
+const WORKER_LOOKUP_SOURCE = [
+    'const { parentPort, workerData } = require("node:worker_threads");',
+    'const dns = require("node:dns");',
+    'let sent = false;',
+    'const send = (m) => { if (!sent) { sent = true; try { parentPort.postMessage(m); } catch { /* port closed */ } } };',
+    'const t = setTimeout(() => send({ ok: false, error: "ETIMEDOUT" }), workerData.timeoutMs);',
+    'dns.promises.lookup(workerData.host, { all: true, family: 0 })',
+    '  .then((res) => { clearTimeout(t); send({ ok: true, addrs: res.map((r) => r.address) }); })',
+    '  .catch((err) => { clearTimeout(t); send({ ok: false, error: String(err && err.code ? err.code : err) }); });',
+].join("\n");
+
+/** #5222: one-shot lookup in a fresh worker thread (fresh libuv pool). Throws
+ *  on timeout or resolver failure (code ETIMEDOUT / the reported code). */
+export const workerResolveHost: WorkerProbe = (host) =>
+    new Promise<string[]>((resolve, reject) => {
+        let settled = false;
+        let worker: Worker | undefined;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try { void worker?.terminate().catch(() => undefined); } catch { /* already gone */ }
+            reject(Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" }));
+        }, WORKER_LOOKUP_TIMEOUT_MS);
+        timer.unref?.();
+        try {
+            worker = new Worker(WORKER_LOOKUP_SOURCE, { eval: true, workerData: { host, timeoutMs: WORKER_INNER_TIMEOUT_MS } });
+        } catch (err) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+            return;
+        }
+        worker.once("message", (msg: { ok?: boolean; addrs?: string[]; error?: string }) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (msg && msg.ok === true && Array.isArray(msg.addrs)) resolve(msg.addrs);
+            else reject(Object.assign(new Error(`worker dns lookup failed (${String(msg?.error ?? "unknown")})`), { code: typeof msg?.error === "string" && msg.error ? msg.error : "EWORKERLOOKUP" }));
+        });
+        worker.once("error", (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+
+let lastWedgeLogAt = 0;
+/** A main-pool success means the resolver is healthy again → the next wedge
+ *  episode logs afresh instead of inheriting this one's cadence. */
+function noteResolverHealthy(): void { lastWedgeLogAt = 0; }
+function noteWedgeConfirmed(host: string): void {
+    const now = Date.now();
+    if (now - lastWedgeLogAt < WEDGE_LOG_INTERVAL_MS) return;
+    lastWedgeLogAt = now;
+    loggerLog("warn", `[tunnel] ${host}: main-thread DNS failed all ${RESOLVE_MAX_ATTEMPTS} attempts but a FRESH worker thread resolved it — this process's resolver state is wedged (e.g. after a WSL/VPN network switch). Admitted via the worker result; RESTART THE PROXY PROCESS to fully restore name resolution (outbound connects share the wedged pool).`);
+}
+
 let localAddrCache: { at: number; ips: Set<string> } | undefined;
 /** All addresses considered "this machine": 127/8 + ::1 + every interface unicast addr. */
 export function localMachineIps(): Set<string> {
@@ -155,6 +239,16 @@ interface TunnelCheckContext {
      * literals and direct-egress hostnames are unaffected.
      */
     egressProxied?: boolean;
+    /**
+     * #5222: after the main-pool resolver exhausts RESOLVE_MAX_ATTEMPTS, run ONE
+     * throwaway worker-thread lookup (fresh libuv pool) to separate a
+     * process-local resolver wedge from a machine-wide DNS outage. Default on;
+     * set false to keep the legacy fail-fast-unresolvable behavior (tests, or
+     * embedded hosts where spawning workers is undesirable).
+     */
+    workerFallback?: boolean;
+    /** #5222: test seam for the worker stage (defaults to workerResolveHost). */
+    workerProbe?: WorkerProbe;
 }
 
 type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
@@ -197,6 +291,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         for (let attempt = 1; attempt <= RESOLVE_MAX_ATTEMPTS; attempt++) {
             try {
                 resolved = await resolve(host);
+                noteResolverHealthy();
                 break;
             } catch (err) {
                 const code = (err as { code?: string } | null)?.code;
@@ -205,23 +300,45 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
                 await new Promise<void>((r) => setTimeout(r, backoff));
             }
         }
+        // #5221 phase 2: feed the wedge detector with the MAIN pool's verdict — before
+        // the worker stage, because the probe mitigates admission but does not heal the
+        // pool (outbound connects still use it). resolvedOk semantics: the resolver
+        // ANSWERED (an empty answer still proves reachability); only a thrown lookup is
+        // wedge evidence. A worker-rescued admission therefore still counts as wedge
+        // evidence (#5326 coupling: without this the alarm goes silent in exactly the
+        // scenario it exists for).
+        resolverWedgeRecord(host, resolved !== undefined);
         if (resolved === undefined) {
-            // #5221 phase 2: only THROWING resolutions are wedge evidence — feed
-            // the alarm detector (detection + alarm only; the process never acts).
-            resolverWedgeRecord(host, false);
+            // #5322: force an immediate eval so the warn log fires at the moment of
+            // tripping instead of on the next status poll.
             getResolverWedgeState();
-            return {
-                ok: false,
-                code: "unresolvable",
-                // #5224: a long-lived process can hold stale OS-resolver state after a
-                // WSL/VPN change (glibc caches resolv.conf; libuv getaddrinfo ages out),
-                // so every admission fails until restart even though a fresh process resolves.
-                message: `cannot resolve tunnel destination ${host}${lastErrCode ? ` (${lastErrCode})` : ""}: local name resolution failed — the local resolver may be unreachable or taken over by another DNS service (VPN/MagicDNS); route egress through an upstream proxy to have the destination resolved remotely, or restart the bili proxy process (a long-lived process can hold a stale system-resolver state after a WSL/VPN network change; a fresh process re-reads it)`,
-            };
         }
-        // The resolver ANSWERED (even an authoritative empty answer proves it is
-        // reachable) — this clears any failure streak for the host.
-        resolverWedgeRecord(host, true);
+        let workerStageRan = false;
+        // #5222: the main pool gave up — one fresh-pool probe before denying. A
+        // long-lived process can wedge its own resolver state permanently
+        // (WSL2/TUN switches observed in the wild); the worker succeeds exactly
+        // when the MACHINE can still resolve, which is what admission needs. Its
+        // answer flows through the SAME classification below — the fallback
+        // admits nothing it would not admit from the main pool.
+        if (resolved === undefined && ctx.workerFallback !== false) {
+            workerStageRan = true;
+            try {
+                resolved = await (ctx.workerProbe ?? workerResolveHost)(host);
+                noteWedgeConfirmed(host);
+            } catch {
+                // machine-wide failure (or worker spawn failure): keep the
+                // legacy unresolvable verdict below; lastErrCode stays the
+                // main pool's own measurement.
+            }
+        }
+        if (resolved === undefined) return {
+            ok: false,
+            code: "unresolvable",
+            // #5224: a long-lived process can hold stale OS-resolver state after a
+            // WSL/VPN change (glibc caches resolv.conf; libuv getaddrinfo ages out),
+            // so every admission fails until restart even though a fresh process resolves.
+            message: `cannot resolve tunnel destination ${host}${lastErrCode ? ` (${lastErrCode})` : ""}: local name resolution failed${workerStageRan ? " and a fresh resolver thread also failed" : ""} — the local resolver may be unreachable or taken over by another DNS service (VPN/MagicDNS); route egress through an upstream proxy to have the destination resolved remotely, or restart the bili proxy process (a long-lived process can hold a stale system-resolver state after a WSL/VPN network change; a fresh process re-reads it)`,
+        };
         ips = resolved;
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
         // #2143: mDNS names (.local / single-label) answer with an unreachable
