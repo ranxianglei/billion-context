@@ -3771,7 +3771,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // signature scheme with its effective policy, remembered refusals, and —
     // for the BUILT-IN scheme only — a copy-ready passthrough snippet (other
     // schemes show an awaiting-re-signer hint: no config can pass them
-    // through, #2090 owner ruling).
+    // through, #2090 owner ruling). #4632: schemes whose registry entry
+    // carries a status note (deliberately blocked channels) render it under
+    // their row, localized by the panel locale.
     async function loadResign() {
         const box = $("resign-body");
         if (!box) return;
@@ -3821,7 +3823,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                         sp.textContent = t("common.copy");
                         btn.appendChild(sp);
                         row.appendChild(btn);
-                    } else {
+                    } else if (!(s.known && s.known.note)) {
                         const hint = document.createElement("span");
                         hint.className = "dim small";
                         hint.textContent = t("cfg.resign_awaiting");
@@ -3830,6 +3832,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             }
             box.appendChild(row);
+            // #4632: registry status note (deliberately blocked channel) under
+            // its row; zh panel gets noteZh when present.
+            const knownNote = s.known && typeof s.known === "object" ? (locale === "zh-CN" ? (s.known.noteZh || s.known.note) : s.known.note) : undefined;
+            if (knownNote) {
+                const noteEl = document.createElement("div");
+                noteEl.className = "dim small";
+                noteEl.textContent = knownNote;
+                box.appendChild(noteEl);
+            }
         }
         if (!anyPending && Object.keys(pending).length === 0) {
             const el = document.createElement("div");

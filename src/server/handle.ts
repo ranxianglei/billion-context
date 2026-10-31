@@ -25,7 +25,7 @@ import { externalSummaryEnabled, messageTimestampSections } from "../external-su
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
+import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
 import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
@@ -2858,7 +2858,7 @@ async function handleRequest(
                     return;
                 }
                 recordSignedRefusal(guardScheme, upstreamOrigin);
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing per the compress-or-refuse contract (${guardScheme === APIG_RESIGN_SCHEME ? "provide a signing credential to make bili re-sign, #1884" : "no re-signer exists for this scheme yet — it stays refused until bili ships one; passthrough settings do not apply"}). Remembered — bili will keep reminding at startup.`);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing per the compress-or-refuse contract (${guardScheme === APIG_RESIGN_SCHEME ? "provide a signing credential to make bili re-sign, #1884" : KNOWN_SIGNATURE_SCHEMES[guardScheme]?.note !== undefined ? "service side blocks bili on this channel — refused permanently by policy (#4632), no re-signer will ship for it; passthrough settings do not apply" : "no re-signer exists for this scheme yet — it stays refused until bili ships one; passthrough settings do not apply"}). Remembered — bili will keep reminding at startup.`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });

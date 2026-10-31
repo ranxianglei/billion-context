@@ -1268,7 +1268,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
 // plus the remembered refusals and which of them are still unresolved.
 function sendResignStatus(res: http.ServerResponse): void {
     const names = new Set<string>([...Object.keys(KNOWN_SIGNATURE_SCHEMES), ...Object.keys(readPendingRefusals())]);
-    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }> = {};
+    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean; note?: string; noteZh?: string }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }> = {};
     for (const name of [...names].sort()) {
         const st = resolveResignSettings(process.env, undefined, name);
         schemes[name] = { known: KNOWN_SIGNATURE_SCHEMES[name], builtIn: name === APIG_RESIGN_SCHEME, enabled: st.enabled, passthrough: st.passthrough, passthroughApplies: name === APIG_RESIGN_SCHEME };

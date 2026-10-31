@@ -423,7 +423,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 - **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。
 - **线上兼容角色改写(`compat.roles`)**—— 上游拒绝 `developer` 角色?[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `compat`)已覆盖 —— 包括零配置即用的失败自学习修复。
-- **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
+- **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)—— 唯一永久例外:`x-ofm-signature`(dsh 免费模型插件的 EAC 渠道)是**按策略拒收**而非等待中 —— 其服务方屏蔽经 bili 路由的流量且条款禁止第三方拦截/重签,bili 不会为其提供重签器;那里的提醒携带的是说明与你的选项(留 bili / 移除插件后只把其余模型经 `/bili/` base URL 前缀路由、让该渠道保持直连且签名有效 / 等官方兼容模式)而非承诺(#4632)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
 
 ### Pi 内置子代理
 
