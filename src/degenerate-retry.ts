@@ -24,10 +24,27 @@ import { appendTrailingUserText } from "./wire-body.js";
 export const DEGENERATE_RETRY_NUDGE =
     "[billion-context] Your previous response ended without a tool call. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly.";
 
+// #4764: for the draft-tail shape the generic nudge above steered wrong — on a
+// compression turn the model read "take your next concrete action" as
+// permission to do anything else (observed: Edit/Bash/TaskOutput instead of
+// the compress call; the draft sat in history as an ordinary assistant message
+// and the compression never happened). These variants name the pending action;
+// they are picked by draftTailKind (a complete draft already holds the finished
+// summary written in the wrong channel, a truncated one stopped before the
+// summary block). Like every injected nudge, neither may contain literal
+// <analysis>/<summary> tags — these texts ride later request views, where the
+// tag shape is the #2612 suppression signal.
+export const DRAFT_TAIL_RETRY_NUDGE_COMPLETE =
+    "[billion-context] Your previous response ended without a tool call. You already wrote the full compression summary as prose — do not extend or repeat it. Submit it now by calling the `compress` tool, with that summary as its `content` argument.";
+export const DRAFT_TAIL_RETRY_NUDGE_TRUNCATED =
+    "[billion-context] Your previous response ended without a tool call: the analysis part of the compression draft finished, but the summary was never written. Stop writing prose now — issue the `compress` tool call immediately, with the summary as its `content` argument.";
+
 /** The retry body: the forwarded body with the continuation nudge appended as a
- *  trailing user turn. Null when the body cannot carry one. */
-export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer): string | null {
-    return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE);
+ *  trailing user turn. Null when the body cannot carry one. #4764: nudgeText
+ *  lets the draft-tail callers steer the retry at the pending action instead of
+ *  the generic wording; omitted callers keep the byte-identical default. */
+export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer, nudgeText: string = DEGENERATE_RETRY_NUDGE): string | null {
+    return appendTrailingUserText(protocol, body, nudgeText);
 }
 
 interface ContinuationRetryOpts {
@@ -56,8 +73,8 @@ interface ContinuationRetryOpts {
  *  when the retry cannot be issued (unbuildable body, upstream error, client
  *  already gone) — the caller then passes the original empty turn through
  *  unchanged. */
-export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Promise<ReadableStream<Uint8Array> | null> {
-    return async () => {
+export function makeContinuationRefetch(opts: ContinuationRetryOpts): (nudgeText?: string) => Promise<ReadableStream<Uint8Array> | null> {
+    return async (nudgeText?: string) => {
         if (opts.signal.aborted) return null;
         // A body whose final input item is a compaction trigger must never be
         // re-issued: appending the nudge after it breaks the wire shape (#283:
@@ -75,7 +92,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                 /* unparseable body: injectContinuationNudge below reports and skips */
             }
         }
-        const retryBody = injectContinuationNudge(opts.protocol, opts.body);
+        const retryBody = injectContinuationNudge(opts.protocol, opts.body, nudgeText);
         if (retryBody === null) {
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
             return null;

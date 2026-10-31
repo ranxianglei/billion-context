@@ -45,8 +45,8 @@ import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
-import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { DEGENERATE_RETRY_NUDGE, DRAFT_TAIL_RETRY_NUDGE_COMPLETE, DRAFT_TAIL_RETRY_NUDGE_TRUNCATED } from "../degenerate-retry.js";
+import { draftTailKind, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary, requestExpectsProseSummaryShape } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -1126,16 +1126,21 @@ export async function* runCompressLoop(
                     // design, not a stalled handoff; retrying it breaks the
                     // compaction (the retry complies too → #870 error).
                     !requestExpectsProseSummary(lastUserSummaryInstruction(coreMessages)) &&
+                    // #4764: vendor-agnostic twin for hosts whose compaction
+                    // instruction names the tags without either Claude Code
+                    // phrasing (proxy-lane view only — see the predicate).
+                    !requestExpectsProseSummaryShape(lastUserSummaryInstruction(coreMessages)) &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
-                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    const tailKind = draftTailKind(assistantText) ?? "complete";
+                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag (${tailKind === "truncated" ? "draft cut off before the summary" : "complete draft written as prose"}) and no tool call; retrying once with the compress-naming continuation nudge (#2303/#4764)`);
+                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} kind=${tailKind} (session ${ctx.session.id})`);
                     const nudge: CoreMessage = {
                         id: `acp_draft_tail_retry_r${round}`,
                         role: "user",
                         contentType: "text",
-                        text: DEGENERATE_RETRY_NUDGE,
+                        text: tailKind === "truncated" ? DRAFT_TAIL_RETRY_NUDGE_TRUNCATED : DRAFT_TAIL_RETRY_NUDGE_COMPLETE,
                     };
                     try {
                         const retryBody = await buildLoopRequestBody([nudge]);
