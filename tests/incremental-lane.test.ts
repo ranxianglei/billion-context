@@ -14,6 +14,7 @@ import { _resetSessionsForTest, peekSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { __resetIncrementalLaneForTests } from "../src/incremental-lane.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-incr-"));
@@ -25,6 +26,10 @@ interface Turn {
     resync?: boolean;
     system?: string;
     request?: Record<string, unknown>;
+    /** #4868: client source fingerprint stamped on the envelope (dual-writer alert). */
+    instanceId?: string;
+    /** Defaults to "conv-inc-1" (header and body must agree). */
+    conversationId?: string;
 }
 
 interface Harness {
@@ -36,11 +41,12 @@ interface Harness {
     markerRaw: (reqPath: string, anthropicBody: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
     dir: string;
+    store: SessionStore;
     settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; debounceMs?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; logEnabled?: boolean; debounceMs?: number } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";
@@ -70,15 +76,16 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: opts.logEnabled ?? false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     if (!(proxy as unknown as { listening?: boolean }).listening) await once(proxy, "listening");
     const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const path = "/v1/messages";
     const turn = async (t: Turn) => {
+        const cid = t.conversationId ?? "conv-inc-1";
         const response = await fetch(`${proxyUrl}/__bili/plugin/turn`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "conv-inc-1" },
-            body: JSON.stringify({ conversationId: "conv-inc-1", sinceSeq: t.sinceSeq, ...(t.resync ? { resync: true } : {}), ...(t.system !== undefined ? { system: t.system } : {}), path, request: { model: "claude-test", max_tokens: 1024, ...(t.request ?? {}) }, messages: t.messages }),
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": cid },
+            body: JSON.stringify({ conversationId: cid, sinceSeq: t.sinceSeq, ...(t.resync ? { resync: true } : {}), ...(t.system !== undefined ? { system: t.system } : {}), path, request: { model: "claude-test", max_tokens: 1024, ...(t.request ?? {}) }, messages: t.messages, ...(t.instanceId !== undefined ? { instanceId: t.instanceId } : {}) }),
         });
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, headers: response.headers, body };
@@ -107,7 +114,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, body };
     };
-    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, store, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
@@ -587,6 +594,101 @@ test("#3433: lane rejects non-anthropic message shapes with 400, never half-conv
         const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [{ role: "user", content: "hello" }] });
         assert.equal(seed.status, 200);
         assert.equal(seed.headers.get("x-bili-applied-seq"), "1");
+    } finally {
+        await h.close();
+    }
+});
+
+// #4868: two DISTINCT client sources replacing the same canonical in quick
+// succession = two hosts sharing one conversation id. Each resync invalidates
+// the other's acks, so both burn consecutive 409s into the client-side
+// REJECTION_CIRCUIT=3 sticky full-resend degradation — without the source
+// fingerprint nothing in the log distinguishes that race from ordinary drift.
+// The lane must name the race (once, per cooldown); same-source resyncs are
+// normal recovery and must NOT alarm (gate discipline: both directions).
+test("#4868: alternating resync sources on one conversation warn once; same source never alarms", async () => {
+    const h = await harness("full", { logEnabled: true });
+    const warnings: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warnings.push(msg); });
+    try {
+        const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1)], instanceId: "host-a" });
+        assert.equal(seed.status, 200);
+        // host-b believes it owns the conversation too: its stale delta 409s
+        // against host-a's canonical...
+        const clash = await h.turn({ sinceSeq: 0, messages: [userTurn(9)], instanceId: "host-b" });
+        assert.equal(clash.status, 409);
+        // ...and its resync replaces the canonical from a DISTINCT source →
+        // exactly one clear warn naming both sides.
+        const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1), userTurn(9)], instanceId: "host-b" });
+        assert.equal(resync.status, 200);
+        const alarms = warnings.filter((w) => w.includes("dual writers"));
+        assert.equal(alarms.length, 1, `expected exactly one dual-writer warn, got: ${JSON.stringify(warnings)}`);
+        for (const needle of ["conv-inc-1", "host-a", "host-b"]) assert.ok(alarms[0].includes(needle), `warn must name ${needle}: ${alarms[0]}`);
+        // Same source resyncing again is ordinary recovery — no second alarm.
+        const again = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1), userTurn(9), assistantTurn(1)], instanceId: "host-b" });
+        assert.equal(again.status, 200);
+        assert.equal(warnings.filter((w) => w.includes("dual writers")).length, 1);
+    } finally {
+        setLogCapture(null);
+        await h.close();
+    }
+});
+
+test("#4868: missing or malformed instanceId cannot trigger the dual-writer alarm", async () => {
+    const h = await harness("full", { logEnabled: true });
+    const warnings: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warnings.push(msg); });
+    try {
+        // Older clients stamp nothing: two anonymous resyncs must stay silent.
+        const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1)] });
+        assert.equal(seed.status, 200);
+        const clash = await h.turn({ sinceSeq: 0, messages: [userTurn(9)] });
+        assert.equal(clash.status, 409);
+        const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1), userTurn(9)] });
+        assert.equal(resync.status, 200);
+        // A malformed fingerprint degrades to anonymous for that side only —
+        // still no alarm against a valid other side.
+        const seed2 = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(2)], conversationId: "conv-inc-2", instanceId: "bad id!" });
+        assert.equal(seed2.status, 200);
+        const clash2 = await h.turn({ sinceSeq: 0, messages: [userTurn(8)], conversationId: "conv-inc-2", instanceId: "host-b" });
+        assert.equal(clash2.status, 409);
+        const resync2 = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(2), userTurn(8)], conversationId: "conv-inc-2", instanceId: "host-b" });
+        assert.equal(resync2.status, 200);
+        assert.equal(warnings.filter((w) => w.includes("dual writers")).length, 0, JSON.stringify(warnings));
+    } finally {
+        setLogCapture(null);
+        await h.close();
+    }
+});
+
+// #4868: resync replaces the canonical — marks keyed by ids that no longer
+// exist in the new branch must be pruned (they would linger in the map and be
+// rewritten into the inc:cache-marks ext key forever, O(turns across branches)).
+// Live marks survive; new marks land as before.
+test("#4868: resync prunes cache marks of the replaced branch; live and new marks survive", async () => {
+    const h = await harness("full");
+    try {
+        const marked = { role: "user", content: [{ type: "text", text: "hello".repeat(400), cache_control: { type: "ephemeral" } }] };
+        const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [marked] });
+        assert.equal(seed.status, 200);
+        let ext = h.store.getSessionExt("conv-inc-1", "inc:cache-marks");
+        assert.ok(Array.isArray(ext) && ext.length === 1, `seed mark persisted: ${JSON.stringify(ext)}`);
+
+        // Resync onto a DIFFERENT branch (distinct text → distinct derived id):
+        // the old mark's id is gone from the canonical → pruned; unmarked
+        // history adds nothing. Same-content messages share their id and would
+        // legitimately keep the mark.
+        const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(7, "branch seven")] });
+        assert.equal(resync.status, 200);
+        ext = h.store.getSessionExt("conv-inc-1", "inc:cache-marks");
+        assert.ok(Array.isArray(ext) && ext.length === 0, `dead-branch mark pruned: ${JSON.stringify(ext)}`);
+
+        // A delta carrying a fresh mark appends normally.
+        const marked2 = { role: "user", content: [{ type: "text", text: "world".repeat(400), cache_control: { type: "ephemeral" } }] };
+        const delta = await h.turn({ sinceSeq: 1, messages: [marked2] });
+        assert.equal(delta.status, 200);
+        ext = h.store.getSessionExt("conv-inc-1", "inc:cache-marks");
+        assert.ok(Array.isArray(ext) && ext.length === 1, `live mark retained: ${JSON.stringify(ext)}`);
     } finally {
         await h.close();
     }

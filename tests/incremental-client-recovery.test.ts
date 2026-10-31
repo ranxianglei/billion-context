@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 
 process.env.NODE_TEST_CONTEXT = "1";
 
-const { __resetIncrementalClientForTests, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn } = await import("../src/agent/incremental-client.ts");
+const { __incrementalInstanceIdForTests, __resetIncrementalClientForTests, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn } = await import("../src/agent/incremental-client.ts");
 
 const SID = "inc-recovery-1";
 
@@ -62,4 +62,21 @@ test("#3369: rejection with no prior state is a no-op reset (a seed/resync canno
     assert.equal(noteIncrementalRejection(SID), "reset");
     const next = planIncrementalTurn({ conversationId: SID, messages: msgs(2), system: undefined });
     assert.equal(next.mode, "seed");
+});
+
+test("#4868: every envelope carries the per-process instanceId fingerprint, stable across plans", () => {
+    __resetIncrementalClientForTests();
+    const expected = __incrementalInstanceIdForTests();
+    assert.ok(typeof expected === "string" && expected.length > 0, "process fingerprint is minted at module load");
+
+    const seed = planIncrementalTurn({ conversationId: SID, messages: msgs(2), system: undefined });
+    assert.equal(seed.mode, "seed");
+    const seedBody = JSON.parse(seed.body) as Record<string, unknown>;
+    assert.equal(seedBody.instanceId, expected, "seed envelope stamps the fingerprint");
+
+    noteIncrementalAck(SID, 2, msgs(2), undefined);
+    const delta = planIncrementalTurn({ conversationId: SID, messages: msgs(4), system: undefined });
+    assert.equal(delta.mode, "delta");
+    const deltaBody = JSON.parse(delta.body) as Record<string, unknown>;
+    assert.equal(deltaBody.instanceId, expected, "delta envelope stamps the SAME fingerprint (one per process lifetime)");
 });
