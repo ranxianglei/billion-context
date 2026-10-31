@@ -1,5 +1,6 @@
 import { defaultCountTokens, orderedRefPair } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { sizePressureOf, type SizePressure } from "../size-pressure.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -55,6 +56,10 @@ interface WebSessionSummary {
      *  never mixes calibers; raw contextTokens stays for API compat + legacy
      *  clients. Absent when nothing has been observed yet. */
     contextBest?: ContextBest;
+    /** #4959 option B: how far this session sits past its own judging window —
+     *  pure diagnostic for scripts/UI (warn at ≥ SIZE_PRESSURE_WARN_RATIO).
+     *  Absent until a window + reading are both known. */
+    sizePressure?: SizePressure;
     tokensSaved: number;
     inputTokens: number;
     cachedTokens: number;
@@ -955,9 +960,11 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #3376: idle cache-keepalive state — memory-only, so live rows only.
     const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
+    const sizePressure = sizePressureOf(s);
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
+        ...(sizePressure ? { sizePressure: { tokens: sizePressure.tokens, target: sizePressure.target, ratio: Math.round(sizePressure.ratio * 100) / 100, warn: sizePressure.warn } } : {}),
         // #2322: a host-provided name (pi /name) outranks the derived
         // first-message title everywhere the row feeds (list, search, export).
         ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),

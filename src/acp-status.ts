@@ -24,6 +24,7 @@ import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./
 import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
+import { sizePressureOf } from "./size-pressure.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
@@ -233,6 +234,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (estTotal > 0 && billed / estTotal >= 1.5) {
             extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
         }
+    }
+    // #4959 option B: a session measuring far past its own judging window can't
+    // be brought back inside by any single fold pass — every forward now costs a
+    // multi-round preflight fold. Pure diagnostic (never blocks/rewrites traffic);
+    // the same signal rides the web-list badge and /__bili/sessions JSON.
+    const sizePressure = sizePressureOf(ctx.session);
+    if (sizePressure?.warn) {
+        extra.push("");
+        extra.push(`SIZE PRESSURE: this session measures ~${shortTokenCount(sizePressure.tokens)} tok but only fits ~${shortTokenCount(sizePressure.target)} tok (${sizePressure.ratio.toFixed(1)}× over its own window) — no single fold pass can bring it back under its own window, so each request pays a long multi-fold preflight before forwarding. Starting a fresh conversation is the reliable reset.`);
     }
     // #3376: idle cache-keepalive state — only-when-observed (absent = zero
     // bytes), so a long-idle cache hit is explainable instead of reading as luck.
