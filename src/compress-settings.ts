@@ -93,6 +93,10 @@ export function mergeCompress(
         rules: pick("rules"),
 
         visibilityMarkers: pick("visibilityMarkers"),
+        // #4313 (PR #5236): display gate — global level only; provider/model
+        // values are merged here but the consumer (resolveMessageTimestamps)
+        // reads the GLOBAL setting, mirroring the single shared core.
+        messageTimestamps: pick("messageTimestamps"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not

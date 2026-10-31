@@ -80,6 +80,7 @@ import { createHash } from "node:crypto";
 // tracker's append-only discipline (#1075/#1486, src/server/handle.ts:1173)
 // never lets a shallow side request clobber a deeper persisted entry.
 import { prefixAffinity } from "./prefix-affinity.js";
+import { isClaudeLaneToken } from "./claude-lane-token.js";
 import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
 // #3397: skeleton persistence hook (deferred-use ESM cycle with
 // src/order-persist.ts — each side calls the other only inside function
@@ -210,8 +211,27 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  #4778) migrates too; only a tag change with NO positional continuation
  *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
  *  old ladder's fork keys, so persisted fork lanes keep their sessions
- *  across the upgrade. */
-export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): SessionOrderResolution {
+ *  across the upgrade.
+ *
+ *  `laneToken` (optional, #5095 D1-C): a bili-minted dispatch token carried
+ *  on the wire (SubagentStart hook → additionalContext → the dispatch's
+ *  first user message). When valid it outranks every heuristic: the key
+ *  is `<rawId>|sub:<fp16(tag)>:t:<token>` deterministically, per DISPATCH —
+ *  parallel same-persona dispatches (same system text, same fingerprint —
+ *  the injectivity gap #5095 documents) land on distinct lanes, and a
+ *  token'd request never claims or re-anchors the raw id.
+ *
+ *  `laneDiscriminator` (#5095 D1-B, optional): the fallback for wires
+ *  WITHOUT a valid token (un-upgraded installs, hook disabled, post-fold
+ *  head loss) — a per-run identity consumed by ONLY the derived-persona
+ *  fork branch. The claude-anthropic header-less-subagent call site passes
+ *  the dispatch's task prompt (first user message fragment): same-type
+ *  subagents re-dispatched under one parent id share their system
+ *  byte-for-byte, so (id, persona) alone is not injective over RUNS. A
+ *  non-empty discriminator widens the fork key to
+ *  `<rawId>|sub:<fp16(tag)>:<fp16(disc)>`; every other caller omits both
+ *  optional args and keeps the byte-identical old ladder. */
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
     const kinds = turns.map((t) => t.kind);
@@ -219,6 +239,20 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     const tag = personaTag !== undefined && personaTag.trim().length > 0 ? personaTag : "";
     const tagHash = tagHashOf(tag);
     const model = declaredModel !== undefined && declaredModel.trim().length > 0 ? declaredModel.trim() : undefined;
+    if (isClaudeLaneToken(laneToken)) {
+        // #5095 D1-C: deterministic birth claim. The token is unique per
+        // subagent dispatch, so it needs no skeleton corroboration — record
+        // the dispatch's own skeleton under its lane key and return. Same
+        // token on every pass of one dispatch recomputes the same key; two
+        // parallel dispatches of the SAME persona (identical tag hash — the
+        // D1 merge) get distinct keys by construction.
+        const laneKey = `${rawId}|sub:${tag !== "" ? `${fp16(tag)}:` : ""}t:${laneToken}`;
+        record(laneKey, turns, tagHash, model);
+        return { key: laneKey, action: "derived-persona", reason: "dispatch lane token — per-dispatch persona lane (#5095)" };
+    }
+    // #5095 D1-B fallback (no valid token on the wire): per-run fragment,
+    // consumed below by the derived-persona fork branch only.
+    const disc = laneDiscriminator !== undefined && laneDiscriminator.trim().length > 0 ? laneDiscriminator.trim() : "";
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
         // First sight under the id. A main-shaped history claims the raw
@@ -315,7 +349,11 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the recorded history continues inside the incoming — anchor migrated (#4778)" };
         }
-        const laneKey = `${rawId}|sub:${fp16(tag)}`;
+        // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
+        // headless-subagent call site passes one) widens the key into a
+        // three-segment form so distinct same-type runs never share a
+        // compression session; empty degrades to the two-segment key.
+        const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
@@ -416,6 +454,6 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  ladder consumed (systemText, model) and keyed by system-hash; the v2
  *  resolver is content-blind and keys by order+id with fragment guards,
  *  so those parameters are simply gone. */
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): string {
-    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel).key;
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): string {
+    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator).key;
 }

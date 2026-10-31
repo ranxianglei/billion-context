@@ -155,11 +155,11 @@ test("guards reject hostile keys and oversize values", async () => {
     }
 });
 
-test("v3 databases migrate to v8 in place, idempotently", async () => {
+test("v3 databases migrate to v10 in place, idempotently", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ext-migrate-"));
     try {
         const dbPath = path.join(tmp, "index.db");
-        // Build a current (v8) database, then roll the extension tables and
+        // Build a current (v10) database, then roll the extension tables and
         // version marker back to the v3 shape — exactly what an upgraded
         // production lane's file looks like to the new code.
         const fresh = UnifiedStore.open(dbPath);
@@ -174,17 +174,17 @@ test("v3 databases migrate to v8 in place, idempotently", async () => {
         const migrated = UnifiedStore.open(dbPath);
         try {
             const ver = (migrated as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9, "open() runs migrateSchema: v3 → v9");
+            assert.equal(ver.user_version, 10, "open() runs migrateSchema: v3 → v10");
             migrated.setKv("probe", "alive", true);
             assert.deepEqual(migrated.getKv("probe", "alive"), true);
             assert.deepEqual(migrated.listSessionIds(), [], "existing v3 content untouched");
         } finally {
             migrated.close();
         }
-        // Reopening a v8 database is a no-op (idempotent migration).
+        // Reopening a v10 database is a no-op (idempotent migration).
         const again = UnifiedStore.open(dbPath);
         const ver2 = (again as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-        assert.equal(ver2.user_version, 9);
+        assert.equal(ver2.user_version, 10);
         again.close();
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

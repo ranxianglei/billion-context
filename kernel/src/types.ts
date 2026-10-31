@@ -40,6 +40,18 @@ export interface CoreMessage {
    *  to the counter path for the loser. Not serialized into wire payloads —
    *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
   ledgerSeq?: number;
+  /** #4313: immutable local wall-clock timestamp (epoch ms) of WHEN this
+   *  message happened, stamped ONCE at first sight and never changed again.
+   *  Rendered into the <acp> tag as time="yyyy-mm-dd hh:mm:ss"; absent =
+   *  pre-feature message, rendered without the attribute (legacy bytes stay
+   *  byte-identical). Set by store-served views from the unified messages
+   *  table's ts column (fork inheritance is a plain row clone); for
+   *  memory-only lanes the stamp-timestamps pipeline node mints it via
+   *  Date.now() at intake and persists it through
+   *  {@link CompressionState.tsStamps} so restarts replay the same value.
+   *  The render path only ever READS this stored value — it never calls
+   *  Date.now() itself (prefix-cache invariant). */
+  ts?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -355,6 +367,15 @@ export interface CompressionState {
    *  NEVER removed from messageRefs (Kernel Contract: ids are never re-issued).
    *  Optional: pre-feature persisted states lack it. */
   deadRefs?: string[];
+  /** #4313: first-sight wall-clock stamps per RAW message id (epoch ms).
+   *  Written by the stamp-timestamps pipeline node on the turn each id is
+   *  first seen (Date.now() once per id; hydrated/carrying ids record their
+   *  stored value instead). Persists with kstate so a restart re-renders
+   *  every tagged message byte-identically — same tokenSnapshot discipline.
+   *  Never pruned: raw ids are never re-issued (Kernel Contract), so the map
+   *  can only grow like messageRefs.byRaw does. Optional: pre-feature states
+   *  lack it (their messages keep rendering without the time attribute). */
+  tsStamps?: Record<string, number>;
   /** Exact inbound ids of the PREVIOUS processTurn pass (pre-pipeline,
    * converter-derived). Continuity signal for reconcile-live-ids (#462): an
    * id that is covered by a fold but was present in the prior pass is the
@@ -681,6 +702,15 @@ export interface ApplyCompressionResult {
      *  result so the model knows its input was changed (#310). Omitted when
      *  empty. */
     notes?: string[];
+    /** True when every requested range resolved legally but NOTHING needed
+     *  folding — all content already covered by active blocks or inside the
+     *  protected zone (#4521 no-op class). Not an error: the model
+     *  re-submitting an already-folded bill of work gets an idempotent
+     *  success-shaped receipt instead of a refusal, so the retry ladder that
+     *  used to spin on "Batch rejected before folding any range" dies at the
+     *  source. Hosts render it with the "[Compression no-op:" prefix and fold
+     *  the exchange away like other zero-applied compress results (#4289). */
+    noop?: true;
   };
 }
 
@@ -688,6 +718,14 @@ export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;
   nudge?: NudgeDecision;
+  /** Compact always-current boundary line, present only on turns where a
+   *  compression round is live (nudge plan with offered ranges) but the
+   *  advisory banner itself is NOT being delivered this request. Carries the
+   *  session's highest allocated ref and the currently offered ranges so the
+   *  model never has to guess refs between banner deliveries (#4521). Hosts
+   *  append it as an ephemeral trailing user message, same carrier as a
+   *  nudge. */
+  statusLine?: string;
   /** Terminal floor detected (#300): compression and truncation are both
    *  exhausted while usage stays at/above truncate.threshold. Emitted every
    *  event while the condition holds; hosts surface it once. */

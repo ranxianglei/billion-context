@@ -1,7 +1,7 @@
 /**
- * #4338: the corrupt index.db degrade scenarios run in a spawned CHILD
- * process, and this file is both the child program and the shared helper
- * module the two parent test files import.
+ * #4338: the corrupt-index and no-engine-banner scenarios run in a spawned
+ * CHILD process, and this file is both the child program and the shared
+ * helper module the two parent test files import.
  *
  * Why a child: on Windows, node:sqlite's FAILED open of a corrupt index.db
  * can leave an OS file handle held with no JS-side instance to release
@@ -34,7 +34,8 @@ import { spawnSync } from "node:child_process";
 import http from "node:http";
 import { once } from "node:events";
 import assert from "node:assert/strict";
-import { mkdirSync, realpathSync, writeFileSync, writeSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, realpathSync, writeSync } from "node:fs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -42,6 +43,8 @@ import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { storageStatusWire } from "../src/storage/runtime-status.ts";
+import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 
@@ -192,24 +195,35 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
+// #4816/#4626 policy chain (FINAL form, 2026-10-30): throwing corruption is
+// classified → NO automatic rename/move/copy AND no automatic rebuild
+// (auto-recovery can't guarantee full data recovery) AND no legacy fallback
+// (forks from the dead index forever) — and construction SUCCEEDS too: bili
+// boots WITHOUT the index, envelope-served, under a loud wire alarm naming
+// the manual fix. Files byte-identical in place; no leaked handle into the
+// dir (so an operator can still move the set aside immediately). These checks
+// pin that policy plus the original #2781/#4357 leak guards.
 const ENGPROOF_CHECK_NAMES = {
-    fallbackRead: "legacy fallback returned a session over the corrupt index",
-    midFlowGuard: "no live handle after the corrupt-index read (#2781 rename guard)",
-    stateDigest: "corrupt-index fallback state digest matches the clean full-mode read",
-    writeNow: "writeNow keeps working over the legacy path after the corrupt-index degrade",
-    postCloseGuard: "no live handle after the final close (post-close rename guard)",
+    noAutoRename: "corrupt index.db left UNTOUCHED — byte-identical, no .corrupt-* copy or rebuild (#4626/#4816 decision)",
+    bootProceeds: "construction SUCCEEDS — boots WITHOUT the index, loud wire alarm names the fix (no move/copy/rebuild/refusal)",
+    envelopeServed: "session loads from the JSON envelopes while the corrupt index sits untouched",
+    midFlowGuard: "no live handle into the sessions dir after the alarm-boot (#2781/#4357 guard)",
     fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
+// #4626-era owner decision: a corrupt index.db degrades loudly and NOTHING
+// is renamed or rebuilt automatically (see engproof). The banner wire shape
+// is pinned here through the remaining deterministic cross-platform degrade
+// cause: the engine ladder exhausted.
 const BANNER_CHECK_NAMES = {
-    overviewAnswers: "/__bili/overview answers 200 with JSON",
-    requestedFull: "storage.requested is full",
-    effectiveLegacy: "storage.effective is legacy",
-    degraded: "storage.degraded is true (corrupt index.db trips the warning)",
-    intentionalOptOut: "storage.intentionalOptOut is false",
-    reason: "storage.reason matches /index database failed to open/",
-    engine: "storage.engine is null",
+    /** Construction THROWS instead of degrading — no server serves a
+     *  degraded page (2026-10-30: no degradation in any case). */
+    constructionRefuses: "construction-refuses-to-start",
+    /** The refused open leaves no half-created index.db behind. */
+    noSidecarLeftBehind: "no-index-db-left-behind",
+    /** Pre-death #3040 forensics: the wire names the cause. */
+    wireNamesEngine: "status-wire-names-missing-engine",
 } as const;
 export const BANNER_CHECKS: readonly string[] = Object.values(BANNER_CHECK_NAMES);
 
@@ -323,51 +337,48 @@ async function runFdGuard(run: CheckRun, name: string, dir: string): Promise<voi
  *  expectedStateDigest] — the parent seeded dir (corpus + full-mode write +
  *  clean full-mode read) and hands in the clean read's state digest. */
 async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
-    const [dir, expectedStateDigest] = argv;
-    if (!dir || !expectedStateDigest) throw new Error("engproof mode needs <dir> <expectedStateDigest>");
+    const [dir] = argv;
+    if (!dir) throw new Error("engproof mode needs <dir>");
 
     // Corrupt the index header (crashed checkpoint / stray write).
     const fd = fs.openSync(path.join(dir, "index.db"), "r+");
     fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
     fs.closeSync(fd);
 
-    // THE #2771 regression: construction must survive, reads must fall
-    // back to the legacy file, and the digest must be exact.
-    const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
-    const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-    store2.cancelAll();
-    try {
-        await run.run(ENGPROOF_CHECK_NAMES.fallbackRead, () =>
-            assert.ok(reloaded, "legacy fallback returned null over a corrupt index"));
-        if (!reloaded) return;
+    // THE policy chain pinned here (FINAL form, 2026-10-30): a provably-
+    // corrupt index must NOT block startup either — construction succeeds,
+    // the file set stays byte-identical in place (no move, no copy, no
+    // automatic rebuild: auto-recovery cannot guarantee full data recovery),
+    // and this process serves from the JSON envelopes under a loud alarm
+    // naming the manual fix. Supersedes the interim refuse-to-start pin.
+    const beforeHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
+    let store: SessionStore | null = null;
+    await run.run(ENGPROOF_CHECK_NAMES.bootProceeds, () => {
+        store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        const reason = storageStatusWire().reason ?? "";
+        assert.match(reason, /integrity check and was left UNTOUCHED/);
+        assert.doesNotMatch(reason, /REFUSES TO START/i);
+    });
+    await run.run(ENGPROOF_CHECK_NAMES.noAutoRename, () => {
+        const names = fs.readdirSync(dir);
+        assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `an automatic .corrupt-* copy must never exist, got ${names.join(", ")}`);
+        const afterHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
+        assert.equal(afterHash, beforeHash, "the corrupt primary must stay byte-identical");
+    });
+    await run.run(ENGPROOF_CHECK_NAMES.envelopeServed, () => {
+        const viaEnvelope = store!.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(viaEnvelope, "with the index out of service the session must still load from its JSON envelope");
+        store!.closeQuietly();
+    });
 
-        // Regression (#2781): the failed open must have CLOSED its handle.
-        await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-moved");
+    // Leak guard (#2781/#4357): a REJECTED store must hold NO persistent
+    // handle into the dir — whole-dir rename round-trip straight after the
+    // refused construction (what lets an operator move the corrupt set
+    // aside without hitting EBUSY).
+    await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-midflow");
 
-        // #4316 PR3/3: the clean full-mode read carried the one-time ledger
-        // alignment; the legacy fallback over the corrupt index did not. The
-        // parent passes its digest already modulo that alignment (single
-        // definition), so strip it here too before comparing.
-        await run.run(ENGPROOF_CHECK_NAMES.stateDigest, () =>
-            assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(reloaded))), expectedStateDigest,
-                "corrupt-index fallback state digest drift vs clean full-mode read"));
-
-        // Writes must keep working (legacy path) — no throw, file refreshed.
-        await run.run(ENGPROOF_CHECK_NAMES.writeNow, () => store2.writeNow(reloaded));
-    } finally {
-        store2.closeQuietly();
-    }
-
-    // #4338 direction 4: the #2781 guard above only covers the window between
-    // loadSync and writeNow — the leak behind #4338 was (re)acquired during
-    // the write phase, past that guard, and only surfaced at rmrf after the
-    // whole retry ladder burned. Guard AFTER the final close too, so future
-    // handle-leak drift trips here — named, deterministic, at the right
-    // place — instead of as a 10-second EBUSY in teardown.
-    await runGuard(run, ENGPROOF_CHECK_NAMES.postCloseGuard, dir, "-postclose");
-
-    // #4357: POSIX rename cannot see open files — scan our own fd table so the
-    // quick_check throw-path leak trips by name on Linux as well.
+    // #4357: POSIX rename cannot see open files — scan our own fd table so
+    // the quick_check throw-path leak trips by name on Linux as well.
     await runFdGuard(run, ENGPROOF_CHECK_NAMES.fdGuard, dir);
 }
 
@@ -394,35 +405,26 @@ async function bannerScenario(argv: string[], run: CheckRun): Promise<void> {
     if (!base) throw new Error("banner mode needs <base>");
     const dir = path.join(base, "sessions");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, "index.db"), Buffer.from("this is definitely not a sqlite database file".repeat(8)));
-    const store = new SessionStore({ dir, enabled: true });
-    _setStoreForTest(store);
-    const upstreamPort = await freePort();
-    const proxy = await startServer(makeOpts(upstreamPort));
-    await once(proxy, "listening");
-    try {
-        const port = (proxy.address() as { port: number }).port;
-        // Holder (not a plain let): the assignment happens inside the check
-        // closure, and TS control-flow narrowing cannot see closure writes —
-        // a `let overview = null` would narrow to `never` at the guard below.
-        const overview: { storage?: StorageWire } = {};
-        await run.run(BANNER_CHECK_NAMES.overviewAnswers, async () => {
-            const res = await fetch(`http://127.0.0.1:${port}/__bili/overview`);
-            assert.equal(res.status, 200, "/__bili/overview answers 200");
-            overview.storage = ((await res.json()) as { storage: StorageWire }).storage;
-        });
-        const storage = overview.storage;
-        if (!storage) return;
-        await run.run(BANNER_CHECK_NAMES.requestedFull, () => assert.equal(storage.requested, "full"));
-        await run.run(BANNER_CHECK_NAMES.effectiveLegacy, () => assert.equal(storage.effective, "legacy"));
-        await run.run(BANNER_CHECK_NAMES.degraded, () => assert.equal(storage.degraded, true, "corrupt index.db trips the warning"));
-        await run.run(BANNER_CHECK_NAMES.intentionalOptOut, () => assert.equal(storage.intentionalOptOut, false));
-        await run.run(BANNER_CHECK_NAMES.reason, () => assert.match(storage.reason ?? "", /index database failed to open/));
-        await run.run(BANNER_CHECK_NAMES.engine, () => assert.equal(storage.engine, null));
-    } finally {
-        await close(proxy);
-        store.closeQuietly();
-    }
+    // #4816 chain -> 2026-10-30 "no degradation in any case": an
+    // unfulfillable unified ask (here: engine ladder exhausted) must make
+    // CONSTRUCTION REFUSE loudly — no server ever comes up to serve a
+    // degraded page. The pre-death wire still records WHY (forensics).
+    setSqliteEnginesUnavailableForTests(true);
+    await run.run(BANNER_CHECK_NAMES.constructionRefuses, () => {
+        assert.throws(
+            () => new SessionStore({ dir, enabled: true }),
+            /no SQLite engine available/i,
+            "construction must refuse, not degrade",
+        );
+    });
+    await run.run(BANNER_CHECK_NAMES.noSidecarLeftBehind, () =>
+        assert.ok(!fs.existsSync(path.join(dir, "index.db"))),
+    );
+    await run.run(BANNER_CHECK_NAMES.wireNamesEngine, () => {
+        // requested mode still reads as full from env; the recorded failure is
+        // exactly what the refusing open wrote before throwing.
+        assert.match(storageStatusWire().reason ?? "", /no SQLite engine available/);
+    });
 }
 
 async function main(argv: string[]): Promise<number> {

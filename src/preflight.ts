@@ -28,6 +28,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
 // #3635: the failure description moved to the leaf module next to its data
@@ -1234,7 +1235,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // minimum-summary gate rejects such output anyway), so omit it.
     // #2952: systemOverride carries a tier-distillation TASK (T2/T3 rules) in
     // place of the default tier-1 TASK; absent → byte-identical default below.
-    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
         summaryLengthBudgetClause(lengthBudget, MIN_SUMMARY_CHARS);
     if (deps.externalSummary) {
@@ -1956,7 +1957,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             const { sourceTier, first, last, lo, hi } = chosen;
             const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
-            const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
+            const system = buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections))
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
             const content = spanContent(lo, hi);
             const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
@@ -2567,7 +2568,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const maxSummary = activeConfig.compress.maxSummaryLength;
                     const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
                     const instructions =
-                        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+                        buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
                         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
                         summaryLengthBudgetClause(perChunkBudget, MIN_SUMMARY_CHARS);
                     nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
@@ -2762,9 +2763,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     // regime-independent — coverage-based, they hold under the #330 relax flip
                     // too, so the span is skipped for the rest of this invocation and
                     // remembered across invocations. Zone/min-gate/length verdicts can clear
-                    // mid-invocation (relax, newer messages) and stay retryable. Raw errors,
-                    // not the truncated verdict: the named-block list must survive intact.
-                    const named = parseStructuralEmptyVerdict(preview.result.errors.join("\n"));
+                    // mid-invocation (relax, newer messages) and stay retryable. #4521 moved
+                    // the structural-empty verdicts from FAILED errors to success warnings
+                    // ("folded nothing — ..."); raw errors AND warnings, not a truncated
+                    // rendering: the named-block list must survive intact.
+                    const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
                     if (named !== null) {
                         skipSet.add(skipKey);
                         recordDeadRange(deps.session, startRef, endRef, named);

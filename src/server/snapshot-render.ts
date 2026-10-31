@@ -121,7 +121,7 @@ function legacyFor(session: Session, deps: SnapshotRenderDeps, clientMsgs: BiliM
     return clientMsgs;
 }
 
-function parseRow(content: string, seq: number): BiliMessage | null {
+function parseRow(content: string, seq: number, ts?: number | null): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
         if (typeof parsed.id !== "string" || typeof parsed.role !== "string") return null;
@@ -134,6 +134,9 @@ function parseRow(content: string, seq: number): BiliMessage | null {
         // DISPLAY index. Rows written before this change simply lack the
         // field; the kernel counter path keeps serving them unchanged.
         msg.ledgerSeq = seq + 1;
+        // #4313: the wall-clock stamp rides the column, never the stored
+        // bytes — hydrate it back onto the object (NULL = pre-feature).
+        if (typeof ts === "number") msg.ts = ts;
         return msg;
     } catch {
         return null;
@@ -230,7 +233,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         if (contentRows !== null) {
             const bySeq = new Map<number, ViewRow>();
             for (const row of contentRows) {
-                const msg = parseRow(row.content, row.seq);
+                const msg = parseRow(row.content, row.seq, row.ts);
                 if (!msg) return { reason: "row-unparsable" }; // uncovered bytes are untrustworthy: degrade, never guess
                 bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
             }
@@ -249,7 +252,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
                 if (full !== null) {
                     const fullBySeq = new Map<number, BiliMessage>();
                     for (const row of full) {
-                        const msg = parseRow(row.content, row.seq);
+                        const msg = parseRow(row.content, row.seq, row.ts);
                         if (msg) fullBySeq.set(row.seq, msg);
                     }
                     for (const r of rows) {
