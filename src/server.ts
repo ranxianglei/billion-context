@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -514,7 +514,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     if (shouldMuteStderrLegAfterFileLive(Boolean(process.env.BILI_LAUNCH_TOKEN?.trim()), process.stderr.isTTY)) {
         onFileLegLive(() => muteStderrLeg());
     }
-    const core = createCore();
+    // #4313 toggle (PR #5236): resolved ONCE per instance — stamping/rendering
+    // are baked into the pipeline nodes, so changing the flag needs a restart.
+    const core = createCore(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : undefined);
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound

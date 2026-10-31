@@ -21,7 +21,7 @@ import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire,
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
-import { externalSummaryEnabled } from "../external-summary-surface.js";
+import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
@@ -1448,7 +1448,7 @@ async function handleRequest(
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.
         session.meta.activePack = reqSurfacePack;
-        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, reqSurface?.promptSections);
+        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, messageTimestampSections(reqSurface?.promptSections));
         else delete session.meta.summaryInstructions;
         // #1082: rebuild-cost signal for the session-file GC — token estimate
         // of the RAW wire payload (full history as received, pre-fold/injection).
