@@ -512,6 +512,13 @@ export function derivedAncestorSessions(session: Session): Session[] {
 // turn) and a short steering section is appended. No store/fold/injection
 // mechanics are touched. Absent plan state or disabled ⇒ byte-identical
 // output (the stable sort degrades to the kernel's lexical order).
+// #5047: plan signal comes from the ACTIVE tier of a recognized complete
+// TodoWrite/todowrite snapshot only (in_progress descriptions, else pending);
+// terminal tasks stop contributing while their historical blocks stay
+// searchable through the lexical pool. Unrecognized inputs (custom planning
+// tools, incremental updates, malformed JSON) keep the legacy whole-text
+// tokenization. Ranking additionally protects explicit queries: a query term
+// that discriminates within the candidate pool outranks plan-only affinity.
 
 const EFFECTIVE_SEARCH_PLAN_KEY = "searchPlanAware";
 
@@ -565,6 +572,51 @@ function planTokenize(text: string): string[] {
     return out;
 }
 
+// #5047: known TodoWrite status vocabulary. A snapshot whose items all use
+// this vocabulary is a recognized complete snapshot; anything else (custom
+// planning tools, incremental updates, foreign status values) keeps the
+// legacy whole-text tokenization below.
+const PLAN_TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
+
+/** Recognize a complete TodoWrite/todowrite snapshot in a planning tool
+ *  call's raw JSON input (`{"todos":[{"content":string,"status":string},…]}`).
+ *  Null when the shape is not a recognized complete snapshot (malformed or
+ *  truncated JSON, missing fields, unknown status vocabulary) — callers then
+ *  keep the pre-#5047 whole-text behavior for that message. */
+function parseTodoSnapshot(text: string): Array<{ content: string; status: string }> | null {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("{")) return null;
+    let doc: unknown;
+    try {
+        doc = JSON.parse(trimmed);
+    } catch {
+        return null;
+    }
+    if (typeof doc !== "object" || doc === null || Array.isArray(doc)) return null;
+    const todos = (doc as Record<string, unknown>).todos;
+    if (!Array.isArray(todos) || todos.length === 0) return null;
+    const items: Array<{ content: string; status: string }> = [];
+    for (const entry of todos) {
+        if (typeof entry !== "object" || entry === null) return null;
+        const rec = entry as Record<string, unknown>;
+        if (typeof rec.content !== "string" || typeof rec.status !== "string") return null;
+        if (!PLAN_TODO_STATUSES.has(rec.status)) return null;
+        items.push({ content: rec.content, status: rec.status });
+    }
+    return items;
+}
+
+/** #5047: the plan-signal tier of a recognized snapshot — in_progress
+ *  descriptions, or pending descriptions when nothing is in progress.
+ *  Terminal (completed/cancelled) descriptions contribute no plan signal;
+ *  their historical blocks stay reachable through the lexical pool. Empty
+ *  result ⇒ the whole snapshot is terminal. */
+function activeTodoDescriptions(items: Array<{ content: string; status: string }>): string {
+    const inProgress = items.filter((t) => t.status === "in_progress").map((t) => t.content);
+    const tier = inProgress.length > 0 ? inProgress : items.filter((t) => t.status === "pending").map((t) => t.content);
+    return tier.join("\n");
+}
+
 function resolveDerivedDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -600,7 +652,10 @@ function resolveDerivedDecompress(
  *  tool call matching each planning pattern (mirrors the kernel's
  *  collectLatestProtected latest-wins semantics — per projected path for
  *  slash patterns, so `skill/*` keeps one slot per skill, #1947) plus the
- *  most recent user turn. Returns null when nothing usable is in context. */
+ *  most recent user turn. Recognized complete TodoWrite/todowrite snapshots
+ *  contribute only their active tier (#5047); unrecognized inputs keep the
+ *  legacy whole-text tokenization. Returns null when nothing usable is in
+ *  context. */
 export function extractPlanState(messages: CoreMessage[], extraPatterns?: string[]): { terms: PlanTerms } | null {
     const patterns = [...new Set([...PLANNING_TOOL_PATTERNS, ...(extraPatterns ?? [])])];
     const start = Math.max(0, messages.length - PLAN_WINDOW_MESSAGES);
@@ -623,7 +678,19 @@ export function extractPlanState(messages: CoreMessage[], extraPatterns?: string
         }
     }
     const sources: Array<{ text: string; weight: number }> = [];
-    for (const msg of latestByPattern.values()) if (msg.text) sources.push({ text: msg.text, weight: 2 });
+    for (const msg of latestByPattern.values()) {
+        if (!msg.text) continue;
+        // #5047: recognized complete snapshots contribute their ACTIVE tier
+        // only (terminal tasks stop steering retrieval); unrecognized shapes
+        // keep the legacy whole-text tokenization.
+        const snapshot = parseTodoSnapshot(msg.text);
+        if (snapshot) {
+            const active = activeTodoDescriptions(snapshot);
+            if (active) sources.push({ text: active, weight: 2 });
+            continue;
+        }
+        sources.push({ text: msg.text, weight: 2 });
+    }
     if (lastUserText) sources.push({ text: lastUserText, weight: 1 });
     if (sources.length === 0) return null;
     const terms: PlanTerms = new Map();
@@ -803,8 +870,20 @@ export function executeSearchContext(
     if (plan && !foreignSessionId && pool.length > limit) {
         const planState = extractPlanState(plan.messages, plan.protectedPatterns);
         if (planState) {
-            const withScores = pool.map((b, i) => ({ b, i, score: planBlockScore(b.topic, b.summary, planState.terms) }));
-            withScores.sort((x, y) => y.score - x.score || x.i - y.i);
+            // #5047: explicit-query protection — a query term that discriminates
+            // within the candidate pool (matches SOME but not ALL blocks) marks the
+            // blocks it hits as explicit-query matches; they outrank blocks whose
+            // only claim is plan affinity. A non-discriminating term (hits every
+            // block, e.g. a shared noun like "token") carries no such signal, so a
+            // genuinely ambiguous query degrades to the pure #1336 plan ranking.
+            const discriminating = terms.filter((t) => {
+                const f = freq.get(t) ?? 0;
+                return f > 0 && f < pool.length;
+            });
+            const qMatch = (b: CompressionBlock): boolean =>
+                discriminating.some((t) => (b.topic ?? "").toLowerCase().includes(t) || b.summary.toLowerCase().includes(t));
+            const withScores = pool.map((b, i) => ({ b, i, score: planBlockScore(b.topic, b.summary, planState.terms), q: qMatch(b) ? 1 : 0 }));
+            withScores.sort((x, y) => y.q - x.q || y.score - x.score || x.i - y.i);
             ranked = withScores.map((s) => s.b);
             scored = withScores.map((s) => ({ block: s.b, score: s.score }));
             plan.log(`[acp-search-plan] "${query}": ${withScores.filter((s) => s.score > 0).length}/${pool.length} candidates plan-relevant → ${scored.slice(0, limit).map((s) => `${s.block.blockId}:${s.score}`).join(", ")}`);
