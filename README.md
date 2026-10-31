@@ -645,20 +645,24 @@ Consequences for anyone tempted to put several instances behind one Service:
   single-instance by design.
 
 **Single machine, multiple installs (#5046).** The topology above covers
-deployment replicas; one desktop has a sibling hazard: two installs on ONE
+deployment replicas; one desktop has a sibling situation: two installs on ONE
 machine (e.g. two DSH profiles — desktop + bot, or a global npm copy beside a
 host-tree copy) each start their own proxy and, unless isolated, both resolve
-the SAME default XDG sessions directory and the same config file. With
-`storage.unified` on (shadow/full), two processes then double-write one
-`index.db`: the log shows `[instances] another bili instance is running …`
-and, for overlapping lanes, `[storage] … two processes on one index.db
-corrupt it`; SQLite write-lock contention (`SQLITE_BUSY` / `database is
-locked`) can fail whole model turns, and sustained double-writing risks
-corruption. The fix is isolation: give each install its own
-`BILI_SESSIONS_DIR` (plus `BILI_CONFIG_FILE` when the config should differ
-too) through that install's launcher/profile environment — no global env
-changes needed. Once isolated, the installs coexist safely and the
-`[instances]` notice drops to info level (different dirs ⇒ no shared state).
+the SAME default XDG sessions directory and the same config file. Multiple
+processes writing ONE local-disk `index.db` is the SUPPORTED topology
+(#5082/#5091) — SQLite WAL is multi-process safe on a local filesystem — so
+startup NEVER blocks on a live foreign writer: the peer shows up as an
+info-level `[storage] process pid … is also using …` line plus the status wire,
+nothing more (policy settled 2026-10-31, withdrawing the #5046/B-era
+refuse-to-start for exactly this shape). What genuinely remains hazardous is
+two installs walking the SAME *session* concurrently — that case alarms
+separately (split-brain contest, #3923). If you still want strictly separate
+histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
+`BILI_CONFIG_FILE` when the config should differ too) through that install's
+launcher/profile environment — no global env changes needed. Once isolated,
+the `[instances]` notice drops off entirely. Note the distinction from the
+deployment case above: local disk with SQLite WAL tolerates many writers;
+shared RWX/NFS storage does NOT and keeps requiring one writer per volume.
 
 Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
 (from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.

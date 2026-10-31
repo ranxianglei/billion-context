@@ -208,8 +208,6 @@ function degradeReason(): string {
     }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
-        // #5046/B: shadow.ts records second-writer refusals pre-formatted (already names the fix + what's lost) — render verbatim instead of wrapping them as "index database failed to open".
-        if (e.startsWith("second-writer:")) return e;
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
         if (isNoEngineError(e)) {
