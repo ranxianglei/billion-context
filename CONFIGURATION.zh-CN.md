@@ -1524,7 +1524,15 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `object`（`{ planAware? }`）
 - **默认值：** *（关闭 —— 未设置即解析为 `planAware: false`；输出与纯词法搜索逐字节一致）*
 - **状态：** ACTIVE（CCR v3 规划感知检索，#1336 —— 默认关闭、实测后再启用；代理模式 + 插件模式）
-- **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，候选块会按当前**规划状态**重排：规划状态从上下文内的消息视图提取——每个规划工具的**最后一次** tool-call（内置模式 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，外加全部 `compress.protectedLatestTools` 模式——与内核快照保护的 latest-wins 语义相同）以及最近一条用户消息。候选块的 topic/summary 与该状态的词项做加权重叠打分：得分 >0 的块排前，同分保持原词法顺序。仅在此条件下发生两件事：返回子集可能不同于纯词法截断；结果末尾追加 `[plan-aware]` 引导段——(a) `top fetch targets:` 列出得分最高的返回块所覆盖的 ref 区间，(b) 对本会话内已 retrieve ≥2 次的覆盖 ref 给出提示，建议改用一次性 `decompress({blockId, startId, endId})` 区间恢复代替反复 `acp_retrieve`。标志关闭、上下文中无规划状态、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只动候选顺序——不改存储/折叠/注入机制、不新增持久化、跨会话搜索（`conversation_id`）保持只读词法。每次重排记一条 `[acp-search-plan] …` 日志（含逐块得分）。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数 + 其中有多少次存在更便宜的精确路径可用——即该块带 ref 区间且 CCR 已武装），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+- **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，使用最近 40 条上下文消息中每个规划工具的最后一次调用，以及该窗口中最近一条用户消息，对候选块重排。内置模式为 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，另加全部 `compress.protectedLatestTools` 模式；latest-wins 语义与内核快照保护一致。
+
+  对名称精确为 `TodoWrite` 或 `todowrite` 的工具，有效的完整 `{ todos: [{ content, status }] }` 快照仅提取 `in_progress` 任务内容；没有进行中任务时，改用 `pending` 内容。已完成任务不提供任务信号；小写 `todowrite` 还将 `cancelled` 识别为终态。清空或全部结束的快照会抑制该来源，不会恢复更早的快照；最近用户消息和其他独立规划工具仍可提供信号。结构化解析要求每项任务都有非空字符串 content 和已知 status，且去掉可选的开头 ACP ref 标签后不超过 4000 字符。格式错误、超长、未知快照结构以及其他工具名沿用有界的旧文本提取逻辑。不会将增量 `TaskCreate`/`TaskUpdate` 事件重建为任务图。
+
+  候选块的 topic/summary 与提取状态做加权词项重叠打分。提取时识别到有效快照后，先比较不同的非虚词查询词覆盖数，再比较全部不同查询词覆盖数，然后比较计划分数，最后保留原词法顺序。英文虚词小集合为 `a/an/the/is/are/was/were/be/been/being/what/who/which/where/when/why/how`；仅在分类时忽略外层句子标点，原始查询匹配不变。虚词重叠不能压过更多实质词证据；实质词覆盖相同时，仍保留 `IS NULL` 等字面差异。全虚词查询沿用原覆盖排序。查询词转小写后按空白切分，短标识符、带标点的标识符、否定词和连续中文短语保持完整。在所有候选中都不存在的词，不会覆盖其余查询证据。这是字面子串匹配，不代表语义理解，例如 `not` 仍可能命中 `note`。没有识别到有效快照时，保持旧的计划分数排序。已完成任务对应的块仍可检索，改变的只是任务信号。
+
+  在识别到完整快照的路径中，只要有非虚词，缩小查询范围的提示就从非虚词中选择，避免建议单独搜索 `what`；全虚词查询保留原词。触发提示仍要求原查询至少有三个词。摘要片段匹配和候选生成不变。存在虚词时，诊断日志在原始 `query=N/M` 覆盖数前增加 `content=N/M` 字段。
+
+  重排可能改变返回子集，并追加 `[plan-aware]` 引导段：(a) `top fetch targets:` 按排名列出计划分数为正的返回块所覆盖的 ref 区间；(b) 对本会话内已 retrieve ≥2 次的覆盖 ref，建议改用一次性 `decompress({blockId, startId, endId})` 区间恢复。标志关闭、没有可用的计划或用户信号、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只改变候选顺序：不删除块，不改存储、折叠、注入机制或持久化，跨会话搜索（`conversation_id`）保持只读词法。每次重排记录 `[acp-search-plan] …` 日志。识别到完整状态快照时，逐块记录查询词覆盖数、计划分数和从 1 开始的原始排名，例如 `b1(query=2/3,plan=0,original=2)`；旧版文本提取路径保留仅含计划分数的日志格式。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数及其中存在更便宜精确路径的次数，即块带有 ref 区间且 CCR 已武装），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
   - `planAware: boolean` — 总开关；非 `true` 一律保持功能完全关闭。
 
 #### `rules`

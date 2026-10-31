@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 import { applyCompressSettings } from "../src/compress-settings.ts";
 import { recordRetrieveHit, storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
@@ -270,7 +271,10 @@ function searchResultText(body: string): string {
     return "";
 }
 
-async function startPlanProxy(captured: string[], planAware: boolean): Promise<{ proxyPort: number; upstreamPort: number; closeAll: () => Promise<void> }> {
+async function startPlanProxy(captured: string[], planAware: boolean, fixture?: {
+    query: string;
+    summaries: [string, string];
+}): Promise<{ proxyPort: number; upstreamPort: number; closeAll: () => Promise<void> }> {
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -280,11 +284,11 @@ async function startPlanProxy(captured: string[], planAware: boolean): Promise<{
             const n = captured.length;
             if (n === 1) {
                 anthropicToolUseSse(res, "msg_c", "compress", JSON.stringify({ content: [
-                    { startId: "m00001", endId: "m00007", summary: "Early history: messages 1-7 covered initial setup.", topic: "Early history" },
-                    { startId: "m00008", endId: "m00014", summary: "Mid history: messages 8-14 about ratelimit and token endpoint design.", topic: "Mid history" },
+                    { startId: "m00001", endId: "m00007", summary: fixture?.summaries[0] ?? "Early history: messages 1-7 covered initial setup.", topic: "Early history" },
+                    { startId: "m00008", endId: "m00014", summary: fixture?.summaries[1] ?? "Mid history: messages 8-14 about ratelimit and token endpoint design.", topic: "Mid history" },
                 ] }));
             } else if (n === 2) {
-                anthropicToolUseSse(res, "msg_s", "search_context", JSON.stringify({ query: "history", limit: 1 }));
+                anthropicToolUseSse(res, "msg_s", "search_context", JSON.stringify({ query: fixture?.query ?? "history", limit: 1 }));
             } else {
                 anthropicTextSse(res, "msg_d", "done");
             }
@@ -385,5 +389,102 @@ test("e2e anthropic: planAware off (default) leaves the search output untouched"
         for (let i = 0; i < captured.length; i++) assert.ok(systemAnchorHasCc(captured[i]!), `request ${i + 1}: client anchor cache_control stable`);
     } finally {
         await closeAll();
+    }
+});
+
+test("e2e anthropic: TodoWrite status selects current work and its wire arguments remain unchanged", async () => {
+    const input = { todos: [
+        { content: "Early history initial setup setup setup setup setup", status: "completed", activeForm: "Finishing early history initial setup" },
+        { content: "ratelimit", status: "in_progress", activeForm: "Implementing ratelimit" },
+    ] };
+    for (const planAware of [false, true]) {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        const captured: string[] = [];
+        const { proxyPort, upstreamPort, closeAll } = await startPlanProxy(captured, planAware);
+        const messages: AnthropicRequestBody["messages"] = planProxyMsgs().slice(0, 30).map((msg, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: msg.content,
+        }));
+        messages.push(
+            { role: "assistant", content: [{ type: "tool_use", id: "todo_snapshot", name: "TodoWrite", input }] },
+            { role: "user", content: [
+                { type: "tool_result", tool_use_id: "todo_snapshot", content: "Todos updated." },
+                { type: "text", text: "Continue." },
+            ] },
+        );
+        try {
+            const res = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": `sp-todo-wire-${planAware}`, "anthropic-version": "2023-06-01" },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: true, system: [{ type: "text", text: "SYS ANCHOR", cache_control: { type: "ephemeral" } }], messages }),
+            });
+            const sse = await res.text();
+            assert.ok(res.ok, `HTTP ${res.status}: ${sse}`);
+            assert.equal(captured.length, 3);
+            const result = searchResultText(captured[2]!);
+            assert.ok(result.includes(planAware ? '"Mid history"' : '"Early history"'), `planAware=${planAware}: selected correct block`);
+            assert.ok(!result.includes(planAware ? '"Early history"' : '"Mid history"'), `planAware=${planAware}: rejected competing block`);
+            for (const body of captured) {
+                const sent = JSON.parse(body) as AnthropicRequestBody;
+                const calls = sent.messages.flatMap((msg) => Array.isArray(msg.content) ? msg.content : []).filter((part) => part.type === "tool_use" && part.name === "TodoWrite");
+                assert.equal(calls.length, 1, "snapshot survives every relay request");
+                const snapshot = calls[0];
+                assert.ok(snapshot?.type === "tool_use");
+                assert.deepEqual(snapshot.input, input, "reading plan state must not alter tool-call history");
+                assert.ok(systemAnchorHasCc(body), "client cache anchor remains intact");
+            }
+        } finally {
+            await closeAll();
+        }
+    }
+});
+
+test("e2e anthropic: informative query words outrank grammar noise without changing TodoWrite or cache anchors", async () => {
+    const input = { todos: [{ content: "ratelimit", status: "in_progress", activeForm: "Implementing ratelimit" }] };
+    const fixture = {
+        query: "what is the jwt issuer",
+        // Repetition makes the distractor win lexical search as well as the
+        // old raw-coverage/plan sorter. Only the target has the two topic words.
+        summaries: ["JWT issuer signing key. Historical key location and rotation.", "what is the ratelimit. what is the ratelimit. ratelimit middleware."] as [string, string],
+    };
+    for (const planAware of [false, true]) {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        const captured: string[] = [];
+        const { proxyPort, upstreamPort, closeAll } = await startPlanProxy(captured, planAware, fixture);
+        const messages: AnthropicRequestBody["messages"] = planProxyMsgs().slice(0, 30).map((msg, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: msg.content,
+        }));
+        messages.push(
+            { role: "assistant", content: [{ type: "tool_use", id: "todo_grammar", name: "TodoWrite", input }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "todo_grammar", content: "Todos updated." }, { type: "text", text: "Continue." }] },
+        );
+        try {
+            const res = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": `sp-grammar-wire-${planAware}`, "anthropic-version": "2023-06-01" },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: true, system: [{ type: "text", text: "SYS ANCHOR", cache_control: { type: "ephemeral" } }], messages }),
+            });
+            const sse = await res.text();
+            assert.ok(res.ok, `HTTP ${res.status}: ${sse}`);
+            assert.equal(captured.length, 3, "compress and search both execute through the relay");
+            const result = searchResultText(captured[2]!);
+            assert.ok(result.includes(planAware ? '"Early history"' : '"Mid history"'), `planAware=${planAware}: expected top block`);
+            assert.ok(!result.includes(planAware ? '"Mid history"' : '"Early history"'), `planAware=${planAware}: competing block excluded`);
+            if (planAware) assert.ok(!result.includes('try searching "what"'), "steering must not send the agent back to grammar noise");
+            for (const body of captured) {
+                const sent = JSON.parse(body) as AnthropicRequestBody;
+                const calls = sent.messages.flatMap((msg) => Array.isArray(msg.content) ? msg.content : []).filter((part) => part.type === "tool_use" && part.name === "TodoWrite");
+                assert.equal(calls.length, 1, "snapshot survives every relay request");
+                const snapshot = calls[0];
+                assert.ok(snapshot?.type === "tool_use");
+                assert.deepEqual(snapshot.input, input, "query ranking must not alter tool-call history");
+                assert.ok(systemAnchorHasCc(body), "client cache anchor remains intact");
+            }
+        } finally {
+            await closeAll();
+        }
     }
 });
