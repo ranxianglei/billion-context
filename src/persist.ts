@@ -31,6 +31,7 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
+import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
@@ -217,6 +218,10 @@ interface PersistedSession {
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
+        // #5303: USD spend ledger (#4899) rides along via buildRecord's spread;
+        // buildSession restores it (dropping it zeroed historical spend on
+        // every cold load).
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -2123,6 +2128,57 @@ export class SessionStore {
         }
     }
 
+    /** #5312: foreign-block sweep data access. Null when the unified store is
+     *  unavailable (legacy-only lanes) — the sweep then reports "unavailable"
+     *  rather than guessing over an empty set. */
+    unifiedAllMessageIds(sessionId: string): string[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.allMessageIds(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    unifiedGetBlocks(sessionId: string): ReturnType<import("./storage/store.js").UnifiedStore["getBlocks"]> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.getBlocks(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    unifiedListSessionIds(): string[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.listSessionIds();
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.archiveBlock(sessionId, blockId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified block archive failed: ${String(err)}`);
+            return null;
+        }
+    }
+
+    unifiedRestoreBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.restoreBlock(sessionId, blockId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified block restore failed: ${String(err)}`);
+            return null;
+        }
+    }
+
     /** #3928: per-session index.db footprint for `bili sessions ls`. Null when
      *  the unified store is unavailable (legacy-only lanes) — sizes then
      *  degrade to the JSON-tree view. */
@@ -3688,6 +3744,12 @@ function buildSession(parsed: PersistedSession): Session {
             // acp_status survives restarts instead of silently resetting.
             wholeBlockRestores: stats.wholeBlockRestores ?? 0,
             wholeBlockRestoresPreciseAvailable: stats.wholeBlockRestoresPreciseAvailable ?? 0,
+            // #5303: the USD spend ledger (billing, #4899) — buildRecord persists
+            // it via spread but this whitelist dropped it, so every cold load
+            // (restart / LRU eviction) zeroed historical spend and the next save
+            // wrote that loss into BOTH stores (envelope + index.db). Restored
+            // through the shared validator; corrupt blobs read as "no ledger".
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),

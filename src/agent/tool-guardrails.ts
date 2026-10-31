@@ -148,15 +148,24 @@ function formatBytes(n: number): string {
 // --- Generic tool-call repetition guard (ported from bcp #308; escalation
 // retuned by #5225) ---
 // A greedy small model can re-emit the same (assistant -> toolResult) pair every
-// turn; token penalties can't break that attractor, so we key on canonical-form
-// identity of consecutive calls (argument keys sorted). Escalation (#5225):
-// warnings up to the `warn` threshold; at the `abort` threshold REFUSE that one
-// call with an explicit final warning while keeping the turn alive (a model
-// mid-legit-poll can still react — any argument/tool change resets the run);
-// ONLY the next identical call refuses AND aborts the turn. The old single-step
-// warn->kill aborted legitimate bounded polling (wait tools re-issue identical
-// args by design; the result changes with external state, the arguments do not)
-// before its deadline. Any arg/tool change resets the run.
+// turn; token penalties can't break that attractor, so we key on canonical
+// identity of consecutive calls (arguments compared key-order-insensitively via
+// canonicalStringify). Escalation has TWO dimensions (#5225):
+// 1) Rapidity: any arg/tool change resets the run, and so does a previous
+//    identical call that actually EXECUTED for >= REPEAT_SLOW_CALL_MS —
+//    wall-clock work between repeats means long-polling external state (e.g.
+//    an MCP wait tool), not a rapid degenerate loop. Escalation only continues
+//    while the run stays rapid. Without duration evidence (missing/out-of-order
+//    results) the count-only behavior stands, which is the fail-safe direction.
+// 2) Staging: warnings up to the `warn` threshold; at the `abort` threshold
+//    REFUSE that one call with an explicit final warning while keeping the turn
+//    alive (a model mid-legit-poll can still react — a refused call produces no
+//    result, so no duration evidence accumulates and the ladder advances);
+//    ONLY the next identical call refuses AND aborts the turn. The old
+//    single-step warn->kill aborted legitimate bounded polling (wait tools
+//    re-issue identical args by design; the result changes with external
+//    state, the arguments do not) before its deadline.
+const REPEAT_SLOW_CALL_MS = 5000;
 export function canonicalStringify(value: unknown): string {
     if (value === null || value === undefined || typeof value !== "object") {
         try {
@@ -194,36 +203,57 @@ interface RepetitionDecision {
 export class RepetitionTracker {
     private lastFp: string | null = null;
     private count = 0;
+    private lastCompleted: { fp: string; durationMs: number } | null = null;
+    private pendingStarts = new Map<string, { fp: string; startedAt: number }>();
     constructor(private readonly thresholds: { warn: number; abort: number }) {}
-    note(toolName: string, input: unknown): RepetitionDecision {
+    note(toolName: string, input: unknown, toolCallId?: string, now: number = Date.now()): RepetitionDecision {
         const fp = repetitionFingerprint(toolName, input);
+        const done = this.lastCompleted;
+        if (done && done.fp === fp && done.durationMs >= REPEAT_SLOW_CALL_MS) {
+            // prior identical call did real wall-clock work -> long-poll, restart the run
+            this.lastFp = null;
+            this.count = 0;
+        }
         if (fp === this.lastFp) this.count += 1;
         else {
             this.lastFp = fp;
             this.count = 1;
         }
+        if (toolCallId !== undefined) this.pendingStarts.set(toolCallId, { fp, startedAt: now });
         let action: RepetitionAction = "none";
         if (this.count > this.thresholds.abort) action = "abort";
         else if (this.count === this.thresholds.abort) action = "final-refuse";
         else if (this.count >= this.thresholds.warn) action = "warn";
         return { action, count: this.count, fingerprint: fp, toolName };
     }
+    /** Feed a tool_result back in so the next note() knows how long the call took.
+     *  Unknown/missing ids are ignored — without duration evidence the count-only
+     *  behavior stands (#5225 fail-safe). */
+    complete(toolCallId: string | undefined, now: number = Date.now()): void {
+        if (toolCallId === undefined) return;
+        const p = this.pendingStarts.get(toolCallId);
+        if (!p) return;
+        this.pendingStarts.delete(toolCallId);
+        this.lastCompleted = { fp: p.fp, durationMs: Math.max(0, now - p.startedAt) };
+    }
     reset(): void {
         this.lastFp = null;
         this.count = 0;
+        this.lastCompleted = null;
+        this.pendingStarts.clear();
     }
 }
 
 function buildRepetitionWarnNotice(toolName: string, count: number): string {
-    return `\n\n[ACP guardrail: WARNING — you have issued ${count} CONSECUTIVE identical \`${toolName}\` calls (same name, same arguments). Repeating an identical call usually produces nothing new; if you are deliberately waiting/polling external state, one LONGER wait beats repeated short polls. Continuing the identical call escalates to a hard refusal before the turn is aborted.]`;
+    return `\n\n[ACP guardrail: WARNING — you have issued ${count} CONSECUTIVE identical \`${toolName}\` calls in quick succession (same tool, equivalent arguments — key order aside). If nothing changed since the last result, re-issuing this exact call will not help; if you are deliberately waiting/polling external state, one LONGER wait beats repeated short polls. Continuing the identical call escalates to a hard refusal before the turn is aborted.]`;
 }
 
 function buildRepetitionFinalRefuseNotice(toolName: string, count: number): string {
-    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls (same name, same arguments). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the entire turn will be ABORTED. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.`;
+    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the entire turn will be ABORTED. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
 }
 
 function buildRepetitionAbortNotice(toolName: string, count: number): string {
-    return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls (same name, same arguments) despite the final refusal. This call was refused and NOT executed. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. The turn has been aborted.`;
+    return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession despite the final refusal. This call was refused and NOT executed. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. The turn has been aborted.`;
 }
 
 export interface GuardrailOptions {
@@ -269,7 +299,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
             tracker = new RepetitionTracker(repCfg);
             trackers.set(sid, tracker);
         }
-        const decision = tracker.note(e.toolName, e.input);
+        const decision = tracker.note(e.toolName, e.input, e.toolCallId);
         if (decision.action === "final-refuse") {
             const msg = buildRepetitionFinalRefuseNotice(decision.toolName, decision.count);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
@@ -295,8 +325,10 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         }
     });
 
-    pi.on("tool_result", (event) => {
+    pi.on("tool_result", (event, rawCtx) => {
         const e = event as unknown as ToolResultEventLike;
+        const ctx = rawCtx as unknown as GuardrailCtx;
+        trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.complete(e.toolCallId);
         const isBash = isBashToolResult(e);
         const fullPath = isBash ? e.details?.fullOutputPath : undefined;
         const timeoutSecs = isBash && e.isError ? detectBashTimeout(e.content) : undefined;
