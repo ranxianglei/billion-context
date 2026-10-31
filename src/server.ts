@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
-import { detectStaleInstall } from "./update.js";
+import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { pckNoticeActive } from "./pck-notice.js";
@@ -98,7 +98,7 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
@@ -675,9 +675,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
-    // a rebuild; different clients cross-wrote one shared proxy).
+    // a rebuild; different clients cross-wrote one shared proxy). The digest
+    // itself comes from our spawner when we have one (#4125): re-hashing under
+    // our own feet diverges from every attach/rotate gate the spawner already
+    // ran on the script it exec'd.
     const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    const ownFingerprint = resolveOwnFingerprint(process.env[SPAWN_FINGERPRINT_ENV], process.argv[1]);
     // #3801: our config shape EXACTLY as the registration below will record
     // it — the byte-stable pair for judging whether a contended-port holder
     // is a true duplicate or a config-drifted predecessor.
@@ -1189,6 +1192,43 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const PREDECESSOR_WAIT_MS = 500;
     let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
     let predecessorWaitAnnounced = false;
+    // #4125: a strictly NEWER same-lane build holding our target port is not
+    // a "predecessor being replaced by an upgrade" — nothing is draining there,
+    // and laddering would fork the lane into a dual instance behind a port
+    // nobody routes to anymore (the two-install deadlock: the spawner's attach
+    // gate rejects the holder's foreign bytes, #3544 rotation only reaches
+    // strictly OLDER residents, and every new spawn loses the bind race). On
+    // confirmation the child exits with the #3654 adoption signal so the
+    // spawner rides the newer build. Probed once PER PORT and then cached
+    // (confirmed = {pid, version}, denied = null): a denial on port N says
+    // nothing about port N+1. Manual starts (no launch token) keep their legacy
+    // ladder semantics — only a spawner honors the adoption exit code — and so
+    // does an upgrade-replacement (its spawner owns the drain wait, never an
+    // adoption).
+    const newerHolderByPort = new Map<number, { pid: number; version: string } | null>();
+    const findNewerSameLaneHolder = async (port: number): Promise<{ pid: number; version: string } | null> => {
+        const cached = newerHolderByPort.get(port);
+        if (cached !== undefined) return cached;
+        let found: { pid: number; version: string } | null = null;
+        if (launchToken !== undefined && !upgradeReplacement && launcherLane !== undefined && ownFingerprint !== undefined) {
+            for (const entry of listInstances()) {
+                if (entry.port !== port || entry.lane !== launcherLane) continue;
+                if (entry.portReleasedAt !== undefined || !isPidAlive(entry.pid)) continue;
+                if (entry.codeFingerprint === ownFingerprint) continue; // twin/drifted paths own those
+                if (!sameInstanceShape(entryShape(entry), ownShape)) continue;
+                // Positive proof only: the live listener must answer health as
+                // EXACTLY the registry entry's claimed pid AND report a build
+                // strictly newer than ours (#4982 discipline).
+                const info = await probeOwnerInfo(entry.origin);
+                if (info?.pid === entry.pid && info.version !== undefined && isVersionNewer(info.version, VERSION)) {
+                    found = { pid: entry.pid, version: info.version };
+                    break;
+                }
+            }
+        }
+        newerHolderByPort.set(port, found);
+        return found;
+    };
     // #3923: per-session writer marker (session-level split-brain visibility) —
     // wired in announceListening, disposed on graceful shutdown.
     let servedWriter: ServedMarkerWriter | undefined;
@@ -1513,6 +1553,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             let busyReason: FailFastReason | undefined;
             let peer: SameLanePeer | undefined;
+            // #4125: set on the first contended-port check when that port was
+            // proven held by a strictly newer same-lane build (see hint below).
+            let newerHolds: { pid: number; version: string } | null | undefined;
             if (isPortBusyError(err.code, lastTriedPort)) {
                 // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
                 // holder squats the IPv4 bind) as EACCES on an unprivileged port —
@@ -1540,9 +1583,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 // shutdown() may have raced the probe — its own exit path owns
                 // the outcome from here on.
                 if (shuttingDown) return;
+                // #4125: before judging the EADDRINUSE, check whether the
+                // contended port holds a STRICTLY NEWER same-lane build — the
+                // upward-adoption verdict (registry claim + answered health
+                // agreeing on pid, version strictly above ours).
+                newerHolds = await findNewerSameLaneHolder(lastTriedPort);
+                if (shuttingDown) return;
                 const action = decideEaddrinuse({
                     upgradeReplacement,
                     twinHolds,
+                    newerHolderHolds: newerHolds !== null,
                     launchToken: launchToken !== undefined,
                     strictPort,
                     attempts: listenAttempts,
@@ -1574,7 +1624,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const hint =
                 isPortBusyError(err.code, lastTriedPort)
                     ? busyReason === "twin-collision"
-                      ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
+                      ? newerHolds !== undefined && newerHolds !== null
+                        ? ` — port ${lastTriedPort} holds a STRICTLY NEWER bili build v${newerHolds.version} (pid ${newerHolds.pid}, lane ${launcherLane}) than this v${VERSION} — exiting instead of hopping: nothing over there is draining, the older generation yields when the resident proves itself newer, and our spawner reads this exit as an adopt signal and rides the newer build instead of deadlocking behind it (#4125/#3544/#3654).`
+                        : ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
                       : busyReason === "upgrade-replacement"
                         ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
                         : busyReason === "strict-port"

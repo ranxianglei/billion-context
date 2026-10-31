@@ -51,6 +51,30 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 
 export const MAX_LOOP_ROUNDS = 10;
 
+/** #5220: canonical signature of a failed proxy call — sorted-key JSON so
+ *  argument-order noise doesn't defeat the repeat-detection set. Unparseable
+ *  arguments fall back to the raw string (byte equality still catches the
+ *  pathological identical-resubmit ping-pong the original #156 guard existed
+ *  for). Takes the RAW model argument bytes (pr.arguments, per #3661/#156).
+ */
+export function failedCallSignature(name: string, argsJson: string): string {
+    let norm = argsJson;
+    try {
+        const obj = JSON.parse(argsJson);
+        if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
+            norm = JSON.stringify(
+                Object.keys(obj as Record<string, unknown>).sort().reduce<Record<string, unknown>>((acc, k) => {
+                    acc[k] = (obj as Record<string, unknown>)[k];
+                    return acc;
+                }, {}),
+            );
+        }
+    } catch {
+        /* keep raw */
+    }
+    return `${name}:${norm}`;
+}
+
 export function buildVisibilityMarker(toolName: string, result: string): string {
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const failed = lines.some((l) =>
@@ -597,11 +621,19 @@ export async function* runCompressLoop(
 
     // #3302 (Ask 6): probe-family observability — a model failing compress with
     // one endpoint fixed and the other varying is enumerating a sparse ref
-    // space; every attempt carries different args, so the failed-only breaker
-    // below ends such turns without ever flagging them. Log it once as an
-    // operator signal; the failure receipts carry the live range table.
+    // space; every attempt carries different args, so the repeat-signature
+    // breaker below lets such turns run (bounded by MAX_LOOP_ROUNDS) without
+    // ever flagging them. Log it once as an operator signal; the failure
+    // receipts carry the live range table.
     const probeFailures = new Map<string, Set<string>>();
     let probeWarned = false;
+    // #5220: canonical signatures of compress/decompress calls already FAILED
+    // in an earlier round of this request. A failed-only round whose signatures
+    // are ALL previously seen is pure ping-pong (the original #156 guard,
+    // restored in narrow form): breaking there costs nothing the model could
+    // have learned from. First-time failures feed the model a recovery
+    // receipt instead (see the failed-only handler below).
+    const failedSigs = new Set<string>();
 
     // #762,#1479: strict-echo origin for re-request normalization (the learned
     // flag rides on ctx.session.metadata; mirrors prepareOpenai's static gate).
@@ -1191,6 +1223,13 @@ export async function* runCompressLoop(
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
             const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
+            // #5220: the marker lines ACTUALLY streamed to the client this round
+            // (deduped, same order as the stream). On a failed-only round this IS
+            // the recovery receipt the retry body must carry — reconstructing it
+            // afterwards from seenMarkers would be impossible (the set no longer
+            // remembers which entries are new) and would drift from what the
+            // client saw.
+            const streamedMarkers: string[] = [];
 
             for (const call of allCalls) {
                 if (call.name.length === 0) {
@@ -1222,6 +1261,7 @@ export async function* runCompressLoop(
                         } else {
                             seenMarkers.add(markerKey);
                             yield adapter.emitMarker(call.name, result.text);
+                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
                         }
                     }
                 } else {
@@ -1481,14 +1521,26 @@ export async function* runCompressLoop(
                 return;
             }
 
-            // #156/#4186: if this round is only failed compress/decompress, stop
-            // here instead of re-requesting. The failed frames spliced into the
-            // retry body above are ephemeral (#1548): never persisted, never seen
-            // by the client. Letting them reach upstream and then vanish from the
-            // next request rewrites the provider's frozen prefix mid-history —
-            // an unsanctioned cache seam. Breaking keeps them off the wire; the
-            // receipt already streamed to the client carries why it failed, and a
-            // later turn can retry with a different range.
+            // Failed-only-round contract — history #156/#4186/#4217, current #5220:
+            // a round whose proxy results are ALL failed compress/decompress used
+            // to end the turn here with a fabricated "length" finish. Cache-clean
+            // (the ephemeral failure frames never reach upstream, #1548) but fatal
+            // to the user: no client on any wire auto-continues "length" (OpenAI:
+            // no such convention; Anthropic: not even a legal stop reason), so one
+            // bad compress call killed a running task mid-work (#5220 report;
+            // #5179 Anthropic field case). #5220 flips the default: feed the
+            // failure to the MODEL and let IT decide. The retry body carries ONE
+            // plain assistant receipt whose bytes are exactly the visibility
+            // markers already streamed to the client, so the client's transcript
+            // carries the same bytes into its next request and the provider's
+            // frozen prefix never diverges — no ephemeral frames, no seam, fuzz
+            // stays green. Bounded twice over: the narrow #156 breaker (every
+            // signature in the round already failed before → ping-pong → break)
+            // and MAX_LOOP_ROUNDS above. Threads-continue turns and
+            // visibilityMarkers=false requests keep the old contract: their client/
+            // delta view lacks the marker bytes, so a receipt-only body would
+            // carry server-invisible bytes upstream — exactly the seam #4186
+            // forbids.
             const failedMutating = proxyResults.filter(
                 (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
             );
@@ -1503,10 +1555,44 @@ export async function* runCompressLoop(
             }
 
             if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
-                ctx.log(`[acp-loop] round ${round}: failed-only mutating round; completing after ${round} round(s) instead of re-requesting (#156/#4186)`);
-                loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (#156/#4186)`);
-                yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
-                return;
+                const sigs = failedMutating.map((pr) => failedCallSignature(pr.name, pr.arguments));
+                const stuck = sigs.every((s) => failedSigs.has(s));
+                const receiptable = !stuck && ctx.visibilityMarkers !== false && !threadContinue;
+                if (!receiptable) {
+                    const why = stuck
+                        ? "every failing signature already failed in an earlier round"
+                        : "receipt channel unavailable (" + ([threadContinue ? "threads-delta" : null, ctx.visibilityMarkers === false ? "visibility markers off" : null].filter(Boolean).join(", ")) + ")";
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round (${why}); completing after ${round} round(s) instead of re-requesting (#156/#4186/#5220)`);
+                    loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (${why}) (#156/#4186/#5220)`);
+                    yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
+                    return;
+                }
+                sigs.forEach((s) => failedSigs.add(s));
+                // Splice the retry body: strip THIS round's ephemeral failure
+                // frames (they must never reach upstream — #1548/#4186) and
+                // append the recovery receipt as a plain assistant message —
+                // bytes identical to what emitMarker already streamed to the
+                // client this round (same order, same dedup: seenMarkers holds
+                // exactly what went out). Falls through to the normal
+                // re-request path below.
+                const dropIds = new Set<string>();
+                for (const pr of failedMutating) {
+                    dropIds.add(`acp_loop_r${round}_asst_tc_${pr.callId}`);
+                    dropIds.add(`acp_loop_r${round}_tool_${pr.callId}`);
+                }
+                coreMessages.splice(0, coreMessages.length, ...coreMessages.filter((m) => !dropIds.has(m.id)));
+                if (streamedMarkers.length > 0) {
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
+                    coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
+                } else {
+                    // Every failure marker of this round was deduped against an
+                    // earlier round — the client saw nothing new, so a receipt
+                    // would be a zero-byte assistant frame (strict wires reject
+                    // empty text blocks). Skip it: the body degrades to history +
+                    // prose, stays cache-clean, and the signature breaker /
+                    // MAX_LOOP_ROUNDS bound any resulting ping-pong.
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; all markers deduped (nothing new reached the client), re-requesting without a receipt (#5220)`);
+                }
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);

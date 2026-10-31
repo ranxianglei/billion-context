@@ -303,6 +303,28 @@ export function entryScriptFingerprint(scriptPath?: string): string | undefined 
     return digest;
 }
 
+/** #4125: env channel carrying the SPAWNER's entry-script hash to its child
+ *  (set by the launcher at spawn time). */
+export const SPAWN_FINGERPRINT_ENV = "BILI_SPAWN_FINGERPRINT";
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+/** #4125: fingerprint a CHILD records for itself — preferring the value its
+ *  spawner computed from the very script it exec'd ($BILI_SPAWN_FINGERPRINT)
+ *  over re-hashing. Re-hashing is unsafe across the spawn window: an in-place
+ *  update (auto-update extraction between the spawner's hash and the child's
+ *  own read) changes the bytes under both feet, so spawner-side attach/rotate
+ *  gates keyed on digest X would be judging against a child registry record
+ *  saying digest Y — one side sees a mismatch where the other sees its own
+ *  twin. The env value is trusted only when well-formed sha256 hex; garbage or
+ *  absence (manual / unspawned starts) falls back to the local re-hash, which
+ *  is pre-fix behavior. */
+export function resolveOwnFingerprint(spawnedValue: string | undefined, scriptPath: string | undefined): string | undefined {
+    const trimmed = spawnedValue?.trim();
+    if (trimmed !== undefined && SHA256_HEX_RE.test(trimmed)) return trimmed;
+    return entryScriptFingerprint(scriptPath);
+}
+
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
  *  write must never leave a half-file behind (#406 family). Shared by the
  *  proxy-origin record and every registry marker. */
