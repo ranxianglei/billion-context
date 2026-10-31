@@ -225,7 +225,8 @@ function safeJson(raw: string | null | undefined): unknown {
 
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
  * record per line: a session header, then messages ordered by seq (CCR
- * placeholders dereferenced to their stored originals when `full`), then
+ * placeholders dereferenced to their stored originals when `full`; retired
+ * rows included carrying `retiredAt`, live rows omit it — #4390/#4664), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
  * state; a generated artifact, never a source of truth. */
 // #3931: consumes the StorageBackend contract (not UnifiedStore) — the
@@ -259,7 +260,9 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
     // store by design (multi-MB rewrite cost, see session.ts contentStore).
     const ccr = new Map((await backend.getCcrEntries(sessionId)).map((e) => [e.key, e.content] as const));
     if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
-    for (const m of await backend.getMessages(sessionId)) {
+    // #4664: historian read — include retired (tombstoned) rows so a rewound
+    // session exports its full history; live rows omit `retiredAt`.
+    for (const m of await backend.getMessages(sessionId, { includeRetired: true })) {
         let message: Record<string, unknown>;
         try {
             message = JSON.parse(m.content) as Record<string, unknown>;
@@ -271,7 +274,7 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             const payload = ph ? ccr.get(ph.ref) : undefined;
             if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
         }
-        lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, message }));
+        lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, ...(m.retiredAt != null ? { retiredAt: m.retiredAt } : {}), message }));
     }
     for (const b of await backend.getBlocks(sessionId)) {
         lines.push(

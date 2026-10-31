@@ -27,8 +27,16 @@ import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { log as loggerLog } from "../logger.js";
-import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
+import { resolvedSqliteEngineInfo } from "./driver.js";
+import { sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
+
+/** The driver's no-engine error text — one predicate, used wherever the
+ *  "is this actually an engine problem?" distinction matters (#5108). */
+function isNoEngineError(errStr: string): boolean {
+    return /no SQLite engine available/i.test(errStr);
+}
 
 interface RuntimeState {
     /** Recorded by the SessionStore constructor; null only before first store build. */
@@ -139,6 +147,21 @@ export function ackSplitBrainContest(sessionId: string): boolean {
 
 const MAX_SPLIT_BRAIN_ACKS = 64;
 
+// #4626: the stored verdict must be a function of CURRENT evidence, not a
+// replay of one moment's snapshot — at detection time the restart-handover
+// tombstone is seconds fresh, but it must not pin the notice forever. The
+// server registers the evidence check (the accused peer's own marker, judged
+// by the same "still contests" definition as detection); without a registered
+// check the stored entry is replayed as-is (legacy behavior, standalone
+// record/ack use). The check is TRI-STATE and fails closed: an unknown result
+// (the marker could not be read at status-read time) keeps the notice —
+// dropping a real notice on a transient FS error is the wrong direction.
+let splitBrainEvidenceCheck: ((contest: SplitBrainContestInput) => boolean | null) | null = null;
+
+export function registerSplitBrainEvidenceCheck(check: ((contest: SplitBrainContestInput) => boolean | null) | null): void {
+    splitBrainEvidenceCheck = check;
+}
+
 /** #4175: the last successful VACUUM INTO backup. */
 export function recordBackupOutcome(lastPath: string, lastBytes: number): void {
     state.backup = { lastPath, lastAt: Date.now(), lastBytes };
@@ -147,6 +170,7 @@ export function recordBackupOutcome(lastPath: string, lastBytes: number): void {
 export function _resetStorageRuntimeStatusForTest(): void {
     state = freshState();
     cooldownCache = null;
+    splitBrainEvidenceCheck = null;
 }
 
 /** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
@@ -162,15 +186,16 @@ function pidAlive(pid: number): boolean {
 /** Short one-line form of a raw error for interpolation into banner text. */
 function shortenError(err: string): string {
     const oneLine = err.replace(/\s+/g, " ").trim();
-    return oneLine.length > 160 ? `${oneLine.slice(0, 157)}...` : oneLine;
+    if (oneLine.length <= 160) return oneLine;
+    // #5108/#4816: both ends carry signal — the error class up front, the
+    // errno/detail at the end (e.g. "corruption detail: …") — so
+    // cut the MIDDLE (usually a long path) instead of the tail. Head-only
+    // truncation made the actionable detail invisible on exactly the
+    // long-path machines (Windows user profiles) this fix targets.
+    return `${safePrefix(oneLine, 78)}…${safeSuffix(oneLine, 78)}`;
 }
 
 function degradeReason(): string {
-    const sidecar = state.sidecar;
-    if (sidecar && sidecar.stats.disabled) {
-        const last = sidecar.stats.lastError ? shortenError(sidecar.stats.lastError) : "unknown";
-        return `unified store auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures (last: ${last})`;
-    }
     // No pinned artifact serves this runtime (below every Node floor, or a Node
     // ABI no prebuild targets), so the engine is refused BEFORE any load and the
     // sidecar open ALSO fails with the generic no-engine error — surface the real
@@ -183,10 +208,19 @@ function degradeReason(): string {
     }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
+        // #5046/B: shadow.ts records second-writer refusals pre-formatted (already names the fix + what's lost) — render verbatim instead of wrapping them as "index database failed to open".
+        if (e.startsWith("second-writer:")) return e;
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
-        if (/no SQLite engine available/i.test(e)) {
+        if (isNoEngineError(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
+        }
+        // #4626-era owner chain (final, 2026-10-30): a provably-corrupt index
+        // stays EXACTLY in place (no move, no copy, no rebuild) and bili
+        // starts WITHOUT it — envelope-served until an operator repairs the
+        // files or moves them aside by hand; the reason carries that fix.
+        if (/StorageIntegrityError|integrity quick_check failed/i.test(state.sidecarOpenError)) {
+            return `index database failed its integrity check and was left UNTOUCHED (${e}) — bili is starting WITHOUT the index (envelope-served); fix: back up index.db{,-wal,-shm}, move those files aside by hand, start again`;
         }
         return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
     }
@@ -259,12 +293,11 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
     // never surface as a degrade.
     const intentionalOptOut = state.encryptionBlocked || state.persistDisabled;
     const sidecar = state.sidecar;
-    const disabled = !!sidecar?.stats.disabled;
     // healthy sidecar ⇒ its mode === requested (maybeOpen opens only under
     // shadow/full); anything else means SQLite carries no data right now.
     const effective: "legacy" | "shadow" | "full" =
-        requested !== "legacy" && !intentionalOptOut && sidecar && !disabled ? requested : "legacy";
-    const degraded = requested !== "legacy" && !intentionalOptOut && (sidecar === null || disabled);
+        requested !== "legacy" && !intentionalOptOut && sidecar ? requested : "legacy";
+    const degraded = requested !== "legacy" && !intentionalOptOut && sidecar === null;
     const cd = cooldownState();
     // #3923/#3959: the second-process warning must never freeze — a foreign
     // pid that has since exited is cleared here, at the status read.
@@ -273,18 +306,37 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         state.secondProcess = null;
         loggerLog("info", `[storage] second-process pid ${sp.pid} has exited — stale warning cleared`);
     }
+    // #4626: same never-freeze discipline as above — once the peer PROVABLY
+    // stops contesting, the stored verdict clears itself; an unknown verdict
+    // (marker unreadable at read time) keeps it.
+    const sb = state.splitBrain;
+    if (sb !== null && splitBrainEvidenceCheck !== null && splitBrainEvidenceCheck(sb) === false) {
+        state.splitBrain = null;
+        loggerLog("info", `[split-brain] session ${sb.sessionId} notice cleared — peer ${sb.peer.instanceId} (pid ${sb.peer.pid}) no longer contests it`);
+    }
     return {
         requested,
         effective,
         degraded,
         intentionalOptOut,
         reason: degraded ? degradeReason() : null,
-        engine: sidecar ? sidecar.engineInfo : null,
+        // #5108: an open failure AFTER the engine resolved (corrupt index.db,
+        // …) must not report "engine: none" — that misdirected triage toward
+        // an engine problem when the engine was fine and the file was not.
+        engine: sidecar
+            ? sidecar.engineInfo
+            : state.sidecarOpenError !== null && !isNoEngineError(state.sidecarOpenError)
+                ? resolvedSqliteEngineInfo()
+                : null,
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,
-        sidecarDisabled: disabled,
-        sidecarLastError: sidecar?.stats.disabled ? sidecar.stats.lastError : null,
+        // The breaker that used to self-disable the sidecar (3-strike) was
+        // removed by owner policy 2026-10-30 — index writes are never
+        // abandoned — so this field is permanently false (kept for the
+        // pre-existing API shape).
+        sidecarDisabled: false,
+        sidecarLastError: sidecar?.stats.lastError ?? null,
         indexDbOpenError: state.sidecarOpenError,
         // #3135 ④/#3818: the sampled digest-drift counter — once the index is
         // the default load path (full), drift must be OBSERVABLE, not just a
@@ -371,7 +423,7 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         `requested mode: ${st.requested}`,
         `effective mode: ${st.effective}${st.intentionalOptOut ? " (BILI_ENCRYPTION_KEY opt-out — intentional)" : ""}`,
         ...(st.degraded && st.reason ? [`degrade reason: ${st.reason}`] : []),
-        `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}` : "none"}`,
+        `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}${state.sidecarOpenError !== null && !isNoEngineError(state.sidecarOpenError) ? " (resolved, but index.db open failed — see degrade reason)" : ""}` : "none"}`,
         `engine bootstrap: ${st.bootstrap ?? "not run"}`,
         ...(st.bootstrapFailure ? [
             `bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining, until ${new Date(st.bootstrapFailure.atMs + COOLDOWN_MS).toISOString()})` : ""}`,

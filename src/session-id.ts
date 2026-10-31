@@ -1,5 +1,6 @@
 import { pckKeyAbated } from "./pck-probe.js";
 import { isCodexClient } from "./codex-compact.js";
+import { claudeLaneTokenIn } from "./claude-lane-token.js";
 import { resolveWireClientProfile } from "./server/lane-decisions.js";
 import type { PromptCacheRouting } from "./config.js";
 
@@ -170,6 +171,38 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  * instructionsFingerprintApplies above. */
 export function claudeAnthropicPersonaOrderApplies(headers: Record<string, string | string[] | undefined>): boolean {
     return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
+}
+
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's messages. The hook injects the token into the dispatch's FIRST
+ *  user message, so the scan stops at the first user message — a marker
+ *  pasted by the user into a LATER message must never fork the main
+ *  conversation off its raw key. Content shapes: bare string, or a block
+ *  array where only `type:"text"` blocks are scanned (the hook context may
+ *  sit inside a <system-reminder> wrapper; the marker is matched as a
+ *  substring, so the wrapper shape does not matter). Returns undefined when
+ *  absent — the overwhelmingly common case (main turns, other hosts,
+ *  un-upgraded installs) keeps resolution byte-identical to before. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (const msg of messages) {
+        if (msg === null || typeof msg !== "object") continue;
+        const m = msg as { role?: unknown; content?: unknown };
+        if (m.role !== "user") continue;
+        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
+        if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+                if (block === null || typeof block !== "object") continue;
+                const b = block as { type?: unknown; text?: unknown };
+                if (b.type === "text" && typeof b.text === "string") {
+                    const tok = claudeLaneTokenIn(b.text);
+                    if (tok !== undefined) return tok;
+                }
+            }
+        }
+        return undefined;
+    }
+    return undefined;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system
