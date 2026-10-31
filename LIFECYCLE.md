@@ -68,6 +68,7 @@
 |------|-----------|
 | `BILI_LAUNCH_TOKEN` | launch 令牌（spawn 时注入；日志中脱敏） |
 | `BILI_PARENT_PID` | owner-pid 看门狗（会话生命周期归属） |
+| `BILI_SPAWN_FINGERPRINT` | spawner 自身代码 sha256（hex64；子进程校验后信任，否则本地重算；#4125） |
 | `BILI_STRICT_PORT` | `=1` claude SessionStart hook 退出端口重试（#964） |
 | `BILI_OPENCODE_ACP_SPEC` | 剥离版 ACP spec 临时配置**文件路径**提示 |
 | `BILI_LAUNCHER_LANE` | lane 身份戳（attach 时比对归属） |
