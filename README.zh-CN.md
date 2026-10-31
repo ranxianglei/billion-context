@@ -465,6 +465,10 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
+### 单机多安装共存（#5046）
+
+同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存）时，各自的代理默认都解析到**同一个** XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。开了统一存储（`storage.unified` = shadow/full）后，两个进程会双写同一个 `index.db`：日志出现 `[instances] another bili instance is running …`，lane 重叠时还有 `[storage] … two processes on one index.db corrupt it` 级别的 error；SQLite 写锁争用（`SQLITE_BUSY` / `database is locked`）会让整轮模型请求直接失败，持续双写还有损坏风险。正确做法是**隔离**：给每份安装设独立的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。隔离后两份可正常并存，`[instances]` 提示会自动降为 info 级（目录不同 ⇒ 无共享状态）。
+
 ### 会话文件清理（#1082）
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。

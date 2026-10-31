@@ -11,6 +11,11 @@
 // names both sides in an error line when it commits a session another live
 // instance committed within the window. Pure observability: no routing,
 // locking, or serving behavior changes.
+// #4626: an instance that shut down GRACEFULLY stamps its final marker with
+// `disposedAt`; such a peer is attribution-only and can never be flagged as
+// a concurrent writer — its pid is provably gone by construction (it ran our
+// shutdown path), so the freshness grace below stays reserved for peers that
+// died without it (crash/kill) where the pid probe may be blind.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -41,6 +46,11 @@ interface WriterMarkerFile {
     stoppedAt?: number;
     /** sessionId → last commit time (ms epoch). */
     servedAt: Record<string, number>;
+    /** Set only on the final marker write of a graceful shutdown (#4626):
+     *  the instance is provably gone — peers keep the file for attribution
+     *  but never treat it as a concurrent writer. Additive; markers from
+     *  older builds carry none. */
+    disposedAt?: number;
 }
 
 /** A surfaced split-brain contest: which session (id + resolved title) and
@@ -74,8 +84,10 @@ const MAX_TRACKED_SESSIONS = 128;
 const VERDICT_TTL_MS = 60_000;
 /** A peer counts as live when its pid is alive OR its marker was written
  *  within this window (covers platforms where the pid check cannot see the
- *  peer process). Gracefully-stopped peers are excluded upstream via
- *  stoppedAt — this fallback only ever rescues CRASHED peers. */
+ *  peer process). Gracefully-stopped peers are excluded upstream by their
+ *  stop stamp (`stoppedAt`, plus the equivalent `disposedAt` alias added by
+ *  #4626) — this fallback only ever rescues CRASHED peers whose death cannot
+ *  be proven. */
 const PEER_FILE_FRESH_MS = 30_000;
 /** reapStaleWriterMarkers removes files whose pid is dead AND whose mtime is
  *  older than this. */
@@ -135,7 +147,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         }
     };
 
-    const writeMarker = (): void => {
+    const writeMarker = (final: boolean): void => {
         const now = Date.now();
         prune(now);
         const body: WriterMarkerFile = {
@@ -147,6 +159,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
             ...(stoppedAt === undefined ? {} : { stoppedAt }),
             servedAt: Object.fromEntries(servedAt),
+            ...(final ? { disposedAt: now } : {}),
         };
         try {
             fs.mkdirSync(dir, { recursive: true });
@@ -161,7 +174,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         flushTimer = undefined;
         if (disposed) return;
         lastFlushAt = Date.now();
-        writeMarker();
+        writeMarker(false);
     };
 
     const scheduleFlush = (): void => {
@@ -181,7 +194,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             const title = opts?.resolveTitle?.(sessionId);
             const laneOf = (x: WriterIdentity): string => (x.lane === undefined || x.lane === "" ? "" : `, lane ${x.lane}`);
             const titleOf = title === undefined || title === "" ? "" : ` "${title}"`;
-            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
             opts?.onContest?.({ sessionId, ...(title === undefined || title === "" ? {} : { title }), self: identity, peer, at: now });
         }
     };
@@ -201,9 +214,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             // able to attribute this instance's last commits after shutdown.
             // stoppedAt marks the stop as GRACEFUL so peers never flag this
             // predecessor in a split-brain contest — the freshness fallback
-            // must only rescue crashed peers whose death we cannot prove.
+            // must only rescue crashed peers whose death we cannot prove;
+            // writeMarker(true) additionally stamps the equivalent disposedAt
+            // (#4626) so both generations of reader code recognize handover.
             stoppedAt = Date.now();
-            writeMarker();
+            writeMarker(true);
         },
         __flushForTest(): void {
             flush();
@@ -214,12 +229,29 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
     };
 }
 
+/** One definition of "still contests" (#4626): the contested `servedAt`
+ *  timestamp, or null when the marker does not contest — shared by the dir
+ *  scan below and the direct-path clear check, so detection and clearing can
+ *  never drift apart. */
+function contestedServedAt(raw: Partial<WriterMarkerFile>, selfInstanceId: string, sessionId: string, mtimeMs: number, now: number): number | null {
+    if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) return null;
+    // Graceful-shutdown peer — attribution only, never a concurrent writer
+    // (its death is certain; no freshness grace). Accept BOTH stamp names so
+    // markers stay readable across builds: `stoppedAt` (the original field,
+    // #4982 restart-gate lineage) and `disposedAt` (#4626).
+    if (typeof raw.stoppedAt === "number" || typeof raw.disposedAt === "number") return null;
+    const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
+    if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) return null;
+    const alive = typeof raw.pid === "number" ? isPidAlive(raw.pid) : false;
+    return alive || now - mtimeMs <= PEER_FILE_FRESH_MS ? at : null;
+}
+
 /** Peer marker files that record a commit of `sessionId` inside the contest
  *  window by a LIVE foreign instance (pid alive or file fresh). Markers
- *  carrying stoppedAt (graceful shutdown) are skipped unconditionally — a
- *  restart flow's predecessor died seconds ago and must not raise an alarm.
- *  Malformed or tearing files are skipped silently — a marker is
- *  observability, not data. */
+ *  carrying a graceful-stop stamp (`stoppedAt`, or the `disposedAt` alias,
+ *  #4626) are skipped unconditionally — a restart flow's predecessor died
+ *  seconds ago and must not raise an alarm. Malformed or tearing files are
+ *  skipped silently — a marker is observability, not data. */
 export function findContestedWriters(dir: string, selfInstanceId: string, sessionId: string, now: number): Array<WriterIdentity & { servedAt: number }> {
     let entries: fs.Dirent[];
     try {
@@ -233,13 +265,9 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         const file = path.join(dir, entry.name);
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
-            if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) continue;
-            if (typeof raw.stoppedAt === "number") continue;
-            const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
-            if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) continue;
             const mtimeMs = fs.statSync(file).mtimeMs;
-            const alive = typeof raw.pid === "number" ? isPidAlive(raw.pid) : false;
-            if (!alive && now - mtimeMs > PEER_FILE_FRESH_MS) continue;
+            const at = contestedServedAt(raw, selfInstanceId, sessionId, mtimeMs, now);
+            if (at === null || typeof raw.instanceId !== "string") continue;
             out.push({
                 instanceId: raw.instanceId,
                 pid: typeof raw.pid === "number" ? raw.pid : -1,
@@ -253,6 +281,43 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         }
     }
     return out;
+}
+
+/** #4626 fail-closed companion to findContestedWriters: does the ACCUSED
+ *  peer's own marker still contest `sessionId`? true = still contested,
+ *  false = provably stopped (marker reaped/absent, dead pid past the
+ *  freshness grace, or the contest window lapsed), null = UNKNOWN (dir or
+ *  file unreadable, torn mid-write) — a transient FS error must never drop a
+ *  real notice, so callers keep it on null. Reads one file, not the dir. */
+export function peerStillContests(dir: string, selfInstanceId: string, peerInstanceId: string, sessionId: string, now: number): boolean | null {
+    let dirStat: fs.Stats;
+    try {
+        dirStat = fs.statSync(dir);
+    } catch {
+        return null;
+    }
+    if (!dirStat.isDirectory()) return null;
+    const file = path.join(dir, `${peerInstanceId}.json`);
+    let content: string;
+    try {
+        content = fs.readFileSync(file, "utf8");
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ENOENT" ? false : null;
+    }
+    let raw: Partial<WriterMarkerFile>;
+    try {
+        raw = JSON.parse(content) as Partial<WriterMarkerFile>;
+    } catch {
+        return null;
+    }
+    if (raw.instanceId !== peerInstanceId) return null;
+    let mtimeMs: number;
+    try {
+        mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+        return null;
+    }
+    return contestedServedAt(raw, selfInstanceId, sessionId, mtimeMs, now) !== null;
 }
 
 /** Startup hygiene: drop marker files whose instance is provably gone (pid
