@@ -5269,16 +5269,23 @@ export async function ensureProxyRunning(
                 // means rotation happened under us — everything left is ours.
                 let start = spawnLogOffset;
                 if (size < start) start = Math.max(0, size - 256);
-                const len = Math.min(256, size - start);
-                if (len <= 0) return "";
+                const span = size - start;
+                if (span <= 0) return "";
+                // #4816: the death cause sits at the END of a child's output —
+                // when this spawn wrote more than the sample window, take the
+                // TAIL instead of the head (head-only sampling then showed
+                // startup noise while the fatal line sat unread further down).
+                const len = Math.min(256, span);
+                const off = span > len ? start + (span - len) : start;
+                const label = span > len ? "tail" : "head";
                 const fd = fs.openSync(logPath, "r");
                 try {
                     const buf = Buffer.alloc(len);
-                    const n = fs.readSync(fd, buf, 0, len, start);
+                    const n = fs.readSync(fd, buf, 0, len, off);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
-                    return ` — child output head: "${s}"`;
+                    return ` — child output ${label}: "${s}"`;
                 } finally {
                     fs.closeSync(fd);
                 }
