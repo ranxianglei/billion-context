@@ -622,18 +622,18 @@ export async function executeReadOriginalImage(
 ): Promise<ProxyToolResult & { image?: { base64: string; mediaType: string } }> {
     const ref = typeof args.ref === "string" ? args.ref.trim() : "";
     if (!REF_PATTERN.test(ref)) {
-        return toolFail(`acp_read_original_image: invalid ref "${ref}" — pass the mNNNNN message ref quoted in the [bili] note beside the shrunken image.`);
+        return toolFail(`[acp_read_original_image FAILED: invalid ref "${ref}" — pass the mNNNNN message ref quoted in the [bili] note beside the shrunken image.]`);
     }
     const entries = session.incomingImageIndex?.get(ref);
     if (!entries || entries.length === 0) {
-        return toolFail(`acp_read_original_image: no original image stored for ${ref} (it may no longer ride the conversation history). Work from the downscaled version you already have.`);
+        return toolFail(`[acp_read_original_image FAILED: no original image stored for ${ref} (it may no longer ride the conversation history). Work from the downscaled version you already have.]`);
     }
     const entry = entries[0];
     let buf: Buffer;
     try {
         buf = await readFile(entry.path);
     } catch {
-        return toolFail(`acp_read_original_image: the original for ${ref} was evicted from local storage; it becomes readable again while the image rides the resent history.`);
+        return toolFail(`[acp_read_original_image FAILED: the original for ${ref} was evicted from local storage; it becomes readable again while the image rides the resent history.]`);
     }
     const counterMeta = session.metadata.imageRescaleReads;
     const counter = counterMeta && typeof counterMeta === "object"
