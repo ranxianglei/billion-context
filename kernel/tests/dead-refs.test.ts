@@ -209,8 +209,12 @@ test("covered endpoints keep the 'already compressed' verdict; nothing is marked
   });
 
   assert.equal(result.result.blocksCreated, 0);
-  assert.match(result.result.errors[0]!, /already compressed/);
-  assert.match(result.result.errors[0]!, /b1/);
-  assert.doesNotMatch(result.result.errors[0]!, /DEAD/);
+  // #4521: covered resubmit is the idempotent no-op — verdict moved from
+  // errors[] to warnings[] (still names b1, still marks nothing dead).
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
+  assert.match(result.result.warnings.join(" "), /already compressed/);
+  assert.match(result.result.warnings.join(" "), /b1/);
+  assert.match(result.result.warnings.join(" "), /do not resend/);
   assert.equal(result.state.deadRefs, undefined);
 });
