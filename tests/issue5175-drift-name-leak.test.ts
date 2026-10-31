@@ -938,3 +938,76 @@ for (const [laneName, drive] of [
         );
     });
 }
+
+// ---------- #5175 residual on the FOURTH wire: responses ----------
+
+// `pipePluginResponsesWithStrip` owns the last independent fast path. It takes a
+// single payload rather than a chunk list, so the cut sweep needs its own
+// two-delta driver — but the invariant is the same one the three chat lanes
+// just proved, and leaving this wire out would repeat exactly the gap the
+// anthropic and google blocks closed.
+function driveResponsesCut(pieces: string[]): Promise<{ text: string; calls: number }> {
+    const enc = new TextEncoder();
+    const sse = (type: string, extra: Record<string, unknown>): string =>
+        `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`;
+    const of = (ev: string[]): ReadableStream<Uint8Array> => {
+        let i = 0;
+        return new ReadableStream<Uint8Array>({ pull(c) { if (i < ev.length) c.enqueue(enc.encode(ev[i++])); else c.close(); } });
+    };
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_respcut_" + Math.random().toString(36).slice(2),
+        stats: { pendingFoldUsage: false, compressCreditTokens: 0 },
+    } as unknown as Session;
+    let calls = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array>> => {
+        calls += 1;
+        return Promise.resolve(
+            of([
+                sse("response.output_text.delta", { item_id: "oi1", output_index: 0, delta: "the real answer" }),
+                sse("response.completed", { response: { id: "r1", usage: { input_tokens: 1, output_tokens: 1 } } }),
+            ]),
+        );
+    };
+    const events = [
+        ...pieces.map((p) => sse("response.output_text.delta", { item_id: "oi1", output_index: 0, delta: p })),
+        sse("response.completed", { response: { id: "r1", usage: { input_tokens: 1, output_tokens: 1 } } }),
+    ];
+    return pipePluginResponsesWithStrip(
+        streamOfLocal(events),
+        res as unknown as import("node:http").ServerResponse,
+        session,
+        undefined,
+        refetch,
+    ).then(() => ({
+        text: [...writes.join("").matchAll(/"delta":"((?:[^"\\]|\\.)*)"/g)]
+            .map((m) => JSON.parse(`"${m[1]}"`) as string)
+            .join(""),
+        calls,
+    }));
+}
+
+test("#5175 residual: a byte cut never hands the responses client a ref or a drifted opener", async () => {
+    let cuts = 0;
+    const offenders: string[] = [];
+    for (const [name, text] of CUT_PAYLOADS) {
+        const bytes = Buffer.from(text, "utf8");
+        for (let cut = 1; cut < bytes.length; cut += 1) {
+            const a = bytes.subarray(0, cut).toString("utf8");
+            const b = bytes.subarray(cut).toString("utf8");
+            const got = (await driveResponsesCut([a, b])).text;
+            cuts += 1;
+            if (KERNEL_REF_TEST.test(got) || DRIFT_OPENER_TEST.test(got)) {
+                offenders.push(`${name}@${cut}: ${JSON.stringify(got.slice(0, 90))}`);
+            }
+        }
+    }
+    assert.ok(cuts > 200, `the sweep must cover every boundary, got ${cuts}`);
+    assert.equal(
+        offenders.length,
+        0,
+        `${offenders.length}/${cuts} cuts leaked on the responses lane:\n${offenders.slice(0, 4).join("\n")}`,
+    );
+});
