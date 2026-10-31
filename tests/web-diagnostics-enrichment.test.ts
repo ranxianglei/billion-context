@@ -11,6 +11,7 @@ import os from "node:os";
 import * as path from "node:path";
 import { buildDiagnostics, _candidateLogReadsForTest, _resetCandidateLogReadsForTest } from "../src/web/diagnostics.js";
 import { isMaskHostsEnabled, setMaskHostsEnabled } from "../src/log-mask.js";
+import { getSession, _resetSessionsForTest } from "../src/session.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 
@@ -192,6 +193,90 @@ test("#3813 single-read: storage tail and conflict tail share one candidate set 
     assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
     withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
     assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
+});
+
+// #4649: the #3611 enrichment was dsh-only — a codex conflict report shipped
+// zero log signatures and no client version (#4648), stalling triage on data
+// the reporter had to dig out by hand. Pin both directions: the codex
+// compaction signatures match the conflict tail (and unrelated lines still do
+// not), and the live pool's distinct clientHints surface as version evidence —
+// including on machines with NO dsh profile, where the old early-return hid
+// the whole section tail.
+test("#4649 codex lane: conflict tail matches codex signatures; client hints carry versions", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-codex-"));
+    _resetSessionsForTest();
+    t.after(() => { rmSync(root, { recursive: true, force: true }); _resetSessionsForTest(); });
+    const stateHome = path.join(root, "state");
+    mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
+    writeFileSync(path.join(stateHome, "billion-context", "bili.log"), [
+        "[ses_codex_1] codex compaction_trigger request not intercepted (no active fold blocks) — forwarding verbatim (no preflight, no rebuild, no window clamp)",
+        "[ses_codex_2] codex compact intercepted (inline-prompt form); forged SSE with 3 block summary(s), upstream not contacted",
+        "[ses_codex_3] codex compact forge failed (window violation); passing through to upstream",
+        "[acp-usage] round 9 input=90000 cached=80000 (cache hit 88%)",
+    ].join("\n") + "\n");
+    const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    const blob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    assert.ok(blob.includes("codex compaction_trigger request not intercepted"), "passthrough decision captured");
+    assert.ok(blob.includes("codex compact intercepted"), "intercept success captured");
+    assert.ok(blob.includes("codex compact forge failed"), "forge failure captured");
+    assert.ok(!blob.includes("[acp-usage] round 9"), "unrelated log lines still excluded");
+    // No sessions yet: the hint line must be absent, not empty-noise.
+    assert.ok(!blob.includes("observed client hints"), "no hint line without live sessions");
+
+    const a = getSession("ses_codex_1");
+    a.metadata.clientHint = "codex_cli_rs/0.163.0";
+    const b = getSession("ses_codex_2");
+    b.metadata.clientHint = "codex_cli_rs/0.163.0";
+    const c = getSession("ses_oc_1");
+    c.metadata.clientHint = "opencode";
+    const blob2 = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    // 3 sessions, 2 DISTINCT hints (the duplicate UA collapses):
+    assert.ok(blob2.includes("observed client hints (2 distinct, live sessions):"), `hint line present with distinct count:\n${blob2}`);
+    // entry order follows lastSeen (same-millisecond ties are insertion-ordered),
+    // so match on membership, not position:
+    const hintLine = blob2.split("\n").find((l) => l.startsWith("observed client hints")) ?? "";
+    assert.ok(hintLine.includes("codex_cli_rs/0.163.0") && hintLine.includes("opencode"),
+        `both distinct hints on one line, got: ${hintLine}`);
+    assert.equal(hintLine.split("codex_cli_rs/0.163.0").length - 1, 1, "duplicate UA hint deduped to one entry");
+});
+
+test("#4649 no dsh profiles: observed client hints still surface (old early-return hid them)", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-codex-noprof-"));
+    _resetSessionsForTest();
+    t.after(() => { rmSync(root, { recursive: true, force: true }); _resetSessionsForTest(); });
+    mkdirSync(path.join(root, "dsh"), { recursive: true });
+    const s = getSession("ses_codex_only");
+    s.metadata.clientHint = "Codex Desktop/1.2.3";
+    const env = { DSH_HOME: path.join(root, "dsh"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    const blob = withEnv(env, () => buildDiagnostics()).blob;
+    assert.ok(blob.includes("no profiles under DSH_HOME"), "no-profiles note kept");
+    assert.ok(blob.includes("observed client hints (1 distinct, live sessions): Codex Desktop/1.2.3"),
+        `hint line present despite missing profiles:\n${blob}`);
+});
+
+// #4688: a PURE orphan-reap ledger (no plugin events, no dsh/codex framing)
+// shipped with an empty evidence section because neither reap verdict nor the
+// OpenAI-lane codex detection was in CONFLICT_LOG_PATTERNS — the report's own
+// log tail was blind to the very event it was reporting. Pin both signatures
+// (and the unrelated-line exclusion) so orphan-reap reports carry their proof.
+test("#4688 orphan-reap report carries the reap verdict and the OpenAI-lane codex detection", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-reap-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const stateHome = path.join(root, "state");
+    mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
+    const reapLine = "[ses_734d5481] zombie fold reap: removed 2 block(s) (b1, b2) from ACP state; blockContents retained, refs pruned to live ids (#2695)";
+    const codexOpenaiLine = "[ses_codex_9] codex local auto-compaction detected (3/120 covered ids retained) — rebasing ACP state onto the compacted history (#2372/#4521)";
+    writeFileSync(path.join(stateHome, "billion-context", "bili.log"), [
+        "[acp-usage] round 4 input=120000 cached=100000 (cache hit 83%)",
+        reapLine,
+        codexOpenaiLine,
+    ].join("\n") + "\n");
+    const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    const blob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    assert.ok(blob.includes("zombie fold reap"), "orphan-reap verdict captured (pre-fix: empty evidence section)");
+    assert.ok(blob.includes("blockContents retained"), "reap line kept whole enough to show contents survived");
+    assert.ok(blob.includes("codex local auto-compaction detected"), "OpenAI-lane codex detection captured");
+    assert.ok(!blob.includes("[acp-usage] round 4"), "unrelated log lines still excluded");
 });
 
 test("#3611 enrichment is generic: storage topic and unknown topics carry it too", (t) => {

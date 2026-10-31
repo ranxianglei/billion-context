@@ -17,6 +17,14 @@
  * `--- recent conflict-related log lines ---` (the exact signatures a
  * maintainer greps to adjudicate a native-compaction episode).
  *
+ * #4649: the #3611 coverage was dsh-only — a codex conflict report shipped
+ * zero log signatures and no client version (#4648), stalling triage on data
+ * the reporter had to dig out by hand. The conflict tail now also matches the
+ * codex compaction evidence chain (intercepted / not-intercepted / forge
+ * failed), and the versions section lists the live pool's distinct
+ * `clientHint`s — for UA-carried clients like codex the hint IS the version
+ * string (`codex_cli_rs/<ver>`), recorded per session at first request.
+ *
  * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body (copied
  * verbatim AND embedded in the prefilled URL). Every byte passes redactForPublish
  * at the SINK (buildDiagnostics) — unconditional host masking + credential-shape
@@ -60,6 +68,7 @@ const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
 const DSH_PROFILE_CAP = 8;
+const CLIENT_HINT_CAP = 8;
 const DSH_REPORT_PACKAGES = ["@deepseek-ai/dsh", "@deepseek-ai/dsh-compaction-basic", "@deepseek-ai/dsh-web-app"] as const;
 
 function humanUptime(seconds: number): string {
@@ -128,12 +137,25 @@ function storageLogTail(lines: string[]): string[] {
 // routed-call refusals (#1729), the destruction verdict (#2193), successful
 // rebases (#2432), and the web-app preset notice that says whether the #3354
 // load-time overlay applies to this machine's profiles.
+// #4649: the codex lane's equivalent chain — whether a compaction was
+// intercepted (and forged locally) or passed through unrecognized; without
+// these a codex conflict report carries no log evidence at all (#4648).
+// #4688: the client-agnostic tail of the chain — the #2695 zombie reap verdict
+// (the line a pure orphan-reap ledger lives on; without it such reports ship
+// an empty evidence section even with the reap in the log pair) and the
+// OpenAI-lane codex local auto-compaction detection (#2372/#4521) that lands
+// beside it once PR #4542 ships.
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
     "compression substrate appears destroyed",
     "native compaction boundary",
     "profile bundles include @deepseek-ai/dsh-web-app",
+    "codex compaction_trigger request not intercepted",
+    "codex compact intercepted",
+    "codex compact forge failed",
+    "zombie fold reap",
+    "codex local auto-compaction detected",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
@@ -201,19 +223,42 @@ function dshPackageVersion(profileDir: string, pkg: string): string | undefined 
     }
 }
 
+// #4649: for clients whose version lives in the User-Agent (codex et al.),
+// the per-session clientHint recorded at first request IS the version
+// evidence — list the live pool's distinct hints so a conflict report names
+// what actually talked to this proxy. Label hints ("claude", "opencode") and
+// UA strings ("codex_cli_rs/<ver>") both appear verbatim; dedupe keeps
+// long-lived multi-session machines readable.
+function observedClientHintLines(): string[] {
+    const seen: string[] = [];
+    try {
+        for (const s of listSessions()) {
+            const h = s.metadata.clientHint;
+            if (typeof h !== "string" || h.length === 0 || seen.includes(h)) continue;
+            seen.push(h);
+        }
+    } catch { /* degrade: no hint line */ }
+    if (seen.length === 0) return [];
+    const listed = seen.slice(0, CLIENT_HINT_CAP).join(" | ");
+    return [`observed client hints (${seen.length} distinct, live sessions): ${listed}${seen.length > CLIENT_HINT_CAP ? ` (+${seen.length - CLIENT_HINT_CAP} more)` : ""}`];
+}
+
 function hostClientVersionLines(): string[] {
     const lines: string[] = ["--- host client versions ---"];
     let dirs: string[] = [];
     try { dirs = dshProfileDirs(process.env); } catch { dirs = []; }
     if (dirs.length === 0) {
         lines.push(`dsh: no profiles under DSH_HOME (${path.basename(resolveDshHome(process.env)) || "?"}/profiles missing — dsh has never run here, or DSH_HOME points elsewhere)`);
-        return lines;
+    } else {
+        for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
+            const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
+            lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+        }
+        if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     }
-    for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-        const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-        lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
-    }
-    if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
+    // #4649: the hint line must appear even when no dsh profile exists — a
+    // codex-only machine is exactly the case the old early-return hid.
+    lines.push(...observedClientHintLines());
     return lines;
 }
 
