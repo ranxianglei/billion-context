@@ -441,6 +441,17 @@ export function sessionResidentHardMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
 }
 
+/** BILI_SESSION_CONTENT_STORE_PIN (1/true): keep each session's CCR content
+ *  store ({byRef}/{byHash} originals) RESIDENT in memory instead of folding
+ *  it away after its save lands (#4788 phase 2, discussion #3916-E; the
+ *  store re-materializes on first touch from the unified ccr mirror or the
+ *  .content-store.json sidecar — payload-first write order, #2674). Unset,
+ *  0/false or any other value = fold (the default). */
+export function contentStorePinned(env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_SESSION_CONTENT_STORE_PIN?.trim().toLowerCase();
+    return raw === "1" || raw === "true";
+}
+
 interface GcSettings {
     enabled: boolean;
     maxAgeMs: number;
