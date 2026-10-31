@@ -2129,6 +2129,10 @@ export const headroomFallbackLogged = new Set<string>();
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
 export const headroomEffectiveLogged = new Set<string>();
+/** #5191: per session|model|value dedup for the [arm-judge] line — the
+ * session overflow arm's judging wall is session-scoped evidence, unlike the
+ * config-derived [headroom] value, so the dedup key carries the session id. */
+export const armJudgingWallLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
@@ -3703,6 +3707,30 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
+    // #5191: handle.ts already announced "nudge/preflight judge input against
+    // ${reserved}" ([headroom]) — but when THIS session's overflow arm proved the
+    // upstream bills the completion share against the same wall (#3450), the
+    // judgments below run on min(reserved, statedWall - completionReserve),
+    // which can sit BELOW the announced window. An incident log showing two
+    // windows with no explanation sent the #5191 reporter chasing config that
+    // was never read. State the wall that actually judges, once per
+    // session|model|arm-value|headroom-value (the [headroom] number itself
+    // moves — the #3450 provider-lifetime proof clamps it later, e.g.
+    // 1,086,000 → 894,000 — and each new announcement deserves its own arm
+    // note). Reference the #4205 reserved twin, NOT config.modelContextLimit:
+    // the post-400 recovery pass reaches this code with modelContextLimit
+    // already rewritten to the armed ceiling, which would mislabel the
+    // comparison number as the [headroom] window.
+    const headroomWindow = typeof session.metadata.reservedContextLimit === "number" && session.metadata.reservedContextLimit > 0
+        ? session.metadata.reservedContextLimit
+        : config.modelContextLimit;
+    if (limit < headroomWindow) {
+        const armKey = `${session.id}|${String(model ?? "?")}|${limit}|${headroomWindow}`;
+        if (!armJudgingWallLogged.has(armKey)) {
+            armJudgingWallLogged.add(armKey);
+            log("info", `[arm-judge] upstream overflow proof (stated wall ${statedWall}, ${completionReserve} billed to completion): nudge/preflight judge input against ${limit} — BELOW the [headroom] window ${headroomWindow}; that line does not apply while this arm is live (#3450, #5191)`);
+        }
+    }
     // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
     // so bili's preflight must stay ahead of that bar to win the race — a 100%
     // trigger lets codex compact first and the ACP lane becomes a backstop.
