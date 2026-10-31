@@ -4248,8 +4248,19 @@ function pickAttachable(
         // below stays intact.
         if (incompatible === "code-fingerprint-mismatch" && c.health?.version !== undefined
                 && isNewerSameLaneHolder(c.inst, opts.lane, c.health.version, VERSION, isUserZoneInstance(c.inst))) {
-            diag?.(`native-attach: adopt ${c.inst.origin} (pid ${c.inst.pid}): foreign bytes but self-reported v${c.health.version} is strictly NEWER than this lane's v${VERSION} — riding the newer build instead of deadlocking behind it (#4125)`);
-            incompatible = undefined;
+            // #4125: upward adoption lifts the fingerprint veto ONLY — the
+            // config-shape guard still applies. instanceCompatible reports the
+            // fp reason first, so a shape drift on a foreign-bytes holder would
+            // otherwise ride along invisibly once the veto is cleared (the
+            // adoptServingTwin path re-checks shape explicitly; mirror it here).
+            const adoptedShape = instanceShapeMismatch(c.inst, opts, foreignLanes);
+            if (adoptedShape === undefined) {
+                diag?.(`native-attach: adopt ${c.inst.origin} (pid ${c.inst.pid}): foreign bytes but self-reported v${c.health.version} is strictly NEWER than this lane's v${VERSION} — riding the newer build instead of deadlocking behind it (#4125)`);
+                incompatible = undefined;
+            } else {
+                diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): reports v${c.health.version} (newer) but its config shape differs (${adoptedShape}) — shape guards survive upward adoption (#4125)`);
+                incompatible = adoptedShape;
+            }
         }
         if (incompatible !== undefined) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): incompatible (${incompatible})`); continue; }
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }

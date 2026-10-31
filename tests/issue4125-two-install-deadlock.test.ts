@@ -210,6 +210,21 @@ test("findLiveAttachableInstance: cross-lane or user-zone holders stay rejected 
     }
 });
 
+test("findLiveAttachableInstance: a strictly-newer holder with a drifted config shape stays rejected (#4125)", async () => {
+    const prev = sandboxHome("bili-4125-d-");
+    try {
+        // Newer AND same-lane, but the holder recorded a model window our
+        // launch doesn't want — upward adoption lifts ONLY the fingerprint
+        // veto; the config-shape guard must survive it (a foreign-bytes holder
+        // masks its shape behind the fp reason in instanceCompatible).
+        const { inst, diag } = await findUpward(NEWER_VERSION, { modelWindows: { "claude-opus": 200000 } });
+        assert.equal(inst, undefined, "newer-but-shape-drifted holder must NOT be adopted");
+        assert.ok(diag.some((m) => m.includes("model-windows-mismatch")), `diag was: ${JSON.stringify(diag)}`);
+    } finally {
+        restoreHome(prev);
+    }
+});
+
 // ---------- P2: the adopt-signal round trip (child exit 3 → parent adopts) ----------
 
 test("ensureProxyRunning: a twin-collision exit against a PROVEN newer holder is adopted, not failed (#4125)", async () => {

@@ -204,6 +204,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed. |
 | `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. |
 | `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | Per-SESSION hard cap on estimated resident bytes (#4788, decision #4792 D1-A). Unlike the pool soft cap — which can only evict OTHER cold sessions and never touches a sole-active session — this bounds ONE session: over the cap at a request-end boundary, its droppable fields (folded-block originals, metadata ledger, the raw tail beyond the bounded view) are forced back to disk even for a pool-exempt session, and the next turn transparently re-reads what it needs via narrow disk reads. Safe drops run at every request boundary as long as the last save has provably landed; the cap adds the per-session call-out (warn, throttled to 60 s). `0` disables the cap check. |
+| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | Escape hatch for the #4788 phase-2 resident drop: keep each session's content store pinned in memory (nothing ever folded away). Default off: after every proven-landed save, idle sessions' content stores are dropped between requests and re-read on demand from the unified index mirror or the sidecar file; sessions whose store has no provably-landed copy (e.g. fresh fork children) stay resident automatically. Set this if you need zero re-read latency at the cost of RAM. |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age threshold in days. |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
@@ -281,6 +282,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
+| `compress.messageTimestamps` | boolean | false | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. Default off keeps every byte identical to pre-feature master (#4313, PR #5236). |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
@@ -770,7 +772,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `boolean`
 - **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** Claude Code subagent session splitting (#970/#4352), two mechanisms both gated by this switch. (1) anthropic-wire requests carrying the `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` pair get their own `<session>\|sub:<agent-id>` session — own lock chain and compression state — instead of queueing behind the main session's lock. (2) Header-less claude code traffic (the VS Code extension build, whose subagents carry no agent-id headers and share the parent's first system block, so the pair gate misses — #4352) is routed through the continuity-aware order resolver: a continuing main conversation keeps the raw key on order+content evidence, while a history-disjoint subagent ride forks onto its own `<session>\|sub:<fp>` lane so it stops destroying the parent's fold substrate. Set `BILI_SUBAGENT_SPLIT=0` to disable BOTH mechanisms.
+- **Description:** Claude Code subagent session splitting (#970/#4352), two mechanisms both gated by this switch. (1) anthropic-wire requests carrying the `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` pair get their own `<session>\|sub:<agent-id>` session — own lock chain and compression state — instead of queueing behind the main session's lock. (2) Header-less claude code traffic (the VS Code extension build, whose subagents carry no agent-id headers and share the parent's first system block, so the pair gate misses — #4352) is routed through the continuity-aware order resolver: a continuing main conversation keeps the raw key on order+content evidence, while a history-disjoint subagent ride forks onto its own lane — keyed per-DISPATCH by the bili SubagentStart hook's token when it rides the first user message (`<session>\|sub:<fp>:t:<token>`), else by a fragment of the run's first user message (`<session>\|sub:<fp>:<userFp>`), so same-type subagents re-dispatched under one parent id never share a compression session (#5095); a ride with neither a valid token nor usable user text keeps the two-segment `<session>\|sub:<fp>` form. Set `BILI_SUBAGENT_SPLIT=0` to disable BOTH mechanisms.
 
 ### `forkAdoption`
 
@@ -1621,6 +1623,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Since #913, `false` also drops the #862 silence clause from the marker-integrity note appended to nudges and the injected compress prompt — an invisible deployment has no marker for the model to imitate or narrate around, so the clause is pure noise there. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
 
+#### `messageTimestamps`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Opt-in message timestamps (#4313, PR #5236): when on, bili mints each message one immutable local-time stamp at first sight and shows it — a `time="yyyy-MM-dd HH:mm:ss"` attribute on every `<acp>` compression tag on the wire, a `[start – end]` coverage span appended to each compress-receipt fingerprint line, and an Occurred line in rendered block summaries. Cost is about 8 tokens per message when visible; off is the default and keeps every outbound byte identical to pre-feature master (including the prompt defaults). Storage still records the stamps either way, so flipping the flag later surfaces them without data loss. Resolution is env (`BILI_MESSAGE_TIMESTAMPS`; `0` forces off, any other value forces on, same convention as BILI_RESIGN) over the config file, resolved once per proxy instance — changing the flag needs a restart.
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
@@ -1847,6 +1856,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | false |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
@@ -1881,6 +1891,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
