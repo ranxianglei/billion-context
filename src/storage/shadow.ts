@@ -90,11 +90,18 @@ export const DRIFT_ESCALATE_STREAK = 3;
  *    unified-full mode it may hold the only copy of recent session state.
  * Empty elsewhere: every field instance of this failure domain is win32-x64
  * (#3338/#3385/#3788/#3823/#4614), and Linux/macOS causes (permissions, disk
- * full) are too varied to hint at usefully.
+ * full) are too varied to hint at usefully. The NO-ENGINE failure is the one
+ * platform-independent exception: one line — "requires Node.js 22+" (owner
+ * 2026-10-31: the error only needs to say Node.js 22 or newer).
  * #5103: also applied to INGEST-time failures (noteIngestFailure) — the same
  * OS-refusal class surfaces after a successful open, so those warnings carry
  * this hint too. */
 export function sqliteOpenFailureHint(err: string): string {
+    // #4343-era no-engine failure (any platform): one actionable line is all
+    // it needs — owner 2026-10-31: "报错只需要说 需要 nodejs 22 以上即可".
+    if (/no SQLite engine available/i.test(err)) {
+        return "requires Node.js 22 or newer";
+    }
     if (process.platform !== "win32") return "";
     if (/unable to open database file/i.test(err)) {
         return " (win32: the OS refused to open the file — check the Node runtime's integrity label FIRST (icacls \"<path-to-node.exe>\"; a Low label is refused by Windows integrity control even with correct ACLs, #5154), then antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, or a path over 260 chars; if the label is clean, exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning; deleting the file will not clear a lock)";
@@ -305,9 +312,7 @@ export class UnifiedShadow {
             // (legacy mode / encryption opt-out / persistence off) resolve to
             // mode===legacy above and never reach here.
             const hint = sqliteOpenFailureHint(errStr);
-            const tail = /no SQLite engine available/i.test(errStr)
-                ? ""
-                : hint !== "" ? `; ${hint}` : "; check file/OS state (CANTOPEN/readonly) or move index.db{,-wal,-shm} aside after backing up to force a fresh rebuild";
+            const tail = hint !== "" ? `; ${hint}` : "; check file/OS state (CANTOPEN/readonly) or move index.db{,-wal,-shm} aside after backing up to force a fresh rebuild";
             loggerLog(
                 "error",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — REFUSING TO START (owner policy 2026-10-30: NO degradation in any case — fix the environment or set BILI_STORAGE_UNIFIED=legacy explicitly to serve JSON-only${tail})`,
