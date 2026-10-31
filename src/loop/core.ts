@@ -1607,15 +1607,22 @@ export async function* runCompressLoop(
                         ctx.log(`[acp-loop] upstream ${e.status} rejects the reasoning echo field as extra — vetoed strict reasoning echo for this session (#5260)`);
                         loggerLog("warn", `[acp-loop] vetoed strictReasoningEcho (session ${ctx.session.id}); blank-echo injection disabled until opposite evidence (#5260)`);
                     }
-                } else if (
-                    e.status === 400 &&
-                    /reasoning_(?:content|text)/i.test(e.body) &&
-                    ctx.session.metadata.strictReasoningEcho !== true
-                ) {
-                    ctx.session.metadata.strictReasoningEcho = true;
-                    delete ctx.session.metadata.strictReasoningEchoVeto;
-                    ctx.log(`[acp-loop] 400 mentions a reasoning echo field — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684/#2169)`);
-                    loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                } else if (e.status === 400 && /reasoning_(?:content|text)/i.test(e.body)) {
+                    if (ctx.session.metadata.strictReasoningEcho !== true) {
+                        ctx.session.metadata.strictReasoningEcho = true;
+                        ctx.log(`[acp-loop] 400 mentions a reasoning echo field — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684/#2169)`);
+                        loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                    }
+                    // #5260 review: the veto clear is its OWN transition — folding
+                    // it into the flag-flip condition above would leave a session
+                    // that learned ON and was later vetoed stuck vetoed forever
+                    // (demand evidence arriving while the flag is already true
+                    // cleared nothing → permanent 400 loop in the opposite direction).
+                    if (ctx.session.metadata.strictReasoningEchoVeto === true) {
+                        delete ctx.session.metadata.strictReasoningEchoVeto;
+                        ctx.log(`[acp-loop] 400 demands the reasoning echo field again — cleared strict reasoning echo veto (#5260)`);
+                        loggerLog("warn", `[acp-loop] cleared strictReasoningEchoVeto (session ${ctx.session.id}) on demand-class evidence (#5260)`);
+                    }
                 }
                 // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).
                 if (e.status >= 400 && e.status < 500) {

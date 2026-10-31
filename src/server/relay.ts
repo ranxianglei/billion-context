@@ -1569,9 +1569,18 @@ async function forwardCaptured(
             } else if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
-                    delete s.metadata.strictReasoningEchoVeto;
                     markDirty(s);
                     log("warn", `[${s.id}] upstream 400 mentions a reasoning echo field — learned strictReasoningEcho for this session (#684/#762/#2169); reasoning-drop disabled`);
+                }
+                // #5260 review: the veto clear is its OWN transition — nesting it
+                // in the flag-flip guard above would leave a session that learned
+                // ON and was later vetoed stuck vetoed forever (demand evidence
+                // arriving while the flag is already true cleared nothing →
+                // permanent 400 loop in the opposite direction).
+                if (s.metadata.strictReasoningEchoVeto === true) {
+                    delete s.metadata.strictReasoningEchoVeto;
+                    markDirty(s);
+                    log("warn", `[${s.id}] upstream 400 demands the reasoning echo field again — cleared strictReasoningEchoVeto (#5260); blank-echo injection re-enabled`);
                 }
             }
         }
