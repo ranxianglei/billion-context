@@ -1028,15 +1028,21 @@ const residentWeights = new WeakMap<Session, { revision: number; bytes: number }
 // is advisory (it only shapes refusal wording), never load-bearing; bounded so
 // a long-lived process cannot accumulate unbounded entries.
 const evictedWeights = new Map<string, number>();
+// #5111: when each eviction-time measurement was taken — the refusal receipt
+// quotes the stamped weight as "last measured", and reporters comparing it
+// against /__bili/memory minutes later need to know how stale that number is.
+const evictedWeightAt = new Map<string, number>();
 const EVICTED_WEIGHT_CAP = 256;
 
 function stampEvictedWeight(id: string, bytes: number): void {
     if (evictedWeights.has(id)) evictedWeights.delete(id);
     evictedWeights.set(id, bytes);
+    evictedWeightAt.set(id, Date.now());
     while (evictedWeights.size > EVICTED_WEIGHT_CAP) {
         const oldest = evictedWeights.keys().next().value;
         if (oldest === undefined) break;
         evictedWeights.delete(oldest);
+        evictedWeightAt.delete(oldest);
     }
 }
 
@@ -1169,6 +1175,10 @@ interface ResidentPressure {
     /** Last-known LIVE weight of this session (eviction-time measurement; falls
      * back to its resident weight when it is resident now). Undefined = unknown. */
     weightBytes?: number;
+    /** Age in ms of the eviction-time measurement behind weightBytes (the pool
+     * drains over time — /__bili/memory minutes later can be far lower);
+     * undefined when the quoted weight is a live resident measurement or unknown. */
+    weightAgeMs?: number;
     /** Resident bytes held by all OTHER sessions (this one excluded). */
     otherBytes: number;
     /** Resident bytes held by OTHER sessions with traffic within
@@ -1189,10 +1199,14 @@ export function residentPressure(id: string): ResidentPressure {
     for (const s of sessions.values()) {
         if (s.id !== id && now - s.lastSeen <= PEER_ACTIVE_WINDOW_MS) activeOtherBytes += sessionWeight(s);
     }
+    const stampedAt = evictedWeightAt.get(id);
     return {
         permanent: weightBytes !== undefined &&
             (weightBytes > MAX_RESIDENT_BYTES || weightBytes + activeOtherBytes > MAX_RESIDENT_BYTES),
         weightBytes,
+        // The quoted figure is only "last measured" when the eviction-time stamp
+        // dominates a live resident weight — then its age is what makes it stale.
+        weightAgeMs: known !== undefined && known >= self && stampedAt !== undefined ? now - stampedAt : undefined,
         otherBytes: total - self,
         activeOtherBytes,
         residentBytes: total,

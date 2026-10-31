@@ -132,3 +132,36 @@ test("#5111: unknown session keeps no permanent claim and zeroed active accounti
     assert.equal(p.permanent, false, "unknown session: no permanent claim without a known weight");
     assert.equal(p.weightBytes, undefined, "unknown session: no weight to quote");
 }));
+
+// #5111 follow-up (repro on a live box): the refusal asserted over-budget
+// eviction as THE cause while the persisted-view fallback (#3982) failed for
+// its own unexplained reason, and the quoted footprint carried no timestamp
+// even though the pool drains between requests. Pin both fixes: the receipt
+// names WHY no fallback copy was readable (stable reason codes from
+// storedTailViewStatus) and quotes how stale the stamped weight is.
+test("#5111: the refusal names why the persisted-view fallback came up empty (exact reason code)", async () => fixture(async () => {
+    const big = growAndEvictBig();
+    const peer = peekSession("peer-sess");
+    assert.ok(peer);
+    peer!.lastSeen = Date.now() - 10 * 60 * 1000;
+    const logs: string[] = [];
+    const res = applyRanges(SPEC(), makeCtx(big, logs));
+    assert.equal(res.outcome, "refused");
+    // Fixture shape: unified-FULL store exists but never persisted a raw-tail
+    // row for this session (transient views are not saved) → no-persisted-rows.
+    assert.ok(res.text.includes("Persisted-view recovery was attempted and found nothing readable (no-persisted-rows)."),
+        `receipt names the fallback failure cause: ${res.text}`);
+    assert.ok(logs.some((l) => l.includes("persisted-view recovery unavailable (no-persisted-rows)")),
+        `log carries the same code: ${JSON.stringify(logs)}`);
+}));
+
+test("#5111: the quoted footprint carries its measurement age (stale-snapshot guard)", async () => fixture(async () => {
+    const big = growAndEvictBig();
+    const p = residentPressure(big.id);
+    assert.ok(p.weightAgeMs !== undefined && p.weightAgeMs >= 0 && p.weightAgeMs < 60_000,
+        `freshly evicted stamp has a small age: ${p.weightAgeMs}`);
+    const logs: string[] = [];
+    const res = applyRanges(SPEC(), makeCtx(big, logs));
+    assert.match(res.text, /measured \d+s ago/, `receipt timestamps the quoted footprint: ${res.text}`);
+    assert.ok(logs.some((l) => l.includes("PERMANENT") && /measured \d+s ago/.test(l)), `log timestamps it too: ${JSON.stringify(logs)}`);
+}));
