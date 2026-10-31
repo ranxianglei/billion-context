@@ -64,14 +64,17 @@ const EIGHT = [
   msg("h", "eighth detailed message body content theta"),
 ];
 
-test("applyCompression fails when the range is ENTIRELY within the recent zone", () => {
+test("applyCompression no-ops when the range is ENTIRELY within the recent zone", () => {
   const core = createCore();
   const messages = [...EIGHT];
   const state = seededState(messages);
   const cfg = config({ preserveRecentMessages: 3 });
 
   // m00006..m00008 are the last 3 → entirely protected. After filtering there
-  // is nothing left to compress, so the range must still fail.
+  // is nothing left to compress. #4521: that is the idempotent no-op class —
+  // the range was legal to request (it aimed at the newest tail, exactly the
+  // messages the model just produced), so refusing it whole-batch only fed
+  // retry livelocks. Zero blocks, zero errors, guidance in warnings[].
   const result = core.applyCompression({
     ranges: [
       {
@@ -87,12 +90,14 @@ test("applyCompression fails when the range is ENTIRELY within the recent zone",
   });
 
   assert.equal(result.result.blocksCreated, 0, "no block created");
-  assert.equal(result.result.errors.length, 1);
+  assert.equal(result.result.errors.length, 0, "no failure — nothing was left to fold");
+  assert.equal(result.result.noop, true, "flagged as the no-op class");
   assert.match(
-    result.result.errors[0]!,
-    /entirely.*protected.*last 3|last 3.*protected/i,
-    `error should mention the protected recent zone with nothing left, got: ${result.result.errors[0]}`,
+    result.result.warnings.join(" "),
+    /protected zone/i,
+    `warning should mention the protected recent zone, got: ${JSON.stringify(result.result.warnings)}`,
   );
+  assert.match(result.result.warnings.join(" "), /do not resend this range/);
 });
 
 test("applyCompression excludes protected tail and compresses the rest (partial overlap)", () => {
@@ -219,10 +224,11 @@ test("applyCompression still allows compressing messages strictly before the rec
   );
 });
 
-test("applyCompression fails by default when the whole range is protected (no explicit set)", () => {
+test("applyCompression no-ops by default when the whole range is protected (no explicit set)", () => {
   // No explicit protectedMessageIds passed — applyCompression must compute the
   // soft-protected zone itself (recent-N + last user message). When the entire
-  // range falls in that zone, it still fails.
+  // range falls in that zone it folds nothing — #4521 no-op class, not a
+  // failure (the zone always stays visible; refusing it fed retry loops).
   const core = createCore();
   const messages = [
     msg("a", "old user msg alpha", "user"),
@@ -252,7 +258,9 @@ test("applyCompression fails by default when the whole range is protected (no ex
     0,
     "default protection applies without explicit set",
   );
-  assert.match(result.result.errors[0]!, /protected/i);
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
+  assert.match(result.result.warnings.join(" "), /protected zone/i);
 });
 
 // --- decompress results are excluded from the recent-protected zone ---
@@ -494,6 +502,8 @@ test("applyCompression A/B: empty list protects a fresh read result; default rec
   ];
   // With preserveRecentMessages=3 and nothing excluded, visible tail = d,e,f
   // → m00004 is inside the protected zone under the empty list.
+  // #4521: zone-only range = idempotent no-op (0 blocks, 0 errors, warning)
+  // — still "protected with empty exclusion list", just not a failure.
   const refused = core.applyCompression({
     ranges: [
       {
@@ -512,8 +522,9 @@ test("applyCompression A/B: empty list protects a fresh read result; default rec
     0,
     "fresh read result protected with empty exclusion list",
   );
-  assert.equal(refused.result.errors.length, 1);
-  assert.match(refused.result.errors[0]!, /protected/i);
+  assert.equal(refused.result.errors.length, 0);
+  assert.equal(refused.result.noop, true);
+  assert.match(refused.result.warnings.join(" "), /protected zone/i);
 
   // Same session shape under the default list: read is out of the zone → reclaimable now.
   const allowed = core.applyCompression({
@@ -754,7 +765,10 @@ test('applyCompression: preserveRecentTools ["read"] is the one-line #1198 remed
     0,
     "fresh read result protected by the subtraction knob",
   );
-  assert.match(refused.result.errors[0]!, /protected/i);
+  // #4521: protection verdict lives in warnings (no-op class), not errors.
+  assert.equal(refused.result.errors.length, 0);
+  assert.equal(refused.result.noop, true);
+  assert.match(refused.result.warnings.join(" "), /protected zone/i);
 });
 
 test("validateConfig checks preserveRecentTools shape and accepts []", () => {

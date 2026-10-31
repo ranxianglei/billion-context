@@ -1332,10 +1332,12 @@ function changelogCatOf(rawLine) {
                 sbb.hidden = false;
                 sbb.classList.add("show");
                 const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                // #4626: .slice(0, 8) of "session-…" is literally "session-" — show enough to tell sessions apart
+                const shortSid = sb.sessionId.length > 24 ? sb.sessionId.slice(0, 24) + "…" : sb.sessionId;
                 sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
                     + escapeHtml(t("sys.split_brain", {
-                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
-                        sid: sb.sessionId.slice(0, 8),
+                        title: typeof sb.title === "string" && sb.title ? sb.title : shortSid,
+                        sid: shortSid,
                         selfPid: String(sb.self.pid),
                         selfLane: laneOf(sb.self),
                         peerPid: String(sb.peer.pid),
