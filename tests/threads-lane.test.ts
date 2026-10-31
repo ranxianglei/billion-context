@@ -2,10 +2,16 @@
 //
 // Threads state lives server-side; a `continue` wire body is delta-only no
 // matter how big the thread grew. The lane mirrors every turn into the
-// unified store (session_ext threads:mirror:*) and, when the mirror crosses
-// the window on a continue (rollout anthropicThreadsReforge on), swaps that
-// continue for a fresh `create` carrying [summary, tail ring, delta] — the
-// only channel that can deliver a fold to a server-side thread.
+// unified store (session_ext threads:mirror:*) — INCLUDING the model's reply,
+// reassembled from the forwarded response stream (#3744) — and, when the
+// mirror crosses the window on a continue (rollout anthropicThreadsReforge
+// on), swaps that continue for a fresh `create` carrying [summary, tail ring,
+// delta] — the only channel that can deliver a fold to a server-side thread.
+// #3744 additions: the summary side-call ships the client's own header set +
+// original system (variant B), the fake upstream enforces the real
+// system-placement rule on creates (so a missing-assistant regression 400s
+// exactly like production), and a rejected reforged create rolls the mirror
+// back and cools the lane down instead of looping.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,7 +27,8 @@ import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { _resetSessionsForTest } from "../src/session.js";
 import { _resetPluginStateForTest } from "../src/plugin.js";
 import { resetToolRingForTest } from "../src/tool-ring.js";
-import { __resetThreadsLaneForTests, type ThreadsMirrorMeta } from "../src/server/threads-lane.js";
+import { __awaitThreadsCapturesForTests, __resetThreadsLaneForTests, type ThreadsMirrorMeta } from "../src/server/threads-lane.js";
+import { firstAnthropicThreadsPlacementViolation } from "./wire-contract-fakes.ts";
 
 const testRoot = mkdtempSync(path.join(os.tmpdir(), "bili-threads-lane-"));
 
@@ -33,9 +40,14 @@ const blockStop = (index: number) => ev("content_block_stop", { type: "content_b
 const messageDelta = () => ev("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { input_tokens: 900, output_tokens: 3 } });
 const messageStop = ev("message_stop", { type: "message_stop" });
 
-const sseReply = (res: http.ServerResponse, id: string, text: string): void => {
+const toolBlockStart = (index: number) => ev("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id: `toolu_${index}`, name: "Bash", input: {} } });
+const toolJsonDelta = (index: number, partial: string) => ev("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: partial } });
+
+const sseReply = (res: http.ServerResponse, id: string, text: string, withToolUse: boolean): void => {
     res.writeHead(200, { "content-type": "text/event-stream" });
-    res.end([messageStart(id), blockStart(0), blockDelta(0, text), blockStop(0), messageDelta(), messageStop].join(""));
+    const frames = [messageStart(id), blockStart(0), blockDelta(0, text.slice(0, Math.ceil(text.length / 2))), blockDelta(0, text.slice(Math.ceil(text.length / 2))), blockStop(0)];
+    if (withToolUse) frames.push(toolBlockStart(1), toolJsonDelta(1, '{"command":'), toolJsonDelta(1, '"ls"}'), blockStop(1));
+    res.end([...frames, messageDelta(), messageStop].join(""));
 };
 
 interface HarnessOpts {
@@ -44,14 +56,29 @@ interface HarnessOpts {
     failFirstSideCall?: boolean;
     /** Status the failed first side-call answers with (default 500). */
     sideCallFailStatus?: number;
+    /** Every thread create after the first is rejected (reforged-create
+     *  failure lane, #3744). */
+    failReforgedCreate?: boolean;
+    /** Streamed replies carry a text block AND a tool_use block (input JSON
+     *  split across two deltas), exercising the SSE reassembly (#3744). */
+    streamToolUse?: boolean;
+    /** Streamed replies carry ONLY a thinking block (nothing replayable) —
+     *  the placeholder-capture lane (#3744 review). */
+    streamThinkingOnly?: boolean;
+    /** Non-stream threads replies answer with this content array. */
+    nonStreamContent?: unknown[];
 }
 
 interface Harness {
     proxyUrl: string;
-    post: (body: Record<string, unknown>, sid?: string) => Promise<{ status: number; body: unknown }>;
+    post: (body: Record<string, unknown>, sid?: string, headers?: Record<string, string>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
     forwardedPaths: string[];
-    readMirror: (sid: string) => { meta?: ThreadsMirrorMeta; error?: string };
+    /** Headers the fake saw on each summary side-call (variant-B check). */
+    sideCallHeaders: Record<string, string>[];
+    readMirror: (sid: string) => { meta?: ThreadsMirrorMeta; entries?: Record<string, unknown>[]; error?: string };
+    /** Drain in-flight reply captures so mirror reads are deterministic. */
+    settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
@@ -67,7 +94,9 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
     _setStoreForTest(store);
     const forwarded: Record<string, unknown>[] = [];
     const forwardedPaths: string[] = [];
+    const sideCallHeaders: Record<string, string>[] = [];
     let sideCalls = 0;
+    let creates = 0;
     const upstream = http.createServer((req, res) => {
         const urlPath = (req.url ?? "/").split("?")[0];
         const chunks: Buffer[] = [];
@@ -85,21 +114,55 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
             }
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             forwarded.push(body);
+            const threadType = (body.thread as { type?: string } | undefined)?.type;
             const stream = body.stream === true;
             const isSideCall = !stream && body.thread === undefined;
-            if (isSideCall) sideCalls++;
+            if (isSideCall) {
+                sideCalls++;
+                sideCallHeaders.push({ ...req.headers } as Record<string, string>);
+            }
             if (isSideCall && opts.failFirstSideCall && sideCalls === 1) {
                 const status = opts.sideCallFailStatus ?? 500;
                 res.writeHead(status, { "content-type": "application/json" });
                 res.end(JSON.stringify({ type: "error", error: { type: status === 404 ? "not_found_error" : "api_error", message: "boom" } }));
                 return;
             }
-            if (stream) {
-                sseReply(res, `msg_${forwarded.length}`, "answer " + forwarded.length);
+            if (threadType === "create") creates++;
+            // #3744: enforce the real system-placement rule on full-history
+            // creates — the assistant-blind mirror's `user system user system`
+            // rebuild must 400 here exactly like it did in production.
+            if (threadType === "create") {
+                const violation = firstAnthropicThreadsPlacementViolation(Array.isArray(body.messages) ? body.messages : []);
+                if (violation >= 0) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `messages.${violation}: role 'system' must precede an 'assistant' message or end the array` } }));
+                    return;
+                }
+            }
+            if (opts.failReforgedCreate && threadType === "create" && creates > 1) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "simulated reforged-create rejection" } }));
                 return;
             }
+            if (stream) {
+                if (opts.streamThinkingOnly === true) {
+                    res.writeHead(200, { "content-type": "text/event-stream" });
+                    const id = `msg_${forwarded.length}`;
+                    const frames = [
+                        messageStart(id),
+                        ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+                        ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } }),
+                        blockStop(0),
+                    ];
+                    res.end([...frames, messageDelta(), messageStop].join(""));
+                    return;
+                }
+                sseReply(res, `msg_${forwarded.length}`, "answer " + forwarded.length, opts.streamToolUse === true);
+                return;
+            }
+            const isThreadsReply = threadType !== undefined;
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ id: `msg_${forwarded.length}`, role: "assistant", content: [{ type: "text", text: "SUMMARY-" + sideCalls }], usage: { input_tokens: 100, output_tokens: 10 } }));
+            res.end(JSON.stringify({ id: `msg_${forwarded.length}`, role: "assistant", content: isThreadsReply ? opts.nonStreamContent ?? [{ type: "text", text: "THREAD-REPLY" }] : [{ type: "text", text: "SUMMARY-" + sideCalls }], usage: { input_tokens: 100, output_tokens: 10 } }));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -109,8 +172,12 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
     const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: window } } } }, modelContextLimit: window, kernelConfig: defaultConfig(window), compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     if (!(proxy as unknown as { listening?: boolean }).listening) await once(proxy, "listening");
     const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
-    const post = async (body: Record<string, unknown>, sid = "threads-1") => {
-        const response = await fetch(`${proxyUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "test-key", "anthropic-version": "2023-06-01", "x-acp-session": sid }, body: JSON.stringify(body) });
+    // Drain the previous turn's reply capture BEFORE sending the next one —
+    // real clients are sequential per conversation, and the drain makes the
+    // mirror state deterministic at every assert point (#3744).
+    const post = async (body: Record<string, unknown>, sid = "threads-1", extraHeaders: Record<string, string> = {}) => {
+        await __awaitThreadsCapturesForTests();
+        const response = await fetch(`${proxyUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "test-key", "anthropic-version": "2023-06-01", "x-acp-session": sid, ...extraHeaders }, body: JSON.stringify(body) });
         const text = await response.text();
         let parsed: unknown = text;
         try {
@@ -120,10 +187,16 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
         }
         return { status: response.status, body: parsed };
     };
-    const readMirror = (sid: string): { meta?: ThreadsMirrorMeta; error?: string } => {
+    const readMirror = (sid: string): { meta?: ThreadsMirrorMeta; entries?: Record<string, unknown>[]; error?: string } => {
         try {
             const meta = store.getSessionExt(sid, "threads:mirror:meta");
-            return { meta: meta as ThreadsMirrorMeta | undefined };
+            const entries: Record<string, unknown>[] = [];
+            for (let i = 0; ; i++) {
+                const raw = store.getSessionExt(sid, `threads:mirror:chunk:${String(i).padStart(4, "0")}`) as { entries?: Record<string, unknown>[] } | null | undefined;
+                if (raw === undefined || raw === null || !Array.isArray(raw.entries)) break;
+                entries.push(...raw.entries);
+            }
+            return { meta: meta as ThreadsMirrorMeta | undefined, entries };
         } catch (err) {
             return { error: String(err) };
         }
@@ -133,7 +206,9 @@ async function harness(storageMode: "full" | "legacy", opts: HarnessOpts = {}): 
         post,
         forwarded,
         forwardedPaths,
+        sideCallHeaders,
         readMirror,
+        settle: () => __awaitThreadsCapturesForTests(),
         close: async () => {
             await new Promise<void>((resolve) => proxy.close(() => resolve()));
             store.closeQuietly();
@@ -185,11 +260,14 @@ test("threads lane: create and continue pass through byte-faithfully while the m
         assert.equal(r2.status, 200);
         assert.equal((h.forwarded[1] as { thread?: { type?: string } }).thread?.type, "continue");
         assert.equal((h.forwarded[1] as { messages?: unknown[] }).messages?.length, 1, "continue delta forwarded as-is");
+        await h.settle();
         const mirror = h.readMirror("threads-1");
         assert.ok(mirror.meta, "mirror meta persisted");
-        assert.equal(mirror.meta?.count, 3, "create(2) + continue delta(1)");
+        assert.equal(mirror.meta?.count, 5, "create(2) + reply(1) + continue delta(1) + reply(1) — replies mirrored from the response stream (#3744)");
         assert.deepEqual(mirror.meta?.shape?.system, CLIENT_SYSTEM, "create shape captured");
         assert.deepEqual(mirror.meta?.shape?.tools, CLIENT_TOOLS);
+        const roles = (mirror.entries ?? []).map((e) => e.role);
+        assert.deepEqual(roles, ["user", "assistant", "assistant", "user", "assistant"], "captured replies interleave the client turns");
     } finally {
         await h.close();
     }
@@ -413,16 +491,186 @@ test("threads lane: a re-create under the same session id resets bili's own fold
             { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
         ]));
         await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"));
+        await h.settle();
         const afterReforge = h.readMirror("threads-1");
         assert.ok((afterReforge.meta?.foldedBefore ?? 0) > 0, "the over-window continue was reforged (fold point recorded)");
         await h.post(createBody([
             { role: "user", content: turnText(1) }, { role: "assistant", content: "b1" },
             { role: "user", content: turnText(2) }, { role: "assistant", content: "b2" },
         ]));
+        await h.settle();
         const afterRecreate = h.readMirror("threads-1");
         assert.equal(afterRecreate.meta?.foldedBefore, 0, "re-create resets the fold point to zero");
         assert.equal(afterRecreate.meta?.foldedSummary, undefined, "re-create drops the stale summary");
-        assert.equal(afterRecreate.meta?.count, 4, "mirror holds only the fresh snapshot");
+        assert.equal(afterRecreate.meta?.count, 5, "mirror holds only the fresh snapshot (+ its captured reply)");
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: streamed replies are mirrored — text + tool_use reassembled from SSE (#3744)", async () => {
+    const h = await harness("full", { streamToolUse: true });
+    try {
+        await h.post(createBody([{ role: "user", content: "run the tests" }]));
+        await h.settle();
+        const mirror = h.readMirror("threads-1");
+        assert.equal(mirror.meta?.count, 2, "client turn + captured reply");
+        const reply = (mirror.entries ?? [])[1] as { role: string; content: { type: string; text?: string; name?: string; input?: unknown }[] };
+        assert.equal(reply.role, "assistant");
+        assert.equal(reply.content[0]?.type, "text");
+        assert.equal(reply.content[0]?.text, "answer 1", "text reassembled across split deltas");
+        assert.equal(reply.content[1]?.type, "tool_use");
+        assert.equal(reply.content[1]?.name, "Bash");
+        assert.deepEqual(reply.content[1]?.input, { command: "ls" }, "tool input reassembled from input_json_delta fragments");
+    } finally {
+        await h.close();
+    }
+});
+
+test("threads lane: non-stream replies are mirrored, thinking blocks filtered (#3744/#1960)", async () => {
+    const h = await harness("full", { nonStreamContent: [
+        { type: "thinking", thinking: "scratch" },
+        { type: "text", text: "done" },
+        { type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "pwd" } },
+    ] });
+    try {
+        const r = await h.post({ ...createBody([{ role: "user", content: "hi" }]), stream: false });
+        assert.equal(r.status, 200);
+        await h.settle();
+        const mirror = h.readMirror("threads-1");
+        const reply = (mirror.entries ?? [])[1] as { role: string; content: { type: string }[] };
+        assert.equal(reply.role, "assistant");
+        assert.deepEqual(reply.content.map((b) => b.type), ["text", "tool_use"], "signature-verified thinking never enters the mirror");
+    } finally {
+        await h.close();
+    }
+});
+
+test("threads lane: a thinking-only non-stream reply mirrors a placeholder assistant slot (#3744 review)", async () => {
+    const h = await harness("full", { nonStreamContent: [
+        { type: "thinking", thinking: "only scratch" },
+        { type: "redacted_thinking", data: "xxx" },
+    ] });
+    try {
+        await h.post({ ...createBody([{ role: "user", content: "hi" }]), stream: false });
+        await h.settle();
+        const mirror = h.readMirror("threads-1");
+        const reply = (mirror.entries ?? [])[1] as { role: string; content: { type: string; text?: string }[] };
+        assert.equal(reply.role, "assistant", "the turn still occupies an assistant slot in the mirror — without it every later reforged create 400s on the placement rule");
+        assert.equal(reply.content[0]?.type, "text");
+        assert.match(String(reply.content[0]?.text ?? ""), /\[threads-lane\] model reply carried no replayable content/, "self-describing placeholder, not a silent gap");
+    } finally {
+        await h.close();
+    }
+});
+
+test("threads lane: a thinking-only streamed reply mirrors a placeholder assistant slot (#3744 review)", async () => {
+    const h = await harness("full", { streamThinkingOnly: true });
+    try {
+        await h.post(createBody([{ role: "user", content: "hi" }]));
+        await h.settle();
+        const mirror = h.readMirror("threads-1");
+        const reply = (mirror.entries ?? [])[1] as { role: string; content: { type: string; text?: string }[] };
+        assert.equal(reply.role, "assistant", "SSE path: sawEvent but nothing replayable → placeholder, not a permanent ordering gap");
+        assert.match(String(reply.content[0]?.text ?? ""), /\[threads-lane\] model reply carried no replayable content/);
+    } finally {
+        await h.close();
+    }
+});
+
+test("threads lane: summary side-call ships the client's own headers + original system (variant B, #3744)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000 });
+    const clientHdrs = { "anthropic-beta": "context-management-2025-06-27", "user-agent": "claude-desktop/2.1.299", "x-claude-code-prompt-id": "prompt-abc", "anthropic-dispatch-id": "disp-xyz" };
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 400) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 400) }, { role: "assistant", content: "a2" },
+            { role: "user", content: turnText(3, 400) }, { role: "assistant", content: "a3" },
+        ]), "threads-1", clientHdrs);
+        const r = await h.post(continueBody([{ role: "user", content: turnText(4, 400) }], "msg_1"), "threads-1", { ...clientHdrs, "x-client-request-id": "req-123" });
+        assert.equal(r.status, 200);
+        const sideCall = h.forwarded[1] as { system?: unknown; messages?: { role?: string; content?: unknown }[] };
+        assert.deepEqual(sideCall.system, CLIENT_SYSTEM, "the client's original system rides the side-call verbatim (attribution + identity intact)");
+        assert.equal(sideCall.messages?.[0]?.role, "user");
+        const userText = typeof sideCall.messages?.[0]?.content === "string" ? sideCall.messages[0].content : "";
+        assert.match(userText, /compressing an older slice/, "summarizer instructions moved into the user message");
+        assert.ok(!JSON.stringify(sideCall.system).includes("compressing an older slice"), "summarizer no longer occupies the system slot");
+        const hdrs = h.sideCallHeaders.at(-1);
+        assert.ok(hdrs, "side-call observed by the upstream");
+        assert.equal(hdrs?.["x-api-key"], "test-key", "client auth passes through");
+        assert.equal(hdrs?.["anthropic-beta"], "context-management-2025-06-27", "client beta header passes through");
+        assert.equal(hdrs?.["user-agent"], "claude-desktop/2.1.299", "client UA passes through");
+        assert.equal(hdrs?.["x-claude-code-prompt-id"], undefined, "one-shot prompt id stripped");
+        assert.equal(hdrs?.["anthropic-dispatch-id"], undefined, "one-shot dispatch id stripped");
+        assert.equal(hdrs?.["x-client-request-id"], undefined, "one-shot request id stripped");
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: CC-style mid-conversation systems no longer break the reforged create (placement 400, #3744)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000 });
+    try {
+        // Pin the validator both directions (#3617 gate discipline): the old
+        // assistant-blind rebuild violates the rule; the captured-reply shape
+        // satisfies it.
+assert.ok(firstAnthropicThreadsPlacementViolation([{ role: "user" }, { role: "user" }, { role: "system" }, { role: "user" }, { role: "system" }]) >= 0, "assistant-blind shape is a placement violation");
+    assert.equal(firstAnthropicThreadsPlacementViolation([{ role: "user" }, { role: "system" }, { role: "assistant" }, { role: "user" }, { role: "system" }]), -1, "captured-reply shape is legal");
+        // CC 2.1.299 style: each continue delta carries a mid-conversation
+        // `system`; the assistant reply lives server-side until captured.
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 350) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 350) }, { role: "assistant", content: "a2" },
+        ]));
+        await h.post(continueBody([{ role: "user", content: turnText(3, 350) }, { role: "system", content: "ctx-3" }], "msg_1"));
+        // This continue crosses the window → reforge. Pre-fix, the rebuilt
+        // create was `user system user system …` and 400'd here.
+        const r = await h.post(continueBody([{ role: "user", content: turnText(4, 350) }, { role: "system", content: "ctx-4" }], "msg_1"));
+        assert.equal(r.status, 200, "reforged create accepted — every system is followed by a captured assistant reply");
+        const reforged = h.forwarded.at(-1) as { thread?: { type?: string }; messages?: { role?: string }[] };
+        assert.equal(reforged.thread?.type, "create", "the continue was swapped for a fresh create");
+        const msgs = reforged.messages ?? [];
+        assert.ok(msgs.some((m) => m.role === "assistant"), "captured assistant replies ride the rebuilt create");
+        assert.equal(firstAnthropicThreadsPlacementViolation(msgs), -1, "rebuilt array satisfies the placement rule");
+    } finally {
+        delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
+        await h.close();
+    }
+});
+
+test("threads lane: a rejected reforged create rolls the mirror back and cools down (#3744)", async () => {
+    process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE = "1";
+    const h = await harness("full", { window: 5000, failReforgedCreate: true });
+    try {
+        await h.post(createBody([
+            { role: "user", content: turnText(1, 350) }, { role: "assistant", content: "a1" },
+            { role: "user", content: turnText(2, 350) }, { role: "assistant", content: "a2" },
+        ]));
+        await h.post(continueBody([{ role: "user", content: turnText(3, 350) }], "msg_1"));
+        await h.settle();
+        const preReforge = h.readMirror("threads-1");
+        assert.equal(preReforge.meta?.foldedBefore, 0, "nothing folded yet");
+        const countBefore = preReforge.meta?.count ?? 0;
+        // This continue crosses the window; the swapped create is rejected.
+        const r = await h.post(continueBody([{ role: "user", content: turnText(4, 350) }], "msg_1"));
+        assert.equal(r.status, 400, "the rejection passes through to the client");
+        await h.settle();
+        const after = h.readMirror("threads-1");
+        assert.equal(after.meta?.foldedBefore, 0, "mirror rolled back — the server-side thread never changed");
+        assert.equal(after.meta?.foldedSummary, undefined, "stale summary dropped");
+        assert.equal(after.meta?.count, countBefore + 1, "the client's delta stays mirrored; only the fold point rolled back");
+        // Cooldown holds: the next over-window continue forwards plain — no
+        // doomed summarize→rebuild→400 round.
+        const before = h.forwarded.length;
+        const r2 = await h.post(continueBody([{ role: "user", content: turnText(5, 350) }], "msg_1"));
+        assert.equal(r2.status, 200);
+        assert.equal(h.forwarded.length, before + 1, "cooldown active: no second side-call within the window");
+        const next = h.forwarded.at(-1) as { thread?: { type?: string } };
+        assert.equal(next.thread?.type, "continue", "fail-open still holds while cooling down");
     } finally {
         delete process.env.BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE;
         await h.close();
