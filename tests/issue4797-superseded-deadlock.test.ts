@@ -23,8 +23,10 @@ import { applyRanges, supersededRefRejection, type RewriteCtx } from "../src/str
 
 // Same drifted shape as kernel/tests/ref-restamp-collision.test.ts:
 // rows/seq a=0..f=5; old refs a=m1 b=m3 c=BLOCKED d=m4 e=m6 f=m7.
-// Post-restamp: b→m2, e→m5, f takes e's vacated m6. Superseded (post-prune):
-// {m3→b, m7→f} — m6 is live for f and MUST NOT sit in the map.
+// Post-restamp: b→m2, e→m5, f takes e's vacated m6. Superseded on master
+// (the kernel liveness prune was reverted — reference/ref-keyed-surfaces.md):
+// {m3→b, m6→e, m7→f} — m6 is LIVE for f AND still e's recorded old label:
+// the #5199 dual-identity case, pinned in tests/issue5199-dual-identity-log.test.ts.
 function restampedSession(): { session: RewriteCtx["session"]; messages: CoreMessage[] } {
     const state: CompressionState = createInitialState();
     const map = emptyRefMap();
