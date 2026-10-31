@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import vm from "node:vm";
-import { apply, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
+import { apply, _resetRegisterForTest, _setBootstrapFailureForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // The node:test runner sets NODE_TEST_CONTEXT itself (see tests/e2e/README.md);
@@ -112,6 +112,36 @@ test("#1590/#4846: index-inject still publishes __BILI__ when no origin is known
             assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
         });
     } finally {
+        rmrf(home);
+    }
+});
+
+// owner 2026-10-31: while no proxy is bound, the snapshot names WHY, so the
+// DSH page can tell the user to upgrade Node.js (v22+) instead of the generic
+// "/acp first" degraded hint.
+test("owner 2026-10-31: index-inject publishes bootstrapFailure while origin-less (node<22 page)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            // no failure recorded yet ⇒ payload byte-identical to today
+            let table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
+            // a no-engine refusal recorded by the host half rides the same row
+            _setBootstrapFailureForTest({ kind: "no-engine", detail: "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)" });
+            table = [];
+            listeners[0](table);
+            assert.deepEqual(table[0].value, {
+                origin: null,
+                contextTab: true,
+                bootstrapFailure: { kind: "no-engine", detail: "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)" },
+            });
+        });
+    } finally {
+        _setBootstrapFailureForTest(undefined);
         rmrf(home);
     }
 });
