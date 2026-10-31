@@ -142,7 +142,7 @@ function restoreEnv(snap: Record<string, string | undefined>): void {
     }
 }
 
-test("#3823 wiring: an unopenable index.db degrades with the platform-appropriate reason", () => {
+test("#3823 wiring: an unopenable index.db REFUSES TO START with the platform-appropriate reason (no degradation in any case, 2026-10-30)", () => {
     const base = mkdtempSync(path.join(tmpdir(), "cantopen-hint-"));
     const sessions = path.join(base, "sessions");
     mkdirSync(sessions, { recursive: true });
@@ -155,27 +155,30 @@ test("#3823 wiring: an unopenable index.db degrades with the platform-appropriat
     setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
     try {
         _resetStorageRuntimeStatusForTest();
-        new SessionStore({ dir: sessions, enabled: true });
+        assert.throws(
+            () => new SessionStore({ dir: sessions, enabled: true }),
+            (err: unknown) => err instanceof Error && err.message.includes("open"),
+            "construction must refuse on CANTOPEN, not degrade",
+        );
         const wire = storageStatusWire();
-        assert.equal(wire.degraded, true, "the sidecar must be degraded");
-        assert.equal(wire.effective, "legacy", "legacy JSON keeps serving");
+        assert.equal(wire.degraded, true, "the failed open must be recorded pre-death");
         assert.ok(
             wire.reason?.startsWith("index database failed to open"),
             `reason names the open failure (got: ${wire.reason})`,
         );
-        const degradeLine = logs.find((l) => l.includes("unified sidecar failed to open"));
-        assert.ok(degradeLine, "the degrade warn was logged");
+        const refuseLine = logs.find((l) => l.includes("unified sidecar failed to open"));
+        assert.ok(refuseLine, "the refusal warn was logged");
         if (process.platform === "win32") {
             assert.ok(wire.reason?.includes("(win32:"), "win32 runner carries the OS-level hint");
             assert.ok(
-                !degradeLine.includes("delete the file to reset the index"),
+                !refuseLine.includes("delete the file to reset the index"),
                 "an OS-level refusal must not carry the delete advice",
             );
         } else {
             assert.ok(!wire.reason?.includes("(win32:"), "non-win32 runner stays un-hinted");
             assert.ok(
-                degradeLine.includes("; delete the file to reset the index"),
-                "a genuine open failure keeps the delete advice off-hint platforms",
+                !refuseLine.includes("delete the file to reset the index"),
+                "the refusal line never carries destructive self-help advice",
             );
         }
     } finally {
@@ -191,7 +194,7 @@ test("#3823 wiring: an unopenable index.db degrades with the platform-appropriat
 // 0444 regular file (root bypasses permission bits, so skip under root;
 // chmod is inert on win32, so skip there — the win32 branch of the hint is
 // unit-pinned above with a platform stub instead).
-test("#4614 wiring: an unwritable existing index.db degrades carrying the readonly signature", () => {
+test("#4614 wiring: an unwritable existing index.db REFUSES TO START carrying the readonly signature (2026-10-30)", () => {
     if (process.platform === "win32") return;
     if (typeof process.getuid === "function" && process.getuid() === 0) return;
     const base = mkdtempSync(path.join(tmpdir(), "readonly-hint-"));
@@ -204,17 +207,20 @@ test("#4614 wiring: an unwritable existing index.db degrades carrying the readon
     setLogCapture((level, msg) => logs.push(`${level} ${msg}`));
     try {
         _resetStorageRuntimeStatusForTest();
-        new SessionStore({ dir: sessions, enabled: true });
+        assert.throws(() => new SessionStore({ dir: sessions, enabled: true }), "read-only index.db must refuse construction");
         const wire = storageStatusWire();
-        assert.equal(wire.degraded, true, "the sidecar must be degraded");
-        assert.equal(wire.effective, "legacy", "legacy JSON keeps serving");
+        assert.equal(wire.degraded, true, "the failed open must be recorded pre-death");
         assert.ok(
             wire.reason?.includes("attempt to write a readonly database"),
             `reason carries the readonly signature (got: ${wire.reason})`,
         );
-        const degradeLine = logs.find((l) => l.includes("unified sidecar failed to open"));
-        assert.ok(degradeLine, "the degrade warn was logged");
-        assert.ok(!degradeLine.includes("(win32:"), "non-win32 stays un-hinted");
+        const refuseLine = logs.find((l) => l.includes("unified sidecar failed to open"));
+        assert.ok(refuseLine, "the refusal warn was logged");
+        assert.ok(!refuseLine.includes("(win32:"), "non-win32 stays un-hinted");
+        assert.ok(
+            !refuseLine.includes("delete the file to reset the index"),
+            "a readonly failure never carries the destructive delete advice",
+        );
     } finally {
         setLogCapture(null);
         _resetStorageRuntimeStatusForTest();
@@ -238,14 +244,14 @@ test("wiring: an OS-level refusal drops the delete advice from the degrade line"
     const restore = stubPlatform("win32");
     try {
         _resetStorageRuntimeStatusForTest();
-        new SessionStore({ dir: sessions, enabled: true });
+        assert.throws(() => new SessionStore({ dir: sessions, enabled: true }), "stubbed win32 CANTOPEN must refuse construction");
         const wire = storageStatusWire();
         assert.ok(wire.reason?.includes("(win32:"), "stubbed win32 carries the OS-level hint in the diagnostic");
-        const degradeLine = logs.find((l) => l.includes("unified sidecar failed to open"));
-        assert.ok(degradeLine, "the degrade warn was logged");
-        assert.ok(degradeLine.includes("(win32:"), "the warn line carries the hint");
+        const refuseLine = logs.find((l) => l.includes("unified sidecar failed to open"));
+        assert.ok(refuseLine, "the refusal warn was logged");
+        assert.ok(refuseLine.includes("(win32:"), "the warn line carries the hint");
         assert.ok(
-            !degradeLine.includes("delete the file to reset the index"),
+            !refuseLine.includes("delete the file to reset the index"),
             "an OS-level refusal must not carry the delete advice",
         );
     } finally {
