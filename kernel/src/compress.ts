@@ -1343,7 +1343,14 @@ const emergencyTruncateNode: PipelineNode = {
     // content-bound, so an edited message misses its entry and re-judges from
     // scratch; entries whose messages left the view retire; the whole latch
     // resets on the next successful fold (applyCompression).
-    const latch = io.state.emergencyTruncateLatch ?? [];
+    // #5217: BLOCKED_REF is a shared sentinel (every protected message maps
+    // to it, refs.ts), not an addressable ref — a clip keyed by it would
+    // replay onto EVERY protected message in view, wholesale replacing
+    // tool-call arguments with unrelated text (non-JSON → upstream 400 on
+    // every turn). Sanitizing here also retires any pre-fix poison from the
+    // persisted state on this pass (self-heal; no manual store edit).
+    const rawLatch = io.state.emergencyTruncateLatch ?? [];
+    const latch = rawLatch.filter((e) => e.ref !== BLOCKED_REF);
     const liveRefs = new Set<string>();
     for (const m of io.messages) {
       const ref = io.state.messageRefs.byRaw[m.id];
@@ -1366,7 +1373,16 @@ const emergencyTruncateNode: PipelineNode = {
       });
     }
     if (usage < ctx.config.truncate.threshold) {
-      if (latch.length === 0 && prevStreak === 0) return io;
+      if (latch.length === 0 && prevStreak === 0) {
+        // #5217: nothing latched anymore — but a poisoned entry may still sit
+        // in the incoming state; retire it so sub-threshold turns heal the
+        // persisted store too (wire bytes unchanged, dead metadata only).
+        if (rawLatch.length === latch.length) return io;
+        return {
+          ...io,
+          state: { ...io.state, emergencyTruncateLatch: undefined },
+        };
+      }
       return {
         ...io,
         messages,
@@ -1435,7 +1451,13 @@ const emergencyTruncateNode: PipelineNode = {
     for (const id of trunc.truncatedIds ?? []) {
       const ref = io.state.messageRefs.byRaw[id];
       const clippedMsg = trunc.messages.find((m) => m.id === id);
-      if (ref !== undefined && clippedMsg?.text !== undefined) {
+      // #5217: never key a clip by the shared BLOCKED sentinel (see above) —
+      // doing so poisons every protected message's replay for the session.
+      if (
+        ref !== undefined &&
+        ref !== BLOCKED_REF &&
+        clippedMsg?.text !== undefined
+      ) {
         clips.push({ ref, text: clippedMsg.text });
       }
     }
