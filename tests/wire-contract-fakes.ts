@@ -768,7 +768,7 @@ export function validateMistralChatBody(body: unknown): string[] {
 
 /** WC-023 lane: Mistral answers FastAPI-style 422 with a detail array — the exact envelope shape of the #5260
  *  rejection (loc generalized to ["body"]; the field name rides in msg so the relay's veto predicate can read it). */
-export function mistralErrorEnvelope(message: string): { status: number; body: string } {
+function mistralErrorEnvelope(message: string): { status: number; body: string } {
     return { status: 422, body: JSON.stringify({ detail: [{ type: "extra_forbidden", loc: ["body"], msg: message, input: "" }] }) };
 }
 
