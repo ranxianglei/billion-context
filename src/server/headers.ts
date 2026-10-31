@@ -29,6 +29,9 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "te",
     "trailer",
     "upgrade",
+    // RFC 7231 §5.1.1: expect is hop-by-hop; undici fetch rejects it with
+    // UND_ERR_NOT_SUPPORTED ("expect header not supported") when forwarded
+    "expect",
 ]);
 
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
@@ -80,7 +83,9 @@ export function stripRemoteCompactionBetaFeature(headers: Record<string, string>
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        // expect is hop-by-hop (RFC 9110 §7.6.2) and undici rejects it with
+        // UND_ERR_NOT_SUPPORTED — dropped here so no egress path can forward it.
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";
