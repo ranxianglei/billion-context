@@ -43,7 +43,7 @@ import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
-import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
+import { wrapStreamWithRunawayGuard, textRunTripHint } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
@@ -1752,7 +1752,7 @@ async function forwardCaptured(
                 // Sits AFTER the #2347 plugin-lane tee on purpose: the dump twin must
                 // observe the raw upstream bytes even when the guard aborts them.
                 pluginBody = wrapStreamWithRunawayGuard(pluginBody, (v) => {
-                    log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+                    log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)})${textRunTripHint(v)} — aborting upstream stream`);
                     clientAbort.abort();
                 });
                 if (prepared.protocol === "responses") {
@@ -2047,7 +2047,7 @@ async function forwardCaptured(
         // responseBody), so the guard wraps the post-tee body: the dump twin still
         // observes raw upstream bytes even when the guard aborts them.
         responseBody = wrapStreamWithRunawayGuard(responseBody, (v) => {
-            log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+            log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)})${textRunTripHint(v)} — aborting upstream stream`);
             clientAbort.abort();
         });
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
