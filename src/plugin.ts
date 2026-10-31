@@ -701,7 +701,7 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
         return;
     }
-    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown; error?: unknown; endpoint?: unknown };
+    const body = parsed as { agent?: unknown; state?: unknown; refusals?: unknown; since?: unknown; error?: unknown; endpoint?: unknown; wedged?: unknown };
     const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
     const nonNeg = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined);
     const agent = str(body.agent, 64);
@@ -712,12 +712,15 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
     }
     const error = str(body.error, 300);
     const endpoint = str(body.endpoint, 200);
+    // #5066: strict boolean — a truthy string must not light the wedged banner.
+    const wedged = typeof body.wedged === "boolean" ? body.wedged : undefined;
     recordAttributionReport(agent, {
         state: body.state,
         refusals: nonNeg(body.refusals) ?? 0,
         since: nonNeg(body.since) ?? 0,
         ...(error !== undefined ? { error } : {}),
         ...(endpoint !== undefined ? { endpoint } : {}),
+        ...(wedged === true ? { wedged: true } : {}),
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
