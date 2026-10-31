@@ -114,7 +114,8 @@ export function installPackFromNpm(spec: string, options: PackInstallOptions = {
             const err = error as { stderr?: unknown; message?: string };
             stderr = typeof err.stderr === "string" ? err.stderr : "";
             if (/ENOENT/.test(String(err.message))) throw new Error("npm was not found on PATH");
-            const tail = stderr.trim().split("\n").slice(-3).join(" ").slice(0, 300);
+            const lines = stderr.trim().split("\n");
+            const tail = lines.slice(Math.max(0, lines.length - 3)).join(" ").slice(0, 300);
             throw new Error(`npm install ${trimmed} failed${tail ? `: ${tail}` : ""}`);
         }
 
