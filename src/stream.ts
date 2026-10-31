@@ -10,7 +10,7 @@ import { executeSearchContextTarget, resolveDecompress } from "./decompress-shar
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
-import { peekStoredTailView } from "./persist.js";
+import { storedTailViewStatus } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -745,7 +745,7 @@ const DEGENERATE_FOLD_COVERAGE = 0.8;
 export function noVisibleContextRefusal(
     ctx: RewriteCtx,
     ranges: ParsedRange[],
-    opts?: { loopTracking?: boolean },
+    opts?: { loopTracking?: boolean; /** #5111: why the persisted-view fallback (#3982) came up empty — named so the receipt stops asserting a cause the diagnostics endpoint contradicts. */ tailViewReason?: string },
 ): ProxyToolResult | null {
     const view = ctx.compressMessages ?? ctx.messages;
     const mappedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
@@ -772,24 +772,45 @@ export function noVisibleContextRefusal(
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
     // #3918: the "self-heals on the next model request" promise holds ONLY when
     // the reloaded session survives between requests. When this session's
-    // last-known live weight cannot fit alongside the current residents within
+    // last-known live weight cannot fit alongside the ACTIVE residents within
     // the byte budget, every request cycle ends with it evicted again and this
     // exact refusal repeats forever — say so plainly instead of advising an
     // impossible retry (the incident: a ~444 MiB image session ping-ponging
-    // against an ~87.5 MiB peer under the 512 MiB default budget).
+    // against an ~87.5 MiB peer under the 512 MiB default budget). #5111: idle
+    // peers do not break the promise — admission evicts them to seat the
+    // reloaded session — so permanence is judged against active peers only, and
+    // a session too heavy for the WHOLE budget gets its own exit advice (closing
+    // others cannot help there).
     const pressure = residentPressure(ctx.session.id);
+    const selfExceedsBudget = (pressure.weightBytes ?? 0) > pressure.budgetBytes;
+    // #5111: the stamped weight is a snapshot of eviction time — name its age so
+    // a later /__bili/memory reading (the pool DRAINS between requests) is not
+    // misread as contradicting this refusal.
+    const ageSec = pressure.weightAgeMs !== undefined ? Math.max(1, Math.round(pressure.weightAgeMs / 1000)) : undefined;
+    const weightNote = ageSec !== undefined ? `, measured ${ageSec}s ago` : "";
+    const recoveryReason = opts?.tailViewReason && opts.tailViewReason !== "recovered" && opts.tailViewReason !== "live-view" ? opts.tailViewReason : undefined;
+    const tailLogNote = recoveryReason ? `; persisted-view recovery unavailable (${recoveryReason})` : "";
     ctx.log(pressure.permanent
-        ? `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — PERMANENT: last-known weight ${formatMiB(pressure.weightBytes)} + other residents ${formatMiB(pressure.otherBytes)} > budget ${formatMiB(pressure.budgetBytes)}; the session cannot stay resident between model requests (#3918)]`
-        : `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)]`);
+        ? `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — PERMANENT: last-known weight ${formatMiB(pressure.weightBytes)}${weightNote}${selfExceedsBudget ? " alone exceeds the whole budget" : ` + active other residents ${formatMiB(pressure.activeOtherBytes)} (idle peers excluded)`} > budget ${formatMiB(pressure.budgetBytes)}; the session cannot stay resident between model requests (#3918/#5111)${tailLogNote}]`
+        : `[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)${tailLogNote}]`);
     const specKey = normalizedSpecKey(ranges);
     const repeatGuard = recordCompressFailure(ctx.session, specKey, pressure.permanent
-        ? "This failure repeats until the resident pool can hold this session alongside the others — closing another open session or raising sessions.residentMaxBytes clears it; waiting for the next turn does NOT."
+        ? (selfExceedsBudget
+            ? "This failure repeats until the pool budget can hold this session ALONE — closing other sessions will NOT free room for it; raise sessions.residentMaxBytes above ~the session's footprint and restart bili."
+            : "This failure repeats until the resident pool can hold this session alongside the others — closing another open session or raising sessions.residentMaxBytes clears it; waiting for the next turn does NOT.")
         : "This failure is the proxy's missing in-memory message view, not your refs — it clears on the next model request. Wait for that turn instead of re-issuing.");
     const loopGuard = opts?.loopTracking === false ? "" : noteCompressLoopFailure(ctx, specKey, undefined, "no-visible-context");
     const healClause = pressure.permanent
-        ? ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}) plus the other resident sessions (~${formatMiB(pressure.otherBytes)}) exceed the resident pool budget (${formatMiB(pressure.budgetBytes)}), so every reload of this session is evicted again and no usable view survives between model requests — retrying now or after the next turn fails identically. To recover: finish or close the other open session(s), or raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB((pressure.weightBytes ?? 0) + pressure.otherBytes)} and restart bili.`
+        ? (selfExceedsBudget
+            ? ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}${weightNote}) alone exceeds the resident pool budget (${formatMiB(pressure.budgetBytes)}) — closing other sessions will NOT free room for it, so retrying now or after the next turn fails identically. To recover: raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB(pressure.weightBytes)} and restart bili.`
+            : ` THIS REFUSAL IS NOT TRANSIENT: your session's last measured memory footprint (~${formatMiB(pressure.weightBytes)}${weightNote}) plus the other ACTIVE resident sessions (~${formatMiB(pressure.activeOtherBytes)}) exceed the resident pool budget (${formatMiB(pressure.budgetBytes)}), so every reload of this session is evicted again and no usable view survives between model requests — retrying now or after the next turn fails identically. To recover: finish or close the other open session(s), or raise sessions.residentMaxBytes in ~/.config/billion-context/billion-context.json (env twin BILI_SESSION_RESIDENT_MAX_BYTES) above ~${formatMiB((pressure.weightBytes ?? 0) + pressure.activeOtherBytes)} and restart bili.`)
         : "Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again.";
-    const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem.${healClause} [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
+    // #5111: name why the persisted-view fallback (#3982) could not serve this
+    // call — "no readable fallback copy" has several distinct causes, and the
+    // old receipt asserted over-budget eviction as THE cause even when the pool
+    // had since drained below budget. Additive line; existing wording untouched.
+    const tailReceiptNote = recoveryReason ? ` Persisted-view recovery was attempted and found nothing readable (${recoveryReason}).` : "";
+    const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem.${healClause}${tailReceiptNote} [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
 }
 
@@ -800,13 +821,18 @@ export function noVisibleContextRefusal(
  *  A non-empty live view stays authoritative — the store is never consulted
  *  for it. Shared by the plain-compress lane (applyRanges) and the external-
  *  summary lane (applyConfiguredCompression). */
-export function recoverEvictedView(ctx: RewriteCtx): void {
-    if ((ctx.compressMessages ?? ctx.messages).length > 0) return;
-    const recovered = peekStoredTailView(ctx.session.id);
-    if (recovered && recovered.length > 0) {
-        ctx.compressMessages = recovered;
-        ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+export function recoverEvictedView(ctx: RewriteCtx): string {
+    if ((ctx.compressMessages ?? ctx.messages).length > 0) return "live-view";
+    const { view, reason } = storedTailViewStatus(ctx.session.id);
+    if (view && view.length > 0) {
+        ctx.compressMessages = view;
+        ctx.log(`[acp-proxy: view recovered from the unified store — ${view.length} message(s); folding against the persisted raw view (#3982)]`);
+        return "recovered";
     }
+    // #5111: the reason is now part of the answer — the refusal receipt quotes
+    // it so "no fallback copy" stops being an unexplained assertion.
+    ctx.log(`[acp-proxy: persisted-view recovery unavailable (${reason}) — keeping the honest empty-view path (#5111)]`);
+    return reason;
 }
 
 function formatMiB(bytes: number | undefined): string {
@@ -1043,8 +1069,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
     }
-    recoverEvictedView(ctx);
-    const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
+    const tailViewReason = recoverEvictedView(ctx);
+    const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop, tailViewReason });
     if (noView) return noView;
     // #2749: reject summaries that are byte-identical to a display stub the
     // model can currently see (the fragments it can "recall" after the
