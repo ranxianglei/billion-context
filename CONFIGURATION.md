@@ -2507,6 +2507,17 @@ Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main 
 
 billion-context detects this via the `instructions` field: subagent requests carry their own role prompt. The **first** instructions seen for a conversation anchor the main namespace (stable even if the main prompt drifts); any other instructions value maps to a separate `|sub:` namespace with its own empty compression state. Subagent requests are self-contained replays, so the fresh namespace is lossless — and the web UI's session list shows the two namespaces as separate sessions sharing the same client label.
 
+The anchor is not specific to Codex or Claude Code — but the split is deliberate, not automatic: it applies to clients whose traffic has been verified to reuse ONE conversation id across several personas (each sending its own system prompt under the same id), today Codex, Claude Code and DeepSeek Harness. For every other client a changed system prompt mid-conversation means "same conversation, evolved prompt" and stays in the main namespace. A concrete non-Claude case is DeepSeek Harness with `@deepseek-ai/dsh-experimental-auto-review` enabled: the reviewer fires before each pending tool call under its own small fixed system prompt (≈1 KB; the four `ENVIRONMENT` / `PROJECT_INSTRUCTIONS` / `FILTERED_HISTORY` / `PENDING_ACTION` sections ride its user turn), so its row appears alongside the main conversation and is also marked running.
+
+Four readings tell such a lane apart without reading any code:
+
+| Reading | Main conversation | Review / subagent lane |
+| --- | --- | --- |
+| system prompt | the full prompt (tens of KB) | very small (≈1 KB) |
+| compressions | grows over time | 0 |
+| requests | roughly one per turn | roughly one per tool call |
+| cache hit rate | varies | ≈99.9% (stable prefix, only the pending action changes) |
+
 ### Windows: exclude the sessions dir from antivirus (#362)
 
 billion-context persists each session's compression state to one JSON file per session under the sessions dir (`%USERPROFILE%\.local\share\billion-context\` by default) and rewrites that file on every turn of a long session. On Windows, real-time antivirus (Windows Defender), the search indexer, or a sync tool (OneDrive) can lock that directory mid-write. When the lock holds across several writes, the rename fails with `EPERM` and every persist for that session fails until the lock is cleared.
