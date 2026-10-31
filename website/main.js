@@ -63,6 +63,7 @@
     /* bili:gen site-dict-en */
     "cw.mcl": "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default.",
     "cw.mxcl": "Forced-compression nudge threshold (default \"75%\"): once history passes this share of the window the nudge fires immediately, bypassing the growth gates. Not a hard cap.",
+    "cw.nesc": "Host-side escalation-nudge line (default 0.7): injects a compression nudge once usage crosses this ratio even while the kernel cadence stays silent — covers the climb below maxContextLimit (#5232). Host-only, never sent to the kernel; an absent or non-positive value keeps the 0.7 default byte-for-byte.",
     "cw.etc": "Default \"95%\": emergency truncation of oversized tool outputs when history passes this share of the window (must be ≥ maxContextLimit).",
     "cw.ohmp": "Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens.",
     "cw.ngt": "Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens.",
@@ -311,6 +312,7 @@
     /* bili:gen site-dict-zh */
     "cw.mcl": "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。窗口来源中优先级最高——覆盖路由/模型声明与顶层默认值。",
     "cw.mxcl": "强制压缩提醒阈值（默认 \"75%\"）：历史超过窗口的该占比时提醒立即触发，绕过增长门槛。不是硬上限。",
+    "cw.nesc": "宿主侧升级提醒线（默认 0.7）：使用率越过该比例时，即使内核节奏仍静默也注入一次压缩提醒——覆盖 maxContextLimit 之下的爬升段（#5232）。仅宿主使用，不下发内核；缺省或非正值保持 0.7 默认（逐字节不变）。",
     "cw.etc": "默认 \"95%\"：历史超过窗口该占比时，对超大工具输出做紧急截断（必须 ≥ maxContextLimit）。",
     "cw.ohmp": "max_tokens 输出预留占窗口的最大比例（0–1，默认 0.25）。",
     "cw.ngt": "增长门槛（默认 50000）：可折叠片段超出基线增长达到该 token 数才发提醒。",
