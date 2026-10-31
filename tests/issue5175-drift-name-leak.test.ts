@@ -483,6 +483,177 @@ test("#5175 B: a retried turn that answers correctly emits no #870 error", async
     assert.equal(text.includes("degenerated again"), false, "the retry answered, so no #870 error may be emitted");
 });
 
+// ---------- #5175 defect B: the retry limit is the same on every lane ----------
+
+// The characterization above pins the retraction limit on the openai chat wire.
+// Defect B is not an openai shape — the model writes the envelope as prose, so
+// whichever fast path carries it sees the same bytes. This replays the identical
+// turn through the other two chat lanes and through the responses wire, and
+// asserts the SAME three facts each time:
+//
+//   1. the unfinished draft IS detected (one continuation is spent),
+//   2. the draft body still reaches the client (bytes are unretractable), and
+//   3. the retry's answer is appended after it.
+//
+// Measured on this branch: identical on all four wires. Measured on pristine
+// master: the draft is forwarded with NO retry at all (calls=0), because the
+// pre-fix predicate only matched a closing tag at the very END of the text.
+const DRAFT_ENVELOPE = "<analysis>\n…\n</analysis>\n\n<summary>\n1. Primary Request: X.\n";
+
+function driveChatLaneOnce(protocol: "openai" | "anthropic" | "google", pieces: string[]): Promise<{ text: string; calls: number }> {
+    const enc = new TextEncoder();
+    const of = (ev: string[]): ReadableStream<Uint8Array> => {
+        let i = 0;
+        return new ReadableStream<Uint8Array>({
+            pull(c) {
+                if (i < ev.length) c.enqueue(enc.encode(ev[i++]));
+                else c.close();
+            },
+        });
+    };
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const frames: string[] = [];
+    if (protocol === "anthropic") {
+        frames.push(sseLocal({ type: "message_start", message: { id: "m1", role: "assistant", content: [] } }));
+        frames.push(sseLocal({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+        for (const p of pieces) frames.push(sseLocal({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } }));
+        frames.push(sseLocal({ type: "content_block_stop", index: 0 }));
+        frames.push(sseLocal({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }));
+        frames.push(sseLocal({ type: "message_stop" }));
+    } else if (protocol === "google") {
+        // Production google frames carry the text WITHOUT a finishReason and a
+        // separate terminal frame carries it — folding both into one frame changes
+        // what the fast-path gate can see.
+        for (const p of pieces) frames.push(sseLocal({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: p }] } }] }));
+        frames.push(sseLocal({ candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] }));
+    }
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_b_" + protocol + "_" + Math.random().toString(36).slice(2),
+        protocol,
+    } as unknown as Session;
+
+    const chat = (delta: Record<string, unknown>, finish: string | null = null): string =>
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    const DONE = "data: [DONE]\n\n";
+    const retryFrames = protocol === "anthropic"
+        ? [
+            sseLocal({ type: "message_start", message: { id: "m2", role: "assistant", content: [] } }),
+            sseLocal({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+            sseLocal({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "the real answer" } }),
+            sseLocal({ type: "content_block_stop", index: 0 }),
+            sseLocal({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }),
+            sseLocal({ type: "message_stop" }),
+        ]
+        : protocol === "google"
+            ? [
+                sseLocal({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "the real answer" }] } }] }),
+                sseLocal({ candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] }),
+            ]
+            : [chat({ role: "assistant" }), chat({ content: "the real answer" }), chat({}, "stop"), DONE];
+
+    let calls = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array>> => {
+        calls += 1;
+        return Promise.resolve(of(retryFrames));
+    };
+    const events = protocol === "openai" ? [chat({ role: "assistant" }), ...pieces.map((p) => chat({ content: p })), chat({}, "stop"), DONE] : frames;
+    return pipePluginChatWithStrip(of(events), res as unknown as import("node:http").ServerResponse, protocol, session, undefined, refetch).then(() => {
+        let acc = "";
+        for (const line of writes.join("").split("\n")) {
+            const t = line.trim();
+            if (!t.startsWith("data:")) continue;
+            const raw = t.slice(5).trim();
+            if (raw === "[DONE]") continue;
+            try {
+                const obj = JSON.parse(raw) as Record<string, unknown>;
+                const choices = obj["choices"];
+                if (Array.isArray(choices)) {
+                    for (const ch of choices as Array<Record<string, unknown>>) {
+                        const d = ch["delta"] as Record<string, unknown> | undefined;
+                        if (d && typeof d["content"] === "string") acc += d["content"];
+                    }
+                }
+                const delta = obj["delta"] as Record<string, unknown> | undefined;
+                if (delta && typeof delta["text"] === "string") acc += delta["text"];
+                const candidates = obj["candidates"];
+                if (Array.isArray(candidates)) {
+                    for (const cand of candidates as Array<Record<string, unknown>>) {
+                        const c = cand["content"] as Record<string, unknown> | undefined;
+                        const parts = c?.["parts"];
+                        if (Array.isArray(parts)) {
+                            for (const part of parts as Array<Record<string, unknown>>) {
+                                if (typeof part["text"] === "string") acc += part["text"];
+                            }
+                        }
+                    }
+                }
+            } catch {
+                /* non-JSON keep-alive comment */
+            }
+        }
+        return { text: acc, calls };
+    });
+}
+
+for (const protocol of ["openai", "anthropic", "google"] as const) {
+    test(`#5175 B (${protocol}): the unfinished draft is retried, and its already-streamed body is not retracted`, async () => {
+        const whole = await driveChatLaneOnce(protocol, [DRAFT_ENVELOPE]);
+        assert.equal(whole.calls, 1, `the ${protocol} lane must detect the envelope and spend one continuation`);
+        assert.ok(whole.text.includes("Primary Request: X"), `the ${protocol} lane cannot retract bytes it already sent (measured, not assumed)`);
+        assert.ok(whole.text.includes("the real answer"), `the ${protocol} lane appends the retry's answer`);
+        // The cut at the envelope boundary is the shape production actually hits.
+        const at = DRAFT_ENVELOPE_CUT;
+        const split = await driveChatLaneOnce(protocol, [DRAFT_ENVELOPE.slice(0, at), DRAFT_ENVELOPE.slice(at)]);
+        assert.equal(split.calls, 1, `the ${protocol} lane detects the envelope even when it is split across deltas`);
+        assert.ok(split.text.includes("the real answer"), `the ${protocol} lane appends the retry's answer after a split`);
+    });
+}
+
+/** The envelope boundary — the split point production actually hits. */
+const DRAFT_ENVELOPE_CUT = DRAFT_ENVELOPE.indexOf("</analysis>") + 4;
+
+test("#5175 B (responses): the unfinished draft is retried, and its already-streamed body is not retracted", async () => {
+    const enc = new TextEncoder();
+    const sseEv = (type: string, extra: Record<string, unknown>): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`;
+    const of = (ev: string[]): ReadableStream<Uint8Array> => {
+        let i = 0;
+        return new ReadableStream<Uint8Array>({
+            pull(c) {
+                if (i < ev.length) c.enqueue(enc.encode(ev[i++]));
+                else c.close();
+            },
+        });
+    };
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_b_resp_" + Math.random().toString(36).slice(2),
+        stats: { pendingFoldUsage: false, compressCreditTokens: 0 },
+    } as unknown as Session;
+    const at = DRAFT_ENVELOPE_CUT;
+    const pieces = [DRAFT_ENVELOPE.slice(0, at), DRAFT_ENVELOPE.slice(at)];
+    let calls = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array>> => {
+        calls += 1;
+        return Promise.resolve(of([
+            sseEv("response.output_text.delta", { item_id: "oi1", output_index: 0, delta: "the real answer" }),
+            sseEv("response.completed", { response: { id: "r1", usage: { input_tokens: 1, output_tokens: 1 } } }),
+        ]));
+    };
+    const events = [
+        ...pieces.map((p) => sseEv("response.output_text.delta", { item_id: "oi1", output_index: 0, delta: p })),
+        sseEv("response.completed", { response: { id: "r1", usage: { input_tokens: 1, output_tokens: 1 } } }),
+    ];
+    await pipePluginResponsesWithStrip(of(events), res as unknown as import("node:http").ServerResponse, session, undefined, refetch);
+    const text = [...writes.join("").matchAll(/"delta":"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string).join("");
+    assert.equal(calls, 1, "the responses lane must detect the envelope and spend one continuation");
+    assert.ok(text.includes("Primary Request: X"), "the responses lane cannot retract bytes it already sent");
+    assert.ok(text.includes("the real answer"), "the responses lane appends the retry's answer");
+});
+
 // #5175 defect A, second lane: the chat wire adjudicates a released delta at the
 // release point (`pushField` → `stripDriftResidue`); the responses wire had NO
 // such call, so the reported paragraph rode `response.output_text.delta`
