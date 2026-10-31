@@ -487,6 +487,7 @@ const zh: Dict = {
     "open": "打开 Web UI",
     "hint": "查看压缩状态、会话与上下文窗口。",
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
+    "degraded_node22": "本机的 Node.js 版本低于 22，压缩代理无法启动——bili 压缩需要 Node.js 22 或更高（使用其内置 SQLite 引擎）。请把 Node.js 升级到 v22+ 后重启 dsh；升级前会话照常工作，只是暂时没有上下文压缩。",
     "connecting": "正在连接 bili 代理…",
     "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，暂时无法打开内嵌页面。若本应用已运行新版本，启动一个新会话即会自动换上新代理（也可手动结束旧代理进程立即生效）；若应用本身还是旧版本，请完全退出并重新启动 dsh。恢复前可点下方按钮直接打开 Web UI。",
     "remote_blocked": "本页面通过远程地址访问，而 bili 面板运行在服务器本机的回环地址（127.0.0.1）上——你的浏览器无法直连它（直连会指向你自己的电脑）。要远程打开面板：在服务器上编辑 ~/.config/billion-context/billion-context.json，向顶层对象加入下方字段并保存——本页会在数秒内自动生效（无需重启 dsh，刷新页面同样可以）；若你能直接访问该面板地址，也可点下方按钮在配置页开启。",
@@ -516,6 +517,7 @@ const en: Dict = {
     "open": "Open Web UI",
     "hint": "Inspect compression status, sessions and context windows.",
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
+    "degraded_node22": "This machine's Node.js is older than 22, so the compression proxy cannot start — bili compression needs Node.js 22 or newer (it uses the built-in SQLite engine). Please upgrade Node.js to v22+ and restart dsh; until then your sessions keep working, just without context compression.",
     "connecting": "Connecting to the bili proxy…",
     "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build, so the embedded page cannot be opened yet. If this app itself runs the new version, starting a new session swaps in the new proxy automatically (or kill the old proxy process manually for an immediate switch); if the app itself is still on the old version, fully quit and relaunch dsh. Until then, use the button below to open the Web UI directly.",
     "remote_blocked": "This page is reached through a remote address, but the bili panel runs on the server's own loopback address (127.0.0.1) — your browser cannot reach it directly (it would point at your own machine). To open the panel remotely: edit ~/.config/billion-context/billion-context.json on the server and add the field below to the top-level object — this page picks it up within seconds (no dsh restart needed; reloading works too); if you CAN reach that panel address directly, use the button below to enable it from the config page.",
@@ -538,6 +540,18 @@ const en: Dict = {
     "copy": "Copy",
     "copied": "Copied",
 };
+
+// owner 2026-10-31: WHY no proxy is bound — published by the host half on the
+// __BILI__ snapshot while origin-less. kind "no-engine" gets its own
+// actionable page text (upgrade Node.js to v22+); anything else keeps today's
+// generic degraded hint. Absent/garbage fields fail open (legacy hosts).
+function readBootstrapFailureKind(): string | undefined {
+    const g = globalThis as { __BILI__?: { bootstrapFailure?: unknown } };
+    const bf = g.__BILI__?.bootstrapFailure;
+    if (bf === null || typeof bf !== "object") return undefined;
+    const kind = (bf as { kind?: unknown }).kind;
+    return typeof kind === "string" && kind.length > 0 ? kind : undefined;
+}
 
 function readOrigin(): string | undefined {
     const g = globalThis as { __BILI__?: { origin?: unknown; relay?: unknown } };
@@ -850,7 +864,7 @@ export function apply(ctx: ClientContext): void {
                 : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
-            middle = hintP("degraded");
+            middle = hintP(readBootstrapFailureKind() === "no-engine" ? "degraded_node22" : "degraded");
         } else if (remoteBlocked) {
             middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
         } else if (liveEmbed === "stale") {
@@ -982,7 +996,7 @@ export function apply(ctx: ClientContext): void {
                 : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
-            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
+            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(readBootstrapFailureKind() === "no-engine" ? "degraded_node22" : "degraded"));
         } else if (remoteBlocked && origin !== undefined) {
             // The jump button targets the panel's config page (#/config) in a
             // fresh tab. For a purely remote browser that address is still

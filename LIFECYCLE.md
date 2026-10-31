@@ -70,6 +70,7 @@
 |------|-----------|
 | `BILI_LAUNCH_TOKEN` | launch 令牌（spawn 时注入；日志中脱敏） |
 | `BILI_PARENT_PID` | owner-pid 看门狗（会话生命周期归属） |
+| `BILI_SPAWN_FINGERPRINT` | #4125：spawn 时注入的 spawner 入口脚本 sha256，子进程据此核对自身脚本完整性 |
 | `BILI_STRICT_PORT` | `=1` claude SessionStart hook 退出端口重试（#964） |
 | `BILI_OPENCODE_ACP_SPEC` | 剥离版 ACP spec 临时配置**文件路径**提示 |
 | `BILI_LAUNCHER_LANE` | lane 身份戳（attach 时比对归属） |
@@ -125,6 +126,7 @@
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | #4788 phase 2 逃生门：`1/true` 时永不泄载会话 CCR 内容存储（排查用；默认 off，泄载后按需从盘透明重建） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
