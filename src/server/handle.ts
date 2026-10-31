@@ -21,7 +21,7 @@ import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire,
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
-import { externalSummaryEnabled } from "../external-summary-surface.js";
+import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
@@ -33,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -1101,17 +1101,28 @@ async function handleRequest(
                        // continuity-aware order resolver so a history-disjoint
                        // ride forks onto its own |sub:<fp> lane while a
                        // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944). #5095 D1-C: when the
-                       // bili SubagentStart hook's token rides the first user
-                       // message, the resolver keys the dispatch per-TOKEN —
-                       // parallel same-type dispatches stop merging on the
-                       // persona fingerprint.
+                       // order+content evidence (#2944).
+                       // #5095 D1-C: when the bili SubagentStart hook's token
+                       // rides the first user message, the resolver keys the
+                       // dispatch per-TOKEN — parallel same-type dispatches
+                       // stop merging on the persona fingerprint (token wins:
+                       // uniqueness by construction, no prompt-collision bet).
+                       // #5095 D1-B fallback: when NO valid token rides the
+                       // wire (un-upgraded installs, disabled hook, post-fold
+                       // head loss), fall back to the dispatch task prompt
+                       // (first user message fragment) as the per-run
+                       // discriminator so the fork key widens to
+                       // |sub:<fp>:<userFp> — a self-lane isolation strictly
+                       // better than the two-segment shared key; empty
+                       // fragment degrades to it. NO other call site passes
+                       // either.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
                            (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
                            pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
+                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
@@ -1437,7 +1448,7 @@ async function handleRequest(
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.
         session.meta.activePack = reqSurfacePack;
-        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, reqSurface?.promptSections);
+        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, messageTimestampSections(reqSurface?.promptSections));
         else delete session.meta.summaryInstructions;
         // #1082: rebuild-cost signal for the session-file GC — token estimate
         // of the RAW wire payload (full history as received, pre-fold/injection).
