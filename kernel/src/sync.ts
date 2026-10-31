@@ -5,7 +5,13 @@ import type { CompressionState, CoreMessage } from "./types.js";
  * inside the block's exact interval claim. Unbounded blocks and unstamped
  * views answer false — the id path decides those. The -1/-1 "no claim"
  * sentinel (PR #4725 N1) also answers false: it is absence of evidence, not
- * a positional claim (a [0,0] row IS a real claim over seq 0). */
+ * a positional claim (a [0,0] row IS a real claim over seq 0).
+ *
+ * Kept exactly as upstream states it: when NO covered id survives, a position
+ * inside the interval is far more likely id churn (re-mint, merged #2636 pair)
+ * than deletion, and a merge legitimately covers fewer ids than positions. The
+ * coverage-shape rule below only governs the shapes where ids are present.
+ */
 function blockSeqPresent(
   block: { startSeq?: number; endSeq?: number },
   messages: CoreMessage[],
@@ -30,6 +36,33 @@ function blockSeqPresent(
     }
   }
   return false;
+}
+
+type CoverageShape = "full" | "tail-gap" | "head-gap" | "holes" | "none";
+
+/** Where the missing covered ids sit, in the block's own coverage order.
+ *
+ *  - `tail-gap`  survivors are a prefix, everything missing is the newest end:
+ *                a rewind removed the span's tail -> the summary is stale.
+ *  - `head-gap`  survivors are a suffix, everything missing is the oldest end:
+ *                the host dropped old history; the summary is the ONLY record
+ *                of it, so dropping it too would be the actual loss.
+ *  - `holes`     missing cells are interior/ragged: the churn shape (client
+ *                re-serialized history), never the rewind shape. Do not guess.
+ *  - `none`      nothing covered is visible; ordering evidence decides.
+ */
+function coverageShape(
+  block: { effectiveMessageIds: string[] },
+  presentBases: Set<string>,
+): CoverageShape {
+  const present = block.effectiveMessageIds.map((id) => presentBases.has(baseIdOf(id)));
+  if (present.length === 0 || present.every(Boolean)) return "full";
+  if (!present.some(Boolean)) return "none";
+  const firstPresent = present.indexOf(true);
+  const lastPresent = present.lastIndexOf(true);
+  if (present.slice(0, lastPresent + 1).every(Boolean)) return "tail-gap";
+  if (present.slice(firstPresent).every(Boolean)) return "head-gap";
+  return "holes";
 }
 
 export interface SyncResult {
@@ -151,15 +184,42 @@ export function syncBlocks(
     // (pruned view) is still present — the summary IS the block's visible
     // representation. Without this, hosts passing pruned views would lose
     // block activity every turn.
-    // #4316 layer 3: a block with an exact ledger interval is also still
-    // present when ANY visible message carries a ledgerSeq stamp inside the
-    // interval — the host restored/re-stamped the originals (fresh ids, same
-    // positions), and the positional claim survives the id churn that the
-    // id-membership check above just missed.
-    const stillPresent =
-      block.effectiveMessageIds.some((id) => presentBases.has(baseIdOf(id))) ||
-      presentIds.has(summaryMessageId(block.blockId)) ||
-      blockSeqPresent(block, messages);
+    // #4592: the question is COVERAGE, not existence. `some` answered "is any of
+    // it still there" and kept injecting a summary that described a half-rewound
+    // span; `every` answered "is all of it there" but treated id churn like a
+    // deletion. The shape of the gap decides:
+    //
+    //   tail gap  -> rewind (the host withdrew the newest end)  -> stale, drop
+    //   head gap  -> the host dropped OLD history; the summary is the only
+    //                record of it, so keep it (dropping it would lose content)
+    //   holes     -> id churn (interior gaps are never the rewind shape):
+    //                keep it; `fold-reconcile` re-keys churned ids upstream
+    //   none      -> nothing id-shaped survived: defer to the positional
+    //                witness (upstream #4316, unchanged), which is the churn /
+    //                merged-pair shape rather than a deletion
+    //
+    // Everything except the tail gap keeps today's keep-alive behaviour, so the
+    // only behaviour that changes is the one shape that can be named.
+    const shape = coverageShape(block, presentBases);
+    let stillPresent: boolean;
+    if (presentIds.has(summaryMessageId(block.blockId))) {
+      // Pruned view: the summary IS the block's visible representation.
+      stillPresent = true;
+    } else {
+      switch (shape) {
+        case "full":
+        case "head-gap":
+        case "holes":
+          stillPresent = true;
+          break;
+        case "tail-gap":
+          stillPresent = false;
+          break;
+        case "none":
+          stillPresent = blockSeqPresent(block, messages);
+          break;
+      }
+    }
     if (!stillPresent) {
       block.active = false;
       deactivated.push(block.blockId);
