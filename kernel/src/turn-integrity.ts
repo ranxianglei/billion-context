@@ -7,6 +7,34 @@ function isAssistantAct(msg: CoreMessage): boolean {
   );
 }
 
+/** Wire-sidecar fields carrying signature-verified thinking-family payloads
+ *  (Anthropic thinking.signature, redacted_thinking blocks). Typed
+ *  structurally rather than as BiliMessage because core modules must not
+ *  import from src/wire/. */
+interface SignedThinkingSidecar {
+  thinkingSignature?: string;
+  rawAnthropicBlock?: unknown;
+}
+
+/** #4885: does this core carry a signature-verified thinking-family payload?
+ *  Anthropic verifies thinking / redacted_thinking blocks byte-for-byte when
+ *  their message is replayed; separating such a block from the siblings of
+ *  its wire message desynchronizes the signature from its context and bricks
+ *  the session (400 "thinking ... blocks cannot be modified"). OpenAI
+ *  reasoning_content is deliberately NOT counted: strict-echo providers
+ *  accept the #564 reverse split (reasoning kept, call folded). */
+export function isSignedThinkingFamily(msg: CoreMessage): boolean {
+  const m = msg as CoreMessage & SignedThinkingSidecar;
+  if (typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)
+    return true;
+  const ab = m.rawAnthropicBlock;
+  return (
+    !!ab &&
+    typeof ab === "object" &&
+    (ab as { type?: unknown }).type === "redacted_thinking"
+  );
+}
+
 /**
  * Atomic turn groups for compression integrity (#684).
  *
@@ -124,16 +152,23 @@ export interface IntegrityWithdrawals {
  *     withdrawn wholesale (all members stay visible).
  *   - INV2 — a tool-call and its tool-result are one exchange: a pair the fold
  *     would split is withdrawn together.
+ *   - INV3 (#4885) — a run of consecutive assistant messages carrying a signed
+ *     thinking-family block rebuilds into ONE provider message; partially
+ *     folding such a run orphans the signature (it merges into the next
+ *     surviving message → 400 on every request). A partially folded signed run
+ *     is withdrawn wholesale. Unsigned runs keep the #564 directional
+ *     allowance; a signed run folding TOGETHER is ordinary compression.
  *
- * The two invariants feed each other. Withdrawing a call for INV2 leaves a turn
+ * The invariants feed each other. Withdrawing a call for INV2 leaves a turn
  * whose reasoning still folds while its call now stays visible — exactly the
  * INV1 split — and withdrawing a turn for INV1 can strand a result whose call
  * survived outside the turn. One pass in a fixed order misses both, so the gate
  * repeats until nothing changes; a turn or pair is acted on once and reported
  * once.
  *
- * The reverse direction stays allowed (#564): reasoning and text may stay
- * visible while the call and its result fold, since that leaves a valid stream.
+ * The reverse direction stays allowed (#564): unsigned reasoning and text may
+ * stay visible while the call and its result fold, since that leaves a valid
+ * stream. Signed thinking-family blocks are the exception (INV3).
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
@@ -165,9 +200,63 @@ export function computeIntegrityWithdrawals(
   }
 
   const groups = computeTurnGroups(messages);
+
+  // #4885: maximal runs of consecutive assistant-role messages that carry at
+  // least one signed thinking-family block. Rebuild merges each run into ONE
+  // provider message, so a partially folded run desynchronizes the signature
+  // from its context. Tool results (role "tool") break runs by construction.
+  const signedRuns: string[][] = [];
+  {
+    let i = 0;
+    while (i < messages.length) {
+      if (messages[i]!.role !== "assistant") {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j + 1 < messages.length && messages[j + 1]!.role === "assistant")
+        j++;
+      let signed = false;
+      for (let k = i; k <= j && !signed; k++)
+        signed = isSignedThinkingFamily(messages[k]!);
+      if (signed) {
+        const members: string[] = [];
+        for (let k = i; k <= j; k++) {
+          const id = messages[k]!.id;
+          if (id) members.push(id);
+        }
+        signedRuns.push(members);
+      }
+      i = j + 1;
+    }
+  }
+  const handledSignedRuns = new Set<number>();
+  let signedRunWithdrawals = 0;
+
   let changed = true;
   while (changed) {
     changed = false;
+
+    for (let r = 0; r < signedRuns.length; r++) {
+      if (handledSignedRuns.has(r)) continue;
+      const members = signedRuns[r]!;
+      // Partial fold only: a run folding together (all members in `remaining`)
+      // or staying whole (none in it) is fine — ordinary compression / no-op.
+      let foldedAny = false;
+      let keptAny = false;
+      for (const id of members) {
+        if (remaining.has(id)) foldedAny = true;
+        else keptAny = true;
+      }
+      if (!foldedAny || !keptAny) continue;
+      handledSignedRuns.add(r);
+      for (const id of members) {
+        remaining.delete(id);
+        withdrawn.add(id);
+      }
+      signedRunWithdrawals++;
+      changed = true;
+    }
 
     for (let g = 0; g < groups.length; g++) {
       if (handledTurns.has(g)) continue;
@@ -206,7 +295,9 @@ export function computeIntegrityWithdrawals(
 
   return {
     withdrawn,
-    splitTurnCount: handledTurns.size,
+    // Signed-run withdrawals count as turn splits: they keep whole assistant
+    // turns intact for the same reason INV1 does.
+    splitTurnCount: handledTurns.size + signedRunWithdrawals,
     splitPairCount: handledPairs.size,
   };
 }
