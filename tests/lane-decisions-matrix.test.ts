@@ -16,25 +16,29 @@ import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { closeServers } from "./server-close-guard.ts";
 
-// #3417 lane-decisions truth table (characterization pass): pin the CURRENT
-// compress-surface behavior (standing prompt + nudge) per lane across all four
-// wires BEFORE extracting the lane-decisions module. Rows:
-//   - omp plugin (control): surface kept
+// #3417 lane-decisions truth table: pins the compress-surface behavior
+// (standing prompt + nudge) per lane across all four wires. Reachability is
+// OBSERVED per request for every plugin lane (#4998 removed the profile-name
+// default — pi/omp/opencode register their ACP tools through an async manifest
+// handshake that can land after a round's payload is built, so a toolless
+// round must go silent like #4344's dead-bridge zcode shape). Rows:
+//   - pi/opencode/omp plugin, NO tools declared (#4998 cold-start/drop shape):
+//     surface dropped; the healthy-declaration twins keep it
 //   - dsh plugin, no tools on the wire (#3177 shape): surface dropped
 //   - dsh plugin, compress declared on the wire (#3401 shape): fixed — kept
 //     (the bug) — this row is pinned as-is and flips in the fix commit
 //   - dsh plugin, only acp_status on the wire: dropped (named-tool precision
 //     target — today trivially dropped, post-fix still dropped for the right
 //     reason: the nudge names compress, which is NOT on the wire)
-//   - #3617-D completion: every profile's host-scoped default exercised via
-//     the real prepare chain (pi/opencode not scoped → kept; omp single
-//     regular tool ignored → kept), plus the proxy-mode structural-on control,
-//     plus the EMERGENCY override pair (#3461 guardrail): taught usage 45k/64k
-//     = 70% sits between the host escalation line (0.7) and the kernel
-//     over-limit line (0.75), so the kernel declines on cadence (fresh
-//     session, growth 0 < floor) while ≥5K of executable mass stays above
-//     minPressureBenefit — the override must inject where the surface is
-//     reachable and must NOT punch through an unreachable dsh tool table.
+//   - #3617-D/#4998 completion: the observational gate exercised per lane via
+//     the real prepare chain (toolless rounds drop; healthy declarations keep;
+//     the headerless zombie probe stays armed on pi too), plus the proxy-mode
+//     structural-on control, plus the EMERGENCY override pair (#3461
+//     guardrail): taught usage 45k/64k = 70% sits between the host escalation
+//     line (0.7) and the kernel over-limit line (0.75), so the kernel declines
+//     on cadence (fresh session, growth 0 < floor) while ≥5K of executable
+//     mass stays above minPressureBenefit — the override must inject where the
+//     surface is reachable and must NOT punch through an unreachable tool table.
 //
 // The nudge arms deterministically: usage reports 50k against a 64k
 // operator-declared window (78%) with a compressible history outside the
@@ -229,7 +233,10 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
 }
 
 const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; expect: (w: Wire) => RowOutcome }[] = [
-    { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4998: the old "omp control keeps the surface" row pinned the
+    // profile-name default; reachability is now observed, so a toolless omp
+    // round (manifest handshake not landed yet / #2708-style drop) goes silent.
+    { name: "omp no-tools drops the surface (#4998: observed reachability)", lane: "omp", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
     // the wire still drops the surface today. The fix commit flips this row to
@@ -259,14 +266,30 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // injectTool off the nudge must stay off on ALL wires (master allowed it
     // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
     { name: "injectTool-off drops the surface everywhere (anthropic nudge convergence)", lane: "omp", tools: [], injectTool: false, expect: () => ({ nudge: false, standingPrompt: false }) },
-    // #3617-D: every profile's host-scoped default through the real chain.
-    // pi/opencode are NOT host-scoped (registry default false) → the tool
-    // table is irrelevant and the surface stays on.
-    { name: "pi no-tools keeps the surface (registry default: not host-scoped)", lane: "pi", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
-    { name: "opencode no-tools keeps the surface (registry default: not host-scoped)", lane: "opencode", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
-    // Contrast twin of the dsh precision rows: a non-host-scoped lane ignores
-    // the declared tool table entirely.
-    { name: "omp single regular tool keeps the surface (non-host-scoped ignores tool table)", lane: "omp", tools: ["get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4998 FIX ROWS: pi/omp/opencode register their ACP tools through an
+    // async manifest handshake inside before_provider_headers, which fires
+    // AFTER that round's payload is already built — a cold-start round 1 (and
+    // any #2708-style drop round) claims plugin ownership while declaring
+    // nothing. The old registry default kept the surface ON for those rounds,
+    // advertising a compress the model cannot call (#3177/#3401 discipline;
+    // captured outbound in the issue repro: full standing prompt, empty ACP
+    // tool table). Observation-only now: toolless rounds go silent, healthy
+    // declarations keep the surface — positive+negative pairs per #3617.
+    // Positive fixtures always pair compress with a regular host tool: a
+    // table made up SOLELY of bili-owned names is a side request by structure
+    // and #1897's leak guard demotes it to passthrough (no action surface)
+    // before the lane decision ever runs.
+    { name: "pi no-tools drops the surface (#4998: registration pending)", lane: "pi", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "pi compress-on-wire keeps the surface (#4998: healthy steady-state)", lane: "pi", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "opencode no-tools drops the surface (#4998: observed reachability)", lane: "opencode", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "opencode compress-on-wire keeps the surface (#4998: healthy steady-state)", lane: "opencode", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Named-tool precision survives the #4998 flip: a regular tool that is
+    // neither compress nor an omnibus is not evidence of reachability.
+    { name: "omp single regular tool still drops the surface (#4998 precision retained)", lane: "omp", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // The self-heal probe must survive the flip on pi lanes too: a sticky
+    // plugin-bound session serving a HEADERLESS round (zombie shape) keeps the
+    // surface ON so zombieStreak can arm degrade-to-proxy (#2155/#4372).
+    { name: "pi headerless zombie round keeps the surface (#2155 probe must stay armed)", lane: "pi", tools: [], headerlessProbe: true, expect: () => ({ nudge: true, standingPrompt: true }) },
     // Proxy mode: bili injects its own tools into the outbound body, so the
     // surface is structurally on regardless of what the client declares.
     { name: "proxy control keeps the surface (structural on: bili owns the tool table)", lane: "proxy", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
@@ -274,7 +297,10 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // between the host escalation line (0.7) and the kernel over-limit line
     // (0.75) — the kernel declines on cadence while executable mass clears
     // minPressureBenefit, so ONLY the host override can arm the nudge.
-    { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4998: the reachable side of the guard now declares its tools — under
+    // observation-only reachability a toolless omp round is unreachable, and
+    // the reverse guard below proves the override cannot punch through one.
+    { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: ["compress", "get_weather"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },

@@ -214,7 +214,7 @@ test("abort x proxy-openai-sse: client abort mid-stream destroys the upstream re
         assert.ok(outcome === "first-byte" || outcome === "header");
         // Poll for the abort to propagate instead of a fixed 300ms sleep:
         // slow runners (win/node24) destroy the upstream socket later.
-        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+        for (let i = 0; i < 60 && up.socketsClosed() < 1; i += 1) {
             await new Promise((r) => setTimeout(r, 100));
         }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) must be destroyed after the client abort (closed=${up.socketsClosed()})`);
@@ -239,7 +239,7 @@ test("abort x proxy-anthropic-sse: client abort mid-stream destroys the upstream
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
         // Poll for the abort to propagate instead of a fixed 300ms sleep:
         // slow runners (win/node24) destroy the upstream socket later.
-        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+        for (let i = 0; i < 60 && up.socketsClosed() < 1; i += 1) {
             await new Promise((r) => setTimeout(r, 100));
         }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
@@ -263,7 +263,7 @@ test("abort x proxy-responses-sse: client abort mid-stream destroys the upstream
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }));
         // Poll for the abort to propagate instead of a fixed 300ms sleep:
         // slow runners (win/node24) destroy the upstream socket later.
-        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+        for (let i = 0; i < 60 && up.socketsClosed() < 1; i += 1) {
             await new Promise((r) => setTimeout(r, 100));
         }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
@@ -287,7 +287,7 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
         await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }));
         // Poll for the abort to propagate instead of a fixed 300ms sleep:
         // slow runners (win/node24) destroy the upstream socket later.
-        for (let i = 0; i < 30 && up.socketsClosed() < 1; i += 1) {
+        for (let i = 0; i < 60 && up.socketsClosed() < 1; i += 1) {
             await new Promise((r) => setTimeout(r, 100));
         }
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);

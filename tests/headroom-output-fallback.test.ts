@@ -66,6 +66,7 @@ type Scenario = {
     registry?: Record<string, { limit?: { context?: number; output?: number } }>;
     maxTokens?: number;
     headers?: Record<string, string>;
+    tools?: string[];
 };
 
 async function turn2MessageCount(s: Scenario): Promise<number> {
@@ -117,17 +118,20 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
         const headers = { "content-type": "application/json", "x-acp-session": s.session, ...(s.headers ?? {}) };
         const budget = s.maxTokens !== undefined ? { max_tokens: s.maxTokens } : {};
+        // #4998: plugin-lane reachability is observed per request — declare the ACP tools
+        // (plus a regular host tool to stay off #1897's bili-only side-request demotion).
+        const tools = s.tools ? { tools: s.tools.map((name) => ({ type: "function", function: { name, description: "d", parameters: { type: "object", properties: {} } } })) } : {};
         const r1 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: s.model, ...budget, messages: [{ role: "user", content: "hello" }] }),
+            body: JSON.stringify({ model: s.model, ...budget, ...tools, messages: [{ role: "user", content: "hello" }] }),
         });
         assert.equal(r1.status, 200);
         await r1.text();
         const r2 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: s.model, ...budget, messages: turn2Messages() }),
+            body: JSON.stringify({ model: s.model, ...budget, ...tools, messages: turn2Messages() }),
         });
         assert.equal(r2.status, 200);
         await r2.text();
@@ -201,6 +205,9 @@ test("e2e #971: runtime-info headers outrank the launcher env", async () => {
     // client actually asks the upstream for): reserved min(180k, 50k)=50k →
     // 150k effective → 80% → nudge (31). If the launcher env wrongly won,
     // reserved 10k → 190k → 63% → 30.
+    // #4998: this models a healthy steady-state pi round, which declares its ACP
+    // tools on the wire — without them the compress surface (and the nudge that
+    // is this test's observable) stays silent by design.
     assert.equal(await turn2MessageCount({
         session: "hf-rank",
         model: "headroom-rank-model",
@@ -209,5 +216,6 @@ test("e2e #971: runtime-info headers outrank the launcher env", async () => {
             "x-bili-plugin-model": "headroom-rank-model",
             "x-bili-plugin-max-output": "180000",
         },
+        tools: ["compress", "read_file"],
     }), 31);
 });

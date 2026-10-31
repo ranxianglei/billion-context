@@ -119,6 +119,8 @@ function dshHeaders(conv: string): Record<string, string> {
     return { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv };
 }
 
+const openaiTools = (names: string[]) => names.map((name) => ({ type: "function", function: { name, description: "d", parameters: { type: "object", properties: {} } } }));
+
 // 14 messages sized like the codex #2372 fixture: the kernel protects the
 // last 5 messages, so folding m00001–m00009 covers 9 ids (> the 8-id floor).
 function seedInput() {
@@ -432,8 +434,11 @@ test("#2432: per-turn nudge injection goes quiet while the compress breaker is a
     // #3177: DSH's ACP tools are host-scope (the preset agent can't reach them), so bili no
     // longer nudges DSH at all — the breaker has nothing to silence there. Exercise it on a
     // tool-visible plugin lane (omp) so the #2432 breaker-quenches-nudge coverage stays live.
+    // #4998: reachability is now OBSERVED per request — a healthy plugin round declares its
+    // tools on the wire; co-declaring a regular host tool keeps the body off #1897's
+    // bili-only side-request demotion (mirrors the plugin-nudge-injection fixtures).
     const post = (conv: string, messages: { role: string; content: string }[]) =>
-        fetch(chatUrl(rig), { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": conv }, body: JSON.stringify({ model: MODEL, messages }) });
+        fetch(chatUrl(rig), { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": conv }, body: JSON.stringify({ model: MODEL, tools: openaiTools(["compress", "read_file"]), messages }) });
     try {
         // Control: healthy session through the growth shape → nudge on turn 3.
         for (const [i, m] of [small, grown, grown].entries()) {

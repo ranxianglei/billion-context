@@ -21,15 +21,16 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 //      name, so an MCP-bridged host declaring `mcp__bili__compress` (zcode /
 //      claude-code lanes, fixed shim server name "bili" per src/mcp.ts #2578)
 //      was invisible to reachability;
-//   2. zcode had NO host-profile entry and inherited ANONYMOUS's
-//      toolsHostScopedByDefault:false — in plugin mode the surface was
-//      structurally ON regardless of the wire, so the nudge advertised a
-//      tool the model could not call (reporter log: 5+ T1 nudges at 21-29%
-//      usage, 0 compressions in 46 requests);
+//   2. zcode had NO host-profile entry and inherited ANONYMOUS's not-host-
+//      scoped default — in plugin mode the surface was structurally ON
+//      regardless of the wire, so the nudge advertised a tool the model could
+//      not call (reporter log: 5+ T1 nudges at 21-29% usage, 0 compressions in
+//      46 requests). (#4998 later removed the per-agent default entirely:
+//      reachability is now observed for EVERY plugin lane.)
 //   3. the standing prompt teaches the bare names while the model's tool
 //      table holds the MCP-prefixed ones.
-// The fix: dialect-aware reachability + a zcode profile (host-scoped,
-// observed) + an MCP name-mapping note on the standing prompt when the wire
+// The fix: dialect-aware reachability + a zcode profile entry (observed per
+// request) + an MCP name-mapping note on the standing prompt when the wire
 // declares the prefixed compress and NOT the bare one. This file pins all
 // three through the unit surface (resolveLaneDecisions / withMcpDialectNote)
 // and the real chain (openai wire, x-bili-plugin: zcode).
@@ -96,12 +97,19 @@ test("unit: dialect observation is lane-independent and proxy mode never flags i
     assert.equal(dsh.compressSurfaceOn, true, "dsh mcp-dialect reads reachable");
     assert.equal(dsh.mcpDialect, true);
 
-    // Non-host-scoped lanes (pi/omp/opencode) keep the surface regardless of
-    // the table, and the note stays off: their extensions register the bare
-    // names, so a prefixed name on the wire is not evidence of an MCP bridge.
-    const pi = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: "pi", parsed: { model: "m", messages: [], tools: [] }, shouldInject: true });
-    assert.equal(pi.compressSurfaceOn, true, "pi default keeps the surface");
-    assert.equal(pi.mcpDialect, false);
+    // Lane-independence runs both ways under observation-only reachability
+    // (#4998): a pi wire carrying ONLY the prefixed compress reads reachable
+    // AND arms the note — the same verdict as dsh above. What the wire
+    // declares is what gets advertised; no per-lane delivery assumption.
+    const pi = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: "pi", parsed: { model: "m", messages: [], tools: mcpTable }, shouldInject: true });
+    assert.equal(pi.compressSurfaceOn, true, "pi mcp-dialect reads reachable");
+    assert.equal(pi.mcpDialect, true, "note arms on pi too (observation-only, #4998)");
+
+    // A toolless pi round (cold-start / drop shape) goes silent — and an empty
+    // table cannot arm the note.
+    const piEmpty = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: "pi", parsed: { model: "m", messages: [], tools: [] }, shouldInject: true });
+    assert.equal(piEmpty.compressSurfaceOn, false, "pi no-tools drops the surface (#4998)");
+    assert.equal(piEmpty.mcpDialect, false);
 
     // Proxy mode: bili injects the BARE tools itself, so the dialect note is
     // never armed there regardless of what the client's table happens to carry.
@@ -215,11 +223,15 @@ test("chain: zcode without a bridge goes silent — no prompt, no note, no injec
 });
 
 test("chain: pi keeps the bare-name prompt with no MCP note (negative control)", async () => {
-    const { forwarded } = await chainOnce("pi", []);
+    // #4998: reachability is observed per request — the negative control must
+    // declare the bare names to earn the full standing prompt (a toolless pi
+    // round is a cold-start/drop shape and goes silent now). The host tool
+    // rides along so the body stays a main turn (#1897 vetoes bili-only tables).
+    const { forwarded } = await chainOnce("pi", ["compress", "read_file"]);
     assert.equal(forwarded.length, 1);
     const msgs = forwarded[0]!["messages"] as { role?: string; content?: unknown }[];
     const first = msgs[0];
-    assert.equal(first?.role, "system", "standing prompt present (pi is not host-scoped)");
+    assert.equal(first?.role, "system", "standing prompt present (bare names declared on the wire)");
     const sys = String(first?.content ?? "");
     assert.ok(sys.includes("acp_status"), "full standing prompt");
     assert.ok(!sys.includes(MCP_DIALECT_NOTE), "no MCP note on a bare-name lane");

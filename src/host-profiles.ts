@@ -20,14 +20,6 @@
 export interface HostProfile {
     readonly identity: string;
     /**
-     * Declared default: does this host register bili's ACP tools host-scope
-     * (invisible to the model) by default? dsh does (#3177: 0/3939 preset
-     * requests carried the tools); pi/omp/opencode expose them visibly. The
-     * observation layer overrides this when the request itself declares the
-     * tools (#3401: some dsh profiles DO surface them).
-     */
-    readonly toolsHostScopedByDefault: boolean;
-    /**
      * Declared: this host's upstream requests need the billing block carried
      * from the client request (#2189, subscription-OAuth lanes 429 without it).
      */
@@ -77,8 +69,14 @@ export interface HostProfile {
     readonly compactsClientSide: boolean;
 }
 
+// ACP tool visibility has NO declared per-agent default (#4998): delivery is
+// environmental on every lane — dsh profiles gate the surface (#3401), zcode
+// rides its MCP bridge (#4344), pi/omp/opencode register through an async
+// manifest handshake that can land after a round's payload is already built
+// (pi cold-start round 1; #2708-style drop rounds). lane-decisions observes
+// each request's own declaration instead of assuming it from the profile name.
 const PROFILES: Record<string, HostProfile> = {
-    dsh: { identity: "dsh", toolsHostScopedByDefault: true, wantsBillingBlock: true, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: true },
+    dsh: { identity: "dsh", wantsBillingBlock: true, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: true },
     // #4344: zcode reaches the ACP tools ONLY through its MCP bridge
     // (mcp__bili__* names), and bridge delivery is environmental — zcode's
     // agent modes gate MCP tools, and the degraded shim path serves an EMPTY
@@ -89,16 +87,16 @@ const PROFILES: Record<string, HostProfile> = {
     // and the surface goes silent instead of advertising a tool the model
     // cannot call (the #4344 shape: nudges armed at 21-29% usage, 0
     // compressions — #3177's "unknown tool" discipline, applied to zcode).
-    zcode: { identity: "zcode", toolsHostScopedByDefault: true, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
-    pi: { identity: "pi", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
-    omp: { identity: "omp", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: true, coworkTransportPossible: true, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
-    opencode: { identity: "opencode", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
+    zcode: { identity: "zcode", wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
+    pi: { identity: "pi", wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
+    omp: { identity: "omp", wantsBillingBlock: false, stampsBodyPromptCacheKey: true, coworkTransportPossible: true, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
+    opencode: { identity: "opencode", wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false },
 };
 
 /** No declared defaults at all — unknown agents and header-less proxy-lane
  * clients resolve here (lane-decisions re-identifies them by name or wire
  * signals). Exported because the wire-client table spreads it. */
-export const ANONYMOUS: HostProfile = { identity: "", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false };
+export const ANONYMOUS: HostProfile = { identity: "", wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, personaOrderKeyed: false, compactsClientSide: false };
 
 /** Resolve the declared profile for a plugin agent header value. Trimmed
  * exact match — the historical shape of every pluginAgent comparison.

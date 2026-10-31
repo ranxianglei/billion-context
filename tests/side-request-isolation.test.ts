@@ -740,14 +740,18 @@ test("e2e: opencode v2 title-gen is classified by intent, not token budget (#169
 
         // Repro (pre-fix behavior): WITHOUT x-bili-plugin-agent the budget heuristic
         // sees no max_tokens → defaults to 8192 → NOT a side request → treated as a
-        // main turn, so the compress philosophy prompt + render tags get injected.
+        // main turn, so its standing system slot gets filled. #4998 made the compress
+        // surface observational per request: this exact title-gen shape declares no bili
+        // tools, so the slot now carries the small tags-only prompt instead of the full
+        // standing compress prompt (the reported ~11KiB injection) — silencing a tool
+        // the one-shot title model cannot call.
         const rControl = await fetch(url, { method: "POST", headers: baseHeaders, body: JSON.stringify(titleBody) });
         assert.equal(rControl.status, 200);
         await rControl.text();
         const controlFwd = rig.lastBody as { messages?: unknown } | null;
         assert.ok(controlFwd, "control: upstream received the request");
         assert.notDeepEqual(controlFwd?.messages, titleBody.messages, "control: without the agent header the title request is misclassified as a main turn and its messages are rewritten");
-        assert.ok(JSON.stringify(controlFwd ?? {}).length > JSON.stringify(titleBody).length + 1000, "control: the compress philosophy prompt inflated the forwarded payload (the reported ~11KiB injection)");
+        assert.ok(!JSON.stringify(controlFwd ?? {}).includes("Compression Philosophy"), "control: the toolless round carries no standing compress prompt — reachability is observed per request (#4998)");
 
         // Fix: WITH x-bili-plugin-agent=title the request is a side request by
         // intent and is forwarded VERBATIM — its messages arrive byte-identical,

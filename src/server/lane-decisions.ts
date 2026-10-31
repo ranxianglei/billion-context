@@ -246,10 +246,17 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
     // Reachability truth: in PROXY mode bili itself injects the tool
     // definitions into the outbound body, so the surface is structurally on.
-    // In PLUGIN mode the host owns the tool table: reach when this request
-    // declares `compress` (observed — some dsh profiles DO surface it, #3401)
-    // or the host exposes bili tools to the model by design (profile default,
-    // #3177). #4344: the declaration counts in EITHER dialect — MCP-bridged
+    // In PLUGIN mode the host owns the tool table, and reachability is
+    // OBSERVED per request — never derived from the profile name (#4998):
+    // pi/omp register their ACP tools through an async manifest handshake
+    // inside before_provider_headers, which fires AFTER that round's payload
+    // is already built, so a cold-start round 1 (and any #2708-style drop
+    // round or stripped subagent lane) can legitimately declare nothing while
+    // still claiming plugin ownership; advertising a tool the model cannot
+    // call is what #3177/#3401 forbid, so those rounds go silent exactly like
+    // #4344's dead-bridge zcode shape does. A healthy round declares
+    // `compress` (observed — some dsh profiles DO surface it, #3401) or an
+    // omnibus that nests it. #4344: the declaration counts in EITHER dialect — MCP-bridged
     // hosts (zcode/claude-code) carry `mcp__bili__compress`, and a lane whose
     // bridge is healthy must not read as unreachable just because the name is
     // prefixed (session-self-heal's biliToolsDeclaredOnWire docs the same
@@ -267,7 +274,6 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         || declaredTools.has("compress")
         || declaredTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
-        || !profile.toolsHostScopedByDefault
         // #2155: a sticky plugin-bound round with NO lane header is the zombie
         // shape (plugin gone from the client). The nudge channel doubles as
         // the self-heal probe — suppressing it here starves zombieStreak and
