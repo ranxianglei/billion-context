@@ -3786,7 +3786,22 @@ export async function preflightCompressIfNeeded(
     // [#autoFold] a growth trigger is operator intent, not a billing guess —
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
-    const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    // #4974: baselineFloor <= 0 has two causes — "no usage baseline at all"
+    // (handled by unknownBaseline above) and "a baseline exists but carries no
+    // current-route evidence". The second can itself be stale-small: an
+    // estimate-grade value measured on a ~10KB auxiliary call while the current
+    // payload is multi-MB. Such a baseline cannot describe THIS payload — the
+    // forward-once bet below would price the body against it and die in the
+    // doomed byte-gate with the refusal pinned (#4974's livelock), while
+    // folding would have healed the session. Same size test as effectiveTokenCount's
+    // anchorImpossible (#4805), minus the lastUsagePayloadUpper clause that
+    // only usage settles set (an estimate arm never does). Skip the probe and
+    // take the fold-first path zero-baseline sessions already use.
+    const probePayloadUpper = estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens;
+    const staleSmallBaseline = session.stats.lastInputTokens > 0
+        && probePayloadUpper >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && probePayloadUpper - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    const probeForEvidence = !growthArmed && !unknownBaseline && !staleSmallBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has

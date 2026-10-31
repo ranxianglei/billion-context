@@ -42,11 +42,17 @@ async function harness() {
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
-    const upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+    const upstream = await new Promise<{ url: string; close: () => Promise<void>; setFail: (v: boolean) => void }>((resolve) => {
+        let fail = false;
         const server = http.createServer((req, res) => {
             const chunks: Buffer[] = [];
             req.on("data", (c: Buffer) => chunks.push(c));
             req.on("end", () => {
+                if (fail) {
+                    res.writeHead(500, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "forced failure" } }));
+                    return;
+                }
                 forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify(req.url?.endsWith("/chat/completions")
@@ -56,7 +62,7 @@ async function harness() {
                       : { id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
             });
         });
-        server.listen(0, "127.0.0.1", () => resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.close(); } }));
+        server.listen(0, "127.0.0.1", () => resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.close(); }, setFail: (v: boolean) => { fail = v; } }));
     });
     const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstream.url, routes: { [upstream.url]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     await once(proxy, "listening");
@@ -78,7 +84,7 @@ async function harness() {
         const response = await fetch(`${origin}/bili/${upstream.url}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_output_tokens: maxTokens, instructions, input }) });
         assert.equal(response.status, 200, await response.text());
     };
-    return { request, forwarded, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
+    return { request, forwarded, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, setFail: upstream.setFail, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
 }
 
 const mainMsg = (n: number) => ({ role: "user", content: `main turn ${n} `.repeat(120) });
@@ -454,6 +460,52 @@ test("(K2) side-lane meter guard: an anchor written by a request far smaller tha
     small.stats.lastUsagePayloadUpper = 900;
     const early = effectiveTokenCount(small, longHistory(3), 0);
     assert.equal(early.tokens, 800, "small payloads keep sizing off the anchor");
+});
+
+// (#4974/#388): the relay-side half of the #388 lane contract — a FAILED side
+// request must never arm the MAIN session's emergency-shrink meter: its wire
+// body describes the ~10KB auxiliary call, not the conversation (incident: one
+// failed title-gen pinned lastInputTokens tiny while preflight measured the
+// real multi-MB payload — the #4974 livelock's arming leg). Negative direction
+// (#3617): a failed MAIN request must still arm, or the #604/#1839 relay-5xx
+// rescue dies. Lands alongside the src/server/relay.ts edit per #2170 (lane
+// logic moves ⇔ a dedicated side-lane suite moves with it).
+test("(L) a FAILED side request must not arm the main session's meter (#4974/#388)", async () => {
+    const h = await harness();
+    try {
+        const conv = "armfail";
+        h.setFail(true);
+        // side shape 1: declared side agent (dsh title-gen persona)
+        await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv, "x-bili-plugin-agent": "title" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, system: "MAIN OPERATING SYSTEM", messages: [{ role: "user", content: "Generate a title." }] }),
+        }).then((r) => r.text());
+        // side shape 2: budget heuristic (no agent header, max_tokens <= 200, no tools)
+        await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 64, system: "MAIN OPERATING SYSTEM", messages: [{ role: "user", content: "summarize" }] }),
+        }).then((r) => r.text());
+        const s = resolveConversation(conv).session!;
+        assert.equal(s.stats.lastInputTokens, 0, "failed side requests must not arm lastInputTokens");
+        assert.notEqual(s.stats.lastInputTokensSource, "estimate", "no estimate-grade baseline may exist after side failures");
+        assert.equal(s.stats.emergencyShrinkAt, undefined, "side failures must not arm the emergency shrink");
+        // negative direction (#3617): a FAILED MAIN request still arms (#604/#1839)
+        const conv2 = "mainfail";
+        await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv2, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conv2, "x-bili-plugin-agent": "main" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 256, system: "MAIN OPERATING SYSTEM", messages: [{ role: "user", content: "work ".repeat(500) }, { role: "assistant", content: "ok ".repeat(300) }] }),
+        }).then((r) => r.text());
+        const m = resolveConversation(conv2).session!;
+        assert.ok(m.stats.lastInputTokens > 0, "a failed main request must still arm lastInputTokens");
+        assert.equal(m.stats.lastInputTokensSource, "estimate", "the main-lane arm stays estimate-grade");
+        assert.ok(m.stats.emergencyShrinkAt !== undefined, "the main-lane arm sets the emergency-shrink marker");
+        h.setFail(false);
+    } finally {
+        await h.close();
+    }
 });
 
 // (#4352): the header-less claude-code persona gate landed in src/server/handle.ts's

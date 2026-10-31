@@ -156,9 +156,20 @@ function installV1ResponseFramer(res: http.ServerResponse): void {
  *  persisted ~23 min). Anchor-less sessions (fresh / silent backends) size on
  *  the per-turn min(localInputEstimate, raw) views, where the arm guarantees a
  *  near-window payload still crosses the emergency band on retry. The next
- *  real usage report overwrites it. */
+ *  real usage report overwrites it.
+ *  #4974: side requests (sidePassthrough — title-gen etc.) must never arm the
+ *  MAIN session's meter: their wire body describes the ~10KB auxiliary call,
+ *  not the conversation. One failed side request pinned lastInputTokens to
+ *  that tiny estimate, so the nudge read ~1% while preflight measured the
+ *  real multi-MB payload — and the probe branch's doomed byte-gate 413'd a
+ *  session that folding would have healed. The #388 lane contract says side
+ *  requests leave kernel state untouched; this is the relay-side half of that
+ *  (the prepare-side half is the title-gen gate in prepare-anthropic.ts). */
 function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number): void {
     const s = prepared.session;
+    // #4974: see doc comment — a side request's payload cannot describe the
+    // main conversation, so its failure must not arm anything for it.
+    if (prepared.sidePassthrough) return;
     if (!Number.isFinite(est) || est <= 0) return;
     // An upstream-proven ceiling (overflow-arm) plus its route-origin evidence
     // must never be demoted by a local payload estimate: demoting it back to

@@ -197,6 +197,11 @@ export async function prepareAnthropic(
     // it honored on every lane. Extraction stays here (anthropic is the only
     // wire whose system is a block array); the decision is lane-decisions'.
     const anthropicBillingBlock = laneDecisions.billingBlockWanted ? extractBillingAttributionBlock(clientSystem) : undefined;
+    // #4974: title-gen-shaped request (tiny output budget). Hoisted from the
+    // try block below so the meter writes at the tail can skip it — its
+    // ~10KB payload would clobber the conversation's measurement (the openai
+    // and responses lanes already gate their writes on the same shape).
+    const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -321,7 +326,6 @@ export async function prepareAnthropic(
         // detectUnannouncedHistoryRewrite below). Title-gen side requests are
         // skipped like on the openai lane (same tiny-budget heuristic).
         let dshRebased = false;
-        const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
         if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
@@ -604,21 +608,26 @@ export async function prepareAnthropic(
     // above failed, processedMessages is empty and the forwarded body is the
     // UNPROCESSED projection — measure that instead so the fallback isn't
     // blinded to a system+tools-only floor.
-    session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
-        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
-    // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
-    // char-count upper bound) — settleUsageReport pairs it with this turn's
-    // usage report to learn the per-route estimate-calibration factor k̂.
-    session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
-        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
-    // #4805: id-membership evidence for the settle gate — the envelope ids
-    // when the lane sends them (any rollout state), else the tool-call ids
-    // resent in the history. Placed after the payload row above so the
-    // main-scale tiebreak sees this request's own upper bound.
-    probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
-    if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
+    // #4974: title-gen side requests are skipped like the openai lane's
+    // isTitleGen gate and the responses lane's isCompactionTrigger gate —
+    // their tiny payload would clobber the conversation's measurement.
+    if (!anthropicTitleGen) {
+        session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+            + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
+        // char-count upper bound) — settleUsageReport pairs it with this turn's
+        // usage report to learn the per-route estimate-calibration factor k̂.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+            + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        // #4805: id-membership evidence for the settle gate — the envelope ids
+        // when the lane sends them (any rollout state), else the tool-call ids
+        // resent in the history. Placed after the payload row above so the
+        // main-scale tiebreak sees this request's own upper bound.
+        probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
+        if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
+    }
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
