@@ -191,7 +191,8 @@ test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failu
     assert.match(stale, /\[stale-ref\]/, "scrubbed marker takes their place");
 
     const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
-    assert.ok(mixed.startsWith("[Compression FAILED:"), "still fails");
-    assert.ok(!mixed.includes("above this session's highest ref"), "note suppressed (start inside frontier)");
-    assert.match(mixed, /m00009/, "an in-frontier unknown endpoint stays verbatim — a real typo the model can correct");
+    assert.ok(mixed.startsWith("[Compressed "), "#4521 flip: an out-frontier endId clamps to the highest allocated ref instead of failing");
+    assert.match(mixed, /endId="m00009" is above this session's highest allocated ref \(m00008\)/, "the receipt names the clamp");
+    assert.match(mixed, /clamped to it/, "the model is told what happened to its endpoint");
+    assert.match(mixed, /m00009/, "the above-frontier endpoint stays verbatim (typo-correctable)");
 });
