@@ -3646,7 +3646,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     async function loadConfig() {
         try {
-                        const cfg = await json(API_ROOT + "/config");
+            const cfg = await json(API_ROOT + "/config");
             // #5319/#5328: refresh the resolved pack inventory (+ per-name
             // source + user-pack dir) so the picker and the editor stay in
             // sync with what is actually on disk.
