@@ -3254,6 +3254,41 @@ function localRefusalCovers(metadata: Record<string, unknown>, origin: string | 
     return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
 }
 
+interface PreflightRecoveryRecord {
+    origin: string;
+    model: string;
+    window: number;
+    probeUsed: boolean;
+    pending: boolean;
+    /** Usage-grade baseline known when the receipt was written (null = none); a differing later report discharges a spent probe (#496). Absent on receipts predating this field. */
+    seenUsage?: number | null;
+}
+
+function preflightRecoveryFor(session: Session, origin: string, model: string | undefined, window: number): PreflightRecoveryRecord | undefined {
+    const raw = session.metadata.preflightRecovery;
+    if (raw === undefined) return undefined;
+    if (raw && typeof raw === "object") {
+        const record = raw as Partial<PreflightRecoveryRecord>;
+        if (record.origin === origin && record.model === model && record.window === window
+            && typeof record.probeUsed === "boolean" && typeof record.pending === "boolean") return record as PreflightRecoveryRecord;
+    }
+    delete session.metadata.preflightRecovery;
+    markDirty(session);
+    return undefined;
+}
+
+function notePreflightRecovery(session: Session, origin: string, model: string, window: number, pending: boolean): void {
+    session.metadata.preflightRecovery = { origin, model, window, probeUsed: true, pending,
+        seenUsage: session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : null } satisfies PreflightRecoveryRecord;
+    markDirty(session);
+}
+
+function clearPreflightRecovery(session: Session): void {
+    if (session.metadata.preflightRecovery === undefined) return;
+    delete session.metadata.preflightRecovery;
+    markDirty(session);
+}
+
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
  *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
@@ -3752,7 +3787,30 @@ export async function preflightCompressIfNeeded(
         const billed = session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : "none";
         log("debug", `[${session.id}] [usage-vs-est] upstream-billed=${billed} est=${Math.round(textEstimate)} k̂=${kFactor !== undefined ? kFactor.toFixed(2) : "n/a"} route=${currentOrigin === undefined ? "?" : maskUrlForLog(currentOrigin)} model=${model ?? "?"} baseline-grade=${session.stats.lastInputTokensSource ?? "none"} (#2283)`);
     }
-    if (limit <= 0 || !model || !triggerFires) return prepared;
+    if (limit <= 0 || !model) return prepared;
+    const recoveryOrigin = normalizeUpstreamOrigin(route?.upstream ?? opts.upstream) ?? "";
+    let recovery = preflightRecoveryFor(session, recoveryOrigin, model, limit);
+    // A spent probe exists only while its question is unanswered: its purpose
+    // (#2313/#496) was to acquire upstream usage evidence. When a proven usage
+    // sample DIFFERENT from the spend-time baseline lands, the upstream has
+    // answered — discharge so the next over-window turn arbitrates afresh
+    // instead of failing fast forever (#488-A steady state). An identical
+    // resend bills identically, sees no change, and stays closed (#5098);
+    // receipts predating seenUsage keep their conservative closure.
+    if (recovery !== undefined && recovery.pending === false && recovery.seenUsage !== undefined
+        && session.stats.lastInputTokensSource === "usage" && session.stats.lastInputTokens > 0
+        && session.stats.lastInputTokens !== recovery.seenUsage) {
+        log("info", `[${session.id}] spent preflight-probe receipt discharged: upstream usage ${session.stats.lastInputTokens} landed after the probe (baseline at probe time: ${recovery.seenUsage}) — re-arbitration allowed again (#496)`);
+        clearPreflightRecovery(session);
+        recovery = undefined;
+    }
+    const payloadFitsWindow = (unknownBaseline
+        ? outboundContextEstimates(prepared, prepared.body.toString(), opts, forwardUpstreamUrl(req, opts, route)).upperBound
+        : calibratedPayload) < limit;
+    if (payloadFitsWindow) clearPreflightRecovery(session);
+    if (!triggerFires) return prepared;
+    const recoveryPending = !payloadFitsWindow && recovery?.pending === true;
+    const evidenceProbeAvailable = payloadFitsWindow || (!recovery?.probeUsed && !recoveryPending);
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
     // window is independent evidence the payload cannot fit here — the
     // forward-once escapes below must not re-bet the estimator guess. Fitting
@@ -3786,7 +3844,10 @@ export async function preflightCompressIfNeeded(
     // [#autoFold] a growth trigger is operator intent, not a billing guess —
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
-    const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    const calibratedHere = kFactor !== undefined && normalizeUpstreamOrigin(kOrigin) !== undefined
+        && normalizeUpstreamOrigin(kOrigin) === currentOrigin;
+    const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0
+        && prepared.processedMessages.length > 0 && evidenceProbeAvailable && !calibratedHere;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
@@ -3828,14 +3889,12 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
         } else {
             log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
+            if (!payloadFitsWindow) notePreflightRecovery(session, recoveryOrigin, model, limit, false);
             return prepared;
         }
     }
-    // #3146: judge fit on the calibrated CJK-aware estimate for EVERY regime —
-    // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
-    // it made a fresh session whose real size fits the window read as over-window
-    // and fail-fast on the early no-compressible-ranges path below (#3146).
-    const payloadFitsWindow = calibratedPayload < limit;
+    // #3146: identified sessions judge fit on the calibrated CJK-aware estimate;
+    // anonymous unknown-baseline sessions retain #553's actual-wire upper bound.
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -3868,8 +3927,9 @@ export async function preflightCompressIfNeeded(
     // this same forward-instead-of-fail-fast decision after compression (below).
     const imageArbitration = imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
     // #3846: a scoped local 413 outranks the image-arbitration bet too.
-    if (imageArbitration && !localRefusalHere && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
+    if (imageArbitration && !localRefusalHere && evidenceProbeAvailable && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
+        notePreflightRecovery(session, recoveryOrigin, model, limit, false);
         return prepared;
     }
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
@@ -3967,6 +4027,11 @@ export async function preflightCompressIfNeeded(
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
+    if (!payloadFitsWindow) {
+        // A client can disconnect during the walk before any refusal is emitted.
+        // Persist the recovery obligation before the first summary/rebuild await.
+        notePreflightRecovery(session, recoveryOrigin, model, limit, true);
+    }
     const clientAbort = new AbortController();
     registerRequestAbort(res, clientAbort);
     res.on("close", () => {
@@ -4045,8 +4110,8 @@ export async function preflightCompressIfNeeded(
     // guaranteed-400 forward into a false "fits". Images ride the payload
     // verbatim (#488): add their cost back or #496's image-dominated payload
     // would look "fitting" on its text estimate alone. Unknown-baseline
-    // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
-    // #553) — the optimistic re-estimate is exactly what that regime distrusts.
+    // sessions keep the upper-bound caliber on the actual wire (#553) — the
+    // optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
     let fits: boolean;
     let foldedCalibratedSize: number | undefined;
@@ -4068,8 +4133,8 @@ export async function preflightCompressIfNeeded(
         // Same measurement the fit gate below uses — the view that actually
         // goes out (processedMessages empty ⇒ kernel transform failure ⇒ the
         // raw body rides; mirror outboundPayloadBreakdown's fallback).
-        const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
-        const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
+        const rebuiltEstimate = outboundContextEstimates(rebuilt, rebuilt.body.toString(), opts, upstreamUrl);
+        const rebuiltTextSize = rebuiltEstimate.textOverhead;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
@@ -4079,13 +4144,13 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltEstimate.imageTokens;
         // #3645: hoist the calibrated post-fold figure so the fail-fast message
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
-        foldedCalibratedSize = rebuiltCalibrated;
+        foldedCalibratedSize = unknownBaseline ? rebuiltEstimate.upperBound : rebuiltCalibrated;
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
-        fits = unknownBaseline ? result.fitsWindow : rebuiltCalibrated < limit;
+        fits = foldedCalibratedSize < limit;
         // #1820: anchor the meter to the rebuilt payload's measured size — the
         // rebuild request's own usage report (the only sample that can supersede
         // this) hasn't landed yet, and the meter's fallback branches would size
@@ -4105,18 +4170,23 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
         }
     } else {
-        fits = unknownBaseline
-            ? result.fitsWindow
-            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
+        const outboundEstimate = outboundContextEstimates(outbound, outbound.body.toString(), opts, upstreamUrl);
+        fits = (unknownBaseline ? outboundEstimate.upperBound
+            : applyEstimateCalibration(outboundEstimate.textOverhead, kFactor, kOrigin, currentOrigin) + outboundEstimate.imageTokens) < limit;
+    }
+    if (!fits) {
+        notePreflightRecovery(session, recoveryOrigin, model, limit, true);
     }
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
     if (clientAbort.signal.aborted || f?.kind === "aborted") {
+        if (!payloadFitsWindow || recoveryPending) notePreflightRecovery(session, recoveryOrigin, model, limit, true);
         const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
         log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding`);
         return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
     }
     if (fits) {
+        clearPreflightRecovery(session);
         if (result.compressedRanges === 0) {
             // [#autoFold] A growth-armed payload fits the real window by definition,
             // so a zero-progress fold is not an error — but it does mean the chain
@@ -4174,7 +4244,8 @@ export async function preflightCompressIfNeeded(
     // and armOverflowShrink recovers with real evidence; a fitting
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
-    if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
+    if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere
+        && !recoveryPending && evidenceProbeAvailable && !calibratedHere) {
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
     }
@@ -4187,7 +4258,7 @@ export async function preflightCompressIfNeeded(
     // Exception (#2662): pure queue drops (no attempt dispatched) are pool
     // congestion, not a chain failure — they must not convert into a
     // terminal verdict, so the very next turn retries instead of idling.
-    if (growthArmed && payloadFitsWindow) {
+    if (growthArmed && payloadFitsWindow && !recoveryPending) {
         if (queueDroppedAll) {
             log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding anyway (payload fits the model window ${limit})`);
         } else if (result.hadFoldableCandidates) {
@@ -4207,7 +4278,7 @@ export async function preflightCompressIfNeeded(
     // upstream overflow evidence. Forward for the upstream to arbitrate billing
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
-    if (imageArbitration && !localRefusalHere) {
+    if (imageArbitration && !localRefusalHere && !recoveryPending && evidenceProbeAvailable) {
         // Same fallback as the fit-gate measurement above: processedMessages
         // empty ⇒ kernel transform failure ⇒ the raw body rides.
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
@@ -4263,7 +4334,8 @@ export async function preflightCompressIfNeeded(
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
     const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
-    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
+    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed
+        && !recoveryPending && evidenceProbeAvailable && !calibratedHere) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
@@ -4313,7 +4385,12 @@ export async function preflightCompressIfNeeded(
     // #3846: a deterministic can-never-fit verdict is local refusal evidence for
     // this scope — persist it so the forward-once escapes above stay closed on
     // retry even after the baseline demotes to estimate or the body changes.
-    if (status === 413) noteLocalRefusal(session, currentOrigin, model, limit);
+    if (status === 413) {
+        noteLocalRefusal(session, currentOrigin, model, limit);
+        // A completed refusal hands recovery to the existing expiring evidence;
+        // only interrupted/unfinished walks retain a pending obligation.
+        if (localRefusalCovers(session.metadata, currentOrigin, model, limit)) clearPreflightRecovery(session);
+    }
     // #2189: an explicit retryable=false from preflight (credential-shape
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.
