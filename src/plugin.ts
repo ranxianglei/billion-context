@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -1181,36 +1181,86 @@ function sessionRevisionOf(session: Session): string {
  *  equal state.lastPassIds in exact order, and it sits under the UTF-8 byte cap.
  *  Pure — never mutates the session. Any miss returns null so callers fail
  *  closed exactly as before. */
+// #5140 CI-red follow-up: every reconstruction miss records WHICH gate fired,
+// so a 409 SNAPSHOT_UNAVAILABLE is diagnosable from server logs and the
+// client-visible error instead of being one silent null among five.
+const reconMissGate = new Map<string, { gate: string; at: number }>();
+const reconMissLastLogMs = new Map<string, number>();
+
+function reconMiss(session: Session, gate: string, detail?: string): null {
+    const why = detail ? `${gate} ${detail}` : gate;
+    const key = `${session.id}:${gate}`;
+    const now = Date.now();
+    if (now - (reconMissLastLogMs.get(key) ?? 0) >= 10_000) {
+        reconMissLastLogMs.set(key, now);
+        loggerLog("warn", `[plugin] raw-tail reconstruction unavailable for ${session.id} (${why}) — snapshot/fork falls back to the legacy path`);
+    }
+    reconMissGate.set(session.id, { gate: why, at: now });
+    return null;
+}
+
+function reconMissReason(sessionId: string): string | undefined {
+    const hit = reconMissGate.get(sessionId);
+    return hit && Date.now() - hit.at < 30_000 ? hit.gate : undefined;
+}
+
+// #5188 round 3: #5140's flake was a timing race — the ctor's first sidecar open
+// died on a transient disk spike under shard load, the resource cleared
+// milliseconds later, and the cold-restore snapshot request arrived before any
+// post-spike recovery attempt had fired. When reconstruction is actually needed
+// and the sidecar is merely MISSING (recoverable without restart), the two
+// user-visible 409 paths wait a bounded moment for that self-recovery instead
+// of racing it. Latched-disabled never waits — waiting cannot help there. The
+// pre-lock read of pluginSnapshot/lastPassIds is fine for gating: a stale answer
+// only costs one unnecessary wait or skips one (same immediate 409 as before).
+async function waitForReconstructionReplicas(session: Session): Promise<void> {
+    if (session.pluginSnapshot !== undefined) return;
+    const expected = session.state.lastPassIds;
+    if (!expected || expected.length === 0) return;
+    const store = getStore();
+    if (store.replicasAvailable()) return;
+    if (store.sidecarDownReason() !== "sidecar-missing") return;
+    await store.waitForReplicas();
+}
+
 function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     const expected = session.state.lastPassIds;
-    if (!expected || expected.length === 0) return null;
+    if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
     const store = getStore();
-    if (!store.replicasAvailable()) return null;
+    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable", store.sidecarDownReason());
     const seqs = store.unifiedTailSeqs(session.id);
-    if (!seqs || seqs.length === 0) return null;
+    if (!seqs || seqs.length === 0) return reconMiss(session, "empty-tailSeqs", `expected=${expected.length}`);
     const rows = store.unifiedTailViewRows(session.id);
-    if (!rows) return null;
+    if (!rows) return reconMiss(session, "null-tailViewRows", `seqs=${seqs.length}`);
     const bySeq = new Map<number, string>();
     for (const row of rows) bySeq.set(row.seq, row.content);
     const out: CoreMessage[] = [];
     for (const seq of seqs) {
         const content = bySeq.get(seq);
-        if (content === undefined) return null; // gap: a logical seq has no stored row
+        if (content === undefined) return reconMiss(session, "gap-tailRow", `seq=${seq}/${seqs.length} rows=${rows.length}`); // gap: a logical seq has no stored row
         let msg: CoreMessage;
-        try { msg = JSON.parse(content) as CoreMessage; } catch { return null; }
-        if (typeof msg.id !== "string" || typeof msg.role !== "string") return null;
+        try { msg = JSON.parse(content) as CoreMessage; } catch { return reconMiss(session, "unparseable-row", `seq=${seq}`); }
+        if (typeof msg.id !== "string" || typeof msg.role !== "string") return reconMiss(session, "bad-row-shape", `seq=${seq}`);
         out.push(msg);
     }
-    if (out.length !== expected.length) return null;
-    for (let i = 0; i < out.length; i += 1) if (out[i]!.id !== expected[i]) return null;
+    if (out.length !== expected.length) return reconMiss(session, "length-mismatch", `rows=${out.length} expected=${expected.length}`);
+    for (let i = 0; i < out.length; i += 1) if (out[i]!.id !== expected[i]) return reconMiss(session, "id-mismatch", `index=${i}`);
     const cap = publicSnapshotCapBytes();
-    if (Buffer.byteLength(stableJson(out), "utf8") > cap) return null;
+    if (Buffer.byteLength(stableJson(out), "utf8") > cap) return reconMiss(session, "cap-exceeded");
+    reconMissGate.delete(session.id);
     return out;
 }
 
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
-    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
+    if (!messages) {
+        const capped = session.metadata.publicSnapshotCapped === true;
+        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
+        // the capped base names the refusal itself; a gate recorded under it is
+        // incidental (reconstruction may bail before reaching the cap check)
+        const why = capped ? undefined : reconMissReason(session.id);
+        throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
+    }
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
@@ -1260,14 +1310,19 @@ export function forkParentRevisionLegacy(session: Session): string {
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
-function resolveForkConversation(id: string): Session | undefined {
+// #4942: async — on network storage backends the existence probes must be
+// able to reach the DB (the sync facade misses by design there). Materialization
+// must ride the SAME async seam: a sync getSession after an async probe would
+// mint an EMPTY resident ghost for a DB-only id, and that ghost then poisons
+// every later getSessionAsync of the id for the process lifetime.
+async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (getStore().loadSync(id)) return getSession(id);
+    if (await getStore().loadAsync(id)) return getSessionAsync(id);
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
-    if (!getStore().loadSync(persistedId)) return undefined;
-    return getSession(persistedId);
+    if (!(await getStore().loadAsync(persistedId))) return undefined;
+    return getSessionAsync(persistedId);
 }
 
 /** #2601 freshness window for persona-lineage following — same family as
@@ -1398,10 +1453,11 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
 
 export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
-    const session = resolveForkConversation(conversationId);
+    const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
+        await waitForReconstructionReplicas(session); // #5188 round 3: don't race self-recovery into a 409
         await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
     } catch (err) {
         forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
@@ -1451,7 +1507,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     const requestHash = forkHash(request);
     const replay = async (): Promise<boolean> => {
         await getStore().recoverCompletedFork(request.childConversationId);
-        const existing = resolveForkConversation(request.childConversationId);
+        const existing = await resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
         if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
@@ -1461,10 +1517,11 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { if (await replay()) return; }
     catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
-    const parent = resolveForkConversation(request.parentConversationId);
+    const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
+        await waitForReconstructionReplicas(parent); // #5188 round 3: don't race self-recovery into a 409
         // #4911: async callback — the unified row clone below awaits the
         // backend on network backends; withSessionLock accepts () => T |
         // Promise<T>, so the lock scope and ordering are unchanged.
@@ -1695,7 +1752,9 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+// #4942: async — the session resolution below must reach the DB on network
+// storage backends (the caller, handleAdminRoute, is already async).
+export async function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): Promise<void> {
     // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
     // the dsh web app (its own loopback port / the dsh-app://app scheme). The
     // trusted-origin gate upstream of dispatch already admitted the request;
@@ -1706,7 +1765,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
         return h;
     };
-    let session = resolveForkConversation(conversationId);
+    let session = await resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
@@ -1982,7 +2041,7 @@ export async function handlePluginTool(
         routedBy = "native";
         deps.log("info", `[plugin] tool "${tool}": routed by host call id (#4580) to "${session.id}"`);
     } else if (conversationId) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             // #2601: a persona-lineage witness is not a spoof — the host stamps
@@ -2083,7 +2142,7 @@ export async function handlePluginTool(
         }
     }
     if (!session) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
