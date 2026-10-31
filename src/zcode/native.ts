@@ -17,6 +17,7 @@ import {
     defaultZcodeRoutePolicy,
     detectCurrentZcodeOrigin,
     detectZcodeStore,
+    isLoopbackHttpUrl,
     resolveZcodeDataDir,
     stampZcodePluginHeader,
     unrouteZcodeText,
@@ -441,6 +442,45 @@ interface BootstrapZcodeOptions {
     readonly healthDeadlineMs?: number;
 }
 
+/** #4692: the z.ai built-in account connects through ZAI_BUSINESS_BASE_URL —
+ *  an env var that lives in the ZCode MAIN process and never lands in the
+ *  provider store. Native routing rewrites only that store, so this surface
+ *  has no JSON-surgery target and its model traffic bypasses bili entirely. A
+ *  hook/MCP child cannot rewrite the parent's env (same wall as codex's login
+ *  provider, #1660/#403), so cert-MITM is the only way to cover it. Detected
+ *  here so a session going blind on it is loud instead of silent (#1896
+ *  extended past the empty-store shape to the non-empty one). */
+interface ZcodeBuiltinAccount {
+    readonly baseUrl: string;
+    readonly host: string;
+}
+
+/** Read-only: does this env configure a live z.ai built-in account whose
+ *  traffic bypasses native routing? Undefined when the var is absent, not
+ *  http(s), already a /bili/ wrapper, or a loopback target (none of those are
+ *  public-bypass surfaces). Never throws. */
+export function detectZcodeBuiltinAccount(env: NodeJS.ProcessEnv = process.env): ZcodeBuiltinAccount | undefined {
+    const raw = (env.ZAI_BUSINESS_BASE_URL ?? "").trim();
+    if (!raw) return undefined;
+    let url: URL;
+    try {
+        url = new URL(raw);
+    } catch {
+        return undefined;
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    if (url.pathname.startsWith("/bili/")) return undefined;
+    // Shared #809 loopback predicate — keeps this detector drift-free from the routing side.
+    if (isLoopbackHttpUrl(raw)) return undefined;
+    return { baseUrl: raw, host: url.hostname.toLowerCase() };
+}
+
+export function reportZcodeBuiltinAccount(account: ZcodeBuiltinAccount, log: (msg: string) => void): void {
+    log(
+        `z.ai built-in account detected (ZAI_BUSINESS_BASE_URL=${account.baseUrl}): it connects directly to ${account.host} and BYPASSES bili — native routing only rewrites the provider store, and this account never lands there, so its model traffic runs direct/uncompressed. Cover it via the GUI cert-MITM setup (Settings → Network: HTTP proxy + root CA path); note zai-series coding-plan model traffic additionally hits the #661 anti-fraud wall (working-but-uncompressed — see CLIENTS.md, #4593/#4610).`,
+    );
+}
+
 export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Promise<BootstrapMode> {
     const env = opts.env ?? process.env;
     const log = opts.log ?? defaultLog;
@@ -454,6 +494,13 @@ export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Pr
         log('zcode route is "none" (BILI_ZCODE_ROUTE) — leaving the provider store direct');
         return { mode: "off" };
     }
+
+    // #4692: the built-in account (ZAI_BUSINESS_BASE_URL) never lands in the
+    // provider store, so nothing downstream can signal when a session goes
+    // blind on it. Fire once here — after the kill-switch opt-out, before any
+    // proxy bring-up — so both the degraded and active outcomes stay loud.
+    const builtin = detectZcodeBuiltinAccount(env);
+    if (builtin !== undefined) reportZcodeBuiltinAccount(builtin, log);
 
     // #1621 + #1892: settle routing viability with the PURE dry-run BEFORE
     // any proxy bring-up. A degraded session (empty personal store, signing
