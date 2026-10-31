@@ -35,6 +35,7 @@
 | `BILI_LAUNCHER_DIRECT` | launcher direct-URL 模式 | `=1` 进入直通 URL 模式：LLM 流量不过代理 ⇒ 无压缩（只有 bili MCP 调用可用）；默认 MITM | —（两种模式都是正式入口则移 §2） | opt-in（`=1`） |
 | `BILI_LAUNCHER_PLUGIN` | launcher plugin 车道 | `=0` kill switch 回 wire 注入工具；`=1` 强制 plugin 车道；缺省自动 | plugin 车道成为唯一车道后退役 kill switch | 默认 auto |
 | `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_RESIGN_BENEFIT` / `BILI_CODEARTS_REF` | #1884 / #2090 | 签名上游重签特性族：`=0` 整族下线（回到 #1884 前重写行为）；passthrough 是「此链路不带压缩」的显式确认通道 | 特性族定型后各成员转 §2 | 特性族在用（`=0` 可整族下线） |
+| `BILI_MESSAGE_TIMESTAMPS` | #4313/#5236 | 消息级时间戳注入 opt-in：默认 off（undefined/0），`=1` 开启——统一存储落库 v10 时间戳列并镜像到 ACP 封套时间戳（读点 src/config.ts:2669）；关闭时线上字节逐字不变 | 功能定型转正后转 §2 常设面 |
 | `BILI_FAKE_COMPLETION_RETRIES` | fake-completion fallback | 假完成重试（opt-in，默认 0 = 禁用） | fallback 机制定型后转 §2 | opt-in |
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
@@ -121,6 +122,7 @@
 | `BILI_SESSION_GC` | 会话 GC 总开关（`=1/true/on` 启用，默认 off；启用后下面三个参数生效） |
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
@@ -161,6 +163,7 @@
 | `BILI_ZONE_PORT` | USER zone 基址覆盖（#1660） |
 | `BILI_CLAUDE_NATIVE_PORT` / `BILI_ZCODE_PORT` | 显式 zone 端口覆盖（strict-port 语义，#1660） |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` / `BILI_ATTACH_HEALTH_DEADLINE_MS` | native attach 证据宽限窗 / 健康截止窗 |
+| `BILI_SPAWN_WAIT_MS` / `BILI_SLOW_START_GRACE_MS` | launcher spawn 初始健康等待窗 / LIVE 子进程慢启动宽限；总 spawn 预算 = 两者之和（#4947） |
 | `BILI_DSH_BIN` / `BILI_PI_BIN` | dsh / pi 可执行文件覆盖 |
 | `BILI_PLUGIN_AGENT` | `--plugin` 目标 agent 选择（默认 claude） |
 | `BILI_LOG_MASK_HOSTS` | 日志主机名掩码（默认开；`=0` 本地调试退出） |

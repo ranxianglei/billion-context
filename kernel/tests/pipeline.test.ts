@@ -26,6 +26,7 @@ test("defaultNodes exposes the canonical ordered pipeline", () => {
   const names = core.defaultNodes().map((n) => n.name);
   assert.deepEqual(names, [
     "reconcile-live-ids",
+    "stamp-timestamps",
     "assign-refs",
     "sync-blocks",
     "prune",
@@ -190,6 +191,7 @@ test("processTurn tags every mapped message with a derived ref (end-to-end)", ()
     config: defaultConfig(100000),
     tokenCount: 100,
   });
+  // Default construction is flag-OFF (#4313 toggle, PR #5236): legacy bytes, no time attr.
   assert.match(
     result.messages[0]!.text!,
     /^<acp tokens="\d+" type="text">m00001<\/acp>\nalpha$/,

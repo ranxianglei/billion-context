@@ -148,6 +148,8 @@ class InlineRes extends EventEmitter {
     readonly bodyStream: ReadableStream<Uint8Array>;
     headHeaders: HeaderPair[] = [];
     private controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    private committed = false;
+    private committedCb: (() => void) | undefined;
 
     constructor() {
         super();
@@ -156,12 +158,30 @@ class InlineRes extends EventEmitter {
         });
     }
 
+    /** Fires once at the moment this response COMMITS — the first writeHead,
+     *  or the implicit 200 of the first write/end. The dispatcher hands its
+     *  caller the Response here (#4985); register before driving the pipeline
+     *  so no commit can outrun the registration. */
+    onCommitted(cb: () => void): void {
+        if (this.committed) cb();
+        else this.committedCb = cb;
+    }
+
+    private markCommitted(): void {
+        if (this.committed) return;
+        this.committed = true;
+        const cb = this.committedCb;
+        this.committedCb = undefined;
+        cb?.();
+    }
+
     writeHead(status: number, reasonOrHeaders?: string | Record<string, string | number | string[]> | [string, string][]): this {
         if (this.headersSent) throw new Error("ERR_HTTP_HEADERS_SENT: Cannot change headers after they are sent to the client");
         this.statusCode = status;
         if (typeof reasonOrHeaders === "string") this.statusMessage = reasonOrHeaders;
         else if (reasonOrHeaders !== undefined) this.headHeaders.push(...normalizeHeaderPairs(reasonOrHeaders));
         this.headersSent = true;
+        this.markCommitted();
         return this;
     }
 
@@ -170,6 +190,7 @@ class InlineRes extends EventEmitter {
         const buf = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
         this.socket.bytesWritten += buf.length;
         this.controller?.enqueue(buf);
+        this.markCommitted();
         cb?.();
         return true;
     }
@@ -179,6 +200,7 @@ class InlineRes extends EventEmitter {
         if (chunk !== undefined) this.write(chunk);
         if (!this.writableEnded) {
             this.writableEnded = true;
+            this.markCommitted();
             try { this.controller?.close(); } catch { /* stream already errored */ }
             this.emit("finish");
             this.emit("close");
@@ -267,53 +289,88 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
                 if (signal.aborted) onAbort();
                 else signal.addEventListener("abort", onAbort, { once: true });
             });
-            void abortPromise.catch(() => { /* consumed by the race below when the abort wins */ });
+            // Pre-commit the race consumes this rejection; post-commit it must
+            // not become an unhandledRejection — the caller sees the abort
+            // through the body stream instead (undici mid-stream semantics).
+            void abortPromise.catch(() => {});
         }
+        // #4985: the commit point. Hand the caller its Response the moment the
+        // pipeline sends response headers (upstream's first byte) instead of
+        // after the LAST relayed byte — awaiting full completion is what made
+        // pi-inline deliver a finished generation in one burst. Register
+        // BEFORE driving the pipeline so no commit can outrun us.
+        const committed = new Promise<void>((resolveCommit) => res.onCommitted(resolveCommit));
+        // The whole dispatch runs under the host's PRE-PATCH fetch: every
+        // upstream call the pipeline makes (forward, count-tokens,
+        // registry…) takes this transport instead of globalThis.fetch,
+        // which in the inline lane is bili's own patch chain — following
+        // it would rewrite the upstream URL back onto the pseudo-origin
+        // and loop forever.
+        const transport = (url: string, options: FetchOptions): Promise<Response> => (rawFetch ?? globalThis.fetch)(url, options as RequestInit);
+        const pipeline = withFetchTransport(
+            transport,
+            () => handle(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx),
+        );
+        // Out-of-band outcome handling: by the time these settle the response
+        // is already committed (or being committed), so failures land on the
+        // wire exactly like startServer()'s dispatch catch — error frame
+        // pre-header, clean end post-header — without ever rejecting a
+        // promise the caller already holds. No hang path: both handlers end
+        // the response unless it was destroyed, and a destroyed res means the
+        // abort leg rejected the race below.
+        let abortSurfaced = false;
+        void pipeline.then(
+            () => {
+                if (!res.writableEnded && !res.destroyed) res.end();
+            },
+            (err: unknown) => {
+                const msg = String(err);
+                const e = err as { name?: string; message?: string };
+                const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
+                if (clientAbort && !abortSurfaced) ctx.log("info", `client aborted mid-stream: ${msg}`);
+                // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
+                // throttled [warn] at the throw site is the canonical record.
+                else if (!isExpectedFailFast(err)) {
+                    if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                    else ctx.log("error", msg);
+                }
+                // A destroyed res belongs to an aborted caller whose stream
+                // carries the abort reason — writing there would throw on the
+                // dead controller; leave it alone.
+                if (res.destroyed) return;
+                if (!res.headersSent) {
+                    // #4254: shared egress builder — renders identically to startServer
+                    // (this lane now also emits the structured upstreamFailure diag).
+                    const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                    res.writeHead(status, headers);
+                    res.end(body);
+                } else {
+                    res.end();
+                }
+            },
+        );
         try {
-            // The whole dispatch runs under the host's PRE-PATCH fetch: every
-            // upstream call the pipeline makes (forward, count-tokens,
-            // registry…) takes this transport instead of globalThis.fetch,
-            // which in the inline lane is bili's own patch chain — following
-            // it would rewrite the upstream URL back onto the pseudo-origin
-            // and loop forever.
-            const transport = (url: string, options: FetchOptions): Promise<Response> => (rawFetch ?? globalThis.fetch)(url, options as RequestInit);
-            const pipeline = withFetchTransport(
-                transport,
-                () => handle(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, ctx.opts, ctx.core, ctx.config, ctx.log, ctx.instanceId, ctx.instanceStartedAt, ctx.proxyWatchers, ctx.initialWatcherPid, ctx.adminCtx),
-            );
-            if (abortPromise !== undefined) await Promise.race([pipeline, abortPromise]);
-            else await pipeline;
+            if (abortPromise !== undefined) await Promise.race([committed, abortPromise]);
+            else await committed;
         } catch (err) {
-            // Mirror of startServer()'s dispatch catch (server.ts): same
-            // client-abort classification, same error shape on the wire.
-            const msg = String(err);
+            // Only the abort leg rejects here — a pre-header cancel. Mirror the
+            // spawn-mode log line, then surface the caller's own reason.
             const e = err as { name?: string; message?: string };
-            const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
-            if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
-            // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
-            // throttled [warn] at the throw site is the canonical record.
-            else if (!isExpectedFailFast(err)) {
-                if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
-                else ctx.log("error", msg);
+            if ((e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && res.destroyed) {
+                abortSurfaced = true;
+                ctx.log("info", `client aborted mid-stream: ${String(err)}`);
             }
-            // A destroyed res belongs to an aborted caller whose promise
-            // carries the abort reason — the body stream is errored, so writing
-            // an error frame here would throw on the dead controller; rethrow
-            // so the caller sees the abort instead of a phantom response.
-            if (res.destroyed) throw err;
-            if (!res.headersSent) {
-                // #4254: shared egress builder — renders identically to startServer
-                // (this lane now also emits the structured upstreamFailure diag).
-                const { status, headers, body } = buildProxyFailureResponse(msg, err);
-                res.writeHead(status, headers);
-                res.end(body);
-            } else {
-                res.end();
-            }
+            throw err;
         } finally {
-            if (signal != null && onAbort != null) signal.removeEventListener("abort", onAbort);
+            // Post-commit the listener must OUTLIVE this function: a mid-body
+            // cancel has to error the stream the caller is reading. It detaches
+            // itself on abort (once:true) or when the response terminates.
+            if (signal != null && onAbort != null) {
+                const detach = (): void => signal.removeEventListener("abort", onAbort!);
+                res.once("finish", detach);
+                res.once("close", detach);
+            }
         }
-        if (!res.writableEnded) res.end();
         return responseFrom(res);
     };
 }

@@ -34,6 +34,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
@@ -50,6 +51,7 @@ import {
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
+    SPAWN_FINGERPRINT_ENV,
     writeZonePort,
     type ProxyInstanceFile,
     type ProxyStartingMarker,
@@ -57,11 +59,12 @@ import {
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
-import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
+import { applyOmpFirstEventTimeout, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
+import { classifyStartupFailure } from "./startup-failure-page.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
@@ -73,7 +76,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -169,12 +172,17 @@ type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" 
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
-const SPAWN_WAIT_MS = 20000;
+// Env knobs (envMillis contract, #1365): large stores (whole-DB pre-bind open,
+// #4939) and two lanes sharing one index.db (write-lock contention on cold
+// start) have been observed exhausting the fixed budget, kill-spawn looping
+// into the same contention. Widen via env instead of patching dist; bad
+// values fall back to the defaults.
+const SPAWN_WAIT_MS = envMillis(process.env, "BILI_SPAWN_WAIT_MS", 20000);
 // #2187: grace beyond the initial wait for a LIVE child still starting.
 // Spawn-window startups have been observed taking 26-45s on slow Windows
 // machines (AV / first-run disk activity); the one-shot 20s budget misread
 // that as failure and left the lane degraded for the whole session.
-const SLOW_START_GRACE_MS = 40_000;
+const SLOW_START_GRACE_MS = envMillis(process.env, "BILI_SLOW_START_GRACE_MS", 40_000);
 // Total wait for a live child: initial window + grace. A child that EXITS or
 // fails to spawn still fails fast (the poll loop breaks on exit/error).
 export const SPAWN_BUDGET_MS = SPAWN_WAIT_MS + SLOW_START_GRACE_MS;
@@ -301,6 +309,16 @@ export interface LauncherDeps {
      *  made "why did we spawn instead of attach" undiagnosable. Default tees
      *  to bili.log + stderr. */
     attachDiag?: (msg: string) => void;
+    /** #5167: drain-aware liveness probe for the #3544 stale rotation wait.
+     *  Keep-alive POOLED probes cannot see a drain — the resident closes its
+     *  LISTENER within milliseconds of accepting the shutdown (that is the
+     *  port-release signal) but keeps answering pooled sockets while it
+     *  drains (worst case (1+10)×10s post-#3890). Polling with Connection:
+     *  close opens a FRESH connection each round, so "answers" once again
+     *  means "the listener still accepts" — exactly the condition the spawned
+     *  child needs before its bind can succeed.
+     *  Default hits the real endpoint; tests stub it. */
+    fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
     requestInstanceShutdown?: (origin: string) => Promise<boolean>;
@@ -3952,9 +3970,16 @@ interface HealthInfo {
     watchdog?: { armed: boolean; watchers?: number[] };
 }
 
-async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
+async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boolean }): Promise<HealthInfo | undefined> {
     try {
-        const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        // #5167: noKeepAlive sends Connection: close so the probe rides a FRESH
+        // connection — used by the rotation wait, where a pooled socket would
+        // keep being answered by a resident that already closed its listener
+        // and is merely draining its keep-alive connections (false "alive").
+        const res = await fetch(healthUrl(origin), {
+            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+            ...(opts?.noKeepAlive ? { headers: { connection: "close" } } : {}),
+        });
         if (!res.ok) return undefined;
         const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
@@ -4041,7 +4066,7 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
-    if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
+    if (inst.host !== opts.host || inst.passthrough !== resolveRecordedPassthrough(opts.passthrough)) return "host-or-passthrough-mismatch";
     // #3436: each cell wants what a spawned child will RECORD, not the raw
     // caller input — the child records loadOptions' gated mitm tier and the
     // parse of the BILI_LAUNCHER_MODEL_* env it receives. Native lanes pass no
@@ -4060,6 +4085,29 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     return Object.keys(wantMax).every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]) ? undefined : "model-max-outputs-mismatch";
 }
 
+/** #4125: UPWARD ADOPTION — a resident that reports a build STRICTLY NEWER
+ *  than ours is safe to ride even though its code fingerprint differs:
+ *  #1225's bytes-equality rule protects us from STALE content, and a newer
+ *  build is never stale. Every other guard stays intact — cross-lane remains
+ *  forbidden regardless of version (#1225/#2905), user-zone instances stay
+ *  user-managed (#1660), config shape still has to match (instanceShapeMismatch
+ *  is checked by the callers) — but without the fp veto, an out-of-band updated
+ *  copy wedged onto our lane's port deadlocks the older generation forever:
+ *  attach rejects its foreign bytes, #3544 rotation only reaches strictly OLDER
+ *  residents, and every new spawn dies twin-collision behind it until someone
+ *  manually kills the holder. The version claim must come from the resident's
+ *  own live health answer — a busy/silent holder proves nothing. */
+export function isNewerSameLaneHolder(
+    inst: { lane?: string },
+    optsLane: string | undefined,
+    healthVersion: string | undefined,
+    ownVersion: string,
+    userZone: boolean,
+): boolean {
+    if (userZone || optsLane === undefined || healthVersion === undefined) return false;
+    return inst.lane === optsLane && isVersionNewer(healthVersion, ownVersion);
+}
+
 function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string, foreignLanes: readonly string[] = []): string | undefined {
     if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return "code-fingerprint-mismatch";
     return instanceShapeMismatch(inst, opts, foreignLanes);
@@ -4076,31 +4124,41 @@ async function probeLiveInstances(
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
     isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
-): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
+): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
     if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
     for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
     const checked = await Promise.all(
-        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
+        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo | undefined } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
             const health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) {
                 // #3654: a refused connection and a saturated event loop both
                 // fail this probe — tell them apart in the log: connect-but-
                 // silent is BUSY (alive, loop inside a large fold), not dead.
-                // Still dropped either way (#1335 gate unchanged).
-                const busy = await isConnectable(c.origin);
-                diag?.(busy
-                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654)`
-                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`);
+                // #4811: BUSY candidates are KEPT (health: undefined), not
+                // dropped — dropping them made discovery declare "empty" over a
+                // live same-lane holder, and the spawn that followed raced it
+                // into EADDRINUSE plus a two-writer index.db window before the
+                // twin adoption that finally converged (#3923/#3959). Which
+                // BUSY instances are actually attachable is pickAttachable's
+                // call, on lifecycle evidence. An ANSWERED probe that reports
+                // not-ok (instance draining) stays dropped.
+                if (health === undefined && (await isConnectable(c.origin))) {
+                    diag?.(`native-attach: keep ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654/#4811)`);
+                    return { inst: c, health: undefined };
+                }
+                diag?.(health === undefined
+                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`
+                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
                 return undefined;
             }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
         }),
     );
-    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo } => c !== undefined);
+    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo | undefined } => c !== undefined);
 }
 
 /** #1335: the attach gate — a listener may be attached to only when its
@@ -4109,9 +4167,9 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo | undefined, attachExternal: boolean): boolean {
     if (attachExternal) return true;
-    return health.watchdog?.armed === true;
+    return health?.watchdog?.armed === true;
 }
 
 /** #1660: the user-sovereignty zone marker — neither a declared lane nor a
@@ -4162,7 +4220,7 @@ function normalizeOrigin(o: string): string {
  *  lane-less / user-zone daemon), while "global-fallback" keeps the pre-#2877
  *  wildcard fallback. */
 function pickAttachable(
-    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
@@ -4183,7 +4241,27 @@ function pickAttachable(
             diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not the explicit attachUrl target`);
             continue;
         }
-        const incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
+        let incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
+        // #4125: fingerprint drift alone doesn't veto a resident that PROVES
+        // itself a strictly newer same-lane build (live health version) —
+        // upward adoption closes the two-install deadlock; every other guard
+        // below stays intact.
+        if (incompatible === "code-fingerprint-mismatch" && c.health?.version !== undefined
+                && isNewerSameLaneHolder(c.inst, opts.lane, c.health.version, VERSION, isUserZoneInstance(c.inst))) {
+            // #4125: upward adoption lifts the fingerprint veto ONLY — the
+            // config-shape guard still applies. instanceCompatible reports the
+            // fp reason first, so a shape drift on a foreign-bytes holder would
+            // otherwise ride along invisibly once the veto is cleared (the
+            // adoptServingTwin path re-checks shape explicitly; mirror it here).
+            const adoptedShape = instanceShapeMismatch(c.inst, opts, foreignLanes);
+            if (adoptedShape === undefined) {
+                diag?.(`native-attach: adopt ${c.inst.origin} (pid ${c.inst.pid}): foreign bytes but self-reported v${c.health.version} is strictly NEWER than this lane's v${VERSION} — riding the newer build instead of deadlocking behind it (#4125)`);
+                incompatible = undefined;
+            } else {
+                diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): reports v${c.health.version} (newer) but its config shape differs (${adoptedShape}) — shape guards survive upward adoption (#4125)`);
+                incompatible = adoptedShape;
+            }
+        }
         if (incompatible !== undefined) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): incompatible (${incompatible})`); continue; }
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }
         const sameLane = opts.lane !== undefined && c.inst.lane === opts.lane;
@@ -4197,7 +4275,7 @@ function pickAttachable(
         // target, and attachExternal=true (the pre-existing #1335 permissive
         // opt-in — keeping it fully permissive means existing users of that
         // flag see NO change from this flip).
-        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health.watchdog?.armed !== true) {
+        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health?.watchdog?.armed !== true) {
             diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not own lane and not an armed shared daemon (attachPolicy=own-lane)`);
             continue;
         }
@@ -4205,7 +4283,22 @@ function pickAttachable(
         // never an attach target by default; log the refusal once per origin.
         // #1660: a user-zone instance (manual `bili start`) is exempt — the
         // missing watchdog is the user's deliberate posture, not drift.
-        if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
+        // #4811: a BUSY candidate (health probe silent, TCP alive) cannot prove
+        // its watchdog state, so it is attachable only when its lifecycle is
+        // verifiable another way — its own lane (#1231 same-lane spawn
+        // discipline), the explicit attachExternal opt-in, or the user zone.
+        // Declared foreign lanes stay refused while BUSY (#1335 unchanged).
+        if (c.health === undefined) {
+            if (!sameLane && !attachExternal && !isUserZoneInstance(c.inst)) {
+                if (!refusedLog.has(c.inst.origin)) {
+                    refusedLog.add(c.inst.origin);
+                    const msg = `bili: refusing to attach to ${c.inst.origin} (pid ${c.inst.pid}) — health probe silent but TCP alive (BUSY, event loop saturated #3654) and its lifecycle is unverifiable from this lane. Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
+                    console.error(msg);
+                    diag?.(msg);
+                }
+                continue;
+            }
+        } else if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
             if (!refusedLog.has(c.inst.origin)) {
                 refusedLog.add(c.inst.origin);
                 console.error(gateRefusalMessage(c.inst, c.health));
@@ -4244,10 +4337,11 @@ async function waitForStarterInstance(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
+    isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag, isConnectable), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -4292,7 +4386,7 @@ export async function findLiveAttachableInstance(
     const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
     const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
     return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
 }
 
@@ -4389,6 +4483,10 @@ const INHERITED_LAUNCHER_CHANNELS = [
     "BILI_LAUNCHER_MODEL_WINDOWS",
     "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
     "BILI_STRICT_PORT",
+    // #4125/#2195: the spawner→child fingerprint channel must never LEAK in
+    // from ambient environment either — an inherited digest would be some
+    // other bring-up's hash.
+    SPAWN_FINGERPRINT_ENV,
 ];
 
 function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -4625,7 +4723,14 @@ export function rotatePortLogIfNeeded(logPath: string): void {
 // "永远更新不了". Before spawning we ask such a resident to drain+exit and wait
 // for the port; on ANY doubt (unverifiable version, no endpoint, refusal,
 // timeout) we fall back to the historical spawn behavior untouched.
-const STALE_ROTATION_WAIT_MS = 12_000; // > the responder's 10s force-exit backstop
+// #5167: the budget only needs to cover the shutdown REQUEST being processed
+// (a wedged loop never closes the listener) — NOT the responder's drain: the
+// port-release signal is the LISTENER closing, which happens milliseconds
+// after the POST is accepted, and the wait below polls with Connection: close
+// so a resident that only answers pooled keep-alive sockets while draining
+// still reads as released. The process itself may take up to (1+10)×10s to
+// fully exit post-#3890; that is fine — the child binds the freed port.
+const STALE_ROTATION_WAIT_MS = 12_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
@@ -4634,7 +4739,10 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            // #5167: one-shot connection — the target closes its listener on
+            // accepting this request; leaving a pooled keep-alive socket behind
+            // would only extend the drain it is about to run.
+            headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
             signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
         });
@@ -4656,23 +4764,28 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
  *  preference resolver is stateful/sticky (#1660) and must not be touched on
  *  bring-ups where nothing rotates. */
 async function rotateStalePredecessor(
-    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     resolveTargetPort: () => number | undefined,
     opts: LaunchOptions,
     attachUrl: string | undefined,
     foreignLanes: readonly string[],
-    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    fetchHealthInfoNoReuse: (origin: string) => Promise<HealthInfo | undefined>,
     now: () => number,
     sleep: (ms: number) => Promise<void>,
     requestShutdown: (origin: string) => Promise<boolean>,
 ): Promise<void> {
     if (attachUrl !== undefined) return;
-    const stale = probed.filter((c) =>
-        !isUserZoneInstance(c.inst)
-        && c.health.watchdog?.armed === true
-        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
-        && c.health.version !== undefined
-        && isVersionNewer(VERSION, c.health.version));
+    // #4811: BUSY candidates carry no health (probe silent) — their version is
+    // unverifiable, so they are never rotation targets; the type guard drops
+    // them here and keeps `stale` narrowed to real HealthInfo below.
+    const stale = probed.filter(
+        (c): c is { inst: ProxyInstanceFile; health: HealthInfo } =>
+            c.health !== undefined
+            && !isUserZoneInstance(c.inst)
+            && c.health.watchdog?.armed === true
+            && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+            && c.health.version !== undefined
+            && isVersionNewer(VERSION, c.health.version));
     if (stale.length === 0) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
@@ -4691,10 +4804,16 @@ async function rotateStalePredecessor(
     }
     const deadline = now() + STALE_ROTATION_WAIT_MS;
     for (;;) {
-        const h = await fetchHealthInfo(candidate.inst.origin);
+        // #5167: poll on a FRESH connection (Connection: close). The resident
+        // closes its LISTENER within milliseconds of accepting the shutdown
+        // above but keeps answering POOLED keep-alive sockets while it drains
+        // (by design, ≤110s post-#3890) — a pooled probe here would read a
+        // draining resident as alive and falsely time out, sending the caller
+        // into the spawn ladder / attach-anyway while the port is actually free.
+        const h = await fetchHealthInfoNoReuse(candidate.inst.origin);
         if (!h?.ok) break;
         if (now() >= deadline) {
-            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still answers healthy; falling back to the normal spawn ladder`);
+            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still accepts fresh connections (listener open); falling back to the normal spawn ladder`);
             return;
         }
         await sleep(HEALTH_POLL_INTERVAL_MS);
@@ -4712,16 +4831,40 @@ export function startOwnerHeartbeat(
     origin: string,
     pid: number,
     intervalMs: number = OWNER_HEARTBEAT_INTERVAL_MS,
-    post: (body: string) => Promise<unknown> = async (body: string) => {
-        await fetch(`${origin}/__bili/watcher`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body,
-            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
-        });
-    },
+    post?: (body: string) => Promise<unknown>,
 ): (() => void) | undefined {
     if (pid !== process.pid) return undefined;
+    // #5152: the beat must be scheduled where a synchronous turn cannot starve
+    // it — and the host thread is exactly where such a turn runs (#5138: ~19
+    // minutes fully blocked). A main-thread beat is what let the proxy judge a
+    // LIVE owner dead (#4994); #5085 widened the confirmation COUNT, but a
+    // stall longer than count × tick exhausts it and reproduces the false
+    // death. A worker has its own event loop, so it keeps beating while the
+    // host thread is pinned (verified: a 4s host block delays zero worker
+    // beats). WHAT is posted is unchanged — only which loop schedules it.
+    //
+    // The `post` seam is preserved verbatim: an overriding caller (the #3544
+    // tests record beats without a live server) keeps the in-thread loop, so
+    // existing contracts and testability are untouched.
+    if (post !== undefined) return runOwnerHeartbeatLoop(post, pid, intervalMs);
+    return runOwnerHeartbeatWorker(origin, pid, intervalMs);
+}
+
+/** #5152: one worker per origin. Every attach path (spawn, attach, preferred
+ *  fallback) calls startOwnerHeartbeat, and a host with several lanes would
+ *  otherwise stack one worker per call for the same proxy. The worker is
+ *  idempotent per (origin, pid) — a repeat call returns a no-op stop().
+ *
+ *  Keyed by origin only: `pid` is always process.pid here (foreign pids return
+ *  above), so one host attests exactly one pid to a given proxy. */
+const ownerHeartbeatWorkers = new Map<string, { stop: () => void; refs: number }>();
+
+/** In-thread beat loop — the historical shape, kept for injected `post`. */
+function runOwnerHeartbeatLoop(
+    post: (body: string) => Promise<unknown>,
+    pid: number,
+    intervalMs: number,
+): () => void {
     let stopped = false;
     const beat = async (): Promise<void> => {
         while (!stopped) {
@@ -4740,6 +4883,120 @@ export function startOwnerHeartbeat(
     };
     void beat();
     return () => { stopped = true; };
+}
+
+/** Worker body for #5152. Bundled VERBATIM into dist, so it only uses builtins
+ *  and globals (fetch/AbortSignal are global in workers). The specifier goes
+ *  through a constant because scripts/check-dist-external.mjs text-scans for
+ *  quoted require forms — the same sanctioned indirection as
+ *  src/storage/integrity-check.ts. */
+const OWNER_HEARTBEAT_WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { origin, pid, intervalMs, timeoutMs } = workerData;
+let stopped = false;
+parentPort.on("message", (m) => { if (m === "stop") stopped = true; });
+const beat = async () => {
+    while (!stopped) {
+        await new Promise((r) => { const t = setTimeout(r, intervalMs); t.unref?.(); });
+        if (stopped) return;
+        try {
+            await fetch(origin + "/__bili/watcher", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ pid, hb: true }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+        } catch {
+            // transient — the next beat retries; the server-side grace window
+            // absorbs single misses
+        }
+    }
+    parentPort.postMessage("stopped");
+};
+void beat();
+`;
+
+/** #5152: the beat-worker surface this module drives — injectable so the
+ *  crash-fallback path can be exercised without a real thread death. */
+export interface OwnerBeatWorker {
+    on(event: "error", listener: (err: Error) => void): unknown;
+    unref(): void;
+    postMessage(message: string): void;
+    terminate(): Promise<number | undefined>;
+}
+
+/** Worker-owned beat (#5152). Falls back to the in-thread loop if the worker
+ *  cannot start OR dies mid-flight, so a host never loses liveness attestation
+ *  silently — a dead worker still holding its refcount slot would starve every
+ *  later attach for this origin of beats. */
+export function runOwnerHeartbeatWorker(
+    origin: string,
+    pid: number,
+    intervalMs: number,
+    spawn: (source: string, workerData: unknown) => OwnerBeatWorker =
+        (source, workerData) => new Worker(source, { eval: true, workerData }),
+): () => void {
+    const existing = ownerHeartbeatWorkers.get(origin);
+    if (existing !== undefined) {
+        // Same proxy, same host pid: the running worker already attests us.
+        // Refcount so the first stop() does not silence a later caller's beat.
+        existing.refs += 1;
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            existing.refs -= 1;
+        };
+    }
+    let stopped = false;
+    let worker: OwnerBeatWorker | undefined;
+    let fallbackStop: (() => void) | undefined;
+    try {
+        worker = spawn(OWNER_HEARTBEAT_WORKER_SOURCE, { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS });
+        worker.unref();
+        worker.on("error", () => {
+            // Construction failure is covered by the catch below; this covers a
+            // thread that dies MID-FLIGHT: keep attesting from the in-thread
+            // loop (its fetch failures keep looping where a dead thread cannot).
+            if (!stopped && fallbackStop === undefined) {
+                fallbackStop = runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+            }
+        });
+    } catch {
+        return runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+    }
+    const entry = { refs: 1, stop: (): void => { /* replaced below */ } };
+    const stop = (): void => {
+        if (stopped) return;
+        stopped = true;
+        ownerHeartbeatWorkers.delete(origin);
+        // Best-effort: tell the worker to stop, then tear it down regardless so
+        // a wedged worker can never outlive the host that owns it.
+        try { worker?.postMessage("stop"); } catch { /* already gone */ }
+        setTimeout(() => { void worker?.terminate(); }, 50).unref?.();
+        fallbackStop?.();
+    };
+    entry.stop = stop;
+    ownerHeartbeatWorkers.set(origin, entry);
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        entry.refs -= 1;
+        if (entry.refs <= 0) entry.stop();
+    };
+}
+
+/** The default in-thread beat sender (fallback path). */
+function defaultOwnerPost(origin: string): (body: string) => Promise<unknown> {
+    return async (body: string) => {
+        await fetch(`${origin}/__bili/watcher`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
+        });
+    };
 }
 
 export async function ensureProxyRunning(
@@ -4807,13 +5064,35 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable);
     const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
         // port would strand every request.
         return attachTo(existing);
+    }
+    // #5103: an explicit attachUrl target that discovery FOUND but every gate
+    // rejected was silent before — only an info-level skip diag per poll tick,
+    // so the user set the field, saw nothing, and waited hours for their own
+    // child. Name the target, the exact rejection reason, and the remedy once
+    // per bring-up, on both the visible channel and the durable log.
+    if (attachUrl !== undefined && existing === undefined) {
+        const target = probed.find((c) => normalizeOrigin(c.inst.origin) === normalizeOrigin(attachUrl));
+        let msg: string;
+        if (target !== undefined) {
+            const reason = instanceCompatible(target.inst, opts, codeFingerprint, foreignLanes);
+            const remedy = reason === "code-fingerprint-mismatch"
+                ? "the target runs different bili bytes than this lane (typical: global install vs host-managed copy right after an update). A target that reports a STRICTLY NEWER build attaches automatically — reaching this message means it reports the same or an older build: align the two installs (restart the host once its copy converges), or stop the target"
+                : reason !== undefined
+                    ? `config shape mismatch (${reason}) — align the target's launch config with this lane's, or stop the target`
+                    : "it passes compatibility but fails the lifecycle gate (no armed watchdog) — set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway";
+            msg = `bili: explicit attach target ${attachUrl} (pid ${target.inst.pid}) is not attachable: ${reason ?? "lifecycle gate"} — ${remedy}`;
+        } else {
+            msg = `bili: no live instance registered at the explicit attach target ${attachUrl} — the proxy there never published an instance record or its owner pid is dead; check its startup log`;
+        }
+        console.error(msg);
+        attachDiag(msg);
     }
     // #3544: nothing attachable above — but a strictly-older generation may
     // still hold our canonical port (its fingerprint differs by definition, so
@@ -4833,7 +5112,7 @@ export async function ensureProxyRunning(
             opts,
             attachUrl,
             foreignLanes,
-            fetchHealthInfo,
+            deps?.fetchHealthInfoNoReuse ?? ((origin: string) => fetchHealthInfoDefault(origin, { noKeepAlive: true })),
             now,
             sleepImpl,
             deps?.requestInstanceShutdown ?? requestInstanceShutdown,
@@ -4863,7 +5142,7 @@ export async function ensureProxyRunning(
         // #3404: same host-safe channel as attachTo above — normal startup
         // progress, not user-actionable.
         attachDiag("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes, deps?.isConnectable ?? tcpConnectable);
         if (waited) {
             return attachTo(waited);
         }
@@ -4911,6 +5190,13 @@ export async function ensureProxyRunning(
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
+    // #4811: where THIS spawn's output begins. The port log is append-only and
+    // rotates only at PORT_LOG_MAX_BYTES, so byte 0 may hold another (much
+    // older) spawn's bytes — sampling from here keeps failure reports about
+    // this child. If the file shrank between open and stat (rotation under us)
+    // every byte present is ours and the whole file is sampled.
+    let spawnLogOffset = 0;
+    try { spawnLogOffset = fs.fstatSync(logFd).size; } catch { /* keep 0 */ }
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is
     // the cross-process arbiter: the read above is only a fast path, so a
@@ -4948,6 +5234,23 @@ export async function ensureProxyRunning(
         // "child exited (code 0)" without the runtime path forced users to
         // guess WHICH program was actually spawned.
         const runtime = deps.nodeRuntime ?? resolveNodeRuntime();
+        // #4125: the port log is SHARED across spawns (append fd, size-based
+        // rotation only) — a zero-output failed child used to leave the
+        // PREVIOUS spawn's content behind, and every quoted sample misattributed
+        // it (observed: a week-old EADDRINUSE line quoted as the current
+        // failure's evidence). The header marks where THIS spawn's segment
+        // starts; advance spawnLogOffset past it so "N bytes since this spawn"
+        // counts only the child's own output (the header is launcher-written,
+        // not child output). Published BEFORE the spawn — like #707's starting
+        // marker — because a spawned child can write before a post-spawn
+        // append lands, which would push its earliest bytes (crash tails,
+        // listen lines) below the offset into "previous spawn" territory.
+        // childPid stays off the header (unknown pre-spawn); the child names
+        // itself in its own pid-tagged listen line (#4994).
+        try {
+            fs.appendFileSync(logPath, `\n=== bili spawn ${new Date(now()).toISOString()} launcherPid=${process.pid} port=${port} ===\n`);
+            spawnLogOffset = fs.statSync(logPath).size;
+        } catch { /* diagnostics only */ }
         try {
             child = spawnImpl(
                 runtime,
@@ -4976,6 +5279,12 @@ export async function ensureProxyRunning(
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
                         ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
+                        // #4125: hand the child the digest of the very script we exec'd,
+                        // so it records the identity WE saw — an auto-update swapping
+                        // dist between our hash and the child's own re-hash would fork
+                        // one bring-up into two identities (spawner gates keyed on X,
+                        // child registry saying Y).
+                        ...(codeFingerprint !== undefined ? { [SPAWN_FINGERPRINT_ENV]: codeFingerprint } : {}),
                     },
                 },
             );
@@ -4984,18 +5293,6 @@ export async function ensureProxyRunning(
                 fs.closeSync(logFd);
             } catch {}
         }
-        // #4125: the port log is SHARED across spawns (append fd, size-based
-        // rotation only) — a zero-output failed child used to leave the
-        // PREVIOUS spawn's content behind, and every quoted sample misattributed
-        // it (observed: a week-old EADDRINUSE line quoted as the current
-        // failure's evidence). Mark where THIS spawn's segment starts; the
-        // samples below read from here on, and "N bytes" means N bytes since
-        // this spawn.
-        try {
-            fs.appendFileSync(logPath, `\n=== bili spawn ${new Date(now()).toISOString()} launcherPid=${process.pid} childPid=${child.pid ?? "?"} port=${port} ===\n`);
-        } catch { /* diagnostics only */ }
-        let spawnLogStartBytes = 0;
-        try { spawnLogStartBytes = fs.statSync(logPath).size; } catch { /* unreadable — treat as fresh */ }
         try {
             child.unref?.();
         } catch {}
@@ -5037,16 +5334,86 @@ export async function ensureProxyRunning(
         // open a multi-MB file in %TEMP%.
         const logHeadSample = (): string => {
             try {
+                const size = fs.statSync(logPath).size;
+                // #4811: sample THIS spawn's bytes (from spawnLogOffset), not
+                // byte 0 — an append-only port log keeps every earlier spawn's
+                // output until it rotates at PORT_LOG_MAX_BYTES, and a stale
+                // head actively misdirected triage (#4811 field case: a
+                // two-day-old EADDRINUSE from an older build). A shrunken file
+                // means rotation happened under us — everything left is ours.
+                let start = spawnLogOffset;
+                if (size < start) start = Math.max(0, size - 256);
+                const span = size - start;
+                if (span <= 0) return "";
+                // #4816: the death cause sits at the END of a child's output —
+                // when this spawn wrote more than the sample window, take the
+                // TAIL instead of the head (head-only sampling then showed
+                // startup noise while the fatal line sat unread further down).
+                const len = Math.min(256, span);
+                const off = span > len ? start + (span - len) : start;
+                const label = span > len ? "tail" : "head";
                 const fd = fs.openSync(logPath, "r");
                 try {
-                    const buf = Buffer.alloc(256);
-                    // #4125: from THIS spawn's segment start — the shared file
-                    // may hold previous spawns' output before that offset.
-                    const n = fs.readSync(fd, buf, 0, buf.length, spawnLogStartBytes);
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, off);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
-                    return ` — child output head: "${s}"`;
+                    return ` — child output ${label}: "${s}"`;
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
+        // #5096: the fatal line of a startup crash sits at the END of this
+        // spawn's output — the head sample above (#4811) can quote nothing but
+        // the first warnings and actively hide it. Sample the tail too, but
+        // only when this spawn wrote enough that the tail is not the head
+        // again (and never quote a pre-spawn remnant as this child's tail).
+        const logTailSample = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                if (size >= spawnLogOffset && size - spawnLogOffset <= 256) return "";
+                const start = size < spawnLogOffset ? Math.max(0, size - 256) : Math.max(spawnLogOffset, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
+                    if (s.length > 200) s = `…${s.slice(s.length - 200)}`;
+                    return ` — child output tail: "${s}"`;
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
+        // #5096: turn the sampled bytes into a human cause when the signature
+        // is known (EPERM/EACCES/… on the bili data dir) — the field case had
+        // users staring at a truncated EPERM head with no idea what to do.
+        const failureHint = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                // #5096 review follow-up: classify THIS spawn's bytes only
+                // (#4811 discipline) — a stale permission signature from an
+                // earlier spawn would misattribute this failure; a shrunken
+                // file means rotation happened, so everything left is ours.
+                const start = size < spawnLogOffset ? Math.max(0, size - 1024) : Math.max(spawnLogOffset, size - 1024);
+                const len = Math.min(1024, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    const hint = classifyStartupFailure(buf.subarray(0, n).toString("utf8"));
+                    return hint ? ` (${hint})` : "";
                 } finally {
                     fs.closeSync(fd);
                 }
@@ -5057,22 +5424,27 @@ export async function ensureProxyRunning(
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
-                // #4125: report bytes SINCE THIS SPAWN, not the whole shared
-                // file — a zero-output failed child must not be described by
-                // (or quoted from) a previous spawn's content. "0" still cannot
-                // tell "child wrote nothing" from "output rotated away"
-                // (rotatePortLogIfNeeded renames to .old before the fd is
-                // opened) — say which when the rotated half exists.
-                const own = Math.max(0, size - spawnLogStartBytes);
+                // #4125/#4811: report bytes SINCE THIS SPAWN, not the whole
+                // shared file — a zero-output failed child must not be
+                // described by (or quoted from) a previous spawn's content.
+                // "0" still cannot tell "child wrote nothing" from "output
+                // rotated away" (rotatePortLogIfNeeded renames to .old before
+                // the fd is opened) — say which when the rotated half exists.
+                const own = Math.max(0, size - spawnLogOffset);
                 const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
                 return own <= 0
                     ? `, ${own} bytes since this spawn — EMPTY, the child produced no output of its own (any earlier content in this shared file belongs to previous spawns)${rotated}`
-                    : `, ${own} bytes since this spawn${rotated}${logHeadSample()}`;
+                    : `, ${own} bytes since this spawn${rotated}${logHeadSample()}${logTailSample()}`;
             } catch {
                 return "";
             }
         };
-        const diagnosePort = async (childAlive: boolean): Promise<string> => {
+        // #4994: returns the structured verdict beside the prose — at budget
+        // exhaustion "our child serves the preferred port" (health pid === the
+        // pid we spawned) is an adoption DECISION, not just a diagnosis. The
+        // same identity proof already vouches in the stale-record fallback
+        // above; the timeout path must be able to act on it instead of killing.
+        const diagnosePort = async (childAlive: boolean): Promise<{ text: string; selfHealthy: boolean }> => {
             const origin = proxyOrigin(opts.host, port);
             let info: HealthInfo | undefined;
             let det: ProbeOutcome = { ok: false, detail: "probe error" };
@@ -5083,31 +5455,35 @@ export async function ensureProxyRunning(
             } catch {
                 /* observability only — keep the generic clause */
             }
+            const selfHealthy = Boolean(info?.ok && child.pid !== undefined && info.pid === child.pid);
             if (info?.ok) {
-                return info.pid === child.pid
-                    ? `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`
-                    : `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`;
+                return selfHealthy
+                    ? { text: `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`, selfHealthy }
+                    // #5103: name the remedy, not just the fact — a foreign holder
+                    // (often a manually started proxy) deadlocks every retry of
+                    // this lane until someone acts on this line.
+                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it. Kill that process (kill ${info.pid ?? "?"}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it instead`, selfHealthy: false };
             }
             // A 200 that is not bili's health payload (foreign dev servers
             // answer ANY path with their index page) must not fall into the
             // generic "probe failed" clause — the probe SUCCEEDED.
             if (det.ok) {
-                return `port ${port} answered but not with bili's health payload — a foreign service likely holds it`;
+                return { text: `port ${port} answered but not with bili's health payload — a foreign service likely holds it`, selfHealthy: false };
             }
             const d = det.detail ?? "unknown error";
             if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) {
-                return `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`;
+                return { text: `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`, selfHealthy: false };
             }
             if (/^HTTP \d{3}$/.test(d)) {
-                return `port ${port} answered ${d} — the listener there is not reporting bili health`;
+                return { text: `port ${port} answered ${d} — the listener there is not reporting bili health`, selfHealthy: false };
             }
             // #3654: a timeout with a live TCP listener underneath is the
             // event-loop-saturation signature (connect succeeds, JS never runs)
             // — name it instead of letting it read as a dead port.
             if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) {
-                return `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`;
+                return { text: `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`, selfHealthy: false };
             }
-            return `last health probe failed with ${d}`;
+            return { text: `last health probe failed with ${d}`, selfHealthy: false };
         };
 
         // #4125: capture WHAT the planned port was doing at SPAWN time. The
@@ -5144,7 +5520,7 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}; at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${(await diagnosePort(true)).text}; at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -5230,8 +5606,12 @@ export async function ensureProxyRunning(
                     // #3575: self-recovering progress diagnostic — host-safe
                     // channel only; a raw console.* here lands on the TUI
                     // screen itself in native lanes (see agent/host-log.ts).
+                    // #5103: carry the remedy in the same line — when the child
+                    // never binds (e.g. it dies earlier on EPERM), THIS line is
+                    // all the user sees for hours, and "waiting" alone gives no
+                    // exit from the deadlock.
                     attachDiag(
-                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
+                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin; if that never happens, kill pid ${info.pid ?? "?"} or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead`,
                     );
                 }
             }
@@ -5246,11 +5626,28 @@ export async function ensureProxyRunning(
         // path (watcher + heartbeat included).
         const adoptServingTwin = async (): Promise<ProxyHandle | undefined> => {
             const candidates = (deps.listAdoptCandidates ?? discoverLiveInstances)()
-                .filter((inst) => isPidAlive(inst.pid) && instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined)
+                .filter((inst) => isPidAlive(inst.pid))
                 .sort((a, b) => Number(b.port === port) - Number(a.port === port) || b.startedAt - a.startedAt);
             for (const inst of candidates) {
+                let compatible = instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined;
+                // #4125: the adoption signal also covers a STRICTLY NEWER holder
+                // whose registry marker discovery couldn't judge (its bytes differ
+                // by definition across trees) — verify the version it REPORTS from
+                // a live health answer before riding it.
+                let adoptedNewerVersion: string | undefined;
+                if (!compatible) {
+                    const reported = await fetchHealthInfo(inst.origin);
+                    if (reported !== undefined && isNewerSameLaneHolder(inst, opts.lane, reported.version, VERSION, isUserZoneInstance(inst))
+                            && instanceShapeMismatch(inst, opts, foreignLanes) === undefined) {
+                        compatible = true;
+                        adoptedNewerVersion = reported.version;
+                    }
+                }
+                if (!compatible) continue;
                 if (!(await (deps.isConnectable ?? tcpConnectable)(inst.origin))) continue;
-                attachDiag(`bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
+                attachDiag(adoptedNewerVersion !== undefined
+                    ? `bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — reports v${adoptedNewerVersion}, strictly NEWER than this lane's v${VERSION}: the older generation yields so this spawn rides the newer build instead of deadlocking behind it (#4125)`
+                    : `bili: adopting serving twin ${inst.origin} (pid ${inst.pid}) — the spawned child lost the #3044 duplicate race to it; requests ride the existing instance (#3654)`);
                 return attachTo(inst);
             }
             return undefined;
@@ -5262,7 +5659,7 @@ export async function ensureProxyRunning(
             const rediscoveryDeadline = now() + POST_EXIT_REDISCOVERY_MS;
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
                     // #3404: successful-attach announcement on the recovery
@@ -5302,22 +5699,82 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
         }
+        // #4994: where THIS child says it bound, parsed from its own log
+        // segment ([spawnLogOffset..end] — no other spawn's lines can answer;
+        // a shrunken file means rotation under us, so sample the tail instead).
+        // The listen line carries the child's pid (`acp-proxy v… (pid N, id …)
+        // listening on http://host:port`), which must match OUR spawned pid AND
+        // be corroborated by a live health probe before anything trusts it.
+        const childLogBoundOrigin = (): { origin: string; port: number } | undefined => {
+            try {
+                const size = fs.statSync(logPath).size;
+                let start = spawnLogOffset;
+                if (size < start) start = Math.max(0, size - 8192);
+                if (size <= start) return undefined;
+                const fd = fs.openSync(logPath, "r");
+                let seg: Buffer;
+                try {
+                    seg = Buffer.alloc(size - start);
+                    const n = fs.readSync(fd, seg, 0, seg.length, start);
+                    seg = seg.subarray(0, n);
+                } finally {
+                    fs.closeSync(fd);
+                }
+                const text = seg.toString("utf8");
+                const re = /\(pid (\d+), id [^)]+\) listening on (https?:\/\/\S+)/g;
+                let m: RegExpExecArray | null;
+                let last: RegExpExecArray | undefined;
+                while ((m = re.exec(text)) !== null) last = m;
+                if (!last || Number(last[1]) !== child.pid) return undefined;
+                const u = new URL(last[2]);
+                const p = Number(u.port);
+                if (!Number.isInteger(p) || p <= 0) return undefined;
+                return { origin: u.origin, port: p };
+            } catch {
+                return undefined;
+            }
+        };
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
         // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
         // persistently slow host accumulated ~1 zombie per ~70s (each also
-        // stranding the lane sticky-port ladder). Hard-kill before failing.
+        // stranding the lane sticky-port ladder). Hard-kill before failing —
+        // EXCEPT when the spawner itself can identify a healthy victim (#4994):
+        // killing a child you just proved is serving was the defect, and the
+        // leak rationale does not apply to a child that is serving.
         // #3116: classify the port WHILE THE CHILD IS STILL ALIVE — probing
         // after the kill turns "bound but hung" into a misleading
         // ECONNREFUSED.
         const diagnosis = await diagnosePort(true);
+        if (diagnosis.selfHealthy) {
+            // Rung 1: the preferred port answers healthy with OUR child's pid —
+            // the same identity proof the stale-record fallback trusts per-poll,
+            // reached here because clobbered records starved it for the budget.
+            settleZonePort(port);
+            startOwnerHeartbeat(proxyOrigin(opts.host, port), watchPid);
+            attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${proxyOrigin(opts.host, port)} after ${SPAWN_BUDGET_MS}ms — the instance handshake never matched but the health probe proves this child serves the port; keeping it instead of killing (#4994)`);
+            return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+        }
+        // Rung 2: the child laddered off the preferred port (EADDRINUSE hop) and
+        // its records were clobbered too — find where IT says it bound and prove
+        // identity there before adopting.
+        const bound = childLogBoundOrigin();
+        if (bound) {
+            const info = await fetchHealthInfo(bound.origin);
+            if (info?.ok && info.pid === child.pid) {
+                settleZonePort(bound.port);
+                startOwnerHeartbeat(bound.origin, watchPid);
+                attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${bound.origin} after ${SPAWN_BUDGET_MS}ms — it bound ${bound.port} per its own listen line and answers health under our pid; keeping it instead of killing (#4994)`);
+                return { origin: bound.origin, port: bound.port, child, logPath };
+            }
+        }
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }

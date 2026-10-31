@@ -241,7 +241,9 @@ const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
  *  HTTP path now resolves them here with a 5 GiB default so multi-gigabyte single
  *  requests are accepted instead of reset. They bound SINGLE-REQUEST in-RAM buffering
  *  (~2x peak while a body is read+decoded); cross-turn history lives in SQLite and is
- *  unaffected. The WebSocket lanes keep the fixed 100 MiB surface (MAX_REQUEST_BYTES). */
+ *  unaffected. The Responses WebSocket lanes resolve the same budget for their wire
+ *  frames, reconstructed-body admission, upstream guards and checkpoint accounting
+ *  (#4804: they previously kept a fixed 100 MiB surface). */
 export function limitsReceiveBytes(): number {
     const v = tInt("BILI_RECEIVE_BODY_BYTES", loadConfigFile().network?.receiveBodyBytes);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
@@ -426,6 +428,28 @@ export function sessionWarmMaxBytes(): number {
 export function sessionResidentMaxBytes(): number {
     const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
+}
+
+/** BILI_SESSION_RESIDENT_HARD_MAX_BYTES > sessions.hardMaxBytes > pool soft cap
+ *  (#4788 D1-A): per-session HARD byte cap on estimated resident weight. Unlike
+ *  the pool soft cap (which evicts OTHER cold sessions and exempts the only
+ *  active one — structural blind spot #4788), this bounds ONE session and
+ *  triggers the between-turns field drops even for an exempt/only-active
+ *  session. `0` disables the cap check entirely. */
+export function sessionResidentHardMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_HARD_MAX_BYTES", loadConfigFile().sessions?.hardMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
+}
+
+/** BILI_SESSION_CONTENT_STORE_PIN (1/true): keep each session's CCR content
+ *  store ({byRef}/{byHash} originals) RESIDENT in memory instead of folding
+ *  it away after its save lands (#4788 phase 2, discussion #3916-E; the
+ *  store re-materializes on first touch from the unified ccr mirror or the
+ *  .content-store.json sidecar — payload-first write order, #2674). Unset,
+ *  0/false or any other value = fold (the default). */
+export function contentStorePinned(env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_SESSION_CONTENT_STORE_PIN?.trim().toLowerCase();
+    return raw === "1" || raw === "true";
 }
 
 interface GcSettings {

@@ -441,13 +441,17 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
                     try {
                         const j = JSON.parse(fs.readFileSync(p, "utf8")) as { payload?: { id?: string; stats?: { requests?: number }; state?: { messageRefs?: { byRaw?: Record<string, unknown> }; blocks?: Record<string, unknown> } } };
                         const inner = j.payload;
-                        if (!inner?.id) return;
-                        found.push({
-                            id: String(inner.id),
-                            requests: inner.stats?.requests ?? null,
-                            refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
-                            blocks: Object.keys(inner.state?.blocks ?? {}).length,
-                        });
+                        // Skip (don't abort the walk on) non-envelope .json
+                        // sidecars — e.g. index.db.chk — so one stray file can't
+                        // blind the whole directory scan.
+                        if (inner?.id) {
+                            found.push({
+                                id: String(inner.id),
+                                requests: inner.stats?.requests ?? null,
+                                refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
+                                blocks: Object.keys(inner.state?.blocks ?? {}).length,
+                            });
+                        }
                     } catch { /* skip unreadable */ }
                 }
             }

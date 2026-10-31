@@ -307,6 +307,7 @@ test("checkTunnelDestination: unresolvable surfaces the raw resolver code + reme
     assert.match(v.message, /\(EAI_AGAIN\)/, "raw resolver error code is surfaced");
     assert.match(v.message, /local name resolution failed/, "diagnostic hint points at a poisoned/unreachable resolver");
     assert.match(v.message, /upstream proxy/, "hint offers the proxy remediation");
+    assert.match(v.message, /restart the bili proxy process/, "#5224: hint offers the stale-resolver restart remedy");
 });
 
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {

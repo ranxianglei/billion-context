@@ -848,6 +848,85 @@ test("plugin-reported context window becomes the nudge denominator and is visibl
     }
 });
 
+// Hermes defers plugin toolsets through tool_search, so a healthy plugin session sends requests
+// whose tools array carries NONE of the ACP names. Those requests must still bind the plugin
+// identity and budget (that is exactly what /acp reads) while compression falls back to the proxy —
+// signalled by x-bili-plugin-compression: proxy. The pure plugin lane (no such header) keeps
+// suppressing wire injection, and a plain client cannot reach the override without the agent marker.
+test("x-bili-plugin-compression: proxy keeps plugin identity, moves compression server-side", async () => {
+    const h = await startHarness([textScript(), textScript(), textScript(), textScript()]);
+    try {
+        const post = async (headers: Record<string, string>, tools: unknown[] | undefined): Promise<void> => {
+            const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", ...headers },
+                body: JSON.stringify({
+                    model: "claude-test",
+                    max_tokens: 1024,
+                    stream: true,
+                    system: UPSTREAM_SYSTEM,
+                    messages: [{ role: "user", content: "hello" }],
+                    ...(tools ? { tools } : {}),
+                }),
+            });
+            for await (const _ of resp.body ?? []) { /* drain */ }
+            assert.equal(resp.status, 200);
+        };
+        const forwarded = (index: number): string[] => {
+            const parsed = JSON.parse(h.captured[index]!.body) as { tools?: Array<Record<string, unknown>> };
+            return (parsed.tools ?? []).map((t) => String(t.name ?? ""));
+        };
+        const roleTool = [{ name: "read_file", description: "read a file", input_schema: { type: "object" } }];
+        const CORE = ["compress", "decompress", "acp_status"];
+
+        // A: deferred toolset + override -> wire injection, plugin identity and budget intact.
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-defer",
+            "x-bili-plugin-compression": "proxy",
+            "x-bili-plugin-context-window": "500000",
+        }, roleTool);
+        const a = forwarded(0);
+        for (const name of CORE) assert.ok(a.includes(name), `proxy must inject ${name}; got ${a.join(",")}`);
+        assert.ok(a.includes("read_file"), "the client's own tools survive");
+        const status = (await (await fetch(
+            `http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=sess-defer`,
+        )).json()) as { ok: boolean; contextLimit: number | null; pluginAgent: string | null; requests: number };
+        assert.equal(status.ok, true, "the hermes session id resolves — /acp works in fallback mode");
+        assert.equal(status.pluginAgent, "hermes");
+        assert.equal(status.contextLimit, 500000, "the plugin-reported window still sizes the budget");
+        assert.equal(status.requests, 1);
+
+        // B: partial snapshot (one ACP name present) — nothing is injected twice.
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-defer-partial",
+            "x-bili-plugin-compression": "proxy",
+        }, [{ name: "compress", description: "x", input_schema: { type: "object" } }]);
+        const b = forwarded(1);
+        assert.equal(b.filter((n) => n === "compress").length, 1, "compress not duplicated");
+        for (const name of ["decompress", "acp_status"]) assert.ok(b.includes(name), `${name} still injected`);
+
+        // C: no override header -> pure plugin lane, unchanged (no injection).
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-pure",
+        }, roleTool);
+        for (const name of CORE) assert.ok(!forwarded(2).includes(name), `pure plugin lane must not inject ${name}`);
+
+        // D: the override without the agent marker is inert — an anonymous proxy-mode request (which
+        // injects anyway) must not be bound to a plugin conversation by the header alone.
+        await post({
+            "x-bili-plugin-conversation": "sess-plain",
+            "x-bili-plugin-compression": "proxy",
+        }, roleTool);
+        const plain = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=sess-plain`);
+        assert.equal(plain.status, 404, "marker-less conversation id is never bound");
+    } finally {
+        await h.close();
+    }
+});
+
 test("headless launcher registrations expire after the TTL (no stale poisoning)", () => {
     _resetPluginStateForTest();
     const t0 = Date.now();

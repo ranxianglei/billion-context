@@ -3,8 +3,10 @@
 // time cutting in-flight upstream streams. Two mechanisms are pinned here:
 //   (1) a kill-0 death verdict now requires WATCHER_DEAD_CONFIRM_TICKS
 //       CONSECUTIVE failed probes (tickWatchedPid — pure, unit-tested below);
-//       one transient OpenProcess failure can no longer kill the proxy, while
-//       heartbeat expiry for a live pid stays immediate (#3544 unchanged);
+//       one transient OpenProcess failure can no longer kill the proxy;
+//       heartbeat expiry for a live pid got its own consecutive confirmation
+//       in #4994 (was immediate — behavior change, see
+//       tests/issue4994-watchdog-heartbeat-confirm.test.ts);
 //   (2) the shutdown backstop RE-ARMS its grace window while connections are
 //       still alive (bounded passes) instead of force-exiting at 10s and
 //       yanking in-flight streams (live child-process test — pre-fix behavior
@@ -23,55 +25,56 @@ import { tickWatchedPid } from "../src/server.ts";
 import type { PidProbe } from "../src/instance.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-const OPTS = { heartbeatGraceMs: 15_000, confirmTicks: 3 };
+const OPTS = { heartbeatGraceMs: 15_000, confirmTicks: 3, heartbeatConfirmTicks: 5 };
 const NOW = 1_000_000;
 const dead = (code = "ESRCH"): PidProbe => ({ alive: false, errCode: code });
 const aliveProbe: PidProbe = { alive: true };
 
 test("#3890 tickWatchedPid: one failed probe does NOT remove the pid", () => {
-    const d = tickWatchedPid(dead(), undefined, NOW, undefined, OPTS);
-    assert.deepEqual(d, { removed: false, staleHeartbeat: false, streak: 1 }, "a single flaky probe is not conclusive");
+    const d = tickWatchedPid(dead(), undefined, NOW, undefined, undefined, OPTS);
+    assert.deepEqual(d, { removed: false, staleHeartbeat: false, streak: 1, hbStreak: 0 }, "a single flaky probe is not conclusive");
 });
 
 test("#3890 tickWatchedPid: blip shorter than confirmTicks survives; a live probe resets the streak", () => {
-    let d = tickWatchedPid(dead(), undefined, NOW, undefined, OPTS);
+    let d = tickWatchedPid(dead(), undefined, NOW, undefined, undefined, OPTS);
     assert.equal(d.removed, false);
-    d = tickWatchedPid(dead(), undefined, NOW + 2_000, d.streak, OPTS);
+    d = tickWatchedPid(dead(), undefined, NOW + 2_000, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, false);
     assert.equal(d.streak, 2);
-    d = tickWatchedPid(aliveProbe, undefined, NOW + 4_000, d.streak, OPTS);
+    d = tickWatchedPid(aliveProbe, undefined, NOW + 4_000, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, false);
     assert.equal(d.streak, 0, "the live probe clears the pending death");
-    d = tickWatchedPid(dead(), undefined, NOW + 6_000, d.streak, OPTS);
+    d = tickWatchedPid(dead(), undefined, NOW + 6_000, d.streak, d.hbStreak, OPTS);
     assert.equal(d.streak, 1, "a later episode starts from zero again");
 });
 
 test("#3890 tickWatchedPid: confirmTicks consecutive failures remove the pid", () => {
-    let d = tickWatchedPid(dead(), undefined, NOW, undefined, OPTS);
-    d = tickWatchedPid(dead(), undefined, NOW + 2_000, d.streak, OPTS);
+    let d = tickWatchedPid(dead(), undefined, NOW, undefined, undefined, OPTS);
+    d = tickWatchedPid(dead(), undefined, NOW + 2_000, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, false, "two failures are not yet conclusive");
-    d = tickWatchedPid(dead(), undefined, NOW + 4_000, d.streak, OPTS);
+    d = tickWatchedPid(dead(), undefined, NOW + 4_000, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, true, "the third consecutive failure confirms death");
     assert.equal(d.staleHeartbeat, false);
 });
 
 test("#3890 tickWatchedPid: live pids keep legacy semantics (no heartbeat record ⇒ never removed)", () => {
-    assert.deepEqual(tickWatchedPid(aliveProbe, undefined, NOW, undefined, OPTS), { removed: false, staleHeartbeat: false, streak: 0 });
+    assert.deepEqual(tickWatchedPid(aliveProbe, undefined, NOW, undefined, undefined, OPTS), { removed: false, staleHeartbeat: false, streak: 0, hbStreak: 0 });
 });
 
-test("#3890 tickWatchedPid: heartbeat expiry stays immediate for a LIVE pid (#3544 unchanged)", () => {
-    assert.deepEqual(tickWatchedPid(aliveProbe, NOW - 1_000, NOW, undefined, OPTS), { removed: false, staleHeartbeat: false, streak: 0 }, "fresh beat keeps it");
-    const stale = tickWatchedPid(aliveProbe, NOW - 16_000, NOW, undefined, OPTS);
-    assert.equal(stale.removed, true, "missed beats beyond grace mark the slot dead immediately — no confirmation needed for a time-based liveness proof");
+test("#3890/#4994 tickWatchedPid: heartbeat expiry for a LIVE pid now requires confirmation (was immediate)", () => {
+    assert.deepEqual(tickWatchedPid(aliveProbe, NOW - 1_000, NOW, undefined, undefined, OPTS), { removed: false, staleHeartbeat: false, streak: 0, hbStreak: 0 }, "fresh beat keeps it");
+    const stale = tickWatchedPid(aliveProbe, NOW - 16_000, NOW, undefined, undefined, OPTS);
+    assert.equal(stale.removed, false, "#4994 behavior change: one stale reading no longer marks the slot dead immediately — a busy-but-alive parent must get a re-beat chance");
     assert.equal(stale.staleHeartbeat, true);
+    assert.equal(stale.hbStreak, 1);
 });
 
 test("#3890 tickWatchedPid: a DEAD pid never takes the heartbeat fast path", () => {
-    let d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, undefined, OPTS);
+    let d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, undefined, undefined, OPTS);
     assert.equal(d.removed, false, "stale lastSeen does not shortcut kill-0 confirmation");
-    d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, d.streak, OPTS);
+    d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, false);
-    d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, d.streak, OPTS);
+    d = tickWatchedPid(dead("ESRCH"), NOW - 60_000, NOW, d.streak, d.hbStreak, OPTS);
     assert.equal(d.removed, true);
     assert.equal(d.staleHeartbeat, false, "removal via kill-0 confirmation is never tagged stale-heartbeat");
 });

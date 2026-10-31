@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.207",
+  "version": "0.1.209",
   "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -30,9 +30,9 @@
     "pretest": "node scripts/test-suite-lock.mjs gate && node scripts/ci-pretest-cache.mjs",
     "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",
-    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
-    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
-    "test:e2e:image": "node --import tsx --test tests/e2e/e2e-image-billing.test.ts",
+    "test:e2e": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-codex.test.ts",
+    "test:e2e:fake": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-codex-fake.test.ts",
+    "test:e2e:image": "node --import ./tests/preload-test-env.mjs --import tsx --test tests/e2e/e2e-image-billing.test.ts",
     "gate:local": "node scripts/release-gate-local.mjs"
   },
   "keywords": [

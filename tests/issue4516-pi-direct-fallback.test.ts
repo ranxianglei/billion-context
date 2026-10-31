@@ -277,3 +277,56 @@ test("#4516 dead-proxy wording: after holding an origin, the refusal says it DIE
     assert.match(String((result.body.error as { message: string }).message), /died and no replacement came up/);
     assert.deepEqual(sink, [], "the direct fallback send is refused before touching the provider");
 });
+
+/** Models V8's real max-string-length limit: buffers whose decoded form
+ *  would exceed it throw RangeError; everything smaller decodes normally
+ *  (so the intercept's own small internal decodes keep working under the
+ *  patch — only the multi-MB request-body decode fails, like in production). */
+function oversizeThrowingTextDecoder(): void {
+    const Real = globalThis.TextDecoder;
+    const passthrough = new Real();
+    globalThis.TextDecoder = class {
+        constructor(_label?: string, _options?: unknown) {}
+        decode(buf?: Uint8Array | ArrayBuffer): string {
+            if (buf !== undefined && buf.byteLength > 1_000_000) {
+                throw new RangeError("Invalid string length");
+            }
+            return passthrough.decode(buf);
+        }
+    } as unknown as typeof TextDecoder;
+}
+
+test("#4912 undecodable typed-array body (decode throws RangeError) → clean local refusal, not an escaped RangeError", async () => {
+    const savedDecoder = globalThis.TextDecoder;
+    oversizeThrowingTextDecoder();
+    try {
+        const { sink, result } = await withFallback(async ({ fetch }) => {
+            const res = await fetch()(UPSTREAM, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-bili-plugin-context-window": "500" },
+                body: new TextEncoder().encode(chatBody(4_200_000)),
+            });
+            const body = await res.json() as Record<string, unknown>;
+            return { status: res.status, gate: res.headers.get("x-bili-gate"), body };
+        });
+        assert.equal(result.status, 422);
+        assert.equal(result.gate, "oversize-refusal-fallback");
+        assert.match(String((result.body.error as { message: string }).message), /did not come up/);
+        assert.deepEqual(sink, [], "the provider must never see an oversized direct send");
+    } finally {
+        globalThis.TextDecoder = savedDecoder;
+    }
+});
+
+test("#4912 decodable typed-array body keeps the media-aware math (no false refusal)", async () => {
+    const { sink, result } = await withFallback(async ({ fetch }) => {
+        const res = await fetch()(UPSTREAM, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-context-window": "500" },
+            body: new TextEncoder().encode(mediaBody(100, 4_200_000)),
+        });
+        return res.status;
+    });
+    assert.equal(result, 200);
+    assert.deepEqual(sink, [UPSTREAM], "typed-array bodies are priced exactly like string ones (media mass excluded)");
+});

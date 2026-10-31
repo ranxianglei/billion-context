@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -22,6 +22,7 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
+import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -31,12 +32,14 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
+import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
+import { FAVICON_ICO_BASE64 } from "../web/favicon.js";
 import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
@@ -258,17 +261,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
-    // #3536: browsers probing the proxy origin for a favicon (the dsh desktop
-    // settings panel frames /__bili/ and the frame fires GET /favicon.ico at
-    // the ORIGIN ROOT) must be answered locally with 204 — falling through to
-    // the relay would rewrite the host onto the configured upstream, burning a
-    // request there and logging a 403 for a static asset no model client ever
-    // asks for. The panel page itself also declares an empty icon (page.ts) so
-    // well-behaved browsers never send the probe at all; this is the backstop
-    // for browsers/timings that still do (probe before redirect, direct visits).
+    // #3536/#4830: browsers probing the proxy origin for a favicon (the dsh
+    // desktop settings panel frames /__bili/ and the frame fires GET
+    // /favicon.ico at the ORIGIN ROOT) must be answered locally — falling
+    // through to the relay rewrites the host onto the configured upstream,
+    // burning a request there and logging timeouts for a static asset no model
+    // client ever asks for. The panel page declares the bundled icon (page.ts)
+    // so well-behaved browsers fetch it once and cache it; this route is what
+    // serves those bytes (plus the backstop for probes that skip the page).
     if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
-        res.writeHead(204);
-        res.end();
+        res.writeHead(200, { "content-type": "image/x-icon", "cache-control": "no-cache" });
+        res.end(Buffer.from(FAVICON_ICO_BASE64, "base64"));
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
@@ -329,6 +332,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    // #4899: pricing editor data — resolved per-model prices (user overrides >
+    // models.dev snapshot) for the panel's billing settings card. Read-only.
+    if (req.method === "GET" && req.url === "/__bili/pricing") return handlePricingGet(res);
     // #3719: per-release notes for the panel's changelog section — same
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
@@ -338,6 +344,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // fail-soft, no config surface; same gating as every other /__bili/ GET above.
     if (req.method === "GET" && req.url === "/__bili/blog") {
         handleBlogGet(res);
+        // #4906: opportunistically pull newer master content in the background
+        // — fire-and-forget, single-flight + TTL-gated inside; this response
+        // still serves the bundled floor / last good overlay instantly.
+        kickBlogRefresh();
         return;
     }
     if (req.method === "GET" && req.url !== undefined && req.url.startsWith("/__bili/blog-assets/")) {
@@ -373,6 +383,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            // #5079: routing must hot-apply too — the web switch changes it live.
+            opts.promptCache = fresh.promptCache;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -387,6 +399,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     // #2861: silence a known host-side plugin notice for this environment.
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
+    // #5079: silence the prompt_cache.routing default-off upgrade notice.
+    if (req.method === "POST" && req.url === "/__bili/notices/dismiss") return handleNoticeDismiss(req, res, log);
     // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
     if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
@@ -552,6 +566,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             }
             const qVacuum = (() => { try { return new URL(req.url!, "http://localhost").searchParams.get("vacuum"); } catch { return null; } })();
             const vacuum = qVacuum === "full" || qVacuum === "incremental" ? qVacuum : parsed.vacuum === "full" ? "full" : parsed.vacuum === "incremental" ? "incremental" : undefined;
+            // #4612: full VACUUM refuses to start while another live process
+            // writes the same db (exclusive write lock across the whole
+            // O(db-size) rewrite) — same preflight as the CLI lane.
+            if (vacuum === "full") {
+                const writer = store.unifiedActiveWriter();
+                if (writer !== null) {
+                    res.writeHead(409, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: `another process (pid ${writer}) is actively writing index.db — full VACUUM holds the exclusive write lock across the whole rewrite; stop the other process first or use ?vacuum=incremental`, writerPid: writer }));
+                    return;
+                }
+            }
             const result = await store.unifiedGc({
                 archiveAfterDays: typeof parsed.archiveAfterDays === "number" && Number.isFinite(parsed.archiveAfterDays) && parsed.archiveAfterDays >= 0 ? parsed.archiveAfterDays : undefined,
                 vacuum,
@@ -965,6 +990,27 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
 
+// #5079: server-side dismissal of the pck default-off upgrade notice (body {"id": string}).
+async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let id = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { id?: unknown })["id"] === "string") id = (doc as { id: string })["id"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
+        return;
+    }
+    if (!dismissUpgradeNotice(id)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
+        return;
+    }
+    log("info", `[pck] notice ${id} dismissed via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
 // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
 async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
     let sessionId = "";
@@ -981,7 +1027,8 @@ async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: `no surfaced split-brain entry for session: ${sessionId}` }, null, 2));
         return;
     }
-    log("info", `[storage] split-brain notice for session ${sessionId.slice(0, 8)} acknowledged via web UI`);
+    // #4626: full id — .slice(0, 8) of "session-…" renders literally "session-"
+    log("info", `[storage] split-brain notice for session ${sessionId} acknowledged via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
@@ -1251,6 +1298,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
+        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

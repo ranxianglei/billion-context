@@ -309,7 +309,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"version": "test-1", "tools": {"anthropic": [
                 {"name": "compress", "description": "compress a range", "input_schema": {"type": "object"}},
                 {"name": "decompress", "description": "decompress a block", "input_schema": {"type": "object"}},
-                {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]}})
+                {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]},
+                # A proxy that supports the compression-channel override names its header here; an
+                # older proxy omits the map entry (empty string), and the plugin must stay legacy.
+                "headers": {"agent": "x-bili-plugin", "conversation": "x-bili-plugin-conversation",
+                            "compression": os.environ.get("BC_MANIFEST_COMPRESSION") or ""}})
         elif self.path.startswith("/__bili/plugin/status"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -752,6 +756,28 @@ elif SCENARIO.startswith("attach"):
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
         })
+elif SCENARIO == "defer-fallback":
+    # Hermes registers the ACP tools natively but its tool_search layer DEFERS the toolset, so the
+    # outgoing snapshot carries none of them — the session would otherwise ride anonymous proxy mode
+    # (pfa-* fork ids, default window, /acp dead). The proxy advertises the compression-channel
+    # override: identity + budget stay plugin-stamped, compression moves server-side.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    os.environ["BC_MANIFEST_COMPRESSION"] = "x-bili-plugin-compression"
+    mod.register(ctx)
+    mw = ctx.middlewares["llm_request"]
+    deferred = mw(request=mw_request("test-model", with_tools=False), session_id="sess-defer",
+                  model="test-model", provider="p", api_mode="chat")
+    partial = mw(request=mw_request("test-model", names=("compress",)), session_id="sess-defer",
+                 model="test-model", provider="p", api_mode="chat")
+    visible = mw(request=mw_request("test-model"), session_id="sess-defer",
+                 model="test-model", provider="p", api_mode="chat")
+    out.update({
+        "defer_none": deferred is None,
+        "defer_headers": deferred["request"]["extra_headers"] if isinstance(deferred, dict) else None,
+        "partial_headers": partial["request"]["extra_headers"] if isinstance(partial, dict) else None,
+        "visible_headers": visible["request"]["extra_headers"] if isinstance(visible, dict) else None,
+    })
 elif SCENARIO.startswith("cmd-acp"):
     # no-proxy leg: no sidecar installed -> register() stays inert, origin unset
     if SCENARIO != "cmd-acp-no-proxy":
@@ -1108,6 +1134,10 @@ interface DriverOut {
     stale_headers?: Record<string, string> | null;
     no_tools_none?: boolean;
     partial_tools_none?: boolean;
+    defer_none?: boolean;
+    defer_headers?: Record<string, string> | null;
+    partial_headers?: Record<string, string> | null;
+    visible_headers?: Record<string, string> | null;
     anthropic_headers?: Record<string, string> | null;
     register_elapsed?: number;
     state_after_register?: string;
@@ -1250,6 +1280,25 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
+    // though the plugin registered it. Once the proxy advertises the compression-channel override,
+    // the request keeps its plugin identity + budget and the proxy owns compression — the pure
+    // plugin lane (no override header) stays untouched.
+    test("deferred toolset: identity/budget stay plugin-stamped, compression falls back to the proxy", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("defer-fallback");
+        assert.ok(out, err);
+        assert.equal(out!.defer_none, false, "a deferred toolset must not drop the request into anonymous proxy mode");
+        assert.equal(out!.defer_headers!["x-bili-plugin"], "hermes");
+        assert.equal(out!.defer_headers!["x-bili-plugin-conversation"], "sess-defer");
+        assert.equal(out!.defer_headers!["x-bili-plugin-compression"], "proxy", "proxy owns compression for this request");
+        assert.equal(out!.partial_headers!["x-bili-plugin-compression"], "proxy", "a partial snapshot also runs proxy-side");
+        assert.equal(out!.visible_headers!["x-bili-plugin-compression"], undefined, "a visible toolset keeps the pure plugin lane");
     });
 
     // #3261: the host knows the model's window (HERMES_HOME/context_length_cache.yaml) but the

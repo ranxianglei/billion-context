@@ -67,6 +67,44 @@ locally-minted ids twice in production. Ingress deletes replayed `msg-proxy-*`
 ids (`src/loop/adapter-responses.ts:62-68`) precisely because they are
 per-round artifacts, not identities.
 
+## The msgid envelope: host-vouched ids ride the bili lane (#4491/#4834)
+
+The lane survey above answers a narrower question than it seems: it surveys
+the **model wire**. The plugin lanes added a second channel where message ids
+DO exist — a bili-private envelope, never forwarded to any model provider:
+
+- `msgIds` — a parallel string array beside `messages` on the incremental
+  turn envelope (`POST /__bili/plugin/turn`; built in
+  `src/agent/incremental-client.ts` `buildBody`). The server re-stamps it as
+  `biliMsgIds` on the assembled body it re-enters the pipeline with
+  (`src/incremental-lane.ts`), and `src/server/prepare-anthropic.ts` strips
+  the field and applies the pin (`src/msgid-pin.ts` `applyMsgIdPin`) before
+  the request leaves for upstream.
+- Semantics: the CLIENT vouches that these ids are stable for that host's
+  view of the conversation (dsh/omp/opencode/pi storage ids). Valid ids are
+  pinned onto the ledger rows as `msg_id` — the client's identity becomes
+  the ledger identity, replacing content-derived ids for those messages.
+- All-or-nothing: a length mismatch, a screen failure, or an
+  already-claimed id drops the WHOLE `msgIds` field (never a partial or
+  misaligned array); on the incremental lane that turn degrades to
+  content-derived identity. Reusing a live canonical id is a 400, not a
+  silent rebind. `resync: true` re-claims the full set wholesale.
+- #4834: resolution is id-FIRST — a cross-model rewrite that re-encodes
+  content (pi `transformMessages` family) no longer vetoes the id; the id
+  wins over content churn. The ledger primary key stays the three-part
+  `(session_id, msg_id, content_hash)` — the hash remains the safety belt
+  against wrong-binding, it just no longer outranks a valid client id.
+- #4863: id claims are taken only when a planned turn is actually
+  dispatched (claim-after-guard), so a turn rejected by the single-flight
+  guard no longer burns its ids.
+
+What this does NOT change: the model wire still carries no message-level
+ids. Tool-call ids stay what they always were — model-minted pairing keys
+the client echoes back, not identities (#2821 re-mints them on projection
+rebuild). Proxy-mode full resends still reconcile through the order-centric
+ladder below. The envelope only exists where a bili plugin lane is present
+and the host can vouch the full set.
+
 ## What "original bytes never change" actually means
 
 The claim is directionally right with one mandatory refinement: **bytes
@@ -369,8 +407,14 @@ byte-identical. Identity bookkeeping is never involved.
 
 ## Future direction
 
-If a future host or lane offers a genuinely stable client-side message id,
-it may be adopted **only as an additional join hint** — never as a replacement
+That question is now answered on the plugin lanes: hosts that can vouch a
+stable id DO ship it (#4491 msgid envelope, above), and where it is present
+it outranks order and hash as the ledger identity (#4834 id-first resolution)
+— with the content-hash remaining the three-part-key safety belt. Hosts that
+cannot vouch ids (and the model wire itself, which has none) keep the
+content-hash base. If a future host or lane offers a genuinely stable
+client-side message id, it may be adopted **only as an additional join hint**
+on the hash-based lanes — never as a replacement
 for the content-hash base of the LEDGER join. The OUTBOUND join is a
 different question and already has its answer: with `snapshotRender` on,
 the outbound prefix is keyed by server snapshot `seq` (#3756, above) and the

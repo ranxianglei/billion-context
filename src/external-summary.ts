@@ -16,6 +16,39 @@ export interface SummaryBudget {
     readonly maxSummaryBytes: number;
 }
 
+/** #4833: provenance of an abort raised by the executor itself. A candidate
+ *  receives ONLY the executor's per-attempt signal, so a bare `signal.aborted`
+ *  cannot tell "our per-target budget expired" from "the whole batch hit its
+ *  total deadline" from "the caller's request was torn down" — all three used
+ *  to surface as client-abort in the HTTP layer's warn line. The marker rides
+ *  `signal.reason` from the aborting controller down to the fetch site. */
+type SummaryAbortSource = "target-timeout" | "batch-deadline" | "cancelled";
+
+export class SummaryAbortError extends Error {
+    readonly source: SummaryAbortSource;
+    constructor(source: SummaryAbortSource) {
+        super(`external summary aborted (${source})`);
+        this.name = "SummaryAbortError";
+        this.source = source;
+    }
+}
+
+/** Read the executor's abort provenance off a signal. Undefined when the signal
+ *  was never aborted or was aborted without our marker (foreign signals keep
+ *  the legacy transport classification). */
+export function summaryAbortSource(signal: AbortSignal): SummaryAbortSource | undefined {
+    const reason: unknown = signal.reason;
+    return reason instanceof SummaryAbortError ? reason.source : undefined;
+}
+
+/** #4833: human-readable WHY for a timed-out attempt — the source, the budget
+ *  it hit, and how much wall-clock the range had burned. Pure numbers and fixed
+ *  words; never echoes payload. */
+function timeoutDetail(source: SummaryAbortSource, limits: SummaryBudget, elapsedMs: number): string {
+    const budgetMs = source === "target-timeout" ? limits.targetTimeoutMs : limits.totalTimeoutMs;
+    return `${source} ${budgetMs}ms (elapsed ${Math.round(elapsedMs)}ms)`;
+}
+
 /** [#2657] Per-batch pool-size request for the shared queue. The pool grows
  *  to the LARGEST request among in-flight work and returns to its base size
  *  once that work settles — one batch never permanently resizes the pool for
@@ -208,31 +241,38 @@ export class ExternalSummaryExecutor {
         }
         const targets = [...candidates];
         const request = Object.freeze({ ...work });
+        const startedAt = performance.now();
         const overall = new AbortController();
-        const cancel = () => overall.abort();
-        signal?.addEventListener("abort", cancel, { once: true });
-        if (signal?.aborted) cancel();
+        // #4833: every internal abort carries its provenance so the candidate's
+        // warn line names the real source instead of guessing client-abort.
+        const cancel = (source: Exclude<SummaryAbortSource, "target-timeout">): void => { if (!overall.signal.aborted) overall.abort(new SummaryAbortError(source)); };
+        const onCallerAbort = (): void => cancel("cancelled");
+        signal?.addEventListener("abort", onCallerAbort, { once: true });
+        if (signal?.aborted) cancel("cancelled");
         const deadline = Math.min(performance.now() + limits.totalTimeoutMs, sharedDeadline ?? Infinity);
-        const totalTimer = setTimeout(cancel, Math.max(0, deadline - performance.now()));
+        const totalTimer = setTimeout(() => cancel("batch-deadline"), Math.max(0, deadline - performance.now()));
         const stopped = (): ExternalSummaryResult => ({ status: signal?.aborted ? "cancelled" : "deadline", attempts });
         try {
             for (const [targetIndex, target] of targets.entries()) {
                 const release = await this.acquire(overall.signal);
-                if (performance.now() >= deadline) cancel();
+                if (performance.now() >= deadline) cancel("batch-deadline");
                 if (!release || overall.signal.aborted) {
                     release?.();
                     return stopped();
                 }
                 const attempt = new AbortController();
-                const abort = () => attempt.abort();
-                overall.signal.addEventListener("abort", abort, { once: true });
-                if (overall.signal.aborted) abort();
+                // Propagate the overall abort WITH its reason so the candidate
+                // sees which budget (or whose cancellation) killed this attempt.
+                const propagateOverall = (): void => { attempt.abort(overall.signal.reason); };
+                overall.signal.addEventListener("abort", propagateOverall, { once: true });
+                if (overall.signal.aborted) propagateOverall();
                 const targetDeadline = performance.now() + limits.targetTimeoutMs;
-                const timer = setTimeout(abort, limits.targetTimeoutMs);
+                const expireTarget = (): void => { attempt.abort(new SummaryAbortError("target-timeout")); };
+                const timer = setTimeout(expireTarget, limits.targetTimeoutMs);
                 // Retain the permit until the actual call settles, even if it ignores cancellation.
                 const operation: Promise<AttemptResult> = Promise.resolve().then(() => {
-                    if (performance.now() >= deadline) cancel();
-                    if (performance.now() >= targetDeadline) abort();
+                    if (performance.now() >= deadline) cancel("batch-deadline");
+                    if (performance.now() >= targetDeadline) expireTarget();
                     if (attempt.signal.aborted) throw new Error("Summary attempt cancelled before dispatch");
                     return target.summarize(request, attempt.signal);
                 }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), () => ({ kind: "error" })).finally(release);
@@ -241,16 +281,17 @@ export class ExternalSummaryExecutor {
                     result = await awaitAttempt(operation, attempt.signal);
                 } finally {
                     clearTimeout(timer);
-                    overall.signal.removeEventListener("abort", abort);
+                    overall.signal.removeEventListener("abort", propagateOverall);
                 }
-                if (performance.now() >= deadline) cancel();
+                if (performance.now() >= deadline) cancel("batch-deadline");
                 if (overall.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: signal?.aborted ? "cancelled" : "timeout" });
+                    if (signal?.aborted) attempts.push({ targetIndex, outcome: "cancelled", detail: "caller abort" });
+                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", limits, performance.now() - startedAt) });
                     return stopped();
                 }
-                if (performance.now() >= targetDeadline) abort();
+                if (performance.now() >= targetDeadline) expireTarget();
                 if (result.kind === "aborted" || attempt.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: "timeout" });
+                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", limits, performance.now() - startedAt) });
                 } else if (result.kind === "error") {
                     attempts.push({ targetIndex, outcome: "error" });
                 } else if (typeof result.value !== "string" || !result.value.trim()
@@ -266,7 +307,7 @@ export class ExternalSummaryExecutor {
             return { status: "failed", reason: "exhausted", attempts };
         } finally {
             clearTimeout(totalTimer);
-            signal?.removeEventListener("abort", cancel);
+            signal?.removeEventListener("abort", onCallerAbort);
         }
     }
 

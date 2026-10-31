@@ -83,6 +83,9 @@ interface Fixture {
     sessionId: string;
     openStore(): UnifiedStore;
     rawInsert(opts: { hash: string; bytes: string; retiredAt: number | null }): void;
+    rawInsertMedia(opts: { hash: string; bytes: string; retiredAt: number | null; mediaHash: string; mediaBytes: string }): void;
+    contentRefcount(hash: string): number;
+    mediaRows(seq: number): number;
     closeAll(): void;
 }
 
@@ -97,7 +100,7 @@ function openFixture(sessionId: string): Fixture {
 
     const handles: { close?: () => void }[] = [];
     const openedRaw = openSqliteDatabase(dbPath, "node:sqlite");
-    const raw = openedRaw.db as unknown as { prepare(sql: string): { run(...args: unknown[]): unknown }; close?(): void };
+    const raw = openedRaw.db as unknown as { prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): unknown }; close?(): void };
     handles.push(raw);
     return {
         dbPath,
@@ -110,6 +113,20 @@ function openFixture(sessionId: string): Fixture {
         rawInsert(opts) {
             raw.prepare("INSERT INTO content (hash, byte_len, algo, bytes, refcount) VALUES (?, ?, 'sha256', ?, 1)").run(opts.hash, Buffer.byteLength(opts.bytes), Buffer.from(opts.bytes));
             raw.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, 1, ?, NULL, 2, 'user', 'text', ?, ?, ?)").run(sessionId, X, opts.hash, "", opts.retiredAt);
+        },
+        rawInsertMedia(opts) {
+            raw.prepare("INSERT INTO content (hash, byte_len, algo, bytes, refcount) VALUES (?, ?, 'sha256', ?, 1)").run(opts.hash, Buffer.byteLength(opts.bytes), Buffer.from(opts.bytes));
+            raw.prepare("INSERT INTO content (hash, byte_len, algo, bytes, refcount) VALUES (?, ?, 'sha256', ?, 1)").run(opts.mediaHash, Buffer.byteLength(opts.mediaBytes), Buffer.from(opts.mediaBytes));
+            raw.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, 1, ?, NULL, 2, 'user', 'text', ?, ?, ?)").run(sessionId, X, opts.hash, "", opts.retiredAt);
+            raw.prepare("INSERT INTO message_media (session_id, seq, media_hash) VALUES (?, 1, ?)").run(sessionId, opts.mediaHash);
+        },
+        contentRefcount(hash) {
+            const row = raw.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as { refcount: number } | undefined;
+            return row?.refcount ?? 0;
+        },
+        mediaRows(seq) {
+            const row = raw.prepare("SELECT COUNT(*) AS n FROM message_media WHERE session_id = ? AND seq = ?").get(sessionId, seq) as { n: number };
+            return row.n;
         },
         closeAll() {
             for (const h of [...handles].reverse()) { try { h.close?.(); } catch { /* no-op */ } }
@@ -150,7 +167,11 @@ test("#4793: LIVE sibling holds the target bytes → retired before the adopting
 test("#4793: RETIRED duplicate holds the target bytes → constraint still spans it → dropped outright", () => {
     const fx = openFixture("u4793-dead");
     try {
-        fx.rawInsert({ hash: H2, bytes: G2, retiredAt: Date.now() });
+        // A media blob attached to the doomed sibling row: its mapping and
+        // its content refcount must go with it (#4800 delete-on-zero GC can
+        // only reclaim blobs whose accounting is exact).
+        const MEDIA = sha256Hex("sibling-media-bytes");
+        fx.rawInsertMedia({ hash: H2, bytes: G2, retiredAt: Date.now(), mediaHash: MEDIA, mediaBytes: "sibling-media-bytes" });
 
         const store = fx.openStore();
         const ok = store.ingestSession(fullInput(fx.sessionId, G2));
@@ -160,6 +181,15 @@ test("#4793: RETIRED duplicate holds the target bytes → constraint still spans
         assert.equal(rows.length, 1, "the retired byte-identical duplicate is dropped");
         assert.equal(rows[0].seq, 0);
         assert.equal(rows[0].contentHash, H2);
+
+        // Refcount accounting: the adopter row owns EXACTLY ONE ref on H2
+        // (its own); the deleted sibling's ref and its media mapping's ref
+        // were both released. Pre-fix both leaked permanently — the blob
+        // could never be GC'd (#4800).
+        assert.equal(fx.contentRefcount(H2), 1, "adopted blob: one ref for one live row, sibling's ref released");
+        assert.equal(fx.contentRefcount(sha256Hex(G1)), 0, "superseded G1 blob fully released");
+        assert.equal(fx.contentRefcount(MEDIA), 0, "sibling media mapping's blob released to zero and swept");
+        assert.equal(fx.mediaRows(1), 0, "the sibling's media mapping row is gone");
     } finally {
         fx.closeAll();
     }

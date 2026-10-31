@@ -11,16 +11,17 @@ import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
+import { stampBillingPrice } from "../billing.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
-import { externalSummaryEnabled } from "../external-summary-surface.js";
+import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
@@ -32,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -40,7 +41,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -52,7 +53,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -64,6 +65,7 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
@@ -71,6 +73,10 @@ import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type Cc
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
+
+// #5243: warn-once per model when the live codex model table is unavailable and
+// window sizing falls back to config.toml model_context_window.
+const codexConfigWindowWarned = new Set<string>();
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
@@ -819,12 +825,16 @@ async function handleRequest(
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
                 : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
+            if (!operatorWindowTuned && aligned.source === "codex-config-window" && !codexConfigWindowWarned.has(model)) {
+                codexConfigWindowWarned.add(model);
+                log("warn", `[codex] model=${model}: no live model table readable under ${process.env.CODEX_HOME || "~/.codex"} (model_catalog_json / models_cache.json missing or invalid) — aligning against config.toml model_context_window; copy your catalog into $CODEX_HOME/models_cache.json for exact sizing`);
+            }
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
-                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (client-window alignment for model=${model}; current client metadata preferred over bundled fallback) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
@@ -997,6 +1007,16 @@ async function handleRequest(
         // proxy-mode traffic never reaches it because the plugin header gate
         // fails first).
         const sideAgent = pluginRequestAgentHeader(req.headers);
+        // #5135: claude code session-title sidecar (proxy mode, header-less):
+        // fires ~1ms ahead of the first main turn under the SAME
+        // x-claude-code-session-id. Recognize it by shape so it neither claims
+        // the raw-key anchor in the #4774 order resolver (side requests resolve
+        // VERBATIM — #2156) nor touches kernel state downstream (#388
+        // passthrough). Evidence-per-client: gated on the claude-code
+        // conversation source — the exact population #4774 routes through the
+        // resolver — never opened globally.
+        const ccTitleSidecar = sideAgent !== "main" && claudeAnthropicPersonaOrderApplies(req.headers)
+            && isClaudeCodeTitleRequest(protocol, parsed);
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
             && (isSideRequest(parsed, sideAgent)
                 // #2503: dsh title sidecar — its output budget grew past the
@@ -1015,6 +1035,9 @@ async function handleRequest(
                  // incident topology.
                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
                      && isDshAutoReviewRequest(protocol, parsed))
+                 // #5135: the claude code title sidecar stays off the raw-key
+                 // anchor claim and off the kernel pipeline entirely.
+                 || ccTitleSidecar
                  || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
@@ -1043,7 +1066,11 @@ async function handleRequest(
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
-        const conversation = protocol === "google"
+        const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
+        const zcodeMemory = zcodeParentIdentity?.clientProvided
+            ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
+            : undefined;
+        const conversation = zcodeMemory !== undefined ? zcodeMemory : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
@@ -1085,15 +1112,45 @@ async function handleRequest(
                           // semantics): ride the verbatim id — never route
                           // empty-tag traffic through the order resolver
                           // (codex turn-1 shape keys by its session header).
-                          ? (anthropicIdentity?.value ?? anthropicSignal)
-                          : personaConversationOrder(
-                              anthropicIdentity?.value ?? anthropicSignal,
-                              (parsed as AnthropicRequestBody).messages,
-                              personaSystemText,
-                              pluginReportedModel(req.headers),
-                          ))
-                    : anthropicIdentity?.value ?? anthropicSignal)
-            : protocol === "openai"
+                           ? (anthropicIdentity?.value ?? anthropicSignal)
+                           : personaConversationOrder(
+                               anthropicIdentity?.value ?? anthropicSignal,
+                               (parsed as AnthropicRequestBody).messages,
+                               personaSystemText,
+                               pluginReportedModel(req.headers),
+                           ))
+                     : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
+                       && !sideRequestLike && personaSystemText !== ""
+                       // #4352: header-less claude code subagents (VS Code
+                       // build) ride the raw parent id; route them through the
+                       // continuity-aware order resolver so a history-disjoint
+                       // ride forks onto its own |sub:<fp> lane while a
+                       // continuing main conversation keeps the raw key on
+                       // order+content evidence (#2944).
+                       // #5095 D1-C: when the bili SubagentStart hook's token
+                       // rides the first user message, the resolver keys the
+                       // dispatch per-TOKEN — parallel same-type dispatches
+                       // stop merging on the persona fingerprint (token wins:
+                       // uniqueness by construction, no prompt-collision bet).
+                       // #5095 D1-B fallback: when NO valid token rides the
+                       // wire (un-upgraded installs, disabled hook, post-fold
+                       // head loss), fall back to the dispatch task prompt
+                       // (first user message fragment) as the per-run
+                       // discriminator so the fork key widens to
+                       // |sub:<fp>:<userFp> — a self-lane isolation strictly
+                       // better than the two-segment shared key; empty
+                       // fragment degrades to it. NO other call site passes
+                       // either.
+                       ? personaConversationOrder(
+                           anthropicIdentity?.value ?? anthropicSignal,
+                           (parsed as AnthropicRequestBody).messages,
+                           personaSystemText,
+                           pluginReportedModel(req.headers),
+                           claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
+                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
+                         )
+                       : anthropicIdentity?.value ?? anthropicSignal)
+             : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
@@ -1198,7 +1255,7 @@ async function handleRequest(
         // dsh-over-Responses (#2203/#2730); the explicit responses clause
         // below stays for the codex/claude instructions personas (codexTurn
         // keys verbatim and must not count).
-        const designNamespaced = personaForked
+        const designNamespaced = zcodeMemory !== undefined || personaForked
             || (protocol === "responses"
                 && codexTurn === undefined
                 && instructionsFingerprintApplies(req.headers)
@@ -1370,7 +1427,9 @@ async function handleRequest(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
+        // #4942: async seam — on network storage backends a memory miss must
+        // be able to reload from the DB instead of starting a fresh session.
+        const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
@@ -1414,7 +1473,7 @@ async function handleRequest(
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.
         session.meta.activePack = reqSurfacePack;
-        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, reqSurface?.promptSections);
+        if (externalSummaryEnabled(reqConfig)) session.meta.summaryInstructions = buildCompressSystemPrompt(reqPrompts, messageTimestampSections(reqSurface?.promptSections));
         else delete session.meta.summaryInstructions;
         // #1082: rebuild-cost signal for the session-file GC — token estimate
         // of the RAW wire payload (full history as received, pre-fold/injection).
@@ -1440,7 +1499,7 @@ async function handleRequest(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
-        } else if (clientProvided) {
+        } else if (clientProvided && zcodeMemory === undefined) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot
@@ -1473,7 +1532,7 @@ async function handleRequest(
         // inventory even when adoption is disabled (the #629 measurement).
         if (anonAffinity?.via === "new" && anonAffinity.lineage?.reason === "forked" && session.stats.requests === 0) {
             try {
-                maybeAdoptForkBlocks({
+                await maybeAdoptForkBlocks({
                     session,
                     parentId: anonAffinity.lineage.parents[0]!,
                     protocol,
@@ -1492,7 +1551,7 @@ async function handleRequest(
         // race-free. Fall back to the headless pending queue (codex spawn)
         // for the first request that creates a new session.
         let derivedParent: string | undefined;
-        if (!pluginAgent && !anonAffinity) {
+        if (!pluginAgent && !anonAffinity && zcodeMemory === undefined) {
             const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
             if (identityAgent) {
                 pluginAgent = identityAgent.agent;
@@ -1500,7 +1559,7 @@ async function handleRequest(
                 derivedParent = identityAgent.parentConversationId;
             }
         }
-        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined) {
+        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined && zcodeMemory === undefined) {
             // A codex subagent thread mints a fresh session too, but it must
             // not claim the ROOT conversation's pending register (the plugin
             // binding belongs to the root session, #317). Same for a split
@@ -1549,7 +1608,7 @@ async function handleRequest(
         // request is sent (#1214) — so consult it here too. Link-only: on
         // non-derived conversations parentConversationId is absent and this
         // is a no-op.
-        if (derivedParent === undefined && pluginAgent !== undefined && pluginConversation !== undefined && !anonAffinity) {
+        if (derivedParent === undefined && pluginAgent !== undefined && pluginConversation !== undefined && !anonAffinity && zcodeMemory === undefined) {
             const stamped = consumePluginRegisterFor(pluginConversation);
             if (stamped?.parentConversationId !== undefined) derivedParent = stamped.parentConversationId;
         }
@@ -1566,7 +1625,7 @@ async function handleRequest(
             // dsh review persona split onto a `|sub:<fp>` session) gets the
             // same discipline — the fork records under its suffixed id and
             // the raw key stays owned by the main session.
-            recordPluginSession((claudeSub !== undefined || personaForked) ? conversation : (pluginConversation ?? conversation), session.id);
+            recordPluginSession((claudeSub !== undefined || personaForked || zcodeMemory !== undefined) ? conversation : (pluginConversation ?? conversation), session.id);
         }
         // #1206: first request of this session — identify the client and scan
         // its plugin registry for a co-resident THIRD-PARTY compression plugin
@@ -1591,6 +1650,15 @@ async function handleRequest(
             } catch (err) {
                 log("warn", `[conflict] third-party plugin scan failed: ${String(err)} (#1206)`);
             }
+        }
+        if (zcodeMemory !== undefined && zcodeParentIdentity !== undefined && session.stats.requests === 0) {
+            const parentId = zcodeParentIdentity.value;
+            session.metadata.derivedFrom = parentId;
+            session.metadata.derivedFromSessionId = parentId;
+            markDirty(session);
+            persistLineageLinkNow(session);
+            const parent = peekSession(parentId) ?? getStore().loadSync(parentId, { protocol, upstreamOrigin });
+            if (parent) maybeAdoptDerivedFork({ session, parent, protocol, parsed, upstreamOrigin, enabled: opts.resumeInheritance !== false, log });
         }
         // #1486: resume-fork inheritance for identified clients. Clients such
         // as Claude Code fork a FRESH client-provided session id on --resume
@@ -1741,7 +1809,7 @@ async function handleRequest(
         // kernel would have fallen to a per-request content fingerprint) — this
         // lookup binding remains for clients that send a real conversation
         // header or session_id.
-        if (protocol === "responses" || protocol === "openai" || protocol === "anthropic") {
+        if (zcodeMemory === undefined && (protocol === "responses" || protocol === "openai" || protocol === "anthropic")) {
             const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
             if (typeof pck === "string" && pck.trim().length > 0) {
                 recordPluginSession(pck.trim(), session.id);
@@ -1788,7 +1856,18 @@ async function handleRequest(
                 log("info", `[${sessionId}] [pi-subagents] child "${subagentFallback.agent ?? "unknown"}" role allowlist lacks ACP context tools — serving proxy-style compression channel (#2268)`);
             }
         }
-        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present;
+        // #4855: a plugin whose host declines to put the ACP tools in the outgoing request (Hermes
+        // defers every plugin toolset behind tool_search) asks for the proxy channel explicitly.
+        // Same demotion as the two signals above — identity/budget stay plugin-bound, compression
+        // moves server-side — so a deferred toolset stops degenerating into anonymous proxy mode.
+        const compressionProxy = pluginCompressionProxyHeader(req.headers);
+        if (compressionProxy && session.metadata.compressionProxyNotified !== true) {
+            session.metadata.compressionProxyNotified = true;
+            markDirty(session);
+            log("info", `[${sessionId}] [plugin] "${pluginAgent}" asked for the proxy compression channel (native tools are not in this request) — identity and budget stay plugin-bound`);
+        }
+        // Memory workers retain the parent's host-side tool binding, not the internal child id.
+        const pluginMode = zcodeMemory === undefined && pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present && !compressionProxy;
         // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
         // channel that can round-trip the full original, so CCR arms only where
         // that channel exists and is resolvable: proxy mode always (the proxy
@@ -2063,7 +2142,10 @@ async function handleRequest(
         const dshReviewSidecar = requestAgent !== "main" && isDshAutoReviewRequest(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar;
+        // #5135: ccTitleSidecar joins the intent set so the title call rides
+        // the #388 passthrough (kernel state untouched) like every other
+        // recognized side request.
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || ccTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2087,7 +2169,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
@@ -2405,13 +2487,34 @@ async function handleRequest(
                     // model's models.dev price (absolute $/Mtok) so out-of-box
                     // reports read in real money instead of Anthropic-ratio
                     // guesses. Report-only — no trigger impact.
-                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) session.metadata.cachePriceProfile = cs.priceProfile;
-                    else {
-                        const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    // #4899 follow-up: the two sources carry DIFFERENT UNIT
+                    // SYSTEMS in one field — user-configured values are
+                    // dimensionless RATIOS (input ≡ 1), registry fallbacks are
+                    // absolute $/Mtok. The companion flag records which, so the
+                    // panel's dollar views can anchor ratios against the
+                    // session's stamped billing price (or stay tokens-only)
+                    // while every existing consumer keeps reading the profile
+                    // verbatim. The flag clears with the profile.
+                    const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) {
+                        session.metadata.cachePriceProfile = cs.priceProfile;
+                        session.metadata.cachePriceProfileAbs = false;
+                    } else {
                         const registryProfile = peekRegistryPriceProfile(requestModel, priceHost);
-                        if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
-                        else delete session.metadata.cachePriceProfile;
+                        if (registryProfile !== undefined) {
+                            session.metadata.cachePriceProfile = registryProfile;
+                            session.metadata.cachePriceProfileAbs = true;
+                        } else {
+                            delete session.metadata.cachePriceProfile;
+                            delete session.metadata.cachePriceProfileAbs;
+                        }
                     }
+                    // #4899: stamp the billing price for this request's model
+                    // (config `billing.prices` > models.dev) so the usage-report
+                    // settle path bills USD without re-resolving. Model-less
+                    // requests keep the previous stamp; a model with NO resolvable
+                    // price clears it (tokens-only display, never fake dollars).
+                    stampBillingPrice(session, requestModel, priceHost);
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW
@@ -2529,6 +2632,11 @@ async function handleRequest(
                 }
                 prepared = await runPrepare();
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
+                // #4528: prepare ran the per-turn O(messages) scan passes over
+                // the resent history; yield so UI/API requests queue-drained
+                // during it are served before the (possibly multi-round)
+                // compression pass starts.
+                await yieldToEventLoop();
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
@@ -2692,6 +2800,10 @@ async function handleRequest(
                         gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
+                // #4528: last local-processing yield before the upstream
+                // forward — anything that queued during the turn is served
+                // here rather than behind the response stream setup.
+                await yieldToEventLoop();
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
@@ -2790,6 +2902,12 @@ async function handleRequest(
             }
         } finally {
             releaseInFlight(session);
+            // #4788 D2: request-end boundary — nothing in this process holds
+            // session state anymore, so run the durable-revision-gated idle
+            // spill here (it self-verifies every invariant and skips silently
+            // when unsafe). Fire-and-forget on purpose: idle upkeep must never
+            // delay or perturb the response path.
+            void getStore().spillBetweenTurns(session).catch(() => { /* idle upkeep */ });
         }
     }
     if (!prepared && !forwarded) {

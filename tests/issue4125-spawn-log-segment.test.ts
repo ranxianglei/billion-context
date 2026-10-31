@@ -70,7 +70,7 @@ test("#4125 zero-output child with stale shared content: message says 0-bytes-si
         assert.ok(msg.includes("0 bytes since this spawn — EMPTY"), msg);
         assert.ok(!msg.includes(STALE_MARKER), "stale previous-spawn content must not be quoted as this failure's evidence");
         assert.ok(content.includes("=== bili spawn"), "the spawn header must mark this segment in the shared file");
-        assert.ok(content.includes(`childPid=${42481}`), "the header names the child for attribution");
+        assert.ok(content.includes(`port=${PORT}`), "the header names the port for attribution (childPid is unknown pre-spawn)");
         assert.ok(content.includes(STALE_MARKER), "previous content stays on disk (rotation policy unchanged) — only the QUOTING changed");
     }
 });

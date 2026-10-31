@@ -16,6 +16,7 @@ import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
 import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
+import { parseBillingSettings, setBillingOverrides } from "./billing.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -407,6 +408,19 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** #4313 (PR #5236): stamp each message with its immutable local
+     *  time-of-occurrence and render it in the <acp> tag (`time="..."`) —
+     *  DEFAULT OFF: off reproduces the pre-#4313 wire bytes exactly (no time
+     *  attribute, original prompt texts, no fingerprint span). On = tags carry
+     *  the stored stamp + timestamped prompt variants (kernel decides). The
+     *  env override BILI_MESSAGE_TIMESTAMPS wins over this file value (any
+     *  defined non-"0" value enables it). Resolved ONCE per proxy instance at
+     *  engine creation (#394 single-instance assumption — no per-session fork),
+     *  so enabling mid-run requires a restart; storage stamps are written
+     *  regardless of the flag, so enabling later renders full history times.
+     *  Global level only (provider/model overrides are ignored for display,
+     *  mirroring how the gate flows into one shared CompressionCore). */
+    messageTimestamps?: boolean;
      /** Force preflight summarization calls to use streaming (SSE) instead of
       *  the default non-stream call (#2133). The error-driven self-learn flag
       *  (`session.metadata.preflightStreamSummary`) fires on any 400 from a
@@ -586,7 +600,16 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-type PromptCacheRouting = "auto" | "enabled" | "disabled";
+/** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
+ *  (chat-wire conversation-id stamping, Responses-wire identity injection).
+ *  Keys the client/host sent are ALWAYS forwarded verbatim — this switch only
+ *  gates bili's own emission. `"disabled"` (default since #5079) never writes
+ *  one; many upstreams ignore or flat-out reject the field. `"auto"` is the
+ *  pre-#5079 behavior (stamp on the internal plugin lane; inject toward
+ *  api.openai.com on Responses); `"enabled"` injects/stamps wherever the code
+ *  supports it. The #2645 A/B probe-and-remember ablation still withholds the
+ *  key per origin+model once a real 400 proves rejection, in every mode. */
+export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -877,10 +900,14 @@ export type ProxyOptions = {
      *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
      *  or `maskHosts: false` (#897); credential masking stays on either way. */
     maskHosts?: boolean;
-    /** Split Claude Code subagent requests (parent+agent header pair) into
-     *  their own session id so they don't queue on the main session's lock
-     *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0 or
-     *  `subagentSplit: false` in the config file (env wins). */
+    /** Split Claude Code subagent requests into their own session id so they
+     *  don't queue on the main session's lock (#970, default on). Two
+     *  mechanisms, both gated by this switch: the agent-id header pair split,
+     *  and header-less claude code traffic (VS Code build subagents, #4352)
+     *  routed through the continuity-aware order resolver so a history-
+     *  disjoint ride forks onto its own |sub lane while continuing main
+     *  conversations keep the raw key. Opt out with env BILI_SUBAGENT_SPLIT=0
+     *  or `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
     /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
@@ -1460,6 +1487,16 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // override it (env wins for environment-specific overrides).
     const fileConfig = loadConfigFile();
 
+    // #4899: parse + publish the billing price overrides here so every reload
+    // path (startup, web Apply onChanged, /__bili/config reload) funnels
+    // through ONE setter — deep settle sites read the module table, no
+    // options plumbing. Invalid shape drops the whole block loudly (#155).
+    const billingSettings = parseBillingSettings(fileConfig.billing);
+    if (fileConfig.billing !== undefined && billingSettings === undefined) {
+        loggerLog("warn", '[acp-config] ignoring invalid "billing" block (expected { prices: { "<model>": { input, output?, cacheRead?, cacheWrite? } } } with $/Mtok numbers)');
+    }
+    setBillingOverrides(billingSettings?.prices);
+
     // #3651: BILI_ALLOW_DSH_COMPACTION no longer exists — surface a stale value
     // once instead of silently ignoring it (§7.3 honest output).
     if (env.BILI_ALLOW_DSH_COMPACTION !== undefined && !removedDshEnvWarned) {
@@ -1653,6 +1690,17 @@ export function resolveRecordedMitmDomains(passed: readonly string[] | undefined
         ...(fileConfig.mitm?.domains ?? []),
         ...splitCsv(effective),
     ]);
+}
+
+/** #4850: passthrough-axis twin of resolveRecordedMitmDomains (#3436
+ *  discipline) — an instance record carries the CONFIG-MERGED mode
+ *  (`passthrough: true` in the config file flips a spawned child even when
+ *  the launcher passed no --passthrough flag; an inherited ACP_PASSTHROUGH
+ *  reaches the child the same way), while launcher callers pass a raw boolean
+ *  flag (native lanes hardcode false). Attach-side shape checks must compare
+ *  against what a spawned child would RECORD, not the raw caller input. */
+export function resolveRecordedPassthrough(flag: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+    return flag || passthroughState(env).enabled;
 }
 
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries
@@ -1926,6 +1974,11 @@ type FileConfig = {
      *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
      *  including `enabled`. */
     rollout?: RolloutFileConfig;
+    /** Per-model billing prices for the web panel's spend/savings display
+     *  (#4899): `billing.prices["<model id>"] = {input, output?, cacheRead?,
+     *  cacheWrite?}` in $/Mtok. Overrides the models.dev registry snapshot;
+     *  resolved through the same name matching. */
+    billing?: Record<string, unknown>;
     /** Security posture block (#3373) — knobs that WIDEN a trust boundary
      *  live here so the exposure surface is auditable in one place.
      *  `adminRelay` (default false, fail-closed): allow an embedding host
@@ -2108,12 +2161,19 @@ type FileConfig = {
      *  `warmMax` caps how many most-recently-saved sessions boot hydrates
      *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
      *  over the budget is never warmed), `residentMaxBytes` the soft target for
-     *  estimated resident session bytes (active/in-flight state stays pinned). */
+     *  estimated resident session bytes (the process-wide POOL ceiling — evicts
+     *  whole cold sessions, active/in-flight state stays pinned), and
+     *  `hardMaxBytes` the per-SESSION hard cap (#4788 D1-A): when ONE session's
+     *  estimated resident weight exceeds it, the next request-end boundary
+     *  force-drops its droppable fields back to disk — including sessions exempt
+     *  from pool eviction. Surviving bytes re-materialize via narrow disk reads.
+     *  Default: same value as `residentMaxBytes` above. */
     sessions?: {
         max?: number;
         warmMax?: number;
         warmMaxBytes?: number;
         residentMaxBytes?: number;
+        hardMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
@@ -2228,6 +2288,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     "pi", "storage", "security",
+    // #4899: per-model billing prices (web panel pricing editor).
+    "billing",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
@@ -2246,7 +2308,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
@@ -2594,6 +2656,21 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     return undefined;
 }
 
+/** #4313 (PR #5236): global message-timestamp display gate.
+ *  BILI_MESSAGE_TIMESTAMPS follows BILI_RESIGN semantics — defined and not
+ *  "0" enables; any other value disables even against an explicit file true;
+ *  unset ⇒ file `compress.messageTimestamps === true`; default FALSE
+ *  (pre-#4313 wire bytes). GLOBAL level only: provider/model settings are
+ *  ignored because the gate flows into one shared CompressionCore + prompt
+ *  exits resolved at engine creation (#394 single-instance assumption).
+ *  Storage-layer stamping (v10 ts column, ledger rows) runs regardless of
+ *  this flag, so enabling later renders full history times. */
+export function resolveMessageTimestamps(fileCompress?: CompressSettings, env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_MESSAGE_TIMESTAMPS;
+    if (raw !== undefined) return raw !== "0";
+    return fileCompress?.messageTimestamps === true;
+}
+
 /** #1660: explicit override of the zcode lane's port (env only — the store
  *  is re-derived at every bootstrap, nothing is baked at install time).
  *  Defined means a strict-port launch; undefined means the lane's sticky
@@ -2876,7 +2953,16 @@ function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
-    return value === "enabled" || value === "disabled" ? value : "auto";
+    // #5079: absent/unknown falls back to "disabled" (was "auto") — self-stamping is opt-in now;
+    // explicit "auto" keeps its pre-#5079 meaning so existing configs migrate unchanged.
+    return value === "auto" || value === "enabled" || value === "disabled" ? value : "disabled";
+}
+
+export function effectivePromptCacheRouting(promptCache: { routing?: string } | undefined): PromptCacheRouting {
+    // Partial ServerOptions (hand-built test harnesses, sub-lane constructions) may omit the
+    // promptCache section entirely — fall back exactly like parsePromptCacheRouting(undefined);
+    // never crash on a missing section mid-request or at startup.
+    return parsePromptCacheRouting(promptCache?.routing);
 }
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
@@ -2999,6 +3085,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("messageTimestamps" in obj) {
+        if (typeof obj.messageTimestamps !== "boolean") ok = false;
+        else out.messageTimestamps = obj.messageTimestamps;
     }
     if ("streamSummary" in obj) {
         if (typeof obj.streamSummary !== "boolean") ok = false;
