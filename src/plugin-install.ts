@@ -946,7 +946,7 @@ function claudeInstall(): string {
     } catch (err) {
         throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate`;
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate. Note: routing claude through bili sets a custom ANTHROPIC_BASE_URL, which disables account-bound features (e.g. Remote Control /remote-control) while the proxy routes traffic — run plain claude without bili for sessions that need them (#4693)`;
 }
 
 function claudeRemove(): string {
