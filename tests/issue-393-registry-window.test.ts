@@ -226,7 +226,7 @@ test("#393: wire mode (no x-bili-plugin) also records effectiveContextLimit", as
 
 // --- Fix 6 (integration): /models is a known discovery path ---
 
-test("#393: GET /models does not log an unrecognized-path warn (control: unknown path does)", async () => {
+test("#393: GET /models does not log an unrecognized-path warn (control: unknown path is refused locally, #5211)", async () => {
     const rig = await startRig(500, true); // log on so the warn path is observable
     const captured: string[] = [];
     setLogCapture((level, msg) => { captured.push(`${level}:${msg}`); });
@@ -235,9 +235,13 @@ test("#393: GET /models does not log an unrecognized-path warn (control: unknown
         await r1.text();
         assert.equal(captured.filter((l) => l.includes("unrecognized path")).length, 0, "/models is a known discovery path");
 
+        // #5211: an origin-form path that is neither model-shaped nor declared is
+        // refused LOCAL instead of spliced onto the configured upstream — the
+        // payload never leaves the machine, and the refusal is rate-limited logged.
         const r2 = await fetch(`http://127.0.0.1:${rig.proxyPort}/totally-unknown-xyz`, { method: "GET" });
         await r2.text();
-        assert.ok(captured.some((l) => l.includes("unrecognized path") && l.includes("totally-unknown-xyz")), "unknown path still warns (control)");
+        assert.equal(r2.status, 404, "unknown origin-form path is refused locally (#5211)");
+        assert.ok(captured.some((l) => l.includes("refused foreign path") && l.includes("totally-unknown-xyz")), "refusal is rate-limited logged (control)");
     } finally {
         setLogCapture(null);
         await closeRig(rig);
