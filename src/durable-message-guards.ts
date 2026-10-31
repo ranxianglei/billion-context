@@ -80,6 +80,45 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh workspace-instructions REVISION identity: the reconciliation shapes of
+ *  the #2447 carrier — @deepseek-ai/dsh-agent-instructions' changedSectionText
+ *  emits one message per changed file, framed by the same
+ *  \x3csystem-reminder\x3e wrapper but with a lowercase marker (or a different
+ *  verb) than the baseline's `Instructions from:`:
+ *    `Updated instructions from: <path>`      — file content edited
+ *    `Additional instructions from: <path>`   — a file discovered LATER (its
+ *                                               content was never in the
+ *                                               baseline at all)
+ *    `Instructions removed: <path>`           — the file no longer applies
+ *  These are NOT ordinary consumable history, which is what the earlier
+ *  case-sensitive match assumed. baselineIdentity excludes file CONTENT
+ *  (lib/index.js:39: projectRoot + discovery/budget config only), so a
+ *  mid-session edit never re-emits a baseline — the revision is the ONLY
+ *  carrier of the change. Folding it leaves the pinned, superseded baseline in
+ *  context and drops the correction: the model keeps obeying rules the user
+ *  already rewrote, and cannot tell it lost the update. That is strictly worse
+ *  than folding both (then the model at least knows it has no rules).
+ *
+ *  IDENTITY IS PER PATH, deliberately not one shared `durable/agents-md`
+ *  bucket: the default policy is latest-per-identity (protectedLatestTools),
+ *  so a shared bucket would let the newest revision DEMOTE the baseline — and
+ *  a baseline merges EVERY discovered file into one message, while a revision
+ *  carries only its own file. On a multi-file session that trade loses rules:
+ *  measured on a real base+d1 pair, the baseline carried 2 files (global +
+ *  project root) and the `Additional` revision carried 1, so a shared bucket
+ *  would have gone from "keep 2, lose 1" to "keep 1, lose 2". Per-path
+ *  identities keep each file's newest version and bound the pinned set to
+ *  "one baseline + one revision per touched file".
+ *
+ *  `durable/*` still matches the suffixed path: matchToolPath compares only
+ *  the first segment for a `<prefix>/*` pattern. #2766 role gate as above. */
+function agentsMdRevisionPath(text: string): string | undefined {
+    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/i.exec(text);
+    if (m === null) return undefined;
+    const path = m[1]!.trim();
+    return path.length > 0 ? `durable/agents-md-update/${path}` : undefined;
+}
+
 /** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
  *  message injected by @deepseek-ai/dsh-agent-instructions — global
  *  (~/.dsh/AGENTS.md) and project instructions merged into ONE user-role
@@ -89,16 +128,21 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
  *  before any web access" forever. Marker-over-wrapper rationale as #2419.
- *  The match is case-sensitive on purpose — reconciliation change messages
- *  use lowercase variants ("Updated instructions from:") that remain ordinary
- *  consumable history. At most ~one such baseline lives per session
- *  (replacements are rare identity changes), so pinning every match is
- *  bounded. #2766: assistant-role messages are never carriers (see
- *  dshSkillCatalogPath). */
+ *  At most ~one such baseline lives per session (replacements are rare
+ *  identity changes), so pinning every match is bounded. #2766: assistant-role
+ *  messages are never carriers (see dshSkillCatalogPath).
+ *
+ *  THE SAME CARRIER HAS A SECOND SHAPE — its REVISIONS (see
+ *  agentsMdRevisionPath above): the baseline projects to `durable/agents-md`,
+ *  each mid-session revision to its own per-path identity. The baseline marker
+ *  stays case-sensitive for a different reason than before: the revision
+ *  shapes are classified FIRST, because a revision body can itself contain the
+ *  uppercase label (a user documenting bili's matching string puts
+ *  `Instructions from:` inside their own AGENTS.md) and would otherwise be
+ *  mistaken for a baseline. */
 export function dshWorkspaceInstructionsPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Instructions from:")
-        ? "durable/agents-md"
-        : undefined;
+    if (msg.role === "assistant" || msg.contentType !== "text" || typeof msg.text !== "string") return undefined;
+    return agentsMdRevisionPath(msg.text) ?? (msg.text.includes("Instructions from:") ? "durable/agents-md" : undefined);
 }
 
 /** dsh mcp-catalog identity (#2446): the durable MCP-server catalog injected
