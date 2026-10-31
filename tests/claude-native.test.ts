@@ -29,6 +29,7 @@ import {
     resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
+import { UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
 import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveZonePortBase } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
@@ -95,6 +96,32 @@ test("applyClaudeManagedBlock: never clobbers foreign keys", () => {
     assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, "0");
     assert.equal((data.other as boolean), true);
     assert.ok(notes.some((n) => n.includes("foreign value") || n.includes("left untouched")));
+});
+
+test("applyClaudeManagedBlock: leaves DISABLE_AUTO_COMPACT untouched when ANTHROPIC_BASE_URL is foreign (#5369)", () => {
+    // When ANTHROPIC_BASE_URL is a foreign relay, bili proxy is bypassed; setting DISABLE_AUTO_COMPACT=1
+    // would disable Claude's auto-compact while bili is not in the loop, creating a deadlock.
+    const settings = { env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3425" } };
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_BASE_URL, "http://127.0.0.1:3425");
+    assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, undefined);
+    assert.ok(notes.some((n) => n.includes("DISABLE_AUTO_COMPACT left untouched")));
+});
+
+test("applyClaudeManagedBlock: pins ANTHROPIC_BASE_URL when BILI_CLAUDE_UPSTREAM matches foreign relay (#5369)", () => {
+    const prev = process.env.BILI_CLAUDE_UPSTREAM;
+    process.env.BILI_CLAUDE_UPSTREAM = "http://127.0.0.1:3425";
+    try {
+        const settings = { env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3425" } };
+        const wrapped = baseUrlForPort(48787).replace(/\/+$/, "") + "/bili/http://127.0.0.1:3425";
+        const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: wrapped, hookCommand: HOOK_COMMAND });
+        assert.equal((data.env as Record<string, string>).ANTHROPIC_BASE_URL, wrapped);
+        assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, "1");
+        assert.ok(notes.some((n) => n.includes("env.ANTHROPIC_BASE_URL pinned")));
+    } finally {
+        if (prev === undefined) delete process.env.BILI_CLAUDE_UPSTREAM;
+        else process.env.BILI_CLAUDE_UPSTREAM = prev;
+    }
 });
 
 test("applyClaudeManagedBlock: pins the Vertex variable too when one is resolved", () => {
@@ -303,8 +330,23 @@ test("claudeNativeBaseUrlForOrigin: wraps an arbitrary origin; explicit upstream
 test("unwrapBiliBaseUrl: strips any loopback-port wrapper; foreign values untouched (#1660)", () => {
     assert.equal(unwrapBiliBaseUrl("http://127.0.0.1:48787/bili/https://api.anthropic.com"), "https://api.anthropic.com");
     assert.equal(unwrapBiliBaseUrl("http://127.0.0.1:18788/bili/https://relay.example"), "https://relay.example");
+    assert.equal(unwrapBiliBaseUrl("http://localhost:8787/bili/http://127.0.0.1:3425"), "http://127.0.0.1:3425");
+    assert.equal(unwrapBiliBaseUrl("http://[::1]:8787/bili/http://127.0.0.1:3425"), "http://127.0.0.1:3425");
     assert.equal(unwrapBiliBaseUrl("https://api.anthropic.com"), undefined);
     assert.equal(unwrapBiliBaseUrl("http://127.0.0.1:8787/v1"), undefined);
+});
+
+test("isBiliClaudeBaseUrl: accepts 127.0.0.1, localhost, and [::1] loopback origins (#5369)", () => {
+    assert.equal(isBiliClaudeBaseUrl("http://127.0.0.1:8787/bili/https://api.anthropic.com"), true);
+    assert.equal(isBiliClaudeBaseUrl("http://localhost:8787/bili/http://127.0.0.1:3425"), true);
+    assert.equal(isBiliClaudeBaseUrl("http://[::1]:8787/bili/http://127.0.0.1:3425"), true);
+    assert.equal(isBiliClaudeBaseUrl("https://localhost:8787/bili/anthropic/https://api.anthropic.com"), true);
+    assert.equal(isBiliClaudeBaseUrl("http://127.0.0.1:3425"), false);
+    assert.equal(isBiliClaudeBaseUrl("https://relay.example.com"), false);
+});
+
+test("UPSTREAM_HOP_HEADERS includes expect to prevent undici UND_ERR_NOT_SUPPORTED (#5369)", () => {
+    assert.ok(UPSTREAM_HOP_HEADERS.has("expect"));
 });
 
 test("resolveClaudeNativePort: env only, undefined without an explicit override (#1660)", () => {

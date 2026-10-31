@@ -29,6 +29,9 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "te",
     "trailer",
     "upgrade",
+    // RFC 7231 §5.1.1: expect is hop-by-hop; undici fetch rejects it with
+    // UND_ERR_NOT_SUPPORTED ("expect header not supported") when forwarded
+    "expect",
 ]);
 
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two

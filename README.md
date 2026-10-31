@@ -430,9 +430,14 @@ declare their context windows under the providers key
 fallback window (route-miss warning, #2317); ③ if the relay rejects bili's
 Anthropic-lane `cache_control` stamps, set `compat.noCacheControl`; ④ loopback
 gateways work out of the box; a gateway on a private non-loopback address may
-additionally need `network.allowPrivateHttpProviders` (#2984). Verified
-end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages,
-including cross-protocol conversion), #4433.
+additionally need `network.allowPrivateHttpProviders` (#2984); ⑤ for Claude Code
+native plugin mode (`bili plugin install claude`), set
+`BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425` before install so the managed block
+wraps the relay into `ANTHROPIC_BASE_URL` (or configure
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425` directly;
+`localhost` and `127.0.0.1` both accepted, #5369). Verified end-to-end over all
+three wires (OpenAI Chat / Responses / Anthropic Messages, including
+cross-protocol conversion), #4433.
 
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
