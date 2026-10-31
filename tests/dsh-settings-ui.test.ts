@@ -648,16 +648,20 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.equal(viewSlot.id, "bili-context");
     assert.equal(viewSlot.order, 30);
     assert.equal(viewSlot.locale, "bili");
-    assert.equal(typeof viewSlot.label, "function");
-    assert.equal((viewSlot.label as () => string)(), "上下文");
+    // #5274: the host measures tab width by iterating the label's glyphs, so a
+    // slot label must be a resolved STRING — a function throws "label is not
+    // iterable" and blanks the whole conversation.session.header subtree.
+    assert.equal(typeof viewSlot.label, "string", "#5274: conversation.view label must be a string, not a function");
+    assert.equal(viewSlot.label, "上下文");
     assert.ok(m.dicts["bili"] !== undefined);
     const settings = m.optionsBySlot.get("settings.section")!;
     assert.equal(settings.name, "settings.section");
     assert.equal(settings.id, "bili");
     assert.equal(settings.order, 100);
     assert.equal(settings.locale, "bili");
-    assert.equal(typeof settings.label, "function");
-    assert.equal((settings.label as () => string)(), "bili设置");
+    // #5274: same host contract as conversation.view above — string, not function.
+    assert.equal(typeof settings.label, "string", "#5274: settings.section label must be a string, not a function");
+    assert.equal(settings.label, "bili设置");
     const bundle = m.optionsBySlot.get("plugins.bundle.config")!;
     assert.equal(bundle.name, "plugins.bundle.config");
     assert.equal(bundle.key, "billion-context");
@@ -764,6 +768,41 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         collectText(dtree, dt);
         assert.ok(dt.some((x) => x.includes("/acp")), `${slot}: degraded hint points at /acp: ${JSON.stringify(dt)}`);
         dm.runCleanups();
+    }
+});
+
+// #5274 regression pin: the dsh host reads every slot `label` synchronously and
+// iterates its glyphs to size the tab (labelNeedsTooltip), so a function label
+// throws "label is not iterable" and the slot error boundary blanks the entire
+// conversation.session.header subtree (tab strip + title row + overflow menu +
+// sidebar button). This sweeps EVERY list-style slot bili registers and asserts
+// its label is a resolved non-empty string — the class-wide invariant, not just
+// the one slot the bug report named.
+test("#5274: every registered slot label is a string, never a function (host iterates its glyphs)", async () => {
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+        },
+        setTimeout,
+        clearTimeout,
+    });
+    try {
+        // plugins.bundle.config is keyed (no label); the other three are list-style and carry one.
+        for (const name of ["settings.section", "conversation.view", "shell.overlay"]) {
+            const opts = m.optionsBySlot.get(name);
+            assert.ok(opts !== undefined, `${name} must be registered`);
+            const label = opts!.label;
+            assert.equal(typeof label, "string", `${name}: label must be a resolved string, not a function`);
+            assert.ok(typeof label === "string" && label.length > 0, `${name}: label must be non-empty`);
+        }
+        // Exact zh values (stub locale bind resolves zh): no contextTabLabel override here.
+        assert.equal(m.optionsBySlot.get("conversation.view")!.label, "上下文");
+        assert.equal(m.optionsBySlot.get("shell.overlay")!.label, "bili 上游状态");
+    } finally {
+        m.runCleanups();
     }
 });
 
@@ -2010,15 +2049,17 @@ test("#4237: contextTabLabel overrides the built-in tab name; blank or non-strin
         setTimeout,
         clearTimeout,
     });
+    // #5274: labels are resolved strings at registration, so these read directly
+    // instead of invoking a function (the host iterates the string's glyphs).
     const named = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "压缩账本" } });
     const viewSlot = named.optionsBySlot.get("conversation.view")!;
-    assert.equal((viewSlot.label as () => string)(), "压缩账本");
+    assert.equal(viewSlot.label, "压缩账本");
     named.runCleanups();
     const blank = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "   " } });
-    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    assert.equal(blank.optionsBySlot.get("conversation.view")!.label, "上下文");
     blank.runCleanups();
     const junk = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: 42 } });
-    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    assert.equal(junk.optionsBySlot.get("conversation.view")!.label, "上下文");
     junk.runCleanups();
 });
 
