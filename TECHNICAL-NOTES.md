@@ -90,7 +90,12 @@ recorded with a `conversationId`, keyed by the same conversation signal the
 session binds on (client conversation header, custom session header, or the
 body's `prompt_cache_key`) — model must match either way (#1531: omp stamps
 `prompt_cache_key` but no plugin header, and main/subagent sessions share
-the agent name while running different models). A reported `maxOutput` only
+the agent name while running different models). A client-minted **child**
+conversation id — `<parent>:side:<id>`, `<parent>:side:conversation:<key>`,
+`<parent>:sub:<id>`, minted by omp for ephemeral turns and subagents — has no
+entry of its own (clients register under the parent uuid), so it resolves to
+the nearest ancestor that reported one, bounded to 4 strips, with the model
+check applied at the level that answers. A reported `maxOutput` only
 stands in when the request body carries no output budget of its own.
 Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/opencode-native.ts` (v1), `src/agent/opencode-v2.ts`,
