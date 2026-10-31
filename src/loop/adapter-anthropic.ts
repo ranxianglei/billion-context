@@ -10,6 +10,7 @@ import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js"
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
+    ParseStreamOpts,
     ParsedStreamEvent,
     ToolCallEmit,
 } from "./core.js";
@@ -168,6 +169,17 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
+// #4679: reconstruct one thinking_delta frame from buffered payload text — used
+// to flush a round>=2 withheld block to the wire in full once its signature
+// lands (the client concatenates deltas, so one frame per block is byte-equivalent).
+function buildThinkingDeltaEvent(index: number, thinking: string): Buffer {
+    return Buffer.from(
+        `event: content_block_delta\n` +
+        `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } })}\n\n`,
+        "utf8",
+    );
+}
+
 export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, clientCacheControls?: Map<string, unknown>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
@@ -318,7 +330,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             return { ...body, system: stamped, messages: withNotes };
         },
 
-        async *parseStream(upstream, round) {
+        async *parseStream(upstream, round, opts?: ParseStreamOpts) {
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
@@ -335,6 +347,22 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let usageYielded = false;
             const indexMap = new Map<number, number>();
             const thinkingIndexes = new Set<number>();
+            // #4679: round>=2 thinking blocks held OFF the client wire until their
+            // signature arrives. `withheldBlocks` marks which upstream indices are in
+            // full-hold (vs #2501's start-only hold); `heldThinkingDeltas` buffers each
+            // one's payload text so it can be flushed together with its signature. A
+            // pre-signature cut then leaves ZERO client state, so the #413 blind
+            // re-fetch heals bili's own re-request round instead of stranding the
+            // client with an unsigned block + terminal error. Fresh per parseStream
+            // call, so a re-fetch starts clean of the dead attempt's buffers.
+            const withheldBlocks = new Set<number>();
+            const heldThinkingDeltas = new Map<number, string>();
+            // Self-arm: once this stream has actually signed a block, hold any LATER
+            // block too — belt-and-suspenders on top of the loop's history/turn evidence.
+            // Re-evaluated per block (a closure, not a captured const) so a signature
+            // seen mid-stream arms the hold for the next block in the same response.
+            let signsSeenInStream = false;
+            const shouldWithholdBlock = (): boolean => round > 1 && (opts?.upstreamSignsThinking === true || signsSeenInStream);
             // #1960: a redacted_thinking block arrives whole in content_block_start
             // (no deltas) — capture its opaque payload so the rebuilt tail replays it
             // byte-exact in position.
@@ -501,6 +529,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         thinkingIndexes.add(upstreamIndex);
                         sawThinking = true;
                         heldThinkingStarts.set(upstreamIndex, eventStr);
+                        // #4679: on an evidenced signing upstream in round > 1, hold the
+                        // WHOLE block (start + payload) off the wire until its signature
+                        // arrives — not just the start (#2501). A cut before the signature
+                        // then leaves zero client state so the #413 blind re-fetch can heal
+                        // bili's own re-request round. No evidence → #2501 behavior intact.
+                        if (shouldWithholdBlock()) {
+                            withheldBlocks.add(upstreamIndex);
+                        }
                     } else {
                         if (block.type === "redacted_thinking") {
                             thinkingIndexes.add(upstreamIndex);
@@ -530,7 +566,16 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
                         }
                     } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-                        if (delta.thinking.length > 0) {
+                        if (withheldBlocks.has(upstreamIndex) && delta.thinking.length > 0) {
+                            // #4679: buffering mode — accumulate OFF the wire, accounting-only.
+                            // The loop records the text for the re-request rebuild (unsigned
+                            // reasoning is dropped there anyway); nothing reaches the client yet.
+                            // No filtering either (#1960): buffered bytes must stay verbatim so
+                            // the later flush matches the signature byte-for-byte.
+                            const buf = heldThinkingDeltas.get(upstreamIndex) ?? "";
+                            heldThinkingDeltas.set(upstreamIndex, buf + delta.thinking);
+                            yield { kind: "reasoning", delta: delta.thinking, withheld: true } as ParsedStreamEvent;
+                        } else if (delta.thinking.length > 0) {
                             // #1960: thinking is a SIGNED payload — Anthropic verifies it
                             // byte-for-byte when the latest assistant message is replayed
                             // ("thinking blocks ... cannot be modified"), and Gemini's
@@ -565,19 +610,48 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             }
                         }
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
-                        // #2501: a signature is payload-bearing — release the held start
-                        // first (Opus 5.5 sends ONLY this between start and stop).
-                        const startBuf = releaseHeldThinking(upstreamIndex);
-                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        if (startBuf) {
-                            yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                        if (withheldBlocks.has(upstreamIndex)) {
+                            // #4679: the signature landed — flush the whole withheld block
+                            // to the wire in one go (start + buffered payload + signature) so
+                            // the client receives one complete SIGNED block. The payload text
+                            // was already accounted during streaming (withheld events); only
+                            // the signature rides the accounting channel now (no raw, empty
+                            // delta → the loop forwards nothing for it; the meta frames below
+                            // ARE the wire bytes). All bytes are local (already received), so
+                            // no network cut can land mid-flush.
+                            const startBuf = releaseHeldThinking(upstreamIndex);
+                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                            lastThinkingIndex = ci;
+                            withheldBlocks.delete(upstreamIndex);
+                            signsSeenInStream = true;
+                            if (startBuf) {
+                                yield { kind: "meta", chunk: startBuf, firstRoundOnly: false, thinkingStart: true } as ParsedStreamEvent;
+                            }
+                            const payload = heldThinkingDeltas.get(upstreamIndex);
+                            heldThinkingDeltas.delete(upstreamIndex);
+                            if (payload !== undefined && payload.length > 0) {
+                                yield { kind: "meta", chunk: buildThinkingDeltaEvent(ci, payload), firstRoundOnly: false } as ParsedStreamEvent;
+                            }
+                            yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: false } as ParsedStreamEvent;
+                            yield { kind: "reasoning", delta: "", signature: delta.signature } as ParsedStreamEvent;
+                        } else {
+                            // #2501: a signature is payload-bearing — release the held start
+                            // first (Opus 5.5 sends ONLY this between start and stop).
+                            const startBuf = releaseHeldThinking(upstreamIndex);
+                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                            // #4679: self-arm — a signature proves this upstream signs, so
+                            // hold any LATER thinking block in this response too.
+                            signsSeenInStream = true;
+                            if (startBuf) {
+                                yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                            }
+                            yield {
+                                kind: "reasoning",
+                                delta: "",
+                                signature: delta.signature,
+                                raw: remapIndexInEvent(eventStr, ci),
+                            } as ParsedStreamEvent;
                         }
-                        yield {
-                            kind: "reasoning",
-                            delta: "",
-                            signature: delta.signature,
-                            raw: remapIndexInEvent(eventStr, ci),
-                        } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
@@ -596,6 +670,19 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             arguments: tb.json,
                         } as ParsedStreamEvent;
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
+                        // #4679: a withheld block closed WITHOUT its signature — on an
+                        // evidenced signing upstream a signature-less thinking block is
+                        // invalid client history (exactly what #2501 bars), so discard the
+                        // whole held block: the client saw none of it, so neither start,
+                        // payload, nor this stop may surface. Seal the accounting segment
+                        // (unsigned → dropped on rebuild). Zero client state keeps the #413
+                        // blind re-fetch free to heal if this close was a pre-signature cut.
+                        if (withheldBlocks.delete(upstreamIndex)) {
+                            heldThinkingDeltas.delete(upstreamIndex);
+                            heldThinkingStarts.delete(upstreamIndex);
+                            yield { kind: "reasoning", delta: "", blockEnd: true, withheld: true } as ParsedStreamEvent;
+                            continue;
+                        }
                         // #2501: the block never released (stop before any payload-bearing
                         // delta) — the client saw none of it, so neither the start nor this
                         // stop may surface: a signature-less thinking block in the client's

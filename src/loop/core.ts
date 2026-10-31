@@ -292,7 +292,12 @@ type RoundPart =
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
+    // #4679: withheld marks a round>=2 thinking payload that an evidenced
+    // signing upstream is holding OFF the client wire until its signature
+    // arrives — the adapter still yields it for re-request accounting, but the
+    // loop must not forward it (a pre-signature cut then leaves zero client
+    // state so the #413 blind re-fetch can heal the turn).
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean; withheld?: boolean }
     // #1960: Anthropic redacted_thinking arrives whole in content_block_start
     // (opaque base64 `data`). The loop must rebuild it byte-exact in position
     // on re-request — Anthropic rejects modified thinking-family blocks — so
@@ -350,13 +355,23 @@ export interface ExtractedTextTriggers {
     calls: ToolCallEmit[];
 }
 
+// #4679: per-parseStream evidence the loop hands to the adapter. Only the
+// anthropic lane reads it — on an evidenced signing upstream, rounds > 1 hold
+// the thinking payload off the client wire until its signature arrives, so a
+// cut before the signature leaves zero client state and the #413 blind
+// re-fetch can heal bili's own re-request round. Absent evidence, adapters
+// stream thinking live exactly as today (no relay regression).
+export interface ParseStreamOpts {
+    upstreamSignsThinking?: boolean;
+}
+
 export interface CompressLoopAdapter {
     buildRequest(
         coreMessages: CoreMessage[],
         systemPrompt: string,
         requestBody: Record<string, unknown>,
     ): Record<string, unknown>;
-    parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent>;
+    parseStream(upstream: ReadableStream<Uint8Array>, round: number, opts?: ParseStreamOpts): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
     emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
@@ -676,6 +691,14 @@ export async function* runCompressLoop(
     // streaming) is tracked with the other attempt state below.
     const historyHasSignedThinking = bodyHasSignedThinking(requestBody);
 
+    // #4679: turn-side evidence that this upstream signs thinking blocks — an
+    // earlier round of THIS turn already streamed a signed thinking block.
+    // Turn-level (persists across rounds): a fresh session whose round 1 signs
+    // still arms the round-2 hold even though its request body carries no
+    // signed history yet. Combined with historyHasSignedThinking it is the
+    // `upstreamSignsThinking` evidence handed to parseStream each attempt.
+    let sawSignedThinkingThisTurn = false;
+
     // #2701: anthropic Threads continue-turns. On these the conversation
     // lives server-side behind `thread.previous_message_id`; the request body
     // carries only this turn's delta messages. The legacy round-2 rebuild —
@@ -833,7 +856,12 @@ export async function* runCompressLoop(
                 sawSignedThinkingThisAttempt = false;
                 fwdBytes = 0;
 
-                for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                // #4679: hand the signing evidence to the adapter so rounds > 1
+                // can hold the thinking payload off the wire until its signature
+                // arrives. Gated on anthropic (the lane that implements the hold);
+                // every other adapter ignores opts and streams thinking live.
+                const upstreamSignsThinking = ctx.protocol === "anthropic" && (historyHasSignedThinking || sawSignedThinkingThisTurn);
+                for await (const ev of adapter.parseStream(currentUpstream, round, { upstreamSignsThinking })) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
@@ -866,9 +894,18 @@ export async function* runCompressLoop(
                             // in-attempt evidence that this upstream signs.
                             unsignedThinkingOnWire = false;
                             sawSignedThinkingThisAttempt = true;
+                            // #4679: same fact, turn-scoped — arms the hold for any
+                            // LATER round of this turn (a fresh session whose round 1
+                            // signed has no signed history yet in its request body).
+                            sawSignedThinkingThisTurn = true;
                         }
                         if (ev.blockEnd) reasoningSealed = true;
-                        if (!ctx.textProtocol) {
+                        // #4679: withheld payloads are accounting-only — the adapter
+                        // already buffered them off the wire and will flush start+
+                        // payload+signature together once the signature lands (or
+                        // discard on a signature-less stop), so forwarding here would
+                        // double-emit or poison the client with an unsigned block.
+                        if (!ctx.textProtocol && !ev.withheld) {
                             if (ev.raw) {
                                 recordReplyText("reasoning", ev.delta);
                                 yield fwd(ev.raw);
