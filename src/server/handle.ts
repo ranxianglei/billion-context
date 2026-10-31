@@ -31,7 +31,7 @@ import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
-import { emitPreflightError } from "../stream-error.js";
+import { emitPreflightError, preflightFailFastBody } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
@@ -2745,14 +2745,7 @@ async function handleRequest(
                                     emitPreflightError(res, prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
-                                        res.end(JSON.stringify({
-                                            error: {
-                                                type: "server_error",
-                                                code: "preflight_compress_failed",
-                                                message: outcome.message,
-                                                retryable: outcome.retryable,
-                                            },
-                                        }));
+                                        res.end(preflightFailFastBody(outcome.message, outcome.retryable));
                                     } catch { /* client gone */ }
                                 }
                             } else {
@@ -2763,14 +2756,7 @@ async function handleRequest(
                                     "content-type": "application/json",
                                     ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
                                 });
-                                res.end(JSON.stringify({
-                                    error: {
-                                        type: "server_error",
-                                        code: "preflight_compress_failed",
-                                        message: outcome.message,
-                                        retryable: outcome.retryable,
-                                    },
-                                }));
+                                res.end(preflightFailFastBody(outcome.message, outcome.retryable));
                             }
                         }
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
