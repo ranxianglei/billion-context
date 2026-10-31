@@ -212,6 +212,20 @@ export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" 
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
+// owner 2026-10-31: the embedded DSH page must NAME a bootstrap failure
+// instead of hiding behind the generic "run /acp first" hint. Recorded in
+// bootstrap()'s catch and published through the __BILI__ snapshot (index-inject
+// row + /bili/origin route); the client half renders an actionable message for
+// "no-engine" (this Node.js has no usable SQLite — builtin needs v22+, the
+// self-download is unavailable) and keeps the generic degraded hint otherwise.
+export type BootstrapFailure = { kind: "no-engine" | "launch-failed"; detail: string };
+let bootstrapFailure: BootstrapFailure | undefined;
+export function classifyBootstrapFailure(err: unknown): BootstrapFailure["kind"] {
+    return /no SQLite engine available/i.test(err instanceof Error ? err.message : String(err)) ? "no-engine" : "launch-failed";
+}
+export function _bootstrapFailureForTest(): BootstrapFailure | undefined { return bootstrapFailure; }
+export function _setBootstrapFailureForTest(value?: BootstrapFailure): void { bootstrapFailure = value; }
+
 // One registration lifecycle per HOST CONTEXT. toolsReady is the ONLY gate
 // for header stamping (pi.ts discipline): stamped headers flip the proxy into
 // plugin mode, which suppresses wire tool injection — stamping before the
@@ -728,6 +742,11 @@ async function bootstrap(): Promise<string | undefined> {
     } catch (err) {
         const msg = `proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`;
         persistClientEvent(msg);
+        // owner 2026-10-31: name the failure on the DSH page (no-engine gets
+        // its own actionable message; everything else rides the generic
+        // degraded hint with this detail in bili.log). Every recovery-timer
+        // respawn re-runs bootstrap(), so the newest failure always wins.
+        bootstrapFailure = { kind: classifyBootstrapFailure(err), detail: errMessage(err) };
         // #4811: a one-shot bootstrap failure must not become permanent. Plan-time
         // arming normally covers this, but this is where the failure IS KNOWN —
         // arm the recovery driver here so a base-less register always has a
@@ -1843,6 +1862,13 @@ export function apply(ctx: PluginContext): void {
         if (label !== undefined) base.contextTabLabel = label;
         return base;
     };
+    // owner 2026-10-31: while no proxy is bound, publish WHY so the DSH page
+    // can show an actionable message (e.g. "upgrade Node.js to 22+") instead
+    // of the generic degraded hint. Once an origin exists the key stays absent.
+    const withBootstrapFailure = (originValue: string | undefined, base: Record<string, unknown>): Record<string, unknown> => {
+        if (originValue === undefined && bootstrapFailure !== undefined) base.bootstrapFailure = { ...bootstrapFailure };
+        return base;
+    };
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
         // #4846: DSH Desktop captures this table ONCE per app launch (one-shot
         // boot snapshot), so a row dropped here is gone for the whole session —
@@ -1854,7 +1880,7 @@ export function apply(ctx: PluginContext): void {
         // readCtxTabFace() only needs contextTab/contextTabLabel. Mirrors the
         // /bili/origin route expression below so snapshot ≡ route at any instant.
         const origin = currentOrigin();
-        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }) });
+        table.push({ kind: "global", name: "__BILI__", value: withBootstrapFailure(origin, withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null })) });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
@@ -1891,7 +1917,7 @@ export function apply(ctx: PluginContext): void {
             // response URL itself; the loopback origin is useless (and leaky)
             // to a remote browser. #4237: same Context-tab face flags as the
             // snapshot row.
-            const body = JSON.stringify(withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
+            const body = JSON.stringify(withBootstrapFailure(origin, withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null })));
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },
