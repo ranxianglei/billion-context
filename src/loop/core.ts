@@ -46,7 +46,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { isDraftDump, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -1169,7 +1169,7 @@ export async function* runCompressLoop(
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
-                    endsWithDraftClose(assistantText) &&
+                    isDraftDump(assistantText) &&
                     // #2612: the client's own compaction request instructs the
                     // model to answer with a plain-text summary block and no
                     // tool call — that compliant reply is a draft tail by

@@ -19,7 +19,7 @@ import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, stripDriftResidue, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
@@ -58,7 +58,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { degenerateTurnWarning, isDraftDump, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -2585,6 +2585,12 @@ export async function pipePluginChatWithStrip(
         index: number;
     }
     const streams = new Map<string, PipeStream>();
+    // #1960 / #2229 / #5175: fields whose bytes must ride BYTE-FOR-BYTE. Kept
+    // beside `filterFor` so the identity-filter decision and this one cannot
+    // drift apart — a field routed to the identity filter must never be
+    // post-processed either.
+    const isVerbatimField = (field: string): boolean =>
+        field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
     const filterFor = (field: string, index: number) => {
         const key = `${field}:${index}`;
         let s = streams.get(key);
@@ -2648,6 +2654,20 @@ export async function pipePluginChatWithStrip(
     /** Set while a frame is being rewritten because a render tag was dropped:
      *  the text that survives such a frame is the tag's own interior. */
     let droppedTagInFrame = false;
+    /** #5175: the counters above answer "did THIS attempt deliver an answer?" —
+     *  the question the #2303/#732 retry and the #673 warn both ask. A retry
+     *  that takes over must start from a clean adjudication slate: the first
+     *  attempt's prose is already on the wire (unretractable), so judging the
+     *  retry against it reads the abandoned draft as the retry's own output and
+     *  emits "#870 degenerated again" for a turn that answered correctly.
+     *  visibleTextChars is deliberately NOT reset: it is turn-level observation
+     *  (the #673 warn and the truncation diag report what the client received). */
+    const resetAttemptAdjudication = (): void => {
+        proseAcc = "";
+        answerProse = "";
+        releasedMarkupChars = 0;
+        sawStrippedEcho = false;
+    };
     let finalFinishReason: string | undefined;
     // #2328 Q2/Q4: termination diagnostics — every truncation emit below
     // carries these on the in-band error frame (meta) and the log line.
@@ -2719,7 +2739,7 @@ export async function pipePluginChatWithStrip(
         // #2612: the request's OWN instruction can make this shape the correct
         // answer — a client compaction asking for a plain-text <summary> block
         // must not be retried (its compliant reply IS a draft tail).
-        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        const draftTail = visibleTextChars > 0 && !sawToolUse && isDraftDump(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
         // B-accident shape) is not an answer; the empty-turn retry must fire for
@@ -2777,6 +2797,9 @@ export async function pipePluginChatWithStrip(
         delete lastChunkMeta["finishReason"];
         retryIndexOffset = blocksForwarded;
         inRetry = true;
+        // The first attempt's adjudication counters describe bytes the client
+        // already holds; the retry is judged on its own output (#5175).
+        resetAttemptAdjudication();
         // The first attempt's held filter state belongs to text the client never
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
@@ -3007,7 +3030,30 @@ export async function pipePluginChatWithStrip(
     };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
-        const clean = s.filter.push(text);
+        // #5175: the state machine is tag-STRUCTURE scoped, so a drifted name
+        // (`acpt`) never enters it and its text is released verbatim. The
+        // whole-text pass catches it after the fact, but the client has already
+        // rendered the frames by then — so adjudicate the released span here
+        // too. Pure and idempotent; a pair split across two pushes degrades to
+        // the historical residual exactly like #1720's.
+        //
+        // The signed-thinking channel is excluded: `filterFor` hands it an
+        // IDENTITY filter because any rewrite desyncs its signature and bricks
+        // replay (#1960 / #2229 unified invariant — "the thinking channel is
+        // NEVER rewritten, only the visible text channel is"). Adjudicating here
+        // would reintroduce exactly that rewrite through the back door.
+        const released = s.filter.push(text);
+        const clean = isVerbatimField(field) ? released : stripDriftResidue(released);
+        // #5175 x #2303: the drift adjudication can empty an entire delta the
+        // state machine released verbatim. That is stripped-EVIDENCE, exactly
+        // like onTagDrop — without recording it the empty-turn retry gate
+        // (#732/#821) judges the turn "bare: no thinking, no stripped echo, no
+        // released markup" and passes a SILENTLY EMPTY assistant message to the
+        // client, which is worse than the verbatim leak it replaced.
+        if (clean !== released) {
+            sawStrippedEcho = true;
+            releasedMarkupChars += released.length - clean.length;
+        }
         if (clean.length > 0) proseAcc += clean;
         return [clean, clean !== text];
     };
@@ -4142,7 +4188,7 @@ export async function pipePluginResponsesWithStrip(
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
-        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && isDraftDump(proseAcc) && !requestExpectsProseSummary(requestText);
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
         // llama.cpp reasoning_text) and whitespace-only output_text (a bare
@@ -4184,6 +4230,12 @@ export async function pipePluginResponsesWithStrip(
         heldEvents = [];
         heldVisibleChars = 0;
         inRetry = true;
+        // The first attempt's adjudication counters describe frames the client
+        // already holds; the retry is judged on its own output (#5175).
+        proseAcc = "";
+        answerProse = "";
+        fastPathChars = 0;
+        sawStrippedEcho = false;
         // The first attempt's held filter state belongs to text the client never
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
@@ -4447,7 +4499,26 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        const clean = tagFilter.push(delta);
+                        const releasedDelta = tagFilter.push(delta);
+                        // #5175: the responses wire needs the SAME release-point
+                        // adjudication its chat twin does (pushField). The state
+                        // machine is tag-STRUCTURE scoped, so a drifted name
+                        // (`acpt`) never enters it and rides out verbatim, and the
+                        // whole-text pass that would catch it runs after the
+                        // client has already rendered the frame. Missing this made
+                        // the two lanes disagree — chat strips, responses leaks —
+                        // which is how defect A survived on the responses wire.
+                        // The signed-reasoning channel never reaches this branch
+                        // (it is handled above, byte-verbatim, #1960).
+                        // Evidence must also be taken from the RAW delta: once a
+                        // drift rule runs inside the filter tail chain too, the unit
+                        // is consumed BEFORE release, so `releasedDelta` is already
+                        // empty and a released-only comparison sees no change. That
+                        // is the #732/#821 silent empty-message failure — the turn
+                        // reaches the client with nothing in it and no retry armed.
+                        if (stripDriftResidue(delta) !== delta) sawStrippedEcho = true;
+                        const clean = stripDriftResidue(releasedDelta);
+                        if (clean !== releasedDelta) sawStrippedEcho = true;
                         lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];

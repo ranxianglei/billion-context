@@ -164,15 +164,15 @@ entries:
     site_en: "\"off\" | \"warn\" | \"repair\" (default repair): reconcile folded state when the client rewinds or rewrites history between turns."
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
   - key: compress.promptPack
-    type: "string (builtin: \"default\", \"lean\")"
+    type: "string (builtin: \"default\", \"lean\", \"chat\")"
     default: "builtin \"default\""
     group: compress
     id: cw.ppk
     render: compress-row
-    desc_en: "Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk."
-    desc_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。"
-    site_en: "Compression prompt pack, resolved project pack → user pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions). Not gated by acknowledgePromptsRisk."
-    site_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）。不受 acknowledgePromptsRisk 门控。"
+    desc_en: "Compression prompt pack, resolved project pack → user pack → shipped pack → builtin; not gated by acknowledgePromptsRisk."
+    desc_zh: "压缩提示词包，按 项目包 → 用户包 → 随包附带（chat）→ 内置 解析；不受 acknowledgePromptsRisk 门控。"
+    site_en: "Compression prompt pack, resolved project pack → user pack → shipped pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions); hosts may also ship a \"chat\" pack (#5319). Not gated by acknowledgePromptsRisk."
+    site_zh: "压缩提示词包，按 项目包 → 用户包 → 随包附带 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）；宿主可另附 \"chat\" 包（#5319）。不受 acknowledgePromptsRisk 门控。"
   - key: compress.tiers
     type: boolean
     default: "true"
