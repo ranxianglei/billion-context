@@ -25,10 +25,14 @@ export const ALWAYS_PROTECTED_TOOLS = ["compress", "acp_rule"] as const;
  *  #4307: both classes leave zero blocks committed, so both are dead weight,
  *  not metadata. Successful and partial receipts start with "[Compressed" and
  *  stay protected — a partial fold's arguments still cover the ranges that
- *  DID apply. */
+ *  DID apply. #4521: "[Compression no-op: …]" is the idempotent-resubmit
+ *  class — parse ok, ranges legal, nothing left to fold (already covered /
+ *  protected zone). Zero blocks committed, so it folds away like the other
+ *  zero-applied results instead of lingering as protected residue. */
 export const FAILED_COMPRESS_RESULT_PREFIXES = [
   "[Compression FAILED",
   "[Compression refused",
+  "[Compression no-op",
 ] as const;
 
 /** True when toolName denotes a compress call in ANY hosted dialect (#4289):

@@ -326,7 +326,7 @@ test("#5095 end to end: parallel same-type dispatches ride distinct lanes; paren
     }
 });
 
-test("#5095 end to end negative: un-upgraded clients (no token) keep the #4352 behavior", async () => {
+test("#5095 end to end fallback: un-upgraded clients (no token) land on the per-run fragment lane", async () => {
     freshState();
     const SESSION = randomUUID();
     const ccHeaders = ccHeadersFor(SESSION);
@@ -340,11 +340,16 @@ test("#5095 end to end negative: un-upgraded clients (no token) keep the #4352 b
         }
         const sub1 = await post(ccHeaders, mainBody(history("sub", 2), SUB_AGENT_SYSTEM));
         assert.equal(sub1.status, 200, `token-less subagent: ${sub1.text}`);
-        const subKey = forkKey(SESSION, tag(SUB_AGENT_SYSTEM));
-        assert.ok(peekSession(subKey), "token-less dispatch still forks by fingerprint (#4352)");
+        // #5095 D1-B fallback: no valid token on the wire → the fork key
+        // widens to the per-run first-user fragment — NOT back onto the
+        // shared two-segment fingerprint lane (#5095's original merge
+        // condition). Un-upgraded installs stay isolated per run.
+        const fragKey = `${SESSION}|sub:${fp16(tag(SUB_AGENT_SYSTEM))}:${fp16("sub-user-1")}`;
+        assert.ok(peekSession(fragKey), "token-less dispatch forks onto its own fragment lane");
+        assert.equal(peekSession(forkKey(SESSION, tag(SUB_AGENT_SYSTEM))), undefined, "no shared fingerprint lane was minted");
         const sub2 = await post(ccHeaders, mainBody(history("sub", 3), SUB_AGENT_SYSTEM));
         assert.equal(sub2.status, 200, `token-less pass 2: ${sub2.text}`);
-        assert.equal(peekSession(subKey)!.stats.requests, 2, "and still merges on the fingerprint lane (documented gap, unchanged)");
+        assert.equal(peekSession(fragKey)!.stats.requests, 2, "successive turns of the SAME run stay on one fragment lane");
         assert.equal(peekSession(SESSION)!.stats.requests, 3, "parent untouched either way");
     } finally {
         await close(proxy);
