@@ -124,6 +124,7 @@
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `=1/true` 保持单会话 CCR 内容存储（byRef/byHash 原文）常驻内存不折叠（#4788 phase 2 / #3916-E；首次触摸时从 unified ccr 镜像或 .content-store.json 侧车重建）；缺省/0/false = 落盘后折叠（默认） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
