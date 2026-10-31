@@ -833,11 +833,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
-    // #2734: stats.tokensSaved is a dead counter upstream (no incrementer since
-    // the kernel import — restored sessions carry a stale stamp, newer ones 0).
-    // Derive the display value from active blocks (gross original tokens under
-    // fold) and keep the stored stat as a floor, so pre-tagging sessions that
-    // still have a real accumulated value never regress.
+    // #2734/#4700: derive the display value from active blocks (gross original
+    // tokens under fold) and keep the stored stat as a floor, so pre-tagging
+    // sessions that still have a real accumulated value never regress. Since
+    // #4700 stats.tokensSaved has a live writer again (credited at the
+    // applyRanges commit point); the floor also covers folds whose blocks
+    // deactivated afterwards (client-side /compact archive, orphan-GC, tier
+    // distillation, host expand) — exactly when the active-block sum collapses.
     let blocksSaved = 0;
     for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
     const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);

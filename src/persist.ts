@@ -1557,10 +1557,12 @@ export class SessionStore {
      *  signature in one grep: >0 proves compression ran in this session's
      *  lifetime, so zero blocks means folds existed and are now missing
      *  (investigate); 0 means the session was likely never folded (raw replay
-     *  is its normal shape). (#2734 removed the last writer of the legacy
-     *  stats.tokensSaved counter — reading it here logged a dead 0 and broke
-     *  exactly this disambiguation, so the diagnostic now reads the kernel's
-     *  live counter instead.) The warn stays broad on purpose — a loss mode
+     *  is its normal shape). (#2734 moved this diagnostic off the legacy
+     *  stats.tokensSaved counter — dead since the kernel import, reading it
+     *  logged a misleading 0 that broke exactly this disambiguation — onto the
+     *  kernel's live counter. #4700 restored the host-side writer; the kernel
+     *  counter stays the right read here regardless.) The warn stays broad on
+     *  purpose — a loss mode
      *  that erases stats must not be able to go silent again. */
     private logColdLoad(id: string, source: string, session: Session, savedAt?: number): void {
         const refs = Object.keys(session.state.messageRefs.byRef ?? {}).length;
