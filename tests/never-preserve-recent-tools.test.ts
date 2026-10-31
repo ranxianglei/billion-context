@@ -109,7 +109,7 @@ function buildBody(): AnthropicRequestBody {
     return body;
 }
 
-function foldReadTurn(neverList: string[] | undefined, preserveList?: string[]): { errors: string[]; blocksCreated: number; readCovered: boolean } {
+function foldReadTurn(neverList: string[] | undefined, preserveList?: string[]): { errors: string[]; warnings: string[]; blocksCreated: number; readCovered: boolean } {
     const core = createCore();
     const state = createInitialState();
     const config = {
@@ -137,6 +137,9 @@ function foldReadTurn(neverList: string[] | undefined, preserveList?: string[]):
     const covered = coveredMessageIds(res.state);
     return {
         errors: res.result.errors,
+        // #4521: an all-protected range is now an idempotent no-op success
+        // whose verdict rides result.warnings (not errors).
+        warnings: res.result.warnings,
         blocksCreated: res.result.blocksCreated,
         readCovered: covered.has(readResult.id),
     };
@@ -151,21 +154,24 @@ test("kernel default list: fresh read inside the recent window folds immediately
 test("read removed from the list: the fresh read pair gains recent-zone protection (#1277)", () => {
     const out = foldReadTurn(["decompress", "search_context", "bash"]);
     assert.equal(out.blocksCreated, 0, "nothing folds — the whole range is protected");
-    assert.match(out.errors[0] ?? "", /protected/i);
+    // #4521: protected-only ranges report as a no-op success (warning), not an error.
+    assert.match([...out.errors, ...out.warnings].join(" "), /protected/i);
     assert.ok(!out.readCovered, "read result untouched");
 });
 
 test("empty list []: same protection as removing read (max-protection escape hatch)", () => {
     const out = foldReadTurn([]);
     assert.equal(out.blocksCreated, 0);
-    assert.match(out.errors[0] ?? "", /protected/i);
+    // #4521: verdict now arrives as a no-op success warning.
+    assert.match([...out.errors, ...out.warnings].join(" "), /protected/i);
     assert.ok(!out.readCovered);
 });
 
 test("kernel positive knob: preserveRecentTools [\"read\"] is the one-line remedy", { skip: SKIP_PRESCRIPTION }, () => {
     const out = foldReadTurn(undefined, ["read"]);
     assert.equal(out.blocksCreated, 0, "nothing folds — the read pair gained zone protection");
-    assert.match(out.errors[0] ?? "", /protected/i);
+    // #4521: verdict now arrives as a no-op success warning.
+    assert.match([...out.errors, ...out.warnings].join(" "), /protected/i);
     assert.ok(!out.readCovered, "read result untouched");
 });
 
