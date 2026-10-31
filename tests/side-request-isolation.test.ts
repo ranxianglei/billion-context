@@ -41,6 +41,21 @@ test("isSideRequest: tiny output budget across protocol field names", () => {
     assert.equal(isSideRequest({ max_output_tokens: 16, tools: [{ type: "function", function: { name: "f" } }] }), false, "#546: responses wire, starved budget + tools → main");
 });
 
+test("isSideRequest: a toolless structured-output request is a side request", () => {
+    // A memory-extraction daemon (Hindsight) inherits the host's HTTPS_PROXY and
+    // sends JSON-schema extraction calls with a large budget. Injected wire tools
+    // turn those into tools + response_format, which strict backends reject.
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_object" } }), true, "chat json_object");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_schema", json_schema: { name: "r", schema: {} } } }), true, "chat json_schema");
+    assert.equal(isSideRequest({ max_output_tokens: 64000, text: { format: { type: "json_schema", name: "r", schema: {} } } }), true, "responses text.format json_schema");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "text" } }), false, "plain text format is not structured");
+    assert.equal(isSideRequest({ max_output_tokens: 64000, text: { format: { type: "text" } } }), false, "responses plain text format");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: null }), false, "null response_format");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: "json_object" }), false, "non-object response_format");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_object" }, tools: [{ type: "function", function: { name: "f" } }] }), false, "#546 still wins: a tool-carrying structured request is a main turn");
+    assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_object" } }, "main"), false, "explicit main persona outranks the shape");
+});
+
 test("isSideRequest: host-declared side-request agent outranks the token-budget heuristic (#1699)", () => {
     // opencode v2 title-gen carries NO max_tokens (options {} for kind==="title"),
     // so the budget path can never see it. Declaring the persona by intent fixes
@@ -758,6 +773,36 @@ test("e2e: opencode v2 title-gen is classified by intent, not token budget (#169
         const fixFwd = rig.lastBody as { messages?: unknown } | null;
         assert.ok(fixFwd, "fix: upstream received the request");
         assert.deepEqual(fixFwd?.messages, titleBody.messages, "fix: title-gen messages forwarded verbatim (no compress prompt/render tags injected)");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: a toolless structured-output request is forwarded without injected tools", async () => {
+    const rig = await startRig();
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers = { "content-type": "application/json", "x-acp-session": SESSION };
+        const messages = [
+            { role: "system", content: "Extract facts from the conversation." },
+            { role: "user", content: "User: I moved to Lisbon last spring." },
+        ];
+        // Control: the same shape without response_format is a main turn and gets the wire tools.
+        const rControl = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 64000, messages }) });
+        assert.equal(rControl.status, 200);
+        await rControl.text();
+        const controlTools = (rig.lastBody as { tools?: unknown[] } | null)?.tools;
+        assert.ok(Array.isArray(controlTools) && controlTools.length > 0, "control: a toolless main turn gets the ACP tools injected");
+
+        const body = { model: MODEL, stream: true, max_tokens: 64000, messages, response_format: { type: "json_object" } };
+        const rFix = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+        assert.equal(rFix.status, 200);
+        await rFix.text();
+        const fwd = rig.lastBody as { tools?: unknown; messages?: unknown; response_format?: unknown } | null;
+        assert.ok(fwd, "upstream received the request");
+        assert.equal(fwd?.tools, undefined, "no tools injected beside response_format");
+        assert.deepEqual(fwd?.messages, messages, "messages forwarded verbatim");
+        assert.deepEqual(fwd?.response_format, body.response_format, "response_format untouched");
     } finally {
         await closeRig(rig);
     }
