@@ -3948,11 +3948,11 @@ function peekStoreForStamp(): SessionStore | null {
  *  session from the unified transcript. Read-only and peek-only — the module
  *  singleton must already exist (never construct a store on a compress path);
  *  a disabled/unavailable sidecar, zero rows, or ANY unparsable row returns
- *  null so callers keep their honest refusal instead of folding against a
- *  half-readable view. Rows are the raw client view caliber (#2627 — what a
- *  live model request would have re-sent), persisted on every save via the
- *  raw-tail ingest. #5111: storedTailViewStatus below is the same read with
- *  the failure reason named, so the refusal receipt can say WHY no fallback
+ *  unreadable (view: null + named reason) so callers keep their honest
+ *  refusal instead of folding against a half-readable view. Rows are the raw
+ *  client view caliber (#2627 — what a live model request would have
+ *  re-sent), persisted on every save via the raw-tail ingest. #5111: the
+ *  failure reason is named, so the refusal receipt can say WHY no fallback
  *  copy was readable instead of only that none was. */
 export function storedTailViewStatus(sessionId: string): { view: BiliMessage[] | null; reason: string } {
     const store = peekStoreForStamp();
@@ -3971,10 +3971,6 @@ export function storedTailViewStatus(sessionId: string): { view: BiliMessage[] |
         }
     }
     return { view: messages, reason: "recovered" };
-}
-
-export function peekStoredTailView(sessionId: string): BiliMessage[] | null {
-    return storedTailViewStatus(sessionId).view;
 }
 
 export function getStore(): SessionStore {
