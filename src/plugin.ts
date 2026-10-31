@@ -1768,7 +1768,29 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     let session = await resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
+    let followedLiveFork = false;
     let resolvedConversationId = conversationId;
+    // #4686: the host stamps its RAW conversation id on every status read even
+    // after the conversation's traffic moved to a `|sub:` fork — the same
+    // shape #2601 cured for tool calls, which this READ path never got: an
+    // exact hit on the stale parent beats fallback=latest (that only fires
+    // when the id has NO record), so the dsh Context tab pins its embedded
+    // frame on the frozen row forever while the live lane keeps folding.
+    // Follow the live fork under the exact #2601/#2948/#3397 criteria: while
+    // the parent is still the live session there is no candidate and the read
+    // stays bound to it, a ref-less aux lane can never be picked, and the
+    // binding returns home automatically when traffic does. The response
+    // keeps the requested conversationId (the client's ownership gate trusts
+    // exact hits) and adds personaFork so consumers can see the served row
+    // is the lineage's live lane rather than the asked-for id.
+    if (session !== undefined) {
+        const live = livePersonaDescendant(session);
+        if (live !== undefined) {
+            deps.log("info", `[plugin] plugin/status "${conversationId}" resolves to a stale persona parent — following live fork "${live.id}" (#4686)`);
+            session = live;
+            followedLiveFork = true;
+        }
+    }
     if (!session && fallbackLatest) {
         // #404: only sessions with real activity in THIS process qualify.
         // Before the fix every boot-restored session carried lastSeen =
@@ -1954,6 +1976,10 @@ export async function handlePluginStatus(conversationId: string, res: import("no
         sessionId: session.id,
         sessionRevision,
         fallback: viaFallback || undefined,
+        // #4686: true when the served row is the requested conversation's live
+        // |sub: fork (stale parent) instead of the asked-for id. Additive;
+        // absent on every pre-existing resolution shape.
+        personaFork: followedLiveFork || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
         model: session.metadata.lastModel ?? null,
