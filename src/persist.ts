@@ -2143,7 +2143,7 @@ export class SessionStore {
         this.liveShadow().vacuum(mode);
     }
 
-    unifiedRawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] | null {
+    unifiedRawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.rawMessages(sessionId, fromSeqExclusive);

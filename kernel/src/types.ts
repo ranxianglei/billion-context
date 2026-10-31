@@ -40,6 +40,18 @@ export interface CoreMessage {
    *  to the counter path for the loser. Not serialized into wire payloads —
    *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
   ledgerSeq?: number;
+  /** #4313: immutable local wall-clock timestamp (epoch ms) of WHEN this
+   *  message happened, stamped ONCE at first sight and never changed again.
+   *  Rendered into the <acp> tag as time="yyyy-mm-dd hh:mm:ss"; absent =
+   *  pre-feature message, rendered without the attribute (legacy bytes stay
+   *  byte-identical). Set by store-served views from the unified messages
+   *  table's ts column (fork inheritance is a plain row clone); for
+   *  memory-only lanes the stamp-timestamps pipeline node mints it via
+   *  Date.now() at intake and persists it through
+   *  {@link CompressionState.tsStamps} so restarts replay the same value.
+   *  The render path only ever READS this stored value — it never calls
+   *  Date.now() itself (prefix-cache invariant). */
+  ts?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -355,6 +367,15 @@ export interface CompressionState {
    *  NEVER removed from messageRefs (Kernel Contract: ids are never re-issued).
    *  Optional: pre-feature persisted states lack it. */
   deadRefs?: string[];
+  /** #4313: first-sight wall-clock stamps per RAW message id (epoch ms).
+   *  Written by the stamp-timestamps pipeline node on the turn each id is
+   *  first seen (Date.now() once per id; hydrated/carrying ids record their
+   *  stored value instead). Persists with kstate so a restart re-renders
+   *  every tagged message byte-identically — same tokenSnapshot discipline.
+   *  Never pruned: raw ids are never re-issued (Kernel Contract), so the map
+   *  can only grow like messageRefs.byRaw does. Optional: pre-feature states
+   *  lack it (their messages keep rendering without the time attribute). */
+  tsStamps?: Record<string, number>;
   /** Exact inbound ids of the PREVIOUS processTurn pass (pre-pipeline,
    * converter-derived). Continuity signal for reconcile-live-ids (#462): an
    * id that is covered by a fold but was present in the prior pass is the

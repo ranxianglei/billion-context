@@ -69,6 +69,15 @@ import type {
 
 export interface Ports {
   countTokens?: (text: string) => number;
+  /** #4313 (toggle, PR #5236): enable immutable message timestamps — first-
+   *  sight stamp minting into state.tsStamps and the <acp> tag's time
+   *  attribute on the render node. Default false: neither runs, so a
+   *  flag-off core renders byte-identically to pre-#4313 masters (hydrated
+   *  ts values are carried but never displayed). Set true by hosts whose
+   *  session opted in via compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS.
+   *  Resolved ONCE per core (instance scope) — storage-layer stamping stays
+   *  unconditional either way, so enabling later renders full history times. */
+  timestamps?: boolean;
 }
 
 export interface CompressionCore {
@@ -291,6 +300,9 @@ function applyRefolds(input: {
 
 export function createCore(ports: Ports = {}): CompressionCore {
   const countTokens = ports.countTokens ?? defaultCountTokens;
+  // #4313 toggle: single gate for both pipeline nodes (stamp + render);
+  // captured once per core so every lane built from this core agrees.
+  const timestampsOn = ports.timestamps === true;
 
   function applyCompression(
     input: ApplyCompressionInput,
@@ -1015,6 +1027,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
   function buildNodes(strategy: RenderStrategy): PipelineNode[] {
     const base: PipelineNode[] = [
       reconcileLiveIdsNode,
+      createStampTimestampsNode(timestampsOn),
       assignRefsNode,
       syncBlocksNode,
       pruneNode,
@@ -1031,7 +1044,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       emergencyTruncateNode,
     ];
     if (strategy === "none") return base;
-    return [...base, createRenderRefsNode(strategy)];
+    return [...base, createRenderRefsNode(strategy, { timestamps: timestampsOn })];
   }
 
   return {
@@ -1057,6 +1070,53 @@ const reconcileLiveIdsNode: PipelineNode = {
     return { ...io, messages: remintCoveredLiveIds(io.messages, io.state) };
   },
 };
+
+// #4313: stamp each message with its immutable local time-of-occurrence,
+// ONCE — for GENUINELY NEW arrivals only. Runs after reconcile-live-ids (so
+// the final post-remint id is what gets stamped, matching ledger rows) and
+// before assign-refs, whose byRaw map is still pre-this-pass: an id absent
+// from it is arriving now (Date.now() mints its stamp); an id already
+// present is a PRE-FEATURE / previously-seen message and must never be
+// backfilled (spec §5 + #3939 philosophy: NULL means unknown, and fabricating
+// "today" for an old message would be a lie). Hydrated ids carry their stored
+// ts (column value) and merely record it here; a persisted stamp outranks any
+// carried value (single source of truth = the ledger). Values persist in
+// state.tsStamps (tokenSnapshot discipline): restarts replay byte-identical
+// tags, and the render path only ever READS the stored value — it never calls
+// Date.now() (prefix-cache invariant). Ephemeral retrieval injections never
+// consume a stamp (same exemption as ref assignment).
+// Factory (#4313 toggle, PR #5236): with `enabled` false the node is a full
+// no-op — it mints nothing, backfills nothing and never touches tsStamps,
+// keeping flag-off sessions byte-identical to pre-#4313 masters (the render
+// side gates independently in render-refs.ts).
+function createStampTimestampsNode(enabled: boolean): PipelineNode {
+  if (!enabled) return { name: "stamp-timestamps", run(io) { return io; } };
+  return {
+  name: "stamp-timestamps",
+  run(io) {
+    const stamps = { ...(io.state.tsStamps ?? {}) };
+    const knownIds = io.state.messageRefs.byRaw;
+    let changed = false;
+    const messages = io.messages.map((m) => {
+      if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
+      const stamped = stamps[m.id];
+      if (stamped !== undefined) {
+        if (m.ts === stamped) return m;
+        changed = true;
+        return { ...m, ts: stamped };
+      }
+      const carried = typeof m.ts === "number" ? m.ts : undefined;
+      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      if (ts === undefined) return m;
+      stamps[m.id] = ts;
+      changed = true;
+      return { ...m, ts };
+    });
+    if (!changed) return io;
+    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+  },
+  };
+}
 
 const assignRefsNode: PipelineNode = {
   name: "assign-refs",
@@ -2217,6 +2277,10 @@ function cloneState(state: CompressionState): CompressionState {
       byRef: { ...state.messageRefs.byRef },
     },
     tokenSnapshot: { ...(state.tokenSnapshot ?? {}) },
+    // #4313: first-sight time stamps ride every clone — dropping them here
+    // loses the block coverage window (and re-arm nothing: already-refed ids
+    // are never re-minted, so the loss would be silent).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
     nudge: { ...state.nudge, anchors: { ...state.nudge.anchors } },
     stats: { ...state.stats },
     absorbed: (state.absorbed ?? []).map((record) => ({ ...record })),
