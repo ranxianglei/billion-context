@@ -58,7 +58,7 @@
 //                         corpus mass leaves the turn viable)
 //
 // Exit code 0 = every ran lane green. Non-zero = at least one red assertion.
-// Evidence (proxy.log, per-turn ndjson, config, corpus) stays in the scratch
+// Evidence (state-dir bili.log, per-turn ndjson, config, corpus) stays in the scratch
 // dir on failure.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -370,8 +370,14 @@ async function main() {
   fs.writeFileSync(path.join(baseDir, "work", "corpus.md"), buildCorpus(G.corpusTokens));
 
   const ctx = { workDir: path.join(baseDir, "work"), childEnv, proxyLog, port, profileEntry, sessionId: null };
-  const mark = () => fs.statSync(proxyLog).size;
-  const slice = (from, to) => fs.readFileSync(proxyLog, "utf8").slice(from, to ?? undefined);
+  // Assertions read the STATE-DIR log, not proxy.log: #5012 mutes the
+  // stdout/stderr tee for managed (launch-token) processes once the log-file
+  // leg proves live, so a detached gate proxy leaves proxy.log with only the
+  // boot banner. The state-dir bili.log carries every line and is append-only
+  // within a gate run (rotation threshold far above a run's ~50KB).
+  const biliLog = path.join(baseDir, "xdg", "state", "billion-context", "bili.log");
+  const mark = () => { try { return fs.statSync(biliLog).size; } catch { return 0; } };
+  const slice = (from, to) => { try { return fs.readFileSync(biliLog, "utf8").slice(from, to ?? undefined); } catch { return ""; } };
 
   async function turn(prompt, label) {
     const r = spawnSync(
@@ -488,7 +494,10 @@ async function main() {
       const noBaseline = !/usage-baseline=\d/.test(s3);
       record("B", "cross-upstream baseline demoted when cited", noBaseline || /demoting to untrusted/.test(s3), noBaseline ? "no baseline cited this run" : "demoting to untrusted");
       record("B", "both markers recalled after switch", has(t3.final, CODEWORDS[6]) && has(t3.final, CODEWORDS[39]), `final="${t3.final.trim().slice(0, 90)}"`);
-      record("B", `request routed to ${G.relayModel}`, s3.includes(G.relayUrl) || s3.includes(G.relayModel), "");
+      // Host masking (#4191/#4254) rewrites private hosts to `<private-host>`
+      // but keeps :port/path — assert on the port-suffixed forward line too.
+      const relayPort = /:(\d+)\/?$/.exec(G.relayUrl)?.[1];
+      record("B", `request routed to ${G.relayModel}`, s3.includes(G.relayUrl) || (relayPort && new RegExp(`forward[^\\n]*:${relayPort}\\b`).test(s3)) || s3.includes(G.relayModel), "");
 
       const m4 = mark();
       const t4 = await turn("Reply with exactly: OK", "t4");
