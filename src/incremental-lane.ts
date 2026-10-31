@@ -777,6 +777,13 @@ export async function handleIncrementalTurn(
             }
             entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null, renderPrefix: null, marksVersion: 0 };
         }
+        // #4867: pre-turn snapshot for the rollback below. `msgs` keeps the old
+        // array reference (applyTurn assigns a NEW array); `marks` must be
+        // CLONED — applyTurn mutates the map in place. `renderPrefix`/
+        // `marksVersion` (#5155) ride along too: the turn refreshes the prefix
+        // cache over the NEW history, and a rollback that left it would let a
+        // later turn splice rejected-branch bytes into an accepted body.
+        const preTurn = { msgs: entry.msgs, marks: new Map(entry.marks), boundary: entry.boundary, system: entry.system, systemSet: entry.systemSet, renderPrefix: entry.renderPrefix, marksVersion: entry.marksVersion };
         const msgsBefore = entry.msgs.length;
         const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload, deltaIds);
         if (!applied.ok) {
@@ -870,9 +877,11 @@ export async function handleIncrementalTurn(
         // on 200 already, so this tightens the contract rather than changing
         // any live behavior.
         const appliedSeq = applied.appliedSeq;
+        let headStatus: number | undefined;
         const originalWriteHead = res.writeHead.bind(res) as (...args: never[]) => ReturnType<typeof res.writeHead>;
         (res as { writeHead?: unknown }).writeHead = (...args: unknown[]) => {
             const status = typeof args[0] === "number" ? args[0] : 200;
+            headStatus = status;
             if (status >= 200 && status < 300) {
                 try {
                     res.setHeader("x-bili-applied-seq", String(appliedSeq));
@@ -885,12 +894,45 @@ export async function handleIncrementalTurn(
         const releaseWriteHead = (): void => {
             (res as { writeHead?: unknown }).writeHead = originalWriteHead as unknown as never;
         };
+        // #4867: applyTurn moved the canonical ahead of the client's ack — if
+        // the forward does not land (throw, or a completed non-2xx: #3344
+        // stamps the ack on 2xx only), restore the pre-turn state so the
+        // client's plain retry of the SAME delta hits instead of a 409
+        // seq-mismatch forcing a full resync. Append turns truncate back;
+        // resync turns restore the replaced prefix whole. Rows of the rejected
+        // branch stay in the append-only table — the existing 409→resync path
+        // owns them.
+        const rollbackCanonical = (): void => {
+            entry.msgs = preTurn.msgs;
+            entry.marks = preTurn.marks;
+            entry.boundary = preTurn.boundary;
+            entry.system = preTurn.system;
+            entry.systemSet = preTurn.systemSet;
+            entry.renderPrefix = preTurn.renderPrefix;
+            entry.marksVersion = preTurn.marksVersion;
+            touchCache(conversationId, entry);
+            log("warn", `[incremental] ${conversationId}: forward did not land — canonical rolled back from ${String(appliedSeq)} to ${String(preTurn.msgs.length)}; the client can retry the same delta (#4867)`);
+        };
         log("info", `[incremental] turn ${conversationId} since=${String(sinceSeq)} applied=${String(appliedSeq)} agent=${agent} model=${String(model)} → forward ${path}`);
         // Best-effort durability close-out: flush the session once the
         // response has fully left so the canonical table catches up with the
         // ack before the client can act on the next turn.
-        await forward(synthetic, res);
+        try {
+            await forward(synthetic, res);
+        } catch (err) {
+            releaseWriteHead();
+            // Roll back only while the ack cannot have reached the client: a
+            // 2xx head already flushed means the client advanced on it, and
+            // rolling back would desync the OTHER way (its next sinceSeq would
+            // outrun the server again).
+            if (!(res.headersSent && headStatus !== undefined && headStatus >= 200 && headStatus < 300)) rollbackCanonical();
+            throw err;
+        }
         releaseWriteHead();
+        // The ack was stamped ⇔ the head was 2xx. Any other outcome (non-2xx
+        // head, or a response that ended without one) left the client
+        // unacknowledged — roll it back.
+        if (headStatus === undefined || !(headStatus >= 200 && headStatus < 300)) rollbackCanonical();
         // #3798: forward() completing means the response phase is over — the
         // holder leaves inFlight here, and the wrap-up chain (rows + pointer
         // durability) floats behind the ack; the next turn awaits it at
