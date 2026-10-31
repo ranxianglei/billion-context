@@ -140,6 +140,7 @@ import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
 import { log as loggerLog } from "./logger.js";
+import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -2233,4 +2234,53 @@ export function noteCanonicalSystemFingerprint(session: Session, canonical: unkn
     const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
     const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
     session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
+}
+
+/** #4789: last-noted outbound bili tool surface per live session object.
+ *  Process-local BY DESIGN — the tripwire is pure observation: recording into
+ *  session.metadata would persist into the state file, mutating user-visible
+ *  storage bytes and drifting the byte-for-byte storage goldens (#4790 CI).
+ *  WeakMap ⇒ entries die with their session object (no cap, no leak); a session
+ *  evicted and reloaded re-seeds silently, so one flip at an eviction boundary
+ *  goes undetected — an acceptable diagnostic gap for a warn-only tripwire. */
+const lastBiliToolSurface = new WeakMap<Session, { fp: string; tags: string[] }>();
+
+/** #4789: tripwire for the outbound bili tool SURFACE. The two metadata-stamped
+ *  conditional tools (acp_retrieve / CCR, acp_read_original_image / image-rescale)
+ *  are the only ACP entries whose membership rides mutable per-request session
+ *  state; observed at egress (prepare), not at the handle stamp, so a mid-request
+ *  metadata reset still shows up as a flip here. Pure observation — never alters
+ *  egress or persisted state; warns once per change with what was added/removed. */
+export function noteBiliToolSurface(session: Session, surface: { ccr: boolean; imageRescale: boolean }, opts: ReconcileOptions = {}): void {
+    const tags = [surface.ccr ? "ccr" : null, surface.imageRescale ? "imageRescale" : null].filter((t): t is string => t !== null).sort();
+    const fp = tags.length === 0 ? "-" : tags.join(",");
+    const prev = lastBiliToolSurface.get(session);
+    if (prev !== undefined && prev.fp !== fp) {
+        if (opts.log !== undefined) {
+            const added = tags.filter((t) => !prev.tags.includes(t));
+            const removed = prev.tags.filter((t) => !tags.includes(t));
+            opts.log("warn", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[tool-set] outbound bili tool surface changed (+${added.join(",") || "-"} / -${removed.join(",") || "-"}) between consecutive requests — tool definitions precede system+messages, so this invalidates the whole prefix cache (#4789)`);
+        }
+    }
+    lastBiliToolSurface.set(session, { fp, tags });
+}
+
+/** #4789 tripwire coverage: derive the surface from the FINAL outbound tools
+ *  array instead of "did the proxy inject" — in plugin lanes injectTools is
+ *  structurally false and the host-declared array IS the wire surface, so an
+ *  injection-side observation is blind exactly where #4789 fired. Presence =
+ *  the name appears under any wire nesting (flat `name`, OpenAI
+ *  `function.name`, Gemini `functionDeclarations[].name`); proxy-mode
+ *  mergeOwnedTools dedup makes inbound-carried ∪ proxy-injected collapse to
+ *  one entry per name, so both lanes read off the same artifact. */
+export function outboundBiliSurface(tools: readonly unknown[] | undefined, ccrName: string): { ccr: boolean; imageRescale: boolean } {
+    const names = new Set<string>();
+    for (const raw of tools ?? []) {
+        if (typeof raw !== "object" || raw === null) continue;
+        const t = raw as { name?: unknown; function?: { name?: unknown }; functionDeclarations?: readonly { name?: unknown }[] };
+        if (typeof t.name === "string") names.add(t.name);
+        if (typeof t.function?.name === "string") names.add(t.function.name);
+        for (const d of t.functionDeclarations ?? []) if (typeof d?.name === "string") names.add(d.name);
+    }
+    return { ccr: names.has(ccrName), imageRescale: names.has(READ_ORIGINAL_IMAGE_TOOL_NAME) };
 }

@@ -12,7 +12,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { outboundBiliSurface, reconcileFoldCoverage, noteBiliToolSurface, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -361,6 +361,8 @@ export async function prepareOpenai(
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
+        // #4789: observe the FINAL outbound array — in plugin lanes the proxy injects nothing, so host-declared presence must be read off the artifact itself.
+        if (!isTitleGen) noteBiliToolSurface(session, outboundBiliSurface(toolsOut, retrieveToolName(session)), { sessionId, log });
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
         // nudge channel of their own, so this proxy-side nudge is the proactive

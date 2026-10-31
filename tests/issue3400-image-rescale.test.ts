@@ -267,8 +267,20 @@ test("gate stamping: storeEffectiveImageRescale/imageRescaleToolArmed", () => {
     assert.equal(imageRescaleToolArmed(s), false);
     storeEffectiveImageRescale(s, true);
     assert.equal(imageRescaleToolArmed(s), true);
-    storeEffectiveImageRescale(s, undefined);
-    assert.equal(imageRescaleToolArmed(s), false);
+});
+
+test("gate pins once per session (#4789): a later opposite decision is a no-op", () => {
+    // Armed at session start -> a mid-session disarm (feature toggled off) must not drop the tool.
+    const on = createSession("s-gate-pin-on");
+    storeEffectiveImageRescale(on, true);
+    storeEffectiveImageRescale(on, undefined);
+    assert.equal(imageRescaleToolArmed(on), true, "once armed, the flag is pinned for the session's life");
+    // Decided-off at session start -> a mid-session arm (feature toggled on) must not add the tool.
+    const off = createSession("s-gate-pin-off");
+    storeEffectiveImageRescale(off, undefined);
+    assert.equal(imageRescaleToolArmed(off), false);
+    storeEffectiveImageRescale(off, true);
+    assert.equal(imageRescaleToolArmed(off), false, "once decided off, the flag is pinned for the session's life");
 });
 
 test("executeReadOriginalImage: returns EXACT stored bytes + cumulative counter", async () => {

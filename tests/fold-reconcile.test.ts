@@ -8,6 +8,8 @@ import {
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
+    noteBiliToolSurface,
+    outboundBiliSurface,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
     turnContexts,
@@ -291,6 +293,87 @@ describe("reconcileFoldCoverage (#1921)", () => {
         assert.equal(logs.length, 1);
         assert.match(logs[0], /system prompt changed/);
         assert.match(logs[0], /fold state unaffected/);
+    });
+});
+
+describe("noteBiliToolSurface (#4789 tripwire)", () => {
+    const empty = () => ({ state: { blocks: [] }, metadata: {} }) as unknown as Session;
+    const logOpts = (logs: string[]) => ({ sessionId: "s1", log: (_l: string, m: string) => logs.push(m) });
+
+    test("stable surface across requests logs nothing", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "first egress seeds silently");
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "unchanged surface stays silent");
+    });
+
+    test("a removal flip warns once naming what left", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1);
+        assert.match(logs[0], /\[tool-set\]/);
+        assert.match(logs[0], /\+(-) \/ -(imageRescale)/);
+        assert.match(logs[0], /#4789/);
+    });
+
+    test("an addition flip reports the new entry", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: true, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1);
+        assert.match(logs[0], /\+(ccr) \/ -(-)/);
+    });
+
+    test("back-and-forth flips each warn", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 2, "each direction change is its own warn");
+    });
+
+    test("tracks and warns without any metadata field present", () => {
+        const session = { state: { blocks: [] } } as unknown as Session;
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "first egress seeds silently");
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1, "the flip is observed regardless of session fields");
+    });
+
+    test("never writes into session.metadata — persisted state bytes stay untouched (#4790 CI)", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: true, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(Object.keys(session.metadata ?? {}).length, 0, "the tripwire must stay pure observation: session.metadata is serialized into the state file and asserted byte-for-byte by the storage goldens");
+    });
+
+    test("outboundBiliSurface reads presence off the final array under every wire nesting", () => {
+        assert.deepEqual(outboundBiliSurface(undefined, "acp_retrieve"), { ccr: false, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([], "acp_retrieve"), { ccr: false, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([{ name: "acp_retrieve" }, { name: "other" }], "acp_retrieve"), { ccr: true, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([{ type: "function", function: { name: "acp_read_original_image" } }], "acp_retrieve"), { ccr: false, imageRescale: true });
+        assert.deepEqual(outboundBiliSurface([{ functionDeclarations: [{ name: "acp_retrieve" }, { name: "x" }] }], "acp_retrieve"), { ccr: true, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([null, 42, { name: "acp_retrieve" }, { type: "function", function: { name: "acp_read_original_image" } }], "acp_retrieve"), { ccr: true, imageRescale: true });
+        assert.deepEqual(outboundBiliSurface([{ name: "acp_retrieve" }], "my_custom_retrieve"), { ccr: false, imageRescale: false });
+    });
+
+    test("plugin-lane incident class: host-declared flip with zero proxy injection still warns (#4789 repro)", () => {
+        const session = empty();
+        const logs: string[] = [];
+        const opts = logOpts(logs);
+        noteBiliToolSurface(session, outboundBiliSurface([{ name: "read_file" }, { name: "bash" }], "acp_retrieve"), opts);
+        noteBiliToolSurface(session, outboundBiliSurface([{ name: "read_file" }, { name: "bash" }, { name: "acp_retrieve" }], "acp_retrieve"), opts);
+        assert.equal(logs.length, 1, "the 36→37 host-side flip must register even though the proxy injected nothing");
+        assert.match(logs[0], /\+(ccr) \/ -(-)/);
     });
 });
 
