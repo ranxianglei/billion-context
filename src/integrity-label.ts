@@ -73,3 +73,12 @@ export function startupFailureHints(err: unknown): string | undefined {
     }
     return undefined;
 }
+
+/** Canonical diagnosis + remedy for a suspected low-integrity node runtime
+ *  (#5155), with the REAL runtime path so the command is copy-pasteable at
+ *  every call site. Embedded verbatim by the log-reopen warn (logger.ts)
+ *  and the persist-EPERM alert (persist-eperm.ts) so those surfaces cannot
+ *  drift apart. */
+export function integrityLabelDiagnosis(nodeExePath: string): string {
+    return `a Low-labeled node.exe cannot write Medium-labeled files even with correct ACLs (#5155) — check icacls "${nodeExePath}" for 'Mandatory Label\\Low Mandatory Level' and restore it with icacls "${nodeExePath}" /setintegritylevel Medium, then restart`;
+}
