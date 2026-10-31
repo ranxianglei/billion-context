@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -29,7 +30,7 @@ import {
     resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
-import { UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
+import { buildForwardHeaders, UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
 import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveZonePortBase } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
@@ -122,6 +123,24 @@ test("applyClaudeManagedBlock: pins ANTHROPIC_BASE_URL when BILI_CLAUDE_UPSTREAM
         if (prev === undefined) delete process.env.BILI_CLAUDE_UPSTREAM;
         else process.env.BILI_CLAUDE_UPSTREAM = prev;
     }
+});
+
+test('applyClaudeManagedBlock: clears a leftover DISABLE_AUTO_COMPACT="1" when the URL stays foreign (#5369)', () => {
+    // Pre-fix installs wrote DISABLE_AUTO_COMPACT=1 unconditionally; with a foreign
+    // URL that keeps native auto-compaction OFF while bili is bypassed, so an
+    // upgrade alone would leave the original deadlock in place.
+    const settings = { env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3425", DISABLE_AUTO_COMPACT: "1" } };
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_BASE_URL, "http://127.0.0.1:3425");
+    assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, undefined);
+    assert.ok(notes.some((n) => n.includes("DISABLE_AUTO_COMPACT removed")));
+});
+
+test("applyClaudeManagedBlock: keeps a non-\"1\" DISABLE_AUTO_COMPACT when the URL stays foreign (#5369)", () => {
+    const settings = { env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3425", DISABLE_AUTO_COMPACT: "0" } };
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal((data.env as Record<string, string>).DISABLE_AUTO_COMPACT, "0");
+    assert.ok(notes.some((n) => n.includes("DISABLE_AUTO_COMPACT left untouched")));
 });
 
 test("applyClaudeManagedBlock: pins the Vertex variable too when one is resolved", () => {
@@ -343,10 +362,34 @@ test("isBiliClaudeBaseUrl: accepts 127.0.0.1, localhost, and [::1] loopback orig
     assert.equal(isBiliClaudeBaseUrl("https://localhost:8787/bili/anthropic/https://api.anthropic.com"), true);
     assert.equal(isBiliClaudeBaseUrl("http://127.0.0.1:3425"), false);
     assert.equal(isBiliClaudeBaseUrl("https://relay.example.com"), false);
+    assert.equal(isBiliClaudeBaseUrl("http://example.com:8787/bili/https://relay.example"), false);
 });
 
 test("UPSTREAM_HOP_HEADERS includes expect to prevent undici UND_ERR_NOT_SUPPORTED (#5369)", () => {
     assert.ok(UPSTREAM_HOP_HEADERS.has("expect"));
+});
+
+test("buildForwardHeaders drops expect so undici fetch does not throw UND_ERR_NOT_SUPPORTED (#5369)", async () => {
+    const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
+    await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve); });
+    const addr = server.address();
+    if (addr === null || typeof addr === "string") throw new Error("unexpected listen address");
+    const url = `http://127.0.0.1:${addr.port}/v1/messages`;
+    try {
+        // The failure mode the magpie relay hit: a client-sent expect header
+        // forwarded verbatim makes undici reject before any bytes go out.
+        await assert.rejects(
+            fetch(url, { method: "POST", headers: { expect: "100-continue", "content-type": "application/json" }, body: "{}" }),
+            (err: unknown) => (err as { cause?: { code?: string } }).cause?.code === "UND_ERR_NOT_SUPPORTED",
+        );
+        const out = buildForwardHeaders({ expect: "100-continue", "Content-Length": "2", host: "127.0.0.1", "content-type": "text/plain" });
+        assert.equal(out["expect"], undefined);
+        assert.equal(out["content-length"], undefined);
+        const resp = await fetch(url, { method: "POST", headers: out as Record<string, string>, body: "{}" });
+        assert.equal(resp.status, 200);
+    } finally {
+        server.close();
+    }
 });
 
 test("resolveClaudeNativePort: env only, undefined without an explicit override (#1660)", () => {
