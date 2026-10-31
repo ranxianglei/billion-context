@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CompressionBlock } from "acp-kernel";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
@@ -163,6 +163,52 @@ export function isBiliCompactionItem(item: unknown): boolean {
 
 export function stripBiliCompactionItems<T>(input: T[]): T[] {
     return input.filter((item) => !isBiliCompactionItem(item));
+}
+
+// #4929: newer codex builds land their LOCAL auto-compaction as a NATIVE
+// Responses compaction item carrying an OPAQUE provider blob (encrypted_content)
+// instead of the legacy text summary message (#2372). The kernel projection
+// drops such items into the preamble (no core id ever exists for them), so the
+// text detector above can never see them and the fold coverage of the replaced
+// head simply vanishes from the resent history.
+export const CODEX_NATIVE_CHECKPOINT_TYPE = "compaction";
+
+/** #4929: shape of a NATIVE provider-issued compaction checkpoint. The
+ *  structural marker (type + opaque encrypted_content) is marker-DECISIVE in
+ *  the #2193 sense: only a client that adopted a real OpenAI compaction
+ *  response carries an item of this wire shape, and user text cannot forge one.
+ *  bili-generated items (fc_bili_ id / bili:acp: sentinel) are excluded — they
+ *  are bili's own forged blobs, already handled by the echo-replace path above.
+ *  Malformed shapes (missing / non-string / empty encrypted_content) never
+ *  match; they are ignored, never fatal. */
+function isNativeCodexCheckpointItem(item: unknown): boolean {
+    const it = item as { type?: unknown; encrypted_content?: unknown } | null;
+    if (!it || typeof it !== "object" || it.type !== CODEX_NATIVE_CHECKPOINT_TYPE) return false;
+    if (isBiliCompactionItem(it)) return false;
+    return typeof it.encrypted_content === "string" && it.encrypted_content.length > 0;
+}
+
+/** #4929: identity of a native checkpoint WITHOUT decoding the opaque blob —
+ *  sha256 hex over the raw encrypted_content bytes. Persisted per session so
+ *  repeated echoes and cold loads recognize the SAME checkpoint and preserve
+ *  later folds instead of re-basing onto it again. */
+export function nativeCodexCheckpointFingerprint(item: unknown): string | null {
+    if (!isNativeCodexCheckpointItem(item)) return null;
+    const blob = (item as { encrypted_content: string }).encrypted_content;
+    return createHash("sha256").update(blob, "utf8").digest("hex");
+}
+
+/** #4929: fingerprint of the first native provider checkpoint in a responses
+ *  input array, or null when no valid item is present. Codex retains exactly
+ *  one surviving checkpoint at the head of its compacted history, so the first
+ *  (oldest) match is the authoritative boundary. */
+export function findNativeCodexCheckpoint(input: unknown): string | null {
+    if (!Array.isArray(input)) return null;
+    for (const item of input) {
+        const fp = nativeCodexCheckpointFingerprint(item);
+        if (fp !== null) return fp;
+    }
+    return null;
 }
 
 // The summary text a forged blob carries (sentinel-prefixed plaintext).
