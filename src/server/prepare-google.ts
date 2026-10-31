@@ -35,6 +35,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { auditGoogleSignatures, googleSigWarnDecision } from "./google-sig-audit.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -383,6 +384,27 @@ export async function prepareGoogle(
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
+    }
+
+    // #5253: on a model that signs its calls, one unsigned functionCall/thought
+    // part 400s the WHOLE request upstream — until now the lane died silently
+    // every turn with no bili-side trace. Audit both sides of the rebuild so
+    // the first affected turn names the origin: client-resend loss (bili is a
+    // verbatim forwarder) vs a bili-side drop (a defect to report as such).
+    {
+        const inAudit = auditGoogleSignatures(Array.isArray(parsed.contents) ? parsed.contents : []);
+        const outAudit = auditGoogleSignatures(rebuiltContents);
+        if (inAudit.signedCalls + inAudit.signedThoughts + outAudit.signedCalls + outAudit.signedThoughts > 0) {
+            session.metadata.googleModelSigns = true;
+        }
+        const unsignedIn = inAudit.unsignedCalls + inAudit.unsignedThoughts;
+        const unsignedOut = outAudit.unsignedCalls + outAudit.unsignedThoughts;
+        const warnedTurns = typeof session.metadata.googleSigWarnedTurns === "number" ? session.metadata.googleSigWarnedTurns as number : 0;
+        if (unsignedOut > 0) session.metadata.googleSigWarnedTurns = warnedTurns + 1;
+        const decision = googleSigWarnDecision({ modelSigns: session.metadata.googleModelSigns === true, unsignedIn, unsignedOut, warnedTurns });
+        if (decision.warn) {
+            log("warn", `[${sessionId}] [google-sig] forwarding ${unsignedOut} unsigned functionCall/thought part(s) (${outAudit.sites.join("; ") || "thought parts"}) to a model that signs its calls — upstream will reject with 400 'missing thought_signature'; ${decision.clientOrigin ? `${unsignedIn} arrived UNSIGNED in the client resend — bili forwards parts verbatim, so the loss is upstream of bili (host/plugin signature replay after history rework)` : "the client resent them SIGNED but bili's rebuild dropped the signature — bili-side defect, re-report with ACP_DUMP_BODY captures"} (#5253)`);
+        }
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
