@@ -238,7 +238,9 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
                 bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
             }
             let coveredSeen = 0;
+            const rowSeqs = new Set<number>();
             for (const r of rows) {
+                rowSeqs.add(r.seq);
                 const v = bySeq.get(r.seq);
                 if (v) r.msg = v.msg;
                 else if (coveredSeqUnion.has(r.seq)) coveredSeen++;
@@ -246,8 +248,9 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
             // Every row must be accounted for: uncovered-with-bytes or
             // covered. A gap (a row neither loaded nor covered — e.g. a
             // concurrent ingest raced the two queries) falls back to one full
-            // load rather than rendering a hole.
-            if (coveredSeen !== [...coveredSeqUnion].filter((seq) => rows.some((r) => r.seq === seq)).length || rows.some((r) => !r.msg && !coveredSeqUnion.has(r.seq))) {
+            // load rather than rendering a hole. rowSeqs membership keeps this
+            // O(|rows| + |covered|), not O(|rows| × |covered|) per render (#5049).
+            if (coveredSeen !== [...coveredSeqUnion].filter((seq) => rowSeqs.has(seq)).length || rows.some((r) => !r.msg && !coveredSeqUnion.has(r.seq))) {
                 const full = store.unifiedTailViewRows(session.id);
                 if (full !== null) {
                     const fullBySeq = new Map<number, BiliMessage>();
