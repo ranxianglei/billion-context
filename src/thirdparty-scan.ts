@@ -126,10 +126,24 @@ export function conflictScanEnabled(env: NodeJS.ProcessEnv = process.env): boole
     return !(v === "0" || v === "false");
 }
 
+/** #4688: Google Antigravity IDE wire profile — UA shape observed in the wild
+ *  (v2.26.0, Windows session through bili): "antigravity/hub/<ver> (aidev_client; …)".
+ *  Prefix-anchored and case-insensitive, mirroring isCodexClient's prefix style;
+ *  deliberately NOT a bare-token match — a UA merely mentioning antigravity
+ *  elsewhere must not inherit this lane's identity. */
+export function isAntigravityClient(headers: Record<string, string | string[] | undefined>): boolean {
+    const ua = headers["user-agent"];
+    if (!ua) return false;
+    const s = Array.isArray(ua) ? ua[0] : ua;
+    if (typeof s !== "string") return false;
+    return /^antigravity\//i.test(s);
+}
+
 /** Identify the requesting client from wire headers so a standalone proxy
- *  (no x-bili-plugin header) can still scan the right registry. Codex is
- *  recognized but returns undefined — it has no scannable plugin registry
- *  here, and its compaction paths are already intercepted/budget-aligned. */
+ *  (no x-bili-plugin header) can still scan the right registry. Codex and
+ *  Antigravity are recognized but return undefined — closed binaries with no
+ *  scannable plugin registry (#1043); their identity resolves on the conflict
+ *  surfaces via conflictClientOf instead (#2219/#4688). */
 export function sniffScanClient(headers: Record<string, string | string[] | undefined>): ScanClient | undefined {
     const h = (name: string): string | undefined => {
         const v = headers[name];
@@ -138,6 +152,7 @@ export function sniffScanClient(headers: Record<string, string | string[] | unde
     if (h("x-claude-code-session-id")) return "claude";
     const ua = h("user-agent");
     if (ua && isCodexClient({ "user-agent": ua })) return undefined;
+    if (ua && isAntigravityClient({ "user-agent": ua })) return undefined;
     if (h("x-opencode-session")) return "opencode";
     const affinity = h("x-session-affinity");
     if (affinity?.startsWith("ses_")) return "opencode";

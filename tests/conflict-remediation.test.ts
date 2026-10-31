@@ -58,6 +58,14 @@ test("conflictClientOf: codex UA truncations normalize to codex, look-alikes do 
     assert.equal(conflictClientOf(makeSession("f", { clientHint: "claude" })), "claude");
 });
 
+test("conflictClientOf: antigravity UA shapes normalize to antigravity, look-alikes do not (#4688)", () => {
+    assert.equal(conflictClientOf(makeSession("a", { clientHint: "antigravity/hub/2.26.0 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)" })), "antigravity");
+    assert.equal(conflictClientOf(makeSession("b", { clientHint: "Antigravity/hub/9.9.9" })), "antigravity");
+    // prefix-anchored only — a mention elsewhere in the UA is not this lane
+    assert.equal(conflictClientOf(makeSession("c", { clientHint: "vendor/antigravity-wrapper/1.0" })), undefined);
+    assert.equal(conflictClientOf(makeSession("d", { clientHint: "Mozilla/5.0 antigravity-fan-club" })), undefined);
+});
+
 test("conflictRemediation: one line per known client, generic fallback for the rest (#2219)", () => {
     const oc = conflictRemediation("opencode");
     assert.ok(oc.includes('"compaction": { "auto": false }'), oc);
@@ -71,12 +79,15 @@ test("conflictRemediation: one line per known client, generic fallback for the r
     assert.ok(!cx.includes("never transits"), "#3008: the inline auto-compact DOES transit as an ordinary turn — the old copy was false");
     assert.equal(conflictRemediation("pi"), conflictRemediation("omp"), "pi and omp share the carriage-evidence hint");
     assert.ok(conflictRemediation("pi").includes("report client + bili version"));
+    const ag = conflictRemediation("antigravity");
+    assert.ok(ag.includes("not double compression"), ag);
+    assert.ok(ag.includes("export --full"), ag);
     const gen = conflictRemediation(undefined);
     assert.ok(gen.includes("fresh session"), gen);
     for (const c of ["dsh", "kimi", "hermes", "zcode", "gemini-cli"]) {
         assert.equal(conflictRemediation(c), gen, `${c} falls back to the generic hint`);
     }
-    for (const c of ["opencode", "claude", "codex", "pi", "omp", undefined]) {
+    for (const c of ["opencode", "claude", "codex", "pi", "omp", "antigravity", undefined]) {
         assert.ok(!conflictRemediation(c).includes("\n"), "hints render inline — one line only");
     }
 });
@@ -124,6 +135,7 @@ test("i18n: every conflict.hint.* key exists in BOTH locales; server map and web
         "conflict.hint.codex",
         "conflict.hint.pi",
         "conflict.hint.omp",
+        "conflict.hint.antigravity",
         "conflict.hint.generic",
         "conflict.hint_more",
         "conflict.docs",
@@ -134,7 +146,7 @@ test("i18n: every conflict.hint.* key exists in BOTH locales; server map and web
         assert.ok(typeof zh === "string" && zh.length > 0, `zh-CN missing ${k}`);
         assert.ok(typeof en === "string" && en.length > 0, `en missing ${k}`);
     }
-    for (const c of ["opencode", "claude", "codex", "pi", "omp"]) {
+    for (const c of ["opencode", "claude", "codex", "pi", "omp", "antigravity"]) {
         assert.ok(MESSAGES["zh-CN"][`conflict.hint.${c}`] && MESSAGES["en"][`conflict.hint.${c}`], `drift: ${c} missing from i18n`);
     }
 });

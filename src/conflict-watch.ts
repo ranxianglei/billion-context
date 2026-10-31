@@ -11,7 +11,7 @@
 
 import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
-import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
+import { isAntigravityClient, isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
 type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption";
 
@@ -106,8 +106,9 @@ export function dshNativeCompactionWitness(session: Session, fingerprint?: Rewri
 // Identity is already recorded at request time (#1426): pluginAgent wins when
 // present ("mcp" is not a client name — MCP evidence flip, #760b — so fall
 // through), then clientHint, which is either an exact sniffScanClient value or
-// a UA truncation; codex UA shapes normalize back to "codex" and clean single
-// tokens pass through as-is (unknown ones simply get the generic hint).
+// a UA truncation; codex/antigravity UA shapes normalize back to their lane
+// names (#2219/#4688) and clean single tokens pass through as-is (unknown ones
+// simply get the generic hint).
 export function conflictClientOf(session: Session): string | undefined {
     const pa = session.metadata.pluginAgent;
     if (typeof pa === "string" && pa.length > 0 && pa !== "mcp") return pa;
@@ -115,6 +116,7 @@ export function conflictClientOf(session: Session): string | undefined {
     if (typeof hint !== "string" || !hint) return undefined;
     if (/^[a-z][a-z0-9-]*$/.test(hint)) return hint;
     if (isCodexClient({ "user-agent": hint })) return "codex";
+    if (isAntigravityClient({ "user-agent": hint })) return "antigravity";
     return undefined;
 }
 
@@ -138,6 +140,8 @@ export function conflictRemediation(client: string | undefined): string {
         case "pi":
         case "omp":
             return "the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version";
+        case "antigravity":
+            return "Antigravity manages its own context window and periodically re-slices history without telling bili — expected lane behavior, not double compression; folded content stays offline-recoverable (export --full), but start a new task/session when you need the pruned context back";
         default:
             return "disable the client's own auto-compaction (or route this session around bili), then start a fresh session — the ledger is per-session, so old entries clear with the old session";
     }
