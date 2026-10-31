@@ -7,6 +7,10 @@ import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 interface OwnerProbeInfo {
     pid?: number;
     instanceId?: string;
+    /** #4125: build version reported by /__bili/health — lets a challenger
+     *  identify a STRICTLY NEWER same-lane holder from a live health answer
+     *  (upward adoption); a busy/silent holder reports nothing. */
+    version?: string;
     /** Negative attribution: responder is up but pre-registration (#2941
      *  readiness gate) — see findForeignOwner for the handling. */
     reason?: string;
@@ -57,11 +61,12 @@ export async function probeOwnerInfo(
             if (neg.ok === false && typeof neg.reason === "string") return { reason: neg.reason };
             return undefined;
         }
-        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown };
+        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown; version?: unknown };
         if (data.ok !== true) return undefined;
         const info: OwnerProbeInfo = {};
         if (typeof data.pid === "number" && Number.isInteger(data.pid) && data.pid > 0) info.pid = data.pid;
         if (typeof data.instanceId === "string" && data.instanceId !== "") info.instanceId = data.instanceId;
+        if (typeof data.version === "string" && data.version !== "") info.version = data.version;
         return info;
     } catch {
         return undefined;

@@ -35,6 +35,7 @@
 | `BILI_LAUNCHER_DIRECT` | launcher direct-URL 模式 | `=1` 进入直通 URL 模式：LLM 流量不过代理 ⇒ 无压缩（只有 bili MCP 调用可用）；默认 MITM | —（两种模式都是正式入口则移 §2） | opt-in（`=1`） |
 | `BILI_LAUNCHER_PLUGIN` | launcher plugin 车道 | `=0` kill switch 回 wire 注入工具；`=1` 强制 plugin 车道；缺省自动 | plugin 车道成为唯一车道后退役 kill switch | 默认 auto |
 | `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_RESIGN_BENEFIT` / `BILI_CODEARTS_REF` | #1884 / #2090 | 签名上游重签特性族：`=0` 整族下线（回到 #1884 前重写行为）；passthrough 是「此链路不带压缩」的显式确认通道 | 特性族定型后各成员转 §2 | 特性族在用（`=0` 可整族下线） |
+| `BILI_MESSAGE_TIMESTAMPS` | #4313/#5236 | 消息级时间戳注入 opt-in：默认 off（undefined/0），`=1` 开启——统一存储落库 v10 时间戳列并镜像到 ACP 封套时间戳（读点 src/config.ts:2669）；关闭时线上字节逐字不变 | 功能定型转正后转 §2 常设面 |
 | `BILI_FAKE_COMPLETION_RETRIES` | fake-completion fallback | 假完成重试（opt-in，默认 0 = 禁用） | fallback 机制定型后转 §2 | opt-in |
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
@@ -77,6 +78,7 @@
 | `BILI_NON_HTTP_PROVIDERS` | #1392 非 http(s) baseUrl provider 白名单传递 |
 | `BILI_PROVIDER_REWRITES` | #535 provider 改写 manifest JSON（存在即关 zcode native） |
 | `BILI_UPGRADE_REPLACEMENT` | #3044 self-restart 替换进程交接标记（UPGRADE_REPLACEMENT_ENV） |
+| `BILI_SPAWN_FINGERPRINT` | #4125 spawner 侧入口脚本 sha256 指纹（SPAWN_FINGERPRINT_ENV，src/instance.ts:343），spawn 时注入供子进程记录自身指纹，避免 auto-update 窗口内 re-hash 漂移 |
 
 ### 2.3 网络调优（#2030 迁移家族：env > 文件 network.* > 默认）
 
@@ -122,6 +124,7 @@
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `=1/true` 保持单会话 CCR 内容存储（byRef/byHash 原文）常驻内存不折叠（#4788 phase 2 / #3916-E；首次触摸时从 unified ccr 镜像或 .content-store.json 侧车重建）；缺省/0/false = 落盘后折叠（默认） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |

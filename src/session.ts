@@ -198,6 +198,73 @@ export function lazyMetadata(
     return proxy;
 }
 
+/** #4788 phase 2: proxies for CCR content stores currently folded away. */
+const droppedContentStoreProxies = new WeakSet<object>();
+
+/** True when the record is a lazy content-store proxy currently folded away. */
+export function isDroppedContentStore(value: unknown): boolean {
+    return typeof value === "object" && value !== null && droppedContentStoreProxies.has(value);
+}
+
+/** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): a session's
+ *  MessageContentStore that folded away after its save landed and re-materializes
+ *  on first touch — the exact shape contentStoreOf restores on a cold load.
+ *  Transparent Proxy over the plain-store shape ({version, byHash, byRef}): no
+ *  call-site changes; saveContentStore / ingest ccr_json+ccr_entries / fork /
+ *  publicSnapshotStoredRefs all walk it like any store and pay ONE narrow read
+ *  per burst. An unrecoverable drop throws on access instead of ever letting a
+ *  save write an EMPTY record where a non-empty one was proven durable (#2674
+ *  payload-first discipline, applied to discharge). */
+export function lazyContentStore(
+    sessionId: string,
+    loader: (id: string) => MessageContentStore | null,
+): MessageContentStore {
+    const target: Record<string, unknown> = {};
+    let dropped = true;
+    const ensure = (): void => {
+        if (!dropped) return;
+        const record = loader(sessionId);
+        if (!record || typeof record !== "object" || !("byRef" in record) || Object.keys(record.byRef as Record<string, unknown>).length === 0) {
+            throw new Error(`[persist] resident content store for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        Object.assign(target, record);
+        dropped = false;
+        droppedContentStoreProxies.delete(proxy);
+    };
+    const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+            ensure();
+            return Reflect.get(t, prop, receiver);
+        },
+        has(t, prop) {
+            ensure();
+            return Reflect.has(t, prop);
+        },
+        ownKeys(t) {
+            ensure();
+            return Reflect.ownKeys(t);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            ensure();
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        set(t, prop, value, receiver) {
+            ensure();
+            return Reflect.set(t, prop, value, receiver);
+        },
+        deleteProperty(t, prop) {
+            ensure();
+            return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+            ensure();
+            return Reflect.defineProperty(t, prop, desc);
+        },
+    });
+    droppedContentStoreProxies.add(proxy);
+    return proxy as unknown as MessageContentStore;
+}
+
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
  *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
@@ -259,6 +326,16 @@ export type Session = {
         /** #4805: the in-flight request's probe verdict ({member, needle}),
          *  recorded at prepare and consumed by settleUsageReport. */
         requestMembership?: { member: boolean; needle: string | null };
+        /** #5293: the user aborted (Esc'd) the model stream mid-turn. The
+         *  interrupted turn's partial output never reports usage, so the next
+         *  usage-grade reading jumps by exactly that unreported mass — counted
+         *  as organic growth, the cadence nudge fires on the user's redirect
+         *  turn (pi: esc → continue → immediate compress injection). `anchor`
+         *  is the meter value at abort time; consumed by the first nudge
+         *  decision whose meter moved past it (absorbAbortedTurnGrowth).
+         *  In-memory only: the abort→resume causality spans one process
+         *  lifetime, and a restart replants nothing. */
+        abortReanchor?: { anchor: number; at: number };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -902,6 +979,64 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
     loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
 }
 
+/** #5293: growth debt from a user-interrupted turn. When the user aborts a
+ *  model stream mid-turn (pi's Esc), the host persists the partial assistant
+ *  message and resends it on the next turn, but the interrupted turn never
+ *  reports usage for that output — the next usage-grade reading jumps by
+ *  exactly the unreported partial. The flat-growth cadence (KDD #8) counts
+ *  that jump as organic growth, so the nudge fires within one or two requests
+ *  of the user's redirect — summarizing output they just rejected.
+ *
+ *  Fix: an event-driven re-anchor in the same category as applyCompression
+ *  resetting lastNudgeShownTokens (kernel compress.ts). The abort site stamps
+ *  transient.abortReanchor (noteAbortedTurn); the FIRST nudge decision whose
+ *  meter moved past the pre-abort anchor re-anchors the low-water reference
+ *  to the current reading (absorbAbortedTurnGrowth). Deliberate exception to
+ *  #3674's low-water rule: #3674 deleted the event-gated re-anchor because it
+ *  dead-zoned small DROPS; here the reference moves UP because a known
+ *  unmeasured mass just landed, gated on a witnessed client action rather than
+ *  drift heuristics. Sessions without a pending stamp see byte-identical
+ *  decisions. Preflight / pressure bands are untouched — only the growth
+ *  cadence reference moves. */
+export const ABORT_REANCHOR_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** Stamp a pending aborted-turn re-anchor; call from the plugin pipe's
+ *  client-abort path AFTER settleUsage has landed whatever the interrupted
+ *  stream reported (the request's input size — the partial output itself
+ *  never reports). A zero/unknown meter carries no information: skip. */
+export function noteAbortedTurn(session: Session): void {
+    if (!Number.isFinite(session.stats.lastInputTokens) || session.stats.lastInputTokens <= 0) return;
+    session.transient ??= {};
+    session.transient.abortReanchor = { anchor: session.stats.lastInputTokens, at: Date.now() };
+}
+
+/** Consume a pending aborted-turn re-anchor if — and only if — the meter has
+ *  actually moved past the pre-abort anchor, i.e. the persisted partial now
+ *  shows up in the measurement. Until then the flag waits (the resume turn
+ *  still reads the stale anchor); a flag older than ABORT_REANCHOR_MAX_AGE_MS
+ *  is dropped without touching state. */
+export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): void {
+    const t = session.transient;
+    const flag = t?.abortReanchor;
+    if (!t || !flag) return;
+    if (Date.now() - flag.at > ABORT_REANCHOR_MAX_AGE_MS) {
+        delete t.abortReanchor;
+        return;
+    }
+    if (!(tokenCount > flag.anchor)) return;
+    const nudge = session.state.nudge;
+    const oldRef = nudge.lastPerMessageNudgeTokens;
+    nudge.lastPerMessageNudgeTokens = Math.max(oldRef, tokenCount);
+    // The pending nudge (if any) died with its turn: clear the shown stamp and
+    // the per-tier cadence stamps together — the same full-reset shape as
+    // applyCompression (kernel compress.ts), so no stale half-threshold or
+    // tier-cadence residue survives the interrupt.
+    nudge.lastNudgeShownTokens = 0;
+    nudge.lastShownByTier = {};
+    delete t.abortReanchor;
+    loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}) (#5293)`);
+}
+
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
 // usage-grade baseline is momentarily absent (the rebuild request's own report
 // hasn't landed yet, or the upstream never reports one), so effectiveTokenCount
@@ -1148,23 +1283,26 @@ export function zeroStats(): Session["stats"] {
     return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
-    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
-    const existing = sessions.get(id);
-    if (existing) {
-        existing.lastSeen = Date.now();
-        existing.restored = false;
-        // Fill in protocol/upstream/label meta on an existing session if the caller
-        // now knows it (e.g. a session was created by loadAll without meta).
-        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
-        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
-        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
-        return existing;
-    }
-    // Memory miss: try reload from disk (e.g. after LRU eviction).
-    const store = getStore();
-    makeResidentRoom();
-    const reloaded = store.loadSync(id, meta);
+type SessionMeta = { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string };
+
+/** #4942 single-flight dedupe: the async reload seam opens a race window the
+ *  sync getSession never had — two concurrent first-touches of the same
+ *  evicted/DB-only session must build ONE resident entry, not two. */
+const pendingSessionLoads = new Map<string, Promise<Session>>();
+
+function stampExisting(existing: Session, meta?: SessionMeta): void {
+    existing.lastSeen = Date.now();
+    existing.restored = false;
+    // Fill in protocol/upstream/label meta on an existing session if the caller
+    // now knows it (e.g. a session was created by loadAll without meta).
+    if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+    if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+    if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
+}
+
+/** Shared tail of getSession / getSessionAsync: adopt the reloaded session
+ *  into the resident pool, or create a fresh one under the cap guard. */
+function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Session | null): Session {
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
         // activity, not the restored-from-disk state (#404).
@@ -1190,6 +1328,46 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     return session;
 }
 
+export function getSession(id: string, meta?: SessionMeta): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
+    const store = getStore();
+    makeResidentRoom();
+    return adoptOrCreate(id, meta, store.loadSync(id, meta));
+}
+
+/** #4942: async twin of getSession for the request path — on network storage
+ *  backends (mysql) the sync facade cannot read session state back, so a
+ *  memory miss must be able to fall to the DB row (store.loadAsync) instead
+ *  of silently starting a fresh session and losing every folded block at each
+ *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
+ *  Concurrent first-touches of the same id share ONE load (single-flight). */
+export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+    // #5044 publication race ported to the async seam: a request landing on a
+    // child id while its fork is mid-publication must fail loudly instead of
+    // adopting a fresh empty session that would wedge the publication.
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    const store = getStore();
+    makeResidentRoom();
+    let pending = pendingSessionLoads.get(id);
+    if (!pending) {
+        pending = (async () => adoptOrCreate(id, meta, await store.loadAsync(id, meta)))()
+            .finally(() => { pendingSessionLoads.delete(id); });
+        pendingSessionLoads.set(id, pending);
+    }
+    return pending;
+}
+
 export function createSession(id: string, meta?: Session["meta"]): Session {
     return {
         id,
@@ -1210,9 +1388,11 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 const publishingForks = new Set<string>();
 
+// #4942: async — the existence probe must reach the DB on network storage
+// backends, or a fork could silently clobber a DB-only child row.
 export async function publishForkSession(session: Session, parentId: string): Promise<void> {
     if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
-    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
     publishingForks.add(session.id);
     try {
         makeResidentRoom(sessionWeight(session));

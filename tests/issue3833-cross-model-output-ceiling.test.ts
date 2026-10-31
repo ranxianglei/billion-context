@@ -43,19 +43,24 @@ test("restoreOutputBudget: a below-ceiling water keeps the pre-existing raise-to
 });
 
 test("clampOutputBudget: window headroom above the model ceiling clamps to the ceiling (#3833)", () => {
-    // The incident numbers: requested 256000, input ~827069, window 1000000, ceiling
-    // 131072. Window headroom alone is floor(1000000 - 827069 - margin) with
-    // margin = ceil(827069 * 0.05) = 41354 -> 131577 (> 131072). The ceiling must
-    // bind so the emitted budget is 131072, not 131577.
-    const capped = clampOutputBudget(256_000, 827_069, 1_000_000, 131_072);
+    // Input 700k of a 1M window: even after the #5278 safety inflation (784000)
+    // the headroom cap floor(1000000 - 784000 - ceil(784000*0.05)) = 176800 sits
+    // ABOVE the declared ceiling 131072, so the ceiling must bind. (The original
+    // incident numbers no longer demonstrate binding — #5278's inflation pulls
+    // their headroom below the ceiling; see the negative test below.)
+    const capped = clampOutputBudget(256_000, 700_000, 1_000_000, 131_072);
     assert.equal(capped, 131_072, "clamped to the model's declared output ceiling, not the larger window headroom (#3833)");
 });
 
-test("clampOutputBudget: an absent ceiling is byte-identical to the legacy window-only cap (#3833 negative)", () => {
-    // Same numbers WITHOUT a ceiling -> the legacy headroom cap (131577) applies,
-    // proving the ceiling term only engages when a bound is actually known.
+test("clampOutputBudget: an absent ceiling gives the pure window-headroom cap on the safe estimate (#3833 negative)", () => {
+    // The incident numbers WITHOUT a ceiling -> the window-headroom cap on the
+    // #5278 safety-inflated estimate applies, proving the ceiling term only
+    // engages when a bound is actually known.
     const legacy = clampOutputBudget(256_000, 827_069, 1_000_000);
-    const margin = Math.max(2048, Math.ceil(827_069 * 0.05));
-    assert.equal(legacy, Math.floor(1_000_000 - 827_069 - margin), "no ceiling -> legacy window-only headroom cap unchanged");
-    assert.ok((legacy ?? 0) > 131_072, "the legacy cap sits ABOVE the ceiling — exactly the gap #3833 closes");
+    const safeEst = Math.ceil(827_069 * 1.12);
+    const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+    assert.equal(legacy, Math.floor(1_000_000 - safeEst - margin), "no ceiling -> pure window-headroom cap");
+    // #5278 note: the inflation pulls this incident-shape headroom BELOW the old
+    // 131577 line, so the ceiling term simply binds less often there.
+    assert.ok((legacy ?? 0) < 131_072, "safety-inflated headroom now sits under the ceiling in this shape");
 });

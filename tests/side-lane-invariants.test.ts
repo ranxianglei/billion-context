@@ -314,12 +314,15 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // (no threshold, no session state) consulted only to set sideIntent. #4438
 // adds isDshAutoReviewRequest — same category again: a pure dsh auto-review
 // shape predicate (no threshold, no session state) consulted to set sideIntent
-// and to keep stamped reviews off the |sub: fork path.
+// and to keep stamped reviews off the |sub: fork path. #5135 adds
+// isClaudeCodeTitleRequest — same category once more: a pure claude-code
+// title-sidecar shape predicate consulted to set sideIntent and to keep the
+// title call out of the #4774 raw-key anchor race.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
@@ -501,6 +504,84 @@ test("(L) #4352 anthropic persona gate is side-vetoed: side shape stays verbatim
         ], 1024);
         assert.equal(listSessions().length, sessions + 1, "full-budget sub persona forks its own |sub lane");
         assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the fork lane counts nowhere on the parent");
+    } finally {
+        await h.close();
+    }
+});
+
+// (#5135): the claude code session-title sidecar (terminal CLI, proxy mode,
+// header-less) fires ~1ms ahead of the first main turn under the SAME
+// x-claude-code-session-id. Pre-fix it claimed the raw-key anchor in the #4774
+// order resolver and the main conversation forked onto |sub:<fp> for the
+// session lifetime. Lane-symbol edit in handle.ts → dedicated lane-suite pin
+// per #2170 discipline: positive rows (title shape rides verbatim + passthrough
+// in BOTH arrival orders) and negative rows (tools present / missing wrapper /
+// non-CC client evidence → full pipeline, counted).
+test("(M) #5135 claude-code title sidecar: no anchor claim in either arrival order", async () => {
+    const h = await harness();
+    try {
+        const MAIN_SYS = "You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent.";
+        const TITLE_SYS = "Summarize the user's first message into a short title.";
+        const CC_TOOLS = [{ name: "Bash", description: "run a shell command", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }];
+        const TITLE_BLOB = "\u003csession\u003efix the flaky login test\u003c/session\u003e";
+        const ccSend = async (conv: string, system: string, msgs: unknown[], maxTokens: number, tools?: unknown[]) => {
+            const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-claude-code-session-id": conv },
+                body: JSON.stringify({ model: "claude-test", stream: false, max_tokens: maxTokens, system, messages: msgs, ...(tools ? { tools } : {}) }),
+            });
+            assert.equal(r.status, 200, await r.text());
+        };
+
+        // Positive A — the reported race: title call FIRST on the virgin id
+        // (own system, single wrapped blob, no tools, budget past the <=200
+        // heuristic) → verbatim keying + passthrough; counts nowhere, mints no
+        // fork; the main turn then lands on the RAW key.
+        const conv = "cc5136";
+        const hits0 = h.forwarded.length;
+        await ccSend(conv, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096);
+        assert.equal(h.forwarded.length, hits0 + 1, "the title call reaches the upstream");
+        assert.equal(resolveConversation(conv).session?.stats.requests ?? 0, 0, "the title call counts nowhere");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "the title call mints no |sub lane");
+        await ccSend(conv, MAIN_SYS, [mainMsg(0)], 256, CC_TOOLS);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the main turn lands on the RAW key");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, `the main conversation never forks, got ${listSessions().map((s) => s.id).join(", ")}`);
+
+        // Positive B — reverse arrival order: the anchor exists first; the
+        // title call afterwards still rides transparently.
+        const conv2 = "cc5136-rev";
+        await ccSend(conv2, MAIN_SYS, [mainMsg(0)], 256, CC_TOOLS);
+        assert.equal(resolveConversation(conv2).session!.stats.requests, 1, "the main turn anchors the raw key");
+        const hits1 = h.forwarded.length;
+        await ccSend(conv2, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096);
+        assert.equal(h.forwarded.length, hits1 + 1, "the later title call still reaches the upstream");
+        assert.equal(resolveConversation(conv2).session!.stats.requests, 1, "the later title call counts nowhere");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv2 + "|")).length, 0, "no fork in either order");
+
+        // Negative A — tools veto: the same wrapped blob WITH a tools surface
+        // is an agent turn → full pipeline, counted on the raw key (pre-fix
+        // behavior preserved; single shallow turn claims the raw key, no fork).
+        const conv3 = "cc5136-tools";
+        await ccSend(conv3, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096, CC_TOOLS);
+        assert.equal(resolveConversation(conv3).session!.stats.requests, 1, "tools-shape request rides the full pipeline");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv3 + "|")).length, 0, "single shallow turn claims the raw key, no fork");
+
+        // Negative B — missing wrapper: a plain first-prompt blob is not the
+        // title shape → full pipeline, counted.
+        const conv4 = "cc5136-nowrap";
+        await ccSend(conv4, TITLE_SYS, [{ role: "user", content: "fix the flaky login test" }], 4096);
+        assert.equal(resolveConversation(conv4).session!.stats.requests, 1, "unwrapped blob rides the full pipeline");
+
+        // Negative C — client-evidence gate: the SAME title shape from a
+        // non-claude-code client (x-acp-session source) is NOT exempted.
+        const conv5 = "cc5136-other";
+        const r5 = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv5 },
+            body: JSON.stringify({ model: "claude-test", stream: false, max_tokens: 4096, system: TITLE_SYS, messages: [{ role: "user", content: TITLE_BLOB }] }),
+        });
+        assert.equal(r5.status, 200, await r5.text());
+        assert.equal(resolveConversation(conv5).session!.stats.requests, 1, "non-CC client evidence gate: full pipeline, counted");
     } finally {
         await h.close();
     }
