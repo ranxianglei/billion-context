@@ -278,6 +278,7 @@
 |-----|------|---------|-----|-------------|
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有効コンテキストウィンドウ（トークン数または N%）：使用率の分母であり、事前チェックのハードウォール。最優先のウィンドウソース。 |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | 強制圧縮のナッジ閾値：履歴がこのウィンドウの割合を超えると、ナッジが即座に発火し、成長ゲートをバイパスする。ハードキャップではない。 |
+| `compress.nudgeEscalationPct` | number \| "N%" | 0.7 | — | ホスト側のエスカレーション・ナッジライン：使用率がこの比率を超えた時点で、カーネルの周期が沈黙している間でも圧縮ナッジを注入する（maxContextLimit 未満の上昇をカバー）。ホスト専用；maxContextLimit 以上で設定した場合、カーネルの圧力帯が先に引き継ぐ。 |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 履歴がこのウィンドウの割合を超えた場合の、過大ツール出力の緊急切り詰め（maxContextLimit 以上である必要がある）。 |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 経由で出力に確保されるウィンドウの割合の上限。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 成長ゲート：折りたたみ可能な範囲がベースライン成長をこのトークン数だけ上回った場合のみ、ナッジが発火する（設計上フラットであり、ウィンドウサイズに依存しない）。 |
