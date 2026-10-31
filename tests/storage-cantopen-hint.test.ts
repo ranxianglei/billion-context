@@ -89,7 +89,7 @@ test("hint: no-engine says Node.js 22+ on every platform", () => {
         try {
             const hint = sqliteOpenFailureHint("no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)");
             assert.ok(hint.includes("Node.js 22"), `expected a Node.js 22+ hint on ${p}, got: ${JSON.stringify(hint)}`);
-            assert.ok(hint.includes("upgrade Node.js"), `expected upgrade guidance on ${p}`);
+            assert.match(hint, /requires Node\.js 22 or newer/, `owner-minimal wording on ${p}`);
         } finally {
             restore();
         }

@@ -100,7 +100,7 @@ export function sqliteOpenFailureHint(err: string): string {
     // #4343-era no-engine failure (any platform): one actionable line is all
     // it needs — owner 2026-10-31: "报错只需要说 需要 nodejs 22 以上即可".
     if (/no SQLite engine available/i.test(err)) {
-        return " (built-in SQLite requires Node.js 22 or newer — upgrade Node.js to v22+)";
+        return "requires Node.js 22 or newer";
     }
     if (process.platform !== "win32") return "";
     if (/unable to open database file/i.test(err)) {
