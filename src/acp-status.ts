@@ -189,6 +189,21 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     });
     if (scope) return toolOk(base);
     const extra: string[] = [];
+    // #4975: eviction/cold-load leaves refs+blocks but NO readable message
+    // view (transient dropped on eviction, pluginSnapshot persists for fork
+    // sessions only, and the unified-store net recovered nothing or was
+    // absent). Every view-derived figure in this report — uncompressed
+    // breakdown, nudge, compressible ranges — then reads ZERO by artifact,
+    // not by measurement; a retained session must never read as "nothing to
+    // compress". Gated on retained state so a genuinely fresh session keeps
+    // today's exact output.
+    const retainedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
+    const retainedBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
+    const viewUnavailable = ctx.messages.length === 0 && (retainedRefs > 0 || retainedBlocks > 0);
+    if (viewUnavailable) {
+        extra.push("");
+        extra.push(`⚠️ LIVE MESSAGE VIEW UNAVAILABLE — the session retains ${retainedRefs} ref(s) and ${retainedBlocks} active block(s), but no message view is readable right now (resident-pool eviction or process restart, and the unified store has no readable copy). Every view-derived figure above and below (uncompressed breakdown, nudge, compressible ranges) reflects the MISSING VIEW, not an empty conversation. Any model request restores the view (#3126); re-run acp_status after that turn for true figures.`);
+    }
     // #3925 → #3011 C9: a fork that started with zero inherited blocks used to
     // be invisible here — "COMPRESSED BLOCKS — none" reads as "nothing folded
     // yet", not "inheritance was skipped". Name the gap and its recovery path:
@@ -231,7 +246,12 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(billedLine);
         if (estTotal > 0 && billed / estTotal >= 1.5) {
-            extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
+            // #4975: with an unavailable view the divergence IS the missing
+            // history, not a tokenizer gap — the marker above names it; the
+            // CJK attribution would send the agent hunting the wrong cause.
+            if (!viewUnavailable) {
+                extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
+            }
         }
     }
     // #3376: idle cache-keepalive state — only-when-observed (absent = zero
@@ -274,7 +294,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // deadlock invisible from the estimate view alone — tell the agent
             // further folding is futile (each fold rewrites the prefix and
             // forfeits the cache hit for almost-nothing reclaimed).
-            if (!nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
+            // #4975: maxPending=0 with an unavailable view is an artifact, not
+            // exhausted mass — the "little left to fold" advice would be wrong.
+            if (!viewUnavailable && !nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
                 extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
             }
             // #847: only advertise ranges the submit gate accepts — the gate

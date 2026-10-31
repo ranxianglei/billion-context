@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore, storageStatusLabel } from "./persist.js";
+import { getStore, peekStoredTailView, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -1829,8 +1829,35 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // as acp_status; on failure omit the nudge/ranges sections instead of
     // serving the stale snapshot.
     let nudge: NudgeDecision | undefined;
+    let panelViewUnreadable = false;
+    let panelRetained: { refs: number; blocks: number } | undefined;
+    let unprunedSource: CoreMessage[] | undefined = mem && mem.original.length > 0 ? mem.original : undefined;
     try {
-        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+        // #4975: eviction drops the transient view and cold-load rebuilds only
+        // persisted state — and pluginSnapshot persists for FORK sessions only,
+        // so an ordinary evicted session reads back with NO view while its
+        // refs/blocks survive. The panel then rendered "0 tool / 0 text" +
+        // max-compressible 0, indistinguishable from a fresh session. Bridge
+        // the same gap the compress lane bridges (#3982): peek the unified
+        // store's raw tail rows. Gated on the empty-view case — steady-state
+        // status reads pay nothing.
+        let messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+        if (messages.length === 0) {
+            const refs = Object.keys(session.state.messageRefs?.byRef ?? {}).length;
+            const blocks = session.state.blocks.filter((b) => b.active).length;
+            if (refs > 0 || blocks > 0) {
+                const stored = peekStoredTailView(session.id);
+                if (stored !== null && stored.length > 0) {
+                    messages = stored;
+                    // the raw client view IS the apply class (#2627/#3236)
+                    unprunedSource = stored;
+                    deps.log("info", `[${session.id}] [plugin] status: live view empty after eviction/cold-load — served ${stored.length} message(s) from the unified store's raw tail rows (#4975, same net as #3982)`);
+                } else {
+                    panelViewUnreadable = true;
+                    panelRetained = { refs, blocks };
+                }
+            }
+        }
         if (messages.length > 0) {
             // #833: base kernelConfig carries no file/provider/model compress
             // settings — render from the session's last resolved Config so the
@@ -1845,7 +1872,7 @@ export async function handlePluginStatus(conversationId: string, res: import("no
                 contentStore: contentStoreOf(session),
                 // #3236: screen advertised ranges on the apply class — the raw
                 // history, not this panel's processed view (#2627 split).
-                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
+                applyView: unprunedSource,
             }).nudge;
         }
     } catch {
@@ -1888,8 +1915,10 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             modelContextLimit,
             // #1320: countMessageTokens includes host-projected thinking mass
             // (signature-only blocks) on the same scale as the breakdown rows.
-            unprunedTokens: mem && mem.original.length > 0
-                ? mem.original.reduce((sum, m) => sum + countMessageTokens(m), 0) + systemPromptTokens
+            // #4975: unprunedSource also carries the store-recovered view when
+            // the live one is gone — same scale, so Session-only derivation holds.
+            unprunedTokens: unprunedSource !== undefined
+                ? unprunedSource.reduce((sum, m) => sum + countMessageTokens(m), 0) + systemPromptTokens
                 : undefined,
         });
     } catch {
@@ -1915,6 +1944,11 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     const lastModel = typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined;
     if (obd !== undefined && obd.model !== undefined && obd.value !== undefined && obd.model === lastModel) {
         preFooter.push(`⚠️ OUTPUT BUDGET: model "${obd.model}" has NO known output ceiling — outgoing max_tokens restored to ${obd.value} tokens from the client's own estimate (no ceiling to back it); longer replies may cut off at the output limit. Declare an output limit in bili config or set maxTokens on the host model item (#2904).`);
+    }
+    // #4975: the breakdown above shows zeros by ARTIFACT (no readable view),
+    // not by measurement — name it before the footer, same slot as advisory.
+    if (panelViewUnreadable && panelRetained !== undefined) {
+        preFooter.push(`⚠️ LIVE VIEW UNREADABLE: the message view is not in memory (resident-pool eviction or process restart) and the unified store has no readable copy — the "0 tool / 0 text" breakdown above reflects the MISSING VIEW, NOT an empty conversation (${panelRetained.refs} ref(s), ${panelRetained.blocks} active block(s) retained). Any model request restores the view (#3126); until then compressible ranges cannot be derived.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
@@ -2230,7 +2264,27 @@ export async function handlePluginTool(
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
             const mem = session.transient?.pluginMessages;
-            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            let messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            let compressMessages = mem && mem.original.length > 0 ? mem.original : undefined;
+            // #4975: acp_status is the surface agents use to decide what to
+            // fold — after eviction/cold-load it read an EMPTY view and
+            // reported 0 tool/0 text + max-compressible 0 while refs/blocks
+            // survived, steering agents away from folding a live session.
+            // Serve it the same stored view the compress lane recovers with
+            // (#3982), gated on acp_status + empty view so every other tool
+            // keeps its exact current path.
+            if (tool === "acp_status" && messages.length === 0) {
+                const refs = Object.keys(session.state.messageRefs?.byRef ?? {}).length;
+                const hasActiveBlock = session.state.blocks.some((b) => b.active);
+                if (refs > 0 || hasActiveBlock) {
+                    const stored = peekStoredTailView(session.id);
+                    if (stored !== null && stored.length > 0) {
+                        messages = stored;
+                        compressMessages = stored;
+                        deps.log("info", `[${session.id}] [plugin] acp_status: live view empty after eviction/cold-load — served ${stored.length} message(s) from the unified store's raw tail rows (#4975, same net as #3982)`);
+                    }
+                }
+            }
             const before = currentContextObservation(session);
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
@@ -2247,7 +2301,7 @@ export async function handlePluginTool(
                 // registered into new blocks' coverage and read back as
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
-                compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                compressMessages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
