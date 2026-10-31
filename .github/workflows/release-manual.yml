@@ -7,8 +7,8 @@ on:
         description: "Version to publish. Blank = auto next patch over npm latest."
         required: false
         default: ""
-      train:
-        description: "RETIRED 2026-10-25 (was: ship the open patch train). Patch lanes are now merge-gated: merging the final carry PR INTO the protected lane publishes (release-bugfix.yml pull_request_target). This box refuses; see reference/release.md."
+      skip_ci_gate:
+        description: "EMERGENCY ONLY (owner decision 2026-11-01): tick to skip the 'Full CI green at publish sha' gate — publishes right after the local typecheck+build pre-flight. LEAVE UNTICKED for normal releases; a ticked run ships code CI did not verify at this sha and logs a loud warning."
         type: boolean
         required: false
         default: false
@@ -35,36 +35,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Resolve the patch lane (train mode)
-        # Dual-lane model: `train=true` ships the CURRENT patch lane instead
-        # of master. The lane is DERIVED from the latest v* tag (never
-        # stored): `bugfix-v<latest-tag>` — every carried fix lives there
-        # until this release cuts the next tag. This release commit lands on
-        # the LANE branch and publishes via the carve-out channel on ship-PR
-        # merge — never via the direct master push below.
+      - name: Resolve the patch lane (retired 2026-10-25 — stub kept so steps.train references stay inert)
         id: train
-        if: inputs.train == true
+        if: false
         run: |
-          set -euo pipefail
-          echo "::error::train mode is RETIRED (2026-10-25) — its direct-push mechanics predate protected lanes. Ship the lane by MERGING its final carry PR INTO it (merge-gated publish in release-bugfix.yml); see reference/release.md"
-          exit 1
-          if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
-          TRAIN="bugfix-v${LAST#v}"
-          git fetch -q origin "+refs/heads/$TRAIN:refs/remotes/origin/$TRAIN" || true
-          if ! git show-ref --verify --quiet "refs/remotes/origin/$TRAIN"; then
-            git checkout --quiet -B train "refs/tags/$LAST"
-            git push -q origin "HEAD:$TRAIN"
-            echo "lane $TRAIN did not exist — cut it from tag $LAST (it will be EMPTY)"
-          else
-            git checkout --quiet -B train "origin/$TRAIN"
-          fi
-          if [ "$(git rev-parse HEAD)" = "$(git rev-parse refs/tags/$LAST^{commit})" ]; then
-            echo "::error::train mode: lane $TRAIN holds no carried fixes yet (tree == tag $LAST). Un-tick the box for a normal release, or label a fix PR 'backport' first."
-            exit 1
-          fi
-          echo "name=$TRAIN" >> "$GITHUB_OUTPUT"
-          echo "train mode: shipping $TRAIN ($(git rev-list --count "$LAST..HEAD") carried fix(es) over tag $LAST)"
-
+          echo "train mode is retired: patch lanes publish by merging their final carry PR INTO the protected lane (release-bugfix.yml); see reference/release.md"
       - name: Resolve version
         id: version
         run: |
@@ -271,7 +246,7 @@ jobs:
         # fallback path fixed (#3539) — without it ci.yml lands only the CORE
         # matrix at the release sha, and a windows+node-24-only regression
         # can publish before any CI leg sees it.
-        if: steps.push.outputs.direct == 'true'
+        if: ${{ steps.push.outputs.direct == 'true' && !inputs.skip_ci_gate }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
@@ -282,13 +257,18 @@ jobs:
           export GITHUB_SHA GITHUB_REF_NAME
           node scripts/release-ci-gate.mjs --dispatch
 
+      - name: Acknowledge CI-gate bypass (emergency checkbox)
+        if: ${{ inputs.skip_ci_gate && steps.push.outputs.direct == 'true' }}
+        run: |
+          echo "::warning::skip_ci_gate=true: publishing WITHOUT waiting for the full CI lanes at this sha. Only the pre-flight typecheck+build ran. This log line is the permanent audit record of the bypass."
+
       - name: Full CI gate (all lanes green at the release commit)
         # Hard precondition for publish: every required lane green at the
         # publish sha. Any red lane or timeout ⇒ release fails, nothing is
         # published. The dispatch step above already refused to fire when
         # master's head was not this commit (#3539); a later push does not
         # invalidate runs already landed at it.
-        if: steps.push.outputs.direct == 'true'
+        if: ${{ steps.push.outputs.direct == 'true' && !inputs.skip_ci_gate }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
