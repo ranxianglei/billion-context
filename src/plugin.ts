@@ -3042,7 +3042,14 @@ export async function pipePluginChatWithStrip(
             const d = ch?.["delta"];
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
-            if (dd["tool_calls"] !== undefined) {
+            // Some OpenAI-compatible upstreams (sglang) emit explicit nulls for
+            // every delta field ("tool_calls": null on plain text deltas). A null
+            // is not a tool call: treating it as one poisoned sawToolUse and made
+            // retryEmptyTurn (#732/#821) silently skip degenerate empty stops
+            // (thinking + stripped render tag + EOS) — the host saw the turn end
+            // cleanly with no visible output. Compare with != null so only real
+            // tool_calls presence counts.
+            if (dd["tool_calls"] != null) {
                 sawToolUse = true;
                 // #1501 observe-only: accumulate fragments per tool-call index;
                 // the stream-end settle warns when a name never arrives (#1484).
@@ -3700,7 +3707,10 @@ function openaiFrameHasToolCalls(choices: unknown): boolean {
     if (!Array.isArray(choices)) return false;
     for (const c of choices) {
         const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
-        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
+        // != null: sglang-style explicit "tool_calls": null deltas are not tool
+        // calls (see the sawToolUse fix above); they must not suppress the
+        // echo-residue audit either.
+        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] != null) return true;
     }
     return false;
 }
