@@ -559,6 +559,16 @@ export async function prepareAnthropic(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
+        // #4521: armed-but-silent window — a nudge plan with offered ranges
+        // that is NOT being delivered this round (backoff/cadence/decide
+        // veto). Without current refs the model guesses beyond the highest
+        // allocated ref on its next compress attempt, and every guess is a
+        // failed round-trip. Ride the same ephemeral trailing-user-message
+        // carrier as the nudge (never persisted, never in the client's
+        // re-sent history, prefix-cache safe).
+        if (turn.statusLine) {
+            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+        }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
         // Snapshot WITHOUT consuming: forward() commits the ids only once

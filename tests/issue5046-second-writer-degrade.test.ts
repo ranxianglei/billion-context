@@ -1,12 +1,25 @@
 /**
- * #5046/B (owner decision 2026-10-29): a live foreign bili process holding
- * <db>.lock must make the proxy sidecar REFUSE to become a persistent second
- * writer and degrade to legacy-only — with one actionable error line (names
- * BILI_SESSIONS_DIR + BILI_CONFIG_FILE + what is lost) and status-wire
- * visibility. Both directions pinned: live foreign holder ⇒ degrade; no
- * foreign holder ⇒ the original fast path is unchanged; mixed-version fleet
- * (old marker without lane) ⇒ conservative branch degrades; the report-only
- * default policy (CLI/export open paths) stays byte-identical.
+ * #5046/B policy evolution — final form (owner decision 2026-10-31):
+ * a live foreign bili process holding <db>.lock NEVER blocks startup again,
+ * whatever lanes are involved. The 2026-10-29→30 refuse-to-start policy
+ * (same-lane / unknown-lane double-write shapes threw StorageSecondWriterError
+ * so boot died before listen) was withdrawn because sharing one index.db IS
+ * the supported topology (#5082/#5091): SQLite WAL is multi-process safe on a
+ * local filesystem, inline lanes never register in the instance registry, and
+ * real mixed-version fleets coexisted on one store for hours without incident.
+ * The condition stays LOUD (no silent degradation): an info-level log line
+ * names the peer, and the web/status wire surfaces the foreign pid via
+ * recordSecondProcessOwner. The genuine hazard — two instances writing the
+ * SAME session — keeps its own per-session alarm (the #3923 split-brain
+ * contest, pinned in tests/issue-split-brain-surface.test.ts).
+ *
+ * Pinned here: live same-lane foreign holder ⇒ still opens (regression of the
+ * exact bricked shape); mixed-version fleet marker WITHOUT lane ⇒ still opens
+ * (regression of the pi-inline shape); cross-lane live holder ⇒ opens
+ * (supported topology unchanged); dead-pid stale lock ⇒ takeover unchanged;
+ * no foreign holder ⇒ original fast path unchanged; the
+ * StorageSecondWriterError export survives for external code that still
+ * imports/catches it even though nothing inside this repo throws it anymore.
  */
 import assert from "node:assert";
 import { spawn } from "node:child_process";
@@ -16,7 +29,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
-import { UnifiedStore } from "../src/storage/store.ts";
+import { UnifiedStore, StorageSecondWriterError } from "../src/storage/store.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { _resetStorageRuntimeStatusForTest, storageStatusWire } from "../src/storage/runtime-status.ts";
@@ -102,7 +115,7 @@ after(() => {
     else process.env.BILI_LAUNCHER_LANE = savedLauncherLane;
 });
 
-test("#5046/B: live same-lane foreign holder ⇒ sidecar degrades to legacy-only, lock untouched, actionable error + status wire", () => {
+test("#5046/B final (2026-10-31): live SAME-lane foreign holder ⇒ open succeeds (the formerly-bricked shape), info reported, lock taken over, status wire names the peer", () => {
     if (!engineAvailable) return;
     _resetStorageRuntimeStatusForTest();
     const state = freshState();
@@ -112,20 +125,38 @@ test("#5046/B: live same-lane foreign holder ⇒ sidecar degrades to legacy-only
     const logs: string[] = [];
     setLogCapture((_level, msg) => logs.push(msg));
     withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
+        // Owner decision 2026-10-31: whatever the lane math says, startup must
+        // NOT be blocked by a live second writer — this used to THROW here.
         const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
-        assert.equal(shadow, null, "must degrade to legacy-only (null), not open a second writer");
-        const refused = logs.find((m) => m.includes("unified storage REFUSED"));
-        assert.ok(refused, `actionable error line expected, got: ${logs.join(" | ")}`);
-        assert.ok(refused!.includes("BILI_SESSIONS_DIR") && refused!.includes("BILI_CONFIG_FILE"), "the fix must name both isolation vars");
-        assert.ok(refused!.includes("CCR") && refused!.includes("checkpoints"), "must say what degradation loses");
-        assert.equal(lockHolderPid(sessions), foreign.pid, "the foreign lock must NOT be stolen");
+        assert.ok(shadow, "a live same-lane foreign holder must NOT block startup anymore");
+        assert.ok(logs.some((m) => m.includes("supported topology")), "#5082/#5091 shared-topology info notice expected");
+        assert.ok(!logs.some((m) => m.includes("REFUSED")), "no refusal wording may remain");
+        assert.equal(lockHolderPid(sessions), process.pid, "lockfile takeover behavior is unchanged");
+        // Loud-but-not-blocking: the web/status wire still surfaces the peer.
         withEnv({ BILI_STORAGE_UNIFIED: "shadow" }, () => {
             const wire = storageStatusWire();
-            assert.equal(wire.degraded, true, "status wire must show degraded");
-            assert.equal(wire.effective, "legacy");
-            assert.ok(wire.reason?.startsWith("second-writer:"), `reason should be the pre-formatted refusal, got: ${wire.reason}`);
-            assert.ok((wire.reason ?? "").includes("BILI_SESSIONS_DIR"), "wire reason must carry the fix");
+            assert.ok(!wire.degraded, "coexistence is not a degradation");
+            assert.equal(wire.secondProcess?.pid, foreign.pid, "live foreign pid stays surfaced on the status wire");
         });
+        shadow!.close();
+    });
+    setLogCapture(null);
+});
+
+test("#5046/B final: mixed-version fleet — old marker WITHOUT lane (inline/pre-#5046) ⇒ open succeeds (formerly refused)", () => {
+    if (!engineAvailable) return;
+    _resetStorageRuntimeStatusForTest();
+    const state = freshState();
+    const sessions = freshSessions();
+    writeMarker(state, undefined);
+    writeLock(sessions, foreign.pid!);
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
+        const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+        assert.ok(shadow, "an unknown-lane peer must NOT block startup anymore (owner decision 2026-10-31)");
+        assert.ok(!logs.some((m) => m.includes("REFUSED")), "no refusal wording may remain");
+        shadow!.close();
     });
     setLogCapture(null);
 });
@@ -184,38 +215,11 @@ test("#5046/B negative: no foreign holder ⇒ original fast path (ENABLED line, 
     setLogCapture(null);
 });
 
-test("#5046/B: mixed-version fleet — old marker WITHOUT lane ⇒ conservative branch degrades", () => {
-    if (!engineAvailable) return;
-    _resetStorageRuntimeStatusForTest();
-    const state = freshState();
-    const sessions = freshSessions();
-    writeMarker(state, undefined);
-    writeLock(sessions, foreign.pid!);
-    const logs: string[] = [];
-    setLogCapture((_level, msg) => logs.push(msg));
-    withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
-        const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
-        assert.equal(shadow, null, "unknown peer lane must stay conservative (degrade), never grant info-level amnesty");
-        assert.ok(logs.some((m) => m.includes("unified storage REFUSED")));
-    });
-    setLogCapture(null);
-});
-
-test("#5046/B: default policy (CLI/export direct open) stays report-only — store returned, lock taken over", () => {
-    if (!engineAvailable) return;
-    _resetStorageRuntimeStatusForTest();
-    const state = freshState();
-    const sessions = freshSessions();
-    writeMarker(state, "dsh");
-    writeLock(sessions, foreign.pid!);
-    const logs: string[] = [];
-    setLogCapture((_level, msg) => logs.push(msg));
-    withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
-        const store = UnifiedStore.open(path.join(sessions, "index.db"));
-        assert.ok(store, "report-only paths (export/maintenance) keep running as before");
-        assert.ok(logs.some((m) => m.includes("supported topology")), "#5091 report-only coexistence info line");
-        assert.equal(lockHolderPid(sessions), process.pid, "report-only takeover unchanged");
-        store.close();
-    });
-    setLogCapture(null);
+test("#5046/B compat surface: StorageSecondWriterError is still exported (external importers/catch sites keep working) though nothing internal throws it", () => {
+    const err = new StorageSecondWriterError(12345, "/tmp/index.db");
+    assert.ok(err instanceof StorageSecondWriterError);
+    assert.ok(err instanceof Error);
+    assert.equal(err.name, "StorageSecondWriterError");
+    assert.equal(err.pid, 12345);
+    assert.equal(err.dbPath, "/tmp/index.db");
 });
