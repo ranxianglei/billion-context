@@ -33,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -1101,12 +1101,17 @@ async function handleRequest(
                        // continuity-aware order resolver so a history-disjoint
                        // ride forks onto its own |sub:<fp> lane while a
                        // continuing main conversation keeps the raw key on
-                       // order+content evidence (#2944).
+                       // order+content evidence (#2944). #5095 D1-C: when the
+                       // bili SubagentStart hook's token rides the first user
+                       // message, the resolver keys the dispatch per-TOKEN —
+                       // parallel same-type dispatches stop merging on the
+                       // persona fingerprint.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
                            (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
                            pluginReportedModel(req.headers),
+                           claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"

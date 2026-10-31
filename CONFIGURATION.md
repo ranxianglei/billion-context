@@ -204,6 +204,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803). Counts decoded size, not compressed on-disk bytes, so zstd archives cannot sneak past the RAM bound. A single file over the budget is never warmed. |
 | `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. |
 | `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | Per-SESSION hard cap on estimated resident bytes (#4788, decision #4792 D1-A). Unlike the pool soft cap — which can only evict OTHER cold sessions and never touches a sole-active session — this bounds ONE session: over the cap at a request-end boundary, its droppable fields (folded-block originals, metadata ledger, the raw tail beyond the bounded view) are forced back to disk even for a pool-exempt session, and the next turn transparently re-reads what it needs via narrow disk reads. Safe drops run at every request boundary as long as the last save has provably landed; the cap adds the per-session call-out (warn, throttled to 60 s). `0` disables the cap check. |
+| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | Escape hatch for the #4788 phase-2 resident drop: keep each session's content store pinned in memory (nothing ever folded away). Default off: after every proven-landed save, idle sessions' content stores are dropped between requests and re-read on demand from the unified index mirror or the sidecar file; sessions whose store has no provably-landed copy (e.g. fresh fork children) stay resident automatically. Set this if you need zero re-read latency at the cost of RAM. |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age threshold in days. |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
@@ -1881,6 +1882,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
