@@ -172,6 +172,33 @@ export const WEB_CLIENT = `(function () {
             if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
+    // #5319 (web half): resolved pack names from GET /__bili/packs — filled by
+    // loadConfig(); empty until then and the picker falls back to default+lean.
+    // #5328: per-name provenance + the user-pack dir (server authority) so the
+    // panel knows which entries 新建/编辑/删除 may touch.
+    let packNames = [];
+    let packSources = {};
+    let packUserDir = "";
+    // #5328: indirections so the inventory refresher lives at panel scope
+    // (loadConfig can call it before/after the quick-config block is built)
+    // while DOM and selection handling stay where the elements exist.
+    let packSelEl = null;
+    let rerenderQuick = null;
+    async function refreshPackInventory() {
+        try {
+            const p = await json(API_ROOT + "/packs");
+            if (!p || !Array.isArray(p.packs)) return;
+            packNames = p.packs.map((x) => String(x.name));
+            packSources = {};
+            for (const x of p.packs) packSources[String(x.name)] = String(x.source || "");
+            if (p.userDir) packUserDir = String(p.userDir) + "/";
+        } catch (e) { }
+        const prev = packSelEl ? packSelEl.value : "";
+        // Option reconstruction never fires the change listener — restore a
+        // still-present custom selection manually.
+        if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
+        if (rerenderQuick) rerenderQuick();
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
@@ -1452,6 +1479,21 @@ function changelogCatOf(rawLine) {
                 ab.hidden = true;
                 ab.classList.remove("show");
                 ab.innerHTML = "";
+            }
+        }
+        // #5221 phase 2 (owner ruling 2026-10-31): persistent local-resolver
+        // wedge — detection-only alarm banner beside the defect advisory.
+        const wb = $("resolver-wedge-banner");
+        if (wb) {
+            const w = d.resolverWedge;
+            if (w && w.tripped) {
+                wb.hidden = false;
+                wb.classList.add("show");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+            } else {
+                wb.hidden = true;
+                wb.classList.remove("show");
+                wb.innerHTML = "";
             }
         }
         const pb = $("plugin-advisory-banner");
@@ -3619,7 +3661,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     async function loadConfig() {
         try {
-            const cfg = await json(API_ROOT + "/config");
+                        const cfg = await json(API_ROOT + "/config");
+            // #5319/#5328: refresh the resolved pack inventory (+ per-name
+            // source + user-pack dir) so the picker and the editor stay in
+            // sync with what is actually on disk.
+            refreshPackInventory();
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -3826,7 +3872,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
-            ["default", "lean"].forEach((name) => {
+            (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
                 const o = document.createElement("option");
                 o.value = name;
                 o.textContent = name;
@@ -3979,15 +4025,134 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         plab.textContent = t("cfg.q_pack");
         pw.appendChild(plab);
         pw.appendChild(packSel);
+        packSelEl = packSel;
+        rerenderQuick = () => syncAll();
         box.appendChild(pw);
         const packNote = document.createElement("div");
         packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
         function updatePackNote() {
             if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
             else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else if (packSel.value === "chat") packNote.textContent = t("cfg.q_pack_chat_desc");
             else packNote.textContent = t("cfg.q_pack_custom");
         }
         box.appendChild(packNote);
+        // #5328: user-dir pack management — 新建/编辑/删除 under the dir the
+        // server reported via GET /__bili/packs (userDir). Builtin/shipped
+        // packs are read-only here; guidance says "override with a same-named
+        // file" instead of pretending they can be edited in place.
+        const pmRow = document.createElement("div");
+        pmRow.style.cssText = "margin:4px 0 2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+        const pmName = document.createElement("input");
+        pmName.type = "text";
+        pmName.className = "field-input mono";
+        pmName.placeholder = t("cfg.q_pack_name_ph");
+        pmName.style.cssText = "width:200px";
+        const pmNew = document.createElement("button");
+        pmNew.className = "btn sm";
+        pmNew.textContent = t("cfg.q_pack_new");
+        const pmEdit = document.createElement("button");
+        pmEdit.className = "btn sm";
+        pmEdit.textContent = t("cfg.q_pack_edit");
+        const pmDel = document.createElement("button");
+        pmDel.className = "btn sm";
+        pmDel.textContent = t("cfg.q_pack_del");
+        const pmStatus = document.createElement("span");
+        pmStatus.style.cssText = "flex-basis:100%;font-size:12px;color:#57606a";
+        pmRow.append(pmName, pmNew, pmEdit, pmDel, pmStatus);
+        const peBox = document.createElement("div");
+        peBox.hidden = true;
+        peBox.style.cssText = "margin:4px 0";
+        const peTa = document.createElement("textarea");
+        peTa.className = "editor mono codebox";
+        peTa.spellcheck = false;
+        peTa.rows = 10;
+        peTa.placeholder = '{\\n  "promptSections": {\\n    "philosophy": "…"\\n  }\\n}';
+        const peBtns = document.createElement("div");
+        peBtns.style.cssText = "margin-top:6px;display:flex;gap:8px";
+        const peSave = document.createElement("button");
+        peSave.className = "btn sm";
+        peSave.textContent = t("cfg.q_pack_save");
+        const peCancel = document.createElement("button");
+        peCancel.className = "btn sm";
+        peCancel.textContent = t("cfg.q_pack_cancel");
+        peBtns.append(peSave, peCancel);
+        peBox.append(peTa, peBtns);
+        box.append(pmRow, peBox);
+        let editingPack = "";   // "" = closed; otherwise the name being edited
+        let editingNew = false;
+        function pmSet(text, isError) {
+            pmStatus.textContent = text || "";
+            pmStatus.style.color = isError ? "#cf222e" : "#57606a";
+        }
+        function selectedIsUserPack(name) {
+            return packUserDir !== "" && String(packSources[name] || "").startsWith(packUserDir);
+        }
+        pmNew.addEventListener("click", () => {
+            editingPack = "";
+            editingNew = true;
+            pmName.value = "";
+            peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            peBox.hidden = false;
+            pmSet("");
+        });
+        pmEdit.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!name || name === "default") { pmSet(t("cfg.q_pack_ro_default"), true); return; }
+            if (!selectedIsUserPack(name)) {
+                const src = String(packSources[name] || "");
+                pmSet(src.startsWith("file:") ? t("cfg.q_pack_ro_project") : t("cfg.q_pack_ro_builtin"), true);
+                return;
+            }
+            try {
+                const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
+                peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                editingPack = name;
+                editingNew = false;
+                pmName.value = name;
+                peBox.hidden = false;
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        });
+        pmDel.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!selectedIsUserPack(name)) { pmSet(t("cfg.q_pack_ro_del"), true); return; }
+            if (typeof confirm === "function" && !confirm(t("cfg.q_pack_confirm_del", { name }))) return;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), { method: "DELETE" });
+                pmSet(t("cfg.q_pack_deleted"));
+                refreshPackInventory();
+            } catch (e) { pmSet(String(e), true); }
+        });
+        peCancel.addEventListener("click", () => {
+            peBox.hidden = true;
+            editingPack = "";
+            editingNew = false;
+            pmSet("");
+        });
+        peSave.addEventListener("click", async () => {
+            // No regex literals with backslashes here (WEB_CLIENT template):
+            // strip one leading path separator via charCode instead.
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            const name = (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            let parsed;
+            try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(parsed, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
         packSel.addEventListener("change", () => commit((d) => {
             if (!compressOf(d)) d.compress = {};
             if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;

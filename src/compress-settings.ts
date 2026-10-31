@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -167,6 +167,21 @@ interface SurfaceResolution {
     packVersion?: string;
 }
 
+function packResolver(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): ReturnType<typeof createPackResolver> {
+    // #5319: host-shipped packs sit between the user dirs and the kernel
+    // builtin registry — same-name user/project files still win, and the
+    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
+    // must not require a kernel/** change).
+    return createPackResolver([
+        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
+        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
+        shippedPacksSource,
+        builtinSource,
+    ]);
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
  *  host's resolver chain [project `./.billion-context/packs` > user
  *  `<configDir>/packs` > shipped host-bundled packs (`chat`, #5319) > kernel
@@ -180,16 +195,7 @@ export function resolveCompressSurfaceDetailed(
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    // #5319: host-shipped packs sit between the user dirs and the kernel
-    // builtin registry — same-name user/project files still win, and the
-    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
-    // must not require a kernel/** change).
-    const resolver = createPackResolver([
-        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
-        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
-        shippedPacksSource,
-        builtinSource,
-    ]);
+    const resolver = packResolver(dirs);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
@@ -199,6 +205,14 @@ export function resolveCompressSurfaceDetailed(
         return { surface: {}, packName: "default" };
     }
     return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+/** Every pack resolvable by name right now (first-wins per name) — the panel
+ *  picker's inventory (#5319 web half). Same chain as per-request resolution. */
+export function listResolvedPacks(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): Pack[] {
+    return packResolver(dirs).listPacks();
 }
 
 export function resolveCompressSurface(

@@ -181,7 +181,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `guardrails` | object | {} (all defaults) | — | Guardrails: tool-output guardrails for the pi/omp plugin bundles (#3066) plus the proxy-side text-run stream guard (#3406). |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default). |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output. |
-| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it. |
+| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call, issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). false / env 0 disables it. |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
@@ -275,7 +275,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
 | `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
-| `compress.promptPack` | string (builtin: "default", "lean", "chat") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → shipped pack → builtin; not gated by acknowledgePromptsRisk. |
+| `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
@@ -1492,7 +1492,25 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `string` (pack name, e.g. `"lean"`)
 - **Default:** `default` *(unset is equivalent — identity surface, kernel defaults everywhere)*
 - **Status:** ACTIVE
-- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the host's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **shipped** (`chat`) → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Built-in `chat` (#5319) rewrites only the compress philosophy and how-to-compress prose for long-term companionship / multi-session memory use; every other surface piece stays at the host defaults, and a same-name user or project file overrides it. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66.
+- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the host's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **shipped** (`chat`) → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Built-in `chat` (#5319) rewrites only the compress philosophy and how-to-compress prose for long-term companionship / multi-session memory use; every other surface piece stays at the host defaults, and a same-name user or project file overrides it. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66. The settings panel can manage the user-dir files directly — New/Edit/Delete for packs under `<configDir>/packs/` (the picker knows each entry's provenance; builtins and shipped packs stay read-only there, override them with a same-named user pack instead).
+
+**Pack file format.** Each `<dir>/<name>.json` holds one pack object. Unknown fields are dropped by the same sanitizer used on every load path (`sanitizePackSurface`), so extra metadata is harmless:
+
+```json
+{
+  "name": "my-pack",          // optional — defaults to the file name without .json
+  "version": "1.0.0",         // optional — shown by `bili pack list` and the panel
+  "description": "…",         // optional
+  "promptSections": {
+    "philosophy": "…",        // replace a whole system-prompt section; JSON null keeps the default
+    "howToCompress": "…"      // start from the tuned texts in src/chat-pack.ts
+  }
+}
+```
+
+Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`, `toolPrompts`, and `adapters` (host-specific extras, e.g. `"pi": { "promptSections": { … } }`). At least one recognized field must survive sanitizing or the file is refused when written.
+
+**Installing other people's packs.** Any npm package whose root contains a `bili-pack.json` (the pack object above) is installable: `bili pack install <pkg>` — also accepts `name@version`, scoped names, git URLs and `.tgz` paths (it delegates to your local `npm`, so registry auth behaves normally). Files land in `<configDir>/packs/` by default (`--project` targets `./.billion-context/packs/`; `--force` replaces an existing pack instead of refusing). Afterwards manage them from the settings panel, or via `bili pack remove <name>` / `bili pack list`.
 
 #### `reconcile`
 

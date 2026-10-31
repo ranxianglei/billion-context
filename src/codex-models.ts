@@ -88,8 +88,9 @@ function positiveWindow(value: unknown): number | undefined {
 
 /** #5243: which surface produced a codex-aligned window — named in the clamp
  *  log so "window clamped" stops claiming client metadata when no client
- *  metadata existed. */
-export type CodexWindowSource =
+ *  metadata existed. Module-local: never imported elsewhere (unused-exports
+ *  gate would flag a bare export). */
+type CodexWindowSource =
     | "client-metadata"
     | "codex-catalog"
     | "codex-models-cache"
