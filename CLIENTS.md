@@ -302,9 +302,12 @@ pure-stdlib Python module shipped inside the npm package:
   it; parent-pid watchdog tears it down when
   hermes exits; concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it
-  point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
-  `SSL_CERT_FILE` (bili's combined CA bundle — current hermes resolves ambient
-  trust there; `HERMES_CA_BUNDLE` stays set for older builds) —
+   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` (https)
+   and `HTTP_PROXY` / `http_proxy` (plain-http — per-scheme resolution, #5117) +
+   loopback kept direct in `NO_PROXY` / `no_proxy` (merged into any user value,
+   never overwritten) +
+   `SSL_CERT_FILE` (bili's combined CA bundle — current hermes resolves ambient
+   trust there; `HERMES_CA_BUNDLE` stays set for older builds) —
   `~/.hermes/config.yaml` is never touched. Provider https hosts are read from hermes' config and whitelisted
   for MITM; everything else blind-tunnels exactly like launcher mode. If no
   proxy can be made healthy, the plugin stands down silently and traffic goes
