@@ -111,11 +111,13 @@ async function runBringUp(t: BringUpCase) {
     const clock = fakeClock();
     const shutdownCalls: string[] = [];
     let spawnCalls = 0;
+    let spawned = false;
     let staleDead = false;
     const stalePort = t.stalePort ?? 18787;
     const staleOrigin = `http://127.0.0.1:${stalePort}`;
     const spawnImpl: SpawnFn = () => {
         spawnCalls += 1;
+        spawned = true;
         return makeFakeChild(CHILD_PID);
     };
     const handle = await ensureProxyRunning(
@@ -124,6 +126,10 @@ async function runBringUp(t: BringUpCase) {
         {
             fetchImpl: async (url) => ({ ok: url.startsWith(ORIGIN) }),
             fetchHealthInfo: async (origin) => {
+                // #4125: post-spawn, the settle branches verify responder identity
+                // through health INFO (not the bare probe) — model the real child,
+                // whose /__bili/health names its own pid.
+                if (spawned && origin === ORIGIN) return { ok: true, pid: CHILD_PID };
                 if (origin !== staleOrigin || staleDead) return { ok: false };
                 const info: { ok: boolean; instanceId: string; pid: number; watchdog: { armed: boolean }; version?: string } = {
                     ok: true,

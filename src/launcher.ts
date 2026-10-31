@@ -5234,6 +5234,23 @@ export async function ensureProxyRunning(
         // "child exited (code 0)" without the runtime path forced users to
         // guess WHICH program was actually spawned.
         const runtime = deps.nodeRuntime ?? resolveNodeRuntime();
+        // #4125: the port log is SHARED across spawns (append fd, size-based
+        // rotation only) — a zero-output failed child used to leave the
+        // PREVIOUS spawn's content behind, and every quoted sample misattributed
+        // it (observed: a week-old EADDRINUSE line quoted as the current
+        // failure's evidence). The header marks where THIS spawn's segment
+        // starts; advance spawnLogOffset past it so "N bytes since this spawn"
+        // counts only the child's own output (the header is launcher-written,
+        // not child output). Published BEFORE the spawn — like #707's starting
+        // marker — because a spawned child can write before a post-spawn
+        // append lands, which would push its earliest bytes (crash tails,
+        // listen lines) below the offset into "previous spawn" territory.
+        // childPid stays off the header (unknown pre-spawn); the child names
+        // itself in its own pid-tagged listen line (#4994).
+        try {
+            fs.appendFileSync(logPath, `\n=== bili spawn ${new Date(now()).toISOString()} launcherPid=${process.pid} port=${port} ===\n`);
+            spawnLogOffset = fs.statSync(logPath).size;
+        } catch { /* diagnostics only */ }
         try {
             child = spawnImpl(
                 runtime,
@@ -5291,6 +5308,9 @@ export async function ensureProxyRunning(
         // #1753: announce a healthy-but-foreign responder on the preferred port
         // at most once — silence would hide exactly the misroute this fix closes.
         let squatterAnnounced = false;
+        // #4125: same discipline for the PRIMARY settle branches (launchToken /
+        // registry-by-pid) — announce a contested claimed origin at most once.
+        let contestedAnnounced = false;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
@@ -5404,21 +5424,17 @@ export async function ensureProxyRunning(
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
-                // "0 bytes" alone cannot tell "child wrote nothing" from "output
+                // #4125/#4811: report bytes SINCE THIS SPAWN, not the whole
+                // shared file — a zero-output failed child must not be
+                // described by (or quoted from) a previous spawn's content.
+                // "0" still cannot tell "child wrote nothing" from "output
                 // rotated away" (rotatePortLogIfNeeded renames to .old before
                 // the fd is opened) — say which when the rotated half exists.
-                // Same honesty when the child appended NOTHING to a non-empty
-                // file: the bytes on disk then belong to an EARLIER spawn, and
-                // quoting them as this child's head is exactly the #4811
-                // misdirection (a shrunken file means rotation under us — the
-                // bytes left ARE ours, so the tail sample stands). The .old
-                // guard keeps that claim honest: if a rotation happened, the
-                // captured offset is untrustworthy and the sample path applies.
-                const rotatedFile = fs.existsSync(`${logPath}.old`);
-                const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
-                if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
-                if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
-                return `, ${size} bytes${rotated}${logHeadSample()}${logTailSample()}`;
+                const own = Math.max(0, size - spawnLogOffset);
+                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
+                return own <= 0
+                    ? `, ${own} bytes since this spawn — EMPTY, the child produced no output of its own (any earlier content in this shared file belongs to previous spawns)${rotated}`
+                    : `, ${own} bytes since this spawn${rotated}${logHeadSample()}${logTailSample()}`;
             } catch {
                 return "";
             }
@@ -5470,6 +5486,30 @@ export async function ensureProxyRunning(
             return { text: `last health probe failed with ${d}`, selfHealthy: false };
         };
 
+        // #4125: capture WHAT the planned port was doing at SPAWN time. The
+        // failure-time diagnosis (diagnosePort) only sees the END state; the
+        // start state separates "predecessor still draining/exiting on the
+        // port" from "child wedged on something unrelated" (e.g. a storage lock
+        // left by a forced exit) — the two read identically at the end, and in
+        // the field case the end state was plain ECONNREFUSED while the real
+        // story was the start state.
+        const initialPortNote = await (async (): Promise<string> => {
+            const origin = proxyOrigin(opts.host, port);
+            let info: HealthInfo | undefined;
+            let det: ProbeOutcome = { ok: false, detail: "probe error" };
+            try {
+                const [i, d] = await Promise.all([fetchHealthInfo(origin), fetchDetail(healthUrl(origin))]);
+                info = i;
+                det = d;
+            } catch { /* observability only — keep the generic clause */ }
+            if (info?.ok) return `healthy bili instance${info.pid !== undefined ? ` (pid ${info.pid})` : ""}`;
+            if (det.ok) return "foreign HTTP answer";
+            const d = det.detail ?? "unknown error";
+            if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) return "nothing listening";
+            if (/^HTTP \d{3}$/.test(d)) return `${d} answer`;
+            if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) return "busy (TCP up, no health answer)";
+            return `probe failed (${d})`;
+        })();
         const deadline = now() + SPAWN_BUDGET_MS;
         // #2187: announce the phase boundary once — a live child past the
         // initial window is still being waited for, and the log is the only
@@ -5480,19 +5520,33 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${(await diagnosePort(true)).text}) (log: ${logPath}${logTail()})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${(await diagnosePort(true)).text}; at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-                if (await probeHealth(inst.origin, fetchImpl)) {
+                // #4125: the same identity discipline as the preferred-port
+                // fallback below — a healthy answer at the origin the child
+                // CLAIMED is proof of our child only while it does not positively
+                // name a different pid. A foreign responder that took over that
+                // address must not be exported to the client as ours (one writer
+                // per copy, #991/#1225); absent pid info keeps legacy semantics.
+                const claimed = await fetchHealthInfo(inst.origin);
+                const healthy = claimed?.ok ?? (await probeHealth(inst.origin, fetchImpl));
+                if (healthy && (claimed?.pid === undefined || child.pid === undefined || claimed.pid === child.pid)) {
                     // #1660: settle the lane's sticky record on the port the
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
                     settleZonePort(inst.port);
                     startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
+                }
+                if (healthy && claimed?.pid !== undefined && child.pid !== undefined && !contestedAnnounced) {
+                    contestedAnnounced = true;
+                    attachDiag(
+                        `bili: ${inst.origin} answers health (pid ${claimed.pid}) but this launcher's child is pid ${child.pid} — refusing to claim a contested origin (#4125)`,
+                    );
                 }
                 continue;
             }
@@ -5506,10 +5560,24 @@ export async function ensureProxyRunning(
             // the preferred-port fallback below, minus the port assumption.
             if (child.pid !== undefined) {
                 const mine = listRegistry().find((e) => e.pid === child.pid);
-                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
-                    settleZonePort(mine.port);
-                    startOwnerHeartbeat(mine.origin, watchPid);
-                    return { origin: mine.origin, port: mine.port, child, logPath };
+                // #4125: same contested-origin discipline as the launchToken
+                // branch above — the registry record vouches for the pid, but a
+                // healthy answer at that origin naming a DIFFERENT pid is a
+                // foreign responder, not our child.
+                if (mine && mine.origin !== "") {
+                    const claimed = await fetchHealthInfo(mine.origin);
+                    const healthy = claimed?.ok ?? (await probeHealth(mine.origin, fetchImpl));
+                    if (healthy && (claimed?.pid === undefined || claimed.pid === child.pid)) {
+                        settleZonePort(mine.port);
+                        startOwnerHeartbeat(mine.origin, watchPid);
+                        return { origin: mine.origin, port: mine.port, child, logPath };
+                    }
+                    if (healthy && claimed?.pid !== undefined && !contestedAnnounced) {
+                        contestedAnnounced = true;
+                        attachDiag(
+                            `bili: ${mine.origin} answers health (pid ${claimed.pid}) but this launcher's child is pid ${child.pid} — refusing to claim a contested origin (#4125)`,
+                        );
+                    }
                 }
             }
             // Fallback for a child that cannot write the instance file (broken
@@ -5631,7 +5699,7 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
         }
         // #4994: where THIS child says it bound, parsed from its own log
         // segment ([spawnLogOffset..end] — no other spawn's lines can answer;
@@ -5704,9 +5772,9 @@ export async function ensureProxyRunning(
         }
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (log: ${logPath}${logTail()})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }

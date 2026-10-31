@@ -94,7 +94,8 @@ test("#3116 timeout with nothing listening: error says so, names the live child,
     const msg = (err as Error).message;
     assert.match(msg, new RegExp(`did not become healthy within ${SPAWN_BUDGET_MS}ms`));
     assert.ok(msg.includes(`nothing is listening on port ${PORT} — the spawned child (still alive, pid 42471) never bound it`), msg);
-    assert.ok(msg.includes("0 bytes — EMPTY, the child produced no output of its own"), msg);
+    // #4125: the size is now scoped to THIS spawn's segment of the shared file.
+    assert.ok(msg.includes("0 bytes since this spawn — EMPTY"), msg);
     assert.deepEqual(kills, ["SIGKILL"], "the abandoned child must be hard-killed exactly once");
     const slowStart = stderrLines.find((l) => l.includes("extending wait"));
     assert.ok(slowStart, "the slow-start notice must still fire");
@@ -211,7 +212,8 @@ test("#3116 early exit: code stays in the message, diagnosis marks the child alr
     const msg = (err as Error).message;
     assert.match(msg, /exited before becoming healthy \(code 1\)/);
     assert.ok(msg.includes(`nothing is listening on port ${PORT} — the spawned child (already exited, pid 42474) never bound it`), msg);
-    assert.ok(msg.includes("0 bytes — EMPTY, the child produced no output of its own"), msg);
+    // #4125: same scoped-wording change as the timeout case above.
+    assert.ok(msg.includes("0 bytes since this spawn — EMPTY"), msg);
 });
 
 test("#3116 describeProbeFailure extracts the socket error class", () => {
