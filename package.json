@@ -105,7 +105,6 @@
     "hermes-plugin",
     "paper/*.md",
     "paper/figures/*.png",
-    "website/articles.json",
     "website/blog/posts"
   ],
   "pi": {
