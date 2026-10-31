@@ -78,6 +78,9 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // only queue inside the same pass. Ranges past the cap fold through the
 // serial walk in later rounds exactly as before.
 const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
+// #5022: material-caliber divergence threshold for the escalation banner's
+// second-caliber note (display-only — budget math never reads it).
+const CALIBER_NOTE_DIVERGENCE = 1.25;
 // #2952 Design A: bounded tier-distillation recovery. When raw-range folding
 // alone cannot close the window gap but distilling existing lower-tier BLOCKS
 // (T1->T2, T2->T3) can, preflight performs the distillation ITSELF — the model
@@ -1794,7 +1797,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
     const roundBudget = Math.min(MAX_PREFLIGHT_ROUNDS * 2, Math.max(MAX_PREFLIGHT_ROUNDS, Math.ceil(MAX_PREFLIGHT_ROUNDS * overshootRatio)));
     if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
-        deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
+        // #5022: entryTokens mixes two calibers (last-measured context vs raw-resend
+        // estimate); when they diverge materially the very next round line reads as
+        // fold loss (1.81M banner vs 1.14M round in the incident log). Name the
+        // second caliber — display only; budgets keep judging entryTokens exactly
+        // as before (#2383 once-per-invocation discipline).
+        const measured = baselineKnown ? deps.session.stats.lastInputTokens : 0;
+        let caliberNote = "";
+        if (measured > 0 && entryLocal > measured * CALIBER_NOTE_DIVERGENCE) {
+            caliberNote = ` (entry estimate from raw resend; last-measured context ~${measured} tok)`;
+        } else if (measured > entryLocal * CALIBER_NOTE_DIVERGENCE) {
+            caliberNote = ` (entry estimate from measured baseline; raw-resend estimate ~${entryLocal} tok)`;
+        }
+        deps.log("warn", `[preflight] payload ~${entryTokens} tok${caliberNote} vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
     }
     // #2383: the fold MECHANISM is decided once per invocation from the entry
     // overshoot (same discipline as baselineKnown — no mid-loop regime flips).
