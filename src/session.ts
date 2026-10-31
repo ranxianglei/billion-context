@@ -1000,7 +1000,10 @@ function deepSizeOf(value: unknown): number {
     return size(value);
 }
 
-function sessionWeight(session: Session): number {
+/** #4788 D1-A: exported so SessionStore's per-session hard-cap gate can reuse
+ * the SAME estimate as __bili/memory (single source of truth for "how heavy
+ * is this resident session right now"). */
+export function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
@@ -1145,23 +1148,26 @@ export function zeroStats(): Session["stats"] {
     return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
-    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
-    const existing = sessions.get(id);
-    if (existing) {
-        existing.lastSeen = Date.now();
-        existing.restored = false;
-        // Fill in protocol/upstream/label meta on an existing session if the caller
-        // now knows it (e.g. a session was created by loadAll without meta).
-        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
-        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
-        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
-        return existing;
-    }
-    // Memory miss: try reload from disk (e.g. after LRU eviction).
-    const store = getStore();
-    makeResidentRoom();
-    const reloaded = store.loadSync(id, meta);
+type SessionMeta = { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string };
+
+/** #4942 single-flight dedupe: the async reload seam opens a race window the
+ *  sync getSession never had — two concurrent first-touches of the same
+ *  evicted/DB-only session must build ONE resident entry, not two. */
+const pendingSessionLoads = new Map<string, Promise<Session>>();
+
+function stampExisting(existing: Session, meta?: SessionMeta): void {
+    existing.lastSeen = Date.now();
+    existing.restored = false;
+    // Fill in protocol/upstream/label meta on an existing session if the caller
+    // now knows it (e.g. a session was created by loadAll without meta).
+    if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+    if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+    if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
+}
+
+/** Shared tail of getSession / getSessionAsync: adopt the reloaded session
+ *  into the resident pool, or create a fresh one under the cap guard. */
+function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Session | null): Session {
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
         // activity, not the restored-from-disk state (#404).
@@ -1187,6 +1193,46 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     return session;
 }
 
+export function getSession(id: string, meta?: SessionMeta): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
+    const store = getStore();
+    makeResidentRoom();
+    return adoptOrCreate(id, meta, store.loadSync(id, meta));
+}
+
+/** #4942: async twin of getSession for the request path — on network storage
+ *  backends (mysql) the sync facade cannot read session state back, so a
+ *  memory miss must be able to fall to the DB row (store.loadAsync) instead
+ *  of silently starting a fresh session and losing every folded block at each
+ *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
+ *  Concurrent first-touches of the same id share ONE load (single-flight). */
+export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+    // #5044 publication race ported to the async seam: a request landing on a
+    // child id while its fork is mid-publication must fail loudly instead of
+    // adopting a fresh empty session that would wedge the publication.
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    const store = getStore();
+    makeResidentRoom();
+    let pending = pendingSessionLoads.get(id);
+    if (!pending) {
+        pending = (async () => adoptOrCreate(id, meta, await store.loadAsync(id, meta)))()
+            .finally(() => { pendingSessionLoads.delete(id); });
+        pendingSessionLoads.set(id, pending);
+    }
+    return pending;
+}
+
 export function createSession(id: string, meta?: Session["meta"]): Session {
     return {
         id,
@@ -1207,9 +1253,11 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 const publishingForks = new Set<string>();
 
+// #4942: async — the existence probe must reach the DB on network storage
+// backends, or a fork could silently clobber a DB-only child row.
 export async function publishForkSession(session: Session, parentId: string): Promise<void> {
     if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
-    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
     publishingForks.add(session.id);
     try {
         makeResidentRoom(sessionWeight(session));
