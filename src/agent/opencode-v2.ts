@@ -63,6 +63,10 @@ const V2_SYNTHETIC_VISIBLE_MAX = 1024;
 // status panel whose leading lines carry the essence, its tail (LINE ITEMS)
 // is the payload, so it gets a wider visible cap than V2_SYNTHETIC_VISIBLE_MAX.
 const V2_CACHE_REPORT_VISIBLE_MAX = 8192;
+// #5315: dedicated id namespace of the auto-generated /acp + /acp-cache report messages — the
+// outgoing hooks filter by this exact id shape, so manually pasted reports can never be caught.
+const BILI_REPORT_ID_PREFIX = "msg_bili_report_";
+const BILI_REPORT_ID_RE = new RegExp(`^${BILI_REPORT_ID_PREFIX}[0-9a-f]{32}$`);
 
 type V2Registration = { dispose?: () => void | Promise<void> };
 
@@ -526,7 +530,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     const reg = await ctx.session.hook(name, (event) => {
                         if (!event.messages) return;
                         const kept = event.messages.filter((message) => !(
-                            message.role === "user" && /^msg_bili_report_[0-9a-f]{32}$/.test(message.id ?? "")
+                            message.role === "user" && BILI_REPORT_ID_RE.test(message.id ?? "")
                         ));
                         event.messages.splice(0, event.messages.length, ...kept);
                     });
@@ -539,7 +543,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         }
         const renderReport = async (sid: string, text: string, description: string): Promise<void> => {
             await ctx.session?.synthetic?.({
-                ...(reportFiltering ? { id: `msg_bili_report_${randomUUID().replaceAll("-", "")}` } : {}),
+                ...(reportFiltering ? { id: `${BILI_REPORT_ID_PREFIX}${randomUUID().replaceAll("-", "")}` } : {}),
                 sessionID: sid,
                 text: reportFiltering ? `\`\`\`text\n${text}\n\`\`\`` : V2_SYNTHETIC_TEXT,
                 description,
