@@ -671,6 +671,14 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         } else {
             notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
         }
+    } else if (dac === "1") {
+        // Pre-fix installs wrote DISABLE_AUTO_COMPACT=1 even when the URL stayed
+        // foreign, so an upgrade alone would keep native auto-compaction OFF while
+        // bili is bypassed — the original deadlock survives. The key is bili-owned
+        // (remove strips it), so drop only the harmful sticky value and say so;
+        // .bili-bak keeps it restorable.
+        delete env.DISABLE_AUTO_COMPACT;
+        notes.push(`env.DISABLE_AUTO_COMPACT removed (leftover "1" from a pre-fix install — bili bypasses this session, so native auto-compaction is restored; restore from .bili-bak if you set it yourself)`);
     } else {
         notes.push(`env.DISABLE_AUTO_COMPACT left untouched (bili proxy bypassed — foreign ANTHROPIC_BASE_URL)`);
     }
