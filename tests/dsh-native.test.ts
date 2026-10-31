@@ -2053,11 +2053,65 @@ test("#2924 gate `threw` attribution: bounded settle-retry recovers and CLAIMS t
                 if (throws <= 2) throw new Error("agent initiator scope is disposed");
                 return { session: { id: "s2924a" } };
             };
-            assert.equal(await gate("https://api.gate-2924a.test/v1/chat/completions"), true, "recovered attribution claims the request");
+            // #4841: init-carrying call — the fetch-lane (HTTP) shape; the
+            // no-init shape is the WS shape and now settles synchronously.
+            assert.equal(await gate("https://api.gate-2924a.test/v1/chat/completions", { bytes: 16 }, {}), true, "recovered attribution claims the request");
             assert.equal(throws, 3, "initial throw + exactly two settle-retries");
             const content = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
             // #3651: non-public upstream hosts are masked in the durable line (paste-safe sink).
             assert.match(content, /attribution recovered after 2 settle-retries — https:\/\/<private-host>\/v1\/chat\/completions claimed \(#2924\)/);
+        });
+    } finally {
+        _setThrewRetryForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4841 gate `threw` no-init (WS-shaped) call: sync verdict class; init keeps the async settle-retry", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4841-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4841-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
+            const origCI = ctx.agents.currentInitiator;
+            ctx.agents.currentInitiator = () => {
+                throw new Error("agent initiator scope is disposed");
+            };
+            const url = "https://api.gate-4841.test/v1/chat/completions";
+            // THE pin (#4841): the WS-lane consumer compares its gate result
+            // with === false WITHOUT awaiting — the no-init (WS-shaped) threw
+            // verdict must be synchronously false, not a Promise resolving to
+            // false later (a Promise never matches and the refusal was lost).
+            const raw = gate(url);
+            assert.equal(raw, false, "no-init threw verdict is synchronously false (pre-await)");
+            assert.equal(refusedLines().length, 1, "sync refusal logs the standard once-per-endpoint line");
+            assert.match(refusedLines()[0]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
+            assert.equal(_attributionHealthForTest().threwStreak, 0, "fast path attempts no settle → consumes no give-up budget");
+            // negative: WITH init the verdict stays a Promise — the settle-retry
+            // path is untouched for HTTP-shaped calls.
+            const withInit = gate(url, { bytes: 16 }, {});
+            assert.ok(withInit instanceof Promise, "init-present call keeps the async settle-retry path");
+            assert.equal(await withInit, false, "settle-retry still refuses a persistently thrown scope");
+            assert.equal(_attributionHealthForTest().threwStreak, 1, "only the settled call consumed settle budget");
+            assert.equal(refusedLines().length, 1, "same endpoint, same state → count continues silently");
+            // recovery: the top-of-gate probe claims again on ok attribution —
+            // self-heal is not lost by skipping settle on the sync path.
+            ctx.agents.currentInitiator = origCI;
+            ctx.setInitiator({ session: { id: "s4841" } });
+            assert.equal(gate(url), true, "recovered attribution claims again");
+            assert.equal(gate(url), true, "…and the no-init shape too (ok arm is sync in every case)");
         });
     } finally {
         _setThrewRetryForTest();
@@ -2362,16 +2416,17 @@ test("#3581 gate degradation reports event-driven; give-up latch stops pointless
             // initial attributionOf, the one settle-retry, the oversize arm's
             // window resolution (sessionModelTargetOf), and the final
             // refuse(attributionOf) re-probe → 4. The latch removes exactly the
-            // settle-retry probe → 3.
-            assert.equal(await gate(url), false);
+            // settle-retry probe → 3. #4841: calls are init-carrying (the
+            // fetch-lane shape) — the no-init shape now settles synchronously.
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes, 4, "request 1: four probes while settling");
-            assert.equal(await gate(url), false);
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes, 8, "request 2: still settling");
-            assert.equal(await gate(url), false);
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes, 12, "request 3: streak reaches giveUpStreak → latch arms");
-            assert.equal(await gate(url), false);
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes, 15, "request 4: latch skips the settle loop — one fewer probe");
-            assert.equal(await gate(url), false);
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes, 18, "request 5: reduced cost holds");
             const health = _attributionHealthForTest();
             assert.equal(health.state, "threw");
@@ -2420,11 +2475,13 @@ test("#3581 recovery clears the episode, re-arms settle-retry, and reports ok", 
                 throw new Error("agent initiator scope is disposed");
             };
             const url = "https://api.gate-3581b.test/v1/chat/completions";
-            for (let i = 0; i < 3; i++) assert.equal(await gate(url), false);
+            // #4841: init-carrying (fetch-lane shape) throughout — the no-init
+            // shape settles synchronously and would not arm the latch.
+            for (let i = 0; i < 3; i++) assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(_attributionHealthForTest().gaveUp, true, "latch armed by three exhausted throws");
             // a new agent scope lands (host re-created it): the first ok claim heals.
             ctx.agents.currentInitiator = () => ({ session: { id: "s3581b" } });
-            assert.equal(await gate(url), true, "recovered attribution claims immediately");
+            assert.equal(await gate(url, { bytes: 16 }, {}), true, "recovered attribution claims immediately");
             const healed = _attributionHealthForTest();
             assert.deepEqual({ state: healed.state, refusals: healed.refusals, since: healed.since }, { state: "ok", refusals: 0, since: 0 });
             assert.equal(healed.threwStreak, 0);
@@ -2438,7 +2495,7 @@ test("#3581 recovery clears the episode, re-arms settle-retry, and reports ok", 
                 probes2 += 1;
                 throw new Error("agent initiator scope is disposed again");
             };
-            assert.equal(await gate(url), false);
+            assert.equal(await gate(url, { bytes: 16 }, {}), false);
             assert.equal(probes2, 4, "settle-retry active again after recovery (full 4-probe cost)");
             const reBroken = _attributionHealthForTest();
             assert.equal(reBroken.state, "threw");
