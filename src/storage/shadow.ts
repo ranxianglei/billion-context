@@ -755,13 +755,13 @@ export class UnifiedShadow {
     }
 
     /** Absolute-seq tip of the session's message log (+1 = next free seq).
-     *  Used as a checkpoint's seq_at. */
+     *  Used as a checkpoint's seq_at. #4739 follow-up: one MAX(seq) aggregate
+     *  over live rows (#4730's lastLiveSeq) instead of materializing the whole
+     *  log (rows + CAS reads + media hydration) just to reduce it to a scalar. */
     sessionTipSeq(sessionId: string): number {
         if (this.sync === null) return 0;
         this.assertLive();
-        let tip = 0;
-        for (const m of this.sync.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
-        return tip;
+        return (this.sync.lastLiveSeq(sessionId) ?? -1) + 1;
     }
 
     /** #3301: message rows for specific ids (+ seq±1 neighbors) — stored
@@ -1220,9 +1220,8 @@ export class UnifiedShadow {
 
     sessionTipSeqAsync(sessionId: string): Promise<number> {
         return this.viaAsync(0, () => this.sessionTipSeq(sessionId), async () => {
-            let tip = 0;
-            for (const m of await this.backend!.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
-            return tip;
+            const max = await this.backend!.lastLiveSeq(sessionId);
+            return (max ?? -1) + 1;
         });
     }
 
