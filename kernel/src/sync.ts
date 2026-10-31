@@ -108,6 +108,11 @@ export function syncBlocks(
     // the host's superseded map forever (the "one-time" restamp stops being
     // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
     refLedgerAligned: state.refLedgerAligned,
+    // #4313: first-sight time stamps must survive the sync clone — dropping
+    // them here would re-mint every stamped message a fresh wall-clock value
+    // on the very next turn (timestamp drift = receipt range churn, and the
+    // stored-value contract of the tag's time attribute broken).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so

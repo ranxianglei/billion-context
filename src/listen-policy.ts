@@ -13,6 +13,14 @@
  * twin, not a predecessor — nothing is draining, so the newcomer exits loudly
  * instead of hopping (the duplicate loses; the serving instance keeps serving
  * and the next launch attaches to it). Applies to marked AND unmarked spawns.
+ *
+ * #4125: a holder that PROVES itself a strictly NEWER same-lane build is
+ * neither twin nor predecessor — nothing is draining there either, so no wait
+ * or ladder variant may touch the port (laddering would fork the lane into a
+ * dual instance behind a port nobody routes to anymore). The newcomer exits
+ * with the adoption signal (#3654 code 3) so its spawner rides the newer one
+ * instead of deadlocking behind it (#3544 reverse: an older generation can't
+ * attach and rotation only reaches strictly OLDER residents).
  */
 /** Internal spawn-channel env set by performSelfRestart onto its replacement
  *  (#3044): the marked process must bind-or-die on exactly the freed port. */
@@ -47,6 +55,9 @@ export interface EaddrinuseContext {
     upgradeReplacement: boolean;
     /** #3044 follow-up: a live same-lane instance running our build holds the port. */
     twinHolds: boolean;
+    /** #4125: a strictly NEWER same-lane build (verified by live health
+     *  version, not just the registry claim) holds the port. */
+    newerHolderHolds: boolean;
     launchToken: boolean;
     strictPort: boolean;
     attempts: number;
@@ -57,10 +68,14 @@ export interface EaddrinuseContext {
 }
 
 export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
-    // The twin rule outranks everything else: a healthy same-build peer is
-    // serving real traffic on that port, so no wait/ladder variant may touch
-    // it — the newcomer dies loudly regardless of its own spawn rights.
-    if (ctx.twinHolds) return { kind: "fail-fast", reason: "twin-collision" };
+    // The twin rule outranks everything else: a healthy peer already serves
+    // real traffic on that port, so no wait/ladder variant may touch it — the
+    // newcomer dies loudly regardless of its own spawn rights. Same verdict for
+    // a strictly NEWER holder (#4125): riding it is the spawner's job via the
+    // adoption signal below, and waiting/laddering only strands traffic in the
+    // classic two-install deadlock (older lane can't attach; #3544 rotation
+    // only reaches strictly older residents).
+    if (ctx.twinHolds || ctx.newerHolderHolds) return { kind: "fail-fast", reason: "twin-collision" };
     if (ctx.upgradeReplacement) {
         if (ctx.predecessorTicksLeft > 0 && ctx.predecessorHolds) {
             return { kind: "wait-predecessor", port: ctx.lastTriedPort };

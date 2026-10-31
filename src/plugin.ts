@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -1310,14 +1310,19 @@ export function forkParentRevisionLegacy(session: Session): string {
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
-function resolveForkConversation(id: string): Session | undefined {
+// #4942: async — on network storage backends the existence probes must be
+// able to reach the DB (the sync facade misses by design there). Materialization
+// must ride the SAME async seam: a sync getSession after an async probe would
+// mint an EMPTY resident ghost for a DB-only id, and that ghost then poisons
+// every later getSessionAsync of the id for the process lifetime.
+async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (getStore().loadSync(id)) return getSession(id);
+    if (await getStore().loadAsync(id)) return getSessionAsync(id);
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
-    if (!getStore().loadSync(persistedId)) return undefined;
-    return getSession(persistedId);
+    if (!(await getStore().loadAsync(persistedId))) return undefined;
+    return getSessionAsync(persistedId);
 }
 
 /** #2601 freshness window for persona-lineage following — same family as
@@ -1448,7 +1453,7 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
 
 export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
-    const session = resolveForkConversation(conversationId);
+    const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
@@ -1502,7 +1507,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     const requestHash = forkHash(request);
     const replay = async (): Promise<boolean> => {
         await getStore().recoverCompletedFork(request.childConversationId);
-        const existing = resolveForkConversation(request.childConversationId);
+        const existing = await resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
         if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
@@ -1512,7 +1517,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { if (await replay()) return; }
     catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
-    const parent = resolveForkConversation(request.parentConversationId);
+    const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
@@ -1747,7 +1752,9 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+// #4942: async — the session resolution below must reach the DB on network
+// storage backends (the caller, handleAdminRoute, is already async).
+export async function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): Promise<void> {
     // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
     // the dsh web app (its own loopback port / the dsh-app://app scheme). The
     // trusted-origin gate upstream of dispatch already admitted the request;
@@ -1758,7 +1765,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
         return h;
     };
-    let session = resolveForkConversation(conversationId);
+    let session = await resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
@@ -2034,7 +2041,7 @@ export async function handlePluginTool(
         routedBy = "native";
         deps.log("info", `[plugin] tool "${tool}": routed by host call id (#4580) to "${session.id}"`);
     } else if (conversationId) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             // #2601: a persona-lineage witness is not a spoof — the host stamps
@@ -2135,7 +2142,7 @@ export async function handlePluginTool(
         }
     }
     if (!session) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
@@ -3035,7 +3042,14 @@ export async function pipePluginChatWithStrip(
             const d = ch?.["delta"];
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
-            if (dd["tool_calls"] !== undefined) {
+            // Some OpenAI-compatible upstreams (sglang) emit explicit nulls for
+            // every delta field ("tool_calls": null on plain text deltas). A null
+            // is not a tool call: treating it as one poisoned sawToolUse and made
+            // retryEmptyTurn (#732/#821) silently skip degenerate empty stops
+            // (thinking + stripped render tag + EOS) — the host saw the turn end
+            // cleanly with no visible output. Compare with != null so only real
+            // tool_calls presence counts.
+            if (dd["tool_calls"] != null) {
                 sawToolUse = true;
                 // #1501 observe-only: accumulate fragments per tool-call index;
                 // the stream-end settle warns when a name never arrives (#1484).
@@ -3693,7 +3707,10 @@ function openaiFrameHasToolCalls(choices: unknown): boolean {
     if (!Array.isArray(choices)) return false;
     for (const c of choices) {
         const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
-        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
+        // != null: sglang-style explicit "tool_calls": null deltas are not tool
+        // calls (see the sawToolUse fix above); they must not suppress the
+        // echo-residue audit either.
+        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] != null) return true;
     }
     return false;
 }

@@ -273,7 +273,17 @@ export async function runStorageGcCommand(opts: {
     json?: boolean;
     dir?: string;
 }): Promise<StorageCommandResult> {
-    const store = new SessionStore({ dir: opts.dir, enabled: true });
+    let store: SessionStore;
+    try {
+        store = new SessionStore({ dir: opts.dir, enabled: true });
+    } catch (err) {
+        // #4612: a live foreign writer does NOT make the unified open refuse
+        // anymore (owner decision 2026-10-31: second-writer conditions are
+        // informational, never blocking) — the full-VACUUM starvation guard
+        // lives in runGc itself (store.unifiedActiveWriter()), so no special
+        // branch is needed here.
+        throw err;
+    }
     try {
         return await runGc(store, opts.days, opts.vacuum, !!opts.dryRun, !!opts.json);
     } finally {

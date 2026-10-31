@@ -16,6 +16,7 @@
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
  *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
+ *   bili pack install <spec>      install a custom compress prompt pack from npm (#5319)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
@@ -42,6 +43,8 @@ import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatus
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
+import { installPackFromNpm, removePackFile } from "./pack-install.js";
+import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
@@ -94,6 +97,10 @@ Usage:
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
                                     prints the sweep plan first, --dry-run stops there)
+  bili pack install <npm-spec>     npm-install a custom compress prompt pack
+  bili pack list / remove <name>   list resolvable packs / delete a local pack file
+                                   (--project targets ./.billion-context/packs/ instead;
+                                    install also accepts --force to replace an existing pack)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -183,7 +190,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -196,6 +203,10 @@ type Parsed = {
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
+    packAction?: "install" | "remove" | "list";
+    packSpec?: string;
+    packProject?: boolean;
+    packForce?: boolean;
     acpCacheDir?: string;
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
@@ -226,6 +237,10 @@ export function parseArgs(argv: string[]): Parsed {
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
+    let packAction: Parsed["packAction"];
+    let packSpec: string | undefined;
+    let packProject = false;
+    let packForce = false;
     let acpCacheDir: string | undefined;
     let acpCacheLog: string | undefined;
     let acpCacheNoLog = false;
@@ -301,6 +316,12 @@ export function parseArgs(argv: string[]): Parsed {
             }
             case "--with-mcp":
                 pluginWithMcp = true;
+                break;
+            case "--project":
+                packProject = true;
+                break;
+            case "--force":
+                packForce = true;
                 break;
             case "--json":
                 jsonOutput = true;
@@ -476,6 +497,20 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore")`);
                 process.exit(2);
             }
+        } else if (cmd === "pack" || cmd === "packs") {
+            command = "pack";
+            const action = positional[1];
+            if (action !== "install" && action !== "remove" && action !== "list") {
+                console.error(`bili pack: unknown action "${action ?? ""}" (try "bili pack install <npm-spec> | remove <name> | list")`);
+                process.exit(2);
+            }
+            packAction = action;
+            const arg = positional[2];
+            if (packAction !== "list" && arg === undefined) {
+                console.error(`bili pack ${packAction}: <${packAction === "install" ? "npm-spec" : "name"}> is required`);
+                process.exit(2);
+            }
+            packSpec = arg;
         } else if (cmd === "storage") {
             command = "storage";
             if (positional[1] !== "gc") {
@@ -488,11 +523,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -604,6 +639,29 @@ export async function main(): Promise<void> {
             }
             return;
         }
+    }
+    if (command === "pack") {
+        try {
+            if (packAction === "list") {
+                for (const p of listResolvedPacks()) {
+                    console.log(`${p.name}\t${p.version ?? "-"}\t${p.source}${p.description ? `  ${p.description}` : ""}`);
+                }
+                return;
+            }
+            if (packAction === "install") {
+                const r = installPackFromNpm(packSpec!, { project: packProject, force: packForce });
+                console.log(`installed pack "${r.name}"${r.version ? ` v${r.version}` : ""} -> ${r.file}`);
+                return;
+            }
+            if (packAction === "remove") {
+                console.log(`removed ${removePackFile(packSpec!, packProject)}`);
+                return;
+            }
+        } catch (error) {
+            console.error(`bili pack: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
     }
     if (command === "export") {
         try {

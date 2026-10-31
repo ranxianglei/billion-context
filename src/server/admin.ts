@@ -6,7 +6,7 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
-import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
+import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
@@ -15,7 +15,7 @@ import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
-import { defaultLogFile } from "../paths.js";
+import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
@@ -32,7 +32,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, handleUserPackDelete, handleUserPackGet, handleUserPackPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
 import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
@@ -335,6 +335,26 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #4899: pricing editor data — resolved per-model prices (user overrides >
     // models.dev snapshot) for the panel's billing settings card. Read-only.
     if (req.method === "GET" && req.url === "/__bili/pricing") return handlePricingGet(res);
+    // #5319 (web half): resolved prompt-pack inventory for the panel picker —
+    // the project > user > shipped > builtin chain, first-wins per name.
+    // Read-only; every /__bili/ URL already passed the loopback/origin gates.
+    if (req.method === "GET" && req.url === "/__bili/packs") {
+        const packs = listResolvedPacks()
+            .map((p) => ({ name: p.name, version: p.version ?? null, description: p.description ?? null, source: p.source }));
+        // #5328: the panel needs the user-pack dir to decide which listed
+        // entries it may edit/delete; the server is the authority on it.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ packs, userDir: path.join(configDir(), "packs") }));
+        return;
+    }
+    // #5328: user-dir pack management — GET/PUT/DELETE <configDir>/packs/
+    // <name>.json. The route regex shapes the name to the pack-name charset
+    // ([A-Za-z0-9][A-Za-z0-9._-]*) before dispatch; the handlers re-validate
+    // with isValidPackName. Everything else under /__bili/ is untouched.
+    const mUserPack = /^\/__bili\/packs\/user\/([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(req.url ?? "");
+    if (mUserPack !== null && req.method === "GET") return handleUserPackGet(res, mUserPack[1]);
+    if (mUserPack !== null && req.method === "PUT") return handleUserPackPut(req, res, mUserPack[1]);
+    if (mUserPack !== null && req.method === "DELETE") return handleUserPackDelete(res, mUserPack[1]);
     // #3719: per-release notes for the panel's changelog section — same
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
@@ -1027,7 +1047,8 @@ async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: `no surfaced split-brain entry for session: ${sessionId}` }, null, 2));
         return;
     }
-    log("info", `[storage] split-brain notice for session ${sessionId.slice(0, 8)} acknowledged via web UI`);
+    // #4626: full id — .slice(0, 8) of "session-…" renders literally "session-"
+    log("info", `[storage] split-brain notice for session ${sessionId} acknowledged via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }

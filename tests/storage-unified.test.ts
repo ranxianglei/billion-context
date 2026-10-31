@@ -794,7 +794,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9, "schema version stamped to 9 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index)");
+            assert.equal(ver.user_version, 10, "schema version stamped to 10 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index + v10 immutable message ts column)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
@@ -825,6 +825,117 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             store2.close();
         }
     } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #4313: v10 immutable first-seen time column (messages.ts)
+// ---------------------------------------------------------------------------
+
+test("schema v10: v9→v10 migration adds messages.ts without backfill; idempotent", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10-"));
+    const dbPath = path.join(dir, "index.db");
+    try {
+        const { DatabaseSync } = await import("node:sqlite");
+        // Fresh install (v10 DDL), one row with a known ts, then knock the
+        // library back to a v9 shape: drop the column (SQLite ≥3.35), stamp
+        // user_version=9.
+        const store = UnifiedStore.open(dbPath);
+        store.close();
+        const raw = new DatabaseSync(dbPath);
+        raw.prepare("INSERT INTO content (hash, byte_len, refcount, bytes) VALUES (?, ?, 1, ?)").run(sha256("hello"), 5, "hello");
+        raw.prepare(
+            "INSERT INTO messages (session_id, seq, msg_id, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, 'message', ?, '', ?)",
+        ).run("v10-mig-1", 1, "x1", "user", sha256("hello"), 1700000000000);
+        raw.exec("ALTER TABLE messages DROP COLUMN ts");
+        raw.exec("PRAGMA user_version = 9");
+        raw.close();
+
+        const reopened = UnifiedStore.open(dbPath);
+        try {
+            const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
+                .prepare("PRAGMA user_version").get() as { user_version: number };
+            assert.equal(ver.user_version, 10, "v9 library migrates to v10");
+            const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
+            assert.equal(rows.length, 1, "row survives the migration");
+            assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");
+        } finally {
+            reopened.close();
+        }
+        // Idempotence arm: reopen a stamped v10 — no ALTER may run twice.
+        const again = UnifiedStore.open(dbPath);
+        again.close();
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#4313: ingest stamps ts from CoreMessage.ts; re-ingest never overwrites it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10b-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const stub = (id: string, msgs: CoreMessage[]): LegacySessionLike => ({
+            id,
+            createdAt: 1700000000000,
+            lastSeen: 1700000001000,
+            meta: {},
+            stats: { requests: 0 },
+            metadata: {},
+            state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+            blockContents: new Map(),
+            lastMessages: msgs,
+        }) as unknown as LegacySessionLike;
+        const T0 = 1700000000000;
+        const T1 = 1800000000000;
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T0 }]))));
+        // Same content, later ts: INSERT OR IGNORE keeps the FIRST stamp.
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T1 }]))));
+        const rows = store.getMessages("ts-s1") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].msgId, "x1");
+        assert.equal(rows[0].ts, T0, "upsert must not overwrite an existing ts (immutable stamp)");
+        // A later message stamps independently; the first row is untouched.
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T0 }, { id: "y", role: "assistant", contentType: "text", text: "world", ts: T1 }]))));
+        const rows2 = store.getMessages("ts-s1") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.deepEqual(rows2.sort((a, b) => a.seq - b.seq).map((r) => [r.msgId, r.ts]), [
+            ["x1", T0],
+            ["y", T1],
+        ]);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their stamps)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10c-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const stub = (id: string, msgs: CoreMessage[]): LegacySessionLike => ({
+            id,
+            createdAt: 1700000000000,
+            lastSeen: 1700000001000,
+            meta: {},
+            stats: { requests: 0 },
+            metadata: {},
+            state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+            blockContents: new Map(),
+            lastMessages: msgs,
+        }) as unknown as LegacySessionLike;
+        const A = 1700000000000;
+        const B = 1750000000000;
+        assert.ok(store.ingestSession(planIngest(stub("fork-parent", [
+            { id: "f1", role: "user", contentType: "text", text: "one", ts: A },
+            { id: "f2", role: "assistant", contentType: "text", text: "two", ts: B },
+        ]))));
+        const parentRows = store.getMessages("fork-parent") as { seq: number }[];
+        const throughSeq = Math.max(...parentRows.map((r) => r.seq));
+        assert.ok(store.cloneSessionRows("fork-parent", "fork-child", throughSeq), "clone lands");
+        const childRows = store.getMessages("fork-child") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.deepEqual(childRows.map((r) => [r.msgId, r.ts]).sort(), [["f1", A], ["f2", B]], "child rows carry the parent's stamps");
+    } finally {
+        store.close();
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 });
