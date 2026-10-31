@@ -9,15 +9,24 @@ import { MysqlBackend, type Mysql2Module } from "../src/storage/mysql.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 
-test("#4982: queued fork fails closed if an earlier mirror disabled storage", async () => {
+test("#4982: a mirror with an exhausted store still attempts the queued fork (never fails closed on a breaker any more)", async () => {
+    // Pre-owner-policy-2026-10-30 shape: the 3-strike breaker could disable
+    // storage mid-run, and createForkAsync refused with "fork storage
+    // unavailable" once it noticed. That gate is GONE — index writes are
+    // never abandoned, so the fork must still ATTEMPT its work against the
+    // exhausted store and surface whatever the store reports (envelope
+    // serves meanwhile), instead of refusing up front.
     let backendCalls = 0;
-    const stats = { disabled: false };
+    let cloneCalls = 0;
+    const stats = { disabled: true };
     const shadow = {
         stats,
         sync: null,
-        backend: { async lastLiveSeq() { backendCalls++; return 0; } },
+        backend: {
+            async lastLiveSeq() { backendCalls++; return 0; },
+            async cloneSessionRows() { cloneCalls++; return false; },
+        },
         async enqueue<T>(work: () => Promise<T>): Promise<T> {
-            stats.disabled = true;
             return work();
         },
     } as unknown as UnifiedShadow;
@@ -26,8 +35,9 @@ test("#4982: queued fork fails closed if an earlier mirror disabled storage", as
         state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
         blockContents: new Map(),
     };
-    await assert.rejects(() => UnifiedShadow.prototype.createForkAsync.call(shadow, "parent", child), /fork storage unavailable/);
-    assert.equal(backendCalls, 0);
+    await UnifiedShadow.prototype.createForkAsync.call(shadow, "parent", child);
+    assert.equal(cloneCalls, 1, "the fork ATTEMPTED its work against the exhausted store instead of refusing");
+    assert.ok(backendCalls >= 1, "the live-seq lookup ran as part of the attempt");
 });
 
 // Actual SQLite storage, including content refcounts and zero-row clones.
