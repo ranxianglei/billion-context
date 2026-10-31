@@ -159,7 +159,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound core text alone is ~\d{7} bytes/, "the byte math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound billable content is ~\d{7} bytes/, "the byte math is in the operator-facing message (#5000: billable = core text + system/tools overhead)");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.

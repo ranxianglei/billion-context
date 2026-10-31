@@ -154,7 +154,7 @@ import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, estimateWireOverheadBytes, projectThinkingMass, readOutputBudget } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -3803,12 +3803,18 @@ export async function preflightCompressIfNeeded(
         // multi-MB body, not an experiment — fail fast with the byte math so
         // the operator can verify it by hand. Bytes, not chars: CJK monsters
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
-        // fitting English payload sits ~4× under the ratio bar.
+        // fitting English payload sits ~4× under the ratio bar. #5000: the mass
+        // priced here is BILLABLE content — core message text PLUS the
+        // system/tools wire overhead (same extraction as the trigger), measured
+        // from the actual outbound body; the JSON envelope itself is transport
+        // syntax no tokenizer bills and stays out of the floor (#3617).
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
-        if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-            const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
-            const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+        const wireOverheadBytes = estimateWireOverheadBytes(prepared.protocol, prepared.body);
+        const doomedProbeBytes = coreTextBytes + wireOverheadBytes;
+        if (doomedProbeBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            const byteFloorTokens = Math.ceil(doomedProbeBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}; system/tools overhead ~${wireOverheadBytes}B`);
+            const doomedMessage = `payload billable content alone is ~${doomedProbeBytes} bytes (~${coreTextBytes}B message text + ~${wireOverheadBytes}B system/tools overhead) — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) or shrink the tool manifest, and retry.`;
             // #2847: the rejection is mathematically deterministic, so the STATUS
             // itself must carry the non-retryable semantics — a 502 says
             // "transient gateway failure" to status-code-driven hosts and they
@@ -4265,11 +4271,15 @@ export async function preflightCompressIfNeeded(
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
     if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
-        const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
+        // #5000: billable content = core message text + system/tools wire
+        // overhead, both measured from the actual outbound body (#3617 both-ways).
+        const doomTextBytes = estimateCoreMessagesUpperBytes(outMsgs);
+        const doomOverheadBytes = estimateWireOverheadBytes(outbound.protocol, outbound.body);
+        const doomBytes = doomTextBytes + doomOverheadBytes;
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(outMsgs)}; system/tools overhead ~${doomOverheadBytes}B`);
+            const doomedMessage = `payload billable content alone is ~${doomBytes} bytes (~${doomTextBytes}B message text + ~${doomOverheadBytes}B system/tools overhead) even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) or shrink the tool manifest, and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
@@ -4495,4 +4505,4 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
 export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
-export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
+export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, estimateWireOverheadBytes, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";

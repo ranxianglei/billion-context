@@ -200,23 +200,28 @@ function responsesSysDevItemText(item: Record<string, unknown>): string {
     return "";
 }
 
-/** #470: tokens the wire payload carries OUTSIDE the message array —
- * system/instructions text and tool definitions (including the proxy-injected
- * ACP tools). estimateCoreMessages only counts messages, so without this term
- * the preflight trigger fires ~10-20K late on agent clients with big tool
- * manifests: text alone "fits" while the real billed input already overflows
- * the window. Same term estimateInputTokens applies to the output clamp (#467). */
-export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): number {
-    let parsed: Record<string, unknown>;
-    if (typeof body === "object" && !Buffer.isBuffer(body)) {
-        parsed = body;
-    } else {
-        try {
-            parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
-        } catch {
-            return 0;
-        }
+/** Parse a wire body for overhead extraction; null when unparseable (callers
+ *  treat that as zero overhead — the legacy catch rule). */
+function parsedWireBody(body: string | Buffer | Record<string, unknown>): Record<string, unknown> | null {
+    if (typeof body === "object" && !Buffer.isBuffer(body)) return body;
+    try {
+        return JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+    } catch {
+        return null;
     }
+}
+
+/** #5000: the exact text pieces a wire payload carries OUTSIDE the message
+ * array — system/instructions text and tool definitions (including the
+ * proxy-injected ACP tools, and responses' loaded-tool items). Single source
+ * of truth for BOTH calibers of this mass: estimateWireOverhead (tokens —
+ * trigger/clamp channel, #470) and estimateWireOverheadBytes (bytes — doom-
+ * gate floor, #5000). They extract here and differ only in how they count, so
+ * the two calibers can never drift apart. */
+export function wireOverheadTexts(
+    protocol: "anthropic" | "openai" | "responses" | "google",
+    parsed: Record<string, unknown>,
+): { sysText: string; toolsJson: string; loadedItemJsons: string[] } {
     const sysRaw = protocol === "responses"
         ? parsed.instructions
         : protocol === "google"
@@ -256,9 +261,50 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
     }
-    return defaultCountTokens(sysText)
-        + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
-        + (protocol === "responses" ? countLoadedToolTokens(parsed) : 0);
+    const toolsJson = JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []);
+    const loadedItemJsons: string[] = [];
+    if (protocol === "responses" && Array.isArray(parsed.input)) {
+        for (const item of parsed.input as Array<Record<string, unknown>>) {
+            if (["additional_tools", "tool_search_call", "tool_search_output", "mcp_list_tools"].includes(item?.type as string)) {
+                loadedItemJsons.push(JSON.stringify(item));
+            }
+        }
+    }
+    return { sysText, toolsJson, loadedItemJsons };
+}
+
+/** #470: tokens the wire payload carries OUTSIDE the message array —
+ * system/instructions text and tool definitions (including the proxy-injected
+ * ACP tools). estimateCoreMessages only counts messages, so without this term
+ * the preflight trigger fires ~10-20K late on agent clients with big tool
+ * manifests: text alone "fits" while the real billed input already overflows
+ * the window. Same term estimateInputTokens applies to the output clamp (#467). */
+export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): number {
+    const parsed = parsedWireBody(body);
+    if (parsed === null) return 0;
+    const { sysText, toolsJson, loadedItemJsons } = wireOverheadTexts(protocol, parsed);
+    return defaultCountTokens(sysText) + defaultCountTokens(toolsJson)
+        + loadedItemJsons.reduce((sum, j) => sum + defaultCountTokens(j), 0);
+}
+
+// #5000: byte twin of estimateWireOverhead for the doomed-gate floor
+// (#2490/#4079). The gates priced ONLY core message bytes while the trigger
+// priced messages PLUS this overhead — a payload whose multi-MB tool manifest
+// makes the billed total cross the window could still clear the floor on the
+// residual caliber. Bytes rather than tokens×density: the floor's invariant
+// (bytes ÷ densest observed density > window ⇒ no tokenizer fits it) holds
+// only for content that IS billed — everything extracted here renders into the
+// prompt on every provider (system text, tool schemas, loaded-tool items).
+// Media stays excluded (separate learned channel), and the JSON envelope is
+// deliberately NOT counted: transport syntax no tokenizer bills — counting it
+// would false-positive dense-but-fitting payloads (#3617 both-ways).
+export function estimateWireOverheadBytes(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): number {
+    const parsed = parsedWireBody(body);
+    if (parsed === null) return 0;
+    const { sysText, toolsJson, loadedItemJsons } = wireOverheadTexts(protocol, parsed);
+    let bytes = Buffer.byteLength(sysText, "utf8") + Buffer.byteLength(toolsJson, "utf8");
+    for (const j of loadedItemJsons) bytes += Buffer.byteLength(j, "utf8");
+    return bytes;
 }
 
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or

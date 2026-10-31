@@ -63,7 +63,7 @@ import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
-import { estimateWireOverhead } from "./budget.js";
+import { estimateWireOverhead, estimateWireOverheadBytes } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -619,10 +619,13 @@ async function forwardCaptured(
     // no preflight) reached this socket with ZERO window comparison. #4068: a
     // 6,165,048-token body hit a 1,048,580 window upstream; #3872: a 5.35×
     // re-send after a mid-session wire switch. Same bars as preflight's doom
-    // probe (#2490), same caliber (core text bytes, media excluded — image
-    // tokens are a separate learned channel): only bodies NO tokenizer at the
-    // densest observed density (~7.5 B/token, #2122) can fit are blocked, so a
-    // dense-but-fitting payload is never false-positived (#3617 both-ways).
+    // probe (#2490), same caliber as preflight's trigger (#5000): billable
+    // content bytes = core message text + system/tools wire overhead, both
+    // measured from what actually goes out; media excluded (image tokens are a
+    // separate learned channel), JSON envelope deliberately NOT counted (no
+    // tokenizer bills transport syntax — counting it false-positived dense-
+    // but-fitting payloads, #3617 both-ways): only payloads NO tokenizer at
+    // the densest observed density (~7.5 B/token, #2122) can fit are blocked.
     // No LocalRefusalRecord here: the doomed body itself re-trips this fuse on
     // every retry, so a record would only outlive the turn and lock the route
     // the way #3974 suffered.
@@ -641,11 +644,16 @@ async function forwardCaptured(
         const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
-            const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
+            // #5000: price the tokenized non-message mass too — system text +
+            // tool schemas from the ACTUAL outbound body (same extraction as
+            // preflight's trigger, wireOverheadTexts), not just core messages.
+            const fuseTextBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
+            const fuseOverheadBytes = estimateWireOverheadBytes(prepared.protocol, wireBody);
+            const fuseBytes = fuseTextBytes + fuseOverheadBytes;
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse profile: ${describeCoreTextDuplication(fuseMsgs)}; system/tools overhead ~${fuseOverheadBytes}B`);
+                const fuseMessage = `outbound billable content is ~${fuseBytes} bytes (~${fuseTextBytes}B message text + ~${fuseOverheadBytes}B system/tools overhead) — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) or shrink the tool manifest, and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
                 else {
