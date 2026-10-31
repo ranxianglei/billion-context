@@ -1427,10 +1427,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         }
         return out + s.slice(last);
     };
-    /** #5175: release path — the whole-text artifact set plus the drifted-name
-     *  cleanup. A span the machine settles as prose still carries the imitation's
-     *  orphan halves when its pair resolved in an earlier push, so the same
-     *  name-agnostic rules run here too. */
+    /** #5175: release path — orphan-close cleanup only. A span the machine
+     *  settles as prose still carries the imitation's orphan halves when its
+     *  pair resolved in an earlier push, so `stripDeadRefCloses` runs here too.
+     *  This is NOT the whole-text artifact set: `stripAcpTags` and
+     *  `stripDriftResidue` are separate entry points, and the drift pairs
+     *  themselves are adjudicated earlier in `process` — by the time a span is
+     *  released they are already gone. */
     const releaseProse = (s: string, attested = false): string => stripDeadRefCloses(s, attested);
     const deadUnitIn = (s: string): boolean => {
         if (!s.includes("\x3c/")) return false;
