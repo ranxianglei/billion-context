@@ -83,6 +83,10 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #5046/B: spawns one bare `node -e` dummy child purely as a live PID
+    // holder for the lock-file fixtures — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire
+    "tests/issue5046-second-writer-degrade.test.ts",
     // #4762: in-process eval workers only (wedge probes), never bind a port -
     // the entry exists for the spawn tripwire alone, like #3890
     "tests/event-loop-watchdog.test.ts",
@@ -96,6 +100,9 @@ export const LIVE_FILES = [
     // state lives under a per-run tmpdir, and each test uses its own receiver +
     // origin, so the refcounted-worker table never sees cross-test collisions.
     "tests/issue5152-owner-beat-survives-host-stall.test.ts",
+    // #4612: spawns an idle node child as the "other live process" fixture;
+    // binds no ports, mkdtemp-isolated per test
+    "tests/issue4612-gc-online-guard.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

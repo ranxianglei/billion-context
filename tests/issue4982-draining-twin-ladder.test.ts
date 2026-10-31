@@ -228,36 +228,67 @@ async function waitForStatus(port: number, timeoutMs: number): Promise<boolean> 
 
 async function killChild(child: ChildProcess): Promise<void> {
     if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
-    await Promise.race([
-        new Promise<void>((resolve) => child.once("exit", () => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-    ]);
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+        child.once("close", () => {
+            clearTimeout(timer);
+            resolve();
+        });
+        child.kill("SIGTERM");
+    });
 }
 
 /** A TCP listener that accepts connections and then says nothing — invisible
  *  to /__bili/health probes (they time out as "no evidence") but still owns
  *  the socket, so binders get EADDRINUSE. Deterministically forces the LATE
  *  EADDRINUSE decision path instead of the pre-bind foreign-owner ladder. */
-function silentTcpListener(port: number): Promise<net.Server> {
+function silentTcpListener(port: number): Promise<{ close(): Promise<void> }> {
     return new Promise((resolve, reject) => {
+        const sockets = new Set<net.Socket>();
         const server = net.createServer((sock) => {
+            sockets.add(sock);
+            sock.once("close", () => sockets.delete(sock));
             // accept and hang — never answer HTTP; drain the probe's bytes so peer
             // EOF is actually delivered (a paused socket buffers them and never sees
             // EOF) and release the connection, or a dead prober pins server.close()
             // with CLOSE-WAIT sockets
             sock.resume();
-            // A killed prober (Windows kill() is a hard terminate) RSTs us mid-probe;
-            // without an error listener that surfaces as an uncaughtException AFTER
-            // the test ends and fails the whole file (win-only #5050 follow-up).
-            sock.on("error", () => {});
             sock.on("end", () => sock.destroy());
+            // An aborted health probe may reset instead of ending the connection,
+            // or a killed prober (Windows kill() is a hard terminate) RSTs mid-probe;
+            // without an error listener that surfaces as an uncaughtException AFTER
+            // the test ends and fails the whole file (#5050). Destroying keeps the
+            // fixture clean and owns the socket.
+            sock.on("error", () => sock.destroy());
         });
         server.once("error", reject);
-        server.listen(port, "127.0.0.1", () => resolve(server));
+        server.listen(port, "127.0.0.1", () => resolve({
+            close: () => new Promise<void>((done) => {
+                server.close(() => done());
+                for (const socket of sockets) socket.destroy();
+            }),
+        }));
     });
 }
+
+test("silent TCP fixture survives an aborted health probe", { timeout: 5_000 }, async () => {
+    const port = await freePort();
+    const fixture = await silentTcpListener(port);
+    const client = net.connect({ host: "127.0.0.1", port });
+    try {
+        await new Promise<void>((resolve, reject) => {
+            client.once("connect", resolve);
+            client.once("error", reject);
+        });
+        client.write("GET /__bili/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        client.resetAndDestroy();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    } finally {
+        client.destroy();
+        await fixture.close();
+    }
+});
 
 function tcpRefused(port: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -323,6 +354,9 @@ function spawnBili(sandbox: string, port: number): { child: ChildProcess; out: {
 async function waitUntilLadderedHealthy(stateHome: string, child: ChildProcess, label: string): Promise<number> {
     let port = 0;
     await waitUntil(async () => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+            throw new Error(`${label} exited before becoming healthy`);
+        }
         const m = readMarkers(stateHome).find((e) => e.pid === child.pid);
         if (!m || typeof m.port !== "number") return false;
         port = m.port as number;
@@ -339,7 +373,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
     let p1Ref: ReturnType<typeof spawnBili> | null = null;
     let p2Ref: ReturnType<typeof spawnBili> | null = null;
     let heldRef: net.Socket | null = null;
-    let squatterRef: net.Server | null = null;
+    let squatterRef: Awaited<ReturnType<typeof silentTcpListener>> | null = null;
     try {
         // P1: the serving proxy that will enter graceful shutdown.
         const p1 = spawnBili(sandbox, port);
@@ -415,7 +449,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         heldRef?.destroy();
         if (p1Ref) await killChild(p1Ref.child);
         const squatter = squatterRef;
-        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        if (squatter) await squatter.close();
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
@@ -426,7 +460,7 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
     const port = await freePort();
     await assertPortDead(port, { label: "4982 unverified-twin port" });
     let p2Ref: ReturnType<typeof spawnBili> | null = null;
-    let squatterRef: net.Server | null = null;
+    let squatterRef: Awaited<ReturnType<typeof silentTcpListener>> | null = null;
     try {
         // A registry marker claiming `port` with a LIVE pid and full identity
         // match — but NO portReleasedAt stamp (pre-fix build, or a failed
@@ -476,7 +510,7 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
     } finally {
         if (p2Ref) await killChild(p2Ref.child);
         const squatter = squatterRef;
-        if (squatter) await new Promise<void>((resolve) => squatter.close(() => resolve()));
+        if (squatter) await squatter.close();
         fs.rmSync(sandbox, { recursive: true, force: true });
     }
 });
