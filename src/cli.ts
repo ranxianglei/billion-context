@@ -14,7 +14,7 @@
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
- *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
+ *   bili sessions ls|rm|archive|restore|orphan-sweep [id]   manage persisted sessions
  *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -89,6 +89,11 @@ Usage:
   bili sessions archive <id>        move one session out of index.db into the single
                                     append-only archive log (rows swept, restorable)
   bili sessions restore <id>        bring an archived session back into index.db
+  bili sessions orphan-sweep [id]   #5308: find collapsed blocks whose covered ids
+                                    have zero overlap with their own session's stored
+                                    transcript (provably foreign, e.g. shared-id leftovers
+                                    from <=v0.1.208). Dry-run by default; --fix archives
+                                    them (reversible). Needs full unified storage.
   bili storage gc                   run the storage sweep now (#3911): archive sessions
                                     older than storage.archiveAfterDays (default 365),
                                     release unreferenced content, shrink index.db
@@ -200,9 +205,10 @@ type Parsed = {
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
-    sessionsSub?: "ls" | "rm" | "archive" | "restore";
+    sessionsSub?: "ls" | "rm" | "archive" | "restore" | "orphan-sweep";
     sessionsTarget?: string;
     sessionsNoVacuum?: boolean;
+    orphanSweepFix?: boolean;
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -239,6 +245,7 @@ export function parseArgs(argv: string[]): Parsed {
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
+    let orphanSweepFix = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -307,7 +314,11 @@ export function parseArgs(argv: string[]): Parsed {
                 doctorJson = true;
                 break;
             case "--fix":
+                // Shared "perform" token: doctor uses it for dsh-ledger repair,
+                // `sessions orphan-sweep` for archiving orphans. Commands are
+                // mutually exclusive, so each branch reads only its own flag.
                 doctorFix = true;
+                orphanSweepFix = true;
                 break;
             case "--no-vacuum":
                 sessionsNoVacuum = true;
@@ -465,15 +476,15 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "sessions") {
             command = "sessions";
             const sub = positional[1];
-            if (sub === "ls" || sub === "rm" || sub === "archive" || sub === "restore") {
+            if (sub === "ls" || sub === "rm" || sub === "archive" || sub === "restore" || sub === "orphan-sweep") {
                 sessionsSub = sub;
                 sessionsTarget = positional[2];
-                if (sub !== "ls" && sessionsTarget === undefined) {
+                if (sub !== "ls" && sub !== "orphan-sweep" && sessionsTarget === undefined) {
                     console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
                     process.exit(2);
                 }
             } else {
-                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore")`);
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore|orphan-sweep")`);
                 process.exit(2);
             }
         } else if (cmd === "storage") {
@@ -488,11 +499,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, orphanSweepFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, orphanSweepFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -621,7 +632,7 @@ export async function main(): Promise<void> {
         // carry their own exit codes (1 = operation failed, 2 = usage).
         try {
             const r = command === "sessions"
-                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum })
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, orphanSweepFix })
                 : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
             process.stdout.write(r.text);
             if (r.code !== 0) process.exit(r.code);
