@@ -34,7 +34,7 @@ import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
@@ -113,6 +113,36 @@ import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN
  */
 
 const PERSIST_VERSION = 3;
+// #5188: wall-clock cooldown between sidecar reopen attempts driven by the
+// SAVE path (see tryRecoverSidecar). A fixed constant — no config surface
+// (#5140): 30 s of spacing bounds the retry cost while still healing an
+// fd-spike-class outage within one agent turn. The READ path
+// (replicasAvailable) paces itself much faster below, because a read asking
+// "are replicas available?" must get a fresh answer instead of waiting for
+// the next write (#5140's cold-restore snapshot 409 arrived milliseconds
+// after construction, before any save could trigger a retry).
+const SHADOW_REOPEN_COOLDOWN_MS = 30_000;
+const SHADOW_REOPEN_READ_CHECK_MS = 100;
+// #5188 round 3: patient-wait budget for the user-visible 409 paths
+// (snapshot/fork) when the sidecar is missing after a transient first-open
+// failure. The read-check slot above drives the recovery ATTEMPTS; this only
+// bounds how long a request waits for that recovery before failing closed
+// exactly as before. Latched-disabled never waits (nothing brings it back
+// without a restart), so the wait can never mask structural breakage.
+const RECON_REPLICAS_WAIT_MS = 750;
+const RECON_REPLICAS_POLL_MS = 50;
+let shadowReopenCooldownMsOverride: number | null = null;
+let shadowReopenReadCheckMsOverride: number | null = null;
+
+/** Test seam: shrink/restore the #5188 sidecar-reopen save-path cooldown (null = default).
+ *  Mirrors setSqliteEnginesUnavailableForTests — always reset by the tests. */
+export function setShadowReopenCooldownMsForTests(ms: number | null): void {
+    shadowReopenCooldownMsOverride = ms;
+}
+/** Test seam: shrink/restore the #5188 read-path availability-check interval (null = default). */
+export function setShadowReopenReadCheckMsForTests(ms: number | null): void {
+    shadowReopenReadCheckMsOverride = ms;
+}
 /** Dotfile (invisible to the kernel's .json walk): written after the first
  *  successful #286 migration pass so later boots skip the scan entirely. */
 const MIGRATION_MARKER = ".bili-migration-286.done";
@@ -308,6 +338,14 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
 export class SessionStore {
+    /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
+     *  and failed, the save path retries maybeOpen on a cooldown; intentional
+     *  opt-outs (persistence off, encryption active) and the mysql async attach
+     *  never record args, so they keep their documented one-shot posture. */
+    private readonly syncSidecarOpen: { legacyLoad: (rec: unknown) => LegacySessionLike | null } | null = null;
+    private sidecarReopenNextAttemptAt = 0;
+    private sidecarReadCheckNextAttemptAt = 0;
+
     readonly enabled: boolean;
     private readonly sessionsDir: string;
     private readonly store: StateStore<PersistedSession>;
@@ -393,16 +431,26 @@ export class SessionStore {
     private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
     /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
-     *  requires an explicit off request AND effective-full mode. If the
-     *  sidecar dies mid-run (3-strike disable) writerOffActive() turns false
-     *  and file writes resume on the very next save (fail-safe: never a
-     *  window with no persistent copy at all). */
+     *  requires an explicit off request AND effective-full mode.
+     *  writerOffActive() additionally needs a LIVE sidecar, so if the sidecar
+     *  never comes up at all (e.g. a proven-corrupt index alarms and boots
+     *  without it, or an engine-less environment refuses) envelope writes
+     *  stay ON for the whole life of this process (fail-safe: never a window
+     *  with no persistent copy at all). */
     private readonly jsonWriterOff: boolean;
     /** #3931 step 3: resolves when the async backend (mysql) opened (or
      *  failed to — the sidecar just stays undefined). Resolved immediately
      *  for sqlite/legacy boots. */
     private readonly mysqlReady: Promise<void> = Promise.resolve();
-    /** Await the storage backend before first use (mysql pool + DDL). */
+    /** #4942: true when a network backend (mysql) was selected for
+     *  unified-full mode — the sidecar attaches asynchronously, so before
+     *  ready() resolves this.shadow is still undefined while the DB already
+     *  carries rows. */
+    private readonly networkFullExpected: boolean = false;
+    /** Await the storage backend before first use (mysql pool + DDL). #5046
+     *  owner policy 2026-10-30 (no degradation in any case): a backend that
+     *  cannot come up REJECTS — boot awaits this before listen(); async
+     *  request paths see it on first use. */
     ready(): Promise<void> {
         return this.mysqlReady;
     }
@@ -446,7 +494,7 @@ export class SessionStore {
     private readonly capWarnAt = new Map<string, number>();
     private readonly debounceMs: number;
 
-    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
+    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger; shadow?: UnifiedShadow }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
         this.debounceMs = Math.max(0, debounceMs);
@@ -503,17 +551,18 @@ export class SessionStore {
         if (wantJsonWriterOff && !this.jsonWriterOff) {
             baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full on the sqlite backend (network backends keep the JSON envelope as the sync read path)");
         }
-        const legacyLoad = (rec: unknown): LegacySessionLike | null => {
-            const s = buildSession(rec as PersistedSession);
-            return toLegacyLike(s);
-        };
+        const legacyLoad = recordToLegacyView;
         // #3931 step 3: network backends (mysql) can only open asynchronously
         // (pool + DDL), so the sidecar attaches when it resolves — until then
         // this.shadow stays undefined and every surface keeps its documented
         // no-sidecar posture (envelope reads/writes, banner, replicas off).
         // `ready()` gates the async consumers (saves, boot, admin).
         const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
+        if (opts?.shadow !== undefined) {
+            // #4942 test seam: a pre-built sidecar skips the env-driven open.
+            this.shadow = opts.shadow;
+            this.networkFullExpected = !!(opts.shadow.readsUnified && opts.shadow.isAsyncBackend);
+        } else if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
             this.mysqlReady = UnifiedShadow.openAsync(
                 this.sessionsDir,
                 process.env,
@@ -525,11 +574,29 @@ export class SessionStore {
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
             });
+            // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
+            // (no degradation in any case). Boot awaits ready() and exits
+            // deterministically; the .catch here keeps every OTHER construct-
+            // then-later-await path from dying via unhandled rejection instead
+            // of the caller seeing the rejection on await.
+            this.mysqlReady.catch(() => {});
             this.shadow = undefined;
+            this.networkFullExpected = storageMode === "full";
         } else {
-            this.shadow = this.enabled && !unifiedBlockedByEncryption
-                ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
-                : undefined;
+            if (this.enabled && !unifiedBlockedByEncryption) {
+                // #5188: remember the open args when this sync attempt actually
+                // runs, so a failure here can be retried. Deliberately NO
+                // cooldown stamp at construction: the first RETRY must be
+                // immediately eligible on first need. A transient load spike
+                // (EMFILE/BUSY under CI-shard load) clears in milliseconds, and
+                // #5140's cold-restore read arrives before any save would have
+                // triggered a paced retry — stamping here kept that read failing
+                // closed for a full cooldown window.
+                this.syncSidecarOpen = { legacyLoad };
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            } else {
+                this.shadow = undefined;
+            }
         }
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -716,11 +783,14 @@ export class SessionStore {
         // #2960 R2.1 boot union (full mode): rows whose legacy file is gone
         // (deleted, or written by a Phase 3 future that stops writing JSON)
         // remain enumerable — the index is self-sufficient. Shadow stays
-        // file-walk: there JSON is the truth base.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // file-walk: there JSON is the truth base. #4942: on network backends
+        // the sidecar attaches asynchronously and the sync facade misses by
+        // design — enumerate through the async twins instead.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -749,11 +819,13 @@ export class SessionStore {
         // without a legacy file stay enumerable (the index is
         // self-sufficient). bootBounded (limits path) intentionally stays
         // file-based: bounded boot is the cold-start triage path for huge
-        // legacy trees.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // legacy trees. #4942: network backends enumerate through the async
+        // twins (the sync facade misses by design there).
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -770,6 +842,21 @@ export class SessionStore {
             if (existsSync(path.join(root, flatFileNameFor(id)))) return true;
         }
         return false;
+    }
+
+    /** #4942: enumeration for the boot/loadAll unions. sqlite keeps the sync
+     *  listSessionIds(); network backends enumerate through sessionSummaries —
+     *  one query carries both the ids and updatedAt, so a budget-bounded
+     *  pre-warm can order newest-first (matching the savedAt-desc arbitration
+     *  of the file path) instead of alphabetical row order. Both sources
+     *  return the SAME row set (neither filters archived tombstones). */
+    private async unionIds(): Promise<string[]> {
+        const shadow = this.shadow;
+        if (!shadow) return [];
+        if (!shadow.isAsyncBackend) return shadow.listSessionIds();
+        const rows = await shadow.sessionSummariesAsync();
+        rows.sort((a, b) => b.updatedAt - a.updatedAt);
+        return rows.map((r) => r.sessionId);
     }
 
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
@@ -887,15 +974,19 @@ export class SessionStore {
         // The pure-index ids that do enter are measured by their SERIALIZED
         // record — the same proxy readRawFileWithBytes gives the file path
         // (#2803: the budget is a RAM proxy, not a disk one).
-        if (this.shadow?.readsUnified) {
+        // #4942: network backends pre-warm through the async twins under the
+        // SAME budget (the sync facade misses by design there); newest-first
+        // ordering comes from unionIds.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
             let warmBytes = 0;
             for (const item of warm) warmBytes += item.bytes;
-            for (const id of this.shadow.listSessionIds()) {
+            for (const id of await this.unionIds()) {
                 if (out.size >= limits.maxSessions) break;
                 if (warmBytes >= limits.maxBytes) break;
                 if (out.has(id)) continue;
                 if (this.stateFileOnDisk(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (!session) continue;
                 const bytes = this.estimateDecodedBytes(session);
                 if (warmBytes + bytes > limits.maxBytes) continue;
@@ -1616,6 +1707,28 @@ export class SessionStore {
         return session;
     }
 
+    /** #4942: async reload seam for network backends — on mysql the sync
+     *  facade has NO read path (viewFor/listSessionIds miss by design, #3931
+     *  step 3), so a cold load with no local envelope used to return null and
+     *  the request path silently started a fresh session, losing every folded
+     *  block at each restart. Serves exactly what loadSync serves whenever
+     *  loadSync finds something (zero behavior change); only when the sync
+     *  path has no copy does it fall to the DB row via viewForAsync.
+     *  Envelope-first precedence is deliberate: envelope writes are
+     *  synchronous per save while DB writes ride the coalesced record queue,
+     *  so an existing envelope is never older than the DB in single-writer
+     *  deployments. Null when neither copy exists. */
+    async loadAsync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<Session | null> {
+        const sync = this.loadSync(id, meta);
+        if (sync) return sync;
+        const shadow = this.shadow;
+        if (!shadow || !shadow.readsUnified || !shadow.isAsyncBackend) return null;
+        await this.ready();
+        const view = await shadow.viewForAsync(id);
+        if (!view) return null;
+        return this.afterLoad(id, view);
+    }
+
     /** Shared post-load fixups for the unified read path: rebuilds the
      *  Session from a store view (viewToRecord → buildSession, the same
      *  forward-compat pass as a legacy load) and applies the #408 clamp
@@ -1816,8 +1929,47 @@ export class SessionStore {
         }
     }
 
+    /** Which half of replicasAvailable() is down — diagnostic for the fork
+     *  raw-tail gate (#5188): missing sidecar (transient open failure,
+     *  recoverable without restart) vs latched-disabled sidecar (structural
+     *  breakage, stays down by design). */
+    sidecarDownReason(): "sidecar-missing" | "sidecar-disabled" {
+        return this.shadow === undefined ? "sidecar-missing" : "sidecar-disabled";
+    }
+
     replicasAvailable(): boolean {
+        // #5188: a false answer must mean "unavailable right now". When the
+        // first sync open died on a transient OS error, save-path hooks alone
+        // leave READ-only consumers failing closed until the next write —
+        // #5140's cold-restore snapshot 409 fired milliseconds after
+        // construction, before any save. Demand-driven recheck on the read
+        // path: paced by its own short interval (one maybeOpen per slot),
+        // steady state costs two field reads.
+        if (this.syncSidecarOpen !== null && this.shadow === undefined) {
+            const now = Date.now();
+            if (now >= this.sidecarReadCheckNextAttemptAt) {
+                this.sidecarReadCheckNextAttemptAt = now + (shadowReopenReadCheckMsOverride ?? SHADOW_REOPEN_READ_CHECK_MS);
+                this.tryRecoverSidecar(true);
+            }
+        }
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #5188 round 3: bounded patient wait for user-visible 409 paths. A first
+     *  open that died on a transient spike recovers on its own (the read-check
+     *  slot inside replicasAvailable() drives the attempts); #5140's flake was
+     *  a request racing that recovery — arriving before the first post-spike
+     *  slot could fire. Healthy returns immediately, latched-disabled returns
+     *  false immediately (waiting cannot help there), and a still-gone resource
+     *  costs at most `timeoutMs` of latency before failing closed as before. */
+    async waitForReplicas(timeoutMs = RECON_REPLICAS_WAIT_MS, pollMs = RECON_REPLICAS_POLL_MS): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (this.replicasAvailable()) return true;
+            if (this.sidecarDownReason() !== "sidecar-missing") return false;
+            if (Date.now() >= deadline) return false;
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
     }
 
     /** #4804: true only in FULL mode — the one mode whose unified reads
@@ -2658,50 +2810,22 @@ export class SessionStore {
                 // can only ride along, never be missing, so the spill gate's
                 // equality check against the CURRENT epoch stays conservative.
                 const proofRevision = session.revisionEpoch;
-                let innerDrained = false;
                 let settledOk = false;
                 try {
                     this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    // #3135 ①/#3818: the 3-strike may have fired INSIDE that
-                    // build (shadow.record's catch disables the sidecar after
-                    // consecutive failures). writerOffActive() turns false for
-                    // the NEXT save — but this very session currently exists
-                    // on NEITHER copy (index got no rows, envelope was never
-                    // armed). Land one synchronous JSON write NOW via the
-                    // kernel store so the disabling tick always closes with
-                    // the data on the durable file copy.
-                    if (this.shadow && this.shadow.stats.disabled) {
-                        this.log("warn", `[persist] unified sidecar disabled mid-build for ${session.id} — landing an immediate JSON envelope write (#3135 ①)`);
-                        const innerProof = session.revisionEpoch;
-                        const build = this.guardedBuild(session);
-                        this.saveWritesInFlight.add(session.id);
-                        void this.store.writeNow(session.id, build)
-                            .then(() => {
-                                this.stampOwnWrite(session.id);
-                                this.noteDurable(session.id, innerProof);
-                                this.lastSaveLanded.set(session.id, true);
-                                this.runIdleSpillIfIdle(session.id);
-                                innerDrained = true;
-                                this.drainFlushWaiters(session.id, true);
-                            })
-                            .catch(() => {
-                                // Errors surface through the kernel write chain's own logging.
-                                this.lastSaveLanded.set(session.id, false);
-                                innerDrained = true;
-                                this.drainFlushWaiters(session.id, false);
-                            })
-                            .finally(() => { this.saveWritesInFlight.delete(session.id); });
-                    } else {
-                        // #4788 D2: the index-only build landed synchronously —
-                        // run the same settle protocol as a kernel-write land
-                        // (invariant #5: this routing path gets equivalent
-                        // drop behavior, gated identically).
-                        this.noteDurable(session.id, proofRevision);
-                        this.lastSaveLanded.set(session.id, true);
-                        this.runIdleSpillIfIdle(session.id);
-                        settledOk = true;
-                    }
+                    // #4788 D2: the index-only build landed synchronously —
+                    // run the same settle protocol as a kernel-write land
+                    // (invariant #5: this routing path gets equivalent
+                    // drop behavior, gated identically). The JSON-envelope
+                    // safety valve for a mid-build disable (#3135 ①) was
+                    // removed together with the 3-strike breaker itself
+                    // (2026-10-30 owner policy: index writes are never
+                    // abandoned, jsonWriter=off accepts index-only persistence).
+                    this.noteDurable(session.id, proofRevision);
+                    this.lastSaveLanded.set(session.id, true);
+                    this.runIdleSpillIfIdle(session.id);
+                    settledOk = true;
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
                     // contents ride sessions.orphans_json in the same
@@ -2714,9 +2838,7 @@ export class SessionStore {
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
                 } finally {
-                    if (!innerDrained) {
-                        this.drainFlushWaiters(session.id, settledOk);
-                    }
+                    this.drainFlushWaiters(session.id, settledOk);
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -2726,6 +2848,7 @@ export class SessionStore {
             return;
         }
         if (!this.enabled) return;
+        this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
         this.saveBuilders.set(id, this.guardedBuild(session));
         const existing = this.saveTimers.get(id);
@@ -2766,7 +2889,14 @@ export class SessionStore {
                 this.drainFlushWaiters(id, this.lastSaveLanded.get(id) === true);
             });
         }, this.debounceMs);
-        timer.unref?.();
+        // #4788: the debounce timer is host-owned periodic upkeep and must not
+        // pin a process open on its own -- so it is unref'd. But `afterNextFlush`
+        // makes it a HOST: a caller that awaits a verdict has no other handle
+        // guaranteed to fire, and an unref'd timer is not a reason for Node to
+        // stay alive. Awaiting then exits the loop with the promise unresolved
+        // (`Promise resolution is still pending but the event loop has already
+        // resolved`). Keep the timer referenced exactly while someone waits.
+        if (!this.flushWaiters.has(id)) timer.unref?.();
         this.saveTimers.set(id, timer);
     }
 
@@ -2787,6 +2917,10 @@ export class SessionStore {
             const ws = this.flushWaiters.get(sessionId) ?? [];
             ws.push((ok: boolean): void => { resolve(ok); });
             this.flushWaiters.set(sessionId, ws);
+            // #4788: the timer was armed unref'd (no waiter existed then). The
+            // waiter now holds the promise open, so the timer must hold the loop
+            // open too -- otherwise the process drains and the verdict is lost.
+            this.saveTimers.get(sessionId)?.ref?.();
         });
     }
 
@@ -3043,6 +3177,44 @@ export class SessionStore {
         session.blockContents = lazy;
     }
 
+    /** #5188: recover a sidecar whose FIRST synchronous open died on a
+     *  transient OS error (fd exhaustion under test/CI load, momentary
+     *  disk-full, a spike of EBUSY). Before this, one failure at
+     *  construction time degraded the whole process for its lifetime and the
+     *  fork raw-tail rebuild failed closed at replicasAvailable() (#5140's
+     *  409s). Two triggers share this attempt: the save path (the natural
+     *  "this store is still wanted" signal), gated by the long cooldown, and
+     *  replicasAvailable() (read path), which bypasses the cooldown but paces
+     *  itself on its own short interval — a read deserves a fresh availability
+     *  answer. Under the 2026-10-30 owner chain MaybeOpen DOES throw for
+     *  transient environment failures (that is how boot refuses), so this
+     *  in-process hook catches: the never-throw save/evict contract survives,
+     *  one log line per cooldown window, no sidecar until a later attempt
+     *  succeeds. A proven-corrupt index (hadIntegrityQuickCheckFailure) is
+     *  never retried in-process — alarm + operator hand-fix by design. */
+    private tryRecoverSidecar(force = false): void {
+        const args = this.syncSidecarOpen;
+        if (!args || this.shadow !== undefined) return;
+        if (hadIntegrityQuickCheckFailure()) return;
+        const now = Date.now();
+        if (!force && now < this.sidecarReopenNextAttemptAt) return;
+        const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
+        this.sidecarReopenNextAttemptAt = now + cooldown;
+        try {
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+        } catch (err) {
+            // Transient refusal class re-occurred mid-process (unreachable via
+            // boot — that path exits first — kept defensive per #5188):
+            // record loudly once per window, keep serving from envelopes.
+            this.log("error", `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
+            return;
+        }
+        if (this.shadow !== undefined) {
+            this.log("info", "[storage] unified sidecar recovered after a transient open failure — unified surfaces resume without a restart (#5188)");
+            return;
+        }
+    }
+
     /** Synchronous flush for a single session. Used on memory eviction so a
      *  dirty evicted session is not lost. Sync because eviction runs in the
      *  sync getSession path; a single small write is acceptable.
@@ -3050,6 +3222,7 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
+        this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
@@ -3211,11 +3384,13 @@ export class SessionStore {
         return this.saveTimers.has(id) || this.writerOffPending.has(id);
     }
 
-    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
-     *  is both configured off AND actually alive — a mid-run sidecar death
-     *  (3-strike disable) automatically resumes file writes. */
+    /** Phase 3 (#2960): the JSON envelope is skipped while the operator asked
+     *  for index-only persistence AND the sidecar opened. Static decision:
+     *  the 3-strike breaker that used to re-arm envelope writes mid-run was
+     *  removed (2026-10-30 owner policy — index writes are never abandoned,
+     *  so there is nothing to fall back FROM anymore). */
     private writerOffActive(): boolean {
-        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
+        return this.jsonWriterOff && this.shadow !== undefined;
     }
 
     /** #4323: per-session envelope freeze (escalated structural drift, see
@@ -3356,6 +3531,14 @@ function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Ma
         });
     }
     return blockContents;
+}
+
+/** #4942: the record→legacy-view adapter the sidecar ingest path runs on
+ *  every committed record — exported so the hermetic seam suite can build a
+ *  sidecar against a stub backend with the SAME adapter the store uses. */
+export function recordToLegacyView(record: unknown): LegacySessionLike | null {
+    const s = buildSession(record as PersistedSession);
+    return toLegacyLike(s);
 }
 
 function buildSession(parsed: PersistedSession): Session {
