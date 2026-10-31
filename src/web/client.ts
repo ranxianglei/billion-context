@@ -1056,7 +1056,7 @@ function changelogCatOf(rawLine) {
             // every priced session resolves identical rates; mixed fleets keep
             // plain ≈$ amounts (never a misleading single rate).
             const r6 = (x) => String(Math.round(x * 1e6) / 1e6);
-            const mra = o.moneyRates ? { w: r6(o.moneyRates.w), r: r6(o.moneyRates.r), q: r6(o.moneyRates.q) } : null;
+            const mra = o.moneyRates ? { w: r6(o.moneyRates.w), r: r6(o.moneyRates.r), q: r6(o.moneyRates.q), ...(o.moneyRates.i != null ? { i: r6(o.moneyRates.i) } : {}) } : null;
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "")
                 + (o.savedUsdGrossTotal
                     ? " · " + (mra ? t("ov.gross_formula", { f: o.foldsTotal, g: fmtW(o.grossSavedTotal), r: mra.r, n: fmtUsd(o.savedUsdGrossTotal) }) : t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }))
@@ -1110,7 +1110,7 @@ function changelogCatOf(rawLine) {
                 const f = (v) => fmtW(v) + (mi > 0 ? " (−" + ((v / mi) * 100).toFixed(1) + "%)" : "");
                 hs.textContent = missSum > 0 ? t("ov.miss_split", { n: f(o.missNewTotal || 0), c: f(o.missCompTotal || 0), x: f(o.missTtlTotal || 0) }) : t("common.none");
                 if (o.missSplitUsdTotal)
-                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) }) + (mra ? " " + t("ov.miss_rates", mra) : "");
+                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) }) + (mra && mra.i != null ? " " + t("ov.miss_rates", mra) : "");
             }
             $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
             $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
@@ -1119,7 +1119,7 @@ function changelogCatOf(rawLine) {
             // reconcile with the 花费 card (i + r + w + o == costUsdTotal), so
             // every displayed token figure has a money face next to it.
             const cu = o.costUsdSplitTotal;
-            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) + (mra ? " · " + t("ov.at_input", { v: mra.w }) : "") : "";
+            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) + (mra && mra.i != null ? " · " + t("ov.at_input", { v: mra.i }) : "") : "";
             $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) + (mra ? " · " + t("ov.at_read", { v: mra.r }) : "") : "";
             $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) + (mra ? " · " + t("ov.at_output", { v: mra.q }) : "") : "";
             const pb = $("protocol-body");
@@ -2726,9 +2726,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #4899 v5: per-session rate args — show THE price inside each formula,
         // same rule as the overview (only when one price actually applies).
         const d6 = (x) => String(Math.round(x * 1e6) / 1e6);
-        const drates = d.rates ? { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) } : null;
+        const drates = d.rates ? { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q), ...(d.rates.i != null ? { i: d6(d.rates.i) } : {}) } : null;
         const inSub = (d.costUsd ? t("ov.tier_unhit", { n: fmtUsd(d.costUsd.input) }) : "")
-            + (drates ? " · " + t("ov.at_input", { v: drates.w }) : "")
+            + (drates && drates.i != null ? " · " + t("ov.at_input", { v: drates.i }) : "")
             + (d.payback != null && d.savedUsdGross != null ? " · " + t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
         mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false, inSub);
         mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null, false,
@@ -2756,7 +2756,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #4899: $ face under the missed-tokens split (current price table); tokens
         // only when no price resolves.
         const missLine = missArgs
-            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) + (drates ? " " + escapeHtml(t("ov.miss_rates", drates)) : "") : "")
+            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) + (drates && drates.i != null ? " " + escapeHtml(t("ov.miss_rates", drates)) : "") : "")
             : "";
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
