@@ -184,8 +184,13 @@ export function shortTokenCount(n: number): string {
   return `~${k >= 10 ? Math.round(k) : Math.round(k * 10) / 10}K`;
 }
 
+// #5186: the ref span is the strongest signal in this line, and models copied
+// it into compress ranges despite the "not as fold suggestions" parenthetical
+// further down — tag each run explicitly where the eye lands. Runs are by
+// construction outside the actionable offer (uncoveredHistoryRuns), so the tag
+// is true for every row this formatter lists.
 export function describeUncoveredRuns(runs: UncoveredRun[], maxListed = 5): string {
-  const listed = runs.slice(0, maxListed).map((r) => `${r.startRef}–${r.endRef} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok)`);
+  const listed = runs.slice(0, maxListed).map((r) => `[not foldable] ${r.startRef}–${r.endRef} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok)`);
   const rest = runs.length - listed.length;
   return rest > 0 ? `${listed.join(", ")}, +${rest} more run(s)` : listed.join(", ");
 }
