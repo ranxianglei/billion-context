@@ -887,7 +887,7 @@ function defaultWhereRunner(name: string): { stdout: string | null } {
 // checkouts and pnpm stores rename the package dir) counts as ours; anything
 // else keeps the name and is never touched. An unreadable .claude.json falls
 // back to the legacy behavior (plain add; the CLI owns its own file errors).
-function claudeMcpFaceAction(entryJs: string, stableOrigin: string):
+function claudeMcpFaceAction(entryJs: string, explicitPin: string | undefined):
     { kind: "current" } | { kind: "fresh" } | { kind: "replace"; reason: string } | { kind: "foreign" } {
     let data: Record<string, unknown>;
     try {
@@ -905,8 +905,13 @@ function claudeMcpFaceAction(entryJs: string, stableOrigin: string):
     const legacy = isNodeCommand && args.some((a) => /dist[\\/]mcp\.(?:js|mjs)$/.test(a));
     if (!ours && !legacy) return { kind: "foreign" };
     if (!ours) return { kind: "replace", reason: "migrated from dist/mcp.js" };
+    // #5128: canonical form since the lane port drifts (#1660) — our script +
+    // (the user's explicit install-time pin, else NO pin: dist/claude-mcp-entry.js
+    // resolves the live lane proxy per session). A stale baked pin is healed away.
     const pin = typeof entry.env === "object" && entry.env !== null ? (entry.env as Record<string, unknown>).BILI_MCP_PROXY : undefined;
-    if (pin === stableOrigin && args.includes(entryJs)) return { kind: "current" };
+    const pinMatches = (pin === undefined && explicitPin === undefined) || (pin !== undefined && pin === explicitPin);
+    if (pinMatches && args.includes(entryJs)) return { kind: "current" };
+    if (pin !== undefined && explicitPin === undefined) return { kind: "replace", reason: "removed stale BILI_MCP_PROXY pin (the entry resolves the live lane proxy per session)" };
     return { kind: "replace", reason: "re-pinned" };
 }
 
@@ -930,7 +935,6 @@ function claudeInstall(): string {
     // can no longer desync from the hook: both resolve through
     // resolveClaudeNativePort(), and the SessionStart hook's repin pass
     // rewrites the baked URL to the live origin anyway (#1660).
-    const nativePort = resolveClaudeNativePort() ?? lanePreferredPort("claude");
     const file = claudeSettingsFile();
     const settings = readJson(file);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
@@ -949,30 +953,37 @@ function claudeInstall(): string {
     });
     writeJson(file, data);
 
-    // MCP face: pinned to the STABLE port the hook brings up — never
-    // proxyOriginForInstall() (an ephemeral launcher proxy would go stale in
-    // this static config). #1821: the entry now carries the mid-session
-    // watchdog that respawns the lane proxy when it dies; pre-watchdog
-    // installs registered plain dist/mcp.js and are swapped in place below so
-    // an upgrade lands the self-heal without a manual reinstall dance.
-    const stableOrigin = `http://127.0.0.1:${nativePort}`;
+    // MCP face. #5128 (same class as #926, fixed for opencode in #936): no
+    // origin pin by default — the lane port drifts +1 on collision (#1660), so
+    // baking BILI_MCP_PROXY to the install-time base froze it stale once the
+    // lane hopped while model traffic rode the repinned URL. The entry resolves
+    // the live proxy per session; a pin lands only from an explicit BILI_MCP_PROXY
+    // env at install time. Never proxyOriginForInstall() (ephemeral → goes stale).
+    // #1821: the entry carries the mid-session watchdog that respawns the lane
+    // proxy when it dies; pre-watchdog installs registered plain dist/mcp.js,
+    // swapped in place below so an upgrade lands the self-heal without a reinstall.
+    const rawPin = process.env.BILI_MCP_PROXY?.trim();
+    const hasPin = rawPin !== undefined && rawPin.length > 0;
     const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
-    const mcpAdd = ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpEntryJs];
+    const mcpAdd = hasPin
+        ? ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${rawPin}`, "--", process.execPath, mcpEntryJs]
+        : ["mcp", "add", "bili", "--scope", "user", "--", process.execPath, mcpEntryJs];
+    const pinSuffix = hasPin ? `pinned ${rawPin}` : "no origin pin — resolves the live lane proxy per session";
     let mcpNote: string;
     try {
-        const action = claudeMcpFaceAction(mcpEntryJs, stableOrigin);
+        const action = claudeMcpFaceAction(mcpEntryJs, hasPin ? rawPin : undefined);
         switch (action.kind) {
             case "current":
-                mcpNote = `MCP face current (${claudeMcpJson()}, pinned ${stableOrigin})`;
+                mcpNote = `MCP face current (${claudeMcpJson()}, ${pinSuffix})`;
                 break;
             case "fresh":
                 runClaudeCli(claude, mcpAdd);
-                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin})`;
+                mcpNote = `MCP face -> ${claudeMcpJson()} (${pinSuffix})`;
                 break;
             case "replace":
                 runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
                 runClaudeCli(claude, mcpAdd);
-                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}, ${action.reason})`;
+                mcpNote = `MCP face -> ${claudeMcpJson()} (${action.reason}${hasPin ? `, pinned ${rawPin}` : ""})`;
                 break;
             case "foreign":
                 mcpNote = `MCP face left untouched (foreign bili server at ${claudeMcpJson()})`;
