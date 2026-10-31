@@ -973,10 +973,11 @@ export type ProxyOptions = {
  *  `allowDshCompaction` escape hatch was REMOVED (#3651) — dsh native
  *  compaction is now refused unconditionally by the #1729 wire guard on every
  *  lane, and a landed checkpoint durably shadows the raw history
- *  (irreversible), so no opt-in remains. The one live key is
- *  `authoredCompaction` (#3723/#3901). Leftover removed keys still sit in old
- *  files: the section stays RECOGNIZED so they don't trip the unknown-key
- *  warning, and each is ignored with a once-per-process deprecation note
+ *  (irreversible), so no opt-in remains. Live keys: `authoredCompaction`
+ *  (#3723/#3901), `contextTab` + `contextTabLabel` (#4237),
+ *  `keepCommandCompact` (#4872). Leftover removed keys still sit in old files:
+ *  the section stays RECOGNIZED so they don't trip the unknown-key warning,
+ *  and each is ignored with a once-per-process deprecation note
  *  (warnRemovedDshAllowKey). */
 interface DshFileSettings {
     /** #3723/#3901: bili-authored compaction answers (ON by default since
@@ -998,6 +999,13 @@ interface DshFileSettings {
      *  rename exists for machines where another plugin occupies the same name
      *  (dsh-context ships its own "上下文"). */
     contextTabLabel?: string;
+    /** #4872: keep @deepseek-ai/dsh-command-compact ENABLED under the #3354
+     *  load-time overlay (only compaction-basic gets disabled), restoring the
+     *  explicit /compact command for third-party plugins bridging through
+     *  ctx.commands.find(agent, "compact"). Default OFF = today's both-
+     *  packages rule. Env BILI_DSH_KEEP_COMMAND_COMPACT wins; resolved at
+     *  bili-native activation (next host restart). */
+    keepCommandCompact?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -2455,9 +2463,9 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     const d = obj.dsh;
     if (d !== null && typeof d === "object" && !Array.isArray(d)) {
         // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
-        // (#4237) are the LIVE keys in the section — everything else found
-        // here is removed/unknown and gets named.
-        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        // (#4237), keepCommandCompact (#4872) are the LIVE keys in the section
+        // — everything else found here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel", "keepCommandCompact"]);
         for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();

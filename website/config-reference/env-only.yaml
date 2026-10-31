@@ -18,6 +18,14 @@ entries:
     group: envonly
     desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
     desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+  - key: BILI_DSH_KEEP_COMMAND_COMPACT
+    type: boolean
+    default: "false"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Env tier for dsh.keepCommandCompact (#4872): 1/true keeps @deepseek-ai/dsh-command-compact enabled under the #3354 load-time overlay (only auto-compaction compaction-basic stays disabled), restoring the explicit /compact command for third-party plugins bridging through ctx.commands.find(agent, \"compact\"); 0/false or unset = today's both-packages rule. Takes effect on the next dsh restart."
+    desc_zh: "dsh.keepCommandCompact 的 env 层（#4872）：1/true 在 #3354 加载期 overlay 下保留 @deepseek-ai/dsh-command-compact 启用（只禁自动压缩 compaction-basic），恢复显式 /compact 命令给通过 ctx.commands.find(agent, \"compact\") 桥接的第三方插件；0/false 或缺省 = 现状两包同禁。下次 dsh 重启生效。"
   - key: BILI_DSH_MAX_TESTED_VERSION
     type: string
     default: "0.2.0-rc.2 (CI e2e anchor)"

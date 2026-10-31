@@ -3914,6 +3914,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
             dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
             dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
+            dshKccRow.inp.checked = ds ? ds.keepCommandCompact === true : false;
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3994,6 +3995,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
             if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
         }));
+        const dshKccRow = row("quick-dsh-keepcompact", t("cfg.q_dsh_keepcompact"));
+        qCtrls.push(dshKccRow.inp);
+        dshKccRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshKccRow.inp.checked) ds.keepCommandCompact = true; else delete ds.keepCommandCompact;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshKccHint = document.createElement("span");
+        dshKccHint.className = "dim small";
+        dshKccHint.textContent = t("cfg.q_dsh_keepcompact_hint");
+        dshKccRow.ctl.appendChild(dshKccHint);
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {
