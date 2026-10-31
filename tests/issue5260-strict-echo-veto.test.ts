@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -161,6 +162,124 @@ test("#5260: main-path e2e — one 422 vetoes strict echo, the next request goes
     } finally {
         await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
         await fake.close();
+        setLogCapture(null);
+    }
+});
+
+test("#5260 review: demand → veto → re-demand — the veto clears on opposite evidence even when the flag is already true", async () => {
+    // Review finding: the PR's first draft nested the veto-clear inside the
+    // learned-flag flip guard. A session holding BOTH evidence classes (learned
+    // ON from an earlier demand 400, later vetoed by an extra-reject) could then
+    // never clear its veto — a re-demand arriving while the flag was already
+    // true did nothing, and every tool-call turn 400'd forever in the opposite
+    // direction (the mirror image of #5260's stuck loop). This drives the full
+    // flip through the real relay: 400 demand (learn ON) → 422 extra-forbidden
+    // (veto over the learned flag) → 400 demand (veto must clear) → 200 with
+    // the blank echo back.
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+
+    const forwarded: Array<{ messages: Record<string, unknown>[] }> = [];
+    let phase: "demand" | "forbid" | "accept" = "demand";
+    const upstream = http.createServer((req, res) => {
+        let raw = "";
+        req.on("data", (c) => (raw += String(c)));
+        req.on("end", () => {
+            const body = JSON.parse(raw) as { messages?: Record<string, unknown>[] };
+            if (Array.isArray(body.messages)) forwarded.push({ messages: body.messages });
+            if (phase === "demand") {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(DEEPSEEK_DEMAND_400);
+            } else if (phase === "forbid") {
+                res.writeHead(422, { "content-type": "application/json" });
+                res.end(MISTRAL_422);
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "chatcmpl_fake",
+                    object: "chat.completion",
+                    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                    usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+                }));
+            }
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: origin,
+        routes: {
+            [origin]: { models: { "deepseek-v4-1-flash-1017": { context: 1_048_576 } } },
+        },
+        modelContextLimit: 1_048_576,
+        kernelConfig: defaultConfig(1_048_576),
+        compress: { injectTool: false, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: true,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        chainContentDetection: false,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const post = () => fetch(`http://127.0.0.1:${proxyPort}/bili/${origin}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "re5260-2" },
+            body: JSON.stringify({ model: "deepseek-v4-1-flash-1017", messages: CLIENT_MESSAGES }),
+        });
+        const tcOf = (fwd: { messages: Record<string, unknown>[] }) => fwd.messages.find((m) => Array.isArray(m.tool_calls));
+
+        // 1) demand-class 400 → learns strict echo ON (the existing #684 behavior).
+        const r1 = await post();
+        assert.equal(r1.status, 400);
+        await r1.text();
+        assert.equal(tcOf(forwarded.at(-1)!)!.reasoning_content, "", "request 1 shows the static-detection injection");
+        assert.ok(captured.some((c) => c.msg.includes("learned strictReasoningEcho")), `demand 400 must learn the flag, got: ${captured.map((c) => c.msg).join(" | ")}`);
+
+        // 2) extra-forbidden 422 → the veto lands ON TOP of the learned flag.
+        phase = "forbid";
+        const r2 = await post();
+        assert.equal(r2.status, 422);
+        await r2.text();
+        assert.equal(tcOf(forwarded.at(-1)!)!.reasoning_content, "", "flag still on → request 2 still carries the injection");
+        assert.ok(captured.some((c) => c.msg.includes("vetoed strictReasoningEcho")), "extra-reject must set the veto over the learned flag");
+
+        // 3) demand-class 400 AGAIN → the veto must clear even though the flag
+        //    is already true (the subcase the first draft got wrong).
+        phase = "demand";
+        const r3 = await post();
+        assert.equal(r3.status, 400);
+        await r3.text();
+        assert.ok(!("reasoning_content" in tcOf(forwarded.at(-1)!)!), "veto held during request 3 — no injection");
+        assert.ok(captured.some((c) => c.msg.includes("cleared strictReasoningEchoVeto")), `re-demand must clear the veto despite the flag already being true, got: ${captured.map((c) => c.msg).join(" | ")}`);
+
+        // 4) accept → the blank echo is back (echo ON, veto gone).
+        phase = "accept";
+        const r4 = await post();
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(tcOf(forwarded.at(-1)!)!.reasoning_content, "", "request 4 carries the blank echo again");
+    } finally {
+        await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
+        upstream.closeAllConnections?.();
+        await new Promise<void>((resolve) => upstream.close(() => resolve()));
         setLogCapture(null);
     }
 });
