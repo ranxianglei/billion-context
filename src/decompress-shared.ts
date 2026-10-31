@@ -140,6 +140,28 @@ function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header:
     }
 }
 
+// #5013: bodies above this ride the wire as a temp-file pointer, not bytes.
+const INLINE_RESTORE_CHAR_CAP = 10000;
+
+/** Auto-spill leg shared by every inline restore path (whole-block, range,
+ *  derived-parent — the last used to skip it entirely, #5013). Under the cap
+ *  the caller proceeds inline; over it the body lands in a tracked 0600 temp
+ *  file (bounded retention via the reaper) and the caller gets a pointer — or
+ *  the failure receipt when the write cannot happen. */
+function autoSpillReceipt(header: string, body: string, fileTag: string): ProxyToolResult | null {
+    if (body.length <= INLINE_RESTORE_CHAR_CAP) return null;
+    const outPath = join(tmpdir(), `acp-decompress-${fileTag}-${Date.now()}.txt`);
+    try {
+        mkdirSync(dirname(outPath), { recursive: true });
+        writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+        trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
+        reapTempFiles();
+        return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
+    } catch (e) {
+        return exportFailureReceipt(outPath, e, body);
+    }
+}
+
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
@@ -242,19 +264,8 @@ export function resolveDecompress(
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
     const toFileOut = toFilePointer(args, ctx, header, body);
     if (toFileOut !== null) return toFileOut;
-    const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-    const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
-    if (outPath) {
-        try {
-            mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
-            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
-            reapTempFiles();
-            return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
-        } catch (e) {
-            return exportFailureReceipt(outPath, e, body);
-        }
-    }
+    const spilled = autoSpillReceipt(header, body, blockId.replace(/[^a-zA-Z0-9_-]/g, "-"));
+    if (spilled !== null) return spilled;
     // #398/#403 + #1294 P2 wiring (dedup of #1316 × #1298): a successful INLINE
     // whole-block restore hands the block's re-summarization material back to
     // the model via this tool result, and the client keeps tool results in its
@@ -445,23 +456,16 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         // queued and no restore is counted; the block stays untouched.
         if (toFileOut.outcome === "failure") return toFileOut;
         injText = toFileOut.text;
-    } else if (body.length > 10000) {
-        const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        // [#1207 review F4] Span in the filename (two spans of one block in the
-        // same millisecond must not clobber each other) and 0600 (folded
-        // conversation content is not world-readable on multi-user hosts).
-        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${Date.now()}.txt`);
-        try {
-            mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
-            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
-            reapTempFiles();
-            injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
-        } catch (e) {
-            return exportFailureReceipt(outPath, e, body);
-        }
     } else {
-        injText = `${header}\n${body}`;
+        // [#1207 review F4] Span stays in the file tag: two spans of one block
+        // in the same millisecond must not clobber each other.
+        const spilled = autoSpillReceipt(header, body, `${block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-")}-${startRaw}-${endRaw}`);
+        if (spilled !== null) {
+            if (spilled.outcome === "failure") return spilled;
+            injText = spilled.text;
+        } else {
+            injText = `${header}\n${body}`;
+        }
     }
     // [#1207 review F5] A client retry re-executes this path; the injection id
     // is deterministic, so dedupe on it — retries re-ack without queueing a
@@ -591,6 +595,13 @@ function resolveDerivedDecompress(
         const body = view?.text || block.summary;
         const count = view?.count ?? 0;
         const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;
+        // #5013: mirror the gates the other restore paths carry — an explicit
+        // toFile was silently ignored here, and an oversized parent block rode
+        // the wire unbounded into a near-full child window.
+        const toFileOut = toFilePointer(args, ctx, header, body);
+        if (toFileOut !== null) return toFileOut;
+        const spilled = autoSpillReceipt(header, body, `${blockId.replace(/[^a-zA-Z0-9_-]/g, "-")}-derived`);
+        if (spilled !== null) return spilled;
         return toolOk(`${header}\n${body}`);
     }
     return toolFail(`[Block ${blockId} not found]`);
