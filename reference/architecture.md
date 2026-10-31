@@ -77,6 +77,7 @@ billion-context/
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
+│   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
 │   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)

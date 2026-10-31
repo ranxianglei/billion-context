@@ -1844,6 +1844,11 @@ export class UnifiedStore {
      *  archived session, not one tiny file per session. */
     static readonly ARCHIVE_LOG_NAME = "archive.jsonl";
 
+    /** #5312: block-granularity archive log — one JSON line per archived fold
+     *  block. Separate from the session log so a block archive never rewrites
+     *  (or is rewritten by) whole-session exports. */
+    static readonly BLOCK_ARCHIVE_LOG_NAME = "block-archive.jsonl";
+
     /** #3901/#3463: archive one session. The full row bodies (messages,
      *  blocks, refs, dead refs, ccr, session_ext, unpinned checkpoints) are
      *  exported verbatim — content bodies included — as ONE JSON line
@@ -2020,6 +2025,110 @@ export class UnifiedStore {
         }
         writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
+        return { ok: true };
+    }
+
+    /** #5312: full historical transcript ids for a session — live AND retired
+     *  rows. Unlike messageIdRows (live-only, render-lane) this returns every
+     *  message identity ever ingested, the conservative basis for judging
+     *  whether a fold block's covered ids ever belonged to THIS session. A
+     *  legitimate fold's covered rows always persist here (retire-don't-delete,
+     *  #4390), so only a genuinely foreign block reads zero intersection. */
+    allMessageIds(sessionId: string): string[] {
+        const rows = this.db.prepare("SELECT msg_id FROM messages WHERE session_id = ?").all(sessionId) as Record<string, unknown>[];
+        return rows.map((r) => r.msg_id as string);
+    }
+
+    /** #5312: reversibly archive ONE fold block out of a session's live set.
+     *  Block-granularity mirror of archiveSession: capture the row verbatim
+     *  plus its CAS bodies into `<archiveDir>/block-archive.jsonl` BEFORE
+     *  releasing refs, so restoreBlock re-puts them byte-exact (same sha256 →
+     *  same hashes). Unlike reapBlocks (orphan-gc) this is REVERSIBLE — content
+     *  is preserved, not journaled-lossy. Idempotent: an already-absent block
+     *  no-ops with reason 'not-found'. */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        const row = this.db.prepare(
+            "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? AND block_id = ?",
+        ).get(sessionId, blockId) as Record<string, unknown> | undefined;
+        if (!row) return { ok: false, reason: "not-found" };
+        const exportPath = join(opts.archiveDir, UnifiedStore.BLOCK_ARCHIVE_LOG_NAME);
+        const wanted: string[] = [row.summary_hash as string];
+        if (row.one_hash !== null && row.one_hash !== undefined) wanted.push(row.one_hash as string);
+        const content: Record<string, string> = {};
+        for (const hash of wanted) {
+            const c = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as { bytes: Buffer | Uint8Array } | undefined;
+            if (c) content[hash] = Buffer.from(c.bytes).toString("utf8");
+        }
+        mkdirSync(opts.archiveDir, { recursive: true });
+        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, blockId, archivedAt: Date.now(), block: row, content }) + "\n");
+        let contentRowsDeleted = 0;
+        this.db.transaction(() => {
+            this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
+            this.releaseContent(row.summary_hash as string);
+            if (row.one_hash !== null && row.one_hash !== undefined) this.releaseContent(row.one_hash as string);
+            const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
+            contentRowsDeleted = zero.n;
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+        });
+        loggerLog("info", `[#5312] archived block ${blockId} from ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
+        return { ok: true, exportPath, contentRowsDeleted };
+    }
+
+    /** #5312: inverse of archiveBlock — re-put the block's CAS bodies and
+     *  re-insert its row from the block archive log, then drop the restored
+     *  line(s). A live twin, if any, stays authoritative (first claimant wins,
+     *  matching restoreArchived) and the CAS bodies are NOT re-put: doing so
+     *  would inflate each body's refcount by 1 permanently (slow content-table
+     *  leak; #5312 review, non-blocking finding 1). putContent still precedes
+     *  the insert on the conflict-free path because the blocks row carries a
+     *  foreign key onto content; ON CONFLICT DO NOTHING stays as belt-and-
+     *  braces behind the explicit twin probe. */
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        const exportPath = join(opts.archiveDir, UnifiedStore.BLOCK_ARCHIVE_LOG_NAME);
+        if (!existsSync(exportPath)) return { ok: false, reason: "export-missing" };
+        let rawLines: string[];
+        try { rawLines = readFileSync(exportPath, "utf8").split("\n"); } catch { return { ok: false, reason: "export-corrupt" }; }
+        let lineNo = -1;
+        for (let i = 0; i < rawLines.length; i++) {
+            if (!rawLines[i].trim()) continue;
+            let head: { sessionId?: string; blockId?: string };
+            try { head = JSON.parse(rawLines[i]) as typeof head; } catch { continue; }
+            if (head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
+        }
+        if (lineNo === -1) return { ok: false, reason: "not-found" };
+        let dump: { block: Record<string, unknown>; content: Record<string, string> };
+        try { dump = JSON.parse(rawLines[lineNo]) as typeof dump; } catch { return { ok: false, reason: "export-corrupt" }; }
+        this.db.transaction(() => {
+            // Twin probe FIRST: a pre-existing live block keeps authority and we
+            // must not touch content refcounts (the reviewed leak path). The FK
+            // blocks→content is why the conflict-free path still puts content
+            // before its insert.
+            const twin = this.db.prepare(
+                "SELECT 1 AS one FROM blocks WHERE session_id = ? AND block_id = ?",
+            ).get(sessionId, blockId);
+            if (twin) return;
+            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            this.db.prepare(
+                `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,
+            ).run(
+                dump.block.block_id as string, sessionId, dump.block.ord as number, dump.block.start_seq as number, dump.block.end_seq as number,
+                (dump.block.start_ref as number | null) ?? null, (dump.block.end_ref as number | null) ?? null, dump.block.tier as number,
+                dump.block.summary_hash as string, (dump.block.one_hash as string | null) ?? null, (dump.block.supersedes_block_id as string | null) ?? null,
+                dump.block.active as number, dump.block.created_at as number, dump.block.covered_hash as string, dump.block.payload_json as string,
+            );
+        });
+        const kept: string[] = [];
+        for (const l of rawLines) {
+            if (!l.trim()) continue;
+            try {
+                const head = JSON.parse(l) as { sessionId?: string; blockId?: string };
+                if (head.sessionId === sessionId && head.blockId === blockId) continue;
+            } catch { continue; }
+            kept.push(l);
+        }
+        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        loggerLog("info", `[#5312] restored block ${blockId} into ${sessionId} from ${exportPath}`);
         return { ok: true };
     }
 

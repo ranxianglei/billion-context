@@ -808,6 +808,29 @@ export class UnifiedShadow {
         return this.sync.archiveSession(sessionId, opts);
     }
 
+    /** #5312: full transcript id set + block rows for the foreign-block sweep
+     *  (reads degrade like the neighboring sync facades on network backends). */
+    allMessageIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.allMessageIds(sessionId);
+    }
+
+    getBlocks(sessionId: string): ReturnType<import("./store.ts").UnifiedStore["getBlocks"]> {
+        if (this.sync === null) return [];
+        return this.sync.getBlocks(sessionId);
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block archive unavailable" };
+        return this.sync.archiveBlock(sessionId, blockId, opts);
+    }
+
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block restore unavailable" };
+        return this.sync.restoreBlock(sessionId, blockId, opts);
+    }
+
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);

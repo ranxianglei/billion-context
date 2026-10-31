@@ -62,7 +62,7 @@
   },
   "dependencies": {
     "mysql2": "^3.15.3",
-    "zod": "4.1.8"
+    "zod": "4.6.7"
   },
   "optionalDependencies": {
     "jimp": "1.6.1"
