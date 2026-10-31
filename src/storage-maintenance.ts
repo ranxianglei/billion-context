@@ -7,7 +7,6 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "./persist.js";
-import { StorageSecondWriterError } from "./storage/store.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 
@@ -278,17 +277,11 @@ export async function runStorageGcCommand(opts: {
     try {
         store = new SessionStore({ dir: opts.dir, enabled: true });
     } catch (err) {
-        // #4612: under the no-degradation policy a live foreign writer makes the
-        // unified open REFUSE (constructor throws) before runGc's own guard can
-        // answer. Surface the same actionable refusal the in-process guard
-        // produces instead of leaking a stack trace through the CLI.
-        if (err instanceof StorageSecondWriterError) {
-            const reason = `refused: another process (pid ${err.pid}) is actively writing index.db — 'storage gc --vacuum full' rewrites the whole database under an exclusive write lock and would starve the other instance's writes until its storage layer degrades. Stop the other process (or wait for it to exit) and retry, or use --vacuum incremental for an online-safe shrink.`;
-            if (opts.dryRun) return { code: 0, text: `${reason}\ndry-run: nothing executed\n` };
-            const data: Record<string, unknown> = { refused: true, writerPid: err.pid, vacuum: opts.vacuum ?? "full", dryRun: false };
-            if (opts.json) return { code: 1, text: `${JSON.stringify(data, null, 2)}\n` };
-            return { code: 1, text: `${reason}\n` };
-        }
+        // #4612: a live foreign writer does NOT make the unified open refuse
+        // anymore (owner decision 2026-10-31: second-writer conditions are
+        // informational, never blocking) — the full-VACUUM starvation guard
+        // lives in runGc itself (store.unifiedActiveWriter()), so no special
+        // branch is needed here.
         throw err;
     }
     try {
