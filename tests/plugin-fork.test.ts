@@ -893,7 +893,11 @@ for (const storageMode of ["legacy", "full"] as const) {
         let child: ReturnType<typeof spawn> | undefined;
         try {
             await compress(h);
-            // The fold settles asynchronously after the tool response (#4599).
+            // CI-only race (#4599): the compress fold lands in the live session
+            // state asynchronously after the tool response (#3573 replay
+            // semantics). On slow runners flushSync below would otherwise persist
+            // the pre-fold state and the cold load reports "0 block(s)
+            // (compressions=0)". Bounded-wait for the fold first.
             for (let i = 0; i < 100 && !(resolveConversation("parent").session?.state.blocks?.length ?? 0); i++) {
                 await new Promise((r) => setTimeout(r, 50));
             }
@@ -1341,6 +1345,21 @@ test("HTTP raw-snapshot retention cap fails closed instead of growing without bo
     }
 });
 
+test("HTTP 409 names the failed reconstruction gate on the generic path (#5188)", { timeout: 60_000 }, async () => {
+    // #5188 review: the generic SNAPSHOT_UNAVAILABLE body must say WHICH
+    // reconstruction gate fired so a bare 409 is diagnosable — while the capped
+    // refusal above keeps its pinned byte-exact message (no suffix there).
+    const h = await harness();
+    try {
+        const session = getSession("recon-gate");
+        assert.equal(session.pluginSnapshot, undefined);
+        assert.equal(session.metadata.publicSnapshotCapped, undefined);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=recon-gate");
+        assert.equal(snapshot.status, 409);
+        assert.equal((snapshot.body as { error?: string }).error, "Error: raw snapshot unavailable; send a fresh plugin model request [reconstruction: empty-lastPassIds]");
+    } finally { await h.close(); }
+});
+
 test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", { timeout: 60_000 }, async () => {
     const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
     process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
@@ -1469,7 +1488,10 @@ test("HTTP a cold-restored non-retained parent serves its intact raw tail immedi
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
         // #5140: the intact raw tail is reconstructable from the unified index, so the cold
         // parent is servable immediately — no model call needed to recover stored source.
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
+        // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
+        const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
