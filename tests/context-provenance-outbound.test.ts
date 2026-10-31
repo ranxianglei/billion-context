@@ -117,7 +117,11 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
                 h.setUsage(false);
                 if (scenario === "upstream-failure") h.setFail();
                 now = 1791049003000;
-                await h.send([...history, "prior response", "x".repeat(7500)], scenario === "model-switch" ? "model-switched" : "model-test");
+                // #2683: the failure arm adopts a billing-caliber reading (chars/4-class,
+                // k̂-scaled) instead of the char-count bound — size the growth so that
+                // reading still outgrows the 10000-token fixture bill and the
+                // replace-stale-usage mechanic under test keeps firing.
+                await h.send([...history, "prior response", "x".repeat(60_000)], scenario === "model-switch" ? "model-switched" : "model-test");
                 const after = await h.status();
                 assert.equal(after.contextTokensSource, "estimate");
                 assert(after.contextTokens > 18000, JSON.stringify(after));
@@ -125,8 +129,15 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
                 assert.equal(after.contextTokensAt, now);
                 assert.notEqual(after.contextGeneration, before.contextGeneration);
                 assert.equal(session.metadata.contextTokensAt, usageAt, "prepare cannot refresh the last real usage time");
-                assert.equal(session.stats.lastUsageGradeTokens, 10000);
-                assert.equal(session.stats.lastInputTokensSource, scenario === "upstream-failure" ? "estimate" : "usage");
+                // #2683: a MODEL switch retires the cross-model usage reading — the bill was
+                // measured under the previous model's tokenizer, so it loses decision
+                // authority (baseline + anchor) until the next usage report. The raw sample
+                // meter (cumulative inputTokens) and the last-usage timestamp are forensic
+                // only, so they survive the switch. Same-model turns keep the reading: a
+                // no-usage success keeps the last real bill, and a failed turn whose payload
+                // outgrew it replaces it with the outbound reading.
+                assert.equal(session.stats.lastUsageGradeTokens, scenario === "model-switch" ? undefined : 10000);
+                assert.equal(session.stats.lastInputTokensSource, scenario === "upstream-failure" ? "estimate" : scenario === "model-switch" ? undefined : "usage");
                 assert.equal(after.inputTokens, 10000);
                 assert.equal(h.forwarded.length, 2);
                 t.diagnostic(JSON.stringify({ wire, scenario, before: before.contextTokens, after: after.contextTokens, source: after.contextTokensSource, usageAt, estimateAt: after.contextTokensAt }));

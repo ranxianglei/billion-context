@@ -263,9 +263,21 @@ test("#1498-F2: transform-failure fallback arms at the RAW view, not wire overhe
 
         const s2 = listSessions().find((x) => x.id === s1!.id);
         assert.equal(s2?.stats.lastInputTokensSource, "estimate", "armed baseline is tagged as an estimate");
+        // #2683: the arm adopts the billing-caliber READING of the raw view
+        // (chars/4-class + wire overhead), not the char-count UPPER bound —
+        // the bound overstated the session baseline up to 4× and survived
+        // model/window changes as phantom mass. The regression this case pins
+        // ("the raw view is measured, not overhead-only") holds at the lower
+        // scale: well above wire-overhead-only arming (hundreds of tokens),
+        // well below the char count.
+        const armed = s2?.stats.lastInputTokens ?? 0;
         assert.ok(
-            (s2?.stats.lastInputTokens ?? 0) >= TEXT_CHARS,
-            `fallback arm must measure the RAW view (>= ${TEXT_CHARS} char bound), got ${s2?.stats.lastInputTokens} — overhead-only arming never rescues the #604 deadlock`,
+            armed >= TEXT_CHARS / 8,
+            `fallback arm must measure the RAW view (>= ${TEXT_CHARS / 8} chars/4-class), got ${armed} — overhead-only arming is the #1498-F2 regression`,
+        );
+        assert.ok(
+            armed < TEXT_CHARS,
+            `fallback arm must NOT adopt the char-count upper bound (< ${TEXT_CHARS}), got ${armed} (#2683)`,
         );
     } finally {
         proxy.close();
