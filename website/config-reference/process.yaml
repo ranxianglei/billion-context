@@ -209,8 +209,8 @@ entries:
     default: "true"
     env: BILI_GUARDRAIL_REPETITION
     group: process
-    desc_en: "Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it."
-    desc_zh: "pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。"
+    desc_en: "Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call, issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). false / env 0 disables it."
+    desc_zh: "pi/omp 插件的同一调用循环破除器：连续第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。false 或 env 0 关闭。"
   - key: guardrails.textRunThreshold
     type: number
     default: "200"

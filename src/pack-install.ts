@@ -18,6 +18,7 @@
 // pattern shared with every other writer here.
 
 import { execFileSync } from "node:child_process";
+import { safePrefix } from "./text-safe.js";
 import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -98,6 +99,21 @@ function findInstalledPkg(prefix: string): { dir: string; manifest: Record<strin
     return best ? { dir: best.dir, manifest: best.manifest } : undefined;
 }
 
+/**
+ * #5340 follow-up (windows shard): without a shell there is no PATH shim
+ * resolution — plain `npm` ENOENTs, and spawning the `.cmd` shim directly
+ * still hit silent instant failures on GH windows runners (7 ms, empty
+ * stderr). The npm-cli.js next to the running node binary sidesteps shims,
+ * PATH and cmd wrapping entirely, and keeps spec args out of any shell.
+ */
+function resolveNpmExec(): { file: string; argsPrefix: string[] } {
+    if (process.platform === "win32") {
+        const cliJs = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+        if (existsSync(cliJs)) return { file: process.execPath, argsPrefix: [cliJs] };
+    }
+    return { file: process.platform === "win32" ? "npm.cmd" : "npm", argsPrefix: [] };
+}
+
 export function installPackFromNpm(spec: string, options: PackInstallOptions = {}): InstalledPack {
     const trimmed = spec.trim();
     if (!trimmed) throw new Error("spec is required (an npm package name, name@version, git URL, or .tgz path)");
@@ -107,15 +123,19 @@ export function installPackFromNpm(spec: string, options: PackInstallOptions = {
     try {
         let stderr = "";
         try {
-            execFileSync("npm", [
+            const npmExec = resolveNpmExec();
+            execFileSync(npmExec.file, [
+                ...npmExec.argsPrefix,
                 "install", "--prefix", tmp, "--no-save", "--no-audit", "--no-fund", trimmed,
             ], { timeout: NPM_TIMEOUT_MS, stdio: ["ignore", "pipe", "pipe"] });
         } catch (error) {
             const err = error as { stderr?: unknown; message?: string };
             stderr = typeof err.stderr === "string" ? err.stderr : "";
             if (/ENOENT/.test(String(err.message))) throw new Error("npm was not found on PATH");
-            const lines = stderr.trim().split("\n");
-            const tail = lines.slice(Math.max(0, lines.length - 3)).join(" ").slice(0, 300);
+            const tailLines = stderr.trim().split("\n");
+            // text-safe family gate: no raw negative slice literals; head-keep,
+            // surrogate-safe via safePrefix (#816/#1615 discipline).
+            const tail = safePrefix((tailLines.length > 3 ? tailLines.slice(tailLines.length - 3) : tailLines).join(" "), 300);
             throw new Error(`npm install ${trimmed} failed${tail ? `: ${tail}` : ""}`);
         }
 

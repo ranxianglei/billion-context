@@ -53,7 +53,6 @@
 | `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
-| `BILI_SESSION_CONTENT_STORE_PIN` | #4788 phase 2（c8d7a802） | idle-fold 逃生口：`=1/true` 让每会话 CCR content store（{byRef}/{byHash} 原文）常驻内存、save 落盘后不折叠（默认折叠；读点 src/knobs.ts:451，store 可从 unified ccr mirror 或 .content-store.json sidecar 重新物化） | #4788 phase 2 idle-fold 生产站稳后评估退役（owner 拍板） | 在用（默认 fold） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -125,6 +124,7 @@
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `=1/true` 保持单会话 CCR 内容存储（byRef/byHash 原文）常驻内存不折叠（#4788 phase 2 / #3916-E；首次触摸时从 unified ccr 镜像或 .content-store.json 侧车重建）；缺省/0/false = 落盘后折叠（默认） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
