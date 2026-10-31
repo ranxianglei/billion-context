@@ -20,7 +20,7 @@ import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPON
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
-import { normalizeUpstreamOrigin } from "./util.js";
+import { CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
@@ -1703,9 +1703,10 @@ export const CALIBRATION_SAMPLE_MAX = 5;
 // it covers the measured CJK band and stays BELOW CALIBRATION_SAMPLE_MAX (5),
 // so non-corresponding reports are still rejected before the clamp sees them.
 // Wild values remain bounded by the evidence gates: ≥2 recent samples agreeing
-// within ×2, keyed by route AND model, MIN_ESTIMATE floor.
-export const CALIBRATION_CLAMP_MIN = 0.25;
-export const CALIBRATION_CLAMP_MAX = 4;
+// within ×2, keyed by route AND model, MIN_ESTIMATE floor. Since #5373 the
+// constants live in util.ts (the read side needs them too) and are
+// re-exported here so existing imports keep resolving.
+export { CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN } from "./util.js";
 // Evidence requirements: ≥2 recent same-route samples agreeing within ×2.
 // One lucky/degenerate pair must not flip every estimate on the route.
 export const CALIBRATION_SAMPLE_WINDOW = 3;
@@ -1742,7 +1743,16 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
     const pendingEst = session.stats.lastLocalTextEstimate;
     const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
-    if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
+    if (pendingEst === undefined || pendingEst < CALIBRATION_MIN_ESTIMATE || settleOrigin === undefined || pendingOrigin !== settleOrigin) {
+        // #5373: this gate used to fail SILENTLY — in production there was no
+        // trace whether a measurement was ever ingested, which is exactly what
+        // made the #5373 incident undiagnosable from the log. One debug line
+        // with the reason keeps healthy sessions quiet but makes every miss
+        // greppable.
+        loggerLog("debug", `[${session.id}] calibration sample not ingested: ${pendingEst === undefined ? "no pending local estimate" : pendingEst < CALIBRATION_MIN_ESTIMATE ? `local estimate ${Math.round(pendingEst)} below min ${CALIBRATION_MIN_ESTIMATE}` : settleOrigin === undefined ? "no settle origin" : `origin mismatch (${pendingOrigin ?? "?"} ≠ ${settleOrigin})`}, billed=${billed} (#1933)`);
+        return;
+    }
+    {
         const rawSample = billed / pendingEst;
         // #2117 B: the ring is keyed by route AND model — tokenizers bill
         // differently across models, so a mid-session model switch starts a
@@ -1764,6 +1774,7 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
             ring.values.push(rawSample);
             if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            loggerLog("debug", `[${session.id}] calibration sample ${rawSample.toFixed(3)} ingested (billed ${billed} / local est ${Math.round(pendingEst)}) — ring [${ring.values.map((v) => v.toFixed(3)).join(", ")}] route=${settleOrigin}${settleModel ? ` model=${settleModel}` : ""} (#1933)`);
             const spread = Math.max(...ring.values) / Math.min(...ring.values);
             if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                 const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
@@ -1773,6 +1784,7 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
                     delete session.stats.calibratedEstimateModel;
+                    loggerLog("info", `[${session.id}] calibration k̂ NOT published — route policy disabled (providers[<key>].calibration.disabled) (#3211)`);
                 } else {
                     const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
@@ -1783,12 +1795,17 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     // branch: the disabled path above clears all three fields and
                     // must not re-stamp one of them (#3211 review).
                     session.stats.calibratedEstimateModel = ring.model;
+                    loggerLog("info", `[${session.id}] calibration k̂=${session.stats.calibratedEstimate.toFixed(3)} published (ring [${ring.values.map((v) => v.toFixed(3)).join(", ")}], n=${ring.values.length}) route=${settleOrigin}${ring.model ? ` model=${ring.model}` : ""} (#1933)`);
                 }
             } else {
+                const hadPublished = session.stats.calibratedEstimate !== undefined;
                 delete session.stats.calibratedEstimate;
                 delete session.stats.calibratedEstimateOrigin;
                 delete session.stats.calibratedEstimateModel;
+                if (hadPublished) loggerLog("info", `[${session.id}] calibration k̂ cleared (n=${ring.values.length}, spread ${spread.toFixed(2)} > ${CALIBRATION_CONSISTENCY_RATIO}) — falling back to raw estimate until evidence agrees (#1933)`);
             }
+        } else {
+            loggerLog("debug", `[${session.id}] calibration sample ${rawSample.toFixed(3)} rejected — outside plausibility band [${CALIBRATION_SAMPLE_MIN}, ${CALIBRATION_SAMPLE_MAX}] (billed ${billed} / local est ${Math.round(pendingEst)}) (#1933)`);
         }
         session.stats.calibrationRing = ring;
     }
@@ -1811,7 +1828,9 @@ export function settleOverflowCalibration(
     upstream?: string,
 ): void {
     if (!(measured > 0)) return;
+    const pendingBefore = session.stats.lastLocalTextEstimate;
     ingestCalibrationPair(session, measured, upstream);
+    loggerLog("info", `[${session.id}] overflow-stated measurement ingested: upstream stated ${measured} tokens for the rejected payload, local est ${pendingBefore !== undefined ? Math.round(pendingBefore) : "none"} (route=${normalizeUpstreamOrigin(upstream) ?? "?"}) — ring discipline applies (#3900/#5373)`);
     // The rejected request will never produce a usage report — retire its
     // pending pair NOW so no later report can mispair against a consumed
     // estimate (#1933 F1). A same-request refold (#1195) re-runs prepare and
