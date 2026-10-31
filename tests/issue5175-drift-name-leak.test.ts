@@ -1182,3 +1182,95 @@ test("#5175 residual: a byte cut never hands the responses client a ref or a dri
         `${offenders.length}/${cuts} cuts leaked on the responses lane:\n${offenders.slice(0, 4).join("\n")}`,
     );
 });
+
+// #5175 fourth seam: the NON-STREAMING plugin JSON path (`pipePluginJson` →
+// `pipePluginJson`). Every other lane in this file is SSE: the four
+// fast-path gates live in the streaming processors, and the pure-rule tests
+// exercise whole-text helpers directly. `pipePluginJson` parses the finished body
+// and strips it in place — a separate entry with its own gate
+// (`containsRenderTagText(text) || containsMarkerLineText …`). Nothing above
+// proves it, so a future change could reopen the leak there alone.
+function jsonBodyFor(protocol: string, text: string): Record<string, unknown> {
+    if (protocol === "openai") {
+        return {
+            id: "c1",
+            object: "chat.completion",
+            choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 3, completion_tokens: 4 },
+        };
+    }
+    if (protocol === "anthropic") {
+        return {
+            id: "m1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 3, output_tokens: 4 },
+        };
+    }
+    if (protocol === "google") {
+        return {
+            candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 4 },
+        };
+    }
+    return {
+        id: "r1",
+        object: "response",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+        usage: { input_tokens: 3, output_tokens: 4 },
+    };
+}
+
+function jsonTextFrom(protocol: string, json: any): string {
+    if (protocol === "openai") return json?.choices?.[0]?.message?.content ?? "";
+    if (protocol === "anthropic") return (json?.content ?? []).map((p: any) => p?.text ?? "").join("");
+    if (protocol === "google") return (json?.candidates?.[0]?.content?.parts ?? []).map((p: any) => p?.text ?? "").join("");
+    return (json?.output ?? []).map((o: any) => (o?.content ?? []).map((p: any) => p?.text ?? "").join("")).join("");
+}
+
+async function driveJsonOnce(protocol: "openai" | "anthropic" | "google" | "responses", text: string): Promise<string> {
+    const { pipePluginJson } = await import("../src/plugin.ts");
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_json_" + Math.random().toString(36).slice(2),
+        protocol,
+    } as unknown as Session;
+    const body = JSON.stringify(jsonBodyFor(protocol, text));
+    await pipePluginJson(
+        streamOfLocal([body]),
+        res as unknown as import("node:http").ServerResponse,
+        session,
+        protocol,
+        undefined,
+        false,
+        "",
+    );
+    const sent = writes.join("");
+    let parsed: any;
+    try {
+        parsed = JSON.parse(sent);
+    } catch {
+        return sent;
+    }
+    return jsonTextFrom(protocol, parsed);
+}
+
+for (const protocol of ["openai", "anthropic", "google", "responses"] as const) {
+    test(`#5175 A: the non-streaming ${protocol} JSON body never carries the drift residue`, async () => {
+        const got = await driveJsonOnce(protocol, REPORTED);
+        assert.equal((got.match(KERNEL_REF_TEST) ?? []).length, 0, `a kernel ref reached the ${protocol} JSON client: ${JSON.stringify(got.slice(0, 90))}`);
+        assert.equal((got.match(DRIFT_OPENER_TEST) ?? []).length, 0, `a drifted opener reached the ${protocol} JSON client: ${JSON.stringify(got.slice(0, 90))}`);
+    });
+}
+
+test("#5175 A control: the non-streaming JSON path leaves genuine markup and prose byte-exact", async () => {
+    const genuine = 'x<sup>2</sup> and <span class="a">z</span> — all plain prose here.';
+    for (const protocol of ["openai", "anthropic", "google", "responses"] as const) {
+        const got = await driveJsonOnce(protocol, genuine);
+        assert.equal(got, genuine, `${protocol} JSON path must not rewrite genuine prose/markup`);
+    }
+});
