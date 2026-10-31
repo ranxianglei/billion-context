@@ -87,6 +87,7 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Drift guard
+        id: driftguard
         env:
           TRAIN_NAME: ${{ steps.train.outputs.name }}
         run: |
@@ -99,8 +100,22 @@ jobs:
           WHAT="master"
           [ -n "$TRAIN_NAME" ] && WHAT="patch train $TRAIN_NAME"
           if [ "$TREE_V" != "$NPM_V" ]; then
-            echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
-            exit 1
+            # Pending-bump state (#5376): an earlier one-click's fallback bump PR merged into
+            # master while CI was red — master now sits EXACTLY one patch ahead of npm latest,
+            # with changelog + manifests already staged there. Publishing THAT version is the
+            # intended release; re-bumping would invent a phantom empty patch. Allowed only when
+            # (a) tree == nextPatch(npm latest), (b) the resolved target IS the tree version, and
+            # (c) that version is not already tagged anywhere upstream.
+            NEXT_P="$(node -p 'const p = process.argv[1].split("-")[0].split("."); p[2] = String(Number(p[2]) + 1); p.join(".")' "$NPM_V")"
+            if [ "$TREE_V" = "$NEXT_P" ] \
+               && [ "${{ steps.version.outputs.version }}" = "$TREE_V" ] \
+               && ! git ls-remote --exit-code --tags origin "v$TREE_V" >/dev/null 2>&1; then
+              echo "::notice::$WHAT package.json ($TREE_V) is one patch ahead of npm latest ($NPM_V) — pending-bump state; publishing $TREE_V straight from master (no new bump commit)."
+              echo "pending_bump=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
+              exit 1
+            fi
           fi
           if [ "${{ steps.version.outputs.version }}" = "$NPM_V" ]; then
             echo "::error::$NPM_V is already published; pick a newer version"
@@ -135,6 +150,9 @@ jobs:
           " "$VER"
 
       - name: Bump version
+        # Skipped in pending-bump state: the tree already carries the target
+        # version plus changelog/manifests (merged fallback bump commit).
+        if: ${{ steps.driftguard.outputs.pending_bump != 'true' }}
         run: |
           node -e '
             const fs = require("fs");
@@ -162,6 +180,7 @@ jobs:
           fi
 
       - name: Verify bump diff
+        if: ${{ steps.driftguard.outputs.pending_bump != 'true' }}
         run: |
           for P in package.json package-lock.json .agents .claude-plugin plugins/codex; do
             [ -e "$P" ] && git add "$P"
@@ -196,6 +215,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VER="${{ steps.version.outputs.version }}"
+          if [ "${{ steps.driftguard.outputs.pending_bump }}" = "true" ]; then
+            # Pending-bump: master already IS the publish content (release version, changelog and
+            # manifests landed via the merged fallback bump PR). Nothing to commit; every
+            # direct-gated downstream step (Full CI dispatch/gate, tag, publish) applies as-is.
+            echo "pending-bump: master already carries v$VER — publishing the current master head, no release commit needed."
+            echo "direct=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git commit -q -m "release v$VER"
           if [ -n "$TRAIN_NAME" ]; then
             # Train mode: the release commit lands ON THE TRAIN; publishing is
