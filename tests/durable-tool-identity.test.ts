@@ -28,7 +28,7 @@ import { defaultConfig, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import type { CompressSettings } from "../src/config.ts";
-import { withDurableProtection, durableMessageToolPaths, dshSkillCatalogPath } from "../src/durable-message-guards.ts";
+import { withDurableProtection, durableMessageToolPaths, dshSkillCatalogPath, dshTimeContextPath } from "../src/durable-message-guards.ts";
 // #2989: rig hygiene resets the LIVE session-order registry (the persona-
 // anchor ladder is off the production path on every lane since #3134 —
 // v2 order resolution everywhere, google included).
@@ -78,6 +78,27 @@ test("withDurableProtection: a durable pattern in protectedLatestTools = takeove
     assert.deepEqual(out.protectedTools, [], "protectedTools not extended when latest takes over");
     assert.deepEqual(out.protectedLatestTools, ["durable/*"]);
     assert.equal(out.messagePathOf, cl);
+});
+
+test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor-skippable but foldable (#5109)", () => {
+    const reading = { id: "t1", role: "user", contentType: "text", text: "Time sampled while preparing turn 3, step 2: 2026-10-29T12:00:00.000Z\nElapsed since the preceding turn: 45s" } as never;
+    const echo = { id: "t2", role: "assistant", contentType: "text", text: "Time sampled while preparing turn 3, step 2: ..." } as never;
+    const unrelated = { id: "t3", role: "user", contentType: "text", text: "What time is it?" } as never;
+    // A real human request that merely QUOTES the phrase mid-sentence must stay
+    // unclassified (prefix-anchored match) — otherwise Rule 3 would strand it.
+    const quote = { id: "t4", role: "user", contentType: "text", text: "Why does the log say \"Time sampled while preparing turn 3\" even though I asked nothing yet?" } as never;
+    assert.equal(dshTimeContextPath(reading), "injected/time-context");
+    assert.equal(dshTimeContextPath(echo), undefined, "assistant echo is never a carrier (#2766)");
+    assert.equal(dshTimeContextPath(unrelated), undefined);
+    assert.equal(dshTimeContextPath(quote), undefined, "a real request quoting the phrase mid-sentence stays unclassified");
+    // The dsh lane classifier resolves it end-to-end...
+    const cl = durableMessageToolPaths["dsh"]!;
+    assert.equal(cl(reading), "injected/time-context");
+    // ...and the default durable policy pins nothing in the injected/
+    // namespace (stays foldable; the path exists for the Rule-3 anchor skip).
+    const out = withDurableProtection(defaultConfig(200_000), cl);
+    assert.deepEqual(out.protectedLatestTools, ["durable/*"], "latest-pin default covers durable/* only");
+    assert.ok(!(out.protectedTools ?? []).some((p) => p.includes("injected")), "no all-instance protection for injected/*");
 });
 
 test("withDurableProtection: idempotent — no duplicate durable/* on re-apply", () => {

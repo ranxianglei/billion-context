@@ -26,6 +26,7 @@ const ENTRY_FILES = new Set([
     "src/mcp.ts",
     "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
+    "src/claude-subagent-hook.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
     "src/agent/omp.ts",
