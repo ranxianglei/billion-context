@@ -808,21 +808,28 @@ export async function handleIncrementalTurn(
             // (parseCanonicalRows); this turn's delta tail has no rows yet,
             // but the wrap-up appends them at maxSeq+1 in order (#5155:
             // asynchronously — the stamps may not have landed yet when the
-            // next turn assembles). Stamps always form a prefix of
-            // entry.msgs, so projecting the unstamped suffix from the last
-            // stamped seq (+1 from 0 when nothing is stamped yet — the first
-            // resync's rows settle in message order) is exact.
+            // next turn assembles), so projecting the unstamped suffix from
+            // the last stamped seq is exact — but ONLY once real pointers
+            // exist. A from-1 projection (nothing stamped yet) is exact for a
+            // FRESH table only: a resync onto a non-empty append-only table
+            // lands the new branch ABOVE the old branch's rows, so 1..N
+            // collides live messages with existing folds' seq intervals and
+            // the seq-coverage channel prunes them from the wire (#5228).
+            // Abstain until the post-flush pointer recording lands real seqs;
+            // the kernel keeps its id-based behavior meanwhile.
             let maxSeq = -1; // 0-based store seq of the last stamped message
             for (const m of entry.msgs) if (typeof m.ledgerSeq === "number") maxSeq = Math.max(maxSeq, m.ledgerSeq - 1);
-            let next = maxSeq + 1;
-            for (const m of entry.msgs) {
-                if (typeof m.ledgerSeq !== "number") {
-                    m.ledgerSeq = next + 1;
-                    next++;
+            if (maxSeq >= 0) {
+                let next = maxSeq + 1;
+                for (const m of entry.msgs) {
+                    if (typeof m.ledgerSeq !== "number") {
+                        m.ledgerSeq = next + 1;
+                        next++;
+                    }
                 }
             }
             const seqs = entry.msgs.map((m) => m.ledgerSeq);
-            body[MSG_SEQS_BODY_FIELD] = seqs;
+            if (seqs.every((s) => typeof s === "number")) body[MSG_SEQS_BODY_FIELD] = seqs;
         }
         const bodyBuf = laneBodyBuffer(body, itemsStr);
 
