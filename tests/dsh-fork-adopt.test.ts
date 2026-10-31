@@ -45,6 +45,47 @@ test("forkIdentityHashOf stays byte-identical to plugin.ts forkMessageIdentityHa
     }
 });
 
+test("fork identity tolerates serialization/projection noise but keeps content gates hard (#5123)", () => {
+    // reasoning↔text with identical text is now the SAME history cell (hosts re-project):
+    const reasoning: CoreMessage = { id: "r", role: "assistant", contentType: "reasoning", text: "Let me think." };
+    const asText: CoreMessage = { id: "r", role: "assistant", contentType: "text", text: "Let me think." };
+    assert.equal(forkIdentityHashOf(reasoning), forkIdentityHashOf(asText));
+    // tool-call arguments differing only in whitespace are now the SAME call:
+    const callA: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-9", text: '{ "command": "ls -la" }' };
+    const callB: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-9", text: '{"command":"ls -la"}' };
+    assert.equal(forkIdentityHashOf(callA), forkIdentityHashOf(callB));
+    // a genuine TEXT change still breaks the match (content gate stays hard):
+    const edited: CoreMessage = { id: "r", role: "assistant", contentType: "text", text: "Let me think again." };
+    assert.notEqual(forkIdentityHashOf(asText), forkIdentityHashOf(edited));
+    // a different tool-call id still breaks it (content gate stays hard):
+    const otherCall: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-8", text: '{"command":"ls -la"}' };
+    assert.notEqual(forkIdentityHashOf(callB), forkIdentityHashOf(otherCall));
+    // client/server parity survives the relaxation:
+    for (const m of [reasoning, asText, callA, callB, edited, otherCall]) assert.equal(forkIdentityHashOf(m), forkMessageIdentityHash(m));
+});
+
+test("matchForkPrefix reaches full depth across reasoning→text + tool-call-whitespace divergence (#5123 acceptance)", () => {
+    // Parent-form rows (what the snapshot stores); the child core re-projects them lossily.
+    const parentForm: Array<CoreMessage> = [
+        { id: "p0", role: "user", contentType: "text", text: "question" },
+        { id: "p1", role: "assistant", contentType: "reasoning", text: "Let me explore." },
+        { id: "p2", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-1", text: '{ "command": "ls" }' },
+        { id: "p3", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tc-1", text: "total 0" },
+    ];
+    const identities = parentForm.map((m, i) => ({ rawId: `r${i}`, ref: `m${String(i + 1).padStart(5, "0")}`, identityHash: forkMessageIdentityHash(m) }));
+    // Child core: same content, but reasoning dropped to text and the tool call re-stringified.
+    const childCore: Array<CoreMessage> = [
+        { id: "c0", role: "user", contentType: "text", text: "question" },
+        { id: "c1", role: "assistant", contentType: "text", text: "Let me explore." },
+        { id: "c2", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-1", text: '{"command":"ls"}' },
+        { id: "c3", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tc-1", text: "total 0" },
+    ];
+    assert.equal(matchForkPrefix(childCore, identities), parentForm.length);
+    // A genuine content change at idx1 still truncates the prefix exactly there:
+    const divergedCore = childCore.map((m, i) => (i === 1 ? { ...m, text: "completely different" } : m));
+    assert.equal(matchForkPrefix(divergedCore, identities), 1);
+});
+
 test("forkOrderHashOf matches the plugin.ts recipe (plain JSON.stringify, literal key order)", () => {
     const identities = [
         { rawId: "a", ref: "m00001", identityHash: "x1" },
@@ -282,6 +323,53 @@ test("tryForkAdoption surfaces fork rejections and replays", async () => {
     assert.deepEqual(replayed, { outcome: "adopted", branchPoint: 3, replayed: true });
 });
 
+// ---------------------------------------------------------------------------
+// #5123: an adoption that inherits ZERO fold state while the parent held some
+// must degrade (leave publicForkReceipt unset so resume-inheritance can run),
+// never claim "adopted". Both directions + backward-compat pinned below.
+// ---------------------------------------------------------------------------
+
+// Body whose projection matches the first two seed messages then diverges:
+// branchPoint=2, core.length=3 -> branchPoint < core.length.
+const truncatedTailBody = () => bodyFor([
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "question one" },
+    { role: "assistant", content: "answer one" },
+    { role: "user", content: "a different tail" },
+]);
+
+test("tryForkAdoption degrades on the server's authoritative flag when zero blocks were inherited (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: true, inheritedBlocks: [], parentBlocks: 3 }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
+    assert.equal(result.outcome, "degraded");
+    assert.match((result as { reason: string }).reason, /^fork inherited 0 of 3 parent blocks \(branch point 2\/3\)$/);
+});
+
+test("tryForkAdoption trusts the server flag even on a full local match (no client-side truncation gate) (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: true, inheritedBlocks: [], parentBlocks: 3 }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl });
+    assert.equal(result.outcome, "degraded");
+    assert.match((result as { reason: string }).reason, /^fork inherited 0 of 3 parent blocks \(branch point 3\/3\)$/);
+});
+
+test("tryForkAdoption still adopts when the server reports a healthy inheritance (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: false, inheritedBlocks: [{ id: "b1", tier: 1, active: true }], parentBlocks: 3 }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
+    assert.equal(result.outcome, "adopted");
+});
+
+test("tryForkAdoption adopts a zero-block parent (nothing to inherit) without degrading (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: false, inheritedBlocks: [], parentBlocks: 0 }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
+    assert.deepEqual(result, { outcome: "adopted", branchPoint: 2, replayed: false });
+});
+
+test("tryForkAdoption keeps legacy behavior when the server omits the degraded flag (#5123 backward compat)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, inheritedBlocks: [] }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
+    assert.deepEqual(result, { outcome: "adopted", branchPoint: 2, replayed: false });
+});
+
 test("tryForkAdoption retries once on PARENT_REVISION_CONFLICT with a fresh snapshot", async () => {
     const calls: Recorded[] = [];
     let revision = "rev-1";
@@ -419,6 +507,39 @@ test("full chain: dsh fork child adopts the parent state and its replay is accep
         assert.equal(divergent.status, 409);
         const divergentBody = await divergent.json() as { code?: string };
         assert.equal(divergentBody.code, "CHILD_CONFLICT");
+    } finally {
+        await h.close();
+    }
+});
+
+test("fork response exposes degraded + parentBlocks so the client can detect empty inheritance (#5123)", async () => {
+    const h = await fullChainHarness();
+    try {
+        const parentMessages = [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+        ];
+        const seed = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "parent-sid" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: parentMessages }),
+        });
+        assert.equal(seed.status, 200, await seed.text());
+        const parentSnap = await (await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=parent-sid`)).json() as { parentRevision: string; orderedMessages: unknown[] };
+        const res = await fetch(`${h.origin}/__bili/plugin/fork`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ protocolVersion: 1, parentConversationId: "parent-sid", childConversationId: "child-pb", parentRevision: parentSnap.parentRevision, branchPoint: { messageCount: 3, orderHash: hash(parentSnap.orderedMessages) }, orderedMessages: parentSnap.orderedMessages, idempotencyKey: "fork:child-pb" }),
+        });
+        const resText = await res.text();
+        assert.equal(res.status, 201, resText);
+        const body = JSON.parse(resText) as { degraded?: boolean; parentBlocks?: number; inheritedBlocks?: unknown[]; blockStatus?: string };
+        assert.equal(body.parentBlocks, 0);
+        assert.equal(body.degraded, false);
+        assert.equal(body.blockStatus, "nothing-to-inherit", "a never-compressed parent has nothing to inherit — not the degenerate zero-of-N case");
+        assert.ok(Array.isArray(body.inheritedBlocks));
     } finally {
         await h.close();
     }

@@ -1085,17 +1085,31 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
+// #5123: must stay byte-identical to src/agent/fork-adopt.ts forkCanonicalText
+// (see the relaxation rationale there). Serialization/projection noise must
+// not truncate fork prefix matching on either side of the wire.
+function forkCanonicalText(text: unknown, contentType: unknown): unknown {
+    if (contentType === "tool-call" && typeof text === "string") {
+        try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
+    }
+    return text ?? null;
+}
+
 export function forkMessageIdentityHash(message: CoreMessage): string {
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
+    return forkHash([message.role, forkCanonicalText(message.text, message.contentType), message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
 }
 
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
- *  exactly the field set forkMessageIdentityHash digests, plus id. An id
- *  prefix match alone would keep a stale snapshot when a resent history flips
- *  an adapter-attached flag (toolIsError) under unchanged ids — the snapshot
- *  must track every byte fork matching can see. If an adapter ever attaches a
- *  new runtime field, it MUST be added here and to forkMessageIdentityHash
- *  together. */
+ *  the RAW fields plus id — deliberately STRICTER than forkMessageIdentityHash
+ *  since #5123, which made the identity hash serialization-tolerant (drops
+ *  contentType, JSON-canonicalizes tool-call text) so projection noise cannot
+ *  truncate fork prefix matching. Keeping this byte-exact means a resent
+ *  history that flips reasoning↔text or re-whitespace-strings a tool call still
+ *  forces a fresh snapshot instead of retaining a stale one. An id prefix match
+ *  alone would keep a stale snapshot when a resent history flips an
+ *  adapter-attached flag (toolIsError) under unchanged ids — the snapshot must
+ *  track every byte. If an adapter ever attaches a new runtime field, it MUST
+ *  be added here (and to forkMessageIdentityHash if fork matching should see it). */
 function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
     return a.id === b.id && a.role === b.role && a.contentType === b.contentType
         && a.text === b.text && a.toolName === b.toolName && a.toolCallId === b.toolCallId
@@ -1652,7 +1666,21 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            // #5123: inheriting zero fold state while the parent held blocks means the
+            // branch point collapsed below every block — the child will replay raw on
+            // its next turn. Flag it `degraded` in the response (server-authoritative,
+            // computed from the server's own ledger — the client need not re-derive it
+            // from a count it may not have) so the client degrades instead of claiming
+            // "adopted" (which sets publicForkReceipt and skips the #1486
+            // resume-inheritance recovery path). Old clients ignore the additive flag.
+            const forkDegraded = blocks.length === 0 && parent.state.blocks.length > 0;
+            // #5123: block-inheritance status independent of prefix-match status — an
+            // "exact" prefix can still inherit zero folds, which misleads receipt readers.
+            const blockStatus = blocks.length > 0 ? "inherited" : forkDegraded ? "none-inherited" : "nothing-to-inherit";
+            if (forkDegraded) {
+                loggerLog("warn", `fork ${request.childConversationId} from ${parent.id}: inherited 0 of ${parent.state.blocks.length} parent blocks (branch point ${request.branchPoint.messageCount}/${snapshot.orderedMessages.length}); child replays raw until resume-inheritance recovers (#5123)`);
+            }
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, blockStatus, degraded: forkDegraded, parentBlocks: parent.state.blocks.length, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
