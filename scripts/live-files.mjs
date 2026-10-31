@@ -68,6 +68,10 @@ export const LIVE_FILES = [
     // servers; every socket is listen(0), spawns are mocked, so the zone band
     // is belt-and-braces like #3890's — the entry is for the tripwire
     "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
+    // #4936: spawns one-shot migrate-storage.ts children (no listening
+    // sockets — the unreachable-DSN gate tests never connect); tripwire-only
+    // entry like #3890's
+    "tests/storage-migrate-script.test.ts",
     // #4982: integration rows spawn bili children against freePort() picks and
     // follow each child's REGISTERED port (ladder-tolerant); BASE is an
     // in-memory-only value, so no zone band is needed — the entry is for the

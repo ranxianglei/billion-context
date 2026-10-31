@@ -545,7 +545,10 @@ export class SessionStore {
         // Phase 3 (#2960): stop writing the legacy JSON envelope while the
         // unified store runs in effective-full mode. Ignored (warned once)
         // under shadow/legacy/encryption — there the JSON file is the sole
-        // source of truth.
+        // source of truth. sqlite-only by design until #4942 lands: the
+        // mysql facade has no synchronous read path (viewFor/listSessionIds
+        // are dead there), so an envelope-less mysql store would lose every
+        // session at every restart.
         const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
         this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption && resolveBackendName(process.env, fileStorageBackend()) === "sqlite";
         if (wantJsonWriterOff && !this.jsonWriterOff) {

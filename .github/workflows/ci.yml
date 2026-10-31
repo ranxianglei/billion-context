@@ -317,7 +317,7 @@ jobs:
   # #3388 step 2: the MySQL contract lane. The storage-backend contract
   # suite runs against a real mysql:8.0 service (BILI_MYSQL_TEST_DSN) in
   # addition to the always-on sqlite lane inside the main test job. Cheap
-  # (two files, ~1min) so it rides the core scope — every PR proves the
+  # (three files, ~1min) so it rides the core scope — every PR proves the
   # mysql backend still satisfies the operation contract.
   mysql-contract:
     needs: [plan]
@@ -355,7 +355,7 @@ jobs:
       # storage-backend-mysql-e2e.test.ts is deliberately NOT listed: its hot-
       # path test fails deterministically on real MySQL (pre-existing defect,
       # not caused by any PR in flight) — tracked in #4926; re-add it there.
-      - run: node --import tsx --test --test-concurrency=1 tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts tests/issue4666-migration-dedup.test.ts
+      - run: node --import tsx --test --test-concurrency=1 tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts tests/issue4666-migration-dedup.test.ts tests/storage-migrate-script.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
 
