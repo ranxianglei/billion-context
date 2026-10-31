@@ -365,8 +365,8 @@ entries:
     default: "536870912"
     env: BILI_SESSION_RESIDENT_MAX_BYTES
     group: process
-    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
-    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. If several large sessions stay open at once, size it above their combined weight (e.g. seven ~136 MiB sessions want ≥1 GiB): a saturated pool evicts idle sessions and every touch of one pays a synchronous cold load that can block the event loop for seconds (#4893); the permanent compress-refusal log names the value to raise it above."
+    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。若同时保持多个大会话打开，请按它们的合计权重上调（例如七个 ~136 MiB 会话需要 ≥1 GiB）：池子饱和时空闲会话被逐出，每次触碰都要付一次同步冷加载，可阻塞事件循环数秒（#4893）；压缩永久拒绝的日志会给出应上调到的具体值。"
   - key: sessions.hardMaxBytes
     type: number
     default: "(same as `sessions.residentMaxBytes`)"
