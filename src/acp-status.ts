@@ -391,17 +391,18 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
         if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
     }
-    // #4204: display counterpart of the egress-side 429 governor — holds are
-    // per origin+credential and answer locally (zero egress) while armed, so
-    // hosts/models can see WHY sends are held back and when the next probe
-    // fires. Display-only; no wire decision lives here.
+    // #4204/#5201: display counterpart of the egress-side 429 governor — holds
+    // are per origin+credential(+model when identifiable) and answer locally
+    // (zero egress) while armed, so hosts/models can see WHY sends are held
+    // back and when the next probe fires. Display-only; no wire decision lives here.
     const throttleHolds = activeThrottleHolds();
     if (throttleHolds.length > 0) {
         for (const h of throttleHolds.slice(0, 4)) {
             extra.push("");
-            extra.push(`UPSTREAM 429 HOLD — ${h.host}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on the next non-429 response (#4204).`);
+            const where = h.model !== undefined ? `${h.host} (model ${h.model})` : h.host;
+            extra.push(`UPSTREAM 429 HOLD — ${where}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on the next non-429 response (#4204).`);
         }
-        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential key(s))`);
+        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more hold key(s))`);
     }
     const shrinkAt = ctx.session.stats.emergencyShrinkAt;
     if (typeof shrinkAt === "number") {

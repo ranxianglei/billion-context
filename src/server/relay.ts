@@ -839,7 +839,11 @@ async function forwardCaptured(
     // that pins a concurrency-style provider limit for the whole account. Zero
     // egress while held; one probe per backoff window keeps recovery automatic.
     if (req.method !== "GET" && req.method !== "HEAD") {
-        const throttleReject = upstreamThrottleLocalReject(upstreamUrl, headers);
+        // #5201: pass the outbound body so the hold key carries the model
+        // dimension when identifiable (sibling models behind one credential
+        // must not hold each other). wireBody is the byte-exact send here —
+        // all mutations above this point are already applied to it.
+        const throttleReject = upstreamThrottleLocalReject(upstreamUrl, headers, Date.now(), wireBody);
         if (throttleReject !== undefined) {
             log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
             if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
@@ -1607,8 +1611,10 @@ async function forwardCaptured(
         // hold; ANY other resolved status proves the endpoint is processing
         // again and clears it.
         if (req.method !== "GET" && req.method !== "HEAD") {
-            if (upstream.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"));
-            else noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+            // #5201: wireBody is the FINAL forwarded body (post refold/shrink
+            // resends) — the verdict belongs to whatever model IT names.
+            if (upstream.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"), Date.now(), wireBody);
+            else noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), wireBody);
         }
         // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
         if (upstream.status >= 400 && upstream.status < 500) {
@@ -1655,7 +1661,7 @@ async function forwardCaptured(
     // resolved 2xx proves the endpoint is accepting sends again, so clear any
     // hold on this origin+credential (counterpart needed because the non-ok
     // branch returns early and never reaches this point).
-    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), wireBody);
     // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
     // and arm the TTL-refresh timer. Pipeline-prepared requests only
     // (passthrough stays out of scope); internally gated to anthropic-wire

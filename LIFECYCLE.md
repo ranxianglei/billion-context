@@ -91,7 +91,7 @@
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | 3600000（0 禁用，垃圾值回落 3600000） |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | unset（不做收缩引导） |
 | `BILI_REPLAY_RETRY_MAX` / `BILI_REPLAY_RETRY_BASE_MS` | 3 / 1500 |
-| `BILI_THROTTLE_429` / `BILI_THROTTLE_429_MAX_CONSECUTIVE` / `BILI_THROTTLE_429_BASE_DELAY_MS` / `BILI_THROTTLE_429_MAX_DELAY_MS` | true / 5 / 2000 / 30000（#4204 出站 429 治理器：同一 origin+凭据连续上游 429 后本地 hold、零出站，退避×抖动、尊重 Retry-After；达上限转终局 424（不在各 SDK 重试集合内），每窗口一次探测自动恢复，任何非 429 响应即清除；`false` 恢复旧的总是转发行为） |
+| `BILI_THROTTLE_429` / `BILI_THROTTLE_429_MAX_CONSECUTIVE` / `BILI_THROTTLE_429_BASE_DELAY_MS` / `BILI_THROTTLE_429_MAX_DELAY_MS` | true / 5 / 2000 / 30000（#4204 出站 429 治理器：同一 origin+凭据（可识别时含模型维度——#5201，一个模型的配额耗尽不连带冻结同凭据的其他模型）连续上游 429 后本地 hold、零出站，退避×抖动、尊重 Retry-After；达上限转终局 424（不在各 SDK 重试集合内），每窗口一次探测自动恢复，任何非 429 响应即清除；`false` 恢复旧的总是转发行为） |
 | `BILI_STREAM_KEEPALIVE_MS` | 15000（0 禁用 hold） |
 | `BILI_PREFLIGHT_HOLD_MS` | 30000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | 300000 |

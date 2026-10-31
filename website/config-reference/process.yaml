@@ -87,8 +87,8 @@ entries:
     default: "true"
     env: BILI_THROTTLE_429
     group: process
-    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior."
-    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。"
+    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior. The hold key carries the request's model when identifiable (top-level body `model`, or the Google-native / Anthropic-on-Vertex URL path — #5201), so one model's exhausted quota cannot hold sibling models behind the same credential; unidentifiable sends keep the origin+credential key."
+    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。hold 键在可识别时携带请求的模型维度（body 顶层 `model`，或 Google 原生 / Vertex Anthropic 的 URL 路径——#5201），一个模型的配额耗尽不会连带冻结同凭据下的其他模型；识别不到模型的发送沿用 origin+凭据键。"
   - key: network.throttle429MaxConsecutive
     type: number
     default: "5"
