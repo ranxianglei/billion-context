@@ -527,6 +527,65 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     };
 }
 
+/** #4950: extract the structured error fields from an in-stream SSE error
+ *  frame. Providers report rejections INSIDE an HTTP-200 stream in several
+ *  shapes; every one of them carries its verdict in `code`/`type` + `message`
+ *  fields, never in prose elsewhere:
+ *  - OpenAI-relay / Gemini top-level: `{ "error": { "code"|"type", "message" } }`
+ *  - Anthropic: `{ "type": "error", "error": { "type", "message" } }`
+ *  - Responses wire: `{ "type": "response.failed", "response": { "error": {...} } }`
+ *  - generic relay frames: `{ "type": "error", "code", "message" }`.
+ *  Returns null when the frame carries no recognizable error object — callers
+ *  must then treat it as non-overflow (never guess from raw bytes). */
+export function structuredErrorFields(ev: Record<string, unknown>): { code?: string; message?: string } | null {
+    const pick = (o: unknown): { code?: string; message?: string } | null => {
+        if (!o || typeof o !== "object") return null;
+        const r = o as Record<string, unknown>;
+        // Numeric codes (Gemini `"code": 400`) carry no vocabulary — the
+        // message alone decides; only STRING code/type join the match text.
+        const code = typeof r["code"] === "string" ? r["code"] : typeof r["type"] === "string" ? r["type"] : undefined;
+        const message = typeof r["message"] === "string" ? r["message"] : undefined;
+        return code !== undefined || message !== undefined ? { code, message } : null;
+    };
+    const nested = pick(ev["error"]);
+    if (nested) return nested;
+    const response = ev["response"];
+    if (response && typeof response === "object") {
+        const inside = pick((response as Record<string, unknown>)["error"]);
+        if (inside) return inside;
+    }
+    if (ev["type"] === "error") {
+        const code = typeof ev["code"] === "string" ? ev["code"] : undefined;
+        const message = typeof ev["message"] === "string" ? ev["message"] : undefined;
+        if (code !== undefined || message !== undefined) return { code, message };
+    }
+    return null;
+}
+
+/** #4950: classify an EXPLICIT structured error frame (see
+ *  structuredErrorFields) as a context overflow. Unlike inspectContextOverflow
+ *  there is NO status gate — the frame arrived inside an HTTP-200 stream, so
+ *  the structured code+message IS the evidence. Deliberately token/context-only:
+ *  the image-count wall (#4124) arrives as an HTTP error body, never as an
+ *  in-stream frame, so guessing counts here would open a mis-learning surface
+ *  with zero field evidence (#570 discipline). */
+export function classifyStructuredOverflow(fields: { code?: string; message?: string } | null): ContextOverflowInfo {
+    if (!fields) return { isOverflow: false, message: "" };
+    const message = [fields.code, fields.message].filter(Boolean).join(" ").slice(0, 300);
+    if (!message) return { isOverflow: false, message };
+    const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(message));
+    if (!isOverflow) return { isOverflow: false, message };
+    const counts = parseOverflowCounts(message);
+    return {
+        isOverflow,
+        window: parseOverflowWindow(message),
+        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        message,
+    };
+}
+
 // #4452: an intermediate gateway that rewrites EVERY rejection into one generic
 // body (Cherry Studio et al. strip the token counts / window from each overflow
 // 400) makes inspectContextOverflow return isOverflow:false even when the payload
