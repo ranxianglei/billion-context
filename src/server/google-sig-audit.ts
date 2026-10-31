@@ -7,7 +7,7 @@ import type { GoogleContent } from "acp-kernel/wire";
 // silent: the lane just died with an upstream 400 every turn. This audit makes
 // it visible and attributes the origin (client resend vs bili rebuild).
 
-export interface GoogleSigAudit {
+interface GoogleSigAudit {
     signedCalls: number;
     unsignedCalls: number;
     signedThoughts: number;
@@ -49,7 +49,7 @@ export function auditGoogleSignatures(contents: readonly GoogleContent[]): Googl
     return out;
 }
 
-export interface GoogleSigWarnInput {
+interface GoogleSigWarnInput {
     /** Sticky per-session latch: this model has been observed signing its
      *  calls/thoughts at least once (its own responses or the client's
      *  replay). Non-signing models never need signatures — no warn. */
@@ -60,7 +60,7 @@ export interface GoogleSigWarnInput {
     warnedTurns: number;
 }
 
-export interface GoogleSigWarnDecision {
+interface GoogleSigWarnDecision {
     warn: boolean;
     /** true when the unsigned bytes came in unsigned (client-side loss);
      *  false means the client sent them signed and the rebuild dropped them
