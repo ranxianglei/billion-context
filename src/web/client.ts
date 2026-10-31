@@ -1481,6 +1481,21 @@ function changelogCatOf(rawLine) {
                 ab.innerHTML = "";
             }
         }
+        // #5221 phase 2 (owner ruling 2026-10-31): persistent local-resolver
+        // wedge — detection-only alarm banner beside the defect advisory.
+        const wb = $("resolver-wedge-banner");
+        if (wb) {
+            const w = d.resolverWedge;
+            if (w && w.tripped) {
+                wb.hidden = false;
+                wb.classList.add("show");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+            } else {
+                wb.hidden = true;
+                wb.classList.remove("show");
+                wb.innerHTML = "";
+            }
+        }
         const pb = $("plugin-advisory-banner");
         if (pb) {
             const advs = Array.isArray(d.pluginAdvisories) ? d.pluginAdvisories : [];
