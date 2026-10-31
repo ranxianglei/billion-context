@@ -53,7 +53,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1928,6 +1928,14 @@ async function handleRequest(
         // not a main turn, and seeding outputBudgetHighWater from it would
         // poison the first starved restore (same class as the #1897 skip).
         const serverToolUtility = isServerToolUtilityCall(parsed);
+        // #5073: a toolless structured-output request (response_format json_object/
+        // json_schema, or Responses text.format) rides the #388 side passthrough via
+        // isSideRequest below and — like serverToolUtility — must skip
+        // restoreOutputBudget here: its max_tokens sizes the extraction response, not
+        // a main turn, so seeding outputBudgetHighWater from it would poison the first
+        // starved restore (#1897/#2500 class). A tool-CARRYING structured request is
+        // vetoed by #546 (isStructuredOutputCall's no-tools gate), so it still restores.
+        const structuredOutput = isStructuredOutputCall(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
@@ -1939,7 +1947,7 @@ async function handleRequest(
         // outputBudgetHighWater from it would poison the first starved restore
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
-        if (!demotedSide && !serverToolUtility) {
+        if (!demotedSide && !serverToolUtility && !structuredOutput) {
             // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
             // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
             // budget is a raw-history collapse, not intent — arm the mid-band rescue.
@@ -2120,7 +2128,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : structuredOutput ? "structured-output utility call (#5073)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
