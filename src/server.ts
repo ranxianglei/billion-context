@@ -95,6 +95,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
+import { sqliteOpenFailureHint } from "./storage/shadow.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
@@ -562,7 +563,10 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     try {
         await getStore().ready();
     } catch (e) {
-        log("error", `[storage] refusing to start: ${String(e)}`);
+        const msg = String(e);
+        // same one-line actionable hint as the shadow.ts refusal above — owner
+        // 2026-10-31: on a no-engine failure this line must say "Node.js 22+"
+        log("error", `[storage] refusing to start: ${msg}${sqliteOpenFailureHint(msg)}`);
         process.exit(1);
     }
     loadConversations();
