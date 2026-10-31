@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, closeSync, ftruncateSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -577,7 +577,11 @@ test("HTTP fork fails closed on malformed, missing, stale and reordered boundari
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, branchPoint: { ...req.branchPoint, orderHash: "0".repeat(64) } })).body.code, "BRANCH_POINT_CONFLICT");
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
-        assert.equal((await h.request("/__bili/plugin/fork", req)).status, 201);
+        const retried = await h.request("/__bili/plugin/fork", req);
+        // 201 = freshly published on the healthy store; 200 = idempotent hit —
+        // legitimate because the alarm-boot fork above may have already
+        // published the child into this process's registry.
+        assert.ok(retried.status === 200 || retried.status === 201, `retry succeeds after recovery (${retried.status})`);
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, idempotencyKey: "different" })).body.code, "CHILD_CONFLICT");
     } finally { await h.close(); }
 });
@@ -760,23 +764,71 @@ test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift
     } finally { await h.close(); }
 });
 
-test("HTTP persistence failure leaves no child and retry can succeed", { timeout: 60_000 }, async () => {
+test("HTTP storage failures: broken dir refuses to start; corrupt index serves forks via envelopes", { timeout: 60_000 }, async () => {
     const h = await harness();
+    // Both failure legs are unified-sidecar behaviors; under the global legacy baseline
+    // preload no sqlite open happens at all, so refuse-to-start can never fire there.
+    const oldMode2 = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     try {
+        // Two failure shapes, per the 2026-10-30 owner policy: (a) an open
+        // into a broken directory REFUSES to start (the constructor throws —
+        // silent construction-time degradation is withdrawn), so that shape
+        // can no longer be injected into a running server; the reachable
+        // unavailable state inside a live process is (b) the proven-corrupt
+        // index, which alarms and serves envelopes without the unified side.
+        writeFileSync(h.dir + "/not-a-directory", "failure fixture");
+        assert.throws(
+            () => new SessionStore({ dir: h.dir + "/not-a-directory", enabled: true }),
+            /EEXIST|ENOTDIR/,
+            "a broken sessions dir refuses the start loudly instead of degrading silently",
+        );
+        const bad = mkdtempSync(join(testRoot, "badidx-"));
+        let seed: SessionStore | undefined;
+        try {
+            seed = new SessionStore({ dir: bad, enabled: true });
+            seed.loadSync("seed", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        } finally {
+            seed?.closeQuietly();
+        }
+        const idxPath = join(bad, "index.db");
+        const fd = openSync(idxPath, "r+");
+        try {
+            ftruncateSync(fd, Math.floor(statSync(idxPath).size / 2));
+        } finally {
+            closeSync(fd);
+        }
+        const failedStore = new SessionStore({ dir: bad, enabled: true, log: () => {} }); // alarms, boots envelope-served
+        _setStoreForTest(failedStore);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
-        writeFileSync(h.dir + "/not-a-directory", "failure fixture");
-        const failedStore = new SessionStore({ dir: h.dir + "/not-a-directory", enabled: true, log: () => {} });
-        _setStoreForTest(failedStore);
         const failed = await h.request("/__bili/plugin/fork", req);
-        assert.equal(failed.status, 503);
-        assert.equal(resolveConversation("child").session, undefined);
-        assert.equal(failedStore.loadSync("child"), null);
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
+        // Corrupt-index stores boot envelope-served and envelopes stay
+        // WRITABLE — so the fork either lands on the envelope (child must
+        // then be fully readable without the index) or fails closed.
+        // Silent half-states (published-but-unreadable child) are the bug.
+        if (failed.status === 201) {
+            const child = failedStore.loadSync("child");
+            assert.ok(child !== null && child !== undefined, "a published child must be readable back from its envelope alone");
+            assert.notEqual((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, null);
+        } else {
+            assert.ok(failed.status === 503 || failed.status === 409, `fork against an index-less store fails closed (${failed.status})`);
+            assert.equal(resolveConversation("child").session, undefined);
+            assert.equal(failedStore.loadSync("child"), null);
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
+        }
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
+        failedStore.closeQuietly();
         _setStoreForTest(h.store);
-        assert.equal((await h.request("/__bili/plugin/fork", req)).status, 201);
-    } finally { _setStoreForTest(h.store); await h.close(); }
+        // Retry: 201 fresh, or 200 if the alarm-boot fork already published
+        // the child — the conversation registry is process-wide.
+        assert.ok([200, 201].includes((await h.request("/__bili/plugin/fork", req)).status));
+    } finally {
+        if (oldMode2 === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode2;
+        _setStoreForTest(h.store);
+        await h.close();
+    }
 });
 
 test("HTTP CCR deleted index fails closed in memory after persistence", { timeout: 60_000 }, async () => {
@@ -916,6 +968,12 @@ for (const storageMode of ["legacy", "full"] as const) {
             const fork = await h.request("/__bili/plugin/fork", req);
             assert.equal(fork.status, 201);
             const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+            // #5046/#5075 (2026-10-30 owner chain): two LIVE bili processes on
+            // ONE sessions dir is refused — sharing a dir across lanes is the
+            // supported topology, same dir is split-brain risk. Close our own
+            // side before the stand-in proxy boots, so exactly one writer holds
+            // the index at a time (this IS the policy, pinned here for real).
+            if (process.env.BILI_STORAGE_UNIFIED !== "legacy") h.store.closeQuietly();
             const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
             child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
             let stderr = "";

@@ -1,6 +1,7 @@
-import type { CompressPromptSections } from "acp-kernel";
+import { FUNCTION_ACP_TAGS_TIMESTAMPED, LEAN_HOW_TO_COMPRESS, LEAN_HOW_TO_COMPRESS_TIMESTAMPED, type CompressPromptSections } from "acp-kernel";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
+import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 
 export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversation model selects consumed ranges; the configured independent summary service generates the authoritative summary. Use object-form content: [{startId, endId, topic?}]. summary is optional and, if supplied, only a non-authoritative hint, not the committed summary. Selected source text and read-only context are sent to the configured service using its separate credentials. All candidates failing leaves originals unchanged. This mode overrides instructions above requiring you to write the final summary.]";
 
@@ -22,6 +23,26 @@ export function externalSummaryEnabled(config: unknown): boolean {
  *  stays. Never apply this to the summary request's own instructions. */
 export function conversationPromptSections(sections: CompressPromptSections | undefined, external: boolean): CompressPromptSections | undefined {
     return external ? { ...sections, howToCompress: null } : sections;
+}
+
+/** #4313 (PR #5236): host-exit selection of the timestamped prompt variants.
+ *  Flag OFF (the default) ⇒ returns the input BY REFERENCE — pre-#4313 bytes,
+ *  zero drift. Flag ON ⇒ copies `sections` and fills exactly the gaps the
+ *  pre-feature defaults used to carry the stamped wording in: the function-
+ *  builder acpTags slot when unclaimed (custom/lean/pack strings and explicit
+ *  `null` deletions win over the variant — same priority as every
+ *  SectionOverride) and the lean-pack how-to-compress block by identity match
+ *  (the full default never carried the diary-line rule, so nothing else
+ *  swaps). Hybrid builders keep their plain one-line ACP TAGS in both states. */
+export function messageTimestampSections(
+    sections: CompressPromptSections | undefined,
+    kind: "function" | "hybrid" = "function",
+): CompressPromptSections | undefined {
+    if (!resolveMessageTimestamps(loadConfigFile().compress)) return sections;
+    const out: CompressPromptSections = { ...sections };
+    if (kind === "function" && out.acpTags === undefined) out.acpTags = FUNCTION_ACP_TAGS_TIMESTAMPED;
+    if (out.howToCompress === LEAN_HOW_TO_COMPRESS) out.howToCompress = LEAN_HOW_TO_COMPRESS_TIMESTAMPED;
+    return out;
 }
 
 /** Upper bound (ms) on how long the proxy needs to execute a summary-producing

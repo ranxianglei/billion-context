@@ -25,7 +25,7 @@ import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
-import { conversationPromptSections, externalSummaryEnabled } from "../external-summary-surface.js";
+import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
@@ -2093,7 +2093,7 @@ async function forwardCaptured(
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
