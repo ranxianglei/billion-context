@@ -361,3 +361,58 @@ test("refreshPiNpmCopy: a live update lock defers the refresh to the next cycle"
         fx.cleanup();
     }
 });
+
+// — advisory gates (#2456 first-check deferral + #1588-A blocklist) —————————
+// pi's channel sits outside the advisory watcher's rollback reach: the gates
+// must hold BEFORE `pi update` is driven. Both directions asserted (#3617).
+
+test("refreshPiNpmCopy: registry latest inside an advisory's affected range → no spawn, logged skip", async () => {
+    const fx = makeFixture("0.1.139");
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setPiRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.140", async () => {
+            await refreshPiNpmCopy(fx.installDir, { ...OPTS, advisoryBlocksVersion: (v) => v === "0.1.140" }, fx.env, log);
+        });
+        assert.deepEqual(calls, [], "advisory-covered latest must not drive pi update");
+        assert.ok(entries.some((l) => l.includes("#1588") && l.includes("0.1.140")), "blocklist skip logged");
+    } finally {
+        _setPiRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
+
+test("refreshPiNpmCopy: advisory first check not landed → defer one cycle, no spawn", async () => {
+    const fx = makeFixture("0.1.139");
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setPiRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.140", async () => {
+            await refreshPiNpmCopy(fx.installDir, { ...OPTS, advisoryAwaitingFirstCheck: () => true }, fx.env, log);
+        });
+        assert.deepEqual(calls, [], "deferral must not spawn");
+        assert.ok(entries.some((l) => l.includes("#2456")), "deferral logged");
+    } finally {
+        _setPiRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
+
+test("refreshPiNpmCopy: gates present but quiescent → refresh proceeds (negative control)", async () => {
+    const fx = makeFixture("0.1.139");
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setPiRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.140", async () => {
+            await refreshPiNpmCopy(fx.installDir, { ...OPTS, advisoryAwaitingFirstCheck: () => false, advisoryBlocksVersion: () => false }, fx.env, log);
+        });
+        assert.ok(calls.length > 0, "quiescent gates must not block the refresh");
+        assert.ok(entries.some((l) => l.includes("0.1.140")), "refresh ran");
+    } finally {
+        _setPiRunnersForTest(undefined);
+        fx.cleanup();
+    }
+});
