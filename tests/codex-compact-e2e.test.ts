@@ -5,7 +5,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, type CompressionBlock } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -345,9 +345,9 @@ test("e2e E2 (trigger form): post-forge turn — echo replaced by a history-born
         assert.equal(h.bodies.length, afterSetup + 1, "post-forge turn forwarded to upstream exactly once");
 
         const s = listSessions().find((x) => x.meta.label === SESSION)!;
-        const captured = s.metadata.codexForgedSummaries as string[] | undefined;
+        const captured = s.metadata.codexForgedSummaries as Array<{ text: string }> | undefined;
         assert.ok(Array.isArray(captured) && captured.length > 0, "forge captured the active block summaries");
-        assert.ok(captured.some((t) => t.includes("MAIN-SUMMARY-SETUP")), "captured summary is the setup block's");
+        assert.ok(captured.some((t) => t.text.includes("MAIN-SUMMARY-SETUP")), "captured summary is the setup block's");
 
         const fwd = h.bodies[h.bodies.length - 1];
         assert.ok(!fwd.includes("fc_bili_"), "echoed bili compaction item replaced before forwarding");
@@ -390,8 +390,8 @@ test("e2e E2 (trigger form): drop-only legacy marker echo still re-injects forge
         await r2.text();
 
         const s = listSessions().find((x) => x.meta.label === SESSION)!;
-        const captured = s.metadata.codexForgedSummaries as string[] | undefined;
-        assert.ok(Array.isArray(captured) && captured.some((t) => t.includes("MAIN-SUMMARY-SETUP")), "forge captured the active block summaries");
+        const captured = s.metadata.codexForgedSummaries as Array<{ text: string }> | undefined;
+        assert.ok(Array.isArray(captured) && captured.some((t) => t.text.includes("MAIN-SUMMARY-SETUP")), "forge captured the active block summaries");
 
         // Turn 3: codex echoes back a LEGACY compaction item — id-prefix only,
         // no sentinel blob (older build) — so nothing is extractable and the
@@ -415,6 +415,90 @@ test("e2e E2 (trigger form): drop-only legacy marker echo still re-injects forge
         const dev = fwdBody.input.find((i) => i.type === "message" && i.role === "developer");
         assert.ok(dev, "developer message present on the drop-only turn");
         assert.ok(JSON.stringify(dev).includes("MAIN-SUMMARY-SETUP"), "drop-only echo must not suppress the forge-time summary re-injection");
+    });
+});
+
+// #4600: the ledger is debt with a lifecycle. Two directions must hold in a
+// real processTurn: (A) requests that replay no conversation pay nothing —
+// the accumulated list used to be injected into every echo-less request,
+// which failed context-only probes with 413 once it outgrew the window;
+// (B) forge-time capture prunes entries whose block's summary was folded
+// into an already-represented newer block, so the persisted debt stops
+// accumulating.
+
+test("e2e E2 (#4600): request replaying no conversation gets no forged-summary re-injection", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+
+        // Turn 2: native auto-compact trigger → intercepted + forged.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        const before = s.metadata.codexForgedSummaries as Array<{ text: string }> | undefined;
+        assert.ok(Array.isArray(before) && before.some((e) => e.text.includes("MAIN-SUMMARY-SETUP")), "forge captured the ledger");
+
+        // Turn 3: context-only auxiliary traffic (title-gen shape — user
+        // context, no completed turns). It replays no conversation, so the
+        // accumulated ledger must NOT be re-injected into it.
+        const r3 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "Create a short title for this session" }] }),
+        });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "probe forwarded to upstream exactly once");
+        const fwd = h.bodies[h.bodies.length - 1];
+        assert.ok(!fwd.includes("MAIN-SUMMARY-SETUP"), "no re-injection into a request that replays no conversation");
+        assert.deepEqual(s.metadata.codexForgedSummaries, before, "the view-only gate leaves the persisted ledger untouched");
+    });
+});
+
+test("e2e E2 (#4600): forge-time capture prunes superseded ledger entries before persisting", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        const liveBlock = (s.state.blocks ?? []).find((b) => b.active);
+        assert.ok(liveBlock, "setup left an active block");
+
+        // Stale reality: two older-generation blocks whose summary messages
+        // the live block has folded into its own effective span, plus their
+        // ledger entries from an earlier forge.
+        const stale = (blockId: string): CompressionBlock => ({
+            blockId, runId: `r_${blockId}`, tier: 1, summary: `STALE-${blockId}-SUMMARY-BODY`,
+            directMessageIds: [], effectiveMessageIds: [`orig_${blockId}`], directBlockIds: [],
+            compressedTokens: 10, createdAt: 0, survivedCount: 0, generation: "old", active: false,
+        });
+        s.state.blocks = [...(s.state.blocks ?? []), stale("b_stale_1"), stale("b_stale_2")];
+        liveBlock.effectiveMessageIds.push("acp_summary_b_stale_1", "acp_summary_b_stale_2");
+        s.metadata.codexForgedSummaries = [
+            { text: "[Compressed conversation section]\nSTALE-b_stale_1-SUMMARY-BODY", blockId: "b_stale_1" },
+            { text: "[Compressed conversation section]\nSTALE-b_stale_2-SUMMARY-BODY", blockId: "b_stale_2" },
+        ];
+
+        // Trigger-form compact over the FULL conversation: the live block
+        // survives syncBlocks, the forge branch runs, and both stale entries
+        // must be pruned from the persisted ledger.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        const text = await r2.text();
+        assert.ok(text.includes("fc_bili_"), "compact forged");
+        assert.equal(h.bodies.length, afterSetup, "upstream untouched");
+
+        const after = s.metadata.codexForgedSummaries as Array<{ text: string; blockId?: string }> | undefined;
+        assert.ok(Array.isArray(after), "ledger persisted as entries");
+        assert.ok(after.every((e) => !e.text.includes("STALE-")), "superseded entries pruned at forge time");
+        assert.ok(after.some((e) => e.text.includes("MAIN-SUMMARY-SETUP")), "current forge's own capture kept");
     });
 });
 
@@ -604,7 +688,7 @@ test("prompt-form auto-compact is intercepted and forged locally (#3008)", async
         assert.equal(h.bodies.length, after, "upstream not contacted for the intercepted auto-compact");
         const s = listSessions().find((x) => x.meta.label === SESSION);
         assert.ok(s, "session tracked");
-        const captured = s!.metadata.codexForgedSummaries as string[] | undefined;
+        const captured = s!.metadata.codexForgedSummaries as Array<{ text: string }> | undefined;
         assert.ok(captured && captured.length > 0, "summaries captured for post-compaction re-injection");
     });
 });
