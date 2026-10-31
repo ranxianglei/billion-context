@@ -31,6 +31,7 @@ import {
   isMessageLatestProtected,
   isMessageProtectedWithPairing,
   isNeverPreserveRecent,
+  lastUserAnchor,
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
@@ -143,12 +144,10 @@ export function computeProtectedRefs(
   // skipped above — user intent is always protected regardless of recent
   // tool results.
   if (preserveN > 0) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role !== "user" || isSyntheticOrPruned(msg, covered)) continue;
-      const ref = state.messageRefs.byRaw[msg.id];
+    const anchor = lastUserAnchor(messages, covered, config);
+    if (anchor) {
+      const ref = state.messageRefs.byRaw[anchor.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
-      break;
     }
   }
 
