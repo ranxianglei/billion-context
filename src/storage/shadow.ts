@@ -28,7 +28,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, StorageSecondWriterError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -254,10 +254,8 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
             } catch (err) {
-                // #5046/B: a live foreign writer owns this db — never touch it (the file is NOT corrupt) and never take over its lock; the outer catch REFUSES.
-                if (err instanceof StorageSecondWriterError) throw err;
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
                 // (#4626-era owner decision, 2026-10-30).
@@ -291,15 +289,6 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
-            // #5046/B (owner decision 2026-10-29): refuse to become a persistent second writer — degrade to legacy-only with ONE actionable error. Availability is preserved (legacy persist keeps compression working); CCR / checkpoints / the unified fast-read path are off until isolated. The status wire carries the same fact via recordSidecarOpenFailure (#3040).
-            if (err instanceof StorageSecondWriterError) {
-                loggerLog(
-                    "error",
-                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write and REFUSES TO START until isolated (#5046 owner chain 2026-10-30: no silent degradation of any kind). Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068); or force legacy explicitly (BILI_STORAGE_UNIFIED=legacy).`,
-                );
-                recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); refusing to start until then (#5046)`);
-                throw err;
-            }
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
             // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
@@ -310,7 +299,7 @@ export class UnifiedShadow {
             // above handles them (loud alarm + boot WITHOUT the index).
             // #4626-era owner decision chain (2026-10-30): every OTHER
             // sidecar-open failure REFUSES TO START instead of degrading —
-            // no-engine/CANTOPEN/readonly/second-writer: availability at the
+            // no-engine/CANTOPEN/readonly/OS-level: availability at the
             // price of a silently different storage path was withdrawn by
             // owner instruction "在任何情况下不降级". Intentional opt-outs
             // (legacy mode / encryption opt-out / persistence off) resolve to
