@@ -97,10 +97,10 @@ import { clearConflictEvents, recordConflict, summarizeConflicts } from "./confl
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
-import { configFile, defaultLogFile, stateDir } from "./paths.js";
+import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
-import { recordSplitBrainContest } from "./storage/runtime-status.js";
+import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -555,6 +555,16 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
     await initSessions();
+    // No-degradation policy (2026-10-30): an ASYNC storage backend (mysql)
+    // attaches after construction; awaiting here makes "backend never came up"
+    // refuse at boot BEFORE listen() instead of surfacing on the first request
+    // (the old contract was openAsync degrades-to-null + first-request failure).
+    try {
+        await getStore().ready();
+    } catch (e) {
+        log("error", `[storage] refusing to start: ${String(e)}`);
+        process.exit(1);
+    }
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // #2807: restore fork lineage that a restart orphaned. Every fork writes
@@ -567,7 +577,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // (peekSession, then the on-disk store), so it has to be resident first.
     // The plugin conversation routing table is irrelevant to this sweep.
     try {
-        const adopted = reconcileDerivedLineage(listSessions(), {
+        const adopted = await reconcileDerivedLineage(listSessions(), {
             log,
             adoptionEnabled: opts.resumeInheritance !== false,
         });
@@ -1225,9 +1235,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // launcher-private launchToken) so lane-aware attach discovery and
         // the #394 warning can reason about EVERY live instance — the single
         // proxy-origin file only reflects the last writer.
-        const registryRecord = { ...instanceRecord };
+        // #5046: carry the resolved sessions dir on the REGISTRY marker only
+        // (not the proxy-origin file) so the #394 warning can judge by
+        // directory — a lane-overlapping peer with a different dir shares no
+        // state and must not get the "stop one" advice.
+        const registryRecord = { ...instanceRecord, sessionsDir: sessionsDir() };
         delete registryRecord.launchToken;
-        const warnedAtRegistration = registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
+        const warnedAtRegistration = registerInstanceAndWarn(
+            registryRecord,
+            (msg) => log("warn", `[instances] ${msg}`),
+            (msg) => log("info", `[instances] ${msg}`),
+        );
         // #2401: registration warns the late starter only — a resident that is
         // ALREADY serving stays blind to a peer appearing later (the exact
         // dual-generation shape behind the stale-serving report). Rescan the
@@ -1236,7 +1254,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const warnedPeers = new Set<string>(warnedAtRegistration);
             const peerRescanMs = 60_000;
             const peerTimer = setInterval(() => {
-                for (const id of warnOnNewPeers({ instanceId, lane: launcherLane }, warnedPeers, (msg) => log("warn", `[instances] ${msg}`))) {
+                for (const id of warnOnNewPeers(
+                    { instanceId, lane: launcherLane, sessionsDir: sessionsDir() },
+                    warnedPeers,
+                    (msg) => log("warn", `[instances] ${msg}`),
+                    (msg) => log("info", `[instances] ${msg}`),
+                )) {
                     warnedPeers.add(id);
                 }
             }, peerRescanMs);
@@ -1267,6 +1290,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 },
             );
             reapStaleWriterMarkers(markerDir, Date.now());
+            // #4626: a surfaced verdict re-evaluates against CURRENT marker
+            // evidence at every status read — the accused peer's own marker,
+            // judged by the same "still contests" definition as detection, so
+            // the restart-handover notice clears itself once the peer
+            // PROVABLY stops; an unreadable marker fails closed (keeps it).
+            registerSplitBrainEvidenceCheck((contest) =>
+                peerStillContests(markerDir, instanceId, contest.peer.instanceId, contest.sessionId, Date.now()));
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
         }
         const nOverrides = Object.keys(opts.routes).length;
