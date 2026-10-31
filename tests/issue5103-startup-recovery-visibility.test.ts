@@ -181,7 +181,7 @@ function mkLegacy(id: string, lastMessages: LegacySessionLike["lastMessages"]): 
     };
 }
 
-test("#5103: first ingest failure warns immediately with the db path; disable warning keeps naming it", () => {
+test("#5103: first ingest failure warns immediately with the db path; failures NEVER self-disable", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5103-shadow-"));
     try {
         const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
@@ -202,20 +202,22 @@ test("#5103: first ingest failure warns immediately with the db path; disable wa
         try {
             shadow.record(mkLegacy("s1", [msg(1), msg(2)]));
             const firstWarn = captured.find((c) => c.level === "warn" && c.msg.includes("failed to ingest"));
-            assert.ok(firstWarn, "the FIRST failure must warn (before #5103 strikes one and two were silent)");
+            assert.ok(firstWarn, "the FIRST failure must warn (#5103) — no silent strikes any more");
             assert.ok(firstWarn!.msg.includes(path.join(dir, "index.db")), "warning must name the database file");
             if (process.platform === "win32") {
                 assert.ok(firstWarn!.msg.includes("(win32:"), "win32 runner carries the OS-level hint");
             }
-            assert.equal(shadow.stats.disabled, false, "one failure must not disable yet");
+            assert.ok(firstWarn!.msg.includes("RETRIED on every subsequent save"), "the warning names the retry-every-save policy");
 
+            // Owner policy (2026-10-30): the old 3-strike self-disable is GONE —
+            // repeated failures must NEVER stop future index writes; every save
+            // retries. Identical error messages dedupe to one warn line.
             shadow.record(mkLegacy("s1", [msg(1), msg(2), msg(3)]));
-            assert.equal(shadow.stats.disabled, false, "two failures must not disable yet");
             shadow.record(mkLegacy("s1", [msg(1), msg(2), msg(3), msg(4)]));
-            const disableWarn = captured.find((c) => c.level === "warn" && c.msg.includes("disabled after 3 consecutive failures"));
-            assert.ok(disableWarn, "third consecutive failure disables with a loud warning");
-            assert.ok(disableWarn!.msg.includes(path.join(dir, "index.db")), "disable warning must keep naming the file");
-            assert.equal(shadow.stats.disabled, true);
+            assert.equal(shadow.stats.disabled, false, "failures must NEVER self-disable any more (breaker removed)");
+            assert.match(shadow.stats.lastError ?? "", /attempt to write a readonly database/, "the latest failure stays surfaced on stats");
+            const ingestWarns = captured.filter((c) => c.level === "warn" && c.msg.includes("failed to ingest"));
+            assert.equal(ingestWarns.length, 1, "identical repeated errors dedupe to one warn line");
         } finally {
             setLogCapture(null);
         }
