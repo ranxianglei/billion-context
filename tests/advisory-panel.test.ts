@@ -22,7 +22,7 @@ function mockRes(): { res: http.ServerResponse; status: number; body: string } {
     return out;
 }
 
-test("#1577: /acp panel surfaces an active advisory before the footer (stripper-safe), byte-exact when clean", () => {
+test("#1577: /acp panel surfaces an active advisory before the footer (stripper-safe), byte-exact when clean", async () => {
     _resetSessionsForTest();
     _resetAdvisoryWatcherForTest();
     try {
@@ -30,7 +30,7 @@ test("#1577: /acp panel surfaces an active advisory before the footer (stripper-
         const deps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
 
         const r0 = mockRes();
-        handlePluginStatus("never-seen", r0.res, deps, true);
+        await handlePluginStatus("never-seen", r0.res, deps, true);
         assert.equal(r0.status, 200);
         const p0 = JSON.parse(r0.body).panel as string | undefined;
         assert.ok(p0, "panel renders for the live session");
@@ -39,7 +39,7 @@ test("#1577: /acp panel surfaces an active advisory before the footer (stripper-
 
         _setAdvisoryStateForTest({ active: { id: "bc-2026-001", affected: ">=1.0.0", target: "0.1.157", reason: "corrupts tool-call arguments", currentVersion: "0.1.156" } });
         const r1 = mockRes();
-        handlePluginStatus("never-seen", r1.res, deps, true);
+        await handlePluginStatus("never-seen", r1.res, deps, true);
         assert.equal(r1.status, 200);
         const p1 = JSON.parse(r1.body).panel as string;
         assert.ok(p1.includes("⚠️ CRITICAL ADVISORY:"), "advisory line present");
@@ -53,7 +53,7 @@ test("#1577: /acp panel surfaces an active advisory before the footer (stripper-
         const dollarReason = "costs $5M; echo $& back";
         _setAdvisoryStateForTest({ active: { id: "bc-2026-002", affected: ">=1.0.0", target: "1.0.9", reason: dollarReason, currentVersion: "1.0.1" } });
         const r2 = mockRes();
-        handlePluginStatus("never-seen", r2.res, deps, true);
+        await handlePluginStatus("never-seen", r2.res, deps, true);
         const p2 = JSON.parse(r2.body).panel as string;
         assert.ok(p2.includes(dollarReason), "dollar-sign reason survives byte-exact");
         assert.equal((p2.match(new RegExp(PANEL_BOX_FOOTER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length, 1, "footer appears exactly once");
