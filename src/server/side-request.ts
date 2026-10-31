@@ -174,6 +174,91 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     return users === 1 && userHasContent;
 }
 
+// #4840: Claude Desktop's Code-tab notification classifier fires a side call under
+// the MAIN conversation id: a FIXED system sentence + exactly ONE freshly-built
+// user blob carrying four ordered status labels (Current state / Tool calls so far
+// / User's most recent ask / Assistant message tail), NO tools, max_tokens=3072 —
+// above the <=200 budget gate, so pre-fix none of the signals saw it. It rode the
+// FULL pipeline as a main turn: its usage sample replaced the main baseline, its
+// model (Haiku) became the session's last model, and its single-message payload
+// clobbered the persisted snapshot + ledger. Identified by shape alone (the #4438
+// auto-review discipline): the fixed system + the four ordered labels carry their
+// own client evidence, and a real main turn can NEVER match — it carries a tools
+// surface and multi-turn history, and never carries these classifier labels. The
+// last label's "(last N chars)" count is DYNAMIC (observed 913, varies per call):
+// matched by shape, never hardcoded.
+export const CLAUDE_NOTIFICATION_SYSTEM_PREFIX = "A user kicked off a Claude Code agent to do a coding task and walked away.";
+
+// The three fixed status labels that must precede the dynamic tail label, in order.
+const CLAUDE_NOTIFICATION_LABELS = ["Current state:", "Tool calls so far:", "User's most recent ask:"] as const;
+// The fourth label's tail length varies per call (#4840: observed 913) — regex, not literal.
+const CLAUDE_NOTIFICATION_TAIL_LABEL = /Assistant message tail \(last \d+ chars\):/;
+
+export function isClaudeNotificationRequest(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest:
+    // any action surface marks an agent turn, not the classifier's one-shot call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // The fixed classifier policy on ANY wire's system carrier (top-level system,
+    // instructions, systemInstruction.parts, or a role:system entry in
+    // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
+    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(CLAUDE_NOTIFICATION_SYSTEM_PREFIX))) return false;
+    const entries = firstPresentArray(p.messages, p.input, p.contents);
+    if (!entries) return false;
+    let users = 0;
+    let content: string | null = null;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        if (rec.role === "system" || rec.role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        if (content !== null) return false;
+        content = plainTextContent(rec.content ?? rec.parts);
+        if (content === null) return false;
+    }
+    // Exactly ONE non-system message whose content is plain text carrying the four
+    // ordered labels: the freshly-built classification snapshot. A replayed history
+    // (any assistant/tool turn or a second user message) vetoes, as does any
+    // non-text block — see the comment above the constant.
+    return users === 1 && content !== null && hasOrderedLabels(content);
+}
+
+function firstPresentArray(...arrays: unknown[]): unknown[] | null {
+    for (const a of arrays) if (Array.isArray(a)) return a;
+    return null;
+}
+
+function plainTextContent(c: unknown): string | null {
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+        let out = "";
+        for (const b of c) {
+            if (typeof b === "string") { out += b; continue; }
+            if (b && typeof b === "object") {
+                const o = b as Record<string, unknown>;
+                if (o.type === "text" && typeof o.text === "string") { out += o.text; continue; }
+            }
+            return null;
+        }
+        return out;
+    }
+    return null;
+}
+
+function hasOrderedLabels(s: string): boolean {
+    let pos = 0;
+    for (const label of CLAUDE_NOTIFICATION_LABELS) {
+        const i = s.indexOf(label, pos);
+        if (i < 0) return false;
+        pos = i + label.length;
+    }
+    return CLAUDE_NOTIFICATION_TAIL_LABEL.test(s.slice(pos));
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the
