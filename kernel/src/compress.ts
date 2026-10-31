@@ -165,6 +165,10 @@ function numericBlockId(id: string): number {
   return parsed ? Number(parsed[1]) : 0;
 }
 
+function formatK(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
+}
+
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -593,6 +597,33 @@ export function createCore(ports: Ports = {}): CompressionCore {
           gateMessage += ` ${reversalNotes.join(" ")}`;
         }
 
+        // #4521: a PURE resubmit (every requested range already consumed,
+        // no dangling/dead refs, nothing countable left) is the idempotent
+        // retry of an already-folded bill of work — historically refused with
+        // "Requested range(s) already compressed", which read as a failure and
+        // dragged another retry. Return it as the no-op success class instead:
+        // same informative text, zero errors, host renders a "[Compression
+        // no-op:" receipt that folds away (#4289 class). Mixed batches (some
+        // consumed + some live-but-too-small) keep the refusal — there is real
+        // work left to re-plan.
+        const pureResubmit =
+          countedRanges === 0 &&
+          consumedRanges.length > 0 &&
+          danglingRefs.length === 0 &&
+          unknownCount === 0;
+        if (pureResubmit) {
+          return {
+            state,
+            result: {
+              blocksCreated: 0,
+              tokensCompressed: 0,
+              errors: [],
+              warnings: [`${gateMessage} Nothing failed and nothing needed redoing — do not resend these ranges.`],
+              noop: true,
+            },
+          };
+        }
+
         // Rejected batches still carry their side effect: the dead-ref
         // tombstones marked above (#2362). The clone differs from input.state
         // ONLY in that field before the gate, so returning it is safe.
@@ -731,7 +762,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
           countTokens,
           preExistingCoverage,
         });
-        blocksCreated += outcome.refolded ? outcome.refolded.length : 1;
+        blocksCreated += outcome.noop
+          ? 0
+          : outcome.refolded
+            ? outcome.refolded.length
+            : 1;
         tokensCompressed += outcome.tokens;
         warnings.push(...outcome.warnings);
       } catch (error) {
@@ -829,6 +864,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
         errors,
         warnings,
         ...(notes.length > 0 ? { notes } : {}),
+        // #4521: a batch where every range was a no-op/skip (covered,
+        // protected, refold-blocked skips) committed nothing and failed
+        // nothing — surface the no-op class so the host renders the
+        // success-shaped receipt instead of "FAILED: no blocks created".
+        ...(blocksCreated === 0 && errors.length === 0 ? { noop: true } : {}),
       },
     };
   }
@@ -875,10 +915,38 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
+    // #4521: between banner deliveries a compression round can stay armed for
+    // many requests (backoff, tier cadence, model-decided timing). During that
+    // window the model sees NO current refs and starts guessing beyond the
+    // highest allocated ref — every guess a failed round-trip. Emit a compact
+    // boundary line whenever a nudge plan carries offered ranges but its
+    // banner is not being delivered this turn; hosts append it as an ephemeral
+    // trailing user message (same carrier as the nudge, same cache safety).
+    let statusLine: string | undefined;
+    const nudge = result.effects.nudge;
+    // Two shapes authorize the refresh line: a real tiered arm whose banner
+    // is deferred this turn (tier !== null: pressure crossed a threshold but
+    // cadence/backoff holds it), or any plan after at least one banner was
+    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
+    // this line only refreshes them). A fresh session's below-threshold plan
+    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
+    // must stay fully silent: same regime promise as the nudge itself
+    // (#196 regime scoping, #3910 lane baseline).
+    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
+    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
+      const highest = highestUsedIndex(state.messageRefs);
+      const offered = nudge.compressibleRanges!
+        .slice(0, 3)
+        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
+        .join(", ");
+      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
+      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
+    }
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
+      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
@@ -1492,6 +1560,11 @@ interface SingleRangeOutcome {
   /** #400: set when the range ended as an in-place refold instead of creating
    * a fresh block — the ids of the blocks updated (caller counts these, not 1). */
   refolded?: string[];
+  /** #4521: set when the range resolved legally but folded nothing (all
+   *  content already covered, or entirely inside the protected zone). The
+   *  caller counts zero blocks and records the warning instead of rejecting
+   *  the batch — an idempotent resubmit is success-shaped, not a failure. */
+  noop?: boolean;
 }
 
 function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
@@ -1509,7 +1582,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     protectedMessageIds: input.protectedMessageIds,
     warnings,
   });
-  if (projection.fatal) throw projection.fatal.error;
+  if (projection.fatal) {
+    // #4521: a range that lies ENTIRELY inside the protected zone is a legal
+    // no-op, not a failure — the model aimed at the newest tail (exactly the
+    // messages it just produced) and there is nothing it may fold there.
+    // Rejecting it sent retry loops back into the same zone (live incident:
+    // four consecutive zone refusals in session 01a18a4d, 20:09). The
+    // recommendation side still demotes zone fatals to gaps, so advertised
+    // ranges never point here (#3236 unchanged).
+    if (projection.fatal.kind === "zone") {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — it lies entirely inside the protected zone (the last ${input.config.preserveRecentMessages} messages and/or the most recent user message), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
+    throw projection.fatal.error;
+  }
   const {
     filteredIds,
     consumedBlockIds,
@@ -1554,14 +1646,40 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
     const first = consumedBlockIds[0]!;
     const last = consumedBlockIds[consumedBlockIds.length - 1]!;
-    throw new Error(
-      `Range ${input.spec.startRef}..${input.spec.endRef} contains no new compressible messages — every message in it is already covered by active block(s) ${consumedBlockIds.join(
-        ", ",
-      )}. Nothing was compressed. To rewrite or merge those blocks, reference them by block ID (${first}..${last}); otherwise run acp_status and compress a range it reports as compressible.`,
-    );
+    // #4521: full-log hosts resolve covered spans as "ok" (never classified
+    // consumed), so an idempotent resubmit of an already-folded range used to
+    // land HERE and reject the whole batch ("Batch rejected before folding any
+    // range") — the dominant retry-loop driver on pi/plugin sessions. A
+    // covered span with nothing new is a no-op success: zero blocks, zero
+    // errors, one warning that names the covering blocks and how to rewrite
+    // them if that was the intent.
+    return {
+      tokens: 0,
+      warnings: [
+        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s) ${consumedBlockIds.join(
+          ", ",
+        )}. Nothing failed and nothing needed redoing; do not resend this range. To rewrite or merge those blocks, reference them by block ID (${first}..${last}) instead.`,
+      ],
+      noop: true,
+    };
   }
 
-  validateCompressionRange(input, filteredIds, consumedBlockIds.length);
+  validateCompressionRange(input);
+
+  if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+    // #4521: everything in the range was dropped by content filters
+    // (protected tool pairs, media, …) with no zone hit and no consumed
+    // blocks — same idempotent no-op class as the two above, so the batch is
+    // not poisoned by it.
+    const highest = highestUsedIndex(input.state.messageRefs);
+    return {
+      tokens: 0,
+      warnings: [
+        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+      ],
+      noop: true,
+    };
+  }
 
   let compressedTokens = 0;
   for (const id of filteredIds) {
@@ -1671,19 +1789,14 @@ function resolveCoverageInterval(
   return merged;
 }
 
-function validateCompressionRange(
-  input: SingleRangeInput,
-  directMessageIds: string[],
-  consumedBlockCount: number,
-): void {
+function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
   validateSummaryLength(input.spec, cfg);
 
-  if (directMessageIds.length === 0 && consumedBlockCount === 0) {
-    throw new Error(
-      "Range contains no compressible messages — all are already covered by active blocks or protected.",
-    );
-  }
+  // #4521: the empty-range case (no direct messages, no consumed blocks)
+  // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
+  // Throwing here rejected whole batches for ranges that were legal but had
+  // nothing left to fold.
 }
 
 function validateSummaryLength(

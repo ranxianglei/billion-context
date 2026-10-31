@@ -123,11 +123,16 @@ test("#2638 a structurally-dead span is preview-rejected once, remembered, and n
         // Turn 1: the dead span is nominated, previewed, rejected ONCE, remembered; the
         // foldable tail still folds. Without the memory the same span is re-previewed in
         // later rounds of this very invocation ("nominated twice within one request").
+        // Both kernel-era verdict wordings count as the structural rejection: the failure-
+        // era error text and the #4521 success-warning ("folded nothing — ...").
+        const isStructuralReject = (l: string) =>
+            l.includes("preview rejected")
+            && (l.includes("no new compressible messages") || l.includes("folded nothing"));
         H.push({ id: `msg-${H.length + 1}`, role: "user", contentType: "text", text: "NEW TURN 1 ".repeat(60) });
         H.push({ id: `msg-${H.length + 1}`, role: "assistant", contentType: "text", text: "REPLY 1 ".repeat(60) });
         const logs1: string[] = [];
         const r1 = await runPreflight(logs1);
-        const rejects1 = logs1.filter((l) => l.includes("preview rejected") && l.includes("no new compressible messages"));
+        const rejects1 = logs1.filter(isStructuralReject);
         assert.equal(rejects1.length, 1, `expected exactly one structural rejection in invocation 1, got: ${logs1.join("\n")}`);
         const rejectsKey = /preview rejected range (m\d+:m\d+)/.exec(rejects1[0])?.[1];
         assert.equal(rejectsKey, "m00007:m00022", `the dead span is the carrier cluster A..M22, got: ${logs1.join("\n")}`);
@@ -142,7 +147,7 @@ test("#2638 a structurally-dead span is preview-rejected once, remembered, and n
         H.push({ id: `msg-${H.length + 1}`, role: "assistant", contentType: "text", text: "REPLY 2 ".repeat(60) });
         const logs2: string[] = [];
         const r2 = await runPreflight(logs2);
-        const rejects2 = logs2.filter((l) => l.includes("preview rejected") && l.includes("no new compressible messages"));
+        const rejects2 = logs2.filter(isStructuralReject);
         assert.equal(rejects2.length, 0, `dead span must not be re-nominated in invocation 2, got: ${logs2.join("\n")}`);
         assert.ok(r2.compressedRanges >= 1, "fresh tail must still fold on invocation 2");
         assert.ok(r2.hadFoldableCandidates);
