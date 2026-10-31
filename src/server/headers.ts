@@ -83,7 +83,9 @@ export function stripRemoteCompactionBetaFeature(headers: Record<string, string>
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        // expect is hop-by-hop (RFC 9110 §7.6.2) and undici rejects it with
+        // UND_ERR_NOT_SUPPORTED — dropped here so no egress path can forward it.
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";
