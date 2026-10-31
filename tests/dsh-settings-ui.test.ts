@@ -797,6 +797,28 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     }
 });
 
+test("owner 2026-10-31: degraded page names the Node.js upgrade for a no-engine bootstrap failure and keeps the generic hint for any other kind (both slots)", async () => {
+    for (const slot of ["settings.section", "plugins.bundle.config"]) {
+        const nm = await mountClient({ open: (_url: string) => {}, fetch: async () => { throw new Error("no route"); }, setTimeout, clearTimeout, __BILI__: { origin: null, bootstrapFailure: { kind: "no-engine", detail: "no SQLite engine available" } } }, slot);
+        nm.resetHooks();
+        const ntree = nm.component() as ElementNode;
+        const nt: string[] = [];
+        collectText(ntree, nt);
+        assert.ok(nt.some((x) => x.includes("Node.js")), `${slot}: no-engine failure renders the Node.js upgrade hint: ${JSON.stringify(nt)}`);
+        assert.ok(!nt.some((x) => x.includes("/acp")), `${slot}: no-engine failure must not suggest the generic /acp remedy: ${JSON.stringify(nt)}`);
+        nm.runCleanups();
+
+        const lm = await mountClient({ open: (_url: string) => {}, fetch: async () => { throw new Error("no route"); }, setTimeout, clearTimeout, __BILI__: { origin: null, bootstrapFailure: { kind: "launch-failed", detail: "ECONNREFUSED" } } }, slot);
+        lm.resetHooks();
+        const ltree = lm.component() as ElementNode;
+        const lt: string[] = [];
+        collectText(ltree, lt);
+        assert.ok(lt.some((x) => x.includes("/acp")), `${slot}: launch-failed keeps the generic /acp hint: ${JSON.stringify(lt)}`);
+        assert.ok(!lt.some((x) => x.includes("Node.js")), `${slot}: launch-failed must not claim a Node.js problem: ${JSON.stringify(lt)}`);
+        lm.runCleanups();
+    }
+});
+
 test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; prefix gateways resolve through the base-relative fallback form", async () => {
     {
         // Root relay deployment: no response URL ⇒ base "" (same-origin paths).
