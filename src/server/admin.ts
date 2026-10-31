@@ -25,7 +25,7 @@ import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
-import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
+import { BILI_TUNNEL_HEADER, getDnsResolveStats } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
 import { pckAblations } from "../pck-probe.js";
@@ -304,7 +304,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
         const aux = auxProxyShot(opts);
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        // #4973: dnsResolve counters let an operator tell "cache is serving"
+        // from "the resolver is actually dead" on the spot.
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), dnsResolve: getDnsResolveStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).

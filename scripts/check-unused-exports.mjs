@@ -98,6 +98,11 @@ const WAIVERS = new Map([
     // structurally through dshCompactionGateTelemetry()'s return type; keep
     // the export so the channel payload stays named at its definition site.
     ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
+    // #4973 admission DNS counters: the /__bili/health dnsResolve payload
+    // interface is referenced only inside src/tunnel-guard.ts (admin.ts consumes
+    // it structurally via getDnsResolveStats()'s return type); keep the export
+    // so the wire shape stays named at its definition site.
+    ["src/tunnel-guard.ts", new Set(["DnsResolveStats"])],
 ]);
 
 const findings = [];

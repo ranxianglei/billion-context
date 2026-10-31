@@ -1,4 +1,4 @@
-import { lookup } from "node:dns/promises";
+import { lookup, resolve4 } from "node:dns/promises";
 import { networkInterfaces } from "node:os";
 import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js";
 
@@ -37,6 +37,15 @@ import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js"
  * be indistinguishable from a genuinely dead name — and the caller answers a
  * resolution failure with 5xx (transport-class), never 403 (permission-class),
  * so clients keep their retry logic alive while the resolver recovers.
+ *
+ * #4973: the resolution itself is cached per hostname (60s positive TTL,
+ * 10min stale-while-error window, concurrent single-flight, 512-entry LRU cap
+ * — hostnames are client input). macOS orders its resolver mDNS-FIRST for
+ * .local names (`domain local, options mdns, timeout 5`), so one cold .local
+ * lookup alone could eat the entire retry budget above and deny a perfectly
+ * good destination; the cache plus the c-ares unicast fast path (see
+ * createUnicastPreferringBase) removes that whole outage class. Counters
+ * surface on /__bili/health as `dnsResolve`.
  */
 
 // #1686: admission-resolution budget. Per-attempt timeout because a dead OS
@@ -45,6 +54,15 @@ import { getResolverWedgeState, resolverWedgeRecord } from "./resolver-wedge.js"
 const RESOLVE_MAX_ATTEMPTS = 3;
 const RESOLVE_BACKOFF_MS = 250;
 const RESOLVE_TIMEOUT_MS = 2000;
+
+// #4973: admission-resolution cache. The tunnel destination repeats across a
+// burst (one upstream per client), so resolving it on EVERY request burned the
+// whole retry budget on one cold OS lookup — and macOS routes .local through
+// mDNS first, making that single lookup ~5s (see createUnicastPreferringBase).
+// Hostnames are client input: the map must stay bounded.
+const ADMISSION_CACHE_TTL_MS = 60_000;     // fresh-answer window
+const ADMISSION_STALE_MS = 10 * 60_000;    // stale-while-error window after last success
+const ADMISSION_MAX_ENTRIES = 512;         // LRU cap on cached hostnames
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
@@ -101,23 +119,180 @@ export type ResolveHost = (host: string) => Promise<string[]>;
 
 // The native lookup({timeout}) option exists at runtime (Node ≥ 15.3) but is
 // missing from @types/node's LookupOptions — race instead of casting. The
-// losing lookup stays handled (Promise.race subscribes to both sides), so a
-// late OS-resolver failure cannot surface as an unhandled rejection.
-const dnsResolveHost: ResolveHost = async (host) => {
+// losing side stays handled (Promise.race subscribes to both), so a late
+// resolver failure cannot surface as an unhandled rejection.
+function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-        const res = await Promise.race([
-            lookup(host, { all: true, family: 0 }),
-            new Promise<never>((_, reject) => {
-                timer = setTimeout(() => reject(Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" })), RESOLVE_TIMEOUT_MS);
-                timer.unref?.();
-            }),
-        ]);
-        return res.map((r) => r.address);
-    } finally {
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error(code), { code })), ms);
+        timer.unref?.();
+    });
+    return Promise.race([promise, timeout]).finally(() => {
         if (timer) clearTimeout(timer);
-    }
-};
+    });
+}
+
+/** Raw OS-resolver lookup under the per-attempt budget. */
+const osLookup: ResolveHost = async (host) => (await withTimeout(lookup(host, { all: true, family: 0 }), RESOLVE_TIMEOUT_MS, "ETIMEDOUT")).map((r) => r.address);
+
+// Single-signature pin of resolve4 (its @types overloads disagree on the bare
+// hostname form); c-ares unicast A query — skips the OS resolver order, hence
+// skips mDNS.
+const unicastLookup: (host: string) => Promise<string[]> = (host) => resolve4(host);
+
+/**
+ * #4973: c-ares UNICAST first for .local names. macOS orders its resolver
+ * mDNS-FIRST for .local (`domain local, options mdns, timeout 5`) — a COLD
+ * .local name spends ~5s in multicast before ever reaching unicast, which eats
+ * the entire admission budget by itself while `dig` answers the same name in
+ * single-digit ms. c-ares skips the OS order and asks the configured servers
+ * directly. When unicast has no answer (a genuine mDNS-only name, an
+ * /etc/hosts entry, or an unreachable server) we fall back to the system
+ * resolver, which still reaches mDNS. onUnicastAnswered fires only when
+ * unicast actually SUPPLIED the answer.
+ */
+export function createUnicastPreferringBase(
+    inner: ResolveHost,
+    onUnicastAnswered: () => void,
+    unicastQuery: (host: string) => Promise<string[]> = unicastLookup,
+): ResolveHost {
+    return async (host) => {
+        if (host.endsWith(".local")) {
+            try {
+                const addrs = await withTimeout(unicastQuery(host), RESOLVE_TIMEOUT_MS, "ETIMEDOUT");
+                if (addrs.length > 0) {
+                    onUnicastAnswered();
+                    return addrs;
+                }
+            } catch {
+                // No unicast answer — fall through to the system resolver.
+            }
+        }
+        return inner(host);
+    };
+}
+
+/** /__bili/health counters for the admission-resolution path (#4973). */
+export interface DnsResolveStats {
+    /** Served from a fresh (TTL-valid) cache entry — zero DNS traffic. */
+    hits: number;
+    /** Live resolutions issued because no fresh entry existed (single-flight leaders). */
+    misses: number;
+    /** Served from a stale entry after the live resolution failed, within the stale window. */
+    staleHits: number;
+    /** Concurrent requests folded into an already-in-flight resolution. */
+    coalesced: number;
+    /** .local names answered by the c-ares unicast fast path (mDNS skipped). */
+    unicast: number;
+    /** Current number of cached hostnames. */
+    entries: number;
+}
+
+interface AdmissionResolverOptions {
+    /** Fresh-answer lifetime in ms; ≤0 disables the cache entirely (passthrough). Default 60s. */
+    ttlMs?: number;
+    /** How long after the last SUCCESSFUL resolution a stale answer keeps serving when live lookups fail. Default 10min. */
+    staleMs?: number;
+    /** Hard cap on cached hostnames (keys are client-controlled). Default 512. */
+    maxEntries?: number;
+    /** Injectable clock for tests. Defaults to Date.now. */
+    now?: () => number;
+}
+
+interface AdmissionResolver {
+    resolve: ResolveHost;
+    stats: () => DnsResolveStats;
+}
+
+/**
+ * #4973: wraps any base resolver with short-TTL positive caching, concurrent
+ * single-flight, and stale-while-error fallback. Only NON-EMPTY successes are
+ * cached — an empty answer stays authoritative per request (#1686 semantics:
+ * "the name exists but has no addresses" is a verdict, not a blip), and
+ * failures are never cached. Stale serving is bounded: once the last success
+ * ages past staleMs, failures propagate again (no silent pass-through of a
+ * name that may have genuinely died).
+ */
+export function createAdmissionResolver(base: ResolveHost, opts: AdmissionResolverOptions = {}): AdmissionResolver {
+    const ttlMs = opts.ttlMs ?? ADMISSION_CACHE_TTL_MS;
+    const staleMs = opts.staleMs ?? ADMISSION_STALE_MS;
+    const maxEntries = Math.max(1, opts.maxEntries ?? ADMISSION_MAX_ENTRIES);
+    const now = opts.now ?? Date.now;
+    const enabled = ttlMs > 0;
+    const stats: DnsResolveStats = { hits: 0, misses: 0, staleHits: 0, coalesced: 0, unicast: 0, entries: 0 };
+    interface Entry { ips: string[]; at: number; }
+    const cache = new Map<string, Entry>();
+    const inflight = new Map<string, Promise<string[]>>();
+    const refreshRecency = (key: string) => {
+        const e = cache.get(key);
+        if (e) { cache.delete(key); cache.set(key, e); }
+    };
+    const evictToCap = () => {
+        while (cache.size > maxEntries) {
+            const oldest = cache.keys().next().value;
+            if (oldest === undefined) break;
+            cache.delete(oldest);
+        }
+    };
+    const resolve: ResolveHost = async (host) => {
+        const key = host.toLowerCase();
+        if (!enabled) {
+            stats.misses++;
+            return base(key);
+        }
+        const t = now();
+        const hit = cache.get(key);
+        if (hit && t - hit.at < ttlMs) {
+            stats.hits++;
+            refreshRecency(key);
+            return [...hit.ips];
+        }
+        const flight = inflight.get(key);
+        if (flight) {
+            stats.coalesced++;
+            return flight;
+        }
+        stats.misses++;
+        const p = (async () => {
+            try {
+                const ips = await base(key);
+                if (ips.length > 0) {
+                    cache.set(key, { ips, at: now() });
+                    evictToCap();
+                }
+                return ips;
+            } catch (err) {
+                const stale = cache.get(key);
+                if (stale && now() - stale.at <= staleMs) {
+                    stats.staleHits++;
+                    return [...stale.ips];
+                }
+                throw err;
+            } finally {
+                inflight.delete(key);
+            }
+        })();
+        inflight.set(key, p);
+        return p;
+    };
+    return {
+        resolve,
+        stats: () => ({ ...stats, entries: cache.size }),
+    };
+}
+
+// Production admission path: c-ares unicast first for .local (#4973), then the
+// OS resolver, wrapped in the shared cache so one upstream resolves once per
+// burst instead of once per request.
+const unicastAnswers = { n: 0 };
+const defaultAdmissionResolver = createAdmissionResolver(
+    createUnicastPreferringBase(osLookup, () => { unicastAnswers.n++; }),
+);
+
+/** Counters surfaced on /__bili/health as `dnsResolve` (#4973). */
+export function getDnsResolveStats(): DnsResolveStats {
+    return { ...defaultAdmissionResolver.stats(), unicast: unicastAnswers.n };
+}
 
 let localAddrCache: { at: number; ips: Set<string> } | undefined;
 /** All addresses considered "this machine": 127/8 + ::1 + every interface unicast addr. */
@@ -190,7 +365,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         // #1686: bounded retry — a transiently unreachable DNS server must not
         // masquerade as a dead name. Only throws are retried; an empty answer
         // is definitive (the resolver said so).
-        const resolve = ctx.resolveHost ?? dnsResolveHost;
+        const resolve = ctx.resolveHost ?? defaultAdmissionResolver.resolve;
         const backoff = ctx.resolveBackoffMs ?? RESOLVE_BACKOFF_MS;
         let resolved: string[] | undefined;
         let lastErrCode: string | undefined;

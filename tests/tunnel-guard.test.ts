@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
+import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, createAdmissionResolver, createUnicastPreferringBase, type ResolveHost } from "../src/tunnel-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #409: the /bili/<absolute-url> tunnel must not reach the proxy's own
@@ -317,6 +317,166 @@ test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped"
 });
 
 // ---------------------------------------------------------------------------
+// #4973: admission-resolution cache + unicast-first base.
+
+test("admissionResolver: fresh hits skip the base resolver", async () => {
+    let calls = 0;
+    const base: ResolveHost = async () => { calls++; return ["93.184.216.34"]; };
+    let t = 0;
+    const r = createAdmissionResolver(base, { now: () => t });
+    assert.deepEqual(await r.resolve("api.example.com"), ["93.184.216.34"]);
+    assert.equal(calls, 1);
+    for (let i = 0; i < 5; i++) { t += 5_000; await r.resolve("api.example.com"); }
+    assert.equal(calls, 1, "within TTL the base resolver is never called again");
+    const s = r.stats();
+    assert.equal(s.hits, 5);
+    assert.equal(s.misses, 1);
+    assert.equal(s.entries, 1);
+});
+
+test("admissionResolver: expired entries re-resolve, case-insensitive keys", async () => {
+    let calls = 0;
+    const base: ResolveHost = async () => { calls++; return [`93.184.216.${calls}`]; };
+    let t = 0;
+    const r = createAdmissionResolver(base, { ttlMs: 60_000, now: () => t });
+    await r.resolve("H.Example.com");
+    t += 59_999;
+    await r.resolve("h.example.com");
+    assert.equal(calls, 1, "just under TTL (and across case variants) still served from cache");
+    t += 1;
+    assert.deepEqual(await r.resolve("h.example.com"), ["93.184.216.2"], "one tick past TTL re-resolves");
+    assert.equal(calls, 2);
+});
+
+test("admissionResolver: ttlMs=0 disables the cache entirely", async () => {
+    let calls = 0;
+    const base: ResolveHost = async () => { calls++; return ["93.184.216.34"]; };
+    const r = createAdmissionResolver(base, { ttlMs: 0 });
+    await r.resolve("h");
+    await r.resolve("h");
+    assert.equal(calls, 2, "disabled cache passes every call through");
+    const s = r.stats();
+    assert.equal(s.hits, 0);
+    assert.equal(s.staleHits, 0);
+    assert.equal(s.entries, 0);
+    assert.equal(s.misses, 2);
+});
+
+test("admissionResolver: concurrent misses coalesce into one flight", async () => {
+    let calls = 0;
+    const base: ResolveHost = () => new Promise((res) => {
+        calls++;
+        setTimeout(() => res(["93.184.216.34"]), 20);
+    });
+    const r = createAdmissionResolver(base);
+    const results = await Promise.all([r.resolve("h"), r.resolve("H"), r.resolve("h")]);
+    for (const ips of results) assert.equal(ips.length, 1);
+    assert.equal(calls, 1, "three concurrent requests, one live resolution");
+    const s = r.stats();
+    assert.equal(s.coalesced, 2);
+    assert.equal(s.misses, 1);
+});
+
+test("admissionResolver: stale-while-error serves the last good answer, then gives up", async () => {
+    let dead = false;
+    const base: ResolveHost = async () => {
+        if (dead) throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" });
+        return ["93.184.216.34"];
+    };
+    let t = 0;
+    const r = createAdmissionResolver(base, { ttlMs: 60_000, staleMs: 600_000, now: () => t });
+    await r.resolve("h");
+    t += 61_000;      // past TTL
+    dead = true;      // resolver dies
+    assert.deepEqual(await r.resolve("h"), ["93.184.216.34"], "within the stale window the last success carries");
+    assert.equal(r.stats().staleHits, 1);
+    t += 600_001;     // past the stale window
+    await assert.rejects(r.resolve("h"), /EAI_AGAIN/, "outside the window failures propagate again — no silent pass-through");
+});
+
+test("admissionResolver: empty answers are never cached (#1686 semantics kept)", async () => {
+    let calls = 0;
+    const base: ResolveHost = async () => { calls++; return []; };
+    const r = createAdmissionResolver(base);
+    assert.deepEqual(await r.resolve("empty.example.com"), []);
+    assert.deepEqual(await r.resolve("empty.example.com"), []);
+    assert.equal(calls, 2, "'the name exists but has no addresses' must not be pinned by the cache");
+    assert.equal(r.stats().entries, 0);
+});
+
+test("admissionResolver: LRU cap evicts least-recently-used beyond the bound", async () => {
+    const hits: string[] = [];
+    const base: ResolveHost = async (h) => { hits.push(h); return ["93.184.216.34"]; };
+    let t = 0;
+    const r = createAdmissionResolver(base, { ttlMs: 60_000, maxEntries: 3, now: () => t });
+    for (const h of ["a", "b", "c"]) await r.resolve(h);
+    assert.equal(r.stats().entries, 3);
+    t += 1_000;
+    await r.resolve("a");  // a becomes most recently used
+    await r.resolve("d");  // over cap → evicts b
+    assert.equal(r.stats().entries, 3);
+    t += 2_000;
+    await r.resolve("b");  // b was evicted → live resolve again
+    assert.equal(hits.filter((x) => x === "b").length, 2, "evicted host resolves live again");
+    await r.resolve("a");  // a survived the eviction (the fresh hit above refreshed its recency)
+    assert.equal(hits.filter((x) => x === "a").length, 1, "recently used entry survived eviction — still served from cache");
+});
+
+test("unicast-first base: .local goes c-ares first, others untouched, fallback on miss", async () => {
+    let osCalls = 0;
+    const inner: ResolveHost = async (h) => { osCalls++; return [`${h}.os`]; };
+    let unicastCalls = 0;
+    let answered = 0;
+    const fakeUnicast = async (h: string): Promise<string[]> => {
+        unicastCalls++;
+        if (h === "gw.jd.local") return ["10.1.1.1"];
+        throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
+    };
+    const resolve = createUnicastPreferringBase(inner, () => { answered++; }, fakeUnicast);
+    assert.deepEqual(await resolve("gw.jd.local"), ["10.1.1.1"]);
+    assert.equal(osCalls, 0, "unicast answer means the OS resolver is never consulted");
+    assert.equal(answered, 1);
+    assert.deepEqual(await resolve("plain.example.com"), ["plain.example.com.os"]);
+    assert.equal(unicastCalls, 1, "non-.local names skip the unicast fast path");
+    assert.deepEqual(await resolve("mdns-only.local"), ["mdns-only.local.os"]);
+    assert.equal(osCalls, 2, "no unicast answer falls back to the system resolver (mDNS still reachable there)");
+    assert.equal(answered, 1, "fallback is not counted as a unicast answer");
+});
+
+test("regression: hot cache passes while the resolver is dead — the #4973 502 cluster cannot recur", async () => {
+    let dead = false;
+    const base: ResolveHost = async () => {
+        if (dead) throw Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" });
+        return ["93.184.216.34"];
+    };
+    let t = 0;
+    const admission = createAdmissionResolver(base, { now: () => t });
+    const ctx = { selfPort: 8787, clientLoopback: false, allowlist: [], localIps, resolveHost: admission.resolve, resolveBackoffMs: 1 };
+    const warm = await checkTunnelDestination("https://gw.example.com/v1", ctx);
+    assert.equal(warm.ok, true);
+    dead = true;                       // resolver outage begins
+    for (let i = 1; i <= 10; i++) {
+        t += 60_000;                   // walk through ten TTL expirations
+        const v = await checkTunnelDestination("https://gw.example.com/v1", ctx);
+        assert.equal(v.ok, true, `request ${i}: the stale answer must carry through the outage`);
+    }
+    assert.ok(admission.stats().staleHits >= 1, "at least one request rode the stale window");
+});
+
+test("regression: cold-cache resolution failure still denies — no silent pass-through", async () => {
+    const dead: ResolveHost = async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); };
+    const admission = createAdmissionResolver(dead);
+    const v = await checkTunnelDestination("https://never-seen.example.com/v1", {
+        selfPort: 8787, clientLoopback: false, allowlist: [], localIps,
+        resolveHost: admission.resolve, resolveBackoffMs: 1,
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "unresolvable");
+    assert.match(v.message, /EAI_AGAIN/);
+    assert.equal(admission.stats().staleHits, 0, "nothing was ever cached, so nothing can be served stale");
+});
+
+// ---------------------------------------------------------------------------
 // Integration: real server, real sockets.
 
 function close(server: http.Server): Promise<void> {
@@ -494,6 +654,16 @@ test("integration: unresolvable /bili/ destination answers 502 transport-class, 
         const r = await get(selfPort, "/bili/http://no-such-host.invalid/v1/chat/completions");
         assert.equal(r.status, 502, `resolution failure must be transport-class (got ${r.status}: ${r.body})`);
         assert.match(r.body, /"detail":"unresolvable"/);
+        // #4973: the admission-resolution counters are part of the health
+        // contract — an operator must be able to tell cache-serving from a
+        // genuinely dead resolver on the spot.
+        const health = await get(selfPort, "/__bili/health");
+        assert.equal(health.status, 200);
+        const hj = JSON.parse(health.body) as { dnsResolve?: Record<string, unknown> };
+        assert.ok(hj.dnsResolve && typeof hj.dnsResolve === "object", "health exposes dnsResolve");
+        for (const k of ["hits", "misses", "staleHits", "coalesced", "unicast", "entries"]) {
+            assert.equal(typeof hj.dnsResolve[k], "number", `health exposes dnsResolve.${k}`);
+        }
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
