@@ -55,29 +55,45 @@ interface ScenarioResult {
     sideCalls: number;
     sideMaxTokens: number[];
     sideLastText: string[];
+    sideReasoningEfforts: (string | undefined)[];
 }
 
-async function runScenario(sessionId: string, modelDecided: boolean, verdict: string | null): Promise<ScenarioResult> {
+async function runScenario(
+    sessionId: string,
+    modelDecided: boolean,
+    verdict: string | null,
+    extraCompress: Record<string, unknown> = {},
+    extraBody: Record<string, unknown> = {},
+    sideDelayMs = 0,
+): Promise<ScenarioResult> {
     const mains: unknown[][] = [];
-    const sides: { maxTokens: unknown; lastText: string }[] = [];
+    const sides: { maxTokens: unknown; lastText: string; reasoningEffort: string | undefined }[] = [];
     const upstream = http.createServer((req, res) => {
+        // #5030 A1: the decision fetch may be aborted mid-delay; writing the
+        // late answer to a dead socket must not crash the test process.
+        req.on("error", () => {});
+        res.on("error", () => {});
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             const messages = Array.isArray(body.messages) ? (body.messages as Record<string, unknown>[]) : [];
             const textOf = (m: Record<string, unknown>): string => (typeof m.content === "string" ? m.content : "");
-            // The decision call is the only request with the tiny output budget
-            // (default 200); the client's own requests carry max_tokens 64_000.
-            if (typeof body.max_tokens === "number" && body.max_tokens <= 200) {
-                sides.push({ maxTokens: body.max_tokens, lastText: textOf(messages[messages.length - 1] ?? {}) });
-                res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({
-                    id: "chatcmpl-decide",
-                    object: "chat.completion",
-                    choices: [{ index: 0, message: { role: "assistant", content: verdict ?? "Let me think about whether we should compress..." }, finish_reason: "stop" }],
-                    usage: { prompt_tokens: 50_000, completion_tokens: 10, total_tokens: 50_010 },
-                }));
+            // The decision call is the only small-budget request (default 1024
+            // since #5030); the client's own requests carry max_tokens 64_000.
+            if (typeof body.max_tokens === "number" && body.max_tokens <= 1024) {
+                sides.push({ maxTokens: body.max_tokens, lastText: textOf(messages[messages.length - 1] ?? {}), reasoningEffort: typeof body.reasoning_effort === "string" ? body.reasoning_effort : undefined });
+                const reply = () => {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({
+                        id: "chatcmpl-decide",
+                        object: "chat.completion",
+                        choices: [{ index: 0, message: { role: "assistant", content: verdict ?? "Let me think about whether we should compress..." }, finish_reason: "stop" }],
+                        usage: { prompt_tokens: 50_000, completion_tokens: 10, total_tokens: 50_010 },
+                    }));
+                };
+                if (sideDelayMs > 0) setTimeout(reply, sideDelayMs);
+                else reply();
                 return;
             }
             mains.push(messages);
@@ -102,6 +118,7 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
             injectTool: true,
             injectNudge: true,
             ...(modelDecided ? { nudgeModelDecided: true } : {}),
+            ...extraCompress,
         },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -131,7 +148,7 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
         const r2 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: turn2Messages() }),
+            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, ...extraBody, messages: turn2Messages() }),
         });
         assert.equal(r2.status, 200);
         await r2.text();
@@ -144,6 +161,7 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
             sideCalls: sides.length,
             sideMaxTokens: sides.map((s) => s.maxTokens as number),
             sideLastText: sides.map((s) => s.lastText),
+            sideReasoningEfforts: sides.map((s) => s.reasoningEffort),
         };
     } finally {
         proxy.close();
@@ -158,7 +176,7 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
 test("#2228: model says yes → directive injected with a program-finalized span", async () => {
     const out = await runScenario("decide-yes", true, '{"compress": true}');
     assert.equal(out.sideCalls, 1, "exactly one decision side call");
-    assert.deepEqual(out.sideMaxTokens, [200], "decision call uses the tiny output budget");
+    assert.deepEqual(out.sideMaxTokens, [1024], "decision call uses the small output budget");
     assert.ok(out.sideLastText[0]?.includes("[bili-compress-decision]"), "side call ends with the decision question");
     assert.equal(out.mainLen, 31, "directive takes the nudge slot (29 client + system + directive)");
     assert.ok(out.mainLastText.includes("[bili-compress-directive]"), "main payload carries the directive");
@@ -185,4 +203,46 @@ test("#2228 control: feature off → legacy advisory nudge unchanged, no side ca
     assert.equal(out.mainLen, 31, "legacy advisory nudge still injected at 78% of 64k");
     assert.ok(!out.mainLastText.includes("[bili-compress-directive]"));
     assert.ok(!out.mainLastText.includes("[bili-compress-decision]"));
+});
+
+// #5030 A2: nudgeDecisionReasoning "off" stamps reasoning_effort:"none" on the
+// decision side call even when the host's main request carries a thinking knob.
+test("#5030: nudgeDecisionReasoning \"off\" disables reasoning on the side call only", async () => {
+    const out = await runScenario("decide-reasoning-off", true, '{"compress": false}', { nudgeDecisionReasoning: "off" }, { reasoning_effort: "high" });
+    assert.equal(out.sideCalls, 1);
+    assert.deepEqual(out.sideReasoningEfforts, ["none"], "side call carries the protocol-native disable");
+});
+
+// #5030 A2: default (unset) keeps the #3004 strip behavior — host knob deleted,
+// nothing stamped.
+test("#5030: unset nudgeDecisionReasoning keeps the #3004 strip", async () => {
+    const out = await runScenario("decide-reasoning-default", true, '{"compress": false}', {}, { reasoning_effort: "high" });
+    assert.equal(out.sideCalls, 1);
+    assert.deepEqual(out.sideReasoningEfforts, [undefined], "host knob stripped, nothing stamped");
+});
+
+// #5030 A2: "follow" forwards the host's knob verbatim to the side call.
+test("#5030: nudgeDecisionReasoning \"follow\" forwards the host's effort", async () => {
+    const out = await runScenario("decide-reasoning-follow", true, '{"compress": false}', { nudgeDecisionReasoning: "follow" }, { reasoning_effort: "low" });
+    assert.equal(out.sideCalls, 1);
+    assert.deepEqual(out.sideReasoningEfforts, ["low"], "side call obeys the host-configured effort");
+});
+
+// #5030 A1: budget below the side call's latency → the decision fetch aborts,
+// the round degrades to "inject nothing" (ladder records the hard failure;
+// the legacy fallback only arms after 3 consecutive failures).
+test("#5030: nudgeDecisionTimeoutMs under the side call's latency fails the decision", async () => {
+    const out = await runScenario("decide-timeout-small", true, '{"compress": true}', { nudgeDecisionTimeoutMs: 100 }, {}, 1000);
+    assert.equal(out.sideCalls, 1, "the side call left the proxy before the abort");
+    assert.equal(out.mainLen, 30, "aborted decision injects nothing this round");
+    assert.ok(!out.mainLastText.includes("[bili-compress-directive]"));
+});
+
+// #5030 A1 control: the same slow side call survives a larger budget — the
+// knob bounds the decision window, it does not disable the lane.
+test("#5030: nudgeDecisionTimeoutMs over the side call's latency lets the decision through", async () => {
+    const out = await runScenario("decide-timeout-large", true, '{"compress": true}', { nudgeDecisionTimeoutMs: 5000 }, {}, 1000);
+    assert.equal(out.sideCalls, 1);
+    assert.equal(out.mainLen, 31, "a slow-but-timely decision still injects the directive");
+    assert.ok(out.mainLastText.includes("[bili-compress-directive]"));
 });

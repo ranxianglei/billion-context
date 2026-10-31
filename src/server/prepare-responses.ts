@@ -8,7 +8,7 @@ import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSett
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { applyDecisionReasoningPolicy, buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
@@ -507,8 +507,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
                     : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
-                stripDecisionReasoningFields("responses", sideBody);
-                const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
+                applyDecisionReasoningPolicy("responses", sideBody, decide.reasoning ?? "strip");
+                const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log, timeoutMs: decide.timeoutMs });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {

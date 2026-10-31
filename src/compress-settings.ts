@@ -75,6 +75,8 @@ export function mergeCompress(
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
+        nudgeDecisionTimeoutMs: pick("nudgeDecisionTimeoutMs"),
+        nudgeDecisionReasoning: pick("nudgeDecisionReasoning"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),

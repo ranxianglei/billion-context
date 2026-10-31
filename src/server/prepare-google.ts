@@ -7,7 +7,7 @@ import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { applyDecisionReasoningPolicy, buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -339,8 +339,8 @@ export async function prepareGoogle(
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 const sideBody: Record<string, unknown> = { ...parsed, contents: [...rebuiltContents, { role: "user", parts: [{ text: buildDecisionPrompt(ranges) }] }], tools: toolsOut, systemInstruction, generationConfig: { ...(parsed.generationConfig ?? {}), maxOutputTokens: decide.maxTokens } };
-                stripDecisionReasoningFields("google", sideBody);
-                const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log });
+                applyDecisionReasoningPolicy("google", sideBody, decide.reasoning ?? "strip");
+                const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log, timeoutMs: decide.timeoutMs });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {

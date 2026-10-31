@@ -84,14 +84,34 @@ entries:
     site_zh: "模型自决的压缩时机（默认关闭）：tier-1 提醒触发时，先通过会话缓存前缀上的短 side call 问模型现在压缩是否划算；严格 JSON 的 yes 注入带程序最终确定范围的指令，其余情况本轮不注入。"
   - key: compress.nudgeDecisionMaxTokens
     type: number
-    default: "200"
+    default: "1024"
     group: compress
     id: cw.ndmt
     render: compress-row
-    desc_en: "Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0."
-    desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。"
-    site_en: "Output budget (tokens) of the model-decision side call (default 200). Must be > 0."
-    site_zh: "模型决策 side call 的输出预算（token，默认 200）。必须 > 0。"
+    desc_en: "Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. #5030: default raised 200 → 1024 — hybrid-thinking models (glm-5.3) spend hidden reasoning inside the same output budget and answer with an empty content at 200."
+    desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。#5030：默认从 200 提升到 1024——混合思考模型（glm-5.3）的隐藏思考与可见回答共享同一输出预算，200 时会以空 content 收尾。"
+    site_en: "Output budget (tokens) of the model-decision side call (default 1024, raised from 200 in #5030 — hybrid-thinking models answered empty at 200). Must be > 0."
+    site_zh: "模型决策 side call 的输出预算（token，默认 1024，#5030 由 200 提升——混合思考模型在 200 时会答空）。必须 > 0。"
+  - key: compress.nudgeDecisionTimeoutMs
+    type: number
+    default: "15000"
+    group: compress
+    id: cw.ndtm
+    render: compress-row
+    desc_en: "Idle timeout (ms) of the model-decision side call. #5030: raise it for providers whose full-context side calls prefill >15 s even on a cache hit (measured 25–60 s at 200–450k tokens on z.ai); the previous 15 s hard wall turned every arm into a timeout. Must be > 0."
+    desc_zh: "模型决策 side call 的空闲超时（毫秒）。#5030：若提供商的全上下文 side call 即使缓存命中也需 15 秒以上 prefill（z.ai 在 200–450k token 实测 25–60 秒），请调大；原 15 秒硬墙会让每次触发都变成超时。必须 > 0。"
+    site_en: "Idle timeout (ms) of the model-decision side call (default 15000). Raise it when full-context decision calls routinely exceed 15 s on a cache hit (25–60 s measured at 200–450k tokens). Must be > 0."
+    site_zh: "模型决策 side call 的空闲超时（毫秒，默认 15000）。当全上下文决策调用在缓存命中下也经常超过 15 秒时调大（200–450k token 实测 25–60 秒）。必须 > 0。"
+  - key: compress.nudgeDecisionReasoning
+    type: "\"strip\" | \"follow\" | \"off\""
+    default: "\"strip\" (unset)"
+    group: compress
+    id: cw.ndr
+    render: compress-row
+    desc_en: "#5030: what the decision side call does with host-stamped reasoning knobs. \"strip\" (default): delete them (#3004 behavior). \"follow\": keep them — the side call obeys the thinking effort configured on the host for this model. \"off\": delete, then explicitly disable reasoning protocol-natively (reasoning_effort \"none\" etc.) so default-thinking models cannot burn the output budget on hidden reasoning."
+    desc_zh: "#5030：决策 side call 对宿主请求上思考开关字段的处理策略。\"strip\"（默认）：删除（#3004 行为）。\"follow\"：保留——side call 遵守宿主为该模型配置的思考强度。\"off\"：删除后按协议原生方式显式关闭思考（如 reasoning_effort \"none\"），避免默认思考模型把输出预算耗在隐藏思考上。"
+    site_en: "Policy for host reasoning knobs on the decision side call: strip (default, #3004), follow (obey the host-configured effort), or off (protocol-native disable)."
+    site_zh: "决策 side call 对宿主思考字段的处理策略：strip（默认，#3004）、follow（遵守宿主配置的思考强度）或 off（按协议原生方式关闭）。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
