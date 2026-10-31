@@ -1614,7 +1614,9 @@ export class MysqlBackend implements StorageBackend {
         const exportPath = join(opts.archiveDir, MysqlBackend.ARCHIVE_LOG_NAME);
         if (row.status === "archived") return { ok: true, exportPath };
         const q = async (sql: string): Promise<Row[]> => ((await this.pool.query(sql, [sessionId])) as unknown as Row[][])[0];
-        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq");
+        // #4665: carry the v8 row state (identity JOIN key + historian
+        // tombstone) across archive/restore — sqlite twin, same reason.
+        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages WHERE session_id = ? ORDER BY seq");
         const mediaMaps = await q("SELECT seq, media_hash FROM message_media WHERE session_id = ?");
         const blocks = await q("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord");
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
@@ -1716,9 +1718,14 @@ export class MysqlBackend implements StorageBackend {
         await this.tx(async (c) => {
             for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
             for (const m of dump.messages) {
+                // #4665: pre-fix dumps lack both fields — recompute identity
+                // from the CAS body (same formula as the v8 migration
+                // backfill); retire state is unrecoverable there → live.
+                const stored = typeof m.content_hash === "string" ? dump.content[m.content_hash] : undefined;
+                const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
                 await c.query(
-                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, m.identity ?? ""],
+                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null],
                 );
             }
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {

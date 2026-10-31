@@ -51,18 +51,20 @@ function advertisedRanges(text: string): Array<[string, string]> {
     return [...hint.matchAll(/(m\d+)\s*[–-]\s*(m\d+)/g)].map((match) => [match[1], match[2]]);
 }
 
-test("already-folded rejection recommends ranges that exclude protected messages and actually compress", () => {
+test("already-folded retry is a no-op receipt that recommends ranges which exclude protected messages and actually compress", () => {
     const ctx = makeCtx(12);
     fold(ctx, "m00001", "m00002");
     const rejected = request(ctx, "m00001", "m00002");
-    assert.equal(rejected.outcome, "refused");
+    // #4521: the covered retry is the idempotent no-op — success-shaped, single line.
+    assert.equal(rejected.outcome, "applied");
+    assert.ok(rejected.text.startsWith("[Compression no-op"), rejected.text);
     const ranges = advertisedRanges(rejected.text);
     assert.ok(ranges.length > 0);
     for (const [start, end] of ranges) {
         assert.ok(Number(start.slice(1)) >= 3 && Number(end.slice(1)) <= 7, `${start}..${end} must exclude covered and protected refs`);
         assert.equal(request(ctx, start, end).outcome, "applied", `${start}..${end} must pass the real submit gate`);
     }
-    assert.equal(rejected.text.split("\n").length, 1, "failure remains visible as one complete marker line");
+    assert.equal(rejected.text.split("\n").length, 1, "receipt remains visible as one complete marker line");
 });
 
 test("fully protected tail yields a stop instruction rather than a misleading retry span", () => {
@@ -70,11 +72,15 @@ test("fully protected tail yields a stop instruction rather than a misleading re
     fold(ctx, "m00001", "m00002");
     const blocksBefore = JSON.stringify(ctx.session.state.blocks);
     for (let attempt = 0; attempt < 2; attempt++) {
+        // #4521: protected-range retries are no-ops now, but the protective
+        // contract is unchanged — never advertise a protected span, always
+        // steer to "continue without compressing" when nothing is eligible.
         const rejected = request(ctx, "m00003", "m00007");
-        assert.equal(rejected.outcome, "refused");
+        assert.equal(rejected.outcome, "applied");
+        assert.match(rejected.text, /protected zone/);
         assert.match(rejected.text, /continue the task without compressing/);
         assert.doesNotMatch(rejected.text, /Live compressible refs|Retry NOW|extend your range/);
-        assert.equal(JSON.stringify(ctx.session.state.blocks), blocksBefore, "failed attempts must not change history coverage");
+        assert.equal(JSON.stringify(ctx.session.state.blocks), blocksBefore, "no-op attempts must not change history coverage");
     }
 });
 
@@ -93,7 +99,7 @@ test("sub-minimum raw leftovers are not advertised as compressible", () => {
     ctx.messages[2].text = "a".repeat(600);
     ctx.messages[3].text = "b".repeat(600);
     const result = request(ctx, "m00001", "m00002");
-    assert.equal(result.outcome, "refused");
+    assert.equal(result.outcome, "applied");
     assert.match(result.text, /continue the task without compressing/);
     assert.doesNotMatch(result.text, /Live compressible refs|Retry NOW/);
 });
@@ -103,7 +109,7 @@ test("recovery includes eligible gaps before the highest active block boundary",
     fold(ctx, "m00004", "m00008");
     fold(ctx, "m00012", "m00016");
     const result = request(ctx, "m00012", "m00016");
-    assert.equal(result.outcome, "refused");
+    assert.equal(result.outcome, "applied");
     const ranges = advertisedRanges(result.text);
     assert.ok(ranges.some(([start]) => start === "m00001"), "eligible old gaps must remain discoverable");
     assert.ok(ranges.some(([start, end]) => Number(start.slice(1)) <= 9 && Number(end.slice(1)) >= 11), `eligible middle gaps must remain discoverable: ${result.text}`);
@@ -119,7 +125,7 @@ test("token-based recent protection is honored even beyond the last-message coun
     fold(ctx, "m00001", "m00002");
     ctx.config.preserveRecentTokens = 10000;
     const result = request(ctx, "m00003", "m00004");
-    assert.equal(result.outcome, "refused");
+    assert.equal(result.outcome, "applied");
     assert.match(result.text, /protected zone/);
     assert.match(result.text, /continue the task without compressing/);
     assert.doesNotMatch(result.text, /Live compressible refs|Retry NOW/);
@@ -139,7 +145,9 @@ test("failure recovery does not stop an active block-distillation nudge", () => 
         assert.equal(result.outcome, "applied", result.text);
     }
     const result = request(ctx, "m00009", "m00012");
-    assert.equal(result.outcome, "refused");
+    // #4521: covered retry = no-op; the recovery hint must still surface the
+    // actionable distillation nudge instead of a stop verdict.
+    assert.equal(result.outcome, "applied");
     assert.match(result.text, /block-distillation nudge is active/);
     assert.doesNotMatch(result.text, /continue the task without compressing|Retry NOW/);
 });
@@ -149,10 +157,12 @@ test("failed live eligibility check never falls back to a guessed ref span", () 
     fold(ctx, "m00001", "m00002");
     ctx.core = { ...ctx.core, processTurn: () => { throw new Error("synthetic live eligibility failure"); } };
     const result = request(ctx, "m00001", "m00002");
-    assert.equal(result.outcome, "refused");
+    // #4521: the no-op receipt still owes the model a truthful eligibility
+    // verdict; when the live check throws, the old guard wording fires verbatim.
+    assert.equal(result.outcome, "applied");
     assert.match(result.text, /eligibility could not be determined/);
     assert.match(result.text, /acp_status before retrying/);
-    assert.doesNotMatch(result.text, /Live compressible refs|Retry NOW/);
+    assert.doesNotMatch(result.text, /Live compressible refs|Current compressible ranges|Retry NOW/);
 });
 
 test("unexpected compression exceptions and their repeat guard use current eligibility", () => {
