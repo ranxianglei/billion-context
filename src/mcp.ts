@@ -120,20 +120,54 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
     send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
+// #5001: a cold-starting proxy (the SessionStart hook spawns it in a SEPARATE
+// child) often is not listening yet when this shim's first tools/list fires.
+// Claude Code retries its MCP handshake only ~250/500/1000ms then gives up for
+// the whole process, so failing fast on the first refused connection loses the
+// bili tools permanently ("No such tool available: mcp__bili__compress"). Poll
+// until the proxy answers instead — bounded, so a genuinely dead proxy still
+// surfaces an error rather than hanging the handshake forever.
+const DEFAULT_MANIFEST_WAIT_MAX_MS = 15_000;
+const DEFAULT_MANIFEST_RETRY_INTERVAL_MS = 250;
+const MANIFEST_FETCH_TIMEOUT_MS = 3_000;
+let manifestWaitMaxMs = DEFAULT_MANIFEST_WAIT_MAX_MS;
+let manifestRetryIntervalMs = DEFAULT_MANIFEST_RETRY_INTERVAL_MS;
+
+function sleepMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchManifest(): Promise<void> {
-    const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
-    const data = (await res.json()) as {
-        tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]>;
-        capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } };
-    };
-    // #2652: learn the summary budget ceiling so compress calls wait for it.
-    const advertised = data.capabilities?.externalSummary?.maxToolDurationMs;
-    if (typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0) manifestMaxToolDurationMs = advertised;
-    // Anthropic wire shape is the canonical MCP-compatible schema source.
-    const anthropic = data.tools?.anthropic ?? [];
-    manifestTools = anthropic.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema }));
-    if (manifestTools.length === 0) throw new Error("manifest served no anthropic tools");
+    const deadline = Date.now() + manifestWaitMaxMs;
+    let lastErr: unknown;
+    let announcedWait = false;
+    for (;;) {
+        try {
+            const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS) });
+            if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
+            const data = (await res.json()) as {
+                tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]>;
+                capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } };
+            };
+            // #2652: learn the summary budget ceiling so compress calls wait for it.
+            const advertised = data.capabilities?.externalSummary?.maxToolDurationMs;
+            if (typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0) manifestMaxToolDurationMs = advertised;
+            // Anthropic wire shape is the canonical MCP-compatible schema source.
+            const anthropic = data.tools?.anthropic ?? [];
+            manifestTools = anthropic.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema }));
+            if (manifestTools.length === 0) throw new Error("manifest served no anthropic tools");
+            return;
+        } catch (err) {
+            lastErr = err;
+            if (!announcedWait) {
+                announcedWait = true;
+                process.stderr.write(`[bili-mcp] bili proxy not ready at ${resolveProxyOrigin()} (${err instanceof Error ? err.message : String(err)}) — waiting up to ${Math.round(manifestWaitMaxMs / 1000)}s for a cold start (#5001)\n`);
+            }
+            if (Date.now() >= deadline) break;
+            await sleepMs(manifestRetryIntervalMs);
+        }
+    }
+    throw lastErr;
 }
 
 /** #2652: only compress invokes the external summary executor (bounded by
@@ -146,12 +180,22 @@ function effectiveToolTimeoutMs(tool: string): number {
 }
 
 let manifestPromise: Promise<void> | null = null;
-function ensureManifest(): Promise<void> {
+export function ensureManifest(): Promise<void> {
     manifestPromise ??= fetchManifest().catch((err) => {
         manifestPromise = null;
         throw err;
     });
     return manifestPromise;
+}
+
+// #5001 test seam: drop the cached promise/tools and (optionally) shrink the
+// cold-start wait budget so the bounded-timeout path runs in milliseconds.
+export function _resetMcpManifestForTest(overrides?: { waitMaxMs?: number; retryIntervalMs?: number }): void {
+    manifestPromise = null;
+    manifestTools = [];
+    manifestMaxToolDurationMs = undefined;
+    manifestWaitMaxMs = overrides?.waitMaxMs ?? DEFAULT_MANIFEST_WAIT_MAX_MS;
+    manifestRetryIntervalMs = overrides?.retryIntervalMs ?? DEFAULT_MANIFEST_RETRY_INTERVAL_MS;
 }
 
 // #2752: same contract as agent/shared.ts's ForwardedToolResult — the endpoint's
@@ -346,7 +390,7 @@ async function handleMessage(msg: {
                 await ensureManifest();
                 sendResult(id, { tools: manifestTools });
             } catch (err) {
-                sendError(id, -32003, `bili proxy unreachable at ${resolveProxyOrigin()} (${err instanceof Error ? err.message : String(err)}) — start bili or set BILI_MCP_PROXY`);
+                sendError(id, -32003, `bili proxy unreachable at ${resolveProxyOrigin()} even after waiting for a cold start (${err instanceof Error ? err.message : String(err)}) — start bili or set BILI_MCP_PROXY`);
             }
             return;
         }
