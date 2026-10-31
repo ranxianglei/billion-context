@@ -230,6 +230,22 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (estTotal > 0) billedLine += ` · est-view total ${estTotal} tok · ratio ${(billed / estTotal).toFixed(1)}×`;
         extra.push("");
         extra.push(billedLine);
+        // #5021: occupancy anchor. BILLED INPUT is an absolute count with no
+        // denominator, and the kernel's COMPRESSED BLOCKS header prints a
+        // LIFETIME "original" total right above it — an agent that does not
+        // know the route's window reads both as current occupancy and
+        // concludes the context is nearly full (measured incident: a session
+        // at 116,902 of a 1,000,000-token window reported "context exhausted"
+        // to its user and stopped working at 11.7%). One line answers "how
+        // much is left" without the agent having to guess a domain it cannot
+        // see: the window only lives in this process's config.
+        const occupancyLimit = ctx.config.modelContextLimit;
+        if (occupancyLimit > 0) {
+            const used = Math.max(0, billed);
+            const occupancyPct = (used / occupancyLimit) * 100;
+            const remaining = Math.max(0, occupancyLimit - used);
+            extra.push(`CONTEXT: ${used} / ${occupancyLimit} tok used (${occupancyPct.toFixed(1)}%) · ${remaining} tok remaining of the input budget`);
+        }
         if (estTotal > 0 && billed / estTotal >= 1.5) {
             extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
         }
