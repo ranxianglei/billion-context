@@ -306,23 +306,27 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     return clamped;
 }
 
-/** #2490: translate the refused dsh compaction replay size (recorded on the
- *  session by the guard in handle.ts) into a token floor for the clamp's
- *  planning basis. bytes/4 mirrors the default estimator's chars/4 caliber
- *  (the replay is JSON text riding the same wires). 0 when nothing was
- *  recorded — legacy behavior.
- *  STICKY BY DESIGN: the guard records a high-water mark and nothing decays
- *  or clears it while the session lives. While compaction stays refused the
- *  raw ledger only grows (refused checkpoints never land), so the max bounds
- *  every future re-send; decaying the floor would re-open the #2490 kill
- *  chain. Lifetime ends with the session (metadata eviction). Known
- *  conservative residue: if a checkpoint lands anyway (direct-bypass path;
- *  the #2028 opt-out was removed, #3666) and shrinks the ledger, the floor
- *  stays at its old high until eviction — fail-closed over-tightening,
- *  accepted.
- *  Note (#3384): recording stays sticky; what changed is APPLICATION — the
- *  clamp gates where this floor may drive planning (see clampOutgoingOutput),
- *  so a stale high-water mark can no longer starve a healthy session. */
+/** #2490: translate the recorded dsh raw-ledger scale (stamped on the session
+ *  by the guard in handle.ts) into a token floor for the clamp's planning
+ *  basis. bytes/4 mirrors the default estimator's chars/4 caliber (the replay
+ *  is JSON text riding the same wires). 0 when nothing was recorded — legacy
+ *  behavior.
+ *  Two stamp regimes (#5289): the REFUSAL path stamps a STICKY high-water over
+ *  the envelope bytes — while compaction stays refused the raw ledger never
+ *  shrinks (refused checkpoints never land), so the max bounds every future
+ *  re-send, and decaying it would re-open the #2490 kill chain. The AUTHORED
+ *  path (#3733) stamps the EXACT bytes of the folded snapshot just handed to
+ *  dsh — that answer genuinely shrinks dsh's store to the snapshot, so the
+ *  floor follows reality instead of ratcheting to the pre-answer peak (which
+ *  starved small-window sessions permanently: 128K window − 93K stale floor
+ *  ≈ 33K max output forever while the folded wire sat at ~49K). Lifetime ends
+ *  with the session (metadata eviction). Known conservative residue: a
+ *  checkpoint landing through a path invisible to bili (direct bypass; the
+ *  #2028 opt-out was removed, #3666) leaves the old high until eviction —
+ *  fail-closed over-tightening, accepted.
+ *  Note (#3384): APPLICATION is gated by the clamp (see clampOutgoingOutput) —
+ *  a stale high-water mark can no longer starve a healthy session outside the
+ *  giant-request / enforced-target regimes. */
 export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefined | null): number {
     const bytes = metadata?.["dshCompactionRefusedBytes"];
     if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return 0;
