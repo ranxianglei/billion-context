@@ -28,7 +28,7 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
-import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { sha256Hex, normalizeMessageRole, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -159,7 +159,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
-        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
+        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: normalizeMessageRole(parsed.role), kind: parsed.contentType ?? "message", media: split.media };
         // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
         // (stored-bytes serialization minus id/wireIndex). content_hash stays
         // the byte-faithful CAS key; only the join moves to identity.
@@ -304,7 +304,7 @@ export function planIngestDelta(
             content: split.content,
             hash: split.hash,
             identity: identityOfStoredContent(split.content),
-            role: parsed.role,
+            role: normalizeMessageRole(parsed.role),
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
             ...(split.media.length > 0 ? { media: split.media } : {}),

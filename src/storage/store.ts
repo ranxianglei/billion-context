@@ -147,6 +147,20 @@ export interface MessageRow {
     identity?: string;
 }
 
+/** #4407: a client-view entry can carry NO `role` field at all (the dsh
+ *  raw-tail ingest persists roleless boundary/compaction-replay entries). The
+ *  messages.role column is TEXT NOT NULL and node:sqlite refuses an undefined
+ *  bind (TypeError "cannot be bound to SQLite parameter N"), so the planner
+ *  must project every roleless entry onto a defined string. The value is
+ *  metadata-only: every wire/render/recovery path reparses the verbatim
+ *  content bytes and drops non-string-role rows, so this sentinel never reaches
+ *  a model request — it exists so one bad row lands instead of latching the
+ *  whole unified store off via the #4341 consecutive-failure amplifier. */
+export const UNSET_MESSAGE_ROLE = "unknown";
+export function normalizeMessageRole(role: unknown): string {
+    return typeof role === "string" ? role : UNSET_MESSAGE_ROLE;
+}
+
 /** #4738: one stored message addressed by its mNNNNN ref number — the web
  *  hydration row, served when the resident window no longer carries the bytes. */
 export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
@@ -1023,11 +1037,19 @@ export class UnifiedStore {
 
             for (const m of messages) {
                 const hash = this.putContent(m.content, m.contentHash);
-                const res = this.db
-                    .prepare(
-                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content));
+                let res;
+                try {
+                    res = this.db
+                        .prepare(
+                            "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        )
+                        .run(s.sessionId, m.seq, m.msgId, m.ref ?? null, m.refNum ?? null, normalizeMessageRole(m.role), m.kind ?? "message", hash, m.identity ?? identityOfStoredContent(m.content));
+                } catch (err) {
+                    // #4407: node:sqlite reports only an opaque "cannot be bound
+                    // to SQLite parameter N" — rethrow with the row identity so
+                    // the degrade relay names which session/seq/msg_id failed.
+                    throw new Error(`messages insert failed session_id=${s.sessionId} seq=${m.seq} msg_id=${m.msgId}: ${err instanceof Error ? err.message : String(err)}`);
+                }
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -1968,7 +1990,7 @@ export class UnifiedStore {
                 // backfill); retire state is unrecoverable there → live.
                 const stored = typeof m.content_hash === "string" ? dump.content[m.content_hash] : undefined;
                 const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
-                insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null);
+                insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, normalizeMessageRole(m.role), m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null);
             }
             const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
@@ -2375,7 +2397,7 @@ export class UnifiedStore {
             checks++;
             const parsed = JSON.parse(m.content) as { id?: string; role?: string; contentType?: string };
             if (parsed.id !== m.msgId) return fail(`messages[${m.seq}].msg_id`, `${m.msgId} vs ${String(parsed.id)}`);
-            if (parsed.role !== m.role) return fail(`messages[${m.seq}].role`, `${m.role} vs ${String(parsed.role)}`);
+            if (normalizeMessageRole(parsed.role) !== m.role) return fail(`messages[${m.seq}].role`, `${m.role} vs ${String(parsed.role)}`);
             if ((parsed.contentType ?? "message") !== m.kind) {
                 return fail(`messages[${m.seq}].kind`, `${m.kind} vs ${String(parsed.contentType)}`);
             }
