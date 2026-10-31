@@ -968,10 +968,12 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
 
 // ---- #3719: web 更新/Updates tab actions ---------------------------------
 
-/** POST /__bili/update/check — force one registry check through the shared
- *  update options (same lock/throttle/proxy gates as the background loop).
- *  Always HTTP 200: an unwired process answers {ok:false, error} so the panel
- *  can show the string verbatim instead of failing the fetch. */
+/** POST /__bili/update/check — run ONE check-only registry pass through the
+ *  shared update options (#4791): full gate ladder, structured verdict
+ *  ({status, latest?, candidate?, note?}), NO download/install — installs
+ *  happen on /__bili/update/install. Always HTTP 200: an unwired process
+ *  answers {ok:false, error} so the panel can show the string verbatim
+ *  instead of failing the fetch. */
 async function handleUpdateCheck(res: http.ServerResponse): Promise<void> {
     if (!updateActionsAvailable()) {
         res.writeHead(200, { "content-type": "application/json" });

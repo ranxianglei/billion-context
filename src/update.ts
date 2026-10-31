@@ -371,7 +371,10 @@ const LAST_INSTALL_FILE = path.join(cacheDir(), ".last-install.json");
 export interface LastInstallRecord {
     from?: string;
     version: string;
-    source: "auto-update" | "manual" | `advisory:${string}`;
+    /** How it got here: "auto-update" (background loop), "manual" (explicit
+     *  CLI), "manual-web" (the web panel's explicit install button, #4791), or
+     *  "advisory:<id>" — a critical-bug advisory's rollback form (#1588). */
+    source: "auto-update" | "manual" | "manual-web" | `advisory:${string}`;
     at: number;
 }
 
@@ -1438,13 +1441,17 @@ async function passUpdatePolicyGate(args: {
     latest: string;
     tag: string;
     force: boolean;
+    /** #4791: user-initiated query — skip rollout PACING (hold/stagger are
+     *  scheduling side-effects a read-only check must not trigger or clear);
+     *  pin/blocked stepping still applies to the reported candidate. */
+    skipPacing?: boolean;
     resolveProxy?: (url: string) => string | undefined;
 }): Promise<{ candidate: string } | { reason: string }> {
     const { force } = args;
     try {
         const policy = await loadUpdatePolicy({ url: knobUpdatePolicyUrl() ?? POLICY_URL_DEFAULT, resolveProxy: args.resolveProxy });
         const doc = policy.doc;
-        if (!force && doc?.hold) {
+        if (!force && !args.skipPacing && doc?.hold) {
             setPlannedUpgrade(undefined);
             policyGateLogOnce("policy:hold", `[update] HOLD active in the remote update policy — ${args.latest} is available but auto-upgrade is frozen fleet-wide until the owner lifts it; manual escape: \`bili update\` (bypasses hold) or npm install -g ${args.packageName}@${args.latest} (#3619)`);
             return { reason: "hold" };
@@ -1473,7 +1480,7 @@ async function passUpdatePolicyGate(args: {
                 policyGateLogOnce(`policy:stepped:${args.latest}->${candidate}`, `[update] installing ${candidate} instead of dist-tag ${args.latest} per the remote policy (#3619)`);
             }
         }
-        if (!force) {
+        if (!force && !args.skipPacing) {
             const win = resolveStaggerWindow(candidate, doc, knobUpdateStaggerMinDelayMs(), knobUpdateStaggerMaxDelayMs());
             const now = Date.now();
             const draw = await ensureStaggerDraw({ key: staggerKey(args.tag, candidate), minDelayMs: win.minMs, maxDelayMs: win.maxMs, now });
@@ -1484,7 +1491,7 @@ async function passUpdatePolicyGate(args: {
                 return { reason: "stagger" };
             }
         }
-        setPlannedUpgrade(undefined);
+        if (!args.skipPacing) setPlannedUpgrade(undefined);
         return { candidate };
     } catch (e) {
         policyGateLogOnce(`policy:gatefail:${String(e)}`, `[update] policy gate failed (${String(e)}) — proceeding with the legacy immediate install (#3619)`);
@@ -1497,9 +1504,30 @@ export function _resetPolicyGateForTest(): void {
     policyGateLogged.clear();
 }
 
-/** Run a single check (throttled unless `force`). Safe to call frequently. */
-export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
-    if (!opts.autoUpdate && !force) return;
+/** #4791: structured verdict of a CHECK-ONLY registry pass. The web panel's
+ *  "Check now" runs the full gate ladder (registry fetch, version compare,
+ *  advisory deferral and block, policy stepping) but stops before any download
+ *  — the button reports what an install WOULD do without doing it. Returned
+ *  only on the check-only path; background/forced callers keep the legacy
+ *  void shape. */
+export interface UpdateCheckOutcome {
+    status: "up-to-date" | "update-available" | "blocked-advisory" | "deferred-advisory" | "refused" | "error";
+    /** Registry dist-tag version (when the registry was reached). */
+    latest?: string;
+    /** Version a manual install would land on after policy stepping (pin/block). */
+    candidate?: string;
+    /** One-line machine reason for refused/error verdicts. */
+    note?: string;
+}
+
+/** Run a single check (throttled unless `force`). Safe to call frequently.
+ *  `checkOnly` (#4791): run the full gate ladder and report its verdict as an
+ *  outcome, cutting off BEFORE the download/install tail — the web panel's
+ *  "Check now" uses this so a query never installs. Every safety gate stays
+ *  armed on this path: they report their verdict instead of being bypassed,
+ *  and only the throttle window is skipped (pacing, not safety). Never throws. */
+export async function checkForUpdate(opts: UpdateOptions, force = false, checkOnly = false): Promise<UpdateCheckOutcome | undefined> {
+    if (!opts.autoUpdate && !force && !checkOnly) return;
     if (inFlight) return;
     inFlight = true;
     try {
@@ -1515,7 +1543,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const intervalMs = ownerLane ? ownerLaneIntervalMs() : CHECK_INTERVAL_MS;
         const lastCheck = await readLastCheck(throttleFile);
         const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
-        if (!force && firstCheckDone && now - lastCheck < intervalMs) {
+        if (!force && !checkOnly && firstCheckDone && now - lastCheck < intervalMs) {
             const retryIn = ((intervalMs - (now - lastCheck)) / 1000 | 0);
             loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
@@ -1524,6 +1552,12 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         firstCheckDone = true;
 
         if (!force && opts.advisoryActive?.()) {
+            if (checkOnly) {
+                // Report the deferral instead of acting on it — no owner-channel
+                // refresh either (that IS an update action).
+                loggerLog("info", "[update] manual web check: deferring to the advisory loop (an active critical-bug advisory owns this install)");
+                return { status: "deferred-advisory", note: "an active critical-bug advisory owns this install (#1481)" };
+            }
             // The advisory watcher is working on this install dir: let its target
             // version win instead of racing it with "follow latest".
             if (managed && installDir) {
@@ -1542,6 +1576,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // to self-update here instead of proceeding.
         if (installDir && await isGitWorkingTree(installDir)) {
             loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
+            if (checkOnly) return { status: "refused", note: `running from a source checkout \u2014 use npm install -g ${opts.packageName} manually (#580)` };
             return;
         }
 
@@ -1551,6 +1586,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // global self-updater.
         if (managed && installDir) {
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
+            if (checkOnly) return { status: "refused", note: `install dir is managed by ${managed.owner} \u2014 update it via ${managed.channel} (#991)` };
             // #1196: a copy inside a host's own tree (dsh profile bundle, pi
             // npm dir) cannot wait for a global self-update that may never
             // come — drive the lockstep refresh through the host's own
@@ -1569,6 +1605,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // once the advisory's first check completes the predicate goes false and
         // the normal loop resumes (or the gate above skips the affected candidate).
         if (!force && opts.advisoryAwaitingFirstCheck?.()) {
+            if (checkOnly) {
+                loggerLog("info", "[update] manual web check: the advisory's first check has not landed yet (#2456) \u2014 nothing installed");
+                return { status: "deferred-advisory", note: "the advisory's first check has not landed yet (#2456)" };
+            }
             loggerLog("info", "[update] deferring this cycle: the advisory's first check has not landed yet (#2456) \u2014 will follow latest next cycle once its state is known");
             return;
         }
@@ -1589,6 +1629,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         });
         if (!res.ok) {
             loggerLog("warn", `[update] registry returned ${res.status} ${res.statusText}, skipping`);
+            if (checkOnly) return { status: "error", note: `registry returned ${res.status} ${res.statusText}` };
             return;
         }
         const data = (await res.json()) as {
@@ -1598,6 +1639,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const latest = data.version;
         if (!latest) {
             loggerLog("warn", `[update] registry response had no version, skipping`);
+            if (checkOnly) return { status: "error", note: "registry response had no version" };
             return;
         }
 
@@ -1607,6 +1649,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const currentVersion = diskVersion ?? opts.currentVersion;
 
         if (reportNotNewer(latest, tag, diskVersion, opts.currentVersion, loggerLog)) {
+            if (checkOnly) return { status: "up-to-date", latest };
             // Up to date, but this process is behind the on-disk install —
             // surface it to the opt-in self-restart handler (#811).
             if (diskVersion && staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
@@ -1627,6 +1670,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // Skip the candidate: the blocklist wins over "follow latest" until
         // the advisory document stops covering it.
         if (!force && opts.advisoryBlocksVersion?.(latest)) {
+            if (checkOnly) {
+                loggerLog("info", `[update] manual web check: ${latest} is covered by a critical-bug advisory's affected range (#1588) \u2014 not installing`);
+                return { status: "blocked-advisory", latest, note: `${latest} is covered by a critical-bug advisory's affected range (#1588)` };
+            }
             loggerLog("info", `[update] skipping ${latest}: covered by a critical-bug advisory's affected range (#1588) — not pulling this install back into the defect; retrying next cycle`);
             return;
         }
@@ -1641,9 +1688,13 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             latest,
             tag,
             force,
+            skipPacing: checkOnly,
             resolveProxy: opts.resolveProxy,
         });
-        if ("reason" in gate) return;
+        if ("reason" in gate) {
+            if (checkOnly) return { status: "refused", latest, note: `remote update policy (${gate.reason}) \u2014 not installing` };
+            return;
+        }
         const target = gate.candidate;
 
         let tarballUrl = data.dist?.tarball;
@@ -1656,6 +1707,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             const steppedDoc = await fetchVersionDoc(opts, opts.packageName, target);
             if (!steppedDoc?.tarball) {
                 loggerLog("warn", `[update] registry has no tarball for policy-selected ${target}, skipping`);
+                if (checkOnly) return { status: "refused", latest, note: `registry has no tarball for policy-selected ${target}` };
                 return;
             }
             tarballUrl = steppedDoc.tarball;
@@ -1664,12 +1716,18 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
         if (!tarballUrl) {
             loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
+            if (checkOnly) return { status: "error", note: `registry response for ${latest} had no tarball URL` };
             return;
         }
 
         const bkey = backoffKey(installDir, target);
-        if (!force && (await backoffInCooldown(bkey))) {
+        if (!force && !checkOnly && (await backoffInCooldown(bkey))) {
             return;
+        }
+
+        if (checkOnly) {
+            loggerLog("info", `[update] manual web check: new version available ${currentVersion} \u2192 ${target}${target !== latest ? ` (dist-tag says ${latest})` : ""} \u2014 check only, not downloading (#4791)`);
+            return { status: "update-available", latest, candidate: target };
         }
 
         loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${target}${target !== latest ? ` (dist-tag says ${latest})` : ""}, downloading\u2026`);
@@ -1702,6 +1760,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
     } catch (e) {
         loggerLog("warn", `[update] check failed: ${String(e)}`);
+        if (checkOnly) return { status: "error", note: String(e) };
     } finally {
         inFlight = false;
     }
@@ -2159,12 +2218,16 @@ async function fetchVersionDoc(
  *  same cross-process lock, same backup/verify/rollback tarball install, same
  *  #580 source-checkout and #991 single-writer guards (those refuse with an
  *  actionable error instead of installing). Returns ok:false with a reason on
- *  any refusal/failure; never throws. */
+ *  any refusal/failure; never throws. The web panel's explicit install button
+ *  shares this path too (#3719/#4791): it passes "web-panel" as advisoryId and
+ *  an explicit installSource so .last-install.json attributes it as
+ *  "manual-web" instead of the legacy `advisory:<id>` label. */
 export async function forceInstallVersion(
     targetVersion: string,
     installDir: string | undefined,
     opts: UpdateOptions,
     advisoryId: string,
+    installSource?: LastInstallRecord["source"],
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         const error = "cannot locate the install directory";
@@ -2206,8 +2269,11 @@ export async function forceInstallVersion(
         if (diskUnderLock === targetVersion) return { ok: true };
         const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
         if (result.ok) {
-            await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, `advisory:${advisoryId}`);
-            loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
+            const channel = installSource ?? `advisory:${advisoryId}`;
+            await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, channel);
+            // Advisory callers keep their pre-existing log wording exactly (#4791 review); only explicit sources get the channel label.
+            const logLabel = installSource ? channel : `advisory ${advisoryId}`;
+            loggerLog("info", `[update] ${logLabel}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);
             notifyStaleInstall(opts, targetVersion);

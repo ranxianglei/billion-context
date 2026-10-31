@@ -1053,8 +1053,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {
