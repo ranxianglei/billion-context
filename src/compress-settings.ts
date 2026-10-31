@@ -7,6 +7,22 @@ import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from
 
 export type { CompressSettings } from "./config.js";
 
+/** #1701: visibility-marker delivery mode. `stream` = dual delivery (marker
+ *  line streamed to the client AND marker messages re-injected model-side —
+ *  the historical behavior); `model-only` = model-side injection on, client
+ *  stream silent (a terminal compression failure still surfaces to the client
+ *  as one visible ❌ line); `off` = both sides suppressed (#862). */
+export type VisibilityMode = "stream" | "model-only" | "off";
+
+/** Normalize the raw `compress.visibilityMarkers` value (legacy booleans plus
+ *  the #1701 tri-state strings) into a mode. Unset and `true` map to `stream`
+ *  (the historical default); `false` maps to `off`. */
+export function resolveVisibilityMode(value: boolean | string | undefined): VisibilityMode {
+    if (value === false || value === "off") return "off";
+    if (value === "model-only") return "model-only";
+    return "stream";
+}
+
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
  *  - `string` ending in `%` (e.g. `"70%"`) → that fraction of `nativeLimit`.
