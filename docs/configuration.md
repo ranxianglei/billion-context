@@ -279,6 +279,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 |-----|------|---------|-----|-------------|
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | Effective context window (tokens or N%): denominator of the usage ratio and a hard preflight wall; highest-priority window source. |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | Forced-compression nudge threshold: once history passes this share of the window the nudge fires immediately, bypassing growth gates. Not a hard cap. |
+| `compress.nudgeEscalationPct` | number \| "N%" | 0.7 | — | Host-side escalation-nudge line: injects a compression nudge once usage crosses this ratio even while the kernel cadence stays silent (covers the climb below maxContextLimit). Host-only; if set at/above maxContextLimit the kernel pressure band takes over first. |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |

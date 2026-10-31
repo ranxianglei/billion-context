@@ -279,6 +279,7 @@
 |-----|------|---------|-----|-------------|
 | `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。 |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | 强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。 |
+| `compress.nudgeEscalationPct` | number \| "N%" | 0.7 | — | 宿主侧升级提醒线：使用率越过该比例时，即使内核节奏仍静默也注入一次压缩提醒（覆盖 maxContextLimit 之下的爬升段）。仅宿主侧；若设到 >= maxContextLimit，内核压力带会先触发。 |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
