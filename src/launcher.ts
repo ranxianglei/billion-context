@@ -4113,6 +4113,14 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
     return instanceShapeMismatch(inst, opts, foreignLanes);
 }
 
+// #5072: sentinel fragment embedded in the launcher's terminal error when the
+// stale-client evidence triple fires (every live same-lane candidate refused
+// for code-fingerprint-mismatch + child twin signal exit-3 + failed adopt).
+// Lane owners (pi-native.ts bootstrap catch) sniff this exact wording in the
+// error chain to upgrade their generic "goes direct (uncompressed)" log into
+// the actionable restart directive — keep both sides in lockstep.
+export const STALE_CLIENT_RESTART_SIGNAL = "RESTART THE HOST PROCESS";
+
 /** #1232: every healthy live instance — not just the last writer of the
  *  single proxy-origin file. With per-lane proxies (#1225/#1231) that file
  *  points at whichever instance registered LAST, which may be another
@@ -5607,6 +5615,10 @@ export async function ensureProxyRunning(
             throw new Error(`bili: proxy spawn failed (${detail}) (runtime: ${runtime}) (log: ${logPath})`);
         }
         if (childExit) {
+            // #5072: set below when the stale-client evidence triple holds —
+            // appended to the terminal throw so lane owners can recognize and
+            // re-emit the actionable restart directive in their own log.
+            let staleClient: string | undefined;
             // #3654: exit code 3 is the child's twin-collision signal (#3044
             // listen-policy): a live same-lane same-build instance already
             // serves the port. Discovery above declared it unhealthy or missed
@@ -5616,6 +5628,26 @@ export async function ensureProxyRunning(
                 const adopted = await adoptServingTwin();
                 if (adopted !== undefined) return adopted;
                 attachDiag("bili: serving-twin adoption failed verification — continuing with the standard post-exit re-discovery");
+                // #5072: evidence triple — the exit-3 proves the serving holder
+                // runs byte-identical code to the CURRENT disk script (the
+                // child executed exactly that script), the adopt above just
+                // re-applied the SAME instanceCompatible gate and found
+                // nothing rideable, so when EVERY live same-lane candidate was
+                // fingerprint-refused the difference sits INSIDE this process:
+                // its loaded build ≠ disk build. The host holds a stale bili
+                // plugin and only a host-process restart clears it. Evidence-
+                // based: no version-string trust needed — fingerprint equality
+                // did the proof. (Re-judged against a fresh discovery rather
+                // than parsed from the diag stream — same inputs, no string
+                // coupling.)
+                if (opts.lane !== undefined) {
+                    const liveSameLane = (deps.listAdoptCandidates ?? discoverLiveInstances)()
+                        .filter((inst) => isPidAlive(inst.pid) && inst.lane === opts.lane);
+                    if (liveSameLane.length > 0 && liveSameLane.every((inst) =>
+                        instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === "code-fingerprint-mismatch")) {
+                        staleClient = `(#5072 stale client: every live ${opts.lane} candidate was refused for code-fingerprint-mismatch while the exited child's twin signal proves the serving holder matches the CURRENT disk script — this process loaded v${VERSION} while the disk build differs ⇒ compression is DISABLED for this host process; ${STALE_CLIENT_RESTART_SIGNAL} so it reloads the updated plugin — model requests go direct (uncompressed) until then)`;
+                    }
+                }
             }
             // #1903: the child died before becoming healthy. Under strictPort
             // that death is almost certainly EADDRINUSE — proof the pinned port
@@ -5631,7 +5663,7 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text}${staleClient !== undefined ? " " + staleClient : ""} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
         }
         // #4994: where THIS child says it bound, parsed from its own log
         // segment ([spawnLogOffset..end] — no other spawn's lines can answer;

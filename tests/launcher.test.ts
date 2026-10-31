@@ -20,6 +20,7 @@ import {
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
 import { resolveNonHttpProviders } from "../src/config.js";
+import { VERSION } from "../src/version.ts";
 import {
     LAUNCHER_DEFAULT_HOST,
     findLiveAttachableInstance,
@@ -28,6 +29,7 @@ import {
     piTestArgs,
     proxyOrigin,
     healthUrl,
+    STALE_CLIENT_RESTART_SIGNAL,
     wrapUpstream,
     unwrapUpstream,
     isLoopbackHost,
@@ -8313,5 +8315,144 @@ test("ensureProxyRunning explicit debug: squatter diagnostic keeps one controlle
         } finally {
             restore();
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// #5072: rotation + adoption gates flanking the stale-client terminal signal.
+// The signal itself (rejection text with every element) is pinned in
+// tests/issue5072-stale-client-restart-signal.test.ts; here the four boundary
+// decisions it sits between: rotation still requires a STRICTLY older holder,
+// adoption rides a same-build twin and NEVER adopts a fingerprint-mismatched
+// one (that mismatch is what makes the whole incident unrecoverable without a
+// host restart).
+test("#5072 rotation negative: an equal-version lane owner is never rotated out", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        let ticks = 0;
+        let shutdownCalls = 0;
+        try {
+            await assert.rejects(
+                ensureProxyRunning(
+                    { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+                    {
+                        scriptPath: FP_SCRIPT,
+                        readInstanceFile: () => recordedInstance({ lane: "pi", codeFingerprint: "deadbeef" }),
+                        fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true }, version: VERSION }),
+                        fetchDetailImpl: async () => ({ ok: false, detail: "ECONNREFUSED" }),
+                        spawnImpl: () => makeFastExitChild(1),
+                        now: () => ticks * 1000,
+                        sleep: async () => { ticks += 10; },
+                        registerWatcher: async () => "ok",
+                        requestInstanceShutdown: async () => { shutdownCalls++; return true; },
+                    },
+                ),
+                /proxy child exited before becoming healthy/,
+            );
+            assert.equal(shutdownCalls, 0, "equal version is not STRICTLY older — no shutdown request may go out");
+            assert.ok(writes.every((w) => !w.includes("rotating stale proxy")), `stderr: ${JSON.stringify(writes)}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("#5072 rotation positive: a strictly-older compatible lane owner IS rotated out before spawn", async () => {
+    await withHomeSandbox(async () => {
+        const { writes, restore } = captureStderr();
+        let ticks = 0;
+        let shutdownAsked = false;
+        let shutdownCalls = 0;
+        try {
+            await assert.rejects(
+                ensureProxyRunning(
+                    { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+                    {
+                        scriptPath: FP_SCRIPT,
+                        readInstanceFile: () => recordedInstance({ lane: "pi", codeFingerprint: "deadbeef" }),
+                        fetchHealthInfo: async () => shutdownAsked ? undefined : { ok: true, instanceId: "inst-1", watchdog: { armed: true }, version: "0.0.1" },
+                        fetchDetailImpl: async () => ({ ok: false, detail: "ECONNREFUSED" }),
+                        spawnImpl: () => makeFastExitChild(1),
+                        now: () => ticks * 1000,
+                        sleep: async () => { ticks += 10; },
+                        registerWatcher: async () => "ok",
+                        requestInstanceShutdown: async (origin) => {
+                            shutdownCalls++;
+                            assert.equal(origin, "http://127.0.0.1:8787", "shutdown targets the stale holder");
+                            shutdownAsked = true;
+                            return true;
+                        },
+                    },
+                ),
+                /proxy child exited before becoming healthy/,
+            );
+            assert.equal(shutdownCalls, 1, "the older generation is shut down exactly once");
+            assert.ok(writes.some((w) => w.includes("rotating stale proxy")), `stderr had no rotation notice: ${JSON.stringify(writes)}`);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test("#5072 adopt positive: a same-build lane twin missed by discovery is adopted after exit-3", async () => {
+    await withHomeSandbox(async () => {
+        const diag: string[] = [];
+        const holder = recordedInstance({ lane: "pi" });
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            // parentPid ≠ process.pid so attachTo's owner heartbeat stays off
+            // (no live timer/post in this hermetic test).
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi", parentPid: 42424 },
+            {
+                scriptPath: FP_SCRIPT,
+                readInstanceFile: () => undefined,   // discovery snapshot misses the late publisher
+                listAdoptCandidates: () => [holder], // registry gained it by bind time
+                isConnectable: async () => true,
+                fetchHealthInfo: async () => undefined,
+                fetchImpl: async () => ({ ok: false }),
+                spawnImpl: () => { spawnCalls++; return makeFastExitChild(3); },
+                registerWatcher: async () => "ok",
+                attachDiag: (m) => diag.push(m),
+            },
+        );
+        assert.equal(spawnCalls, 1, "spawn ran, lost the twin race, signaled exit 3");
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, holder.origin, "the adopted twin serves this launch");
+        assert.ok(diag.some((m) => m.includes("adopting serving twin")), `diag: ${JSON.stringify(diag)}`);
+        assert.ok(diag.every((m) => !m.includes(STALE_CLIENT_RESTART_SIGNAL)), "a successful adoption carries no restart signal");
+    });
+});
+
+test("#5072 adopt negative: a fingerprint-mismatched holder is never adopted after exit-3", async () => {
+    await withHomeSandbox(async () => {
+        const diag: string[] = [];
+        const holder = recordedInstance({ lane: "pi", codeFingerprint: "deadbeef" });
+        let ticks = 0;
+        let thrown: unknown;
+        try {
+            await ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi", parentPid: 42424 },
+                {
+                    scriptPath: FP_SCRIPT,
+                    readInstanceFile: () => holder,
+                    listAdoptCandidates: () => [holder],
+                    isConnectable: async () => true,
+                    fetchHealthInfo: async () => undefined,
+                    fetchImpl: async () => ({ ok: false }),
+                    spawnImpl: () => makeFastExitChild(3),
+                    registerWatcher: async () => "refused",
+                    attachDiag: (m) => diag.push(m),
+                    now: () => ticks * 1000,
+                    sleep: async () => { ticks += 10; },
+                },
+            );
+            throw new Error("expected ensureProxyRunning to reject");
+        } catch (e) {
+            thrown = e;
+        }
+        const err = thrown instanceof Error ? thrown : new Error(String(thrown));
+        assert.match(err.message, /twin-collision signal/, "the child's exit-3 twin proof is preserved in the terminal error");
+        assert.ok(diag.every((m) => !m.includes("adopting serving twin")), `mismatched holder was adopted: ${JSON.stringify(diag)}`);
+        assert.ok(diag.some((m) => m.includes("serving-twin adoption failed verification")), `diag: ${JSON.stringify(diag)}`);
     });
 });
