@@ -731,10 +731,11 @@ test("#5175 A: a drift-stripped turn is retried instead of reaching the client e
 //   <actp tokens="80">m08844</action>
 //   <tool_call tokens="0" type="text">m10234</acctokens>
 // `DRIFT_PAIR` and `DRIFT_ATTR` both carry a `\1` backreference, so they require
-// the halves to agree; `DRIFT_EMPTY_MISMATCH` only covers an EMPTY body. The
-// compound shape therefore had no owner and rode the fast path verbatim — found
-// by replaying the shipped corpus (57 units across 6 fields, all safe: neither
-// name is HTML or a kernel protocol tag) and then confirmed on the real wire.
+// the halves to agree. Nothing owned a disagreeing close, so the compound shape
+// rode the fast path verbatim — found by replaying the shipped corpus (21 units
+// across 21 field paths in 10 sessions, all safe: every removed span carries a
+// kernel ref, so it is emitter echo and never ordinary content) and then
+// confirmed on the real wire.
 const ATTR_MISMATCH = "Here is the status report.\n\n<actp tokens=\"80\">m08844</action>\n\nThat is all.";
 const TOOLCALL_MISMATCH = "x\n\n<tool_call tokens=\"0\" type=\"text\">m10234</acctokens>\n\ny";
 
@@ -779,10 +780,9 @@ test("#5178 negative: a genuine html opening tag stays prose and is never stripp
 // ATTRIBUTES, and closed under a different guessed name — `<acpt m17138></apct>`.
 // The reported paragraph is made of exactly this unit. Every earlier drift rule
 // missed it: DRIFT_PAIR/DRIFT_ATTR carry a `\1` backreference (halves must
-// agree), DRIFT_EMPTY_MISMATCH allows disagreement but only for an EMPTY
-// attribute slot, and DRIFT_ATTR_MISMATCH allows disagreement plus a ref body
-// but demands `tokens=`. So "bare-ref attribute + disagreeing close" had no
-// owner and reached the client verbatim.
+// agree) and DRIFT_ATTR_MISMATCH allows disagreement plus a ref body but demands
+// `tokens=`. So "bare-ref attribute + disagreeing close" had no owner and
+// reached the client verbatim.
 const BARE_MISMATCH = "Here is the status report.\n\n<acpt m17138></apct>\n\nThat is all.";
 
 test("#5175 A: a bare-ref attribute with a disagreeing close is stripped whole-text", () => {
