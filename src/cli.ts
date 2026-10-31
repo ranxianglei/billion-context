@@ -91,8 +91,13 @@ Usage:
                                     (--no-vacuum skips the shrink)
   bili sessions archive <id>        move one session out of index.db into the single
                                     append-only archive log (rows swept, restorable)
-  bili sessions restore <id>        bring an archived session back into index.db
-  bili storage gc                   run the storage sweep now (#3911): archive sessions
+   bili sessions restore <id>        bring an archived session back into index.db
+   bili sessions foreign-blocks      list fold blocks whose covered messages never
+                                     belonged to their session's transcript (dry-run;
+                                     --apply reversibly archives them, --restore
+                                     <sid>:<bid> brings one back). Catches legacy
+                                     cross-session fold blocks that linger after upgrade
+   bili storage gc                   run the storage sweep now (#3911): archive sessions
                                     older than storage.archiveAfterDays (default 365),
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
@@ -211,9 +216,11 @@ type Parsed = {
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
-    sessionsSub?: "ls" | "rm" | "archive" | "restore";
+    sessionsSub?: "ls" | "rm" | "archive" | "restore" | "foreign-blocks";
     sessionsTarget?: string;
     sessionsNoVacuum?: boolean;
+    sessionsApply?: boolean;
+    sessionsRestoreTarget?: string;
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -248,6 +255,8 @@ export function parseArgs(argv: string[]): Parsed {
     let sessionsSub: Parsed["sessionsSub"];
     let sessionsTarget: string | undefined;
     let sessionsNoVacuum = false;
+    let sessionsApply = false;
+    let sessionsRestoreTarget: string | undefined;
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
@@ -333,6 +342,18 @@ export function parseArgs(argv: string[]): Parsed {
             case "--no-vacuum":
                 sessionsNoVacuum = true;
                 break;
+            case "--apply":
+                sessionsApply = true;
+                break;
+            case "--restore": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value (<sessionId>:<blockId>)`);
+                    process.exit(2);
+                }
+                sessionsRestoreTarget = val;
+                break;
+            }
             case "--dry-run":
                 storageDryRun = true;
                 break;
@@ -486,15 +507,17 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "sessions") {
             command = "sessions";
             const sub = positional[1];
-            if (sub === "ls" || sub === "rm" || sub === "archive" || sub === "restore") {
+            if (sub === "ls" || sub === "foreign-blocks") {
+                sessionsSub = sub;
+            } else if (sub === "rm" || sub === "archive" || sub === "restore") {
                 sessionsSub = sub;
                 sessionsTarget = positional[2];
-                if (sub !== "ls" && sessionsTarget === undefined) {
+                if (sessionsTarget === undefined) {
                     console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
                     process.exit(2);
                 }
             } else {
-                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore")`);
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore|foreign-blocks")`);
                 process.exit(2);
             }
         } else if (cmd === "pack" || cmd === "packs") {
@@ -523,11 +546,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -679,7 +702,7 @@ export async function main(): Promise<void> {
         // carry their own exit codes (1 = operation failed, 2 = usage).
         try {
             const r = command === "sessions"
-                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum })
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
                 : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
             process.stdout.write(r.text);
             if (r.code !== 0) process.exit(r.code);

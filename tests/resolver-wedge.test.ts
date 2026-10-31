@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { _resolverWedgeTest, getResolverWedgeState, resolverWedgeRecord } from "../src/resolver-wedge.js";
 import { checkTunnelDestination } from "../src/tunnel-guard.js";
 
+// #5221 phase 2 (owner ruling 2026-10-31): detection-only alarm — never acts.
+// Gate discipline (#3617): both directions asserted. All timing rides the
+// injected clock seam — no real waits.
+
 const MIN = 60_000;
 let clock = 0;
 
@@ -87,7 +91,9 @@ test("checkTunnelDestination feeds the detector: throw-only failures count, an a
         if (host === "empty.answer") return [];
         return ["93.184.216.34"];
     };
-    const ctx: Parameters<typeof checkTunnelDestination>[1] = { clientLoopback: true, selfPort: 8787, allowlist: [], resolveHost, resolveBackoffMs: 1 };
+    // workerFallback:false keeps this hermetic — the #5222 worker probe runs a REAL
+    // lookup on its own thread and must not leak network timing into this scenario.
+    const ctx: Parameters<typeof checkTunnelDestination>[1] = { clientLoopback: true, selfPort: 8787, allowlist: [], resolveHost, resolveBackoffMs: 1, workerFallback: false };
 
     const v1 = await checkTunnelDestination("https://green.one/model", ctx);
     assert.equal(v1.ok, true);
@@ -111,4 +117,19 @@ test("checkTunnelDestination feeds the detector: throw-only failures count, an a
     assert.ok(s, "both formerly-green hosts failing for >5 min must trip");
     assert.deepEqual(s!.hosts, ["green.one", "green.two"], "the empty-answer host never entered the evidence set");
     assert.equal(s!.sinceMs, failClock, "streaks began at first throwing lookup");
+});
+
+test("user-supplied hosts cannot grow the tracker past its cap (#5222 bound)", () => {
+    setup();
+    for (let i = 0; i < 300; i++) {
+        const h = `h${i}.example`;
+        resolverWedgeRecord(h, true);
+        resolverWedgeRecord(h, false);
+    }
+    clock += 6 * MIN;
+    const s = getResolverWedgeState();
+    assert.ok(s, "the surviving hosts still qualify");
+    assert.equal(s!.hosts.length, 256, "tracker is capped (MAX_TRACKED_HOSTS)");
+    assert.ok(!s!.hosts.includes("h0.example") && !s!.hosts.includes("h43.example"), "first-seen entries evicted first (FIFO)");
+    assert.ok(s!.hosts.includes("h299.example"), "newest entries survive");
 });

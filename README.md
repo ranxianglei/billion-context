@@ -693,6 +693,7 @@ bili sessions ls                 # id, label, decoded size, last-updated, storag
 bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
 bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
 bili sessions restore <id>       # bring an archived session back from the log line
+bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
 ```

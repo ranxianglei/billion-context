@@ -11,6 +11,12 @@ name: CI Run Janitor
 #     legit lane (windows test shard) measured ~21 min; 4h running is a hang
 #   - any queued/in_progress pull_request run whose head branch no longer
 #     exists (deleted-branch zombies), regardless of age
+#   - BACKLOG BREAKER (2026-10-31 incident): when the queue itself is
+#     overloaded (more than starvedQueueLimit runs queued), EVERY queued run
+#     older than starvedQueuedMaxMinutes (default 60) is cancelled — the 2026-10-31
+#     post-mortem showed queue DEPTH is what stalls dispatch for the whole repo
+#     (236 queued runs sat at ~0 in_progress until the backlog was drained
+#     manually); draining early beats waiting out a multi-hour snowball.
 # master's own push runs are NEVER cancelled (they are the head's only
 # required checks — cancelling would delete that signal for good); a starving
 # master run is reported as a workflow warning instead.
@@ -34,6 +40,14 @@ on:
         description: "Log what would be cancelled without cancelling"
         type: boolean
         default: false
+      starvedQueueLimit:
+        description: "Starvation alert when more than this many runs sit queued at once (healthy-day ceiling is a low double digit)"
+        default: "30"
+        required: false
+      starvedQueuedMaxMinutes:
+        description: "BACKLOG BREAKER: while the queue is overloaded (> starvedQueueLimit), also cancel queued runs older than this many minutes (0 disables)"
+        default: "60"
+        required: false
 
 permissions:
   actions: write
@@ -56,6 +70,8 @@ jobs:
           QUEUE_MAX: ${{ inputs.queuedMaxMinutes || '120' }}
           PROGRESS_MAX: ${{ inputs.progressMaxMinutes || '240' }}
           DRY_RUN: ${{ inputs.dryRun && '1' || '' }}
+          STARVED_QUEUE: ${{ inputs.starvedQueueLimit || '30' }}
+          STARVED_QUEUE_MAX: ${{ inputs.starvedQueuedMaxMinutes || '60' }}
         run: |
           set -euo pipefail
           now=$(date +%s)
@@ -67,6 +83,33 @@ jobs:
               "repos/$REPO/actions/runs?status=$1&per_page=100"
           }
           { collect queued; collect in_progress; } | sort -u > /tmp/janitor-runs.tsv
+
+          # Runner-starvation circuit breaker (2026-10-31 incident): this sweep
+          # reaps zombies but CANNOT create capacity. When the queue balloons far
+          # past healthy-day depth, the problem is GitHub's hosted allocation
+          # throttling itself, not individual hangs — the 2026-10-31 runs waited
+          # up to ~3.5 h queued before their 2-8 min jobs ever started, and this
+          # very lane's ticks sat in that same queue (self-starvation). Surface it
+          # loudly so a human can intervene (check Actions billing/runner capacity,
+          # manually prune redundant runs: `gh run list --jq ...` + `gh run cancel`)
+          # instead of watching every required check stall silently for hours.
+          queued_count=$(awk -F'\t' '$2 == "queued"' /tmp/janitor-runs.tsv | wc -l)
+          inprogress_count=$(awk -F'\t' '$2 == "in_progress"' /tmp/janitor-runs.tsv | wc -l)
+          starve_mode=0
+          if [ "$queued_count" -gt "$STARVED_QUEUE" ]; then
+            starve_mode=1
+            by_event=$(awk -F'\t' '$2 == "queued" { c[$4]++ } END { for (e in c) printf "%s=%d ", e, c[e] }' /tmp/janitor-runs.tsv)
+            oldest_queued=$(awk -F'\t' '$2 == "queued" { print $3 " run="$1 }' /tmp/janitor-runs.tsv | sort | head -1 || true)
+            starve_note=$([ "$STARVED_QUEUE_MAX" -gt 0 ] && printf 'queued runs older than %sm are cancelled below to break the snowball' "$STARVED_QUEUE_MAX" || printf 'breaker disabled (starvedQueuedMaxMinutes=0), no auto-cancel in this sweep')
+            echo "::warning::RUNNER STARVATION: ${queued_count} runs queued at once (healthy ceiling ${STARVED_QUEUE}; in_progress=${inprogress_count}) [${by_event}] oldest='${oldest_queued:-n/a}' — 2026-10-31 incident class: backlog DEPTH itself stalls dispatch for this repo; ${starve_note}."
+          else
+            echo "queue depth ok (queued=${queued_count} in_progress=${inprogress_count} ceiling=${STARVED_QUEUE})"
+          fi
+          # BUGFIX 2026-10-31: the original release of this lane forgot the input
+          # redirection here — `while read` on stdin never iterates inside an
+          # Actions job, so EVERY rule below (zombie reap, age limits, master
+          # warnings) was dead code from day one (2026-10-30). Feed the collected
+          # list explicitly.
           while IFS=$'\t' read -r id status created event branch; do
             if [ "$id" = "$SELF_ID" ]; then continue; fi
             age_min=$(( (now - $(date -d "$created" +%s)) / 60 ))
@@ -81,6 +124,13 @@ jobs:
             if [ "$event" = "pull_request" ] && [ -n "$branch" ]; then
               if ! gh api "repos/$REPO/branches/$branch" >/dev/null 2>&1; then
                 reason="head branch '$branch' deleted"
+              fi
+            fi
+            if [ -z "$reason" ] && [ "$status" = "queued" ] && [ "$starve_mode" = "1" ] && [ "$STARVED_QUEUE_MAX" -gt 0 ]; then
+              # Backlog breaker: under overload the usual QUEUE_MAX patience
+              # makes the snowball bigger — drain the old waiting room early.
+              if [ "$age_min" -ge "$STARVED_QUEUE_MAX" ]; then
+                reason="queued ${age_min}m >= ${STARVED_QUEUE_MAX}m while queue overloaded (${queued_count} > ${STARVED_QUEUE})"
               fi
             fi
             if [ -z "$reason" ]; then
@@ -101,5 +151,5 @@ jobs:
               echo "::warning::cancel of $id failed (run may have just transitioned)"
             fi
             cancelled=$((cancelled + 1))
-          done
-          echo "janitor sweep done (cancelled=$cancelled master_warned=$warned dry_run=${DRY_RUN:-no})"
+          done < /tmp/janitor-runs.tsv
+          echo "janitor sweep done (cancelled=$cancelled master_warned=$warned starve_mode=$starve_mode dry_run=${DRY_RUN:-no})"

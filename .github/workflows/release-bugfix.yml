@@ -67,6 +67,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       # Fast mode = BOTH explicit signals (typed-phrase guard vs accidental/
       # automated dispatches, #4718). Non-dispatch events see FAST_ON=false.

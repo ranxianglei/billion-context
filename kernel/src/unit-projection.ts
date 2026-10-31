@@ -1,5 +1,14 @@
-import { activeBlocks, blockById, coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
-import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
+import {
+  activeBlocks,
+  blockById,
+  coveredMessageIds,
+  isLiveCheckpointCarrier,
+} from "./state.js";
+import {
+  buildIndexByMessageId,
+  resolveBoundaries,
+  blockVisibleInRange,
+} from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
   collectFailedCompressCallIds,
@@ -10,7 +19,12 @@ import {
   collectAgedCompressCallIds,
   lastUserAnchor,
 } from "./protected.js";
-import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import type { LatestProtected } from "./protected.js";
+import {
+  buildIntegrityPre,
+  computeIntegrityWithdrawals,
+} from "./turn-integrity.js";
+import type { IntegrityPre } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
 import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
 import type {
@@ -61,6 +75,11 @@ export interface UnitProjectionInput {
   /** Warnings are pushed here in apply's original emission order so the
    * apply-side refactor stays byte-identical. Omit for read-only screens. */
   warnings?: string[];
+  /** #5337 option A: per-pass O(n) derivations shared by every unit screened
+   *  against the SAME (messages, state, config) triple — build once with
+   *  {@link buildProjectionShared}. Omitted callers (the single-shot
+   *  apply/report paths) compute inline exactly as before. */
+  shared?: ProjectionShared;
 }
 
 export interface UnitProjectionFatal {
@@ -98,11 +117,23 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   let splitTurnCount = 0;
   let splitPairCount = 0;
 
+  // #5337 option A: optional per-pass derivations (see buildProjectionShared).
+  // Every use site below falls back to the legacy inline computation when the
+  // caller provides no shared context, so standalone projections (apply,
+  // report) stay byte-identical to the pre-sharing implementation.
+  const shared = input.shared;
+  const byId = shared?.byId;
+  const msgById = (id: string): CoreMessage | undefined =>
+    byId === undefined
+      ? input.messages.find((m) => m.id === id)
+      : input.messages[byId.get(id) ?? -1];
+
   const resolved = resolveBoundaries({
     startRef: input.startRef,
     endRef: input.endRef,
     messages: input.messages,
     state: input.state,
+    indexByMessageId: byId,
   });
 
   // Host checkpoint carriers (#335): a host that renders its own compression
@@ -114,8 +145,10 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // unknown id) fold like ordinary messages. Block-ref boundaries deliberately
   // distill across checkpoints and keep folding carriers.
   const plainRange = resolved.boundaryKind !== "block";
-  const liveCarrierIds = new Set<string>();
-  if (plainRange) {
+  const liveCarrierIds = new Set<string>(
+    plainRange ? shared?.liveCarrierIds : undefined,
+  );
+  if (plainRange && !shared) {
     // #2663: the selector screens with this same predicate — one definition,
     // two call sites, so advertise/validate cannot drift apart again.
     for (const message of input.messages) {
@@ -140,8 +173,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // Re-scan for nested blocks in the ADJUSTED range (tool-pair extension may
   // have pulled in messages that are anchors of existing blocks).
   if (rangeMessageIds.length > resolved.messageIds.length) {
-    const indexByMessageId = new Map<string, number>();
-    input.messages.forEach((m, i) => indexByMessageId.set(m.id, i));
+    const indexByMessageId =
+      shared?.byId ?? buildIndexByMessageId(input.messages);
     const adjustedStart =
       rangeMessageIds.length > 0
         ? (indexByMessageId.get(rangeMessageIds[0]!) ?? resolved.startIndex)
@@ -195,6 +228,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     directMessageIds,
     input.messages,
     input.config,
+    shared,
   );
 
   // filterProtectedToolMessages drops protected tool calls (and their paired
@@ -209,7 +243,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   }
 
   const mediaExcluded = directMessageIds.filter((id) => {
-    const msg = input.messages.find((m) => m.id === id);
+    const msg = msgById(id);
     return !!msg && hasUnrecoverableMediaPayload(msg);
   });
   if (mediaExcluded.length > 0) {
@@ -259,22 +293,23 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       // semantics: fold what remains, exactly as before (#3953 changes
       // nothing there; the zone fatal below still fires only when even the
       // carve empties the range).
-      const pairByCallId = new Map<string, [string, string]>();
-      for (const m of input.messages) {
-        if (m.contentType === "tool-call" || m.contentType === "tool-result") {
-          const key = m.toolCallId ?? m.id;
-          const pair = pairByCallId.get(key) ?? ["", ""];
-          if (m.contentType === "tool-call") pair[0] = m.id; else pair[1] = m.id;
-          pairByCallId.set(key, pair);
-        }
-      }
+      // #5337 option A: pair map shared across units; the DROP side becomes a
+      // Set so membership stays O(1) — the previous .includes() inside .some()
+      // made this branch quadratic in unit width.
+      const pairByCallId = shared?.pairByCallId ?? buildPairMap(input.messages);
       const keptIds = filteredIds.slice(0, firstProtectedIdx);
       const droppedIds = filteredIds.slice(firstProtectedIdx);
+      const droppedSet = new Set(droppedIds);
       const strandsPair = keptIds.some((id) => {
-        const m = input.messages.find((x) => x.id === id);
+        const m = msgById(id);
         if (!m || (m.contentType !== "tool-call" && m.contentType !== "tool-result")) return false;
         const pair = pairByCallId.get(m.toolCallId ?? m.id);
-        return !!pair && pair.some((half) => half !== "" && half !== id && droppedIds.includes(half));
+        return (
+          !!pair &&
+          pair.some(
+            (half) => half !== "" && half !== id && droppedSet.has(half),
+          )
+        );
       });
       if (truncatable > 0 && firstProtectedIdx > 0 && !strandsPair) {
         truncatedAfter = truncatable;
@@ -304,7 +339,9 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
         },
       });
     }
-    const anchorMsg = lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
+    const anchorMsg = shared
+      ? shared.anchorMessage
+      : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
     const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
     const anchorNote =
       anchorRef && anchorRef !== "BLOCKED"
@@ -370,7 +407,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       foldedRef = new Set(effectiveMessageIds);
       for (const id of survivingCoverage) foldedRef.add(id);
     }
-    const initial = computeIntegrityWithdrawals(input.messages, foldedRef);
+    const initial = computeIntegrityWithdrawals(
+      input.messages,
+      foldedRef,
+      shared?.integrityPre,
+    );
     splitTurnCount = initial.splitTurnCount;
     splitPairCount = initial.splitPairCount;
     if (initial.withdrawn.size > 0) {
@@ -421,7 +462,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           const recheck = new Set(effectiveMessageIds);
           for (const id of unfolded) recheck.delete(id);
           for (const id of survivingCoverage) recheck.add(id);
-          current = computeIntegrityWithdrawals(input.messages, recheck).withdrawn;
+          current = computeIntegrityWithdrawals(
+            input.messages,
+            recheck,
+            shared?.integrityPre,
+          ).withdrawn;
         }
         if (stuck || current.size > 0) {
           const sample = [...consumedCoverage].slice(0, 5).join(", ");
@@ -467,6 +512,100 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       isBlockBoundary,
     };
   }
+}
+
+/** #5337 option A: every per-screening-pass O(n) derivation over ONE message
+ *  array, computed ONCE instead of once per screened unit. This was the
+ *  quadratic term of the recommend node: U units x O(n) rescans (history
+ *  index maps, carrier scan, protected/latest/aged collectors, tool-pairing
+ *  map, last-user anchor, turn-integrity pre-scan) about O(n^2) total —
+ *  ~17 s for a single processTurn at 23k core messages while Node's event
+ *  loop was blocked (#5304 repro on v0.1.209).
+ *
+ *  Build once per (messages, state, config) triple via
+ *  {@link buildProjectionShared} and pass to every projectUnit call on that
+ *  triple. Semantics are byte-identical: each field is exactly the value the
+ *  corresponding inline computation produced per unit (projectUnit screens
+ *  many units against one immutable array within a turn). The judgment
+ *  criteria themselves (#3236 discipline) are untouched — only how the
+ *  inputs reach them changed. */
+export interface ProjectionShared {
+  /** Raw-id -> index over `messages` (last occurrence wins, map semantics). */
+  byId: Map<string, number>;
+  /** Host checkpoint carriers (#335/#2663) — the plain-range scan result. */
+  liveCarrierIds: Set<string>;
+  /** Failed-compress exchange toolCallIds (#4289). */
+  failedCompressCallIds: Set<string>;
+  /** Latest-only protection sets (protectedLatestTools). */
+  latestProtected: LatestProtected;
+  /** Aged compress-exchange toolCallIds (#4348 fold exemption lift). */
+  agedCompressCallIds: Set<string>;
+  /** latest.callIds plus the full-history protected-tool scan — the exact
+   *  base set filterProtectedToolMessages builds without sharing. Callers
+   *  must COPY it (per-unit passes add removed ids' toolCallIds). Immutable. */
+  baseProtectedCallIds: Set<string>;
+  /** tool-call/tool-result pairing keyed by toolCallId ?? id. */
+  pairByCallId: Map<string, [string, string]>;
+  /** Last visible user anchor (drives the #3953 truncation warning note). */
+  anchorMessage: CoreMessage | undefined;
+  /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
+  integrityPre: IntegrityPre;
+}
+
+/** One-pass build of {@link ProjectionShared}; see that interface for what
+ *  each field mirrors and why one build serves an entire screening pass. */
+export function buildProjectionShared(
+  messages: CoreMessage[],
+  state: CompressionState,
+  config: Config,
+): ProjectionShared {
+  const liveCarrierIds = new Set<string>();
+  for (const message of messages) {
+    if (isLiveCheckpointCarrier(message, state)) liveCarrierIds.add(message.id);
+  }
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
+  const latestProtected = collectLatestProtected(messages, config);
+  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const baseProtectedCallIds = new Set<string>(latestProtected.callIds);
+  const isExemptFold = (msg: CoreMessage): boolean =>
+    !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
+  for (const msg of messages) {
+    if (
+      isMessageProtected(msg, config, failedCompressCallIds) &&
+      msg.toolCallId &&
+      !isExemptFold(msg)
+    ) {
+      baseProtectedCallIds.add(msg.toolCallId);
+    }
+  }
+  return {
+    byId: buildIndexByMessageId(messages),
+    liveCarrierIds,
+    failedCompressCallIds,
+    latestProtected,
+    agedCompressCallIds,
+    baseProtectedCallIds,
+    pairByCallId: buildPairMap(messages),
+    anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
+    integrityPre: buildIntegrityPre(messages),
+  };
+}
+
+/** tool-call/tool-result pairing map over a whole message array (a side may
+ *  be empty until its half shows up). Mirrors the inline map the #3953
+ *  truncation check used to rebuild per unit. */
+function buildPairMap(messages: CoreMessage[]): Map<string, [string, string]> {
+  const pairByCallId = new Map<string, [string, string]>();
+  for (const m of messages) {
+    if (m.contentType === "tool-call" || m.contentType === "tool-result") {
+      const key = m.toolCallId ?? m.id;
+      const pair = pairByCallId.get(key) ?? ["", ""];
+      if (m.contentType === "tool-call") pair[0] = m.id;
+      else pair[1] = m.id;
+      pairByCallId.set(key, pair);
+    }
+  }
+  return pairByCallId;
 }
 
 /** Union of the raw ids covered by all active blocks — the set apply treats
@@ -530,6 +669,7 @@ function filterProtectedToolMessages(
   directMessageIds: string[],
   messages: CoreMessage[],
   config: Config,
+  shared?: ProjectionShared,
 ): string[] {
   // Protected tool calls (and their results, paired by toolCallId) stay in
   // visible context and are simply dropped from the compressible set. They are
@@ -538,10 +678,19 @@ function filterProtectedToolMessages(
   // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
   // ranges applied) are NOT protected — they are dead drafts that must stay
   // foldable so a failing compress loop cannot permanently bloat context.
-  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
-  const protectedCallIds = new Set<string>();
+  // #5337 option A: each collector below is a full O(n) history scan. With a
+  // shared context they were derived ONCE per screening pass (the ?? inline
+  // fallbacks keep the single-shot apply/report paths identical to the
+  // pre-sharing implementation). `baseProtectedCallIds` already unions
+  // latest.callIds with the full-history protection scan; callers copy it
+  // because the per-unit passes below may add to it.
+  const failedCompressCallIds =
+    shared?.failedCompressCallIds ??
+    collectFailedCompressCallIds(messages, config);
+  const protectedCallIds = new Set<string>(shared?.baseProtectedCallIds ?? []);
   const removedIds = new Set<string>();
-  const latest = collectLatestProtected(messages, config);
+  const latest =
+    shared?.latestProtected ?? collectLatestProtected(messages, config);
   // #4348: compress exchanges older than the newest few lose the hard-coded
   // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
   // are exhaust and the summaries live on in block anchors. Newest exchanges
@@ -549,22 +698,34 @@ function filterProtectedToolMessages(
   // recognized compress dialects too — required, since the MCP lane's
   // hard-protection hook would otherwise pin mcp__bili__compress forever;
   // host patterns for all other tools are unaffected.
-  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const agedCompressCallIds =
+    shared?.agedCompressCallIds ?? collectAgedCompressCallIds(messages, config);
   const isExemptFold = (msg: CoreMessage): boolean =>
     !!msg.toolCallId && agedCompressCallIds.has(msg.toolCallId);
-  for (const id of latest.callIds) protectedCallIds.add(id);
-  for (const msg of messages) {
-    if (
-      isMessageProtected(msg, config, failedCompressCallIds) &&
-      msg.toolCallId &&
-      !isExemptFold(msg)
-    ) {
-      protectedCallIds.add(msg.toolCallId);
+  if (!shared) {
+    for (const id of latest.callIds) protectedCallIds.add(id);
+    for (const msg of messages) {
+      if (
+        isMessageProtected(msg, config, failedCompressCallIds) &&
+        msg.toolCallId &&
+        !isExemptFold(msg)
+      ) {
+        protectedCallIds.add(msg.toolCallId);
+      }
     }
   }
+  // Shared byId resolves duplicate ids to the LAST occurrence — the semantics
+  // of every existing index-based path (resolveBoundaries always used maps).
+  // The replaced .find() hits returned the FIRST, reachable only on invalid
+  // duplicate-id inputs (message ids are ledger-unique in practice).
+  const byId = shared?.byId;
+  const lookupMsg = (id: string): CoreMessage | undefined =>
+    byId === undefined
+      ? messages.find((m) => m.id === id)
+      : messages[byId.get(id) ?? -1];
 
   for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
+    const msg = lookupMsg(id);
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
@@ -579,7 +740,7 @@ function filterProtectedToolMessages(
 
   for (const id of directMessageIds) {
     if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
+    const msg = lookupMsg(id);
     if (!msg) continue;
     if (
       msg.contentType === "tool-result" &&
