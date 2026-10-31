@@ -33,7 +33,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryExtractChildKey } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -912,6 +912,13 @@ async function handleRequest(
                         .filter((t) => t.length > 0)
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
+        // #4952: ZCode project_memory_extract background loop reuses the parent's
+        // conversation id (x-session-id) while appending worker-only tool messages.
+        // Derive its STABLE per-run child key here so every request of one run
+        // lands on the same isolated lane; undefined for every non-worker request
+        // (detection is explicit-attribution-only — see zcodeMemoryExtractChildKey).
+        const zcodeMem = zcodeMemoryExtractChildKey(req.headers);
+        const zcodeMemChild = zcodeMem !== undefined ? `${zcodeMem.parent}|zmem:${zcodeMem.queryId}` : undefined;
         const responsesIdentity = protocol === "responses"
             ? (codexTurn
                 ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
@@ -1045,7 +1052,7 @@ async function handleRequest(
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
-        const conversation = protocol === "google"
+        let conversation = protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
@@ -1186,6 +1193,24 @@ async function handleRequest(
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
+        // #4952: split the ZCode project_memory_extract worker onto its stable
+        // per-run child lane so its temporary tool messages stop sharing the
+        // parent's mutable compression session (orphan-reap on resume). Guarded
+        // so we only clobber when the base resolution actually landed on the
+        // declared parent (a stronger signal winning must not be overridden).
+        // The explicit project_memory_extract attribution is AUTHORITATIVE
+        // evidence of a distinct worker lane — it deliberately outranks the
+        // generic body-shape side-request heuristic (#388): that heuristic reads
+        // tools/budget off the body, so a no-tools low-budget synthesis sub-call
+        // in the same run would otherwise get routed back onto the SHARED parent
+        // state and partially re-introduce #4952. The raw parent key stays owned
+        // by the main session; affinityToken below keeps consuming the RAW
+        // client-provided value, so upstream cache affinity is unchanged.
+        let zcodeMemSplit = false;
+        if (zcodeMem !== undefined && zcodeMemChild !== undefined && conversation === zcodeMem.parent) {
+            conversation = zcodeMemChild;
+            zcodeMemSplit = true;
+        }
         // #1916/#1307: true when the dsh persona fingerprint actually split
         // this request onto a suffixed session key (kernel anchor mismatch).
         // Used by the recordPluginSession branch below so the fork records
@@ -1208,7 +1233,13 @@ async function handleRequest(
                 // suffixed id so the single-valued conversations map keeps the raw
                 // key owned by the main session (#970 discipline).
                 ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                : undefined;
+                : (zcodeMemSplit && zcodeMem !== undefined)
+                  // #4952: the ZCode memory-extract fork records under its suffixed
+                  // child key so the raw parent key stays owned by the main session
+                  // (same #970 single-valued-map discipline); wire-agnostic so the
+                  // canary + recordPluginSession see the split on any wire.
+                  ? zcodeMem.parent
+                  : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
         // #2170 measure 4: stamp sessions deliberately namespaced onto a
         // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
@@ -1545,6 +1576,17 @@ async function handleRequest(
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        if (derivedParent === undefined && zcodeMemSplit && zcodeMem !== undefined) {
+            // #4952: the ZCode memory-extract worker declares its parent through
+            // the shared x-session-id — bind copy-on-fork adoption + the read-only
+            // lineage link to that declared parent so the worker inherits the
+            // parent's refs/blocks at birth (one-time state copy, NO ongoing
+            // mutable sharing) and decompress/search_context fall back along the
+            // parent chain. The plugin-register paths above never fire for this
+            // proxy-mode worker (no x-bili-plugin), so derivedParent is still
+            // undefined here and this is its sole binding source.
+            derivedParent = zcodeMem.parent;
+        }
         // #1426 web UI: persist which client this session came from, first hit wins.
         // Plugin agents are already recorded above as metadata.pluginAgent; non-plugin
         // clients fall back to header sniffing, then to a truncated User-Agent hint.

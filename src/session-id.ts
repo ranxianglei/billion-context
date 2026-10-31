@@ -512,3 +512,48 @@ export function claudeSubagentSplit(id: string, headers: Record<string, string |
     const agent = claudeSubagentAgentId(headers, systemBlocks);
     return agent ? `${id}|sub:${agent}` : id;
 }
+
+/** #4952: ZCode project-memory-extraction background loop.
+ *
+ *  ZCode's `project_memory_extract` copies the parent conversation's history
+ *  and appends temporary tool messages to a local snapshot, then reuses the
+ *  parent's provider/runtime identity — stamping `x-session-id` = the parent's
+ *  conversation id plus an EXPLICIT attribution builder (`x-zcode-query-source:
+ *  project_memory_extract`) and a per-run `x-query-id`. Keying that loop onto
+ *  the parent's verbatim id merges two histories onto ONE mutable compression
+ *  session: the worker overwrites the parent's usage baseline / message
+ *  snapshot / ref allocation / orphan-cleanup counters, and when the parent
+ *  resumes WITHOUT the worker-only messages the worker's blocks are orphaned
+ *  and reaped (#4952). Same failure domain as the Claude Code subagent split
+ *  (#970/#4769) but on the OpenAI-compatible wire with an explicit operation
+ *  marker instead of a system-text heuristic.
+ *
+ *  Detection is evidence-per-client and narrow by design (§2 KDD#9): fire ONLY
+ *  on the explicit `project_memory_extract` source + a non-empty query id + a
+ *  client-provided parent conversation id (the SAME id both branches ride —
+ *  ZCode stamps x-session-id for main and worker). Never classify arbitrary
+ *  `other` requests and never inspect prompt wording. Returns the declared
+ *  parent + query id so the caller can derive a STABLE per-run child key
+ *  `<parent>|zmem:<query-id>` (never per-request) while the raw parent key
+ *  stays owned by the main session. Any missing/malformed signal → undefined
+ *  (no split, status quo preserved).
+ */
+export function zcodeMemoryExtractChildKey(
+    headers: Record<string, string | string[] | undefined>,
+): { parent: string; queryId: string } | undefined {
+    // String-only on purpose (matches conversationHeaderSource above and the
+    // dshPersonaFingerprintApplies "array form is not the lane shape" contract):
+    // real HTTP delivers these single-valued headers as strings; only set-cookie
+    // arrives as an array, so an array here is a malformed signal → no split.
+    const value = (v: string | string[] | undefined): string | undefined =>
+        typeof v === "string" ? v.trim() : undefined;
+    if (value(headers["x-zcode-query-source"]) !== "project_memory_extract") return undefined;
+    const queryId = value(headers["x-query-id"]);
+    if (!queryId) return undefined;
+    // Consistent parent identity: the worker must ride the SAME client-provided
+    // conversation id as its parent (ZCode stamps x-session-id for both). No
+    // client-provided id → no way to bind the child to a known parent → no split.
+    const parent = clientConversationHeader(headers);
+    if (!parent) return undefined;
+    return { parent, queryId };
+}
