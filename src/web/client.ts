@@ -4126,10 +4126,13 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const baseSel = document.createElement("select");
         baseSel.id = "pack-base-sel";
         baseSel.className = "field-input";
-        [["", "cfg.q_pack_base_blank"], ["default", "cfg.q_pack_base_default"], ["chat", "cfg.q_pack_base_chat"], ["lean", "cfg.q_pack_base_lean"]].forEach((pair) => {
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
             const opt = document.createElement("option");
-            opt.value = pair[0];
-            opt.textContent = t(pair[1]);
+            opt.value = value;
+            opt.textContent = label;
             baseSel.appendChild(opt);
         });
         const btnBaseLoad = document.createElement("button");
@@ -4148,14 +4151,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         descIn.placeholder = t("cfg.q_pack_desc_ph");
         descIn.style.cssText = "width:100%;box-sizing:border-box";
         descWrap.append(descLab, descIn);
-        function packSectionField(labelKey, helpKey, rows) {
+        function packSectionField(label, helpText, rows) {
             const wrap = document.createElement("div");
             wrap.style.cssText = "margin:8px 0";
             const lab = document.createElement("div");
-            lab.textContent = t(labelKey);
+            lab.textContent = label;
             lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
             const help = document.createElement("div");
-            help.textContent = t(helpKey);
+            help.textContent = helpText;
             help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
             const ta = document.createElement("textarea");
             ta.className = "field-input mono";
@@ -4165,8 +4168,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             wrap.append(lab, help, ta);
             return { wrap, ta };
         }
-        const phF = packSectionField("cfg.q_pack_phil", "cfg.q_pack_phil_help", 5);
-        const hcF = packSectionField("cfg.q_pack_hc", "cfg.q_pack_hc_help", 8);
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
         const taPh = phF.ta;
         const taHc = hcF.ta;
         const formHint = document.createElement("div");

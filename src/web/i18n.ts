@@ -1353,7 +1353,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "cfg.q_pack_ai_apply_ok": "Parsed and filled into the form; the full JSON is synced to the Advanced (JSON) tab",
         "cfg.q_pack_ai_extra": "The model also returned advanced fields: {names} — kept in the Advanced (JSON) tab and saved with the pack",
         "cfg.q_pack_json_obj": "the pasted content must be a single JSON object",
-        "cfg.q_pack_ai_p1": "You are helping me customize a compression prompt pack for billion-context. My scenario and requirements:",
+        "cfg.q_pack_ai_p1": "You are helping me customize a compression prompt pack for billion-context. My scenario and requirements are as follows: {need}",
         "cfg.q_pack_ai_p2": "Write the JSON in bili-pack.json shape. Top-level object may contain: name (optional; lowercase letters/digits and ._- ; omit if unwanted), description (optional; one plain-sentence purpose), promptSections (object; at least one of): philosophy — the stance summaries take, what to keep first, what must never be lost; howToCompress — concrete summary-writing rules: structure, granularity, timeline requirements.",
         "cfg.q_pack_ai_p3": "Rules: 1. Content must fit my concrete scenario — no generic filler; 2. The readers of both sections are the AI model itself — clear imperative bullet-style sentences; 3. If a section adds no value for my scenario, OMIT that key entirely (omitted = system defaults stay) instead of writing an empty string; 4. Output ONLY one JSON object — no markdown fences, no comments, no prose.",
         "cfg.q_pck": "prompt_cache_key self-stamping (promptCache.routing)",
