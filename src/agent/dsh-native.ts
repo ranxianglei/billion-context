@@ -2804,7 +2804,8 @@ export async function apply(ctx: PluginContext): Promise<void> {
             if (found !== undefined) logHostEvent("info", "[native-client]", `bili-native-dsh: detected dsh build v${found}`);
             if (emitNewerClientBuildNote(DSH_BUILD_CHECK, found)) dshNewerBuildNoted = true;
         } catch {
-            // resolver is fail-open: layout surprises stay silent
+            // fail-open: a THROWING layout degrades to silence; an unresolvable
+            // one already got the explicit-unknown note (#5302)
         }
     }
 
