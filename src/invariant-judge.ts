@@ -25,6 +25,13 @@
 //     answered 400. I3 is exit-internal, fold-split agnostic, and
 //     attribution-scoped (a half-pair the client itself sent broken is the
 //     host's defect, not bili's).
+//   Plugin carrier regime (#4401): in plugin lanes the client's own re-sent
+//     compress pair IS the wire carrier (KDD#7/#1567) — while the pair rides,
+//     the kernel anchor is stripped, so the exit can carry NO acp_summary
+//     marker. A successful compress receipt marks the folded regime; cells
+//     covered by active blocks (host state, `coveredIds`) are expected
+//     absences, not drops; the zero-carrier anomaly (no anchor AND no pair)
+//     stays red.
 //
 // Single-request independence: the inbound core IS the client ground truth, so
 // the judge needs no cross-request state — structurally avoiding the process-
@@ -43,7 +50,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
-import { parseStoredPlaceholder, type CoreMessage } from "acp-kernel";
+import { parseStoredPlaceholder, type CompressionState, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
@@ -58,6 +65,17 @@ const SUMMARY_MARKER = "[Compressed conversation section]";
 // kernel/src/crush.ts CRUSH_KEY — a tool-result decoding to an object with this
 // key was legitimately crushed (lossless, deterministic), not rewritten.
 const CRUSH_KEY = "__acp_crush";
+// #4401: plugin-lane folds (KDD#7/#1567) ride their summary in the client's own
+// re-sent compress pair — while that pair rides, stripKernelSummaries removes
+// the kernel anchor, so a steady-state folded plugin session carries ZERO
+// acp_summary markers on the wire. The tool-RESULT half of a SUCCESSFUL
+// compress call (the receipt built at src/stream.ts:1108) is therefore a summary
+// carrier of exactly the same rank as the anchor: it marks the folded regime.
+// Gated on the success prefix on purpose — refused/failed receipts
+// ("[Compression refused/FAILED…") folded nothing, so they must NOT mark the
+// regime (drops behind them stay visible). Every wire codec backfills toolName
+// onto paired results (kernel/src/wire/*), so this is wire-neutral.
+const COMPRESS_RECEIPT_PREFIX = "[Compressed ";
 
 type ViolationKind =
   | "mid-history-rewrite"
@@ -85,6 +103,8 @@ export interface JudgeVerdict {
   violations: Violation[];
   /** Named-exemption volume consumed this request (#3842 count-bounded list). */
   exempt?: { carrier: number; reasoning: number; crush: number; ccr: number; truncate: number };
+  /** Entry cells excused as fold-covered by host state (#4401). */
+  covered?: number;
   /** Egress lane the verdict came from — main first-send vs loop round-2+. */
   lane?: "main" | "loop";
   /** #4241: true when judged in render-lane tail-fidelity mode (outbound prefix was server-rendered). */
@@ -97,9 +117,10 @@ interface JudgeOptions {
   maxCarrierGap?: number;
   // #3842 named exemptions are COUNT-BOUNDED: carrier/reasoning/crush volume
   // beyond this per request is itself a violation signal (a defect dressing up
-  // as exemptions), even when every stable message matched. Default 128 — a
-  // steady folded session stays far under it (≈ one carrier per live block +
-  // one reasoning item per reasoning turn).
+  // as exemptions), even when every stable message matched. Default 128 — with
+  // host coverage state, legitimate riding-pair volume is bounded out of the
+  // ledger by 2 x |coveredIds| (see the exemption ledger below), so only
+  // unbounded carrier/reasoning/crush volume reaches this cap.
   maxExempt?: number;
   // #4241: when set (a finite number >= 0), THIS turn's outbound prefix was
   // server-rendered (snapshot-render lane) — the raw inbound prefix is NOT a
@@ -108,6 +129,12 @@ interface JudgeOptions {
   // entry[renderTailStart..] against the outbound; the rendered prefix is exempt
   // from the frozen-prefix requirement. Absent ⇒ legacy full inbound-vs-outbound.
   renderTailStart?: number;
+  // #4401: ids of messages covered by ACTIVE fold blocks (host state). In the
+  // plugin carrier regime their absence from the outbound IS the fold — an
+  // entry cell whose id is here is expected-absent, not a drop. Only honored
+  // when the exit actually carries fold evidence (anchor or success receipt);
+  // zero carriers + missing covered cells is the anomaly that must stay red.
+  coveredIds?: ReadonlySet<string>;
 }
 
 function normText(m: CoreMessage): string {
@@ -124,16 +151,30 @@ function isReasoning(m: CoreMessage): boolean {
   return m.contentType === "reasoning";
 }
 
+// #4401: the re-sent compress pair (KDD#7 plugin-lane carrier) is exempt volume
+// like any injected artifact — the call half rides as client history, the
+// successful result half marks the folded regime. Name recognition reuses
+// isCompressToolName (bare + MCP-dialect, lockstep with I3 / hideConsumed):
+// a plugin lane that folds through the MCP shell re-sends its pair under
+// mcp__bili__compress, and the carrier regime must read it like the bare form.
+function isCompressToolMsg(m: CoreMessage): boolean {
+  return (m.contentType === "tool-call" || m.contentType === "tool-result") && isCompressToolName(m.toolName);
+}
+
+function isCompressReceipt(m: CoreMessage): boolean {
+  return isCompressToolMsg(m) && m.contentType === "tool-result" && (m.text ?? "").startsWith(COMPRESS_RECEIPT_PREFIX);
+}
+
 function isCarrier(m: CoreMessage): boolean {
   if (m.summaryOfBlockId !== undefined) return true;
   const t = m.text ?? "";
-  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER);
+  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER) || isCompressToolMsg(m);
 }
 
 function isSummaryCarrier(m: CoreMessage): boolean {
   if (m.summaryOfBlockId !== undefined) return true;
   const t = m.text ?? "";
-  return t.includes(SUMMARY_MARKER) || m.id.startsWith("acp_summary");
+  return t.includes(SUMMARY_MARKER) || m.id.startsWith("acp_summary") || isCompressReceipt(m);
 }
 
 function isCrushedToolResult(m: CoreMessage): boolean {
@@ -287,9 +328,11 @@ export function judgeInboundOutbound(
 ): JudgeVerdict {
   const maxGap = opts.maxCarrierGap ?? 4;
   const maxExempt = opts.maxExempt ?? 128;
+  const coveredIds = opts.coveredIds;
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
+  let covered = 0;
 
   // The fold point is the first summary carrier; everything before it is the
   // frozen prefix (must match), everything from it on is the fold/tail (free).
@@ -381,6 +424,14 @@ export function judgeInboundOutbound(
       }
 
       if (found < 0) {
+        // #4401: an active block covers this cell — its absence IS the fold, not a
+        // drop. Gated on `folded`: no carrier in the exit means the fold left no
+        // evidence at all, and that anomaly must stay red. Consumes nothing on the
+        // exit side (j stays put — the cell has no outbound twin to resume after).
+        if (folded && coveredIds?.has(e.id)) {
+          covered++;
+          continue;
+        }
         violations.push({
           kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
           index: i,
@@ -418,16 +469,27 @@ export function judgeInboundOutbound(
   // envelopes), independent of matching — a defect mass-producing exempt-
   // looking elements surfaces even when every stable message matched.
   const carrierExempt = exit.filter(isCarrier).length;
+  // #4401 review follow-up: riding compress pairs are structurally bounded by
+  // host state — one pair per active block, each active block covers >= 1
+  // message, so 2 x |coveredIds| is a safe ceiling for legitimate pair volume
+  // (a steady session with dozens of active blocks legally carries >128
+  // carrier msgs). Only EXCESS pair volume counts toward the cap; without
+  // host coverage state the full pair volume counts (safe direction: may
+  // over-warn, never under-warns), so a defect mass-producing fake carriers
+  // still trips the guard.
+  const pairVolume = exit.filter(isCompressToolMsg).length;
+  const pairCeiling = coveredIds ? 2 * coveredIds.size : pairVolume;
+  const pairExcess = Math.max(0, pairVolume - pairCeiling);
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
   const ccrExempt = exit.filter(isCcrStoredResult).length;
   const truncateExempt = exit.filter(isTruncationExit).length;
-  const exemptTotal = carrierExempt + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
+  const exemptTotal = (carrierExempt - pairVolume) + pairExcess + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
   if (exemptTotal > maxExempt) {
     violations.push({
       kind: "exemption-overflow",
       index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} pairExcess=${pairExcess} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
     });
   }
 
@@ -441,6 +503,7 @@ export function judgeInboundOutbound(
     ...(folded && foldStart >= 0 ? { foldStart } : {}),
     matched,
     total,
+    ...(covered > 0 ? { covered } : {}),
     violations,
     exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt, ccr: ccrExempt, truncate: truncateExempt },
     ...(renderLane ? { renderLane: true } : {}),
@@ -470,6 +533,24 @@ interface InvariantJudgeInput {
    *  the first client index of the live tail; the judge then validates only that
    *  suffix against the outbound (the rendered prefix is exempt). Absent ⇒ legacy. */
   renderTailStart?: number;
+  /** #4401: active-block coverage from host state (see JudgeOptions.coveredIds). */
+  coveredIds?: ReadonlySet<string>;
+}
+
+// Host-state side of #4401: the ids an ACTIVE fold block covers. These are the
+// exact cells processTurn replaced with carriers THIS request, in the same
+// canonical-id namespace as the inbound cores (the ids reconcileFoldCoverage
+// already matches against the resent history). undefined when nothing is
+// covered — growth-only requests pay no allocation.
+export function activeBlockCoveredIds(state: CompressionState | null | undefined): Set<string> | undefined {
+  if (!state || state.blocks.length === 0) return undefined;
+  let set: Set<string> | undefined;
+  for (const b of state.blocks) {
+    if (!b.active || b.effectiveMessageIds.length === 0) continue;
+    (set ??= new Set());
+    for (const id of b.effectiveMessageIds) set.add(id);
+  }
+  return set;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -513,9 +594,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
       // #4862: label by the invariant that actually fired — an I3 pairing
       // violation on a non-folded request must not read as "I1".
       const inv = head.kind === "unpaired-tool-call" || head.kind === "unpaired-tool-result" ? 3 : v.folded ? 2 : 1;
-      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
+      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
-      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
+      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
   };
 }
@@ -541,7 +622,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, coveredIds: input.coveredIds });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
