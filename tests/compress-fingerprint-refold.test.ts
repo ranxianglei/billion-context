@@ -152,7 +152,10 @@ test("#1294 P1: a failed re-compress emits no fingerprint lines and keeps its re
     const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "one" }] }), ctx).text;
     assert.ok(ok.includes("tokens saved"), ok);
     const again = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "two" }] }), ctx).text;
-    assert.ok(again.startsWith("[Compression FAILED"), again.split("\n")[0]);
+    // #4521: re-compressing the same range is the idempotent no-op — success-
+    // shaped receipt, still no fingerprint lines (nothing was stored).
+    assert.ok(again.startsWith("[Compression no-op"), again.split("\n")[0]);
+    assert.match(again, /do not resend/);
     assert.doesNotMatch(again, /… tail "/);
 });
 
@@ -326,9 +329,9 @@ test("#2544: receipt states summaries are stored in full and steers to search_co
     }
     assert.ok(lastFp > 0, `fingerprint lines present: ${out}`);
     assert.equal(lines[lastFp + 1], STEERING_2544, "steering directly after the last fingerprint, nothing between");
-    // A failed re-compress has no fingerprints and must not carry the note.
+    // A no-op re-compress (#4521) has no fingerprints and must not carry the note.
     const again = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "two" }] }), ctx).text;
-    assert.ok(again.startsWith("[Compression FAILED"), again.split("\n")[0]);
+    assert.ok(again.startsWith("[Compression no-op"), again.split("\n")[0]);
     assert.ok(!again.includes(STEERING_2544), "no steering without fingerprints");
     // The log copy diverges by design (#1718): length-only fingerprints, no note.
     const logLine = ctx.logs.find((l) => l.startsWith("[acp-proxy: [Compressed")) ?? "";
