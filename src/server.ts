@@ -86,6 +86,7 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { epochConfirmPending } from "./fold-reconcile.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -4222,9 +4223,16 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
         }
     } else {
+        // #5223: a kernel-transform failure leaves processedMessages empty while
+        // the outbound IS the raw client body (the prepare catch keeps the
+        // inbound JSON as-is) — judging fit on the empty array read "fits" and
+        // shipped a 5.5M-token raw history upstream (guaranteed 413 + wasted
+        // upload). Mirror outboundPayloadBreakdown's #1498-F2 fallback and the
+        // compressedRanges>0 branch above: judge the view that actually ships.
+        const shipMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
         fits = unknownBaseline
             ? result.fitsWindow
-            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
+            : estimateCoreMessages(shipMsgs) + overheadEstimate + imageTokens < limit;
     }
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
@@ -4292,8 +4300,18 @@ export async function preflightCompressIfNeeded(
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
     if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
-        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
-        return outbound;
+        // #5223: the arbitration bet assumes a payload near the window. A rebuild
+        // whose transform failed leaves processedMessages empty and the raw body
+        // rides — at that size "let the upstream arbitrate" is a guaranteed
+        // multi-MB 400, not an arbitration. Withhold the escape past the doomed
+        // bar (#2490/#2313 byte math) and fail fast below instead.
+        const shipMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const shipDoomBytes = estimateCoreMessagesUpperBytes(shipMsgs);
+        if (shipDoomBytes <= Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
+            return outbound;
+        }
+        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt body's core text alone is ~${shipDoomBytes} bytes — past the doomed bar for window ${limit}; withholding the #1839 arbitration forward and failing fast instead (#5223)`);
     }
     // [#autoFold] fail-fast is an OVERFLOW concept: a growth-armed payload
     // fits the real window by definition, so a fold that could not reach the
@@ -4436,6 +4454,12 @@ export async function preflightCompressIfNeeded(
     // status-based heuristic below; every other path keeps today's mapping.
     const retryable = progressContinues ? true : f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     let ffDetail = f?.detail ?? "the payload still exceeds the window after preflight compression";
+    if (epochConfirmPending(session)) {
+        // #5223: make the drift pause actionable — a generic over-window verdict
+        // left hosts guessing why folding "could not bring it under" when
+        // folding was deliberately paused, not failing.
+        ffDetail += " Folding is currently paused for this session: the resent history shares nothing with bili's fold state (fold-drift epoch confirmation pending, #3641), so no fold could be applied this turn. Realign the conversation (or start a fresh session) and folding resumes automatically.";
+    }
     if (progressContinues) {
         const shortfall = foldedCalibratedSize !== undefined ? Math.max(0, limit - foldedCalibratedSize) : undefined;
         ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
