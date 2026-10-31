@@ -198,6 +198,73 @@ export function lazyMetadata(
     return proxy;
 }
 
+/** #4788 phase 2: proxies for CCR content stores currently folded away. */
+const droppedContentStoreProxies = new WeakSet<object>();
+
+/** True when the record is a lazy content-store proxy currently folded away. */
+export function isDroppedContentStore(value: unknown): boolean {
+    return typeof value === "object" && value !== null && droppedContentStoreProxies.has(value);
+}
+
+/** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): a session's
+ *  MessageContentStore that folded away after its save landed and re-materializes
+ *  on first touch — the exact shape contentStoreOf restores on a cold load.
+ *  Transparent Proxy over the plain-store shape ({version, byHash, byRef}): no
+ *  call-site changes; saveContentStore / ingest ccr_json+ccr_entries / fork /
+ *  publicSnapshotStoredRefs all walk it like any store and pay ONE narrow read
+ *  per burst. An unrecoverable drop throws on access instead of ever letting a
+ *  save write an EMPTY record where a non-empty one was proven durable (#2674
+ *  payload-first discipline, applied to discharge). */
+export function lazyContentStore(
+    sessionId: string,
+    loader: (id: string) => MessageContentStore | null,
+): MessageContentStore {
+    const target: Record<string, unknown> = {};
+    let dropped = true;
+    const ensure = (): void => {
+        if (!dropped) return;
+        const record = loader(sessionId);
+        if (!record || typeof record !== "object" || !("byRef" in record) || Object.keys(record.byRef as Record<string, unknown>).length === 0) {
+            throw new Error(`[persist] resident content store for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        Object.assign(target, record);
+        dropped = false;
+        droppedContentStoreProxies.delete(proxy);
+    };
+    const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+            ensure();
+            return Reflect.get(t, prop, receiver);
+        },
+        has(t, prop) {
+            ensure();
+            return Reflect.has(t, prop);
+        },
+        ownKeys(t) {
+            ensure();
+            return Reflect.ownKeys(t);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            ensure();
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        set(t, prop, value, receiver) {
+            ensure();
+            return Reflect.set(t, prop, value, receiver);
+        },
+        deleteProperty(t, prop) {
+            ensure();
+            return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+            ensure();
+            return Reflect.defineProperty(t, prop, desc);
+        },
+    });
+    droppedContentStoreProxies.add(proxy);
+    return proxy as unknown as MessageContentStore;
+}
+
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
  *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
