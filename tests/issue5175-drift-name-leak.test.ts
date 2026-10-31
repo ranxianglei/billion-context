@@ -706,3 +706,88 @@ for (const [name, text] of LAST_MILE_CASES) {
         );
     });
 }
+
+// ---------- #5175 defect A on the ANTHROPIC wire ----------
+
+// The two lanes above are `openai` and `responses`. `processAnthropic` is a
+// SEPARATE fast path (its own four-probe gate at `src/plugin.ts`), so passing
+// those two says nothing about this one — and production traffic is not
+// openai-only. Measured on pristine master (`e209109bf`): every chunk
+// size forwards the reported paragraph with `refs=3 openers=3`; on this branch
+// the same drive yields `refs=0 openers=0` at every size. Without this test the
+// anthropic gate has no end-to-end tripwire at all.
+function driveAnthropicOnce(pieces: string[]): Promise<string> {
+    const evs: string[] = [];
+    evs.push(sseLocal({ type: "message_start", message: { id: "msg1", role: "assistant", content: [] } }));
+    evs.push(sseLocal({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+    for (const p of pieces) {
+        evs.push(sseLocal({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } }));
+    }
+    evs.push(sseLocal({ type: "content_block_stop", index: 0 }));
+    evs.push(sseLocal({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }));
+    evs.push(sseLocal({ type: "message_stop" }));
+    const writes: string[] = [];
+    const res = makeResLocal(writes);
+    const session = {
+        ...makeSessionLocal(),
+        id: "testsess5175_anthro_" + Math.random().toString(36).slice(2),
+        protocol: "anthropic",
+    } as unknown as Session;
+    return pipePluginChatWithStrip(
+        streamOfLocal(evs),
+        res as unknown as import("node:http").ServerResponse,
+        "anthropic",
+        session,
+        undefined,
+        undefined,
+    ).then(() => {
+        let acc = "";
+        for (const line of writes.join("").split("\n")) {
+            const t = line.trim();
+            if (!t.startsWith("data:")) continue;
+            const body = t.slice(5).trim();
+            if (body.length === 0 || body === "[DONE]") continue;
+            let ev: Record<string, unknown>;
+            try {
+                ev = JSON.parse(body) as Record<string, unknown>;
+            } catch {
+                continue;
+            }
+            const d = ev["delta"] as Record<string, unknown> | undefined;
+            if (d && d["type"] === "text_delta" && typeof d["text"] === "string") acc += d["text"];
+        }
+        return acc;
+    });
+}
+
+for (const [name, text] of [
+    ["the reported paragraph", REPORTED],
+    ["a drifted unit with a non-enum close", DRIFTED],
+] as Array<[string, string]>) {
+    test(`#5175 A: the anthropic wire never carries the drift residue (${name})`, async () => {
+        for (const size of [1000, 40, 7, 1]) {
+            const got = await driveAnthropicOnce(chunked(text, size));
+            assert.equal(
+                (got.match(/m\d{4,}/g) ?? []).length,
+                0,
+                `a kernel ref reached the anthropic client at size=${size}: ${JSON.stringify(got)}`,
+            );
+            assert.ok(
+                !/<(?:acpt|apct|acct|acad|acme|accent|actp)\b/i.test(got),
+                `a drifted render-opener reached the anthropic client at size=${size}: ${JSON.stringify(got)}`,
+            );
+        }
+    });
+}
+
+test("#5175 A: the anthropic wire leaves genuine markup and prose alone", async () => {
+    const html = 'The formula is x<sup>2</sup> and <span class="a">z</span> is the label.';
+    for (const size of [1000, 7, 1]) {
+        const got = await driveAnthropicOnce(chunked(html, size));
+        assert.equal(
+            got,
+            html,
+            `genuine markup must survive the anthropic lane verbatim at size=${size}`,
+        );
+    }
+});
