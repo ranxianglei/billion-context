@@ -1620,3 +1620,256 @@ test("#2592/#2709: Request-object input with the marker diverts without disturbi
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages"]);
     assert.equal(req.bodyUsed, false, "the original Request stays sendable (#2496) — the sniff probed a clone");
 });
+
+// #4566: a host memoizes its proxy hop (Bun init.proxy from PI_PROXY_ANTHROPIC /
+// env HTTP(S)_PROXY) for its whole process life. When the lane port moves under
+// it, that stale hop must not ride bili-originated dispatches (loopback targets
+// need no hop) and must be neutralized on direct fallbacks when it points at a
+// bili-owned lane port. Positive+negative pairs per #3617 gate discipline.
+
+type HopInit = RequestInit & { proxy?: string };
+
+interface HopCall {
+    url: string;
+    init?: HopInit;
+    noProxyDuringSend?: string | undefined;
+}
+
+function makeHopRecordingFetch(sink: HopCall[]) {
+    return (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        sink.push({ url, init, noProxyDuringSend: process.env.NO_PROXY });
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+}
+
+async function withHopPatch<T>(state: NativeInterceptState, fn: (fetch: typeof globalThis.fetch) => Promise<T>): Promise<{ sink: HopCall[]; result: T }> {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: HopCall[] = [];
+    globalThis.fetch = makeHopRecordingFetch(sink);
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const result = await fn(globalThis.fetch);
+        return { sink, result };
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+}
+
+const HOP_ENV_KEYS = ["PI_PROXY", "PI_PROXY_ANTHROPIC", "BILLION_CONTEXT_PROXY", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+
+async function withHopEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map<string, string | undefined>();
+    for (const k of HOP_ENV_KEYS) saved.set(k, process.env[k]);
+    try {
+        for (const [k, v] of Object.entries(vars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        return await fn();
+    } finally {
+        for (const [k, v] of saved) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    }
+}
+
+test("#4566: rewrite drops the host's stale hop — loopback proxy origin needs no hop", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41001", ready: Promise.resolve("http://127.0.0.1:41001") };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41001/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
+});
+
+test("#4566: self branch drops the host's stale hop", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41002", ready: Promise.resolve("http://127.0.0.1:41002") };
+    const stale: HopInit = { proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:41002/bili/http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41002/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the self dispatch");
+});
+
+test("#4566: reroute after respawn drops the stale hop on both sends", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:41003",
+        ready: Promise.resolve("http://127.0.0.1:41003"),
+        attach: true,
+        respawn: () => {
+            state.origin = "http://127.0.0.1:41009";
+            state.ready = Promise.resolve("http://127.0.0.1:41009");
+            return Promise.resolve("http://127.0.0.1:41009");
+        },
+    };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const calls: Array<{ url: string; init?: HopInit }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push({ url, init });
+        if (url.startsWith("http://127.0.0.1:41003/")) throw new TypeError("fetch failed");
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("http://127.0.0.1:41003/bili/http://127.0.0.1:8199/v1/messages", { proxy: "http://127.0.0.1:18788" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.deepEqual(calls.map((c) => c.url), [
+        "http://127.0.0.1:41003/bili/http://127.0.0.1:8199/v1/messages",
+        "http://127.0.0.1:41009/bili/http://127.0.0.1:8199/v1/messages",
+    ]);
+    for (const c of calls) assert.ok(!("proxy" in (c.init ?? {})), `stale hop must not ride ${c.url}`);
+});
+
+test("#4566: fallback drops an init.proxy that points at a bili-owned lane port", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const owned: HopInit = { method: "POST", proxy: "http://127.0.0.1:18791" };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", owned);
+            assert.equal(res.status, 200);
+        });
+        assert.deepEqual(sink.map((c) => c.url), ["https://api.anthropic.com/v1/messages"]);
+        assert.ok(!("proxy" in (sink[0].init ?? {})), "bili-owned stale hop dropped from the direct dispatch");
+    });
+});
+
+test("#4566 negative: fallback keeps the user's own non-bili hop untouched", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const userHop: HopInit = { method: "POST", proxy: "http://user-proxy.example:3128" };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://user-proxy.example:3128" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", userHop);
+            assert.equal(res.status, 200);
+        });
+        assert.equal(sink[0].init?.proxy, "http://user-proxy.example:3128", "a user-chosen hop is never bili's to drop");
+        assert.equal(sink[0].noProxyDuringSend, undefined, "a user-owned env hop must not arm NO_PROXY");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "env restored after the test");
+});
+
+test("#4566: fallback neutralizes a bili-owned env hop with a scoped NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.ok((sink[0].noProxyDuringSend ?? "").includes("api.anthropic.com"), "target host exempted while the send is in flight");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored exactly once the last hold releases");
+});
+
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+    for (let i = 0; i < 500; i++) {
+        if (cond()) return;
+        await new Promise((r) => setTimeout(r, 1));
+    }
+    assert.fail(`timed out waiting for ${what}`);
+}
+
+test("#4566: NO_PROXY holds refcount concurrent fallbacks and restore the base value exactly", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791", NO_PROXY: "base.example" }, async () => {
+        const sink: HopCall[] = [];
+        let releaseAll: () => void = () => {};
+        const gate = new Promise<void>((r) => { releaseAll = r; });
+        globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+            const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+            sink.push({ url, init, noProxyDuringSend: process.env.NO_PROXY });
+            await gate;
+            return new Response("{}", { status: 200 });
+        }) as typeof fetch;
+        try {
+            assert.equal(installNativeFetchIntercept(state), true);
+            const p1 = (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("https://one.invalid/v1/messages", { method: "POST" });
+            await waitFor(() => sink.length === 1, "first fallback to reach the underlying send");
+            const p2 = (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("https://two.invalid/v1/messages", { method: "POST" });
+            await waitFor(() => sink.length === 2, "second fallback to reach the underlying send");
+            assert.ok((sink[1].noProxyDuringSend ?? "").includes("one.invalid") && (sink[1].noProxyDuringSend ?? "").includes("two.invalid"), "both hosts held while both sends are in flight");
+            releaseAll();
+            await Promise.all([p1, p2]);
+            assert.equal(process.env.NO_PROXY, "base.example", "pre-existing NO_PROXY base restored verbatim");
+        } finally {
+            releaseAll();
+            globalThis.fetch = saved;
+            _resetForTest();
+        }
+    });
+});
+
+test("#4566: rewrite retry after a transient blip drops the stale hop too", async () => {
+    let failures = 0;
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:41004",
+        ready: Promise.resolve("http://127.0.0.1:41004"),
+        respawn: () => {
+            state.ready = Promise.resolve("http://127.0.0.1:41004");
+            return Promise.resolve("http://127.0.0.1:41004");
+        },
+    };
+    const sink: HopCall[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        if (failures < 1) {
+            failures += 1;
+            sink.push({ url, init });
+            throw new TypeError("fetch failed");
+        }
+        return makeHopRecordingFetch(sink)(input, init);
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("http://127.0.0.1:8199/v1/messages", { method: "POST", proxy: "http://127.0.0.1:18788" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.equal(sink.length, 2, "failed first send + successful retry");
+    for (const c of sink) assert.ok(!("proxy" in (c.init ?? {})), `stale hop must not ride ${c.url}`);
+});
+
+// #3617 gate-direction completion for #4566: the loopback strip gate also has
+// a keep direction (a hop must RIDE when the final target is NOT loopback —
+// remote bili instances, e.g. container networking), and the dsh-compaction
+// divert site carries the same strip as the other loopback sites.
+
+test("#4566 negative: a non-loopback bili origin keeps the host's own hop", async () => {
+    const state: NativeInterceptState = { origin: "http://bili-host.example:41006", ready: Promise.resolve("http://bili-host.example:41006") };
+    const hop: HopInit = { method: "POST", proxy: "http://corp-proxy.example:3128" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.anthropic.com/v1/messages", hop);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://bili-host.example:41006/bili/https://api.anthropic.com/v1/messages"]);
+    assert.equal(sink[0].init?.proxy, "http://corp-proxy.example:3128", "only loopback targets are hopless — a remote bili origin keeps the host's proxy posture");
+});
+
+test("#4566: dsh-compaction divert drops the stale hop like the other loopback sites", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41007", ready: Promise.resolve("http://127.0.0.1:41007"), takeoverGate: () => false };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788", body: dshCompactionEnvelope() };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41007/bili/https://api.deepseek.com/v1/chat/completions"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale hop must not ride the diverted dispatch");
+});
