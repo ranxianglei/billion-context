@@ -735,8 +735,18 @@ test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift
         const cell = child.pluginSnapshot![0];
         const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] };
         assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "intact snapshot verifies clean before any mutation");
+        // #4266: thinkingTokens is one-sided metering mass (server view only, re-derived per turn)
+        // and is excluded from fork identity — a metering-only divergence must NOT read as drift.
         const savedThinkingTokens = cell.thinkingTokens;
         cell.thinkingTokens = 7;
+        try {
+            assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "metering-mass divergence alone stays clean");
+        } finally {
+            cell.thinkingTokens = savedThinkingTokens;
+        }
+        // A genuine identity-field divergence under the same id still reads hash-drift-under-same-id.
+        const savedText = cell.text;
+        cell.text = "mutated identity field";
         try {
             const verdict = publicForkInputCheck(child, "anthropic", body);
             assert.equal(verdict.ok, false);
@@ -745,7 +755,7 @@ test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift
                 assert.doesNotMatch(verdict.reason, /id-drift|ref-broken/);
             }
         } finally {
-            cell.thinkingTokens = savedThinkingTokens;
+            cell.text = savedText;
         }
         const savedRef = child.state.messageRefs.byRaw[cell.id];
         assert.notEqual(savedRef, undefined);

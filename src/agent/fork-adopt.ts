@@ -74,10 +74,14 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
-/** Byte-identical to src/plugin.ts forkMessageIdentityHash. */
+/** Byte-identical to src/plugin.ts forkMessageIdentityHash: both-sides-only
+ *  field set — thinkingTokens (host-projected metering mass, never present in
+ *  the client's bytes) is excluded; signed thinking content rides
+ *  thinkingSignature / googleThoughtSignature instead. */
 export function forkIdentityHashOf(message: CoreMessage): string {
-    const toolIsError = (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
+    const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
+    const toolIsError = m.toolIsError === true;
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over

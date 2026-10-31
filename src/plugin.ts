@@ -1046,8 +1046,19 @@ function comparableHistory(value: unknown): boolean {
     if (Array.isArray(value)) return value.every(comparableHistory);
     if (!value || typeof value !== "object") return false;
     const part = value as Record<string, unknown>;
-    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
+    // #4266: thinking-family blocks project to a named reasoning message and
+    // every wire hashes their bytes into that message's text — anthropicToCore
+    // reads b.thinking, openaiToCore carries reasoning_content, responsesToCore
+    // takes reasoning-item content (or a canonical opaque seed when only
+    // encrypted content is present) — so they are comparable by view. A
+    // payload-less thinking block carries nothing to compare, so it stays
+    // non-comparable (fail-closed: such a session refuses the fork instead of
+    // hashing a view with an unknowable content surface).
+    if (part.type === "thinking") return typeof part.thinking === "string" || typeof part.signature === "string";
+    if (part.type === "redacted_thinking") return typeof part.data === "string";
+    if (part.type === "reasoning") return true;
     if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return comparableHistory(part.content);
     if (part.output !== undefined) return comparableHistory(part.output);
@@ -1085,8 +1096,18 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
+// Fork identity digests ONLY fields present on BOTH sides of the comparison:
+// the parent snapshot cells AND the child's replayed bytes re-projected at
+// ingress. thinkingTokens is deliberately EXCLUDED — the host projects it onto
+// prepared arrays (projectThinkingMass) and it never exists in the client's
+// bytes, so digesting it flags every stamped cell as spurious drift (the
+// GENERATED_METERING_FIELDS doctrine). Signed thinking content IS identity:
+// its carrier rides thinkingSignature / googleThoughtSignature, so a rotated
+// signature reads as drift (advisory adoption, one unfolded request) instead
+// of silently inheriting stale signature bytes (#1960 territory).
 export function forkMessageIdentityHash(message: CoreMessage): string {
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
+    const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m)]);
 }
 
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
@@ -1096,10 +1117,21 @@ export function forkMessageIdentityHash(message: CoreMessage): string {
  *  must track every byte fork matching can see. If an adapter ever attaches a
  *  new runtime field, it MUST be added here and to forkMessageIdentityHash
  *  together. */
+// thinkingTokens compares PRESENCE only (see forkMessageIdentityHash: the
+// value itself is one-sided metering noise, re-derived every turn — comparing
+// it would stop the CoW walk at every stamped cell and replace the whole
+// snapshot view on each turn). Presence is view-relevant: a freshly stamped
+// cell must displace an unstamped stored copy (or vice versa when attribution
+// ends), otherwise the stored snapshot silently loses — or keeps — the hidden
+// mass marker.
 function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
+    const am = a as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
+    const bm = b as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
     return a.id === b.id && a.role === b.role && a.contentType === b.contentType
         && a.text === b.text && a.toolName === b.toolName && a.toolCallId === b.toolCallId
-        && a.thinkingTokens === b.thinkingTokens && a.summaryOfBlockId === b.summaryOfBlockId
+        && am.thinkingSignature === bm.thinkingSignature && am.googleThoughtSignature === bm.googleThoughtSignature
+        && (typeof a.thinkingTokens === "number") === (typeof b.thinkingTokens === "number")
+        && a.summaryOfBlockId === b.summaryOfBlockId
         && forkToolIsError(a) === forkToolIsError(b);
 }
 
@@ -1261,7 +1293,17 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
         const why = capped ? undefined : reconMissReason(session.id);
         throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
     }
-    if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
+    // #4266 mechanism 1: signed thinking is no longer an opaque refusal. Wire
+    // thinking/redacted_thinking blocks project to a named reasoning message
+    // (anthropicToCore), so they are comparable by view. The host-projected
+    // metering mass (thinkingTokens, cache-ledger GENERATED_METERING_FIELDS)
+    // stays OUT of fork identity: it exists only on prepared arrays, never in
+    // the client's bytes, and is re-derived every turn — digesting it would
+    // flag every stamped cell as spurious drift on the child's first request.
+    // Signed content rides thinkingSignature/googleThoughtSignature inside the
+    // identity hash, so only genuinely uncomparable content (images, audio,
+    // publicSnapshotTextComparable === false) still refuses.
+    if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
