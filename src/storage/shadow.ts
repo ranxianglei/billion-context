@@ -855,6 +855,21 @@ export class UnifiedShadow {
         return this.sync.messageIdRows(sessionId);
     }
 
+    /** #5308 orphan sweep (read-only): all transcript msg_ids (active + retired),
+     *  empty when there is no local unified store. */
+    listSessionTranscriptMsgIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.listSessionTranscriptMsgIds(sessionId);
+    }
+
+    /** #5308 orphan sweep (perform): persist an out-of-process metadata mutation
+     *  on the local unified store. Fails fast on an async backend (the sweep only
+     *  runs against full-mode local storage). */
+    updateSessionMetadataJson(sessionId: string, metadataJson: string): void {
+        if (this.sync === null) throw new Error("[orphan-sweep] unified store unavailable (async backend)");
+        this.sync.updateSessionMetadataJson(sessionId, metadataJson);
+    }
+
     /** #D5-5: content rows outside the covered intervals only. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
         if (this.sync === null) return [];

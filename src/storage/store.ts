@@ -2845,6 +2845,29 @@ export class UnifiedStore {
         return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string, ts: (r.ts as number | null) ?? null }));
     }
 
+    /** #5308 orphan sweep (read-only): every transcript msg_id for a session,
+     *  active AND retired rows. A folded message's row is RETIRED (tombstoned),
+     *  never deleted, so retired rows still prove the substrate belonged to this
+     *  session's durable record. Selects only msg_id — no content hydration. */
+    listSessionTranscriptMsgIds(sessionId: string): string[] {
+        const rows = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ?")
+            .all(sessionId) as Record<string, unknown>[];
+        return rows.map((r) => r.msg_id as string);
+    }
+
+    /** #5308 orphan sweep (perform): durably record an out-of-process metadata
+     *  mutation on one session's authoritative index.db row. Updates metadata_json
+     *  and advances updated_at so this write wins the full-mode load staleness
+     *  guard (buildForLoadAll re-imports a JSON file newer than the row, which
+     *  would otherwise clobber the exclusion). Atomic; no watermark/refcount/
+     *  message/kstate/tail touched. buildSession honors the list on next load. */
+    updateSessionMetadataJson(sessionId: string, metadataJson: string): void {
+        this.db
+            .prepare("UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?")
+            .run(metadataJson, Date.now(), sessionId);
+    }
+
     /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
      *  outside the covered intervals. Inclusive [start, end] pairs; overlaps
      *  are harmless (each pair contributes an outside-of-pair conjunct).

@@ -7,6 +7,7 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "./persist.js";
+import { applyOrphanSweep, type OrphanSweepResult } from "./orphan-sweep.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 
@@ -242,11 +243,29 @@ async function runGc(store: SessionStore, days: number | undefined, vacuum: "ful
     return { code: 0, text: `${text}\n` };
 }
 
+/** #5308 (D2): exit code for the orphan sweep. Non-zero when writes failed or
+ *  when --fix found orphans but could not durably archive them (non-full mode),
+ *  so automation knows the problem persists; a dry-run that merely reports is 0. */
+function orphanSweepExitCode(result: OrphanSweepResult): number {
+    if (result.errors.length > 0) return 1;
+    if (!result.dryRun && result.plan.findings.length > 0 && result.sweptBlocks === 0) return 1;
+    return 0;
+}
+
+async function runOrphanSweep(store: SessionStore, target: string | undefined, json: boolean, fix: boolean): Promise<StorageCommandResult> {
+    const result = await applyOrphanSweep(store, { dryRun: !fix, sessionId: target });
+    if (json) return { code: orphanSweepExitCode(result), text: `${JSON.stringify(result, null, 2)}\n` };
+    const mode = `${result.plan.storageMode}${result.dryRun ? ", dry-run" : result.sweptBlocks > 0 ? ", applied" : ", no-op"}`;
+    const text = [`orphan-block sweep (${mode})`, ...result.lines].join("\n");
+    return { code: orphanSweepExitCode(result), text: `${text}\n` };
+}
+
 export async function runSessionsCommand(opts: {
-    sub: "ls" | "rm" | "archive" | "restore";
+    sub: "ls" | "rm" | "archive" | "restore" | "orphan-sweep";
     target?: string;
     json?: boolean;
     noVacuum?: boolean;
+    orphanSweepFix?: boolean;
     dir?: string;
 }): Promise<StorageCommandResult> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
@@ -260,6 +279,8 @@ export async function runSessionsCommand(opts: {
                 return await runArchive(store, opts.target, !!opts.json);
             case "restore":
                 return await runRestore(store, opts.target, !!opts.json);
+            case "orphan-sweep":
+                return await runOrphanSweep(store, opts.target, !!opts.json, !!opts.orphanSweepFix);
         }
     } finally {
         store.closeQuietly();

@@ -2201,6 +2201,26 @@ export class SessionStore {
         }
     }
 
+    /** #5308 orphan sweep (read-only): every transcript msg_id for a session
+     *  (active + retired rows). Null when the unified store is unavailable or
+     *  degraded mid-call — the sweep degrades to "cannot prove", never guesses. */
+    unifiedSessionTranscriptMsgIds(sessionId: string): string[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.listSessionTranscriptMsgIds(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #5308 orphan sweep (perform): persist an out-of-process metadata mutation
+     *  (the orphan-block exclusion list) on the session's index.db row. Full mode
+     *  only — callers gate on unifiedReads() first so the write is authoritative
+     *  and picked up on reload. Throws on failure (e.g. SQLITE_BUSY). */
+    setUnifiedSessionMetadataJson(sessionId: string, metadataJson: string): void {
+        this.liveShadow().updateSessionMetadataJson(sessionId, metadataJson);
+    }
+
     /** #D5-5 render windowing: content rows outside the covered intervals.
      *  Null when the unified store is unavailable. */
     unifiedUncoveredRows(sessionId: string, intervals: readonly [number, number][]): import("./storage/store.js").MessageRow[] | null {
@@ -3603,6 +3623,20 @@ function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Ma
     return blockContents;
 }
 
+/** #5308 orphan sweep: drop blocks doctor has durably marked foreign. The
+ *  exclusion lives in metadata.orphanExcludedBlocks (blockId -> {at, reason}),
+ *  written out-of-process by `bili sessions orphan-sweep --fix` and honored here
+ *  so a provably-orphan block can never render into THIS session again. Absent /
+ *  malformed list = no-op fast path. Data stays in kstate -> fully reversible by
+ *  removing the entry. */
+function filterExcludedOrphanBlocks(state: CompressionState, excluded: unknown): CompressionState {
+    if (!excluded || typeof excluded !== "object" || Array.isArray(excluded)) return state;
+    const ids = Object.keys(excluded as Record<string, unknown>);
+    if (ids.length === 0) return state;
+    const exSet = new Set(ids);
+    return { ...state, blocks: state.blocks.filter((b) => !exSet.has(b.blockId)) };
+}
+
 /** #4942: the record→legacy-view adapter the sidecar ingest path runs on
  *  every committed record — exported so the hermetic seam suite can build a
  *  sidecar against a stub backend with the SAME adapter the store uses. */
@@ -3690,7 +3724,7 @@ function buildSession(parsed: PersistedSession): Session {
             wholeBlockRestoresPreciseAvailable: stats.wholeBlockRestoresPreciseAvailable ?? 0,
         },
         metadata: parsed.metadata ?? {},
-        state: mergeState(parsed.state),
+        state: filterExcludedOrphanBlocks(mergeState(parsed.state), (parsed.metadata as { orphanExcludedBlocks?: unknown } | undefined)?.orphanExcludedBlocks),
         createdAt: parsed.createdAt ?? Date.now(),
         // #404: lastSeen reflects the on-disk savedAt (the last real
         // activity), NOT the restore moment — a restart must not fabricate
