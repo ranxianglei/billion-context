@@ -1027,7 +1027,8 @@ async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: `no surfaced split-brain entry for session: ${sessionId}` }, null, 2));
         return;
     }
-    log("info", `[storage] split-brain notice for session ${sessionId.slice(0, 8)} acknowledged via web UI`);
+    // #4626: full id — .slice(0, 8) of "session-…" renders literally "session-"
+    log("info", `[storage] split-brain notice for session ${sessionId} acknowledged via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }

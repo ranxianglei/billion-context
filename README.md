@@ -644,6 +644,22 @@ Consequences for anyone tempted to put several instances behind one Service:
   conversation load-balanced across proxies*. Long conversations are
   single-instance by design.
 
+**Single machine, multiple installs (#5046).** The topology above covers
+deployment replicas; one desktop has a sibling hazard: two installs on ONE
+machine (e.g. two DSH profiles — desktop + bot, or a global npm copy beside a
+host-tree copy) each start their own proxy and, unless isolated, both resolve
+the SAME default XDG sessions directory and the same config file. With
+`storage.unified` on (shadow/full), two processes then double-write one
+`index.db`: the log shows `[instances] another bili instance is running …`
+and, for overlapping lanes, `[storage] … two processes on one index.db
+corrupt it`; SQLite write-lock contention (`SQLITE_BUSY` / `database is
+locked`) can fail whole model turns, and sustained double-writing risks
+corruption. The fix is isolation: give each install its own
+`BILI_SESSIONS_DIR` (plus `BILI_CONFIG_FILE` when the config should differ
+too) through that install's launcher/profile environment — no global env
+changes needed. Once isolated, the installs coexist safely and the
+`[instances]` notice drops to info level (different dirs ⇒ no shared state).
+
 Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
 (from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
 
