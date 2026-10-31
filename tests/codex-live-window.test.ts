@@ -6,7 +6,7 @@ import test from "node:test";
 import http from "node:http";
 import { once } from "node:events";
 import { createCore, defaultConfig, defaultPrompts } from "acp-kernel";
-import { codexAlignedWindow, readCodexModelWindow } from "../src/codex-models.ts";
+import { codexAlignedWindow, codexAlignedWindowDetailed, readCodexModelWindow } from "../src/codex-models.ts";
 import { reserveOutputHeadroom } from "../src/util.ts";
 import { preflightCompress } from "../src/preflight.ts";
 import { getSession } from "../src/session.ts";
@@ -155,4 +155,56 @@ test("real preflight: live window admits fixed overhead that the stale fallback 
         upstream.close(); upstream.closeAllConnections();
         await closed;
     }
+});
+
+test("#5246: model_catalog_json path is consulted when models_cache.json is absent", (t) => {
+    const home = fixture(t);
+    const catalog = path.join(home, "model-catalog.json");
+    fs.writeFileSync(catalog, JSON.stringify({ models: [{ slug: model, context_window: 272_000, max_context_window: 872_000 }] }));
+    fs.writeFileSync(path.join(home, "config.toml"), `model_catalog_json = "${catalog}"\nmodel_context_window = 1050000\n`);
+    assert.equal(fs.existsSync(path.join(home, "models_cache.json")), false);
+    assert.equal(readCodexModelWindow(model, home), 828_400);
+});
+
+test("#5246: model_catalog_json outranks models_cache.json when both exist", (t) => {
+    const home = fixture(t);
+    const catalog = path.join(home, "custom.json");
+    fs.writeFileSync(catalog, JSON.stringify({ models: [{ slug: model, context_window: 300_000 }] }));
+    fs.writeFileSync(path.join(home, "models_cache.json"), JSON.stringify({ models: [{ slug: model, context_window: 999_000 }] }));
+    fs.writeFileSync(path.join(home, "config.toml"), `model_catalog_json = "${catalog}"\n`);
+    assert.equal(readCodexModelWindow(model, home), 285_000);
+});
+
+test("#5246: config-only fallback caps at the codex-known ceiling, never the raw override", (t) => {
+    const home = fixture(t);
+    fs.writeFileSync(path.join(home, "config.toml"), "model_context_window = 1050000\n");
+    assert.equal(readCodexModelWindow(model, home), 258_400);
+    assert.equal(readCodexModelWindow("gpt-5.4", home), 950_000);
+    assert.equal(readCodexModelWindow("gpt-5.5", home), 258_400);
+    fs.rmSync(path.join(home, "config.toml"));
+    assert.equal(readCodexModelWindow(model, home), undefined);
+});
+
+test("#5246: codexAlignedWindowDetailed names the winning source per rung", (t) => {
+    const home = fixture(t);
+    const previous = process.env.CODEX_HOME;
+    t.after(() => { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; });
+    process.env.CODEX_HOME = home;
+    const nonCodex = { "user-agent": "node-fetch" };
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, model, codex, 900_000), { limit: 900_000, clamped: true, source: "client-report" });
+    const catalog = path.join(home, "cat.json");
+    fs.writeFileSync(catalog, JSON.stringify({ models: [{ slug: model, context_window: 300_000 }] }));
+    fs.writeFileSync(path.join(home, "config.toml"), `model_catalog_json = "${catalog}"\n`);
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, model, codex), { limit: 285_000, clamped: true, source: "catalog-json" });
+    fs.rmSync(path.join(home, "config.toml"));
+    fs.rmSync(catalog);
+    fs.writeFileSync(path.join(home, "models_cache.json"), JSON.stringify({ models: [{ slug: model, context_window: 300_000 }] }));
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, model, codex), { limit: 285_000, clamped: true, source: "models-cache" });
+    fs.rmSync(path.join(home, "models_cache.json"));
+    fs.writeFileSync(path.join(home, "config.toml"), "model_context_window = 1050000\n");
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, model, codex), { limit: 258_400, clamped: true, source: "config-context-window" });
+    fs.rmSync(path.join(home, "config.toml"));
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, "gpt-5.5", codex), { limit: 272_000, clamped: true, source: "bundled-snapshot" });
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, "glm-5", codex), { limit: 272_000, clamped: true, source: "flat-fallback" });
+    assert.deepEqual(codexAlignedWindowDetailed(1_050_000, "gpt-5.5", nonCodex), { limit: 1_050_000, clamped: false, source: null });
 });

@@ -12,7 +12,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContext
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
-import { codexAlignedWindow } from "../codex-models.js";
+import { codexAlignedWindowDetailed, type CodexWindowSource } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
@@ -98,6 +98,11 @@ function persistLineageLinkNow(session: Session): void {
  *  be noise on a stream that re-sends the same id every turn. */
 const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
+
+// #5246: a custom-catalog Codex install with no readable live model table gets
+// its window from config.toml model_context_window — flag it once per model so
+// triage knows the value is a declared guess, not a verified catalog entry.
+const codexConfigFallbackWarned = new Set<string>();
 
 export async function handle(
     req: http.IncomingMessage,
@@ -818,15 +823,19 @@ async function handleRequest(
             // never clamped); the clamped value is authoritative for this
             // client (codex's own config), so it also clears the
             // low-confidence fallback flag.
-            const aligned = operatorWindowTuned
-                ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
+            const aligned: { limit: number; clamped: boolean; source: CodexWindowSource | null } = operatorWindowTuned
+                ? { limit: reqConfig.modelContextLimit, clamped: false, source: null }
+                : codexAlignedWindowDetailed(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
+            if (aligned.source === "config-context-window" && !codexConfigFallbackWarned.has(model)) {
+                codexConfigFallbackWarned.add(model);
+                log("warn", `[codex] model=${model} live model table unavailable (no readable models_cache.json/model_catalog_json) — effective window sized from config.toml model_context_window, not a verified model catalog`);
+            }
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
-                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (client-window alignment for model=${model}; current client metadata preferred over bundled fallback) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (model=${model}; window source=${aligned.source}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
