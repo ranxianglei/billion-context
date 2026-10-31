@@ -731,6 +731,10 @@ async function bootstrap(): Promise<string | undefined> {
             { scriptPath: nativeProxyScriptPath() },
         );
         if (gen !== originGen) return handle.origin;
+        // Success outranks an older recorded failure — a respawn after the
+        // user fixed the environment must not keep advertising it once a
+        // later unbind drops the origin plane again.
+        bootstrapFailure = undefined;
         state.origin = handle.origin;
         register.base = handle.origin;
         // #983: do NOT write BILLION_CONTEXT_PROXY — dsh has no reader for it
