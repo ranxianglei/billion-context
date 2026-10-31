@@ -405,6 +405,22 @@ unneeded tools, prune skills; 2) lower `compress.nudgeGrowthTokens` to ~50k;
 3) enable lean mode. Worked example in
 [CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
 
+**My omp conversation isn't compressing and I use the idle recap — why?** In
+native plugin mode (`bili plugin install omp`), omp's idle **recap**
+(`recap.enabled`, on by default; fires after `recap.idleSeconds`, default 240 s)
+and other ephemeral side turns (`/btw`, IRC auto-replies) reach the proxy bound
+to your **main session**: on the OpenAI wire they carry the parent session's
+`prompt_cache_key` while the host's `:side:` sub-id never serializes. Because such
+a turn ships the full tool table, bili treats it as a main turn — so if a
+compression nudge happens to be due at that moment, it lands in this throwaway
+request whose reply never enters history and whose tool calls are never executed:
+the nudge slot is consumed with no possible result, and repeated idle turns can
+trip the nudge self-heal suppression and delay soft compression until the
+preflight hard backstop fires (#4897/#4903). This is a known limitation, not data
+loss. Workaround today: set `"recap": { "enabled": false }` in omp's config (or
+lower `recap.idleSeconds`) to remove the trigger source; the root fix — host-side
+marking so these route to their own sub-session — is tracked in #4903.
+
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher
