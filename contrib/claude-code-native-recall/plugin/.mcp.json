@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "recall": {
+      "command": "${RECALL_PYTHON:-python3}",
+      "args": [
+        "-X",
+        "utf8",
+        "${CLAUDE_PLUGIN_ROOT}/recall/mcp_server.py"
+      ]
+    }
+  }
+}
