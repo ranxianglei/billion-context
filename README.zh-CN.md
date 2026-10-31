@@ -63,6 +63,10 @@ QQ群:
 
 生产规模纵向研究:四个半月、三宿主、174,327 次模型调用、187.6 亿累计输入 token(三宿主合计约 247 亿),204,800-token 窗口零违规,马拉松会话 8,584–12,049 次调用。
 
+### 📊 第三方独立评测基准
+
+- **[1,500 题三大基准横评报告（`LongMemEval-S` · `ContextBench` · `MemoryAgentBench`）](./benchmarks/third-party-1500/README.zh-CN.md)**（[English](./benchmarks/third-party-1500/README.md)）—— 基于 `DeepSeek V4.1 Flash`、`Qwen3-Embedding-8B`、`Qwen3-Reranker-4B` 与 `Pi Agent`，对 `billion-context` (`v0.1.202`)、`full` 全量上下文及 3 条 RAG 管线（`bm25`、`embedding`、`embedding-rerank`）进行全成本归因盲测：**ContextBench 端到端有效 F1 夺得全场第一**（`0.3097`，比 `full` 省钱 `58.3%`）、**LongMemEval-S 领先最强 RAG 达 +16.6%**（`79.20%` vs `62.60%`，比独立会话 `full` 省钱 `71.1%`）、**MemoryAgentBench 1.48M 超长会话实现 100% 存活与 30× 稳态压缩**（`full` 199 题全部爆窗崩溃）。
+
 ---
 
 `billion-context` 架在**任意**编程助手与其模型 API 之间,用 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 压缩重写 Anthropic/OpenAI 流。何时压缩、压缩什么 —— <strong>由模型决定</strong>,而非硬截断。
