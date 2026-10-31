@@ -884,3 +884,57 @@ test("#5175 A: the google wire leaves genuine markup and prose alone", async () 
         assert.equal(got, prose, `prose must survive the google lane verbatim at size=${size}`);
     }
 });
+
+// ---------- #5175 residual: the cross-cut invariant, stated per lane ----------
+
+// Every sweep in this file so far drives a payload WHOLE or in fixed-size
+// chunks. The production failure in #5175 is a payload arriving as two SSE
+// deltas split at an ARBITRARY byte boundary, which is what makes the drift
+// pair's two halves land in different `push` calls. This pins the invariant
+// that actually matters for that split, on all three chat lanes at once:
+//
+//   a cut may leave ref-less residue, but it may NEVER deliver a kernel ref
+//   or a drifted opener.
+//
+// Measured on pristine master (`e209109bf`): 287 of 287 cuts leak on every
+// lane. On this branch: 0 refs and 0 openers on every lane, while the four
+// structural shapes are clean end to end (237 of 237 cuts).
+const CUT_PAYLOADS: Array<[string, string]> = [
+    ["enum-close", "Here is the report.\n\n<acct m00257></acct>\n\nThat is all."],
+    ["drift-close", "Here is the report.\n\n<acct m00257></accpt>\n\nThat is all."],
+    ["attr-mismatch", 'Here is the report.\n\n<acpt tokens="80">m08844</action>\n\nThat is all.'],
+    ["bare-mismatch", "Here is the status report.\n\n<acct m17138></apct>\n\nThat is all."],
+    ["reported", "acct> </apct> <acct m17138></apct>  </apct> </apct>"],
+];
+
+const KERNEL_REF_TEST = /m\d{5,}/;
+const DRIFT_OPENER_TEST = /<(?:acpt|apct|acct|acad|acme|accent|actp)\b/i;
+
+for (const [laneName, drive] of [
+    ["openai", driveChat],
+    ["anthropic", (chunks: string[]) => driveAnthropicOnce(chunks)],
+    ["google", (chunks: string[]) => driveGoogleOnce(chunks)],
+] as Array<[string, (chunks: string[]) => Promise<string>]>) {
+    test(`#5175 residual: a byte cut never hands the ${laneName} client a ref or a drifted opener`, async () => {
+        let cuts = 0;
+        const offenders: string[] = [];
+        for (const [name, text] of CUT_PAYLOADS) {
+            const bytes = Buffer.from(text, "utf8");
+            for (let cut = 1; cut < bytes.length; cut += 1) {
+                const a = bytes.subarray(0, cut).toString("utf8");
+                const b = bytes.subarray(cut).toString("utf8");
+                const got = await drive([a, b]);
+                cuts += 1;
+                if (KERNEL_REF_TEST.test(got) || DRIFT_OPENER_TEST.test(got)) {
+                    offenders.push(`${name}@${cut}: ${JSON.stringify(got.slice(0, 90))}`);
+                }
+            }
+        }
+        assert.ok(cuts > 200, `the sweep must cover every boundary, got ${cuts}`);
+        assert.equal(
+            offenders.length,
+            0,
+            `${offenders.length}/${cuts} cuts leaked on the ${laneName} lane:\n${offenders.slice(0, 4).join("\n")}`,
+        );
+    });
+}
