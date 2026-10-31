@@ -3998,9 +3998,10 @@ export async function preflightCompressIfNeeded(
     // only the original tokenCount reads as "nothing happened" even when 16
     // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
     // stay undefined when no fold ran, so the original phrasing holds there.
+    let remainingImageTokens = imageTokens;
     const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
-        const imageNote = imageTokens >= limit
-            ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
+        const imageNote = remainingImageTokens >= limit
+            ? ` Images alone account for ~${remainingImageTokens} estimated tokens (≥ window ${limit}); reduce the remaining image payload or raise the window.`
             : "";
         const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
             ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
@@ -4110,6 +4111,7 @@ export async function preflightCompressIfNeeded(
     // #3226: re-sign the summarization egress over its own body (same arm as the
     // main forward); undefined for unsigned traffic.
     const preflightResignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
+    const responsesProjection = prepared.responsesProjection;
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -4137,6 +4139,9 @@ export async function preflightCompressIfNeeded(
                 signal: clientAbort.signal,
                 log,
                 imageReserve: imageTokens,
+                measureImageReserve: prepared.protocol === "responses" && responsesProjection
+                    ? (view) => imageReserveFor(session, "responses", { input: patchResponsesInput(responsesProjection, view) }, opts, upstreamUrl)
+                    : undefined,
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
                 upstreamOrigin: currentOrigin,
@@ -4165,6 +4170,7 @@ export async function preflightCompressIfNeeded(
     // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
+    let reducedImageWire = false;
     let fits: boolean;
     let foldedCalibratedSize: number | undefined;
     if (result.compressedRanges > 0) {
@@ -4187,6 +4193,9 @@ export async function preflightCompressIfNeeded(
         // raw body rides; mirror outboundPayloadBreakdown's fallback).
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
+        const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
+        remainingImageTokens = rebuiltImageTokens;
+        reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
@@ -4196,7 +4205,7 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens;
         // #3645: hoist the calibrated post-fold figure so the fail-fast message
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
@@ -4210,16 +4219,16 @@ export async function preflightCompressIfNeeded(
         // already-at-window context. Raw caliber (images included, no k̂
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
-        setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
+        setPostRebuildAnchor(session, rebuiltTextSize + rebuiltImageTokens);
         // [#3444] exhausted honest pass: the chain folded everything it could
         // (no failure) yet the rebuilt payload still sits at/above the growth
         // target — the target is physically unreachable for this session.
         // Record the measured floor so the next trigger arms on real growth
         // past it instead of re-firing every request; latest measurement wins.
-        if (growthArmed && result.failure === undefined && rebuiltTextSize + imageTokens >= compressionTarget) {
-            session.metadata.autoFoldFloorTokens = rebuiltTextSize + imageTokens;
+        if (growthArmed && result.failure === undefined && rebuiltTextSize + rebuiltImageTokens >= compressionTarget) {
+            session.metadata.autoFoldFloorTokens = rebuiltTextSize + rebuiltImageTokens;
             markDirty(session);
-            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
+            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + rebuiltImageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + rebuiltImageTokens} for headroom`);
         }
     } else {
         fits = unknownBaseline
@@ -4324,13 +4333,16 @@ export async function preflightCompressIfNeeded(
     // upstream overflow evidence. Forward for the upstream to arbitrate billing
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
-    if (imageArbitration && !localRefusalHere) {
+    const imageArbitrationAfterFold = reducedImageWire && resolveImageBilling(opts.imageBilling, upstreamUrl) === "pixels"
+        && session.stats.lastInputTokensSource !== "overflow-arm";
+    if ((imageArbitration || imageArbitrationAfterFold) && !localRefusalHere) {
         // Same fallback as the fit-gate measurement above: processedMessages
         // empty ⇒ kernel transform failure ⇒ the raw body rides.
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const outText = estimateCoreMessages(outMsgs);
-        if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
-            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
+        const remainingImages = imageReserveFor(session, outbound.protocol, outbound.body, opts, upstreamUrl);
+        if (outText + overheadEstimate < limit && outText + overheadEstimate + remainingImages >= limit) {
+            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s); remaining images (~${remainingImages} estimated tokens) still exceed window ${limit}; forwarding the reduced wire for upstream billing arbitration (#496/#1800)`);
             return outbound;
         }
     }
