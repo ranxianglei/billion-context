@@ -94,7 +94,9 @@ test("#5328: user-dir pack management endpoints", async (t) => {
         await waitReady(port);
         // /__bili/packs reports the user dir the panel may manage.
         const inv = JSON.parse((await request("GET", port, "/__bili/packs")).body) as { userDir?: string };
-        assert.equal(inv.userDir, packDir, "userDir matches XDG config packs dir");
+        // #5332: the endpoint reports forward-slashed paths so the panel's
+        // prefix match works on Windows; compare against the normalized form.
+        assert.equal(inv.userDir, packDir.split(path.sep).join("/"), "userDir matches XDG config packs dir (posix-normalized)");
 
         // Create.
         const payload = { promptSections: { philosophy: "user philosophy" }, customExtra: "kept" };

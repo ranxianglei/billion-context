@@ -339,12 +339,15 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // the project > user > shipped > builtin chain, first-wins per name.
     // Read-only; every /__bili/ URL already passed the loopback/origin gates.
     if (req.method === "GET" && req.url === "/__bili/packs") {
+        // #5328/#5332: the panel needs the user-pack dir to decide which listed
+        // entries it may edit/delete; the server is the authority on it. Paths
+        // come back forward-slashed so the panel's `source.startsWith(userDir)`
+        // match holds on Windows too (path.join is backslashed there).
+        const posixPath = (p: string): string => p.split(path.sep).join("/");
         const packs = listResolvedPacks()
-            .map((p) => ({ name: p.name, version: p.version ?? null, description: p.description ?? null, source: p.source }));
-        // #5328: the panel needs the user-pack dir to decide which listed
-        // entries it may edit/delete; the server is the authority on it.
+            .map((p) => ({ name: p.name, version: p.version ?? null, description: p.description ?? null, source: posixPath(p.source) }));
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ packs, userDir: path.join(configDir(), "packs") }));
+        res.end(JSON.stringify({ packs, userDir: posixPath(path.join(configDir(), "packs")) }));
         return;
     }
     // #5328: user-dir pack management — GET/PUT/DELETE <configDir>/packs/
