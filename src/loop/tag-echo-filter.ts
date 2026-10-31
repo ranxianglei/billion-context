@@ -227,6 +227,25 @@ const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
 // [\w>] lookbehind mirrors ORPHAN_REF_CLOSE: word-adjacent runs (xm01233) and
 // runs right after a tag terminator (\x3e, #644) are not this unit.
 const DEAD_REF_CLOSE = new RegExp("(?<![\\w>])m\\d{4,}\\s*\\x3c\\/[a-zA-Z]{0,32}(?![a-zA-Z])(?![^\\x3c\\x3e]{0,32}\\x3e)", "g");
+// #5195: opener-less render-tag residue — the model echoes a render tag but
+// drops the <name head, leaving `[attrs] > <ref-run>` (optionally + a close,
+// which LONE_CLOSE peels separately). Every observed leak carries
+// type="text">mNNNNN; the anchor attr (type="text" / tokens=N) plus a ref
+// glued to the terminator is never prose (the ref-adjacency gate). Attr runs
+// are bounded to 3 pre/post tokens — a real render tag carries ~2 — which keeps
+// backtracking flat and rejects prose that merely mentions an attr. Whole-text:
+// applied AFTER lone-open/mangled-open so an INTACT <name …> opener is already
+// gone and this fires only on genuinely opener-less residue (protects #644,
+// whose opener LONE_OPEN removes first, leaving no attrs>ref span behind).
+const ATTR_TOKEN = "[A-Za-z_][A-Za-z0-9._-]*=\"[^\"]*\"";
+const OPENERLESS_ANCHOR = "(?:type=\"text\"|tokens=\"\\d+\")";
+const OPENERLESS_ATTRS = "(?:" + ATTR_TOKEN + "[ \\t]*){0,3}";
+// Whitespace-preserving by design (#644 doctrine): the drop never consumes the
+// space around it, so a chunk boundary landing on that space cannot flip the
+// verdict — whole-text and streaming agree on the residual whitespace.
+const OPENERLESS_REF_SRC =
+    "(?<![\\w])" + OPENERLESS_ATTRS + OPENERLESS_ANCHOR + "(?:[ \\t]*" + ATTR_TOKEN + "){0,3}" + "[ \\t]*>[ \\t]*" + REFS_RUN;
+const OPENERLESS_REF = new RegExp(OPENERLESS_REF_SRC, "g");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -491,6 +510,13 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+    // #5195: opener-less render-tag residue ([attrs incl type="text"/tokens=N]
+    // > ref-run). Runs AFTER lone-open/mangled-open above so an INTACT <name …>
+    // opener is already gone — this fires only on genuinely opener-less residue
+    // and cannot disturb #644 (whose opener LONE_OPEN removes first, leaving no
+    // attrs>ref span). A trailing close, when present, was already peeled by
+    // LONE_CLOSE above, so this drops just the attrs>ref half.
+    out = out.replace(OPENERLESS_REF, "");
     // #2862: dead ref-close units (ref + unterminated close head, mid-text or
     // at EOF). Position matters twice: BEFORE the truncate passes — TRUNC_CLOSE
     // eats the \x3c/name tail first and would leave the bare ref behind (the
@@ -586,7 +612,7 @@ export function containsRenderTagText(s: string): boolean {
 // before </word>; the kernel wraps refs in tags, so a naked ref IS the leak).
 // Used where bytes bypassed or escaped the filter and must be logged, not
 // dropped: fast-path gate sites and filter release points.
-const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]/;
+const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]|(?:type="text"|tokens="\d+")\s*>\s*m\d{4,}/;
 export function containsEchoResidue(s: string): boolean {
     return ECHO_RESIDUE.test(s);
 }
