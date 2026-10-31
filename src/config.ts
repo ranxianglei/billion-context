@@ -408,6 +408,19 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** #4313 (PR #5236): stamp each message with its immutable local
+     *  time-of-occurrence and render it in the <acp> tag (`time="..."`) —
+     *  DEFAULT OFF: off reproduces the pre-#4313 wire bytes exactly (no time
+     *  attribute, original prompt texts, no fingerprint span). On = tags carry
+     *  the stored stamp + timestamped prompt variants (kernel decides). The
+     *  env override BILI_MESSAGE_TIMESTAMPS wins over this file value (any
+     *  defined non-"0" value enables it). Resolved ONCE per proxy instance at
+     *  engine creation (#394 single-instance assumption — no per-session fork),
+     *  so enabling mid-run requires a restart; storage stamps are written
+     *  regardless of the flag, so enabling later renders full history times.
+     *  Global level only (provider/model overrides are ignored for display,
+     *  mirroring how the gate flows into one shared CompressionCore). */
+    messageTimestamps?: boolean;
      /** Force preflight summarization calls to use streaming (SSE) instead of
       *  the default non-stream call (#2133). The error-driven self-learn flag
       *  (`session.metadata.preflightStreamSummary`) fires on any 400 from a
@@ -2295,7 +2308,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
@@ -2641,6 +2654,21 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return undefined;
+}
+
+/** #4313 (PR #5236): global message-timestamp display gate.
+ *  BILI_MESSAGE_TIMESTAMPS follows BILI_RESIGN semantics — defined and not
+ *  "0" enables; any other value disables even against an explicit file true;
+ *  unset ⇒ file `compress.messageTimestamps === true`; default FALSE
+ *  (pre-#4313 wire bytes). GLOBAL level only: provider/model settings are
+ *  ignored because the gate flows into one shared CompressionCore + prompt
+ *  exits resolved at engine creation (#394 single-instance assumption).
+ *  Storage-layer stamping (v10 ts column, ledger rows) runs regardless of
+ *  this flag, so enabling later renders full history times. */
+export function resolveMessageTimestamps(fileCompress?: CompressSettings, env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_MESSAGE_TIMESTAMPS;
+    if (raw !== undefined) return raw !== "0";
+    return fileCompress?.messageTimestamps === true;
 }
 
 /** #1660: explicit override of the zcode lane's port (env only — the store
@@ -3057,6 +3085,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("messageTimestamps" in obj) {
+        if (typeof obj.messageTimestamps !== "boolean") ok = false;
+        else out.messageTimestamps = obj.messageTimestamps;
     }
     if ("streamSummary" in obj) {
         if (typeof obj.streamSummary !== "boolean") ok = false;

@@ -227,7 +227,7 @@ function laneSessionId(conversationId: string): string {
  *  rows exist but do not parse (→ 409 client resync, never a silently-
  *  truncated history). */
 function readCanonicalFromStore(sessionId: string): { kind: "ok"; msgs: BiliMessage[] } | { kind: "unavailable" } | { kind: "bad"; err: string } {
-    let rows: { seq: number; content: string }[] | null;
+    let rows: { seq: number; content: string; ts: number | null }[] | null;
     try {
         rows = getStore().unifiedRawMessages(sessionId);
     } catch {
@@ -248,7 +248,7 @@ function readCanonicalFromStore(sessionId: string): { kind: "ok"; msgs: BiliMess
     if (ptrs !== null) {
         if (ptrs.length === 0) return { kind: "ok", msgs: [] };
         const bySeq = new Map(rows.map((r) => [r.seq, r]));
-        const picked: { seq: number; content: string }[] = [];
+        const picked: { seq: number; content: string; ts: number | null }[] = [];
         for (const seq of ptrs) {
             const row = bySeq.get(seq);
             if (row === undefined) return { kind: "bad", err: "canonical pointers reference missing rows" };
@@ -265,7 +265,7 @@ function readCanonicalFromStore(sessionId: string): { kind: "ok"; msgs: BiliMess
     return msgs === null ? { kind: "bad", err: "malformed canonical rows" } : { kind: "ok", msgs };
 }
 
-function parseCanonicalRows(rows: { seq: number; content: string }[]): BiliMessage[] | null {
+function parseCanonicalRows(rows: { seq: number; content: string; ts?: number | null }[]): BiliMessage[] | null {
     const msgs: BiliMessage[] = [];
     for (const row of rows) {
         let parsed: unknown;
@@ -282,7 +282,10 @@ function parseCanonicalRows(rows: { seq: number; content: string }[]): BiliMessa
         // plugin render endpoint). Store-served canonical messages carry
         // their position on the server-owned log, so fold coverage can key
         // on seq intervals instead of content-hash ids (id churn immune).
-        msgs.push({ ...(parsed as BiliMessage), ledgerSeq: row.seq + 1 });
+        // #4313: ts rides the column, never the stored bytes — hydrate it back
+        // onto the message object (absent/NULL = pre-feature, tag stays
+        // attribute-free).
+        msgs.push({ ...(parsed as BiliMessage), ledgerSeq: row.seq + 1, ...(typeof row.ts === "number" ? { ts: row.ts } : {}) });
     }
     return msgs;
 }
@@ -420,7 +423,7 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
         const store = getStore();
         const prevPtrs = readCanonicalPointers(sessionId);
         let ptrs: number[];
-        let rows: { seq: number; content: string }[] | null;
+        let rows: { seq: number; content: string; ts: number | null }[] | null;
         if (prevPtrs !== null && prevPtrs.length <= msgs.length) {
             ptrs = [...prevPtrs];
             rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? Math.max(...ptrs) : -1);

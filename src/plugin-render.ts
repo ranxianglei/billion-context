@@ -84,6 +84,8 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         const m = parsed as BiliMessage & { ledgerSeq?: number };
         // store seqs are 0-based; ref display numbers are 1-based (#4346)
         m.ledgerSeq = row.seq + 1;
+        // #4313: hydrate the stored wall-clock stamp onto the message object.
+        if (typeof row.ts === "number") m.ts = row.ts;
         prefix.push(m);
         idToSeq.set(m.id, row.seq);
     }
