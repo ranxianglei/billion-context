@@ -280,6 +280,36 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
     return texts.join("\n\n");
 }
 
+/** #5095 D1-B: per-run discriminator for the claude-anthropic derived-persona
+ *  lane key. Same-type subagents re-dispatched under one parent id carry a
+ *  byte-identical system (the persona tag), so the dispatch task prompt —
+ *  the first user message with extractable text — is what tells runs apart;
+ *  it is unique per run and stable for the agent's whole lifetime. Users
+ *  whose content holds no top-level text (pure tool_result) are skipped. ""
+ *  when nothing is usable → the call site degrades to the two-segment lane
+ *  key. Body-only read: no header literals here (B-class guard). */
+export function anthropicFirstUserFrag(messages: unknown): string {
+    const list = Array.isArray(messages) ? messages : [];
+    const cap = 1024;
+    for (const m of list) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) return content.slice(0, cap);
+        } else if (Array.isArray(content)) {
+            const parts: string[] = [];
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+                    parts.push((part as { text: string }).text);
+                }
+            }
+            const joined = parts.join("\n\n");
+            if (joined.length > 0) return joined.slice(0, cap);
+        }
+    }
+    return "";
+}
+
 /**
  * Return only an identity the client already supplied. Generated identities
  * remain proxy-internal so billion-context does not invent upstream headers.
