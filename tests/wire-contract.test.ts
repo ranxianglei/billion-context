@@ -53,7 +53,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, validateMistralChatBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -246,6 +246,13 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
             validate: (streaming: unknown) =>
                 Array.isArray(JSON.parse(vertexErrorEnvelope(streaming === true, "x").body)) ? ["WC-021 stream errors are array-wrapped"] : [],
             body: true,
+        },
+        // WC-023 is the Mistral lane — its message schema forbids the strict-echo field bili injects on
+        // assistant tool-call messages (#5260). End-to-end assertions live in tests/issue5260-strict-echo-veto.test.ts.
+        {
+            ruleId: "WC-023",
+            validate: validateMistralChatBody,
+            body: { messages: [{ role: "assistant", content: "", tool_calls: [{ id: "c1" }], reasoning_content: "" }] },
         },
     ];
     for (const { ruleId, validate, body } of laneProbes) {
