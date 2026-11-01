@@ -7,6 +7,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
+* **#5460(P2):性能基准夹具与 `bili bench`(只记录不判)**。`bili fixture-gen --seed K --msgs N --shape openai|anthropic` 把参数当纯函数吐出纯合成对话(同 seed 字节级相同、零隐私面;S-small 50 / S-med 2k / S-large 2万条≈80MiB 复刻 #5403 形状)。`bili bench <scenario>` 在一次性 XDG 目录+随机端口里拉起真代理、对进程内确定性假上游(复用 e2e-dsh hermetic 手法)按 dsh 插件车道的全量重发形状逐回合回放夹具,结束后读子进程 perf.sqlite 产出 JSON 工件:`total_ms` p50/p95/max/mean、进出站字节、内存 HWM、回合错误清单。**只记录不判**:指标再慢也 exit 0,只有 harness 失败(服务起不来/全回合失败/采集未武装)才 exit 1——容差带判定与基线 ratchet 留给 P3(`--rounds 3` 中位数支持已就位)。内置 6 个场景(core×5 + nightly×1 S-large);PR 级 CI 零 perf job(owner 定),FULL/夜间接线在 P3。tests/issue5460-perf-bench.test.ts(夹具确定性/哨兵不变量/S-large 尺寸锚/统计数学/CLI 解析;端到端 smoke 门控 ACP_TEST_BENCH=1,需先 build)。
 * **#5460(P1):实时性能采集落地(SQLite 存储)**。近期所有性能事故(#5403 OOM×6、#4528 主线程卡死、#5385 前缀钉死)都是用户先发现、CI 零预警。现在 DB 存储模式(sqlite/mysql)下每处理一个请求,就在会话目录旁的新小库 `perf.sqlite` 落一行(消息数/进出字节/本地耗时/会话号),另有每 30 秒一条内存水位采样(rss/heap/external)——OOM 类事故从此有爬坡曲线可查。写路径与服务完全隔离:任何写失败只停采集(一次性警告),绝不影响服务;纯 JSON 存储模式冻结零足迹(owner 定)。`BILI_PERF_TELEMETRY=0` 整体关闭。后续:P2 场景夹具+`bili bench`(只记录不判)、P3 基线容差带接 FULL/夜间 CI(普通 PR CI 零性能 job)、P4 `/stats`+Web 面板性能页+外部看门狗——跟踪单 #5460。
 
 ### Fixed
