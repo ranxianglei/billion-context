@@ -487,7 +487,10 @@ export function nodeSqliteUpgradeHint(nodeVersion: string = process.versions.nod
     const minor = parts[1];
     const hasBuiltin = typeof major === "number" && typeof minor === "number" && !Number.isNaN(major) && !Number.isNaN(minor) && (major > 22 || (major === 22 && minor >= 5));
     if (hasBuiltin) return "";
-    return " — node:sqlite needs Node.js >= 22.5; upgrade Node.js for the builtin engine (engine tarball mirrors tried in order: npm + npmmirror; set BILI_UPDATE_REGISTRY or update.registry to pin one)";
+    // owner 2026-10-31: user-facing text is one consistent phrase — "Node.js
+    // 22 or newer" (the internal gate below still keys on the true builtin
+    // threshold, 22.5).
+    return " — node:sqlite needs Node.js 22 or newer; upgrade Node.js for the builtin engine (engine tarball mirrors tried in order: npm + npmmirror; set BILI_UPDATE_REGISTRY or update.registry to pin one)";
 }
 
 /** v12 and earlier construct with `(file, { nativeBinding })`; the extra option
