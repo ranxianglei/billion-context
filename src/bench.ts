@@ -17,7 +17,7 @@ import { generateFixture, renderAnthropicBody, renderOpenaiBody, type FixtureSha
 import { BUILD_COMMIT, VERSION } from "./version.js";
 import { openSqliteDatabase } from "./storage/driver.js";
 
-export interface BenchScenario {
+interface BenchScenario {
     id: string;
     desc: string;
     shape: FixtureShape;
@@ -44,7 +44,7 @@ const HEALTH_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 5_000;
 const ROUND_ERROR_CAP = 5;
 
-export interface BenchStat { min: number; p50: number; p95: number; max: number; mean: number }
+interface BenchStat { min: number; p50: number; p95: number; max: number; mean: number }
 
 /** Nearest-rank percentile on a sorted copy: idx = ceil(q*n)-1. Pure so the
  *  report math is unit-testable without booting anything. */
@@ -83,7 +83,7 @@ function maxPerfId(dbFile: string): number {
     }
 }
 
-export interface BenchRunReport {
+interface BenchRunReport {
     run: number;
     rounds_run: number;
     rounds_failed: number;
@@ -99,7 +99,7 @@ export interface BenchRunReport {
     };
 }
 
-export interface BenchArtifact {
+interface BenchArtifact {
     schema_version: 1;
     generated_at: string;
     bili_version: string;
@@ -289,7 +289,7 @@ function resolveDist(explicit?: string): string {
     return abs;
 }
 
-export interface BenchOptions {
+interface BenchOptions {
     scenarioId: string;
     rounds?: number;
     dist?: string;
