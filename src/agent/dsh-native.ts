@@ -1209,7 +1209,7 @@ function pfSlotIdsOf(messages: unknown): string[] | undefined {
     const out: string[] = [];
     for (const m of messages) {
         let id: unknown = m === null || typeof m !== "object" ? undefined : (m as { id?: unknown }).id;
-        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /\s\p{C}/u.test(id)) {
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id)) {
             id = undefined;
         }
         out.push(typeof id === "string" ? id : pfChannel.PF_SLOT_UNKNOWN);
