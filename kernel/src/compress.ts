@@ -19,6 +19,7 @@ import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
+import { relocateCompressCarriers } from "./relocate-compress.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
@@ -1042,6 +1043,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
       absorbPromptNode,
       filterNode,
       hideCompressCallsNode,
+      // EXPERIMENTAL, default off (Config.compressAtFoldPoint): move still-visible
+      // carrier pairs onto their fold point. Must run AFTER hide-compress-calls
+      // (whose orphan sweep just settled which carriers survive) and BEFORE
+      // view-latch so the latch records the relocated bytes.
+      relocateCompressCarriersNode,
       viewLatchNode,
       recommendNode,
       nudgeNode,
@@ -1317,6 +1323,22 @@ const hideCompressCallsNode: PipelineNode = {
       ...io,
       messages: hidden.messages,
       state: { ...io.state, ...patch },
+    };
+  },
+};
+
+const relocateCompressCarriersNode: PipelineNode = {
+  name: "relocate-compress-carriers",
+  run(io, ctx) {
+    const cfg = ctx.config;
+    if (!cfg.compressAtFoldPoint) return io;
+    return {
+      ...io,
+      messages: relocateCompressCarriers(io.messages, io.state, {
+        isCompressTool: cfg.isCompressTool,
+        clearThinking: cfg.compressAtFoldPointClearThinking === true,
+        reasoningDroppable: cfg.reasoningDroppable,
+      }),
     };
   },
 };

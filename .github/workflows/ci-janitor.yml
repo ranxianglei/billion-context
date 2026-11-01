@@ -17,9 +17,10 @@ name: CI Run Janitor
 #     post-mortem showed queue DEPTH is what stalls dispatch for the whole repo
 #     (236 queued runs sat at ~0 in_progress until the backlog was drained
 #     manually); draining early beats waiting out a multi-hour snowball.
-# master's own push runs are NEVER cancelled (they are the head's only
-# required checks — cancelling would delete that signal for good); a starving
-# master run is reported as a workflow warning instead.
+# master's own runs (push or schedule) are NEVER cancelled — since #5426 dropped
+# the push arm, the :03/:33 schedule runs are master's standing verification
+# (master-build/release stay push-triggered); a starving one is reported as a
+# workflow warning instead of being reaped.
 
 on:
   schedule:
@@ -114,8 +115,8 @@ jobs:
             if [ "$id" = "$SELF_ID" ]; then continue; fi
             age_min=$(( (now - $(date -d "$created" +%s)) / 60 ))
 
-            if [ "$event" = "push" ] && [ "$branch" = "master" ]; then
-              echo "::warning::master push run $id ($status, ${age_min}m old) is starved — not cancelling (head's required checks)"
+            if [ "$branch" = "master" ] && { [ "$event" = "push" ] || [ "$event" = "schedule" ]; }; then
+              echo "::warning::master $event run $id ($status, ${age_min}m old) is starved — not cancelling (master's standing verification)"
               warned=$((warned + 1))
               continue
             fi
