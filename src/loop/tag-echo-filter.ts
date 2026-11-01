@@ -2025,12 +2025,16 @@ function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown
 
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
 // pi + qwen echoed render tags through the verbatim plugin stream): strip the
-// text fields a chat chunk / completion carries —
-// `choices[].delta.{content,reasoning_content,reasoning}` on streams,
-// `choices[].message.*` on non-streaming bodies. Tool-call arguments are
-// deliberately left untouched (#1039): they carry user intent that hosts
-// execute/persist, so a shape-based false positive would silently corrupt
-// data — only model prose is stripped. Mutates in place, mirroring
+// visible text a chat chunk / completion carries —
+// `choices[].{delta,message}.content` on streams and non-streaming bodies
+// alike. Two channels stay byte-for-byte on purpose:
+//   - tool-call arguments (#1039): they carry user intent that hosts
+//     execute/persist, so a shape-based false positive would silently
+//     corrupt data;
+//   - `reasoning_content` / `reasoning` (#2229): the thinking channel is the
+//     model's private channel, and replay or signature checks validate it, so
+//     rewriting it desyncs the session.
+// Only model prose is stripped. Mutates in place, mirroring
 // stripResponsesText.
 export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
