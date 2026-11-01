@@ -97,6 +97,32 @@ function normalizeForWrite(entries: OrderSkeletonEntry[]): OrderSkeletonEntry[] 
     return kept;
 }
 
+/** Pre-reclaim coverage (src/snapshot-journal.ts `covers`): does the published
+ *  output still dominate every record of this input under the merge rule
+ *  above? `normalizeForWrite` applies the entry cap AND the byte budget, so an
+ *  input's record can be capped out even though it was parsed and merged.
+ *
+ *  O(n+m) per leaf, and O(n) for the output across a whole publish: the journal
+ *  passes the SAME output reference for every leaf, so the per-id index is
+ *  built once and reused — never a rescan of the output per record. */
+let coverIndexFor: OrderSkeletonEntry[] | null = null;
+let coverIndex: Map<string, OrderSkeletonEntry> = new Map();
+function outputCovers(output: OrderSkeletonEntry[], input: OrderSkeletonEntry[]): boolean {
+    if (output.length === 0) return input.length === 0;
+    if (coverIndexFor !== output) {
+        coverIndex = new Map<string, OrderSkeletonEntry>();
+        for (const e of output) coverIndex.set(e.id, e);
+        coverIndexFor = output;
+    }
+    for (const rec of input) {
+        const kept = coverIndex.get(rec.id);
+        // Merge admits a newer record only when it is at least as fresh, so the
+        // output must carry this id at `lastSeen >= rec.lastSeen`.
+        if (!kept || kept.lastSeen < rec.lastSeen) return false;
+    }
+    return true;
+}
+
 const journal = openSnapshotJournal<OrderSkeletonEntry[]>({
     // Resolver, not `orderFile()`: the path depends on `XDG_STATE_HOME` at call
     // time (see the same note in affinity-persist.ts).
@@ -104,6 +130,7 @@ const journal = openSnapshotJournal<OrderSkeletonEntry[]>({
     parse: parseSnapshotDoc,
     encode: (entries) => ({ version: 1, entries }),
     merge: (a, b) => mergeEntries(a, b),
+    covers: outputCovers,
     log: (level, msg) => log(level, `[session-order] ${msg}`),
 });
 
@@ -118,7 +145,7 @@ function writeSnapshot(): void {
         const mine = orderSnapshot();
         const census = journal.census([]);
         const entries = normalizeForWrite(mergeEntries(mine, census.records));
-        const result = journal.publish(entries, census.consumed);
+        const result = journal.publish(entries, census);
         if (census.incomplete) {
             const gap = census.retained.length > 0
                 ? `${census.retained.length} unreadable input(s) left in place`
@@ -172,7 +199,7 @@ export function hydrateOrderSkeletons(): void {
         for (const w of census.warnings) log("warn", `[session-order] hydrate: ${w}`);
         const imported = applyOrderSnapshot(census.records);
         if (imported > 0) {
-            log("info", `[session-order] hydrated ${imported} skeleton(s) from ${path.basename(orderFile())} + ${census.consumed.length} journal leaf(s) — persona resolution survives restarts (#3397)`);
+            log("info", `[session-order] hydrated ${imported} skeleton(s) from ${path.basename(orderFile())} + ${census.leaves.length} journal leaf(s) — persona resolution survives restarts (#3397)`);
         }
     } catch (e) {
         log("warn", `[session-order] hydrate failed (${e instanceof Error ? e.message : String(e)}); starting with empty skeletons`);

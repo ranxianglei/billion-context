@@ -100,6 +100,33 @@ function normalizeForWrite(entries: AffinitySnapshotEntry[]): AffinitySnapshotEn
     return [...entries].sort((a, b) => b.lastSeen - a.lastSeen).slice(0, MAX_TRACKED_SESSIONS);
 }
 
+/** Pre-reclaim coverage (src/snapshot-journal.ts `covers`): does the published
+ *  output still dominate every record of this input under the merge rule
+ *  above? `normalizeForWrite` can drop an input's record that no other input
+ *  and not this process held, so merging is NOT enough to license deleting it.
+ *
+ *  O(n+m) per leaf, and O(n) for the output across a whole publish: the journal
+ *  passes the SAME output reference for every leaf, so the per-id winner index
+ *  is built once and reused. Nothing scans the output per record (that would be
+ *  quadratic over a 1024-entry cap). */
+let coverIndexFor: AffinitySnapshotEntry[] | null = null;
+let coverIndex: Map<string, AffinitySnapshotEntry> = new Map();
+function outputCovers(output: AffinitySnapshotEntry[], input: AffinitySnapshotEntry[]): boolean {
+    if (output.length === 0) return input.length === 0;
+    if (coverIndexFor !== output) {
+        coverIndex = new Map<string, AffinitySnapshotEntry>();
+        for (const e of output) coverIndex.set(e.sessionId, e);
+        coverIndexFor = output;
+    }
+    for (const rec of input) {
+        const kept = coverIndex.get(rec.sessionId);
+        // Same-id: the output's record must be the one mergeEntries would have
+        // chosen over this input (`e.depth > cur.depth || (equal && fresher)`).
+        if (!kept || !(kept.depth > rec.depth || (kept.depth === rec.depth && kept.lastSeen >= rec.lastSeen))) return false;
+    }
+    return true;
+}
+
 const journal = openSnapshotJournal<AffinitySnapshotEntry[]>({
     // A resolver, not `affinityFile()`: the path depends on `XDG_STATE_HOME` at
     // call time, and a module-load-time call would freeze the pre-test/pre-move
@@ -108,6 +135,7 @@ const journal = openSnapshotJournal<AffinitySnapshotEntry[]>({
     parse: parseSnapshotDoc,
     encode: (entries) => ({ version: 1, entries }),
     merge: (a, b) => mergeEntries(a, b),
+    covers: outputCovers,
     log: (level, msg) => log(level, `[prefix-affinity] ${msg}`),
 });
 
@@ -122,7 +150,7 @@ function writeSnapshot(): void {
         const mine = prefixAffinity.exportSnapshot();
         const census = journal.census([]);
         const entries = normalizeForWrite(mergeEntries(mine, census.records));
-        const result = journal.publish(entries, census.consumed);
+        const result = journal.publish(entries, census);
         if (census.incomplete) {
             // Partial coverage is a REPORTING fact, not a reclamation veto: the
             // valid inputs whose records are in `entries` were reclaimed above;
@@ -131,7 +159,7 @@ function writeSnapshot(): void {
                 ? `${census.retained.length} unreadable input(s) left in place`
                 : "some durable input was unreadable or churned";
             log("warn", `[prefix-affinity] published ${entries.length} chain(s); ${gap} and still missing from this view`);
-        } else if (census.consumed.length > 0) {
+        } else if (census.leaves.length > 0) {
             const mineIds = new Set(mine.map((e) => e.sessionId));
             const preserved = entries.filter((e) => !mineIds.has(e.sessionId)).length;
             const forks = countSameDepthForks(mine, census.records);
@@ -188,7 +216,7 @@ export function hydratePrefixAffinity(): void {
         for (const w of census.warnings) log("warn", `[prefix-affinity] hydrate: ${w}`);
         const imported = prefixAffinity.importSnapshot(census.records);
         if (imported > 0) {
-            log("info", `[prefix-affinity] hydrated ${imported} chain(s) from ${path.basename(affinityFile())} + ${census.consumed.length} journal leaf(s) — anonymous sessions reattach across restarts`);
+            log("info", `[prefix-affinity] hydrated ${imported} chain(s) from ${path.basename(affinityFile())} + ${census.leaves.length} journal leaf(s) — anonymous sessions reattach across restarts`);
         }
     } catch (e) {
         log("warn", `[prefix-affinity] hydrate failed (${e instanceof Error ? e.message : String(e)}); starting with empty affinity`);

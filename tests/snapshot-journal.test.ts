@@ -103,9 +103,10 @@ function readAll(dir: string): Rec[] {
     return [...byId.values()];
 }
 
-/** A journal over `snapshot` whose parse/encode/merge are the two stores'
- *  generic equivalents: union by id, fresher `seen` wins. No test restates a
- *  retention policy the journal itself owns. */
+/** A journal over `snapshot` whose parse/encode/merge/covers are the two
+ *  stores' generic equivalents: union by id, fresher `seen` wins, and an output
+ *  covers an input only when it carries that id at `seen >= input.seen`. No
+ *  test restates a retention policy the journal itself owns. */
 function journalScript(snapshot: string): string {
     return `
 const { openSnapshotJournal } = await import(${JSON.stringify(JOURNAL)});
@@ -121,6 +122,20 @@ const journal = openSnapshotJournal({
         for (const e of b) { const cur = byId.get(e.id); if (!cur || e.seen >= cur.seen) byId.set(e.id, e); }
         return [...byId.values()];
     },
+    // Reclaim only what the published bytes still hold; a cap that dropped a
+    // record leaves its input uncovered (and therefore on disk). Indexed once
+    // per published output, like the real stores: the journal passes the same
+    // reference for every leaf.
+    covers: (() => {
+        let forOutput = null, byId = new Map();
+        return (output, input) => {
+            if (forOutput !== output) {
+                byId = new Map(output.map((e) => [e.id, e]));
+                forOutput = output;
+            }
+            return input.every((e) => { const kept = byId.get(e.id); return kept !== undefined && kept.seen >= e.seen; });
+        };
+    })(),
 });
 `;
 }
@@ -137,16 +152,17 @@ test("a publication names its output uniquely and never rewrites the legacy base
     const script = `
 ${journalScript(snapshot)}
 const census = journal.census([]);
-const first = journal.publish([{ id: "a", value: 1, seen: 1 }], census.consumed);
-const second = journal.publish([{ id: "b", value: 1, seen: 1 }], []);
-console.log(JSON.stringify({ first, second, baselineConsumed: census.consumed }));
+const first = journal.publish([{ id: "a", value: 1, seen: 1 }], census);
+// A fresh read that saw nothing reclaimable: its \`leaves\` empty.
+const second = journal.publish([{ id: "b", value: 1, seen: 1 }], { leaves: [] });
+console.log(JSON.stringify({ first, second, baselineConsumed: census.leaves.map((l) => l.name) }));
 `;
     const out = await runChild(script);
 
     assert.ok(out.first.published, "the first publish reports a publication name");
     assert.notEqual(out.first.published, out.second.published, "every publication gets its own name");
     assert.equal(out.first.reclaimed, 0, "the baseline is not a reclaimable input");
-    assert.equal(out.second.reclaimed, 0, "an empty consumed list reclaims nothing");
+    assert.equal(out.second.reclaimed, 0, "empty leaves reclaim nothing");
     assert.deepEqual(out.baselineConsumed, [], "the legacy file is never offered for reclamation");
 
     assert.ok(publishedNames(journalDir).includes(out.first.published), "the published output exists");
@@ -163,7 +179,7 @@ test("a publication is a directory with one payload and no partial-visibility wi
 
     const script = `
 ${journalScript(snapshot)}
-const result = journal.publish([{ id: "a", value: 1, seen: 1 }], []);
+const result = journal.publish([{ id: "a", value: 1, seen: 1 }], { leaves: [] });
 console.log(JSON.stringify({ result }));
 `;
     const out = await runChild(script);
@@ -186,17 +202,37 @@ test("a publication includes its legacy baseline, and only its exact inputs are 
     const script = `
 ${journalScript(snapshot)}
 const census = journal.census([]);
-const result = journal.publish(census.records, census.consumed);
+const result = journal.publish(census.records, census);
 console.log(JSON.stringify({ census, result }));
 `;
     const out = await runChild(script);
 
-    assert.deepEqual(out.census.consumed.slice().sort(), ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"], "the census offers exactly the inputs it parsed");
+    assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name).slice().sort(), ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"], "the census offers exactly the inputs it parsed");
     assert.deepEqual(out.census.retained, [], "nothing was retained");
     assert.equal(out.result.reclaimed, 2, "both consumed inputs are reclaimed");
     assert.deepEqual(publishedNames(journalDir), [out.result.published], "only the new output remains — the old inputs are gone, not orphaned");
     const remaining = readAll(journalDir);
     assert.deepEqual(remaining.map((e: Rec) => e.id).sort(), ["a", "b", "legacy"], "the new output carries the baseline and both inputs");
+});
+
+test("a sibling-reclaimed input is neither reclaimed twice nor reported as retained", async () => {
+    const dir = freshDir("sibling-reclaimed");
+    const snapshot = path.join(dir, "affinity.json");
+    const journalDir = stageJournal(snapshot, {
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "a", value: 1, seen: 1 }] }),
+    });
+    const script = `
+${journalScript(snapshot)}
+const fs = await import("node:fs");
+const census = journal.census([]);
+fs.rmSync(${JSON.stringify(path.join(journalDir, "pub-1-aaaaaaaaaaaaaaaa"))}, { recursive: true });
+const result = journal.publish(census.records, census);
+console.log(JSON.stringify({ result }));
+`;
+    const out = await runChild(script);
+    assert.equal(out.result.reclaimed, 0, "this writer did not delete the already-vanished leaf");
+    assert.equal(out.result.uncovered, 0, "the output still covers the record");
+    assert.equal(out.result.retained, 0, "a sibling's successful reclamation leaves nothing retained on disk");
 });
 
 test("a crash before publication leaves every input intact and no visible output", () => {
@@ -248,7 +284,7 @@ console.log(JSON.stringify({ census }));
 `;
     const out = await runChild(script);
     assert.deepEqual(out.census.records.map((e: Rec) => e.id), ["b"], "the intact input's records survive; the half-deleted one contributes nothing");
-    assert.deepEqual(out.census.consumed, ["pub-2-bbbbbbbbbbbbbbbb"], "only the input actually parsed is offered for reclamation");
+    assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name), ["pub-2-bbbbbbbbbbbbbbbb"], "only the input actually parsed is offered for reclamation");
 });
 
 // ─── corruption: retained inputs and per-input conservation ───
@@ -265,14 +301,14 @@ test("an unreadable or ill-shaped input is retained while valid inputs are still
     const script = `
 ${journalScript(snapshot)}
 const census = journal.census([]);
-const result = journal.publish(journal.mergeWith(census.records, []), census.consumed);
+const result = journal.publish(journal.mergeWith(census.records, []), census);
 console.log(JSON.stringify({ census, result }));
 `;
     const out = await runChild(script);
 
-    // Conservation: the corrupt inputs are not in `consumed`, so they cannot be
-    // deleted; the valid one IS in `consumed` and its record is in the output.
-    assert.deepEqual(out.census.consumed, ["pub-3-cccccccccccccccc"], "only the parsed input is offered for reclamation");
+    // Conservation: the corrupt inputs are not among the census `leaves`, so they cannot be
+    // deleted; the valid one IS in `leaves` and its record is in the output.
+    assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name), ["pub-3-cccccccccccccccc"], "only the parsed input is offered for reclamation");
     assert.deepEqual(out.census.retained.slice().sort(), ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"], "unparsed inputs are reported as retained");
     assert.equal(out.census.incomplete, true, "partial coverage is reported to the caller");
     assert.deepEqual(out.census.records.map((e: Rec) => e.id), ["good"], "readable inputs still merge");
@@ -290,13 +326,14 @@ test("a permanently corrupt input costs bounded debris, not unbounded growth", a
     const snapshot = path.join(dir, "affinity.json");
     const journalDir = stageJournal(snapshot, { "pub-0-0000000000000000": "{ not json" });
 
-    // Four write cycles: each publishes and reclaims the previous VALID output.
+    // Four write cycles: each publishes a view that still holds the previous
+    // output's record, so the predecessor VALID output is genuinely covered.
     const script = `
 ${journalScript(snapshot)}
 const ids = [];
 for (let i = 1; i <= 4; i++) {
     const census = journal.census([]);
-    const result = journal.publish([{ id: "r" + i, value: i, seen: i }], census.consumed);
+    const result = journal.publish(journal.mergeWith(census.records, [{ id: "r" + i, value: i, seen: i }]), census);
     ids.push({ published: result.published, reclaimed: result.reclaimed, retained: census.retained.length });
 }
 console.log(JSON.stringify({ ids }));
@@ -326,7 +363,7 @@ console.log(JSON.stringify({ census }));
     const out = await runChild(script);
 
     assert.equal(out.census.incomplete, true, "a journal we cannot list makes the census incomplete");
-    assert.deepEqual(out.census.consumed, [], "nothing is offered for reclamation");
+    assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name), [], "nothing is offered for reclamation");
     assert.deepEqual(out.census.records, [{ id: "legacy", value: 1, seen: 1 }], "readable legacy data remains available despite an unreadable journal");
     assert.ok(out.census.warnings.some((w: string) => w.includes("unreadable")), "the failure is reported, not swallowed");
 });
@@ -349,7 +386,7 @@ fs.openSync = (file, ...args) => {
 let result;
 try {
     const census = journal.census([{ id: "new", value: 2, seen: 2 }]);
-    result = journal.publish(census.records, census.consumed);
+    result = journal.publish(census.records, census);
 } finally { fs.openSync = originalOpen; }
 console.log(JSON.stringify({ result, records: journal.census([]).records }));
 `;
@@ -391,12 +428,12 @@ test("a corrupt legacy baseline still allows reclaiming valid publications", asy
     const script = `
 ${journalScript(snapshot)}
 const census = journal.census([]);
-const result = journal.publish(journal.mergeWith(census.records, []), census.consumed);
+const result = journal.publish(journal.mergeWith(census.records, []), census);
 console.log(JSON.stringify({ census, result }));
 `;
     const out = await runChild(script);
 
-    assert.deepEqual(out.census.consumed, ["pub-1-aaaaaaaaaaaaaaaa"], "the parsed publication is reclaimable even though the baseline is corrupt");
+    assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name), ["pub-1-aaaaaaaaaaaaaaaa"], "the parsed publication is reclaimable even though the baseline is corrupt");
     assert.equal(out.result.reclaimed, 1, "conservation is per-input, not all-or-nothing on any corruption");
     assert.equal(fs.readFileSync(snapshot, "utf8"), "{ not json", "the corrupt baseline itself is never deleted or rewritten");
 });
@@ -412,12 +449,12 @@ function spawnWriter(snapshot: string, id: string): { child: ChildProcess; ready
     const script = `
 ${journalScript(snapshot)}
 const census = journal.census([]);
-process.send({ ready: true, consumed: census.consumed.length });
+process.send({ ready: true, consumed: census.leaves.length });
 process.once("message", (msg) => {
     if (msg !== "go") return;
     const mine = [{ id: ${JSON.stringify(id)}, value: 1, seen: Date.now() }];
     try {
-        const result = journal.publish(journal.mergeWith(census.records, mine), census.consumed);
+        const result = journal.publish(journal.mergeWith(census.records, mine), census);
         process.send({ done: true, published: result.published, reclaimed: result.reclaimed });
     } catch (e) {
         process.send({ done: false, error: String((e && e.message) || e) });
@@ -605,10 +642,20 @@ const journal = openSnapshotJournal({
         for (const e of b) { const cur = byId.get(e.id); if (!cur || e.seen >= cur.seen) byId.set(e.id, e); }
         return [...byId.values()].sort((x, y) => y.seen - x.seen).slice(0, 4);
     },
+    covers: (() => {
+        let forOutput = null, byId = new Map();
+        return (output, input) => {
+            if (forOutput !== output) {
+                byId = new Map(output.map((e) => [e.id, e]));
+                forOutput = output;
+            }
+            return input.every((e) => { const kept = byId.get(e.id); return kept !== undefined && kept.seen >= e.seen; });
+        };
+    })(),
 });
 const many = Array.from({ length: 20 }, (_, i) => ({ id: "r" + i, value: i, seen: i }));
 const normalized = journal.mergeWith(many, []);
-journal.publish(normalized, []);
+journal.publish(normalized, { leaves: [] });
 const fs = await import("node:fs");
 const leaves = fs.readdirSync(${JSON.stringify(journalDir)}).filter((n) => n.startsWith("pub-"));
 const published = JSON.parse(fs.readFileSync(${JSON.stringify(journalDir)} + "/" + leaves[0] + "/" + ${JSON.stringify(SNAPSHOT_PAYLOAD)}, "utf8")).entries;
@@ -617,6 +664,218 @@ console.log(JSON.stringify({ count: published.length, ids: published.map((e) => 
     const out = await runChild(script);
     assert.equal(out.count, 4, "the caller's cap is enforced before the bytes hit disk");
     assert.deepEqual(out.ids, ["r19", "r18", "r17", "r16"], "the cap keeps the freshest records");
+});
+
+// ─── bounded outputs: a capped view reclaims only what it still covers ───
+
+/** A journal whose write path mirrors both real stores: merge by id (fresher
+ *  `seen` wins), then cap to `cap` records. The cap is the whole point — a
+ *  merged view is allowed to drop a record that one input held alone. */
+function cappedJournalScript(snapshot: string, cap: number): string {
+    return `
+const { openSnapshotJournal } = await import(${JSON.stringify(JOURNAL)});
+const cap = ${cap};
+const merge = (a, b) => {
+    const byId = new Map(a.map((e) => [e.id, e]));
+    for (const e of b) { const cur = byId.get(e.id); if (!cur || e.seen >= cur.seen) byId.set(e.id, e); }
+    return [...byId.values()];
+};
+const journal = openSnapshotJournal({
+    snapshotPath: ${JSON.stringify(snapshot)},
+    parse: (raw) => {
+        if (!raw || typeof raw !== "object" || !Array.isArray(raw.entries)) throw new Error("not a snapshot");
+        return raw.entries;
+    },
+    encode: (entries) => ({ version: 1, entries }),
+    merge,
+    covers: (() => {
+        let forOutput = null, byId = new Map();
+        return (output, input) => {
+            if (forOutput !== output) {
+                byId = new Map(output.map((e) => [e.id, e]));
+                forOutput = output;
+            }
+            return input.every((e) => { const kept = byId.get(e.id); return kept !== undefined && kept.seen >= e.seen; });
+        };
+    })(),
+});
+const publishWrite = (mine) => {
+    const census = journal.census([]);
+    const merged = merge(mine, census.records).sort((x, y) => y.seen - x.seen).slice(0, cap);
+    return { census, result: journal.publish(merged, census) };
+};
+`;
+}
+
+test("a bounded output keeps the input leaf holding a record the cap dropped", async () => {
+    const dir = freshDir("bounded-uncovered");
+    const snapshot = path.join(dir, "affinity.json");
+    // `unique` is fresh but not fresh enough to survive a cap of 2 while this
+    // process's two own records are newer. It lives ONLY in this leaf.
+    const journalDir = stageJournal(snapshot, {
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "unique", value: 7, seen: 7 }] }),
+        "pub-2-bbbbbbbbbbbbbbbb": JSON.stringify({ version: 1, entries: [{ id: "m1", value: 0, seen: 1 }] }),
+    });
+
+    const script = `
+${cappedJournalScript(snapshot, 2)}
+const run = publishWrite([{ id: "m1", value: 1, seen: 100 }, { id: "m2", value: 2, seen: 99 }]);
+const fs = await import("node:fs");
+const dir = ${JSON.stringify(journalDir)};
+const readable = (name) => fs.existsSync(dir + "/" + name + "/" + ${JSON.stringify(SNAPSHOT_PAYLOAD)});
+console.log(JSON.stringify({
+    result: run.result,
+    published: JSON.parse(fs.readFileSync(dir + "/" + run.result.published + "/" + ${JSON.stringify(SNAPSHOT_PAYLOAD)}, "utf8")).entries.map((e) => e.id),
+    uniqueLeaf: readable("pub-1-aaaaaaaaaaaaaaaa"),
+    oldLeaf: readable("pub-2-bbbbbbbbbbbbbbbb"),
+    uniqueAfter: journal.census([]).records.find((e) => e.id === "unique"),
+}));
+`;
+    const out = await runChild(script);
+
+    assert.deepEqual(out.published.sort(), ["m1", "m2"], "the cap drops the unique input while the newer m1 supersedes the other leaf");
+    assert.equal(out.result.uncovered, 1, "the leaf holding a capped-out record is reported uncovered");
+    assert.equal(out.uniqueLeaf, true, "its payload is still on disk: the cap did not license deleting the record's only source");
+    assert.equal(out.oldLeaf, false, "the leaf whose record the output still dominates IS reclaimed");
+    assert.deepEqual(out.uniqueAfter, { id: "unique", value: 7, seen: 7 }, "the surviving leaf is still readable by the next census");
+
+    // One bounded warning, and it names the gap rather than claiming completeness.
+    assert.equal(out.result.reclaimed, 1, "exactly the dominated leaf was deleted");
+    assert.equal(out.result.uncovered, 1, "the capped-out leaf stays and is counted");
+    assert.equal(out.result.retained, out.result.uncovered, "retained is the parseable inputs left in place, i.e. the uncovered ones here");
+});
+
+test("a capped-out record survives a later wider census and is reclaimed only once covered", async () => {
+    const dir = freshDir("bounded-widens");
+    const snapshot = path.join(dir, "affinity.json");
+    const journalDir = stageJournal(snapshot, {
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "unique", value: 7, seen: 7 }] }),
+    });
+
+    const script = `
+${journalScript(snapshot)}
+const fs = await import("node:fs");
+const dir = ${JSON.stringify(journalDir)};
+const uniqueId = ${JSON.stringify("pub-1-aaaaaaaaaaaaaaaa")};
+const present = () => fs.existsSync(dir + "/" + uniqueId + "/" + ${JSON.stringify(SNAPSHOT_PAYLOAD)});
+const out = [];
+
+// 1. A bounded write: cap 1 keeps only the in-memory record, so the leaf's
+//    unique record is NOT in the published bytes.
+const firstCensus = journal.census([]);
+out.push({ step: "bounded", result: journal.publish([{ id: "m1", value: 1, seen: 100 }], firstCensus), present: present() });
+
+// 2. A later WIDER census still sees the record — the cap cost a write, not a record.
+const widen = journal.census([]);
+out.push({ step: "wider", ids: widen.records.map((e) => e.id).sort(), consumed: widen.leaves.length });
+
+// 3. Publishing that wider set now dominates the leaf, so it is reclaimed.
+const wide = journal.publish(widen.records, widen);
+out.push({ step: "covered", result: wide, present: present(), remaining: journal.census([]).records.map((e) => e.id).sort() });
+console.log(JSON.stringify({ out }));
+`;
+    const out = await runChild(script);
+
+    assert.equal(out.out[0].result.uncovered, 1, "the bounded write reports the leaf it could not cover");
+    assert.equal(out.out[0].present, true, "and leaves its bytes alone");
+    assert.deepEqual(out.out[1].ids, ["m1", "unique"], "the later census still sees the capped-out record — nothing was lost");
+    assert.equal(out.out[1].consumed, 2, "both leaves are candidates for the wider write");
+    assert.equal(out.out[2].result.reclaimed, 2, "the genuine superset reclaims both inputs");
+    assert.equal(out.out[2].result.uncovered, 0, "a covering output reports no gap");
+    assert.equal(out.out[2].present, false, "only now is the record's leaf reclaimed");
+    assert.deepEqual(out.out[2].remaining, ["m1", "unique"], "the output itself is the single durable source of both records");
+});
+
+test("an uncovered input is never deleted even when the caller nominates it after publishing", async () => {
+    const dir = freshDir("bounded-nominate");
+    const snapshot = path.join(dir, "affinity.json");
+    // The consumer hands back every name the census parsed while its own bound
+    // dropped the records those names hold. Coverage, not the caller's word,
+    // decides what is reclaimed.
+    const journalDir = stageJournal(snapshot, {
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "keep-1", value: 1, seen: 1 }] }),
+        "pub-2-bbbbbbbbbbbbbbbb": JSON.stringify({ version: 1, entries: [{ id: "keep-2", value: 2, seen: 2 }] }),
+    });
+
+    const script = `
+${cappedJournalScript(snapshot, 1)}
+const run = publishWrite([{ id: "only", value: 0, seen: 500 }]);
+console.log(JSON.stringify({ censusLeaves: run.census.leaves.map((l) => l.name).sort(), result: run.result }));
+`;
+    const out = await runChild(script);
+
+    assert.deepEqual(out.censusLeaves, ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"], "both inputs were nominated for reclamation");
+    assert.equal(out.result.uncovered, 2, "and both are refused: the cap-1 output covers neither");
+    assert.equal(out.result.reclaimed, 0, "a bounded output reclaims nothing it cannot dominate");
+    assert.deepEqual(publishedNames(journalDir).sort(), ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb", out.result.published].sort(), "every input survives beside the new output");
+    assert.deepEqual(readAll(journalDir).map((e) => e.id).sort(), ["keep-1", "keep-2", "only"], "no record was lost");
+});
+
+test("a same-id input is reclaimed only when the output dominates that exact record", async () => {
+    const dir = freshDir("bounded-same-id");
+    const snapshot = path.join(dir, "affinity.json");
+    const journalDir = stageJournal(snapshot, {
+        // Same id as the write, but NEWER than the output it would be merged
+        // into: merging is not dominance, so this leaf must survive.
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "s", value: 2, seen: 50 }] }),
+    });
+
+    const script = `
+${journalScript(snapshot)}
+const fs = await import("node:fs");
+const LEAF = ${JSON.stringify(path.join(journalDir, "pub-1-aaaaaaaaaaaaaaaa", SNAPSHOT_PAYLOAD))};
+// One real read: the census parses pub-1's record (seen 50) and offers it.
+const read = journal.census([]);
+const stale = journal.publish([{ id: "s", value: 1, seen: 10 }], read);
+const survivedStale = fs.existsSync(LEAF);
+const fresh = journal.publish([{ id: "s", value: 3, seen: 90 }], read);
+console.log(JSON.stringify({ stale, survivedStale, fresh, survivedFresh: fs.existsSync(LEAF) }));
+`;
+    const out = await runChild(script);
+
+    assert.equal(out.stale.uncovered, 1, "an output older than the input's record does not cover it");
+    assert.equal(out.stale.reclaimed, 0, "and reclaims nothing");
+    assert.equal(out.survivedStale, true, "the leaf survives the older output");
+    assert.equal(out.fresh.uncovered, 0, "the newer output does dominate that record");
+    assert.equal(out.survivedFresh, false, "so the leaf it covered is gone");
+});
+
+test("the real affinity store keeps a durable leaf its write bound capped out", { timeout: 60_000 }, async () => {
+    const state = freshDir("store-bounds");
+    const script = `
+process.env.XDG_STATE_HOME = ${JSON.stringify(state)};
+const fs = await import("node:fs");
+const path = await import("node:path");
+const { prefixAffinity } = await import(${JSON.stringify(AFFINITY_RESOLVER)});
+const { flushPrefixAffinity } = await import(${JSON.stringify(AFFINITY)});
+
+const dir = path.join(${JSON.stringify(state)}, "billion-context");
+const journalDir = path.join(dir, "prefix-affinity.json.journal");
+fs.mkdirSync(journalDir, { recursive: true });
+// A foreign leaf holding a chain this process never saw. Give it the OLDEST
+// lastSeen so the store's 1024-chain cap drops it from the next write.
+const leaf = "pub-1-aaaaaaaaaaaaaaaa";
+fs.mkdirSync(path.join(journalDir, leaf));
+fs.writeFileSync(path.join(journalDir, leaf, ${JSON.stringify(SNAPSHOT_PAYLOAD)}), JSON.stringify({ version: 1, entries: [
+    { sessionId: "capped-out", depth: 1, tailHash: "t", itemHashes: ["h"], lastSeen: 1 },
+]}));
+
+// Fill the in-memory store past the cap with strictly newer chains, so the
+// write's normalizeForWrite drops the foreign one.
+const many = Array.from({ length: 1100 }, (_, i) => ({ sessionId: "s" + i, depth: 1, tailHash: "t" + i, itemHashes: ["h" + i], lastSeen: 1000 + i }));
+prefixAffinity.importSnapshot(many);
+flushPrefixAffinity();
+
+const leavesAfter = fs.readdirSync(journalDir).filter((n) => n.startsWith("pub-"));
+const cappedOutStillThere = fs.existsSync(path.join(journalDir, leaf, ${JSON.stringify(SNAPSHOT_PAYLOAD)}));
+const retained = JSON.parse(fs.readFileSync(path.join(journalDir, leaf, ${JSON.stringify(SNAPSHOT_PAYLOAD)}), "utf8"));
+const cappedOutReadable = retained.entries.some((entry) => entry.sessionId === "capped-out");
+console.log(JSON.stringify({ leavesAfter: leavesAfter.length, cappedOutStillThere, cappedOutReadable }));
+`;
+    const out = await runChild(script);
+
+    assert.equal(out.cappedOutStillThere, true, "the store's own chain cap dropped that record, so its leaf stayed on disk");
+    assert.equal(out.cappedOutReadable, true, "the retained generation still contains the complete capped-out record");
 });
 
 // ─── child harness ───
