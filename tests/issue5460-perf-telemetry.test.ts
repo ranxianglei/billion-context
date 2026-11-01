@@ -185,6 +185,25 @@ test("#5460 P1: logRequestCost wires structured rows through the single choke po
     } finally { perfStopAll(); }
 });
 
+test("#5460 P1: retention sweep caps perf_events at 200k rows — oldest drop first", () => {
+    resetModule();
+    const dir = sandbox();
+    try {
+        assert.equal(perfTelemetryInit("sqlite", { dir }), true);
+        for (let i = 0; i < 200_001; i++) {
+            perfRecordRequest({ sessionId: `r${i}`, inboundBytes: i });
+        }
+        perfStopAll();
+        const db = new DatabaseSync(path.join(dir, PERF_DB_FILE));
+        try {
+            const n = db.prepare("SELECT COUNT(*) AS n FROM perf_events").get() as { n: number };
+            assert.equal(Number(n.n), 200_000, "retention cap must hold");
+            const newest = db.prepare("SELECT session_id FROM perf_events ORDER BY id DESC LIMIT 1").get() as { session_id: string };
+            assert.equal(newest.session_id, "r200000", "newest rows survive, oldest drop");
+        } finally { db.close(); }
+    } finally { perfStopAll(); }
+});
+
 test("#5460 P1: legacy (pure-JSON) storage mode leaves ZERO telemetry footprint — owner constraint ②", async () => {
     // The sqlite arming branch runs for every enabled store — including
     // storage.unified=legacy ones where maybeOpen() returns null. This pins
