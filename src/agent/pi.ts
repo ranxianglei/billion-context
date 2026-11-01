@@ -17,7 +17,8 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
-import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
@@ -1322,11 +1323,6 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
-                    // #5403/#5418: echo the watermark stamp back to the proxy.
-                    if (sid !== undefined) {
-                        const pfSeq = pfSeqByConversation.get(sid);
-                        if (pfSeq !== undefined) headers[PF_COUNT_HEADER_NAME] = String(pfSeq);
-                    }
                     // #3248: when the lane advertises incremental turns, declare
                     // the divert intent. Declaring is safe — the lane shape-tests
                     // the body, so full-resend turns (retries, dead conversations,
@@ -1400,18 +1396,6 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // model requests strictly sequentially per session). Cleared on the
         // after_provider_response ack, dropped on failure.
         const pendingIncrementalAcks = new Map<string, { messages: IncrementalWireMessage[]; system: unknown; base: string }>();
-        // #5403/#5418 full-resend watermark echo: the proxy measures each
-        // chat-completions body's element count T and answers it in
-        // x-bili-pf-seq; the next turn feeds it back as x-bili-pf-count
-        // (server side gates behind rollout.features.pluginFullResendWatermark).
-        // Inline header literals (agent bundles must not import server modules,
-        // #3482 leaf rule). Count mode only: pi's before_provider_headers fires
-        // BEFORE before_provider_request (SDK event order), so wire messages —
-        // and hence tail-ids — are unreachable at stamp time; a stale entry
-        // costs the server at most ONE verification round (verdicts restamp).
-        const PF_COUNT_HEADER_NAME = "x-bili-pf-count";
-        const PF_SEQ_HEADER_NAME = "x-bili-pf-seq";
-        const pfSeqByConversation = new Map<string, number>();
         async function maybeIncrementalTurn(event: { payload?: unknown }, ctx: Ctx): Promise<unknown> {
             if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
             const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
@@ -1505,6 +1489,32 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #5403/#5418 unified watermark channel: capture THIS request's
+            // host msgids per family for the ONE chokepoint emitter. Runs on
+            // EVERY model request — including the OpenAI-family turns the
+            // incremental divert shape-gates away (#3433). A failed resolution
+            // CLEARS the previous list; a stale anchor is worse than no field.
+            {
+                const pfSid = sessionIdOf(ctx);
+                if (pfSid !== undefined && pfSid.length > 0) {
+                    const payload = (event as { payload?: unknown } | undefined)?.payload;
+                    const msgs = payload === null || typeof payload !== "object" ? undefined : (payload as { messages?: unknown }).messages;
+                    let branch: unknown;
+                    try {
+                        branch = ctx.sessionManager?.getBranch?.();
+                    } catch {
+                        branch = undefined;
+                    }
+                    pfChannel.pfCaptureIds(
+                        pfSid,
+                        Array.isArray(msgs) && msgs.length > 0
+                            ? wireMessagesLookAnthropic(msgs)
+                                ? laneMsgIdsForWire(msgs, branch)
+                                : laneMsgIdsForOpenAiWire(msgs, branch)
+                            : undefined,
+                    );
+                }
+            }
             // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
             // any await below — the hint must be the generation of THIS
             // payload. The fetch-layer planner (omp-native) reads it back by
@@ -1568,23 +1578,6 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             return stampPromptCacheKey(event, ctx, agent);
         });
-        // #5403/#5418: record the watermark stamp per session — deliberately
-        // a SEPARATE listener from the incremental ack handler below: plain
-        // full-resend responses (no pending entry) are exactly the ones that
-        // carry x-bili-pf-seq.
-        pi.on("after_provider_response", ((event: unknown, ctx: Ctx) => {
-            try {
-                const ev = event as { status?: unknown; headers?: Record<string, unknown> } | undefined;
-                const seq = ev?.status === 200 ? ev.headers?.[PF_SEQ_HEADER_NAME] : undefined;
-                const sid = sessionIdOf(ctx);
-                if (typeof seq === "string" && /^\d+$/.test(seq) && sid !== undefined && sid.length > 0) {
-                    if (pfSeqByConversation.size >= 1024) pfSeqByConversation.clear();
-                    pfSeqByConversation.set(sid, Number(seq));
-                }
-            } catch {
-                // observability only
-            }
-        }) as unknown as (...args: unknown[]) => void);
         // #3248 incremental turns: the ack channel. after_provider_response
         // fires with status + headers BEFORE the stream is consumed, so the
         // x-bili-applied-seq header is readable here. 200 → record the ack

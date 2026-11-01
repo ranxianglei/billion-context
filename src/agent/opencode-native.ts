@@ -78,6 +78,7 @@ import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
@@ -681,8 +682,14 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
  *  messages.transform hook — the only opencode seam that sees them (V2's
  *  http.request sees just the wire, so V2-shaped turns degrade to
  *  content-derived identities). Never mutates the host's messages. */
-const harvestMsgIdsTransform = async (_input: unknown, output: { messages?: unknown }): Promise<void> => {
+const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
+    // #5403/#5418 unified watermark channel: feed the ONE chokepoint emitter
+    // with the SAME validated 1:1 list the harvest just aligned — undefined
+    // (any misalignment) CLEARS the previous list; the emitter degrades to
+    // count-only rather than sending a stale anchor.
+    const sid = (input === null || typeof input !== "object" ? undefined : (input as { sessionID?: unknown }).sessionID);
+    if (typeof sid === "string" && sid.length > 0) pfChannel.pfCaptureIds(sid, alignedMsgIdsForWire(sid, output?.messages));
 };
 
 // #1135: dynamic origin getter instead of a captured constant — after a
@@ -817,9 +824,6 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             if (base === undefined) return;
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
-            // #5403/#5418: echo the watermark stamp back to the proxy.
-            const ocPfSeq = pfSeqByConversationOC.get(input.sessionID);
-            if (ocPfSeq !== undefined) output.headers[PF_COUNT_HEADER_NAME_OC] = String(ocPfSeq);
             // #1102: opencode mints one session id per persona (task-tool
             // subagents get fresh child ids), so instruction drift (AGENTS.md
             // reconcile) must not fork the compression session.
@@ -1050,20 +1054,9 @@ const INC_PENDING_TTL_MS = 30_000;
  *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
 
-// #5403/#5418 full-resend watermark echo (same handshake as the dsh/pi shims):
-// the proxy answers each evaluated chat-completions turn with x-bili-pf-seq and
-// the client feeds it back as x-bili-pf-count on the next turn. Count mode
-// only — opencode's chat.headers hook carries no message list, so tail-ids are
-// unreachable here without a wire change. Inline literals (#3482 leaf rule);
-// a stale entry costs the server at most ONE verification round.
-const PF_COUNT_HEADER_NAME_OC = "x-bili-pf-count";
-const PF_SEQ_HEADER_NAME_OC = "x-bili-pf-seq";
-const pfSeqByConversationOC = new Map<string, number>();
-
 /** Test hook: drop all planned turns (the map is module state across suites). */
 export function __resetOpencodeIncrementalForTests(): void {
     incPendingOpencode.clear();
-    pfSeqByConversationOC.clear();
 }
 
 /** Ack collector registered on the module's NativeInterceptState: the
@@ -1074,18 +1067,6 @@ export function __resetOpencodeIncrementalForTests(): void {
  *  turn-id header is not an incremental ack at all. Exported for the native
  *  suites; wired below. */
 export function opencodeIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
-    // #5403/#5418: learn the watermark stamp on EVERY successful model send —
-    // attributed by THIS dispatch's outgoing conversation header (the url is
-    // shared context, never the key, #3329), so plain full-resend responses
-    // record too, unlike the incremental ack below.
-    if (response.status === 200) {
-        const pfSeq = response.headers.get(PF_SEQ_HEADER_NAME_OC);
-        const conv = headers?.["x-bili-plugin-conversation"];
-        if (pfSeq !== null && /^\d+$/.test(pfSeq) && conv !== undefined && conv.length > 0) {
-            if (pfSeqByConversationOC.size >= 1024) pfSeqByConversationOC.clear();
-            pfSeqByConversationOC.set(conv, Number(pfSeq));
-        }
-    }
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
     if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
     const pending = incPendingOpencode.get(turnId);
