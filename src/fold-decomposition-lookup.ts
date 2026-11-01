@@ -142,3 +142,39 @@ export function resolveStoredDecompositions(
     ordered.sort((a, b) => a.seq - b.seq);
     return ordered.map((o) => o.m);
 }
+
+/** #5395: stored originals for caller-chosen ids (pruner-shape byte
+ *  verification) — unlike resolveStoredDecompositions' narrow #3301 backfill
+ *  class, the caller decides WHICH ids to pull (its cheap marker pre-filter
+ *  already ran). Same row discipline: latest seq per id wins; unparseable rows
+ *  are auxiliary-evidence misses, not errors. undefined = index unavailable or
+ *  no rows → the pruner-shape channel degrades to honest unmatched (absence is
+ *  stable for folded-out history). */
+export function storedMessagesById(sessionId: string, msgIds: readonly string[]): Map<string, CoreMessage> | undefined {
+    let rows: StoredRow[] | null;
+    try {
+        rows = getStore().unifiedMessageRows(sessionId, msgIds);
+    } catch (err) {
+        loggerLog("warn", `[fold-reconcile] pruner-shape stored lookup failed: ${String(err)}`);
+        return undefined;
+    }
+    if (rows === null || rows.length === 0) return undefined;
+    const latestSeq = new Map<string, number>();
+    const out = new Map<string, CoreMessage>();
+    for (const row of rows) {
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(row.content);
+        } catch {
+            continue;
+        }
+        if (typeof parsed !== "object" || parsed === null) continue;
+        const m = parsed as CoreMessage;
+        if (typeof m.id !== "string" || typeof m.role !== "string") continue;
+        const prev = latestSeq.get(row.msgId);
+        if (prev !== undefined && prev >= row.seq) continue;
+        latestSeq.set(row.msgId, row.seq);
+        out.set(m.id, m);
+    }
+    return out.size > 0 ? out : undefined;
+}
