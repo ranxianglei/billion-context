@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, MAX_SILENT_DIRECT_BODY_BYTES, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
@@ -505,6 +505,49 @@ test("install: a same-instance re-activation outranks an older activation's late
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
     assert.equal(calls[0].headers["x-bili-test"], "same");
+});
+
+test("install: a missing live-state slot refuses an oversized direct model request (#5405)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40905", ready: Promise.resolve("http://127.0.0.1:40905") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Simulate the exact #3394 teardown shape: the slot is empty but the
+        // shared fetch chain is still installed.
+        liveStateSlotEffect(state)()();
+        await assert.rejects(
+            () => globalThis.fetch("http://127.0.0.1:8199/v1/messages", {
+                method: "POST",
+                body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+            }),
+            /refusing oversized direct model request while intercept state is missing/,
+        );
+        assert.deepEqual(sink, [], "the oversized request must not reach the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an unattributed oversized request is refused before direct send (#5405)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40906",
+        ready: Promise.resolve("http://127.0.0.1:40906"),
+        takeoverGate: () => false,
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        await assert.rejects(
+            () => fetch("http://127.0.0.1:8199/v1/messages", {
+                method: "POST",
+                body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+            }),
+            /refusing oversized unattributed direct model request/,
+        );
+    });
+    assert.deepEqual(sink, [], "the oversized request must not reach the provider");
 });
 
 test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {

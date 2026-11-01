@@ -576,6 +576,14 @@ export function bodyProvablyOverWindow(
  *  precisely what is unavailable (#4516). */
 const CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 
+/** #5405: a missing live-state slot used to forward every model request
+ *  straight to the provider, even when the body was far larger than any
+ *  plausible context window. Normal small direct sends (plugin intentionally
+ *  deactivated) must keep working, but a multi-megabyte prompt cannot be
+ *  allowed to ride out silently: refuse it locally and tell the user to
+ *  restart the host so the interceptor can rebind. */
+export const MAX_SILENT_DIRECT_BODY_BYTES = 2 * 1024 * 1024;
+
 function declaredWindowFromHeaders(input: string | URL | Request, init: RequestInit | undefined): number | undefined {
     const headers = outgoingHeadersOf(input, init);
     if (headers === undefined) return undefined;
@@ -1105,7 +1113,22 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // captured one: an empty slot means no plugin is active, so pass through
         // direct rather than hit a disposed context.
         const state = g[ACTIVE_STATE] as NativeInterceptState | undefined;
-        if (url === undefined || state === undefined) return send(input, init);
+        if (url === undefined) return send(input, init);
+        if (state === undefined) {
+            // #5405: a missing slot means bili is not active, so small calls
+            // keep their clean direct path. An oversized model request is the
+            // one case we must not forward silently: the provider would bill
+            // and truncate a prompt the plugin never compressed. Fail locally
+            // and say how to restore routing instead.
+            if (isModelApiUrl(url)) {
+                const size = bodyByteSizeOf(init);
+                if (size !== undefined && size.bytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.bytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); restart the host`);
+                    throw new TypeError("billion-context: refusing oversized direct model request while intercept state is missing; restart the host");
+                }
+            }
+            return send(input, init);
+        }
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
         // mode. Steady state costs nothing (gate already resolved). A timeout
@@ -1208,6 +1231,17 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                   ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
                   : await directSendBodyMeasure(defaultInput, init);
             const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindow) : undefined;
+            // #5405: the gate's 1M-token floor deliberately keeps small
+            // declared windows from false-refusing, but that also lets a
+            // ~975K-token body through as a silent direct send. A raw-byte
+            // ceiling catches the catastrophic case without second-guessing
+            // the token math.
+            const silentBytes = measured !== undefined ? measured.bytes : bodyByteSizeOf(init)?.bytes;
+            if (degradeLog === undefined && silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+                state.onDispatch?.(dispatchUrl, "refused");
+                logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) — would be sent uncompressed`);
+                throw new TypeError("billion-context: refusing oversized unattributed direct model request");
+            }
             if (doom !== undefined) {
                 state.onDispatch?.(dispatchUrl, "refused");
                 if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — oversized request refused locally instead (~${doom.floorTokens.toLocaleString("en-US")} tok core-text floor > ${doom.window.toLocaleString("en-US")} tok window)`);
