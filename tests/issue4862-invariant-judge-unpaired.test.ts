@@ -137,7 +137,11 @@ test("I3 POS in-flight compress re-mint does not inflate volume over a host-brok
   assert.equal(v.ok, true, JSON.stringify(v.violations));
 });
 
-test("I3 POS compress call with pending result is exempt (kernel parity, bare + MCP dialect)", () => {
+test("I3 NEG answered compress call whose outbound result vanished IS a finding", () => {
+  // The inbound side carries the complete pair (call + result). The outbound side
+  // still ships the call but the result is gone, so the model would see an
+  // unanswered tool call. A complete pair is the only clean shape; an answered
+  // call that lost its result outbound is a real defect, never an exemption.
   for (const name of ["compress", "mcp__bili__compress"]) {
     const entry = [
       mk("user", "text", "compress it"),
@@ -148,6 +152,48 @@ test("I3 POS compress call with pending result is exempt (kernel parity, bare + 
     const exit = [
       mk("system", "text", SUMMARY),
       mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" }),
+      mk("user", "text", "next"),
+    ];
+    const v = judgeInboundOutbound(entry, exit);
+    assert.equal(v.ok, false, `${name}: an answered call that lost its result outbound must be reported`);
+    assert.ok(
+      v.violations.some((x) => x.kind === "unpaired-tool-call" && x.index === 1),
+      `${name}: ${JSON.stringify(v.violations)}`,
+    );
+  }
+});
+
+test("I3 POS truly pending compress call stays exempt (bare + MCP dialect)", () => {
+  // No result on EITHER side: the call has not been answered yet, so neither
+  // side can be accused of dropping one.
+  for (const name of ["compress", "mcp__bili__compress"]) {
+    const entry = [
+      mk("user", "text", "compress it"),
+      mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" }),
+      mk("user", "text", "next"),
+    ];
+    const exit = [
+      mk("system", "text", SUMMARY),
+      mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" }),
+      mk("user", "text", "next"),
+    ];
+    const v = judgeInboundOutbound(entry, exit);
+    assert.equal(v.ok, true, `${name}: ${JSON.stringify(v.violations)}`);
+  }
+});
+
+test("I3 POS complete compress pair outbound stays clean (bare + MCP dialect)", () => {
+  for (const name of ["compress", "mcp__bili__compress"]) {
+    const entry = [
+      mk("user", "text", "compress it"),
+      mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" }),
+      mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+      mk("user", "text", "next"),
+    ];
+    const exit = [
+      mk("system", "text", SUMMARY),
+      mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" }),
+      mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
       mk("user", "text", "next"),
     ];
     const v = judgeInboundOutbound(entry, exit);

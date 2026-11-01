@@ -12,6 +12,7 @@ import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
+import type { SeparatorSlot } from "../server/responses-ordering.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -233,6 +234,15 @@ export interface LoopCtx {
      *  of the pre-compress view (stale view = model sees zero effect + a
      *  finished deliverable → wraps up and stops). */
      refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
+    /** #564/#2627: producer-recorded ordering-separator slots for the CURRENT
+     *  round's body, read fresh for each continuity check. Round 2+ bodies are
+     *  built from the fold this loop just materialized, so their separators are
+     *  minted here rather than by prepare; without this the continuity judge
+     *  would read a newly added marker as a mid-insertion. */
+    separatorSlots?: () => readonly SeparatorSlot[] | undefined;
+    /** #564/#2627: the core list `separatorSlots` indexes into, as rendered into
+     *  this round's wire. Read together with the slots so the judge maps producer
+     *  identity to a final wire index instead of searching the array. */
     // Which wire protocol produced the usage the loop records. Needed to
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
@@ -548,7 +558,12 @@ export async function* runCompressLoop(
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
         noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
         if (prevSentFull) {
-            maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id);
+            // #564/#2627: provenance is resolved against the array that belongs to
+            // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
+            // `wireArr` no longer describes it; rather than map stale indexes (which
+            // would exempt the wrong element), hand over NO array and let the judge
+            // skip the separator exemption for that round.
+            maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id, ctx.separatorSlots?.(), wireShedRewrote ? undefined : wireArr);
         }
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +

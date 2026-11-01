@@ -21,7 +21,8 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { handleAcpStatus, liveCompressionRanges } from "../src/acp-status.ts";
-import { repairResponsesAssistantOrdering, stripKernelSummaries } from "../src/server.ts";
+import { repairResponsesAssistantOrdering } from "../src/server/responses-ordering.ts";
+import { stripKernelSummaries } from "../src/server.ts";
 import { isResponsesTurnSeparatorId, withoutTurnSeparators } from "../src/turn-separator.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
@@ -102,7 +103,7 @@ function setupFixture(build: () => CoreMessage[]): Fixture {
     const prep = core.processTurn({ messages: original, state: session.state, config, tokenCount: 0, renderTags: "text-only" });
     session.state = prep.state;
     const processed = stripKernelSummaries(prep.messages as BiliMessage[], prep.state) as CoreMessage[];
-    const sendView = repairResponsesAssistantOrdering(processed, original);
+    const sendView = repairResponsesAssistantOrdering(processed, original).messages;
     const refs: Record<string, string> = {};
     for (const m of original) {
         const r = refForRaw(session.state.messageRefs, m.id);

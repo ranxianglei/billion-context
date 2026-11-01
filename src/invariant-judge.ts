@@ -48,6 +48,7 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
+import { collectSeparatorManifest, separatorCoreProvenance, SeparatorManifest, separatorProvenanceSet, type SeparatorSlot } from "./server/responses-ordering.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -108,6 +109,14 @@ interface JudgeOptions {
   // entry[renderTailStart..] against the outbound; the rendered prefix is exempt
   // from the frozen-prefix requirement. Absent ⇒ legacy full inbound-vs-outbound.
   renderTailStart?: number;
+  /** #564/#2627: outbound indexes owned by bili's OWN Responses ordering
+   *  separators, resolved by the producer against the exact wire array this
+   *  verdict is computed from. An element at one of these indexes is exempt
+   *  from insertion/carrier-drift accounting — it is bili's marker, not client
+   *  prose. The set is producer-supplied and never inferred from item text or
+   *  ids, so identical client prose at any other index stays judgeable.
+   *  Absent ⇒ legacy behavior (no separator is exempt). */
+  separatorProvenance?: ReadonlySet<number>;
 }
 
 function normText(m: CoreMessage): string {
@@ -248,8 +257,21 @@ function egressPairingViolations(entry: readonly CoreMessage[], exit: readonly C
   const client = pairingState(entry);
   const egress = pairingState(exit);
   const out: Violation[] = [];
+  // #4862/#564: the compress exemption is NOT a blanket tool-name skip. Kernel's
+  // hideConsumedCompressCalls owns the result of a compress call that is still
+  // IN FLIGHT, so an unanswered compress call bili ships legitimately has no
+  // result to show. But a compress call the CLIENT already answered feeds no
+  // such ownership: if its result disappears outbound, that is bili breaking a
+  // complete pair and the upstream 400 that follows is ours. Exempt only ids
+  // with no entry-side answer; a completed pair is judged like any other.
+  const entryAnswered = new Set<string>();
+  for (const m of entry) if (m.contentType === "tool-result" && m.toolCallId) entryAnswered.add(m.toolCallId);
+  const compressInFlight = new Set<string>();
+  for (const m of exit) {
+    if (m.contentType === "tool-call" && m.toolCallId && isCompressToolName(m.toolName) && !entryAnswered.has(m.toolCallId)) compressInFlight.add(m.toolCallId);
+  }
   const countUnanswered = (msgs: readonly CoreMessage[], st: PairingState): number =>
-    msgs.filter((m) => m.contentType === "tool-call" && m.toolCallId && st.unansweredCallIds.has(m.toolCallId) && !isCompressToolName(m.toolName)).length;
+    msgs.filter((m) => m.contentType === "tool-call" && m.toolCallId && st.unansweredCallIds.has(m.toolCallId) && !compressInFlight.has(m.toolCallId)).length;
   // Volume guard (#2821): a host that itself ships a half-pair and then has
   // the id re-minted on projection produces exit-unpaired ids the entry never
   // named — per-id indistinguishable from a re-minted pair bili broke. Volume
@@ -258,7 +280,7 @@ function egressPairingViolations(entry: readonly CoreMessage[], exit: readonly C
   if (countUnanswered(exit, egress) > countUnanswered(entry, client)) {
     exit.forEach((m, i) => {
       if (m.contentType !== "tool-call" || !m.toolCallId || !egress.unansweredCallIds.has(m.toolCallId)) return;
-      if (isCompressToolName(m.toolName)) return; // kernel parity: hideConsumedCompressCalls owns these results
+      if (compressInFlight.has(m.toolCallId)) return; // kernel parity: hideConsumedCompressCalls owns an in-flight result
       if (client.unansweredCallIds.has(m.toolCallId)) return; // host-sent broken, not ours to flag
       out.push({ kind: "unpaired-tool-call", index: i, detail: `outbound[${i}] tool-call #${m.toolCallId}${m.toolName ? ` (${m.toolName})` : ""} has no same-id tool-result after it — upstream rejects half-pairs with a 400 (#4862)` });
     });
@@ -287,6 +309,10 @@ export function judgeInboundOutbound(
 ): JudgeVerdict {
   const maxGap = opts.maxCarrierGap ?? 4;
   const maxExempt = opts.maxExempt ?? 128;
+  // #564/#2627: indexes the PRODUCER owns. Empty ⇒ legacy behavior everywhere
+  // below, so non-Responses wires and separator-free turns are byte-identical.
+  const ownedSep = opts.separatorProvenance;
+  const isOwnedSeparator = (k: number): boolean => ownedSep !== undefined && ownedSep.has(k);
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
@@ -329,6 +355,7 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
+        if (isOwnedSeparator(k)) continue;
         scanned++;
         if (scanned > cap) break;
         if (stableEqual(e, x)) { found = k; break; }
@@ -344,9 +371,8 @@ export function judgeInboundOutbound(
       if (located) {
         for (let k = j; k < found; k++) {
           const x = exit[k];
-          if (!isCarrier(x) && !isReasoning(x)) {
-            violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before tail inbound[${i}]: ${fp(x)}` });
-          }
+          if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+          violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before tail inbound[${i}]: ${fp(x)}` });
         }
       }
       matched++;
@@ -374,6 +400,7 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
+        if (isOwnedSeparator(k)) continue;
         scanned++;
         if (scanned > maxGap) break;
         if (stableEqual(e, x)) { found = k; break; }
@@ -392,9 +419,8 @@ export function judgeInboundOutbound(
 
       for (let k = j; k < found; k++) {
         const x = exit[k];
-        if (!isCarrier(x) && !isReasoning(x)) {
-          violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
-        }
+        if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+        violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
       }
       matched++;
       j = found + 1;
@@ -405,10 +431,9 @@ export function judgeInboundOutbound(
     if (folded && sumIdx > matched) {
       for (let k = matched; k < sumIdx; k++) {
         const x = exit[k];
-        if (!isCarrier(x) && !isReasoning(x)) {
-          violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
-          break;
-        }
+        if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+        violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
+        break;
       }
     }
   }
@@ -470,6 +495,9 @@ interface InvariantJudgeInput {
    *  the first client index of the live tail; the judge then validates only that
    *  suffix against the outbound (the rendered prefix is exempt). Absent ⇒ legacy. */
   renderTailStart?: number;
+  /** Producer-owned claims bound to the exact serialized Responses body.
+   *  Validated here against the same parsed wire used for the exit projection. */
+  separatorManifest?: SeparatorManifest;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -538,10 +566,17 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
     const entry = input.originalMessages ?? [];
-    const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
+    let parsed = input.parsed;
+    if (parsed === undefined && input.separatorManifest !== undefined && input.protocol === "responses" && typeof input.body === "string") {
+      parsed = JSON.parse(input.body) as Record<string, unknown>;
+    }
+    const exitCores0 = parseExitCores(input.body, input.protocol, parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
+    const separatorProvenance = input.separatorManifest !== undefined && input.protocol === "responses" && Array.isArray(parsed?.input)
+      ? separatorCoreProvenance(separatorProvenanceSet(input.separatorManifest, parsed.input, typeof input.body === "string" ? input.body : undefined), exitCores)
+      : undefined;
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, ...(separatorProvenance !== undefined ? { separatorProvenance } : {}) });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
@@ -563,14 +598,35 @@ export function maybeJudgeContinuity(
   body: string | Buffer,
   protocol: string | undefined,
   sessionId?: string,
+  /** #564/#2627: producer-recorded ordering-separator slots for `body`, the
+   *  exact wire array those slots index into, and the core list that array was
+   *  rendered from (the lockstep partner that assigns each marker its real wire
+   *  index). Absent on non-Responses wires and on rounds whose fold added no
+   *  marker — the judge then behaves as before. */
+  slots?: readonly SeparatorSlot[],
+  bodyArr?: readonly unknown[],
 ): void {
   if (!armed() || !prev) return;
   try {
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;
-    const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores);
+      const exitCores = fault ? fault([...exitCores0]) : exitCores0;
+    // #564/#2627: the producer's carrier objects are matched against `bodyArr` —
+    // the exact array the sent body was serialized from — by one linear reference
+    // walk. The owned wire indexes are then translated to exit-core indexes with
+    // the `wireIndex` the codec stamps, so the exemption lands on the parsed core
+    // that came from the producer's item and nowhere else. A missing or replaced
+    // carrier, or an absent array (shed round), claims nothing.
+    const provenance = (() => {
+      if (!Array.isArray(slots) || slots.length === 0 || !Array.isArray(bodyArr)) return undefined;
+      const manifest = collectSeparatorManifest(bodyArr, slots, typeof body === "string" ? body : undefined);
+      if (manifest === undefined) return undefined;
+      return separatorCoreProvenance(separatorProvenanceSet(manifest, bodyArr, typeof body === "string" ? body : undefined), exitCores);
+    })();
+    const v = judgeInboundOutbound(entry, exitCores, {
+      ...(provenance !== undefined && provenance.size > 0 ? { separatorProvenance: provenance } : {}),
+    });
     (sink ?? defaultSink(sessionId, "loop"))({ ...v, lane: "loop" });
   } catch {
     // advisory layer: a judge failure must never disturb the request
