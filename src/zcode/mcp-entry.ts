@@ -15,6 +15,8 @@ import { readProxyInstanceFile } from "../instance.js";
 import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
 import { resolveZcodeNativePort } from "../config.js";
 import { closeLogger, configureLogger, log as teeLog } from "../logger.js";
+import { configureLogRetention } from "../log-retention.js";
+import { logRetentionPolicy } from "../knobs.js";
 import { defaultLogFile } from "../paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import type { ZcodeRoutePolicy } from "./json-edit.js";
@@ -197,6 +199,9 @@ async function serveDegraded(reason: string, log: (msg: string) => void): Promis
 
 export async function main(): Promise<void> {
     if (process.env.NODE_TEST_CONTEXT !== undefined) return;
+    // Same resolved policy as the proxy's startup boundary: this entry writes the
+    // SAME default log, so it must not rotate it under different budget rules.
+    configureLogRetention(logRetentionPolicy());
     configureLogger(defaultLogFile());
     const log = (msg: string) => teeLog("info", `[bili-zcode] ${msg}`);
     let bootstrap;

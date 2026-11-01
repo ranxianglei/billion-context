@@ -37,13 +37,29 @@
  * masking in log-mask.ts. The programmatic capture hook receives the raw
  * message: it is an in-process test/diagnostic seam, not a log surface.
  */
-import { createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
+import { closeSync, createWriteStream, fstatSync, mkdirSync, openSync, statSync, type WriteStream } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { VERSION } from "./version.js";
 import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
+import {
+    LOG_FILE_MODE,
+    logRetention,
+    applyLogRetention,
+    chmodPrivateFile,
+    logCoverage,
+    migrateLegacyOld,
+    sealActiveLog,
+    stampNewLog,
+    type LogCoverage,
+} from "./log-retention.js";
+import { formatBytes } from "./log-retention-coverage.js";
 
-const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
+/** Rotate by sealing the active file into an immutable generation once it grows
+ *  past the policy's segment size (10 MiB by default, unchanged). Sealing is
+ *  cheaper than the old scheme's single `.old` because history now spans ordered
+ *  generations up to the retention budget. */
+const MAX_BYTES = (): number => logRetention().segmentBytes;
 
 export type Logger = (level: string, msg: string) => void;
 
@@ -88,6 +104,11 @@ let writeProven = false;
 let logPath: string | undefined;
 let bytesWritten = 0;
 let reopenWarned = false;
+// Set when the last open-time trim could not get under budget because only the
+// live sink remained: a file we append to can never be shrunk here, so the
+// condition is remembered and reported by logRetentionStatus() instead of
+// being dropped on the floor (the trim happens once, at open).
+let activeOnlyExcess = false;
 
 let capture: ((level: string, msg: string) => void) | null = null;
 
@@ -194,31 +215,34 @@ export function setLogCapture(fn: ((level: string, msg: string) => void) | null)
 
 function openStream(file: string): WriteStream {
     mkdirSync(path.dirname(file), { recursive: true });
-    // Rotate if oversized.
+    // Rotate if oversized: seal the active file into an immutable, uniquely
+    // named generation (rename, so nothing is lost and a concurrent reader keeps
+    // its inode), then let the budget trim sealed history. Windows-safe: the
+    // generation name never exists yet, and a failed rename keeps us appending.
     let existingSize = 0;
     try {
-        existingSize = statSync(file).size;
-        if (existingSize >= MAX_BYTES) {
-            try {
-                // Drop the previous generation first: keep at most one .old,
-                // and on Windows renameSync cannot overwrite an existing target.
-                try { unlinkSync(file + ".old"); } catch { /* no previous generation */ }
-                renameSync(file, file + ".old");
-                existingSize = 0;
-            } catch {
-                // rename can fail if .old is held open; best-effort.
-            }
+        const st = statSync(file);
+        existingSize = st.size;
+        // Take ownership of private log files a previous build created with a
+        // wider umask (bili.log was 0644 on a default-022 machine). Isolated
+        // from rotation: a chmod failure must not skip sealing.
+        chmodPrivateFile(file);
+        if (existingSize >= MAX_BYTES()) {
+            if (sealActiveLog(file).sealed !== null) existingSize = 0;
         }
     } catch {
         // file doesn't exist yet — fine
     }
-    const s = createWriteStream(file, { flags: "a" });
-    // 'open' only records the fd (orphan-inode detection needs it). It must NOT
-    // arm liveness: on win32 (observed node 22 in CI) some paths (e.g. a
-    // DIRECTORY) open fine and only their writes fail (#3857).
-    s.on("open", (fd: number) => {
-        if (stream === s) streamFd = fd;
-    });
+    // Migrate the pre-generation logger's single `.old` into the ordered set so
+    // upgrading does not delete the only retained history.
+    if (logRetention().migrateLegacyOld) migrateLegacyOld(file);
+    activeOnlyExcess = applyLogRetention(file).activeOnlyExcess;
+    // Bind the descriptor before any queued write can race a path rotation.
+    const fd = openSync(file, "a", LOG_FILE_MODE);
+    let s: WriteStream;
+    try { s = createWriteStream(file, { fd, autoClose: true }); }
+    catch (error) { closeSync(fd); throw error; }
+    streamFd = fd;
     // If the stream errors (disk full, perms), drop it so the next write
     // triggers a reopen instead of piling onto a dead stream. #3857: an ASYNC
     // open failure (EPERM/EACCES on a locked or sandboxed path) never reaches
@@ -270,11 +294,11 @@ function noteProvenWrite(s: WriteStream): void {
 
 /** One [warn] per degradation episode (reset when a write delivers). */
 function warnReopenFailed(err: unknown): void {
+    // Repeated failed opens still undo a premature caller mute. Only the
+    // diagnostic is one-shot; the surviving output leg must never be disabled.
+    stderrMuted = false;
     if (reopenWarned) return;
     reopenWarned = true;
-    // #2864: the file leg just died — restore the muted stderr fallback so a
-    // launcher-spawned child keeps SOME durable output instead of going silent.
-    stderrMuted = false;
     const reason = err instanceof Error ? err.message : String(err);
     const msg = `log file ${logPath ?? "?"} unavailable (${reason}); continuing with stderr-only logging`;
     if (capture) {
@@ -313,6 +337,9 @@ function getStream(): WriteStream | undefined {
  * Configure the log file. Call once at startup. When `file` is undefined or
  * "off", file logging is disabled (stderr only). A failed open degrades to
  * stderr-only instead of crashing startup.
+ *
+ * Policy (target window + byte budget) comes from `configureLogRetention()`,
+ * called earlier at the same startup boundary from the resolved knobs.
  */
 export function configureLogger(file?: string): string | undefined {
     if (!file || file === "off") {
@@ -323,8 +350,40 @@ export function configureLogger(file?: string): string | undefined {
         return undefined;
     }
     logPath = file;
+    try {
+        mkdirSync(path.dirname(file), { recursive: true });
+        // Record the true start of this log's history, so a coverage report can
+        // say "younger than the target" instead of guessing. Never touches a
+        // file another writer owns.
+        stampNewLog(file, `${logTimestamp()} [info] [v=${VERSION}] log session start\n`);
+    } catch { /* best-effort: openStream creates the directory anyway */ }
     stream = getStream();
+    // Observable shortfall: the hard budget wins over the 48h target, so say so
+    // once per start instead of letting a reader discover the gap silently. A
+    // young install is not a defect and the message never claims continuity.
+    // Unavailable history warns as well: a file that cannot be read is a real
+    // observation loss even when the measured span happens to look long enough.
+    const coverage = logCoverage(file);
+    if (stream && (!coverage.targetSpanMet || !coverage.available)) log(coverage.available ? "info" : "warn", coverage.message);
     return file;
+}
+
+/** What the retained log set measures right now — the honest answer to "is 48
+ *  hours here?", including the reason when it is not and the fact that
+ *  continuity is unproven. Reads the disk; never mutates. Undefined when file
+ *  logging is off. An over-budget live sink cannot be shrunk by the trim (this
+ *  process is appending to it), so that condition is carried from the last trim
+ *  as its own fact rather than being folded into the coverage numbers. */
+export function logRetentionStatus(): LogCoverage | undefined {
+    if (!logPath) return undefined;
+    const coverage = logCoverage(logPath);
+    if (!activeOnlyExcess) return coverage;
+    const policy = logRetention();
+    const total = coverage.totalBytes;
+    return {
+        ...coverage,
+        message: `${coverage.message}; the active log alone (${formatBytes(total)}) exceeds the ${formatBytes(policy.budgetBytes)} budget, and a live sink is never truncated`,
+    };
 }
 
 /** Line timestamp: the system's LOCAL wall-clock time, no zone suffix
@@ -369,11 +428,13 @@ export const log: Logger = (level, msg) => {
     // file — durable record.
     let s = getStream();
     if (s) {
-        // Runtime rotation: if we've crossed the threshold since last check,
-        // close the old stream (end() drains its buffer) and reopen against
-        // the current path (openStream renames the oversized file out).
-        if (bytesWritten >= MAX_BYTES) {
+        // Runtime rotation: if we've crossed the segment size since last check,
+        // close the old stream (end() drains its buffer) and reopen against the
+        // current path (openStream seals the oversized file into a generation
+        // and enforces the byte budget).
+        if (bytesWritten >= MAX_BYTES()) {
             closeQuietly(s);
+            sealActiveLog(logPath!);
             stream = undefined;
             s = getStream();
         }

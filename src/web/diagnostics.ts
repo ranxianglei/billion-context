@@ -43,7 +43,9 @@ import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
 import { redactForPublish } from "../log-mask.js";
+import { readLogLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
 import { safeSuffix } from "../text-safe.js";
@@ -87,24 +89,42 @@ function baseLines(): string[] {
 // contract (a regression to per-tail reads would re-double the cost).
 let candidateLogReads = 0;
 
-/** All non-empty lines across the rotated log pair; [] on any fs failure. */
-function candidateLogLines(): string[] {
+/** All non-empty lines across every retained generation (sealed history oldest-
+ *  first, then the active file); [] on any fs failure. ONE enumeration shared
+ *  with the other default readers, read once per report (#3813).
+ *  Streaming: the retention set is a byte budget of many generations, so this
+ *  keeps only the two bounded tails the report publishes instead of every line
+ *  of every generation. */
+async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
+    storage: string[];
+    conflict: string[];
+    /** Files that could not be read — the tails are then INCOMPLETE and the
+     *  report must say so rather than present a partial scan as the whole
+     *  retained history. */
+    unreadable: string[];
+}> {
     candidateLogReads += 1;
+    const storage: string[] = [];
+    const conflict: string[] = [];
+    const unreadable: string[] = [];
+    const pushBounded = (into: string[], line: string, cap: number): void => {
+        into.push(line);
+        if (into.length > cap) into.shift();
+    };
     try {
-        const logFile = getLogPath() ?? defaultLogFile();
-        const dir = logFile ? path.dirname(logFile) + path.sep : "";
-        const candidates = [dir + "bili.log.old", dir + "bili.log"];
-        let lines: string[] = [];
-        for (const f of candidates) {
-            try { if (!statSync(f).isFile()) continue; } catch { continue; }
-            try {
-                lines = lines.concat(readFileSync(f, "utf8").split("\n").filter((l) => l.length > 0));
-            } catch { continue; }
+        const files = logGenerations(getLogPath() ?? defaultLogFile()).map((g) => g.path);
+        for await (const line of readLogLines(files, { onError: (f) => unreadable.push(f) })) {
+            if (needStorage && line.includes("[storage]")) pushBounded(storage, line, STORAGE_LOG_TAIL_LINES);
+            if (needConflict && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                pushBounded(conflict, line, CONFLICT_LOG_TAIL_LINES);
+            }
         }
-        return lines;
     } catch {
-        return [];
+        // Enumeration or iteration blew up: report nothing rather than a
+        // half-scan dressed as the full retained history.
+        return { storage: [], conflict: [], unreadable: ["*"] };
     }
+    return { storage, conflict, unreadable };
 }
 
 /** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
@@ -114,13 +134,10 @@ function candidateLogLines(): string[] {
  * length bound as conflictLogTail — a [storage] line can carry a URL with
  * credentials, a private host, or an absolute path. */
 function storageLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => l.includes("[storage]"))
-        .slice(-STORAGE_LOG_TAIL_LINES)
-        .map((l) => {
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -137,16 +154,13 @@ const CONFLICT_LOG_PATTERNS = [
 ];
 
 function conflictLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
-        .slice(-CONFLICT_LOG_TAIL_LINES)
-        .map((l) => {
-            // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
-            // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
-            // on-disk log) the published tail still cannot leak them.
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
+        // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
+        // on-disk log) the published tail still cannot leak them.
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 function safeSessionCount(): number {
@@ -288,6 +302,8 @@ interface TopicContext {
     storageLogLines: string[];
     conflicts: ReturnType<typeof summarizeConflicts> | null;
     conflictLogLines: string[];
+    /** Generations that could not be read; both tails are partial when set. */
+    unreadableLogs: string[];
 }
 
 interface TopicDef {
@@ -298,7 +314,12 @@ interface TopicDef {
 const TOPICS: Record<string, TopicDef> = {
     "storage-legacy-only": {
         title: () => `SQLite unified storage degraded to legacy-only (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
-        section: (ctx) => storageDiagnosticsLines(ctx),
+        section: (ctx) => [
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the storage tail below covers only the readable ones)`]
+                : []),
+            ...storageDiagnosticsLines(ctx),
+        ],
     },
     // #3235: the compression-conflict banner rides the same #3040 facility —
     // "copy diagnostics / report on GitHub" buttons straight on the banner.
@@ -313,6 +334,9 @@ const TOPICS: Record<string, TopicDef> = {
         section: (ctx) => [
             ...conflictDiagnosticsLines(ctx.conflicts),
             "--- recent conflict-related log lines ---",
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the tails below cover only the readable ones)`]
+                : []),
             ...(ctx.conflictLogLines.length > 0
                 ? ctx.conflictLogLines
                 : ["(no matching lines in the current log pair)"]),
@@ -353,19 +377,26 @@ function snapshotShadowDiagnosticsLines(): string[] {
     return lines;
 }
 
-export function buildDiagnostics(topic?: string): DiagnosticsReport {
+export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
     const t = topic?.trim().slice(0, 64) ?? "";
     const def = t ? TOPICS[t] : undefined;
     // #3813: read the rotated log pair at most ONCE per report — the storage
     // tail and the conflict banner filter the SAME candidate lines, so a
     // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously.
-    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
+    // possible), stalling the event loop synchronously. Both tails are now
+    // collected in the same streaming pass, which retains only their bounded
+    // buffers instead of every line of every generation.
+    const needStorage = Boolean(def);
+    const needConflict = t === "conflict-banner";
+    const tails = needStorage || needConflict
+        ? await candidateLogTails(needStorage, needConflict)
+        : { storage: [], conflict: [], unreadable: [] };
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail(logLines) : [],
-        conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
+        storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
+        conflicts: needStorage ? safeConflictSummary() : null,
+        conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
+        unreadableLogs: tails.unreadable,
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);

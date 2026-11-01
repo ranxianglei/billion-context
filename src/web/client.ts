@@ -4828,6 +4828,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             $("log-count").textContent = d.total > 0
                 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
                 : "";
+            if (Array.isArray(d.unreadable) && d.unreadable.length > 0) {
+                $("log-count").textContent += " · " + t("logs.incomplete", { n: d.unreadable.length });
+            }
             const bodyEl = $("log-body");
             const rows = d.lines || [];
             if (!rows.length) {
@@ -4935,47 +4938,32 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
-        const ldl = $("log-dl");
-        if (ldl) ldl.addEventListener("click", async () => {
-            busy(ldl, true);
-            try {
-                const q = ($("log-search").value || "").trim();
-                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldl, false);
-            }
-        });
-        const ldlAll = $("log-dl-all");
-        if (ldlAll) ldlAll.addEventListener("click", async () => {
-            busy(ldlAll, true);
-            try {
-                // Full unfiltered log (rotated .old + current) regardless of the
-                // search box — the honest "download everything" path.
-                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-full-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldlAll, false);
-            }
-        });
+        for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
+            const button = $(buttonId);
+            if (button) button.addEventListener("click", async () => {
+                busy(button, true);
+                try {
+                    const q = ($("log-search").value || "").trim();
+                    const query = all ? "raw=1&all=1" : "raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras();
+                    const response = await fetch(API_ROOT + "/logs?" + query);
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const unreadable = response.headers.get("x-bili-log-incomplete");
+                    if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
+                    const blob = await response.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                } catch (e) {
+                    toast(t("toast.failed", { msg: e.message }), "err");
+                } finally {
+                    busy(button, false);
+                }
+            });
+        }
         const testBtn = $("test-upstream");
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
