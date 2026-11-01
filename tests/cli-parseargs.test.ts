@@ -99,20 +99,23 @@ test("parseArgs: -i/-s misuse exits 2 with a pointed message (#5428)", () => {
     ];
     for (const [argv, re] of cases) {
         const origExit = process.exit;
+        const origError = console.error;
         let code: string | number | undefined;
+        let printed = "";
         // biome-ignore lint/suspicious/noExplicitAny: test stub
         (process as any).exit = ((c: number) => { code = c; throw new Error(`exit ${c}`); }) as any;
+        console.error = ((...args: unknown[]) => { printed += args.join(" ") + "\n"; }) as typeof console.error;
         try {
             parseArgs(argv);
             assert.fail(`expected ${argv.join(" ")} to exit 2`);
         } catch (err) {
             assert.match(String(err), /exit 2/);
             assert.equal(code, 2);
+            assert.match(printed, re);
         } finally {
             // biome-ignore lint/suspicious/noExplicitAny: test stub
             (process as any).exit = origExit;
+            console.error = origError;
         }
-        // the error message reached stderr — assert via the regex on the thrown path
-        assert.ok(re, "case documented");
     }
 });
