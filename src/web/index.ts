@@ -4,8 +4,12 @@ import { VERSION, BUILD_COMMIT } from "../version.js";
 export {
     handleConfigGet,
     handleConfigPut,
+    handlePackTemplatesGet,
     handlePricingGet,
     handleSummaryCredentialPut,
+    handleUserPackDelete,
+    handleUserPackGet,
+    handleUserPackPut,
     readProviders,
     readUpstreamSettings,
 } from "./api.js";

@@ -90,6 +90,17 @@ export function conversationHeaderSource(headers: Record<string, string | string
     return undefined;
 }
 
+/** Memory workers replay the parent history but keep their tool tail private. */
+export function zcodeMemoryConversation(parent: string, headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (headers["x-zcode-query-source"] !== "project_memory_extract"
+        || headers["x-zcode-session-type"] !== "other"
+        || headers["x-session-id"] !== parent) return undefined;
+    const query = headers["x-query-id"];
+    if (typeof query !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(query)) return undefined;
+    // |sub: descendants can take over host-stamped management calls; workers cannot.
+    return `${parent}|aux:zcode-memory:${query}`;
+}
+
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
  *  participate in the compression-session key at all. Inverted allowlist: the
  *  fingerprint is OFF by default and applies ONLY to signals with a verified

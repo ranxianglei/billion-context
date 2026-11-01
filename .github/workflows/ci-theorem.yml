@@ -36,11 +36,22 @@ on:
     - cron: '16/30 * * * *'
     # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
   workflow_dispatch:
+
+# 2026-10-31 queue-starvation incident: same house pattern as ci-e2e (#3331/#3772)
+# — one run per ref, superseded PR runs cancelled within their group, scheduled
+# runs queue behind each other and are NEVER cancelled (the smart gate needs an
+# un-cancelled green scheduled head to skip), non-ci:full label events sit in
+# their own '-skip' group so they can never kill an in-flight real run.
+concurrency:
+  group: theorem-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
   # or on the 30-min cron when master moved since the last green scheduled run.
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -71,6 +82,7 @@ jobs:
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
