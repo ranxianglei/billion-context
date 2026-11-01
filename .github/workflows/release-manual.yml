@@ -13,7 +13,7 @@ on:
         required: false
         default: false
       raw_publish:
-        description: "NUCLEAR OPTION (owner decision 2026-11-01): runs ONLY npm ci + npm run build, then npm publish immediately — no typecheck, no tests, no CI lanes, no push to master, no release PR. It publishes, pushes the git tag, creates the GitHub Release, and opens a version-sync PR so master can converge. Implies the skip_ci_gate bypass; both audit warnings are logged. Untick everything for normal releases."
+        description: "NUCLEAR OPTION (owner decision 2026-11-01): runs npm run build, then npm publish immediately — no typecheck, no tests, no CI lanes, no push to master, no release PR. It publishes, pushes the git tag, creates the GitHub Release, and opens a version-sync PR so master can converge. Implies the skip_ci_gate bypass; both audit warnings are logged. Untick everything for normal releases."
         type: boolean
         required: false
         default: false
@@ -186,14 +186,13 @@ jobs:
         # before publishing (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
-          #npm ci
           npm run typecheck
           npm run build
 
       - name: Raw emergency publish (build only — NO typecheck, NO tests, NO CI, NO master push)
         id: rawpub
         # #5430 nuclear option (owner decision 2026-11-01): the ONLY things that run before
-        # `npm publish` are `npm ci && npm run build`. master is never touched by this path;
+        # `npm publish` are  npm run build`. master is never touched by this path;
         # it publishes, pushes the git tag, creates the GitHub Release, and opens a
         # version-sync PR so master can converge without re-running this path. Every
         # downstream step keys off steps.push.outputs.direct / needs_pr, which stay EMPTY
@@ -207,7 +206,6 @@ jobs:
           set -euo pipefail
           VER="${{ steps.version.outputs.version }}"
           echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
-          npm ci
           npm run build
           if [ -n "$(npm view billion-context@${VER} version 2>/dev/null || true)" ]; then
             echo "::error::v${VER} already exists on npm — refusing a raw re-publish"
