@@ -56,7 +56,7 @@ import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } fr
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
-import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
+import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
@@ -2350,9 +2350,12 @@ export function apply(ctx: PluginContext): void {
         if (signedUrlSeen.has(key)) return;
         if (signedUrlSeen.size >= 64) return;
         signedUrlSeen.add(key);
+        const note = KNOWN_SIGNATURE_SCHEMES[scheme]?.note;
         const line = scheme === APIG_RESIGN_SCHEME
             ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or byte-untouched direct with passthrough configured)`
-            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing per the compress-or-refuse contract (no unsigned pass-through — the link stays unavailable until bili ships a re-signer for it, #2090)`;
+            : note !== undefined
+                ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot and will not re-sign this scheme (refusing per the compress-or-refuse contract): ${note}`
+                : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing per the compress-or-refuse contract (no unsigned pass-through — the link stays unavailable until bili ships a re-signer for it, #2090)`;
         persistClientEvent(line);
     };
 
@@ -2364,7 +2367,14 @@ export function apply(ctx: PluginContext): void {
         const entries = Object.entries(unresolved);
         if (entries.length > 0) {
             const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
-            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them (no configuration passes a signed body through unsigned); see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.`;
+            // #4632: schemes with a registry note (deliberately blocked channels)
+            // carry their own status text — "wait for a re-signer" would be
+            // false advertising for those.
+            const notes = entries.map(([scheme]) => KNOWN_SIGNATURE_SCHEMES[scheme]?.note).filter((n): n is string => n !== undefined);
+            const contractText = notes.length > 0
+                ? `Per the compress-or-refuse contract they stay refused (no configuration passes a signed body through unsigned)${notes.length < entries.length ? "; schemes without a note below wait for a re-signer from bili" : ""}`
+                : "Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them (no configuration passes a signed body through unsigned)";
+            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. ${contractText}; see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.` + (notes.length > 0 ? ` Scheme notes: ${[...new Set(notes)].join(" ")}` : "");
             console.warn(line);
             persistClientEvent(line);
         }

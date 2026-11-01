@@ -1423,11 +1423,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const entries = Object.entries(unresolved);
             if (entries.length > 0) {
                 const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
+                // #4632: schemes whose registry entry carries a note (deliberately
+                // blocked channels) get that note instead of the "wait for a
+                // re-signer" promise — for those, shipping one would be a
+                // deliberate circumvention, which we do not do.
+                const notes = entries.map(([scheme]) => KNOWN_SIGNATURE_SCHEMES[scheme]?.note).filter((n): n is string => n !== undefined);
+                const contractText = notes.length > 0
+                    ? `Per the compress-or-refuse contract they stay refused — no configuration can pass a signed body through unsigned.${notes.length < entries.length ? " Schemes without a note below wait for a re-signer from bili." : ""}`
+                    : "Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them — no configuration can pass a signed body through unsigned.";
                 log(
                     "warn",
                     `[resign] ${entries.length} signed request scheme(s) were refused earlier and remain UNRESOLVED: ${list}. ` +
-                        `Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them — no configuration can pass a signed body through unsigned. Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). ` +
-                        "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
+                        `${contractText} Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). ` +
+                        "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies." +
+                        (notes.length > 0 ? ` Scheme notes: ${[...new Set(notes)].join(" ")}` : ""),
                 );
             }
         }

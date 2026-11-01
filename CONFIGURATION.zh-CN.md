@@ -591,18 +591,20 @@
 ### `resign`
 
 - **类型：** `object` —— 按签名方案分键：`Record<方案, { enabled?, passthrough?, credentialRef? }>`,键 = 电线上检测到的签名方案 token(小写；内置:`"sdk-hmac-sha256"`；自定义:HMAC `Authorization` token 如 `"aws4-hmac-sha256"`,或 body 签名头名如 `"x-ofm-signature"`)
-- **默认值：** 内置 `"sdk-hmac-sha256"` 键开箱即用 —— `enabled: true`、`passthrough: false`、`credentialRef` *（未设置 —— 账号池发现）*；文件没提到的方案一律保持这些默认 —— 对**非内置方案**，这意味着本地 403 拒收，且持续有效直到 bili 补上该方案的重签器（二元契约，#2090）；见说明
+- **默认值：** 内置 `"sdk-hmac-sha256"` 键开箱即用 —— `enabled: true`、`passthrough: false`、`credentialRef` *（未设置 —— 账号池发现）*；文件没提到的方案一律保持这些默认 —— 对**非内置方案**，这意味着本地 403 拒收，且持续有效直到 bili 补上该方案的重签器（二元契约，#2090），**唯一例外**：服务方屏蔽经 bili 路由的流量、且条款禁止第三方拦截/重签的方案按策略**永久拒收**（今天：`x-ofm-signature`，#4632）；见说明
 - **状态：** ACTIVE
 - **说明：** #1884 重签臂的配置文件面（body 级签名；今天就是华为 CodeArts APIG 的 `SDK-HMAC-SHA256`）。检测是**形状判定**而非名字白名单（#2090）：任何命名了 HMAC 构造的 `Authorization` 方案 token，或以 `-signature` / `-content-sha256` 结尾的请求头，都把该请求标记为 body 已签名 —— 每个网关都自造一套头（dsh 免费模型插件就是 `x-ofm-signature`），封闭名单会不断漏掉新形状，变成静默的上游 401，并在别的插件界面里显示成「凭据无效」。接下来发生什么取决于 bili 能否重签该方案：
   - **内置方案且能解析出凭据**（dsh codearts 账号池）：零配置重签臂 —— 在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。内置键的默认值**就是**这套行为，所以按方案分键并不把这个字段做成华为特殊设计。
-  - **其他任何被检测到的方案**（SigV4、网关自造头）：bili 内部**既没有凭据来源，也没有重签器实现**，所以 bili **一律拒收**（owner 二元契约拍板，#2090：签名请求要么重签+压缩、要么拒绝，绝不无签名放行）。403 文案指明方案名并明说「目前没有任何配置能让这条链路工作」；每次拒收都会记进 state 目录下的 `resign-pending.json`（`~/.local/state/billion-context/`），此后每次启动 bili 都会打 `[resign] … UNRESOLVED` 横幅列出未解决项（dsh agent lane 在插件装载时也会警告），直到 bili 补上该方案的重签器。这些方案的 `passthrough` 设置**无效**——提醒只在分支被卸载（`enabled: false` / `BILI_RESIGN=0`，恢复 pre-resign 改写处理、上游大概率又 401）时自动清除。自 v0.1.186（#2260）起，这类死键还会在配置加载时被一条 `[acp-config]` 警告点名（同一死键集合只报一次），403 文案不再是唯一信号。
+  - **其他任何被检测到的方案**（SigV4、网关自造头）：bili 内部**既没有凭据来源，也没有重签器实现**，所以 bili **一律拒收**（owner 二元契约拍板，#2090：签名请求要么重签+压缩、要么拒绝，绝不无签名放行）。403 文案指明方案名并明说「目前没有任何配置能让这条链路工作」；每次拒收都会记进 state 目录下的 `resign-pending.json`（`~/.local/state/billion-context/`），此后每次启动 bili 都会打 `[resign] … UNRESOLVED` 横幅列出未解决项（dsh agent lane 在插件装载时也会警告），直到 bili 补上该方案的重签器 —— 或转为按策略永久拒收（屏蔽 bili 的服务方等不到重签器；见下文 `x-ofm-signature`）。这些方案的 `passthrough` 设置**无效**——提醒只在分支被卸载（`enabled: false` / `BILI_RESIGN=0`，恢复 pre-resign 改写处理、上游大概率又 401）时自动清除。自 v0.1.186（#2260）起，这类死键还会在配置加载时被一条 `[acp-config]` 警告点名（同一死键集合只报一次），403 文案不再是唯一信号。
 
   本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
   - `enabled: boolean` —— 该方案的开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
   - `passthrough: boolean` —— 对该方案的、无法重签的请求的原样转发。**仅对内置方案有效**（其拒收有用户侧修复——提供凭据——所以在不压缩直送上做显式选择是真实决策；#1884）。对其他任何方案该字段**无效**：按 #2090 二元契约，签名请求要么重签+压缩、要么拒绝，没有任何取值能把拒收变成放行。**键定死签名**：配置一个方案永远不会顺带放开另一个方案。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先（同样只影响内置方案）。
   - `credentialRef: string` —— 钉死重签用的 dsh credentials 服务 ref，而不是账号池发现。环境变量 `BILI_CODEARTS_REF` 优先。
 
-  已知方案注册表与可观测性：bili 自带 `sdk-hmac-sha256`（内置，#1884）、`aws4-hmac-sha256`、`hmac-sha256`、`x-ofm-signature`（#2090）的名称标签与出处。**登记是一种承诺而非能力**：按二元契约，每个已登记方案最终都必须在 bili 里补上重签器 —— 在此之前该方案被响亮拒绝（web UI 标记为「等待重签器」）；尚未注册的新方案由形状检测兜底，同样拒绝、绝不静默改写。待处理拒收、各方案实时状态与未解决集合可在 web UI（`/__bili/` → 配置 → 签名上游（resign））查看，或读回环限定的 `GET /__bili/resign`。
+  已知方案注册表与可观测性：bili 自带 `sdk-hmac-sha256`（内置，#1884）、`aws4-hmac-sha256`、`hmac-sha256`、`x-ofm-signature`（#2090）的名称标签与出处。**登记是一种承诺而非能力**：按二元契约，每个已登记方案最终都必须在 bili 里补上重签器 —— 在此之前该方案被响亮拒绝（web UI 标记为「等待重签器」）；尚未注册的新方案由形状检测兜底，同样拒绝、绝不静默改写。**有一类方案豁免此承诺**：服务方屏蔽经 bili 路由的流量、且条款禁止第三方拦截/重签的方案按策略**永久拒收** —— 其提醒携带说明与用户选项，而非重签器承诺（今天：`x-ofm-signature`，#4632；见下）。待处理拒收、各方案实时状态与未解决集合可在 web UI（`/__bili/` → 配置 → 签名上游（resign））查看，或读回环限定的 `GET /__bili/resign`。
+
+  **`x-ofm-signature`（dsh 免费模型插件，EAC 渠道）—— 按策略永久拒收（#4632）：** 服务方屏蔽经 bili 路由的该渠道流量，且其条款不允许第三方代理拦截或重签这些请求。因此 bili **有意不**为其提供重签器 —— 这里的登记含义是「永久拒收且响亮说明」，不是「等待中」。每条拒收消息、启动横幅、dsh 插件日志与 web UI 卡片都携带说明与你的选项：保留 bili（该渠道响亮拒收，profile 里其余模型照常压缩）；从 dsh profile 移除 billion-context 插件（`bili plugin remove dsh`），改为只把想压缩的模型经 `/bili/` 前缀路由（其 base URL 改为 `http://localhost:8787/bili/<上游>`，免费模型端点保持直连，运行 `bili start`）——该渠道恢复直连且签名有效、其余照常压缩；移除插件且不换路由（整个 profile 直连、无压缩）；或服务方出官方 bili 兼容模式。**不要**用 `resign["x-ofm-signature"].enabled: false` / `BILI_RESIGN=0` 去「修」它 —— 那会恢复 pre-resign 改写行为，等于向一个本来就屏蔽你的服务方发验签必失败的请求（账号风险、零收益）。立场声明：本项目不支持违反他人协议的软件；针对该方案的兼容处理只为了让你的其余链路能用上 bili。
 
   内置（CodeArts）前置条件与临时缓解：`sdk-hmac-sha256` 的重签 arm 由 bili 自己的 dsh native lane 注入 —— 它遍历 `$DSH_HOME/jet-hub/state.json`（Windows 默认 `%USERPROFILE%\.dsh\jet-hub\state.json`）中 `provider: "codearts"` 且未 `enabled: false` 的账号，用宿主凭据服务（必须暴露给 native 插件）逐个解析账号的 `credentialRef`，取第一个能解析出 `{access_key_id, secret_access_key}` 的。如果你的宿主版本缺了其中任何一环（例如某个 DSH 构建不再注入凭据服务、或状态文件布局变更），所有签名请求都会被拒收为 `bili_resign_unavailable`——即使凭据本身有效；这是宿主侧缺口而非 bili 配置错误，最低 DSH 版本随宿主跟踪、不在此钉死。升级宿主之前，`BILI_RESIGN_PASSTHROUGH=1` 可让 codearts 链路字节原样直通（仅内置方案，不压缩）。注意拒收消息打印的配置路径与配置加载器读取用的是同一个函数计算出的精确解析路径，按报错里写的文件改总是对的。
 
@@ -612,7 +614,8 @@
   {
     "resign": {
       "sdk-hmac-sha256": { "passthrough": true },
-      "aws4-hmac-sha256": { "passthrough": true } // 非内置方案无效（#2090）——配置加载时会被点名
+      "aws4-hmac-sha256": { "passthrough": true }, // 非内置方案无效（#2090）——配置加载时会被点名
+      "x-ofm-signature": { "passthrough": true } // 无效且无意义 —— 服务方屏蔽 bili 经此渠道的流量；按策略永久拒收（#4632）
     }
   }
   ```
