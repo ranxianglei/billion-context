@@ -429,9 +429,13 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
 
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
- *  conversation not seen yet" — an armed-but-idle state, not an error. */
-export async function fetchProxyVersion(proxyBase: string): Promise<string | undefined> {
-    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, STATUS_TIMEOUT_MS);
+ *  conversation not seen yet" — an armed-but-idle state, not an error.
+ *  #5167: `init` lets callers send Connection: close so the probe rides a
+ *  FRESH connection — the drain-aware rotation wait relies on it (a pooled
+ *  keep-alive socket keeps being answered by a resident that already closed
+ *  its listener and is merely draining, which reads as a false "alive"). */
+export async function fetchProxyVersion(proxyBase: string, init?: RequestInit): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;
     const m = json as { version?: unknown; commit?: unknown };
     const version = m.version;

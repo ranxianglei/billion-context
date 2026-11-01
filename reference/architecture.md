@@ -33,7 +33,8 @@ billion-context/
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
-│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941)
+│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
+│   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)
@@ -76,6 +77,7 @@ billion-context/
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
+│   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
 │   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
@@ -104,6 +106,8 @@ billion-context/
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
+│   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)
+│   ├── session-resolve.ts        # #2944 order-primary persona resolver (skeleton + fork lanes)
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
@@ -136,6 +140,7 @@ billion-context/
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)
 │   ├── pi-channel.ts             # pi npm-copy self-refresh spec form
 │   ├── claude-native-bootstrap.ts # Claude native bootstrap hook entry
+│   ├── claude-subagent-hook.ts  # Claude SubagentStart hook: mint per-dispatch lane token (#5095)
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time env injection)
 │   ├── loop/                     # Unified compress loop (wire-independent core)
 │   │   ├── index.ts              #   Stream-failure presentation options (#1455)

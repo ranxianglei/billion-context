@@ -2,12 +2,12 @@ import { defaultCountTokens, orderedRefPair } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
-import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
+import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
-import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
+import { resolveBillingPrice, savedUsdFromFolds, validCostUsd } from "../billing.js";
 
 /** Shape of a resolved price row — taken via ReturnType so this module never
  *  couples to billing.ts's internal export surface (see #4916 unused-export
@@ -343,11 +343,9 @@ type DiskEntry = {
     summary: WebSessionSummary | null;
 };
 
-let diskStore: SessionStore | null = null;
-function getDiskStore(): SessionStore {
-    if (!diskStore) diskStore = new SessionStore({ enabled: true });
-    return diskStore;
-}
+// #4990: read surface rides the persist process singleton (getStore) — a
+// locally-constructed SessionStore re-ran the open-time path (integrity
+// check, lockfile, migration, checkpoint) on the live main thread.
 
 let byFile: Map<string, DiskEntry> | null = null;
 let byId: Map<string, string> | null = null;
@@ -489,7 +487,7 @@ function isPristineSessionsRoot(error: unknown): boolean {
 async function refreshIndex(): Promise<void> {
     if (scanInFlight) return scanInFlight;
     const run = (async () => {
-        const store = getDiskStore();
+        const store = getStore();
         const dir = store.dir;
         let files: Array<{ abs: string; mtimeMs: number; size: number }>;
         try {
@@ -585,20 +583,20 @@ function ensureIndex(): Promise<Map<string, DiskEntry>> {
     return refreshIndex().then(() => byFile!);
 }
 
-/** Test hooks: reset the index (memo + store singleton — its dir was resolved
- *  at construction, so a changed BILI_SESSIONS_DIR needs a fresh one) and read
- *  decode accounting (decodedTotal = index-scan decodes, detailDecodes = lazy
- *  single-file detail loads — together the structural proof that steady-state
- *  scans cost zero decodes and a detail never re-scans, #1937). */
+/** Test hooks: reset the index (memo + the persist store singleton it rides —
+ *  its dir was resolved at construction, so a changed BILI_SESSIONS_DIR needs a
+ *  fresh one, #4990) and read decode accounting (decodedTotal = index-scan
+ *  decodes, detailDecodes = lazy single-file detail loads — together the
+ *  structural proof that steady-state scans cost zero decodes and a detail
+ *  never re-scans, #1937). */
 export function _resetDiskCacheForTest(): void {
-    // Close before nulling — in unified modes the singleton holds an index.db
-    // handle that would leak past rmSync on Windows (the #2690 review-4 class).
-    diskStore?.closeQuietly();
+    // Closes the store before nulling it — in unified modes the singleton holds
+    // an index.db handle that would leak past rmSync on Windows (#2690 review-4).
+    _resetStoreForTest();
     byFile = null;
     byId = null;
     resolvedPristine = false;
     scanInFlight = null;
-    diskStore = null;
     decodeCount = 0;
     detailDecodes = 0;
     detailInFlight.clear();
@@ -633,18 +631,6 @@ function num(v: unknown, fallback = 0): number {
 
 function str(v: unknown): string | undefined {
     return typeof v === "string" && v.length > 0 ? v : undefined;
-}
-
-/** #4899: validate the persisted USD ledger blob — metadata/stats are
- *  user-editable JSON, so only finite non-negative fields survive; anything
- *  else reads as "no ledger" instead of poisoning the display. */
-function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
-    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
-    const o = v as Record<string, unknown>;
-    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
-    const input = f(o.input), cacheRead = f(o.cacheRead), cacheWrite = f(o.cacheWrite), output = f(o.output);
-    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
-    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
 /** #4899 v2 (owner design): the dollar faces of the panel are a DERIVED VIEW.
@@ -1040,8 +1026,8 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
     // decoded; ghost rows dropped because only files produce entries). Legacy
     // keeps the plain bounded file walk.
     let fromRows = false;
-    if (getDiskStore().webSummaryBaseline() === "authoritative") {
-        const rows = getDiskStore().unifiedWebSummaries();
+    if (getStore().webSummaryBaseline() === "authoritative") {
+        const rows = getStore().unifiedWebSummaries();
         if (rows !== null) {
             for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
             fromRows = true;
@@ -1296,13 +1282,14 @@ const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
 async function loadSessionById(id: string): Promise<{ session: Session; live: boolean } | null> {
     const live = listSessions().find((s) => s.id === id);
     if (live) return { session: live, live: true };
-    const synced = getDiskStore().loadSync(id);
+    // #4942: async seam — DB-only sessions are invisible to the sync facade.
+    const synced = await getStore().loadAsync(id);
     if (synced) return { session: synced, live: false };
     const files = await ensureIndex();
     const abs = byId?.get(id);
     if (abs && files.has(abs)) {
         detailDecodes++;
-        const decoded = await getDiskStore().loadSessionFromFile(abs, id);
+        const decoded = await getStore().loadSessionFromFile(abs, id);
         if (decoded) return { session: decoded, live: false };
     }
     return null;
@@ -1444,7 +1431,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             }
         }
         if (pending.length > 0) {
-            const rows = getDiskStore().unifiedMessageContentByRefs(session.id, pending);
+            const rows = getStore().unifiedMessageContentByRefs(session.id, pending);
             for (const row of rows ?? []) {
                 const text = storedMessageText(row.content);
                 if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
@@ -1723,7 +1710,7 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
         const num = /^m(\d+)$/.exec(ref);
         if (typeof raw === "string" && num) {
             try {
-                const rows = getDiskStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                const rows = getStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
                 const row = rows && rows.length > 0 ? rows[0] : undefined;
                 const stored = row ? storedMessageText(row.content) : null;
                 if (row && stored !== null) {

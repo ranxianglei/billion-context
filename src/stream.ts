@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
+import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -482,13 +483,44 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
 // char length plus head/tail excerpts (newlines flattened to spaces) so the
 // model can verify its summary was stored intact without decompressing.
-export function summaryFingerprintLine(blockId: string, summary: string): string {
+export function summaryFingerprintLine(blockId: string, summary: string, range?: { startTs: number; endTs: number } | null): string {
     // #1615: code-unit cuts can split a surrogate pair and the lone half
     // breaks upstream JSON parsing of the whole body — clamp + scrub (#816
     // family, third site; never slice model-visible text by hand again).
     const head = scrubLoneSurrogates(safePrefix(summary, 30).replace(/\r?\n/g, " "));
     const tail = scrubLoneSurrogates(safeSuffix(summary, 100).replace(/\r?\n/g, " "));
-    return ` · ${blockId} full summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
+    // #4313: the covered window's local time span, appended deterministically
+    // from STORED stamps (state.tsStamps) — never a wall-clock read here.
+    const span = range ? ` [${formatTagTime(range.startTs)} – ${formatTagTime(range.endTs)}]` : "";
+    return ` · ${blockId} full summary ${summary.length}ch${span} · head "${head}" … tail "${tail}"`;
+}
+
+/** #4313: resolve a block's covered time window from the persisted first-sight
+ *  stamps (tokenSnapshot discipline). ALL covered ids — the effective message
+ *  ids plus any resolvable boundary refs (bN-shaped boundary specs are not
+ *  raw ids and simply don't resolve) — must carry a stamp; one unknown time
+ *  anywhere in the coverage voids the range instead of silently narrowing it
+ *  (a range that starts late would claim events happened later than they
+ *  did). The receipt then keeps its pre-feature format. */
+export function blockCoverageTimes(block: CompressionBlock, state: CompressionState): { startTs: number; endTs: number } | null {
+    const stamps = state.tsStamps;
+    if (!stamps) return null;
+    let lo: number | undefined;
+    let hi: number | undefined;
+    const covered: Array<{ id: string; ts?: number }> = [];
+    const consider = (id: string | undefined | null) => {
+        if (!id || covered.some((e) => e.id === id)) return;
+        covered.push({ id, ts: stamps[id] });
+    };
+    for (const id of block.effectiveMessageIds) consider(id);
+    consider(block.startRef ? state.messageRefs.byRef[block.startRef] : undefined);
+    consider(block.endRef ? state.messageRefs.byRef[block.endRef] : undefined);
+    for (const { ts } of covered) {
+        if (typeof ts !== "number") return null; // never invent / narrow a range
+        if (lo === undefined || ts < lo) lo = ts;
+        if (hi === undefined || ts > hi) hi = ts;
+    }
+    return lo !== undefined && hi !== undefined ? { startTs: lo, endTs: hi } : null;
 }
 
 // #1718: log-safe variant of the fingerprint line. Summaries are
@@ -588,7 +620,9 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         let nudge: NudgeDecision | undefined;
         try {
             const turn = ctx.core.processTurn({
-                messages: ctx.messages,
+                // #5139: same view-class fix as liveCompressionRanges — outbound-only
+                // markers must not endpoint ranges screened against the apply view.
+                messages: withoutTurnSeparators(ctx.messages),
                 state: ctx.session.state,
                 config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
                 tokenCount: statusInputBaseline(ctx.session),
@@ -807,7 +841,11 @@ export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionS
         if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
         let parsed: ReturnType<typeof parseCompressInput>;
         try {
-            parsed = parseCompressInput(m.text);
+            // #5161: quiet — this scan re-parses past calls on every fold; in
+            // external-summary mode their summary-less entries are schema-legal,
+            // so per-call rejection warns were pure false noise (the scan only
+            // needs the summaries that DO parse).
+            parsed = parseCompressInput(m.text, undefined, { quiet: true });
         } catch {
             continue;
         }
@@ -858,12 +896,14 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
  *  Refusal only when an endpoint is a superseded key whose translation
  *  dead-ends (the message lost its mapping entirely — an honest stale cite).
  *
- *  Transitional honesty: for sessions restamped by kernels WITHOUT the
- *  superseded-liveness prune, case 1 can in principle swallow a resent
- *  pre-restart call's intent (number now owned by someone else). The replay
- *  window is seconds; the deadlock it replaces is permanent — live-first is
- *  the right trade, and the kernel prune removes the ambiguity entirely for
- *  fresh restamps. */
+ *  Transitional honesty: sessions whose restamp predates kernel #5196's
+ *  slot-retirement may still carry an ambiguity — a number restamped over a
+ *  live occupant, so case 1 can in principle swallow a resent pre-restart
+ *  call's intent. #4807 (#4797) traded that seconds-long replay window
+ *  against a permanent deadlock; live-first keeps that trade. Kernels from
+ *  #5196 onward retire every seat a mover vacates into its own seq+1, so no
+ *  freshly stamped number ever names two messages and case 1 can never
+ *  mis-engage on such data. */
 interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
@@ -1184,6 +1224,26 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
 
         if (r.blocksCreated === 0) {
+            // #4521: the idempotent no-op class — kernel folded nothing because
+            // there was nothing left to fold (every range already covered, or
+            // entirely inside the protected zone), and that is NOT a failure:
+            // no breaker arm, no loop-guard streak, success-shaped receipt.
+            // This was the dominant "compression FAILED, retry, FAILED again"
+            // driver on long sessions (live incident: session 01a18a4d, 4
+            // consecutive refusals 20:09 over ranges that were 100% legal).
+            if (r.errors.length === 0) {
+                const warnText = r.warnings.length > 0 ? r.warnings.join(" ") : "every requested range was already folded or protected.";
+                ctx.log(`[acp-proxy: compress no-op ${detail} → 0 blocks (nothing left to fold; nothing failed)]`);
+                // Reuse the failure-path recovery hint verbatim: a model that
+                // keeps aiming at covered/protected ranges needs the live
+                // pointer (eligible ranges, distillation target, or the explicit
+                // stop wording) — without it the no-op receipt says "do not
+                // resend" but never says what TO do, which is how the retry
+                // loops persisted (#4521). eligibilityFailure stays guarded by
+                // compressionRecovery itself (never a guessed span).
+                const recovery = compressionRecovery(ctx);
+                return compressResult(`[Compression no-op: nothing was folded and nothing failed — ${warnText}${recovery.hint} Continue your current task.]`, "applied", 0, "noop");
+            }
             const errs = r.errors.join("; ") || "no blocks created";
             // #2362: machine-readable failure class for the [plugin] execution
             // line — outcome=refused alone never says why in the logs.
@@ -1383,9 +1443,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return prev === undefined || prev !== b.summary;
         });
         syncSubagentSessions(ctx.session, changedBlocks, ctx.compressMessages ?? ctx.messages);
+        // #4313 toggle (PR #5236): the [start – end] coverage span rides the
+        // same flag as the wire tags — default OFF keeps receipts byte-identical
+        // to pre-feature master. Storage still stamps unconditionally; this only
+        // gates the display span.
+        const messageTimestampsOn = resolveMessageTimestamps(loadConfigFile().compress);
         const subagentMap = subagentSessionsOf(ctx.session);
         for (const b of changedBlocks) {
-            msg += `\n${summaryFingerprintLine(b.blockId, b.summary)}`;
+            msg += `\n${summaryFingerprintLine(b.blockId, b.summary, messageTimestampsOn ? blockCoverageTimes(b, res.state) : null)}`;
             logMsg += `\n${summaryFingerprintLogLine(b.blockId, b.summary)}`;
             const ids = subagentMap[b.blockId];
             if (ids !== undefined && ids.length > 0) {

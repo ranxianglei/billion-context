@@ -62,11 +62,27 @@ export class BoundaryNotFoundError extends Error {
   }
 }
 
+/** #5337 option A: one O(n) raw-id -> index map over a message array. Built
+ *  once per screening pass (many units share it) instead of once per unit,
+ *  which was one of the O(n) terms multiplied by the unit count. Duplicate
+ *  ids resolve to their LAST position — same as the per-call maps replaced. */
+export function buildIndexByMessageId(
+  messages: readonly CoreMessage[],
+): Map<string, number> {
+  const byId = new Map<string, number>();
+  messages.forEach((message, index) => byId.set(message.id, index));
+  return byId;
+}
+
 export interface ResolveBoundariesInput {
   startRef: string;
   endRef: string;
   messages: CoreMessage[];
   state: CompressionState;
+  /** #5337 option A: prebuilt raw-id -> index map over EXACTLY `messages`
+   *  (screening screens many units against one array — build once per pass).
+   *  Omitted callers build one here as before. */
+  indexByMessageId?: Map<string, number>;
 }
 
 export interface ResolvedRange {
@@ -91,10 +107,8 @@ export function resolveBoundaries(
     );
   }
 
-  const indexByMessageId = new Map<string, number>();
-  input.messages.forEach((message, index) =>
-    indexByMessageId.set(message.id, index),
-  );
+  const indexByMessageId =
+    input.indexByMessageId ?? buildIndexByMessageId(input.messages);
 
   let snappedBoundaries: string[] = [];
   const startAnchor = resolveAnchorIndex(
@@ -216,6 +230,28 @@ function resolveAnchorIndex(
       // hole (pruned or skipped) and must not be read as cross-session.
       const highest = highestUsedIndex(state.messageRefs);
       if (boundary.numericId > highest) {
+        // #4521: an endId above the highest allocated ref is the model aiming
+        // at "the newest tail" without knowing where it ends — the single most
+        // common compress failure on long sessions (it cannot see refs minted
+        // after the last banner). START anchors keep the hard refusal (a
+        // cross-generation start ref is a real targeting error), but the END
+        // anchor clamps down to the highest visible message: the range still
+        // folds everything the model meant ("up to now"), and the snapped note
+        // teaches the correct ceiling for next time.
+        if (endpoint === "end") {
+          const neighbor = snapToNeighborVisible(
+            state,
+            indexByMessageId,
+            boundary.numericId,
+            endpoint,
+          );
+          if (neighbor !== null) {
+            return {
+              index: neighbor,
+              snapped: `${label}="${boundary.raw}" is above this session's highest allocated ref (${highest > 0 ? formatPaddedRef(highest) : "none"}) — clamped to it (refs are minted in order and never pre-allocated, so higher numbers do not exist yet). The range folds up to the last visible message.`,
+            };
+          }
+        }
         throw new BoundaryNotFoundError(
           "unknown",
           endpoint,

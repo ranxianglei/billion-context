@@ -408,6 +408,24 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** #4313 (PR #5236; default-on follow-up): stamp each message with its
+     *  immutable local time-of-occurrence and render it in the <acp> tag
+     *  (`time="..."`) — DEFAULT ON since the leak-audit follow-up: stamps are
+     *  deterministic render inputs, so on-by-default costs nothing beyond ONE
+     *  frozen-prefix rewrite per active session at the enabling restart.
+     *  Set `false` to reproduce the pre-#4313 wire bytes exactly (no time
+     *  attribute, original prompt texts, no fingerprint span). The env override
+     *  BILI_MESSAGE_TIMESTAMPS wins over this file value (any defined non-"0"
+     *  value enables it; "0" forces pre-feature bytes even against an explicit
+     *  true). Resolved ONCE per proxy instance at engine creation (#394
+     *  single-instance assumption — no per-session fork), so changing it
+     *  mid-run requires a restart; storage stamps are written regardless of the
+     *  flag, so opting in later renders full history times. Global level only
+     *  (provider/model overrides are ignored for display, mirroring how the
+     *  gate flows into one shared CompressionCore). NOTE:
+     *  tests/preload-test-env.mjs pins the display gate OFF for the suite,
+     *  keeping byte-comparing baselines on pre-feature wire bytes. */
+    messageTimestamps?: boolean;
      /** Force preflight summarization calls to use streaming (SSE) instead of
       *  the default non-stream call (#2133). The error-driven self-learn flag
       *  (`session.metadata.preflightStreamSummary`) fires on any 400 from a
@@ -587,7 +605,16 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-type PromptCacheRouting = "auto" | "enabled" | "disabled";
+/** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
+ *  (chat-wire conversation-id stamping, Responses-wire identity injection).
+ *  Keys the client/host sent are ALWAYS forwarded verbatim — this switch only
+ *  gates bili's own emission. `"disabled"` (default since #5079) never writes
+ *  one; many upstreams ignore or flat-out reject the field. `"auto"` is the
+ *  pre-#5079 behavior (stamp on the internal plugin lane; inject toward
+ *  api.openai.com on Responses); `"enabled"` injects/stamps wherever the code
+ *  supports it. The #2645 A/B probe-and-remember ablation still withholds the
+ *  key per origin+model once a real 400 proves rejection, in every mode. */
+export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -2139,12 +2166,19 @@ type FileConfig = {
      *  `warmMax` caps how many most-recently-saved sessions boot hydrates
      *  before listening, `warmMaxBytes` its decoded-byte budget (a single file
      *  over the budget is never warmed), `residentMaxBytes` the soft target for
-     *  estimated resident session bytes (active/in-flight state stays pinned). */
+     *  estimated resident session bytes (the process-wide POOL ceiling — evicts
+     *  whole cold sessions, active/in-flight state stays pinned), and
+     *  `hardMaxBytes` the per-SESSION hard cap (#4788 D1-A): when ONE session's
+     *  estimated resident weight exceeds it, the next request-end boundary
+     *  force-drops its droppable fields back to disk — including sessions exempt
+     *  from pool eviction. Surviving bytes re-materialize via narrow disk reads.
+     *  Default: same value as `residentMaxBytes` above. */
     sessions?: {
         max?: number;
         warmMax?: number;
         warmMaxBytes?: number;
         residentMaxBytes?: number;
+        hardMaxBytes?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
     /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
@@ -2279,7 +2313,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
@@ -2627,6 +2661,29 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     return undefined;
 }
 
+/** #4313 (PR #5236; default-on follow-up): global message-timestamp display gate.
+ *  BILI_MESSAGE_TIMESTAMPS follows BILI_RESIGN semantics — defined and not
+ *  "0" enables; any other value disables even against an explicit file true;
+ *  unset ⇒ file `compress.messageTimestamps !== false`; default TRUE —
+ *  first-sight immutable stamps are deterministic render inputs (never wall
+ *  clock at render time), so bytes stay stable turn over turn; the leak audit
+ *  on live sessions showed identical hit-rates with the flag on vs off.
+ *  Upgrading users pay ONE frozen-prefix rewrite per active session at the
+ *  restart after which the flag first resolves true, then stable.
+ *  Opt-out: file `compress.messageTimestamps: false` or env "0" keeps every
+ *  byte identical to pre-#4313 master. GLOBAL level only: provider/model
+ *  settings are ignored because the gate flows into one shared CompressionCore
+ *  + prompt exits resolved at engine creation (#394 single-instance
+ *  assumption). Storage-layer stamping (v10 ts column, ledger rows) runs
+ *  regardless of this flag, so opting in later renders full history times.
+ *  NOTE: tests/preload-test-env.mjs pins the display gate OFF for the whole
+ *  suite so byte-comparing baselines keep their pre-feature wire bytes. */
+export function resolveMessageTimestamps(fileCompress?: CompressSettings, env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_MESSAGE_TIMESTAMPS;
+    if (raw !== undefined) return raw !== "0";
+    return fileCompress?.messageTimestamps !== false;
+}
+
 /** #1660: explicit override of the zcode lane's port (env only — the store
  *  is re-derived at every bootstrap, nothing is baked at install time).
  *  Defined means a strict-port launch; undefined means the lane's sticky
@@ -2909,7 +2966,16 @@ function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
-    return value === "enabled" || value === "disabled" ? value : "auto";
+    // #5079: absent/unknown falls back to "disabled" (was "auto") — self-stamping is opt-in now;
+    // explicit "auto" keeps its pre-#5079 meaning so existing configs migrate unchanged.
+    return value === "auto" || value === "enabled" || value === "disabled" ? value : "disabled";
+}
+
+export function effectivePromptCacheRouting(promptCache: { routing?: string } | undefined): PromptCacheRouting {
+    // Partial ServerOptions (hand-built test harnesses, sub-lane constructions) may omit the
+    // promptCache section entirely — fall back exactly like parsePromptCacheRouting(undefined);
+    // never crash on a missing section mid-request or at startup.
+    return parsePromptCacheRouting(promptCache?.routing);
 }
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
@@ -3032,6 +3098,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("messageTimestamps" in obj) {
+        if (typeof obj.messageTimestamps !== "boolean") ok = false;
+        else out.messageTimestamps = obj.messageTimestamps;
     }
     if ("streamSummary" in obj) {
         if (typeof obj.streamSummary !== "boolean") ok = false;

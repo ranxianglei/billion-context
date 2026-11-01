@@ -7,6 +7,10 @@ import { isProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 interface OwnerProbeInfo {
     pid?: number;
     instanceId?: string;
+    /** #4125: build version reported by /__bili/health — lets a challenger
+     *  identify a STRICTLY NEWER same-lane holder from a live health answer
+     *  (upward adoption); a busy/silent holder reports nothing. */
+    version?: string;
     /** Negative attribution: responder is up but pre-registration (#2941
      *  readiness gate) — see findForeignOwner for the handling. */
     reason?: string;
@@ -57,11 +61,12 @@ export async function probeOwnerInfo(
             if (neg.ok === false && typeof neg.reason === "string") return { reason: neg.reason };
             return undefined;
         }
-        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown };
+        const data = (await res.json()) as { ok?: unknown; pid?: unknown; instanceId?: unknown; version?: unknown };
         if (data.ok !== true) return undefined;
         const info: OwnerProbeInfo = {};
         if (typeof data.pid === "number" && Number.isInteger(data.pid) && data.pid > 0) info.pid = data.pid;
         if (typeof data.instanceId === "string" && data.instanceId !== "") info.instanceId = data.instanceId;
+        if (typeof data.version === "string" && data.version !== "") info.version = data.version;
         return info;
     } catch {
         return undefined;
@@ -206,4 +211,49 @@ function sameAddress(a: string, b: string): boolean {
     } catch {
         return false;
     }
+}
+
+// ── #4762: terminal-EADDRINUSE holder diagnosis ─────────────────────────────
+// A wedged proxy (event loop blocked, socket still open) holds its port while
+// serving nothing. Registry entries still look alive (the pid exists) and a
+// shallow probe can drain intermittently, so the twin rule can mistake a
+// zombie for a healthy peer and the dying child exits claiming "the serving
+// instance keeps serving" — when nothing is being served. One bounded probe at
+// the moment of death distinguishes the two and names the actionable pid.
+
+export const HOLDER_PROBE_TIMEOUT_MS = 2_000;
+
+/** Wildcard bind hosts are probed through loopback instead. */
+export function holderProbeOrigin(host: string, port: number): string {
+    const h = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+    return `http://${h}:${port}`;
+}
+
+/** Pure hint composition for the terminal EADDRINUSE log line — the probe
+ *  result is already resolved, so tests need no live socket. */
+export function holderHintFragment(serving: boolean, holderPid?: number): string {
+    if (serving) {
+        return `existing listener answered /__bili/health${holderPid !== undefined ? ` (pid ${holderPid})` : ""} — it IS serving; this process exits as the duplicate and the spawner should attach to it`;
+    }
+    const remedy = holderPid !== undefined
+        ? `kill it to free the port (Windows: taskkill /PID ${holderPid}; Linux/macOS: kill ${holderPid})`
+        : "identify its owner (e.g. netstat/lsof on the port) and kill it";
+    return `existing listener did NOT answer /__bili/health within ${Math.round(HOLDER_PROBE_TIMEOUT_MS / 1000)}s — it appears wedged or dead (holding the port without serving); ${remedy}. A spawner that keeps hitting EADDRINUSE should kill that pid and retry instead of looping forever (#4762)`;
+}
+
+/** Probe the current holder of a just-lost port and compose the diagnostic
+ *  fragment. Never throws — a failed probe simply reads as "not serving". */
+export async function probeHolderForHint(params: {
+    origin: string;
+    /** Registry-attributed pid of the holder (may be stale); the live
+     *  responder's pid wins when both exist. */
+    knownPid?: number;
+    fetchImpl?: HealthFetcher;
+    timeoutMs?: number;
+}): Promise<string> {
+    const info = await probeOwnerInfo(params.origin, params.fetchImpl, params.timeoutMs ?? HOLDER_PROBE_TIMEOUT_MS);
+    // reason:"starting" is our OWN pre-registration state — unreachable here
+    // (we never bound), but treat any non-ok responder as not-serving anyway.
+    const serving = info !== undefined && info.reason === undefined;
+    return holderHintFragment(serving, info?.pid ?? params.knownPid);
 }

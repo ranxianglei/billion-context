@@ -10,8 +10,41 @@
 ```bash
 npm run build          # tsup bundle (inlines acp-kernel)
 npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
-npm test               # node --import tsx --test tests/*.test.ts
+npm test               # scripts/test-suite-lock.mjs run → node --import <preloads> --test tests/*.test.ts
 ```
+
+## Test-runner preload: storage baseline + dir sandbox
+
+Every suite entry point (`npm test` via `scripts/test-suite-lock.mjs`, CI via
+`scripts/run-ci-tests.mjs`) loads `tests/preload-storage-baseline.mjs` before
+the tests. It does two things:
+
+1. `BILI_STORAGE_UNIFIED ??= "legacy"` — keeps the broad wire/e2e corpus on
+   the legacy storage baseline (the storage family pins and overrides its own
+   modes; see the preload header, #2815).
+2. **Default-dir sandbox** — `XDG_DATA_HOME` / `XDG_STATE_HOME` /
+   `XDG_CACHE_HOME` are pointed at a per-run temp tree (`$TMPDIR/bili-test-dirs-*`)
+   unless already set. A suite that builds a store or server without pinning a
+   directory otherwise resolves through the XDG defaults straight into your
+   REAL `~/.local/{share,state,cache}/billion-context` — envelopes, index.db
+   rows, and state bookkeeping land beside production data (found while
+   triaging #5082: a local run of `tests/anthropic-cache-control.test.ts`
+   wrote `sess-1639-*` rows and `sessions/anthropic/127.0.0.1_*` envelopes
+   into the live sessions dir). Tests that pin their own `XDG_*` are
+   unaffected (`||=` — empty counts as unset, matching the lock script's XDG
+   handling); set the three vars yourself to deliberately run against real
+   machine state. The contract is pinned by `tests/preload-sandbox-dirs.test.ts`.
+
+Targeted runs inherit the same protection when you include the preload in the
+loader chain (recommended form for local single-file runs):
+
+```bash
+node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/<area>.test.ts
+```
+
+A bare `node --import tsx --test ...` still works (the storage family pins its
+own dirs), but any suite that relies on DEFAULT path resolution will write
+into your real machine state — prefer the preload chain.
 
 ## CI: test schedule (#2816)
 
@@ -50,6 +83,37 @@ denominator together (they must stay equal).
 The `static-gates` job (same os×node matrix) runs typecheck + kernel suite +
 pi-subagents suite + build IN PARALLEL with the `test` job; they used to be
 sequential steps ahead of the tests (~90s of critical path per leg).
+
+## Hermetic data roots (#5107)
+
+Running the suite on a machine that also has bili installed must never touch
+the developer's real data tree. Two layers enforce this:
+
+1. **Preload redirect** — `tests/preload-test-env.mjs` (wired into
+   `scripts/test-suite-lock.mjs`, `scripts/run-ci-tests.mjs`, and the
+   `test:e2e*` npm scripts as an `--import`) points every test process'
+   ambient roots at a per-process temp dir: `BILI_SESSIONS_DIR`,
+   `BILI_CONFIG_FILE` (absent config), and all four XDG homes. Each test FILE
+   runs in its own process, so each gets its own root — parallel shards never
+   collide, and the OS tmp cleanup discards them. Per-test isolation
+   (`_setStoreForTest`, mkdtemp dirs, explicit env) still wins; the preload
+   only replaces the ambient default, so a test that forgets isolation
+   degrades to a throwaway root instead of the production tree.
+2. **Leak guard** — `npm test` (via `scripts/test-suite-lock.mjs run`)
+   snapshots the PRODUCTION sessions dir (`BILI_SESSIONS_DIR` →
+   `$XDG_DATA_HOME/billion-context/sessions` → `~/.local/share/…`, resolved
+   from the wrapper's pre-isolation env) before the run and diffs after: NEW
+   files fail the suite, modified pre-existing files only warn (a concurrently
+   live bili instance can touch its own sessions). Escape hatch for the
+   false-positive case: `BILI_TEST_LEAK_GUARD=0 npm test`
+   (reference/env-vars.md).
+
+Bare targeted runs outside `npm test` do NOT load the preloads on their
+own — carry them explicitly or they resolve the real default roots:
+
+```bash
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/<file>.test.ts
+```
 
 ## Local Testing & Install
 
