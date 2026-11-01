@@ -44,7 +44,7 @@ export const WIRE_RULES: readonly WireRule[] = [
         id: "WC-018",
         wire: "google",
         summary:
-            "Vertex rejects a request whose user content carries plain (unsigned, non-thought) text AFTER a functionResponse part — 400 'Requests ending with a model turn are not supported'; text-before-functionResponse is accepted. bili normalizes user-side part order at both boundaries: coreToGoogle's flushUser and appendGoogleNudge (stable partition of movable plain text ahead of non-text parts; signed/thought parts never move)",
+            "Vertex rejects a request whose user content carries plain (unsigned, non-thought) text AFTER a functionResponse part — 400 'Requests ending with a model turn are not supported'; text-before-functionResponse is accepted. bili normalizes user-side part order at both boundaries: coreToGoogle's flushUser and appendGoogleNudge (stable partition of movable plain text ahead of non-text parts; signed/thought parts never move) — EXCEPT for Claude-family targets routed through Google's v1internal/Cloud Code wire, whose Anthropic backend requires the OPPOSITE tool_result-first order, so the normalize is skipped when the target model matches /claude/i (#5392)",
         provenance:
             "bili #3159 production 400 (dsh-vertex-argon 1.1.4 / DSH 0.2.0-rc.2 over billion-context 0.1.196, official Vertex endpoint, gemini-4-argon generateContent): after a successful tool call the next request 400'd because Bili appended a plain-text nudge AFTER the trailing functionResponse part. Controlled A/B matrix on the official endpoint (issue table, 2026-10-14): [functionResponse]→200, [functionResponse, text]→400, [text, functionResponse]→200. The Gemini Developer API accepts both orders — the strictness is Vertex-specific.",
     },
@@ -504,14 +504,18 @@ export function validateCodexResponsesWsCreate(body: unknown): string[] {
 }
 
 /** WC-006, WC-018 on a Gemini generateContent/streamGenerateContent body. */
-function validateGoogleBody(body: unknown): string[] {
+function validateGoogleBody(body: unknown, model?: string): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     // WC-018: Vertex rejects a request whose user content carries plain
     // (unsigned, non-thought) text AFTER a functionResponse part — 400
     // "Requests ending with a model turn are not supported" (#3159). Runs
     // before the tools early-return like every other contents-level rule.
-    if (Array.isArray(body.contents)) {
+    // #5392: skipped for Claude-family targets — their Anthropic-behind-Google
+    // backend needs the OPPOSITE order (tool_result-first), which is exactly the
+    // natural responses-first shape coreToGoogle emits when told the model.
+    const claudeWire = typeof model === "string" && /claude/i.test(model);
+    if (!claudeWire && Array.isArray(body.contents)) {
         body.contents.forEach((content, i) => {
             if (!isPlainObject(content) || content.role === "model") return;
             if (!Array.isArray(content.parts)) return;
@@ -776,7 +780,8 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string;
             try {
                 parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
             } catch { /* non-JSON body: nothing to validate */ }
-            const found = validate(parsed);
+            const gmodel = wire === "google" ? (req.url ?? "").match(/\/models\/([^/:]+):/)?.[1] : undefined;
+            const found = gmodel !== undefined ? validateGoogleBody(parsed, gmodel) : validate(parsed);
             const pathInfo = lane === "vertex-anthropic" ? vertexAnthropicPathInfo(req.url ?? "") : null;
             const streaming = pathInfo?.method === "streamRawPredict";
             requests.push({ url: req.url ?? "", body: parsed, ...(lane === "vertex-anthropic" ? { model: pathInfo?.model ?? null } : {}) });

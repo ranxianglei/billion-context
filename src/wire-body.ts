@@ -12,7 +12,7 @@ import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
  *
  *  Returns null when the body is unparseable or carries no turn array — the
  *  caller skips the mutation rather than sending a body it has mangled. */
-export function appendTrailingUserText(protocol: WireProtocol, body: string | Buffer, text: string): string | null {
+export function appendTrailingUserText(protocol: WireProtocol, body: string | Buffer, text: string, model?: string): string | null {
     const raw = typeof body === "string" ? body : body.toString("utf8");
     let obj: Record<string, unknown>;
     try {
@@ -47,7 +47,7 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         if (last && typeof last === "object" && last.role === "user" && Array.isArray(last.parts)) {
             // #3159: plain text after a functionResponse part 400s on Vertex —
             // keep the canonical order when merging into a tool-result tail.
-            last.parts = normalizeGoogleUserPartOrder([...(last.parts as unknown[]), { text }] as GooglePart[]);
+            last.parts = normalizeGoogleUserPartOrder([...(last.parts as unknown[]), { text }] as GooglePart[], { model });
         } else {
             arr.push({ role: "user", parts: [{ text }] });
         }

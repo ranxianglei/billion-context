@@ -469,7 +469,7 @@ const ZERO_DIGEST = "sha256:" + "0".repeat(64);
  *  see module header). Restamping an already-stamped body REPLACES the
  *  trailing carrier instead of stacking. Returns the new body or null when
  *  the shape admits no carrier slot. */
-export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag: string): unknown | null {
+export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag: string, model?: string): unknown | null {
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const body = parsed as Record<string, unknown>;
     if (wire === "openai") {
@@ -550,10 +550,10 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
             if (pp && typeof pp === "object" && !Array.isArray(pp)) {
                 const ppo = pp as Record<string, unknown>;
                 if (Object.keys(ppo).length === 1 && typeof ppo.text === "string" && parseChainCheckpoint(ppo.text)) {
-                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts.slice(0, pi), { text: tag }] as GooglePart[]) }] };
+                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts.slice(0, pi), { text: tag }] as GooglePart[], { model }) }] };
                 }
             }
-            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts, { text: tag }] as GooglePart[]) }] };
+            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts, { text: tag }] as GooglePart[], { model }) }] };
         }
     }
     return { ...body, contents: [...contents, { role: "user", parts: [{ text: tag }] }] };
@@ -565,14 +565,14 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
  *  so any downstream bili verifying the same bytes recomputes the same value.
  *  requestId derives from the digest — deterministic, constant-size, and it
  *  correlates the stamp with the exact body it covers. */
-export function stampOutbound(parsed: unknown, wire: WireProtocol, processor: string, nowMs: number = Date.now()): unknown | null {
+export function stampOutbound(parsed: unknown, wire: WireProtocol, processor: string, nowMs: number = Date.now(), model?: string): unknown | null {
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const placeholder: Pick<ChainCheckpoint, "v" | "processor" | "issuedAt" | "requestId"> = { v: SUPPORTED_CHECKPOINT_VERSION, processor, issuedAt: nowMs, requestId: "-" };
     const digest = computeCheckpointDigest(parsed, wire, placeholder);
     if (digest === null) return null;
     const requestId = digest.slice("sha256:".length, "sha256:".length + 8);
     const tag = renderChainCheckpoint({ v: SUPPORTED_CHECKPOINT_VERSION, processor, issuedAt: nowMs, requestId, digest });
-    return insertCheckpointCarrier(parsed, wire, tag);
+    return insertCheckpointCarrier(parsed, wire, tag, model);
 }
 
 // Generation-side digest (step 3 stamps with this): insert a zero-digest
