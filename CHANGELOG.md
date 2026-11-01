@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+* **#5460(P1):实时性能采集落地(SQLite 存储)**。近期所有性能事故(#5403 OOM×6、#4528 主线程卡死、#5385 前缀钉死)都是用户先发现、CI 零预警。现在 DB 存储模式(sqlite/mysql)下每处理一个请求,就在会话目录旁的新小库 `perf.sqlite` 落一行(消息数/进出字节/本地耗时/会话号),另有每 30 秒一条内存水位采样(rss/heap/external)——OOM 类事故从此有爬坡曲线可查。写路径与服务完全隔离:任何写失败只停采集(一次性警告),绝不影响服务;纯 JSON 存储模式冻结零足迹(owner 定)。`BILI_PERF_TELEMETRY=0` 整体关闭。后续:P2 场景夹具+`bili bench`(只记录不判)、P3 基线容差带接 FULL/夜间 CI(普通 PR CI 零性能 job)、P4 `/stats`+Web 面板性能页+外部看门狗——跟踪单 #5460。
+
 ### Fixed
 
 * **#5412: 异步存储后端的「压缩冻结会话」现在也能自愈。** #5408 事故(一个会话连续 17 次摘要漂移后被保护机制冻住、8 小时无人知晓)的主修复 #5409 只教了同步存储路径(SQLite 直写)自救:漂移挂起期间保存会自动升级为全量重导入并清掉索引里的残留行。异步路径(opt-in 网络后端,如 mysql)那份孪生代码没搬——同样被冻住的会话在那上面永远救不回来,每次保存都重写不完整视图、下轮采样继续漂移。本 PR 在 `src/storage/shadow.ts` 的异步入队路径补上同一行对齐(`completeLog = hasRawTail || driftedSessions.has(id)`),行为与同步路径逐字一致;回归测试同时钉住正门(latch 挂起的折叠保存清掉外来行)与负门(未挂起保存不清扫)。
