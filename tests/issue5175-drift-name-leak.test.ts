@@ -14,6 +14,12 @@ import {
     stripDriftResidue,
 } from "../src/loop/tag-echo-filter.ts";
 import { endsWithDraftClose, isDraftDump } from "../src/degenerate-turn.ts";
+import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
+import { createSession } from "../src/session.ts";
+import { rewriteJsonResponseAsync } from "../src/stream.ts";
+import { rewriteOpenaiJsonResponseAsync } from "../src/stream-openai.ts";
+import { rewriteResponsesJsonResponseAsync } from "../src/stream-responses.ts";
+import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
 import type { Session } from "../src/session.ts";
 
@@ -1284,5 +1290,84 @@ test("#5175 A control: the non-streaming JSON path leaves genuine markup and pro
     for (const protocol of ["openai", "anthropic", "google", "responses"] as const) {
         const got = await driveJsonOnce(protocol, genuine);
         assert.equal(got, genuine, `${protocol} JSON path must not rewrite genuine prose/markup`);
+    }
+});
+
+// #5175 fifth seam: the four NON-STREAMING JSON REWRITERS
+// (`rewriteJsonResponseAsync` / `-Openai` / `-Responses` / `-Google`). These are
+// what a real (non-plugin) client gets when `prepare()` injects the compress tool
+// and the upstream answers with `stream:false` — the relay parses the finished
+// body, hands it to the per-protocol rewriter, then `res.end(JSON.stringify)`.
+// Every one of them gates on `containsRenderTagText(text)` and then calls
+// `stripAcpTags`. On the pre-#5175 predicate that gate is false for a drifted
+// name, so all four hand the model's echo back verbatim — measured on pristine
+// `master`: refs=1 openers=1 for each of the four. After the shape rule:
+// refs=0 openers=0. Nothing else in this file covers these entries.
+function rewriteCtx(): never {
+    const core = createCore();
+    const config = defaultConfig(400_000) as Config;
+    config.preserveRecentMessages = 0;
+    config.preserveRecentTokens = 0;
+    const session = createSession(`rw-${Math.random().toString(36).slice(2)}`);
+    const messages: CoreMessage[] = [
+        { id: "history", role: "assistant", contentType: "text", text: "plain history" },
+        { id: "now", role: "user", contentType: "text", text: "go on" },
+    ];
+    session.state = core.processTurn({ messages, state: session.state, config, tokenCount: 10_000, renderTags: "text-only" }).state;
+    return { core, config, session, messages, log: () => {} } as never;
+}
+
+const REWRITE_CASES: Array<[string, () => Promise<unknown>]> = [
+    ["anthropic", () => rewriteJsonResponseAsync({ content: [{ type: "text", text: REPORTED }] }, rewriteCtx())],
+    [
+        "openai",
+        () =>
+            rewriteOpenaiJsonResponseAsync(
+                { choices: [{ message: { role: "assistant", content: REPORTED }, finish_reason: "stop" }] },
+                rewriteCtx(),
+            ),
+    ],
+    [
+        "responses",
+        () =>
+            rewriteResponsesJsonResponseAsync(
+                { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: REPORTED }] }] },
+                rewriteCtx(),
+            ),
+    ],
+    ["google", () => rewriteGoogleJsonResponseAsync({ candidates: [{ content: { role: "model", parts: [{ text: REPORTED }] } }] }, rewriteCtx())],
+];
+
+for (const [name, run] of REWRITE_CASES) {
+    test(`#5175 A: the non-streaming ${name} rewriter never hands the drift residue back`, async () => {
+        const out = await run();
+        const s = JSON.stringify(out) ?? "";
+        assert.equal((s.match(KERNEL_REF_TEST) ?? []).length, 0, `a kernel ref survived the ${name} rewriter: ${JSON.stringify(s.slice(0, 120))}`);
+        assert.equal((s.match(DRIFT_OPENER_TEST) ?? []).length, 0, `a drifted opener survived the ${name} rewriter: ${JSON.stringify(s.slice(0, 120))}`);
+    });
+}
+
+test("#5175 A control: the four non-streaming rewriters leave genuine markup and prose byte-exact", async () => {
+    // Compare the REWRITTEN TEXT, not the serialized JSON: JSON.stringify escapes
+    // the `"` in class="a", so a substring test against the raw source would fail
+    // even when the rewriter is a pure identity. This caught a bug in my own test,
+    // not in the rewriter — the payload round-tripped unchanged.
+    const genuine = 'x<sup>2</sup> and <span class="a">z</span> — all plain prose here.';
+    const extract = {
+        anthropic: (v: any) => (v?.content ?? []).map((p: any) => p?.text ?? "").join(""),
+        openai: (v: any) => v?.choices?.[0]?.message?.content ?? "",
+        responses: (v: any) =>
+            (v?.output ?? []).map((o: any) => (o?.content ?? []).map((p: any) => p?.text ?? "").join("")).join(""),
+        google: (v: any) => (v?.candidates?.[0]?.content?.parts ?? []).map((p: any) => p?.text ?? "").join(""),
+    } as const;
+    const bodies: Array<[keyof typeof extract, Promise<unknown>]> = [
+        ["anthropic", rewriteJsonResponseAsync({ content: [{ type: "text", text: genuine }] }, rewriteCtx())],
+        ["openai", rewriteOpenaiJsonResponseAsync({ choices: [{ message: { role: "assistant", content: genuine }, finish_reason: "stop" }] }, rewriteCtx())],
+        ["responses", rewriteResponsesJsonResponseAsync({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: genuine }] }] }, rewriteCtx())],
+        ["google", rewriteGoogleJsonResponseAsync({ candidates: [{ content: { role: "model", parts: [{ text: genuine }] } }] }, rewriteCtx())],
+    ];
+    for (const [name, pending] of bodies) {
+        const got = extract[name](await pending);
+        assert.equal(got, genuine, `${name} rewriter must not rewrite genuine prose/markup`);
     }
 });
