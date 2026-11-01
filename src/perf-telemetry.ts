@@ -14,6 +14,7 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import * as path from "node:path";
 import { sessionsDir } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
 
 export const PERF_DB_FILE = "perf.sqlite";
 const PERF_TABLE = "perf_events";
@@ -89,7 +90,7 @@ function ensureDb(): DatabaseSync | null {
         return db;
     } catch (e) {
         state.dead = true;
-        warnDegrade((l, m) => console.error(l, m), `open failed: ${e instanceof Error ? e.message : String(e)}`);
+        warnDegrade(loggerLog, `open failed: ${e instanceof Error ? e.message : String(e)}`);
         return null;
     }
 }
@@ -135,7 +136,7 @@ export function perfTelemetryInit(mode: "sqlite" | "mysql" | "json", opts?: Init
     if (mode === "json") { state.mode = "json"; return false; }
     state.mode = mode;
     state.dir = opts?.dir ?? defaultDir();
-    const log = opts?.log ?? ((l: string, m: string) => console.error(l, m));
+    const log = opts?.log ?? loggerLog;
     state.memTimer = setInterval(() => perfRecordMemSample(log), opts?.memIntervalMs ?? DEFAULT_MEM_INTERVAL_MS);
     state.memTimer.unref?.();
     return true;
@@ -165,7 +166,7 @@ export function perfRecordRequest(r: {
         parse_ms: r.parseMs ?? null,
         payload_json: r.extra ? JSON.stringify({ engine: state.mode, ...r.extra }) : JSON.stringify({ engine: state.mode }),
     };
-    insertRow(db, row, w ?? ((l, m) => console.error(l, m)));
+    insertRow(db, row, w ?? loggerLog);
 }
 
 /** Memory watermark row — the OOM class (#5403 ×6) finally shows its ramp. */
@@ -180,7 +181,7 @@ export function perfRecordMemSample(w?: (level: "warn" | "error" | "info", msg: 
         total_ms: null, parse_ms: null,
         payload_json: JSON.stringify({ rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers }),
     };
-    insertRow(db, row, w ?? ((l, m2) => console.error(l, m2)));
+    insertRow(db, row, w ?? loggerLog);
 }
 
 /** Close everything (process shutdown / tests). Idempotent. */
