@@ -1104,10 +1104,20 @@ function forkToolIsError(message: CoreMessage): boolean {
 // GENERATED_METERING_FIELDS doctrine). Signed thinking content IS identity:
 // its carrier rides thinkingSignature / googleThoughtSignature, so a rotated
 // signature reads as drift (advisory adoption, one unfolded request) instead
-// of silently inheriting stale signature bytes (#1960 territory).
+// of silently inheriting stale signature bytes (#1960 territory). The opaque
+// redacted_thinking payload is payload-addressed like images (#3751): its
+// projected text is a constant label carrying no bytes, so without this slot
+// a rotated payload under an unchanged id would pass the gate and inherit
+// stale bytes silently — the raw block's data digests into the tuple instead.
+function redactedPayloadDigest(message: CoreMessage): string | null {
+    const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
+    if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
+    return createHash("sha256").update(block.data, "utf8").digest("hex").slice(0, 16);
+}
+
 export function forkMessageIdentityHash(message: CoreMessage): string {
     const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
-    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m)]);
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m), redactedPayloadDigest(m)]);
 }
 
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares

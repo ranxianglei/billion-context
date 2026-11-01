@@ -16,6 +16,9 @@
 // signature-only cell passes the child's first-request prefix gate
 // (one-sided thinkingTokens must not read as drift), while a rotated
 // signature under an unchanged id DOES read as hash-drift-under-same-id.
+// The opaque redacted_thinking payload is payload-addressed like images
+// (#3751): its parent forks, a verbatim replay verifies clean, and a rotated
+// payload under an unchanged id reads as hash-drift-under-same-id too.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -212,6 +215,53 @@ test("stamped signature-only thinking passes the child's first-request prefix ga
         assert.deepEqual(publicForkInputCheck(childSession, "anthropic", firstRequest), { ok: true }, "one-sided metering mass must not read as identity drift");
         const rotated = structuredClone(firstRequest);
         for (const block of (rotated.messages[1] as { content: { type: string; signature?: string }[] }).content) if (block.type === "thinking") block.signature = "sig-rotated-4266";
+        const verdict = publicForkInputCheck(childSession, "anthropic", rotated);
+        assert.equal(verdict.ok, false, JSON.stringify(verdict));
+        if (!verdict.ok) assert.match(verdict.reason, /hash-drift-under-same-id/, verdict.reason);
+    } finally { await h.close(); }
+});
+
+test("a redacted_thinking parent forks and its verbatim prefix verifies clean", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const redactedHistory = () => [
+            { role: "user", content: "open task ".repeat(50) },
+            { role: "assistant", content: [
+                { type: "redacted_thinking", data: "cmVkYWN0ZWQtcGF5bG9hZC00MjY2LXYx" },
+                { type: "text", text: "visible answer ".repeat(50) },
+            ] },
+            { role: "user", content: "next step" },
+        ];
+        await h.sendModel("parent-red", redactedHistory());
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent-red");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "parent-red", "child-red"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSession = resolveConversation("child-red").session!;
+        assert.ok(childSession.pluginSnapshot!.some((m) => m.text === "[redacted_thinking]"), "the redacted cell must ride the child snapshot");
+        const firstRequest = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...redactedHistory(), { role: "user", content: "child first turn" }] };
+        assert.deepEqual(publicForkInputCheck(childSession, "anthropic", firstRequest), { ok: true }, "verbatim redacted prefix verifies clean");
+    } finally { await h.close(); }
+});
+
+test("a rotated redacted_thinking payload under an unchanged id reads as hash-drift-under-same-id", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const redactedHistory = (data: string) => [
+            { role: "user", content: "open task ".repeat(50) },
+            { role: "assistant", content: [
+                { type: "redacted_thinking", data },
+                { type: "text", text: "visible answer ".repeat(50) },
+            ] },
+            { role: "user", content: "next step" },
+        ];
+        await h.sendModel("parent-reddrift", redactedHistory("cmVkYWN0ZWQtcGF5bG9hZC00MjY2LXYx"));
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent-reddrift");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "parent-reddrift", "child-reddrift"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSession = resolveConversation("child-reddrift").session!;
+        const rotated = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...redactedHistory("cmVkYWN0ZWQtcGF5bG9hZC00MjY2LXYy"), { role: "user", content: "child first turn" }] };
         const verdict = publicForkInputCheck(childSession, "anthropic", rotated);
         assert.equal(verdict.ok, false, JSON.stringify(verdict));
         if (!verdict.ok) assert.match(verdict.reason, /hash-drift-under-same-id/, verdict.reason);

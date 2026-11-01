@@ -77,11 +77,18 @@ function forkHash(value: unknown): string {
 /** Byte-identical to src/plugin.ts forkMessageIdentityHash: both-sides-only
  *  field set — thinkingTokens (host-projected metering mass, never present in
  *  the client's bytes) is excluded; signed thinking content rides
- *  thinkingSignature / googleThoughtSignature instead. */
+ *  thinkingSignature / googleThoughtSignature; the opaque redacted_thinking
+ *  payload digests itself (its projected text is a constant label). */
+function redactedPayloadDigest(message: CoreMessage): string | null {
+    const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
+    if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
+    return createHash("sha256").update(block.data, "utf8").digest("hex").slice(0, 16);
+}
+
 export function forkIdentityHashOf(message: CoreMessage): string {
     const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
     const toolIsError = m.toolIsError === true;
-    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError]);
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
