@@ -3,9 +3,9 @@
 // Schema-stability culture mirrors the storage goldens: the DDL text is
 // pinned, the file layout is pinned, and every degradation path must prove
 // it leaves serving untouched (telemetry NEVER throws into the request path).
-import { test, before, after } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -100,6 +100,25 @@ test("#5460 P1: BILI_PERF_TELEMETRY=0 kill switch wins over any mode", () => {
     }
 });
 
+test("#5460 P1: open failure degrades ONCE — no throw into the request path, no retry", () => {
+    resetModule();
+    const dir = sandbox();
+    // A non-SQLite regular file at the db path makes the first exec throw
+    // deterministically ("file is not a database") — the open-failure path.
+    writeFileSync(path.join(dir, PERF_DB_FILE), "not a sqlite database");
+    const warns: string[] = [];
+    try {
+        assert.equal(perfTelemetryInit("sqlite", { dir, log: (l, m) => warns.push(`${l}:${m}`) }), true);
+        perfRecordRequest({ sessionId: "s1" });
+        perfRecordRequest({ sessionId: "s2" });
+        perfRecordMemSample();
+        const degraded = warns.filter((w) => w.startsWith("warn:") && w.includes("telemetry degraded"));
+        assert.equal(degraded.length, 1, `exactly ONE degrade warn, got ${degraded.length}`);
+        assert.ok(degraded[0].includes("open failed"), "warn must name the open failure");
+        assert.equal(perfRecentRows().length, 0, "no rows may be recorded while dead");
+    } finally { perfStopAll(); }
+});
+
 test("#5460 P1: init is idempotent — later calls never re-arm or throw", () => {
     resetModule();
     const dir = sandbox();
@@ -166,5 +185,27 @@ test("#5460 P1: logRequestCost wires structured rows through the single choke po
     } finally { perfStopAll(); }
 });
 
-before(() => { /* env handled per-test via resetModule */ });
+test("#5460 P1: legacy (pure-JSON) storage mode leaves ZERO telemetry footprint — owner constraint ②", async () => {
+    // The sqlite arming branch runs for every enabled store — including
+    // storage.unified=legacy ones where maybeOpen() returns null. This pins
+    // that such a store still never creates perf.sqlite.
+    const { SessionStore } = await import("../src/persist.js");
+    resetModule();
+    const savedUnified = process.env.BILI_STORAGE_UNIFIED;
+    const savedKey = process.env.BILI_ENCRYPTION_KEY;
+    delete process.env.BILI_ENCRYPTION_KEY;
+    process.env.BILI_STORAGE_UNIFIED = "legacy";
+    const dir = sandbox();
+    try {
+        new SessionStore({ enabled: true, dir });
+        perfStopAll();
+        assert.equal(perfActiveMode(), "json", "legacy mode must arm the frozen (inert) engine");
+        assert.ok(!existsSync(path.join(dir, PERF_DB_FILE)), "pure-JSON mode must never create a metrics file");
+    } finally {
+        if (savedUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = savedUnified;
+        if (savedKey === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = savedKey;
+        perfTelemetryResetForTests();
+    }
+});
+
 after(() => { for (const d of SANDBOXES.splice(0)) rmSync(d, { recursive: true, force: true }); });

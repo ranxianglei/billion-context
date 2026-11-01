@@ -35,11 +35,12 @@ interface PerfState {
     warned: boolean;
     insertsSinceSweep: number;
     memTimer: NodeJS.Timeout | null;
+    log: ((level: "warn" | "error" | "info", msg: string) => void) | null;
 }
 
 const state: PerfState = {
     db: null, mode: "", dir: null, dead: false, warned: false,
-    insertsSinceSweep: 0, memTimer: null,
+    insertsSinceSweep: 0, memTimer: null, log: null,
 };
 
 const ring: Array<Record<string, unknown>> = [];
@@ -82,6 +83,10 @@ function warnDegrade(w: (level: "warn" | "error" | "info", msg: string) => void,
 
 function ensureDb(): DatabaseSync | null {
     if (state.db) return state.db;
+    // Degrade contract (#5327 discipline): one failure → dead forever. Without
+    // this check a broken dir would retry new DatabaseSync on EVERY request
+    // and every mem tick instead of stopping collection once.
+    if (state.dead) return null;
     if (!state.dir) return null;
     try {
         const db = new DatabaseSync(dbPath(state.dir));
@@ -90,7 +95,7 @@ function ensureDb(): DatabaseSync | null {
         return db;
     } catch (e) {
         state.dead = true;
-        warnDegrade(loggerLog, `open failed: ${e instanceof Error ? e.message : String(e)}`);
+        warnDegrade(state.log ?? loggerLog, `open failed: ${e instanceof Error ? e.message : String(e)}`);
         return null;
     }
 }
@@ -137,6 +142,7 @@ export function perfTelemetryInit(mode: "sqlite" | "mysql" | "json", opts?: Init
     state.mode = mode;
     state.dir = opts?.dir ?? defaultDir();
     const log = opts?.log ?? loggerLog;
+    state.log = log;
     state.memTimer = setInterval(() => perfRecordMemSample(log), opts?.memIntervalMs ?? DEFAULT_MEM_INTERVAL_MS);
     state.memTimer.unref?.();
     return true;
@@ -200,6 +206,7 @@ export function perfTelemetryResetForTests(): void {
     state.dead = false;
     state.warned = false;
     state.insertsSinceSweep = 0;
+    state.log = null;
     ring.length = 0;
 }
 
