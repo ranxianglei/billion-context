@@ -43,6 +43,7 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
+export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 export const HEAD_CHECK_ELEMENTS = 8;
 const PF_BREAKER_MISSES = 5;
 const PF_DISABLED_TTL_MS = 60 * 60 * 1000;
@@ -53,6 +54,9 @@ interface PFSavedState {
     m: string;
     misses: number;
     disabledAt?: number;
+    /** Last received tail-id list (#5418 v2) — survives restarts so the
+     *  prevId continuity check is live on the first turn back. */
+    l?: string[];
 }
 
 interface PFSeed {
@@ -65,6 +69,10 @@ interface PFSeed {
      * region is never re-scanned, so its stripped-marker accounting rides
      * with the seed (unchanged-by-assertion). */
     readonly stripCounts: RawStripCounts;
+    /** Host message ids of elements [stampT_prev-1 .. stampT-1] as sent by
+     *  our shim last turn (#5418 v2) — its LAST entry is the prevId the next
+     *  request's list must open with. Undefined until one was received. */
+    readonly lastTailIds?: string[];
     /** Some stashed core came from a content-array element (e.g.
      * image_url). openaiToCore renders the LAST such element differently
      * from a mid-history one (verified kernel positional rule), so once the
@@ -105,6 +113,35 @@ export interface FastpathOutcome {
     readonly measuredT: number | undefined;
     readonly decision: string;
     readonly creditedMiss: boolean;
+    /** Tail-id list received THIS turn, shape-valid — finalize carries it
+     *  into the (re)seeded state either way so continuity holds across both.
+     *  Absent (undefined) for count-only turns or shape-invalid lists. */
+    readonly receivedTailIds?: string[];
+}
+
+/** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
+ *  Wire form is ids.map(encodeURIComponent).join(","): each SEGMENT is
+ *  individually percent-encoded, so any comma inside an id travels as %2C
+ *  while separator commas stay literal — split(",") then per-segment
+ *  decode is unambiguous for arbitrary id alphabets. All-or-nothing
+ *  screening mirroring the host-side collector — a bad entry voids the
+ *  WHOLE list, never a subset (partial identity claims are how
+ *  mis-attribution starts, #2821 discipline). */
+function parseTailIds(raw: string): string[] | null {
+    const segs = raw.split(",");
+    if (segs.length === 0 || segs.length > 2048) return null;
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const seg of segs) {
+        let id: string;
+        try { id = decodeURIComponent(seg); } catch { return null; }
+        if (id.length === 0 || id.length > 512) return null;
+        if (/[\s\p{C}]/u.test(id)) return null;
+        if (seen.has(id)) return null;
+        seen.add(id);
+        ids.push(id);
+    }
+    return ids;
 }
 
 function readSaved(sessionId: string): PFSavedState | null {
@@ -122,6 +159,9 @@ function readSaved(sessionId: string): PFSavedState | null {
             m: typeof o.m === "string" ? o.m : "",
             misses: typeof o.misses === "number" && Number.isInteger(o.misses) ? o.misses : 0,
             disabledAt: typeof o.disabledAt === "number" ? o.disabledAt : undefined,
+            l: Array.isArray(o.l) && o.l.length > 0 && o.l.length <= 2048
+                && (o.l as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
+                ? (o.l as string[]) : undefined,
         };
     } catch {
         return null;
@@ -181,10 +221,10 @@ export function evaluateWatermarkFastpath(
     const T = scan.total;
     const rawStamp = req.headers[PF_COUNT_HEADER];
     const stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
-    const miss = (decision: string, credited: boolean): FastpathOutcome => {
+    const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
         if (credited) noteCreditedMiss(session.id, decision, log);
         log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
-        return { hit: null, measuredT: T, decision, creditedMiss: credited };
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds };
     };
     if (Number.isNaN(stamped)) return miss("no-stamp", false);
     if (stamped > T) return miss("ahead", true);
@@ -194,17 +234,33 @@ export function evaluateWatermarkFastpath(
     if (seed !== undefined && seed.stampT === stamped && seed.model === input.model) {
         // --- hit candidate: verify head + decode window ---------------------
         const K = stamped;
-        if (seed.multimodal) return miss("seeded-multimodal", false);
+        // #5418 v2 (owner identity ladder msgid>顺序>#11): when OUR shim is in
+        // the loop it ships the host's own message ids alongside the stamp —
+        // element [K-1] plus every NEW element, "几个不是几十个". Shape/dup
+        // faults mark a shim<->proxy desync (CREDITED toward the breaker);
+        // a prevId mismatch marks a legit in-place rewrite of the anchor
+        // (uncredited — the legacy reseed re-baselines the next turn).
+        // Absent header = pure count mode (every pre-v2 behavior unchanged).
+        const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
+        let tailIds: string[] | undefined;
+        if (rawTailIds !== undefined) {
+            const parsed = typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
+            if (parsed === null || parsed.length !== T - K + 1) return miss("tail-ids-shape", true);
+            tailIds = parsed;
+            const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
+            if (prevKnown !== undefined && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false);
+        }
+        if (seed.multimodal) return miss("seeded-multimodal", false, tailIds);
         const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
         const headFragment: { messages: unknown } = { messages: [] };
         const windowFragment: { messages: unknown } = { messages: [] };
         headFragment.messages = parseElementSlices(bodyText, scan.messageSpans.slice(0, headEnd));
         windowFragment.messages = parseElementSlices(bodyText, scan.messageSpans.slice(K));
-        if (!Array.isArray(headFragment.messages) || !Array.isArray(windowFragment.messages)) return miss("fragment-parse", false);
+        if (!Array.isArray(headFragment.messages) || !Array.isArray(windowFragment.messages)) return miss("fragment-parse", false, tailIds);
         stripRawStage(headFragment, "openai"); // legacy convention: strip before convert; head counts stay with the seed ledger
         const windowCounts = stripRawStage(windowFragment, "openai");
         const headCores = openaiToCore(headFragment as OpenAIRequestBody);
-        if (headCores.systemText !== seed.systemText) return miss("head-drift", true);
+        if (headCores.systemText !== seed.systemText) return miss("head-drift", true, tailIds);
         // In-place head EDIT detection. The system-text check alone would miss
         // an in-place rewrite of any non-system head element (dsh message-edit
         // flows): counts stay equal, the stamp stays honest, and the stale
@@ -228,15 +284,15 @@ export function evaluateWatermarkFastpath(
         if (headElements >= 0 && seed.cores.length > 0) {
             const compareUpTo = Math.min(headElements, headCores.msgs.length, seed.cores.length);
             const seedHead = seed.cores.slice(0, compareUpTo);
-            if (headCores.msgs.length < seedHead.length) return miss("head-shape", false);
+            if (headCores.msgs.length < seedHead.length) return miss("head-shape", false, tailIds);
             for (let hi = 0; hi < seedHead.length; hi++) {
                 const a = headCores.msgs[hi];
                 const b = seedHead[hi];
-                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false);
+                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false, tailIds);
             }
         }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
-        if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true);
+        if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true, tailIds);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);
         return {
             hit: {
@@ -252,6 +308,7 @@ export function evaluateWatermarkFastpath(
             measuredT: T,
             decision: "hit",
             creditedMiss: false,
+            receivedTailIds: tailIds,
         };
     }
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
@@ -380,9 +437,10 @@ export function finalizeWatermarkTurn(
             stampT: T,
             model: input.model,
             stripCounts: outcome.hit.markerCounts,
+            lastTailIds: outcome.receivedTailIds,
             multimodal: outcome.hit.seedMultimodal,
         });
-        writeSaved(session.id, { t: T, m: input.model, misses: 0 });
+        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
@@ -393,12 +451,13 @@ export function finalizeWatermarkTurn(
             stampT: T,
             model: input.model,
             stripCounts: input.turnStripCounts,
+            lastTailIds: outcome.receivedTailIds,
             multimodal: coresHaveImagePart(input.legacyCores),
         });
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
     // stamp is how a client converges on truth while the lane stays hit-less.
-    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt });
+    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
 }

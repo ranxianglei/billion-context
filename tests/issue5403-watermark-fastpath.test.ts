@@ -27,7 +27,6 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
 import { once } from "node:events";
-import { tmpdir } from "node:os";
 import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -131,6 +130,20 @@ function normalize(raw: string): string {
     return raw.replace(/\stime=\\?"[0-9T:.Z+\-]+\\?"/g, ' time="X"');
 }
 
+// The v2 identity channel needs the client's own stable msgids per element.
+// Hermetic stand-in for host-minted ids: a FNV-1a hash of the element BYTES
+// (same message ⇒ same id; edited/minted ⇒ new id — the server treats that
+// as a legit prevId break and self-heals, exactly like a real host would).
+function idOf(el: unknown): string {
+    const s = JSON.stringify(el);
+    let h = 0x811c9dc5;
+    for (let k = 0; k < s.length; k++) {
+        h ^= s.charCodeAt(k);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return `eid-${h.toString(16)}`;
+}
+
 async function runClient(origin: string, upstreamUrl: string, sid: string, turns: Array<{ messages: unknown[]; max_tokens: number; stream: boolean }>): Promise<(number | null)[]> {
     const stamps: (number | null)[] = [];
     for (let i = 0; i < turns.length; i++) {
@@ -141,6 +154,10 @@ async function runClient(origin: string, upstreamUrl: string, sid: string, turns
         };
         const prev = stamps[stamps.length - 1];
         if (prev !== null && prev !== undefined) headers["x-bili-pf-count"] = String(prev);
+        const ids = (turns[i].messages as unknown[]).map(idOf);
+        if (prev !== null && prev !== undefined && ids.length >= prev) {
+            headers["x-bili-pf-tail-ids"] = ids.slice(prev - 1).map(encodeURIComponent).join(",");
+        }
         const res = await fetch(`${origin}/bili/${upstreamUrl}/v1/chat/completions`, {
             method: "POST", headers, body: JSON.stringify(turns[i]),
         });
@@ -192,7 +209,7 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
         })();
         if (diffI >= 0) {
             // triage aid: leave the first diverging pair on disk (CI-safe tmpdir)
-            writeFileSync(`${tmpdir()}pfab-diff-${process.pid}-${Date.now()}.txt`,
+            writeFileSync(path.join(os.tmpdir(), `pfab-diff-${process.pid}-${Date.now()}.txt`),
                 `=== turn ${diffI} A(legacy) ===\n${ha0.captured[diffI].raw.slice(0, 4000)}\n\n=== turn ${diffI} B(fastpath) ===\n${hb0.captured[diffI].raw.slice(0, 4000)}\n`);
         }
         for (let i = 0; i < 8; i++) {
@@ -201,6 +218,7 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
             for (const o of [ha0.captured[i], hb0.captured[i]]) {
                 assert.ok(!o.headerKeys.includes("x-bili-pf-count"), "x-bili-pf-count leaked past the proxy");
                 assert.ok(!o.headerKeys.includes("x-bili-pf-seq"), "x-bili-pf-seq leaked past the proxy");
+                assert.ok(!o.headerKeys.includes("x-bili-pf-tail-ids"), "x-bili-pf-tail-ids leaked past the proxy");
             }
         }
         assert.ok(memA.breakdown.lastMessages > 0, "legacy pinned resident history");

@@ -2390,7 +2390,22 @@ export function apply(ctx: PluginContext): void {
         // rejects and never evaluates); absent entry ⇒ first turn, unseeded
         // verification on the server.
         const pfCount = pfSeqByConversation.get(sid);
-        if (pfCount !== undefined) headers[PF_COUNT_HEADER_NAME] = String(pfCount);
+        if (pfCount !== undefined) {
+            headers[PF_COUNT_HEADER_NAME] = String(pfCount);
+            // #5418 v2 (owner identity ladder, msgid over order): ship the
+            // HOST's own message ids for the watermark window — element
+            // K-1 (the prev anchor) plus every NEW element, "几个而不是几十
+            // 个". Join+encodeURIComponent: the separator comma stays literal
+            // while commas inside ids encode (%2C), so the proxy's split is
+            // unambiguous. Same all-or-nothing capture as the incremental
+            // envelope (#4491): no usable ids ⇒ pure count mode, never a
+            // partial or mis-aligned list — a bad length costs ONE credited
+            // verification round server-side and self-heals via restamp.
+            const pfIds = dispatchScope.getStore()?.msgIds;
+            if (pfIds !== undefined && pfIds.length >= pfCount) {
+                headers[PF_TAIL_IDS_HEADER_NAME] = encodeURIComponent(pfIds.slice(pfCount - 1).join(","));
+            }
+        }
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -2484,6 +2499,7 @@ export function apply(ctx: PluginContext): void {
     // bounded hard below.
     const PF_COUNT_HEADER_NAME = "x-bili-pf-count";
     const PF_SEQ_HEADER_NAME = "x-bili-pf-seq";
+    const PF_TAIL_IDS_HEADER_NAME = "x-bili-pf-tail-ids";
     const pfSeqByConversation = new Map<string, number>();
     async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
         if (!register.toolsReady || init === undefined) return;

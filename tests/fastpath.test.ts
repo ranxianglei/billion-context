@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
@@ -190,6 +190,74 @@ test("in-place HEAD edit is caught by prefix-core comparison, uncredited, self-h
     const texts = r3.out.hit!.view.map((m) => String((m as { text?: unknown }).text ?? ""));
     assert.ok(texts.some((t) => t.includes("c-EDITED")), "edited content must ride, stale byte must not");
     assert.ok(!texts.some((t) => t.trim() === "c"), "stale pre-edit element must be gone from the view");
+});
+
+const TAIL = (ids: string[]): Record<string, string> => ({ [PF_TAIL_IDS_HEADER]: ids.map(encodeURIComponent).join(",") });
+
+test("tail-ids: prevId chain rides consecutive hits; a broken anchor is uncredited and self-heals", () => {
+    makeStubStore();
+    const session = freshSession("pf-tailids");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    // seed turn carried no list -> prevId check dormant on the first stamped turn
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const h2 = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, b2);
+    assert.equal(h2.out.decision, "hit", LOGS.join("\n"));
+    assert.deepEqual(h2.out.receivedTailIds, ["h-b", "h-c"]);
+    // next turn must open with the list's LAST id — the stored anchor
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d")]);
+    const h3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]) }, b3);
+    assert.equal(h3.out.decision, "hit", LOGS.join("\n"));
+    // anchor mismatch = legit in-place rewrite of the PREVIOUS TURN's last
+    // message (its id minted again): UNcredited, legacy reseed drops the stale
+    // anchor, one growth hits again
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d-EDITED"), USR("e")]);
+    const m4 = runTurn(session, { [PF_COUNT_HEADER]: "5", ...TAIL(["h-dPRIME", "h-e"]) }, b4);
+    assert.equal(m4.out.decision, "tail-ids-prev", LOGS.join("\n"));
+    assert.equal(m4.out.creditedMiss, false);
+    const b5 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d-EDITED"), USR("e"), USR("f")]);
+    const h5 = runTurn(session, { [PF_COUNT_HEADER]: "6", ...TAIL(["h-e", "h-f"]) }, b5);
+    assert.equal(h5.out.decision, "hit", LOGS.join("\n"));
+});
+
+test("tail-ids: wrong length / duplicate / bad segment are CREDITED shape faults", () => {
+    makeStubStore();
+    const session = freshSession("pf-tailbad");
+    const b1 = bodyOf([SYS("s"), USR("a")]);
+    runTurn(session, {}, b1);
+    // every verified miss reseeds at its own T, so each fault row must GROW one
+    // element — stamped stays last-turn-T while the list length lies again.
+    const g = (n: number): string => bodyOf([SYS("s"), USR("a"), ...Array.from({ length: n }, (_, j) => USR(`g${j}`))]);
+    const shortList = runTurn(session, { [PF_COUNT_HEADER]: "2", ...TAIL(["only-prev"]) }, g(1));
+    assert.equal(shortList.out.decision, "tail-ids-shape", LOGS.join("\n"));
+    assert.equal(shortList.out.creditedMiss, true);
+    assert.ok((watermarkDebugState(session).missCount ?? 0) >= 1);
+    const dup = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["x", "x", "x"]) }, g(2));
+    assert.equal(dup.out.decision, "tail-ids-shape");
+    assert.equal(dup.out.creditedMiss, true);
+    const badseg = runTurn(session, { [PF_COUNT_HEADER]: "4", ...{ [PF_TAIL_IDS_HEADER]: "x%zz,x%zz" } }, g(3));
+    assert.equal(badseg.out.decision, "tail-ids-shape");
+    assert.equal(badseg.out.creditedMiss, true);
+    // five consecutive verified misses arm the breaker; held turns still restamp
+    let heldDecision = "";
+    for (let i = 4; i <= 7; i++) heldDecision = runTurn(session, { [PF_COUNT_HEADER]: String(i + 1), ...TAIL(["q", "q", "q"]) }, g(i)).out.decision;
+    assert.equal(heldDecision, "breaker-armed", LOGS.join("\n"));
+}
+);
+
+test("tail-ids: comma inside an id survives the wire form", () => {
+    makeStubStore();
+    const session = freshSession("pf-tailcomma");
+    const b1 = bodyOf([SYS("s"), USR("a")]);
+    runTurn(session, {}, b1);
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    const h2 = runTurn(session, { [PF_COUNT_HEADER]: "2", ...TAIL(["pre,v1", "new,id"]) }, b2);
+    assert.equal(h2.out.decision, "hit", LOGS.join("\n"));
+    assert.deepEqual(h2.out.receivedTailIds, ["pre,v1", "new,id"]);
+    // continuity through a comma-bearing anchor
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const h3 = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["new,id", "c"]) }, b3);
+    assert.equal(h3.out.decision, "hit", LOGS.join("\n"));
 });
 
 test("system element appearing at the WINDOW head degrades (hoist hazard)", () => {

@@ -151,11 +151,13 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 
 现在这条车道携带一个水位线。每个成功的插件车道 chat-completions 响应都会盖 `x-bili-pf-seq` = 该请求 `messages` 数组的服务端实测元素数 T。T 由 `src/server/fastpath-scan.ts` 的单遍结构扫描器测出(字符遍历 + 字符串状态机):它验证足够的 JSON 以可信,但只分配跨度偏移——无 AST、无全量解析。dsh 扩展把上一轮的戳在下个请求里作为 `x-bili-pf-count` 带回(`src/agent/dsh-native.ts` 内联字面量头名——agent 束禁止 import 服务端模块,#3482)。其他车道从不回带,因此永不命中、零成本。
 
+身份通道 v2(owner 层级 msgid>顺序>hash,#11):裸 count 只按**位置**钉边界——保元素数改写的客户端不可见。我们的 shim 在环时,请求额外携带 `x-bili-pf-tail-ids`:元素 K−1(上一轮锚点)的宿主 msgid + 全部新增元素——「几个,不是几十个」。宿主不在 chat-completions body 里发 id,但我们注入的扩展能从宿主上下文读到(`dispatchScope.msgIds`,与增量信封同一套全有全无筛查,#4491),因此不需要宿主发版。线上形态为**逐段**百分号编码(`ids.map(encodeURIComponent).join(",")`):分隔逗号保持字面量、id 内部的逗号走 %2C,服务端「先拆后解」对任意 id 字母表都无歧义。判决:长度不符/重复/坏段 ⇒ CREDITED 形状故障(shim↔代理失步,计入熔断);prevId ≠ 存锚 ⇒ UNcredited(用户改写自己最后一条消息的合法情形——legacy 重播种弃旧锚,下一轮自愈)。缺头 ⇒ 纯计数模式,v2 之前的一切行为逐字不变。
+
 命中条件:回带值是 T 之下的前界(严格小于 T)、进程内种子(上一轮的 canonical cores,模块级 `WeakMap<Session, …>`,刻意放在 Session 对象之外,让面板字段分解如实反映会话真相)恰在该 count、同模型下盖过戳、前 8 个元素重转后 system 逐字一致、窗口首非 system/developer(hoist 会失步 `reconcileSystemAnchor`)。命中时管道拿到的是「[种子 cores] + [尾窗 [K..T) 现解析的 cores]」而非全量解析,且 `snapshotMessages` 只钉尾窗。尾窗 cores 必须按前缀重新编号:`openaiToCore` 铸造 cluster id 按调用内出现次序(`h_<sha256-16>` 基名加 `_N` 后缀)、`wireIndex` 取自所给数组的位置——前缀里出现过同样内容基名的,窗口这边必须接上序号,否则账本身份契约就断;K=1 时不重编号甚至会把两条不同的 wire 消息**合并**成一条(prune 的 first-user-pin 在同一 wireIndex 上扩展 run)。
 
 失败即软着陆(反偏离锁):legacy 管道代码**原封未动**——本特性只在调用方喂进去的输入上做替换,任何疑点(无/坏/旧 stamp、count 倒退或零增长、模型切换、头部漂移、hoist 险、扫描失败、熔断器持有)整轮回退到那条没动过的全量路径,然后**重新盖戳**,客户端一轮之内收敛到真值。5 次连续「可归因」(credited)miss 触发熔断,车道停摆一小时不再取命中——持有期间仍持续扫描并盖戳(如果持有期不发戳,客户端水位线就永远卡在旧值,这个死锁在上线前已被单元测试抓住并钉死)。可归因指能证明不是我们错(客户端说谎或改写了历史);未播种/零增长这类 miss 免费。
 
-声明的信任边界(§7.4——必须人工评审,禁止自动合并):**保元素数不变的前缀字节改写不可检测**。这就是跳过逐条字节复核的全部代价,也是为什么它以 0% 默认关的 rollout 门(`rollout.features.pluginFullResendWatermark` / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK`)出厂,并要求 A/B 黄金测试在任何放量之前证明出站字节逐字一致。破坏性改写(通告 compaction、截断、重排)都会改变 count,在任何陈旧 core 喂给内核之前就被判掉。
+声明的信任边界(§7.4——必须人工评审,禁止自动合并):**保元素数不变的前缀字节改写不可检测**——锚点除外:v2 在锚点比对 carried prevId 与存锚,id 重铸 = 一次 UNcredited miss + 下一轮自愈。这就是跳过逐条字节复核的全部代价,也是为什么它以 0% 默认关的 rollout 门(`rollout.features.pluginFullResendWatermark` / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK`)出厂,并要求 A/B 黄金测试在任何放量之前证明出站字节逐字一致。破坏性改写(通告 compaction、截断、重排)都会改变 count,在任何陈旧 core 喂给内核之前就被判掉。
 
 诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
 

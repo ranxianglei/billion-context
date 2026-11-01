@@ -32,6 +32,7 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // ever reaches a model endpoint.
     "x-bili-pf-count",
     "x-bili-pf-seq",
+    "x-bili-pf-tail-ids",
     "te",
     "trailer",
     "upgrade",
