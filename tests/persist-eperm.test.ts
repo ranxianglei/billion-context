@@ -124,3 +124,15 @@ test("alert message names the dir and points at Defender exclusions + OneDrive",
     assert.ok(/OneDrive/i.test(msg), "warns about OneDrive");
     assert.ok(msg.includes("8"), "includes the failure count");
 });
+
+// #5155: evidence order — the reproducible A/B switch (node runtime's Low
+// integrity label, with the copy-pasteable icacls remedy) must rank BEFORE
+// antivirus in the alert.
+test("alert message ranks the node runtime's integrity label before antivirus (#5155)", () => {
+    const msg = buildAlertMessage(DIR, 8);
+    const labelPos = msg.indexOf("integrity label");
+    const avPos = msg.search(/Defender|antivirus/i);
+    assert.ok(labelPos !== -1, "names the integrity label");
+    assert.ok(labelPos < avPos, "integrity label comes first");
+    assert.ok(msg.includes("/setintegritylevel Medium"), "carries the fix command");
+});

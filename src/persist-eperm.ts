@@ -1,7 +1,8 @@
 /**
  * Layer 2 of the #362 fix: watch the acp-kernel StateStore `log` callback for
  * repeated write failures on one session id and emit a single actionable
- * "add this dir to Defender exclusions" alert.
+ * alert naming the suspects in evidence order (#5155: the node runtime's Low
+ * integrity label first — reproducible A/B — then Defender/sync-tool locks).
  *
  * The log callback is the ONLY place that sees a hot-path failure: `scheduleSave`
  * (debounced) is swallowed internally by the kernel, so its sole failure signal
@@ -14,6 +15,7 @@
  * kernel, because it is Windows/billion-context specific.
  */
 import { log as loggerLog } from "./logger.js";
+import { integrityLabelDiagnosis } from "./integrity-label.js";
 
 const LOCK_CODES = /\b(EPERM|EBUSY|EACCES)\b/;
 
@@ -78,8 +80,7 @@ export class PersistEpermAlert {
 export function buildAlertMessage(dir: string, count: number): string {
     return [
         `[persist] session dir ${dir} failed ${count} consecutive writes (EPERM — rename is locked).`,
-        "Likely cause: Windows Defender / antivirus / indexer / a sync tool is locking the directory.",
-        `Fix: add ${dir} to Windows Defender exclusions (Settings → Virus & threat protection → Manage settings → Exclusions → Add an exclusion),`,
-        "and make sure no OneDrive / sync tool is syncing this path.",
+        `First suspect — the node runtime's NTFS mandatory integrity label: ${integrityLabelDiagnosis(process.execPath)}.`,
+        `Otherwise: Windows Defender / antivirus / indexer / a sync tool is locking the directory — add ${dir} to Defender exclusions (Settings → Virus & threat protection → Manage settings → Exclusions → Add an exclusion) and make sure no OneDrive / sync tool is syncing this path.`,
     ].join("\n");
 }
