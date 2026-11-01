@@ -2557,7 +2557,7 @@ async function handleRequest(
                     }
                     if (countTokens) {
                         return protocol === "google"
-                            ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)
+                            ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session, googleModel ?? v1Model)
                             : prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session);
                     }
                     if (protocol === "google") {
