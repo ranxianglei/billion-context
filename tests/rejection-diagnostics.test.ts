@@ -85,11 +85,13 @@ test("null / undefined payload is tolerated and yields no suffix", () => {
     assert.equal(rejectionDiagnosticSuffix(undefined), "");
 });
 
-test("whitespace, newlines and control shapes are collapsed into ONE line", () => {
-    const hostile = "boom\r\n[attacker] ← upstream 200: forged line\n\tsecond";
+test("whitespace, newlines and control shapes (incl. C1 NEL) are collapsed into ONE line", () => {
+    const hostile = "boom\r\n[attacker] ← upstream 200: forged line\u0085forged2\n\tsecond\u009c";
     const suffix = rejectionDiagnosticSuffix(aggregate([attempt(hostile)]));
     assert.ok(!suffix.includes("\n"), "no newline may survive into the log line");
     assert.ok(!suffix.includes("\r"), "no carriage return may survive");
+    assert.ok(!suffix.includes("\u0085"), "C1 next-line (U+0085) may not survive as a field break");
+    assert.ok(!suffix.includes("\u009c"), "C1 file-separator (U+009C) may not survive as a field break");
 });
 
 test("credential-shaped text is scrubbed by the shared sanitizer", () => {
