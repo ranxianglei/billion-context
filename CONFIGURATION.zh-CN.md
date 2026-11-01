@@ -2472,6 +2472,17 @@ Codex 子代理（如 `guardian_subagent` 审批 reviewer）复用主会话的 `
 
 billion-context 通过 `instructions` 字段识别：子代理请求带自己的角色 prompt。会话**首次**看到的 instructions 锚定主命名空间（即使主 prompt 后来漂移也稳定）；任何其他 instructions 值映射到独立的 `|sub:` 命名空间，拥有自己的空白压缩状态。子代理请求是自包含重放，所以新命名空间无损 —— Web UI 的会话列表会把两个命名空间显示为共享同一客户端标签的独立会话。
 
+这个锚定不只对 Codex / Claude Code 成立——但分裂是有意的、按客户端启用的：只有流量已被证实「同一个会话 id 盖在多个角色上、每个角色在该 id 下带自己的 system prompt」的客户端才启用，目前是 Codex、Claude Code 与 DeepSeek Harness。其他客户端的 system prompt 中途变化意味着「同一会话、提示词演进」，仍留在主命名空间。一个非 Claude 的实例是启用了 `@deepseek-ai/dsh-experimental-auto-review` 的 DeepSeek Harness：reviewer 在每次待执行工具调用前用自己的小块固定 system prompt（约 1 KB；`ENVIRONMENT` / `PROJECT_INSTRUCTIONS` / `FILTERED_HISTORY` / `PENDING_ACTION` 四节走的是它的 user 轮）发一次请求，于是它的会话行与主对话并排出现，同样显示「运行中」。
+
+四个读数可以在不读代码的情况下认出这类车道：
+
+| 读数 | 主对话 | 评审 / 子代理车道 |
+| --- | --- | --- |
+| system prompt | 完整提示词（数十 KB） | 很小（约 1 KB） |
+| 压缩次数 | 随时间增长 | 0 |
+| 请求数 | 大致每轮一次 | 大致每次工具调用一次 |
+| 缓存命中率 | 因场景而异 | 约 99.9%（前缀稳定，只有待执行动作在变） |
+
 ### Windows：把会话目录加入杀软排除项（#362）
 
 billion-context 把每个会话的压缩状态持久化为会话目录（默认 `%USERPROFILE%\.local\share\billion-context\`）下「一会话一 JSON 文件」，长会话每一轮都会重写该文件。在 Windows 上，实时杀毒（Windows Defender）、搜索索引器或同步工具（OneDrive）可能在写入中途锁住该目录。当锁跨多次写入持续时，rename 会以 `EPERM` 失败，在锁解除前该会话的每次持久化都会失败。
