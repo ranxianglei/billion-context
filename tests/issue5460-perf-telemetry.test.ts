@@ -185,21 +185,25 @@ test("#5460 P1: logRequestCost wires structured rows through the single choke po
     } finally { perfStopAll(); }
 });
 
-test("#5460 P1: retention sweep caps perf_events at 200k rows — oldest drop first", () => {
+test("#5460 P1: retention sweep caps perf_events at the 200k-row window — oldest drop first", () => {
     resetModule();
     const dir = sandbox();
     try {
         assert.equal(perfTelemetryInit("sqlite", { dir }), true);
-        for (let i = 0; i < 200_001; i++) {
+        // Stop EXACTLY on a sweep boundary past the cap (a multiple of the
+        // 500-insert sweep period): the sweep that just fired must leave the
+        // table at precisely the cap, newest kept. Between sweeps the table
+        // may hold up to cap+period-1 (amortized by design).
+        for (let i = 0; i < 200_500; i++) {
             perfRecordRequest({ sessionId: `r${i}`, inboundBytes: i });
         }
         perfStopAll();
         const db = new DatabaseSync(path.join(dir, PERF_DB_FILE));
         try {
             const n = db.prepare("SELECT COUNT(*) AS n FROM perf_events").get() as { n: number };
-            assert.equal(Number(n.n), 200_000, "retention cap must hold");
+            assert.equal(Number(n.n), 200_000, "retention cap must hold at the sweep boundary");
             const newest = db.prepare("SELECT session_id FROM perf_events ORDER BY id DESC LIMIT 1").get() as { session_id: string };
-            assert.equal(newest.session_id, "r200000", "newest rows survive, oldest drop");
+            assert.equal(newest.session_id, "r200499", "newest rows survive, oldest drop");
         } finally { db.close(); }
     } finally { perfStopAll(); }
 });
