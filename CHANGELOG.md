@@ -27,6 +27,14 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ### Added
 - **消息时间戳渲染默认开启（#4313 后续）**:此前 `compress.messageTimestamps` 为可选特性（默认关，线上字节与特性前逐字节一致）。生产会话的缓存审计（同会话开关前后命中率均 95.0%、无一条时间戳导致的前缀重写 miss、全部异常可归因上游 TTL 驱逐）证实存戳渲染跨轮逐字节稳定，故默认翻转为**开**：`time=` 压缩标签属性、回执指纹行 `[起 – 止]` 覆盖跨度、摘要 Occurred 行对所有人默认可见（每条消息首次出现时铸一次不可变墙钟戳，渲染只读存戳不读墙钟）。关闭方式不变：文件 `compress.messageTimestamps: false` 或 `BILI_MESSAGE_TIMESTAMPS=0`，关闭后每个出站字节与 pre-#4313 master 一致。升级用户的一次性代价：标志首次解析为开的那个重启后，每个活跃会话付一次冻结前缀缓存重写（旧消息补上 time= 属性 + 提示词变体切换），之后稳定。测试基线：tests/preload-test-env.mjs 整套件 pin 显示门控关，字节对比型金标保持特性前形态；issue4313 toggle 套件按新契约翻转并新增 message-timestamps-default-on.test.ts 钉住生产默认路径。
 
+### #3248 — 增量车道 GA：全新安装开箱即用
+
+- **行为变更(旧→关→开)**:增量车道（宿主只发对话增量、不再每轮全量重发历史，#3248/#5155/#5156）此前 `rollout.features.pluginIncrementalTurns` 打包值为 `percent: 0`——**每个安装都要运营者手动开**。四个当年阻塞它的缺陷已全部关闭并修复：#3343（marker divert 缺回环校验，安全）、#3433（dsh-native 未接入 `wireMessagesLookAnthropic`，OpenAI 车道会丢 `tool_calls`）、#3352（opencode 原生零收益）、#3369（一次瞬时失败永久降级）。现在打包值改为 **`percent: 100`**：新装用户无需任何配置文件、环境变量或面板操作，装上即走增量车道。
+- **为什么默认翻转是安全的**:快车道只在**全部**验证命中时接手——请求体形状（`incrementalTurnBodyShape`）、宿主 GET 探针、统一存储 sidecar、回执。任何一项不满足就整轮回落到原有的全量重发路径，字节与从前完全一致。所以这个默认值只改变**宿主发出多少字节**（#5156 的收益），不改变任何正确性保证。安全面同理：形状化请求在进入 `applyTurn` 之前先过 `adminGateDenial` 回环校验（#3343），非回环/隧道/不可信来源一律 403，默认开启不扩大攻击面。
+- **单一开关 + 两个逃生口**:文件 `rollout.features.pluginIncrementalTurns: false`（或任意 percent 灰度）、环境变量 `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0`。两者语义与顺序不变：env > config > 打包 percent > 关闭（fail closed）。
+- **升级提示**:已在跑增量车道的安装字节不变（它们本来就开着）；从默认关升上来的安装，第一个回合起即走增量路径，无需重启以外的任何操作。需要保回旧行为的用户设上面任一逃生口即可。
+- 测试：`tests/incremental-lane.test.ts` 的探针用例按新契约翻转（默认报 enabled，env `0` 才关）；503 用例改由 env 逃生口驱动；新增 `tests/rollout.test.ts` 内的 GA 打包值 + 双逃生口断言，以及 `tests/incremental-lane-default-on.test.ts`（干净 XDG 根、无配置文件、真实 `featureEnabled`/`incrementalTurnsEnabled`/`GET /__bili/plugin/turn` 三段驱动；反向对照证明默认回退到 0 时 1/2/5 三条必须变红）。
+
 ### #5079 — `prompt_cache_key` 自注入默认关闭,`promptCache.routing` 一个开关管住两条 wire
 
 - **行为变更(旧→新)**:此前 bili 在插件车道对一切目的地默认给请求体盖 `prompt_cache_key=<会话 id>`(#2218/#2649 定案,Responses wire 仅对 `api.openai.com` 注入)。由于大量服务见到该字段会直接拒绝、且这类服务无法枚举,**默认反转为关闭**:`promptCache.routing` 缺省值从 `"auto"` 变为 `"disabled"`(无法识别的值同样落到 `"disabled"`)。客户端自带的 key 不受影响:任何模式下都原样转发(A/B 探测记忆对已证实拒收的 origin+model 组合照常撤键)。
