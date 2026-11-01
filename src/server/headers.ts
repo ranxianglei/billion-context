@@ -26,6 +26,12 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // #1117: bili-internal passthrough marker (native fetch patch → proxy);
     // never meaningful to a real upstream.
     "x-bili-passthrough",
+    // #5418: watermark fastpath handshake — client→proxy watermark claim and
+    // proxy→client measured total. Pure billing-plane bookkeeping; the A/B
+    // golden (tests/issue5403-watermark-fastpath.test.ts) pins that neither
+    // ever reaches a model endpoint.
+    "x-bili-pf-count",
+    "x-bili-pf-seq",
     "te",
     "trailer",
     "upgrade",

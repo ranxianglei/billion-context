@@ -145,6 +145,7 @@ export function scanMessagesSpans(
                 // Last-wins on duplicates, matching JSON.parse.
                 if (messagesSeen) messageSpans.length = 0;
                 else messagesSeen = true;
+                const arrStart = i;
                 if (i >= n || s.charCodeAt(i) !== 91) throw new Error("e");
                 i++;
                 skipWs();
@@ -165,6 +166,10 @@ export function scanMessagesSpans(
                 } else {
                     i++;
                 }
+                // Position-only entry (the value is never re-parsed): consumers rebuild the
+                // top-level object in WIRE KEY ORDER — the key sequence is part of the byte
+                // contract, appending "messages" late would reorder its siblings (#5418).
+                if (extraKeys === "all" || extraKeys.includes("messages")) fieldSpans.set("messages", { start: arrStart, end: i });
             } else {
                 const fs = i;
                 walkValue();

@@ -1649,6 +1649,8 @@ async function forwardCaptured(
         // it back). The dsh recall bridge does not need it (it learns at
         // beforeSend), but any client may adopt the header directly.
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
+        // #5418: the prepare lane's own success-response headers (watermark seq stamp).
+        if (prepared !== null && prepared.responseExtraHeaders !== undefined) Object.assign(respHeaders, prepared.responseExtraHeaders);
         res.writeHead(upstream.status, respHeaders);
     }
     // #4204: success-side counterpart of the non-2xx observation above — a
