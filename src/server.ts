@@ -1857,6 +1857,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         hbStreaks.delete(pid);
                         log("info", `[watchdog] pid ${pid} heartbeating again — clearing stale-heartbeat streak (#4994)`);
                     }
+                } else if (decision.heartbeatVeto) {
+                    // #4125: fresh beat vs failed existence probe — announce the
+                    // disagreement once per episode so the field can attribute
+                    // what the probe actually failed with (same errno clue as
+                    // the #3890 line below).
+                    if ((deadStreak.get(pid) ?? 0) === 0) {
+                        log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) but its heartbeat beat recently — trusting the identity-anchored heartbeat, failure not counted (#4125/#3890)`);
+                    }
+                    deadStreak.delete(pid);
                 } else {
                     if (decision.streak === 1) {
                         // Field instrumentation (#3890): Windows collapses every
@@ -2267,16 +2276,26 @@ interface WatcherTickDecision {
     streak: number;
     /** Stale-while-alive streak after this tick (0 when the beat is fresh or removed). #4994. */
     hbStreak: number;
+    /** #4125: the probe failed but a FRESH heartbeat vouched for the pid — the failure was neither counted nor removing. */
+    heartbeatVeto?: boolean;
 }
 
-/** #3890/#4994: pure per-pid death-streak step. Each axis confirms
- *  independently over CONSECUTIVE agreeing ticks: a failed kill-0 probe
+/** #3890/#4994/#4125: pure per-pid death-streak step. Two axes confirm
+ *  independently over CONSECUTIVE agreeing ticks (#4994): a failed kill-0 probe
  *  increments its streak and only removes at confirmTicks; a stale-while-alive
  *  reading increments the heartbeat streak and only removes at
  *  heartbeatConfirmTicks. A live probe resets the kill-0 axis, a fresh beat
  *  resets the heartbeat axis, and a tick that disagrees with an axis breaks
  *  THAT axis's run (episodes never accumulate across interruptions). Legacy
- *  pids (no heartbeat record) keep kill-0-only semantics (#3544). */
+ *  pids (no heartbeat record) keep kill-0-only semantics (#3544). On top of
+ *  that, #4125: a FAILED probe on a pid whose last beat is still FRESH is
+ *  vetoed entirely — not counted, not removed — because the beat is
+ *  identity-anchored (only the true owner posts its own pid over loopback)
+ *  while kill-0 is an identity-blind existence check; disagreement resolves in
+ *  favor of the stronger proof. Field case: three consecutive transient
+ *  OpenProcess failures against a LIVE host burned the whole confirm window
+ *  and force-exited a healthy proxy mid-session; the same host pid then
+ *  re-armed fine on the replacement proxy, proving it never died. */
 export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, prevHbStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number; heartbeatConfirmTicks: number }): WatcherTickDecision {
     if (probe.alive) {
         const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
@@ -2285,6 +2304,9 @@ export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, no
         return hbStreak >= opts.heartbeatConfirmTicks
             ? { removed: true, staleHeartbeat: true, streak: 0, hbStreak: 0 }
             : { removed: false, staleHeartbeat: true, streak: 0, hbStreak };
+    }
+    if (lastSeen !== undefined && nowMs - lastSeen <= opts.heartbeatGraceMs) {
+        return { removed: false, staleHeartbeat: false, streak: 0, hbStreak: 0, heartbeatVeto: true };
     }
     const streak = (prevStreak ?? 0) + 1;
     return streak >= opts.confirmTicks
