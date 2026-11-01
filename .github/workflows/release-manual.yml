@@ -186,6 +186,10 @@ jobs:
         # then publishes (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
+          # The raw_publish step installs deps itself; this path must not rely on
+          # it (#5430 moved the install into the raw-only step and left this
+          # path with no node_modules -> `tsup: not found` in pretypecheck).
+          npm ci
           npm run typecheck
           npm run build
 
