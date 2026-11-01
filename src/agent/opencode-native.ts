@@ -817,6 +817,9 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             if (base === undefined) return;
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
+            // #5403/#5418: echo the watermark stamp back to the proxy.
+            const ocPfSeq = pfSeqByConversationOC.get(input.sessionID);
+            if (ocPfSeq !== undefined) output.headers[PF_COUNT_HEADER_NAME_OC] = String(ocPfSeq);
             // #1102: opencode mints one session id per persona (task-tool
             // subagents get fresh child ids), so instruction drift (AGENTS.md
             // reconcile) must not fork the compression session.
@@ -1047,9 +1050,20 @@ const INC_PENDING_TTL_MS = 30_000;
  *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
 
+// #5403/#5418 full-resend watermark echo (same handshake as the dsh/pi shims):
+// the proxy answers each evaluated chat-completions turn with x-bili-pf-seq and
+// the client feeds it back as x-bili-pf-count on the next turn. Count mode
+// only — opencode's chat.headers hook carries no message list, so tail-ids are
+// unreachable here without a wire change. Inline literals (#3482 leaf rule);
+// a stale entry costs the server at most ONE verification round.
+const PF_COUNT_HEADER_NAME_OC = "x-bili-pf-count";
+const PF_SEQ_HEADER_NAME_OC = "x-bili-pf-seq";
+const pfSeqByConversationOC = new Map<string, number>();
+
 /** Test hook: drop all planned turns (the map is module state across suites). */
 export function __resetOpencodeIncrementalForTests(): void {
     incPendingOpencode.clear();
+    pfSeqByConversationOC.clear();
 }
 
 /** Ack collector registered on the module's NativeInterceptState: the
@@ -1060,6 +1074,18 @@ export function __resetOpencodeIncrementalForTests(): void {
  *  turn-id header is not an incremental ack at all. Exported for the native
  *  suites; wired below. */
 export function opencodeIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
+    // #5403/#5418: learn the watermark stamp on EVERY successful model send —
+    // attributed by THIS dispatch's outgoing conversation header (the url is
+    // shared context, never the key, #3329), so plain full-resend responses
+    // record too, unlike the incremental ack below.
+    if (response.status === 200) {
+        const pfSeq = response.headers.get(PF_SEQ_HEADER_NAME_OC);
+        const conv = headers?.["x-bili-plugin-conversation"];
+        if (pfSeq !== null && /^\d+$/.test(pfSeq) && conv !== undefined && conv.length > 0) {
+            if (pfSeqByConversationOC.size >= 1024) pfSeqByConversationOC.clear();
+            pfSeqByConversationOC.set(conv, Number(pfSeq));
+        }
+    }
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
     if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
     const pending = incPendingOpencode.get(turnId);
