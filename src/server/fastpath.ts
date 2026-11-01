@@ -44,7 +44,7 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
-export const HEAD_CHECK_ELEMENTS = 8;
+const HEAD_CHECK_ELEMENTS = 8;
 const PF_BREAKER_MISSES = 5;
 const PF_DISABLED_TTL_MS = 60 * 60 * 1000;
 const PF_EXT_KEY = "pf:state";
