@@ -107,8 +107,9 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
-    // Retention children use per-test mkdtemp roots and stdio/IPC only;
-    // they bind no port and share no logger or generation directory.
+    // #5487: spawns a one-shot sealer child (process.execPath) against its own
+    // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
+    // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
     "tests/log-retention.test.ts",
 ];
 
