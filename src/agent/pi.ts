@@ -1283,6 +1283,21 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 },
             });
         }
+        // Await tool registration in before_agent_start so cold-start native
+        // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
+        // active tool loadout and <codemode_catalog> system prompt. Without this,
+        // session_start's unawaited registerTools(..., false) can lose the race
+        // with native proxy boot, registerTools only completes later inside
+        // before_provider_headers/before_provider_request (after Turn 1's
+        // system prompt is already built), and Turn 2 emits a mid-conversation
+        // role:"system" codemode_catalog diff.
+        pi.on("before_agent_start", async (_event, ctx) => {
+            try {
+                await registerTools(pi, ctx, state, agent);
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+        });
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
                 // #1243: on the native lane the proxy origin lands via an async

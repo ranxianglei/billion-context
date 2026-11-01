@@ -88,11 +88,22 @@ export function detectGenerationBoundary(
     log?: (level: string, msg: string) => void,
 ): boolean {
     if (readGenerationBoundary(session)) return true;
+    // A generation boundary only exists at the start of a new session generation
+    // (first request after a model/upstream switch restarts the ref ledger at m00001).
+    // Once request #1 has passed without stale-ref residue, never newly latch on
+    // later turns (stats.requests > 1) — mid-session tool outputs or catalog updates
+    // quoting mNNNNN strings are not ledger-reset residue, and flipping mid-session
+    // mutates the standing system prompt and invalidates the upstream prefix cache.
+    if ((session.stats?.requests ?? 0) > 1) return false;
     if (messages.length === 0) return false;
     const frontier = highestMappedIndex(session.state);
     const stale = new Set<number>();
     let found = false;
     for (const m of messages) {
+        // In-band system messages (e.g. client system-prompt patches or codemode_catalog
+        // sections containing compress's 'm00150–m00220' example) are ambient instructions,
+        // never previous-generation conversation history.
+        if (m.role === "system") continue;
         const text = m.text;
         if (!text) continue;
         REF_CITATION_RE.lastIndex = 0;
