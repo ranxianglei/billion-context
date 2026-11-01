@@ -267,7 +267,9 @@
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
 | `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
-| `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
+| `compress.nudgeDecisionMaxTokens` | number | 1024 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。#5030：默认从 200 提升到 1024——混合思考模型（glm-5.3）的隐藏思考与可见回答共享同一输出预算，200 时会以空 content 收尾。 |
+| `compress.nudgeDecisionTimeoutMs` | number | 15000 | — | 模型决策 side call 的空闲超时（毫秒）。#5030：若提供商的全上下文 side call 即使缓存命中也需 15 秒以上 prefill（z.ai 在 200–450k token 实测 25–60 秒），请调大；原 15 秒硬墙会让每次触发都变成超时。必须 > 0。 |
+| `compress.nudgeDecisionReasoning` | "strip" \| "follow" \| "off" | "strip" (unset) | — | #5030：决策 side call 对宿主请求上思考开关字段的处理策略。"strip"（默认）：删除（#3004 行为）。"follow"：保留——side call 遵守宿主为该模型配置的思考强度。"off"：删除后按协议原生方式显式关闭思考（如 reasoning_effort "none"），避免默认思考模型把输出预算耗在隐藏思考上。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
