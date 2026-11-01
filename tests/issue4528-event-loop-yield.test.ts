@@ -52,7 +52,13 @@ describe("#4528 logRequestCost large-history guard", () => {
     it("warns once when the inbound history has grown past the message threshold", () => {
         const { lines, log } = capture();
         logRequestCost(log, "sess-big", 1500, 11_000_000, performance.now() - 8000);
-        assert.equal(lines.filter(([l]) => l === "warn").length, 1);
+        const warns = lines.filter(([l]) => l === "warn");
+        assert.equal(warns.length, 1);
+        assert.match(warns[0][1], /large-history: 1500 msgs/);
+        assert.match(warns[0][1], /inbound=/);
+        assert.match(warns[0][1], /local=\d+ms/);
+        // #5481: the wording IS the fix — factual count report, no stall attribution.
+        assert.match(warns[0][1], /not evidence of event-loop starvation/);
         assert.ok(lines.some(([l, m]) => l === "info" && m.includes("sess-big") && m.includes("1500 msgs")));
     });
 
