@@ -669,10 +669,11 @@ two installs walking the SAME *session* concurrently — that case alarms
 separately (split-brain contest, #3923). If you still want strictly separate
 histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
 `BILI_CONFIG_FILE` when the config should differ too) through that install's
-launcher/profile environment — no global env changes needed. Once isolated,
-the `[instances]` notice drops off entirely. Note the distinction from the
-deployment case above: local disk with SQLite WAL tolerates many writers;
-shared RWX/NFS storage does NOT and keeps requiring one writer per volume.
+launcher/profile environment — no global env changes needed. Registration still
+reports different directory paths informationally: those paths alone prove neither
+SQLite isolation nor a same-conversation contest. Local SQLite WAL supports distinct
+conversation writers; shared RWX/NFS does not provide that safety, and independent
+deployment stores do not replicate or fail over.
 
 Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
 (from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
