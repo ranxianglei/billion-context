@@ -166,8 +166,9 @@ const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
 /** dsh per-turn time-context carrier (#5142, superseding #5109's naming):
  *  the timestamp notice injected before each turn (marker above).
  *  Deliberately FOLDABLE by design — unlike the four durable carriers it
- *  carries no state beyond its own turn and must NEVER be pinned, so it
- *  stays OUT of dshDurableToolPath / kernel protection. Its problem is
+ *  carries no state beyond its own turn and must NEVER be pinned, so its
+ *  path lives in the oneshot/ namespace where no protection pattern matches
+ *  it (kernel-foldable) while still riding dshDurableToolPath. Its problem is
  *  retirement, not foldability: the host re-sends it only on the turn it
  *  was sampled for, so once folded it leaves the resent history FOREVER —
  *  a permanent missing covered id that fold-reconcile used to count as
