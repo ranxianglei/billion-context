@@ -96,6 +96,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -4567,6 +4568,9 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    // #5408: this line is THE observation point — a hot-at-attach session that
+    // never produces one is silent compression loss (the incident signature).
+    noteRequest(sessionId);
     if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
         log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
     }
