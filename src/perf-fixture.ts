@@ -12,7 +12,7 @@
 
 export type FixtureShape = "openai" | "anthropic";
 
-export interface FixtureSpec {
+interface FixtureSpec {
     seed: number;
     msgs: number;
     shape: FixtureShape;
