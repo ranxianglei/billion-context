@@ -1489,6 +1489,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // so the next nudge decision sees post-compress reality instead of
         // re-firing on the stale pre-compress number (#252 double-inject).
         ctx.session.stats.compressCreditTokens = (ctx.session.stats.compressCreditTokens ?? 0) + r.tokensCompressed;
+        // #4700: restore the writer of the cumulative savings counter. It died
+        // with the kernel import, and #2734's web derivation from ACTIVE blocks'
+        // compressedTokens is the only live source left — so whenever folded
+        // blocks deactivate (client-side /compact archive, orphan-GC, tier
+        // distillation, host expand) the SAVED column collapses to 0 even
+        // though real folds happened. Credit the gross at this single commit
+        // point shared by every lane (tool-driven proxy/plugin folds AND
+        // preflight): refused paths return earlier, partial folds'
+        // r.tokensCompressed counts only successful ranges, and in-place
+        // refolds report tokens 0, so nothing double-counts.
+        ctx.session.stats.tokensSaved += r.tokensCompressed;
         // #1911: deliberately NO estimate fallback here. Writing viewTokens − S
         // into lastInputTokens would leave an estimate-grade value in a
         // usage-grade field (source stays "usage") and arm kernel context-space
