@@ -1,6 +1,6 @@
 {
 	"name": "billion-context-pi-subagents",
-	"version": "0.2.2",
+	"version": "0.2.3",
 	"description": "acp_delegate sub-agent tools for the Pi coding agent — split out of billion-context-pi (#612); vendored in-repo (#2384).",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
