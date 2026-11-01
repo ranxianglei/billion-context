@@ -126,8 +126,12 @@ function scriptTurns(): Array<{ messages: unknown[]; max_tokens: number; stream:
 // The only sanctioned normalization: kernel time="…" attributes carry wall
 // clock and differ run-to-run; nothing else may differ. Captured bodies are
 // JSON, so the quotes arrive escaped (time=\"…\"); match both forms (#5471).
+// The value itself arrives as `yyyy-mm-dd hh:mm:ss` (SPACE between date and
+// time — the tag contract's stated format), so the class must admit space or
+// the mask misses whenever the two phases straddle a wall-clock second
+// (#5471 follow-up: caught live at `2026-11-02 00:28:19` vs `...:20`).
 function normalize(raw: string): string {
-    return raw.replace(/\stime=\\?"[0-9T:.Z+\-]+\\?"/g, ' time="X"');
+    return raw.replace(/\stime=\\?"[0-9T:.Z+\- ]+\\?"/g, ' time="X"');
 }
 
 // The v2 identity channel needs the client's own stable msgids per element.
