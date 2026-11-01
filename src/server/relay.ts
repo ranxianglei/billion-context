@@ -2,6 +2,7 @@ import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catal
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -68,7 +69,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -798,6 +799,9 @@ async function forwardCaptured(
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
+            // The judge validates this body-bound manifest while reusing its
+            // one actual-wire projection; relay does not decode the history again.
+            ...(prepared.separatorManifest !== undefined ? { separatorManifest: prepared.separatorManifest } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
     }
@@ -2115,6 +2119,10 @@ async function forwardCaptured(
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
             const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // #564/#2627: separator slots for the CURRENT round's body, refreshed
+            // by each fold. The loop reads this through `ctx.separatorSlots` so the
+            // continuity judge sees the same producer record prepare sees.
+            let loopSeparatorSlots: readonly SeparatorSlot[] = [];
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -2165,8 +2173,16 @@ async function forwardCaptured(
                     // turn rendered one history with two different shapes and the
                     // byte prefix broke mid-history on every fold.
                     const dropped = prepared.dropReasoning ? prepared.dropReasoning(out) : out;
-                    const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
-                    return ordered;
+                    if (prepared.protocol === "responses") {
+                        const ordered = repairResponsesAssistantOrdering(dropped, prepared.originalMessages);
+                        // #564/#2627: the round-2+ body is built from THIS array, so
+                        // re-minted separator positions must travel with it or the
+                        // continuity judge reads a newly added marker as a mid-insertion.
+                        loopSeparatorSlots = ordered.slots;
+                        return ordered.messages;
+                    }
+                    loopSeparatorSlots = [];
+                    return dropped;
                 });
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
@@ -2177,7 +2193,7 @@ async function forwardCaptured(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, separatorSlots: () => loopSeparatorSlots, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's

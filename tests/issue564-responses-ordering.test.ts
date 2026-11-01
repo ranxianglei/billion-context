@@ -6,7 +6,11 @@ import { responsesToCore, coreToResponses, type ResponsesProjection, type BiliMe
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
-import { stripKernelSummaries, repairResponsesAssistantOrdering } from "../src/server.ts";
+import { stripKernelSummaries } from "../src/server.ts";
+import { repairResponsesAssistantOrdering, collectSeparatorManifest, separatorCoreProvenance, separatorProvenanceSet, isSeparatorCarrier, RESPONSES_TURN_SEPARATOR } from "../src/server/responses-ordering.ts";
+import { patchResponsesInputWithToolImages as patchResponsesInput } from "../src/responses-tool-output.ts";
+import { RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "../src/turn-separator.ts";
+import { _setInvariantJudgeForTest, maybeRunInvariantJudge } from "../src/invariant-judge.ts";
 
 // #564 regression: after a successful compress, upstream must still receive a
 // valid Responses assistant history. Within one assistant run the order is
@@ -166,7 +170,7 @@ test("#564 path 2: compress re-request keeps Responses assistant run ordering va
         const t = core.processTurn({ messages: original, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
         session.state = t.state;
         const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-        return repairResponsesAssistantOrdering(stripKernelSummaries([...t.messages, ...records] as BiliMessage[], t.state), original);
+        return repairResponsesAssistantOrdering(stripKernelSummaries([...t.messages, ...records] as BiliMessage[], t.state), original).messages;
     };
     const ctx = {
         core, config,
@@ -215,7 +219,7 @@ test("#564 path 1: reasoning whose whole turn body was folded away is dropped", 
         reasoningMsg("rsX", "ENC_X"),
         reasoningMsg("rsY", "ENC_Y"), asstMsg("txY", "BODY-Y"),
     ];
-    const out = repairResponsesAssistantOrdering(folded, original);
+    const out = repairResponsesAssistantOrdering(folded, original).messages;
     const ids = out.map((m) => m.id);
     assert.ok(!ids.includes("rsX"), "orphaned reasoning rsX dropped (its body was compressed into the block)");
     assert.ok(ids.includes("rsY") && ids.includes("txY"), "turn Y reasoning+body retained");
@@ -233,7 +237,7 @@ test("#564 path 1b: originally-reasoning-only turn keeps its reasoning, runs sta
         reasoningMsg("rsZ", "ENC_Z"),
         reasoningMsg("rsY", "ENC_Y"), asstMsg("txY", "BODY-Y"),
     ];
-    const out = repairResponsesAssistantOrdering(folded, original);
+    const out = repairResponsesAssistantOrdering(folded, original).messages;
     const ids = out.map((m) => m.id);
     assert.ok(ids.includes("rsZ"), "reasoning-only turn's reasoning is NOT dropped");
     assert.ok(ids.some((id) => id.startsWith("acp_turn_sep_")), "a separator was inserted between the two runs");
@@ -248,9 +252,140 @@ test("#564: a surviving acp_summary carrier is untouched (no spurious separator)
     ];
     const carrier = userMsg("acp_summary_b1", "Inspected files A and B.");
     const folded: CoreMessage[] = [userMsg("u1", "q"), reasoningMsg("rsA", "ENC_A"), asstMsg("txA", "TEXT-A"), carrier, reasoningMsg("rsB", "ENC_B"), asstMsg("txB", "TEXT-B")];
-    const out = repairResponsesAssistantOrdering(folded, original);
+    const out = repairResponsesAssistantOrdering(folded, original).messages;
     assert.equal(out.length, folded.length, "nothing added or dropped when a non-assistant carrier already separates the runs");
     assert.ok(out.map((m) => m.id).includes("acp_summary_b1"), "summary carrier preserved");
     assert.ok(!out.some((m) => (m.text ?? "").includes("compressed")), "no synthetic separator injected");
     assertValidAssistantOrdering(wireItems(out), "carrier");
 });
+
+// --- #564/#2627 producer-owned provenance -------------------------------
+// A separator is outbound-only and, on the wire, byte-identical to a client
+// user message carrying the same text (coreToResponses emits
+// {type:"message",role:"user",content:<text>} and responsesToCore re-derives the
+// core id from text alone). Provenance is therefore OBJECT IDENTITY: the producer
+// mints the canonical carrier on the marker core's `rawResponsesItem` sidecar,
+// the real codec emits that very object, and the claim is the index where that
+// object is found in the FINAL array.
+
+const SEPARATOR_ORIGINAL: CoreMessage[] = [
+    userMsg("u1", "q"),
+    reasoningMsg("rsA", "ENC_A"), asstMsg("txA", "TEXT-A"),
+    reasoningMsg("rsB", "ENC_B"), asstMsg("txB", "TEXT-B"),
+];
+
+const SEPARATOR_FOLDED: CoreMessage[] = [
+    userMsg("u1", "q"),
+    reasoningMsg("rsA", "ENC_A"), asstMsg("txA", "TEXT-A"),
+    reasoningMsg("rsB", "ENC_B"), asstMsg("txB", "TEXT-B"),
+];
+
+
+test("#2627 provenance: identical CLIENT prose is never claimed", () => {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    // The client added its own user message carrying the separator's exact text,
+    // and even a core whose id looks like a producer marker.
+    const prose: CoreMessage = { id: `${RESPONSES_TURN_SEPARATOR_ID_PREFIX}99`, role: "user", contentType: "text", text: RESPONSES_TURN_SEPARATOR };
+    const withProse: CoreMessage[] = [...ordered.messages.slice(0, 1), prose, ...ordered.messages.slice(1)];
+    const wire = coreToResponses(withProse) as unknown[];
+    const body = JSON.stringify({ input: wire });
+    const manifest = collectSeparatorManifest(wire, ordered.slots, body);
+    assert.ok(manifest, "the producer's real marker is still claimed");
+    assert.equal(manifest.claims.length, 1, "the client's look-alike id and text add no claim");
+    assert.equal(manifest.claims[0]!.id, ordered.slots[0]!.id, "only the producer's own marker id is claimed");
+    assert.equal(wire[manifest.claims[0]!.index], ordered.slots[0]!.carrier, "the claimed index is the producer's carrier object");
+    // The look-alike sits somewhere else in the array and stays judgeable.
+    const clientIndex = wire.findIndex((item) => (item as Item)["content"] === RESPONSES_TURN_SEPARATOR && item !== ordered.slots[0]!.carrier);
+    assert.equal(separatorProvenanceSet(manifest, wire, body).has(clientIndex), false);
+});
+
+test("#2627 provenance: a dropped carrier claims nothing", () => {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    const wire = coreToResponses(ordered.messages) as Item[];
+    // Simulate a rewrite that replaces the carrier with a fresh look-alike object.
+    const replaced = wire.map((item) => (item === ordered.slots[0]!.carrier ? { type: "message", role: "user", content: RESPONSES_TURN_SEPARATOR } : item));
+    assert.equal(collectSeparatorManifest(replaced, ordered.slots, JSON.stringify({ input: replaced })), undefined, "a substituted object is not the producer's carrier");
+    // And a rewrite that removes it entirely.
+    const removed = wire.filter((item) => item !== ordered.slots[0]!.carrier);
+    assert.equal(collectSeparatorManifest(removed, ordered.slots, JSON.stringify({ input: removed })), undefined, "a dropped carrier yields no claims");
+});
+
+test("#2627 provenance: an inserted item re-anchors the carrier to its new index", () => {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    const wire = coreToResponses(ordered.messages) as Item[];
+    const before = collectSeparatorManifest(wire, ordered.slots, JSON.stringify({ input: wire }))!;
+    // strict-echo inserts blank reasoning; the producer's carrier keeps its
+    // identity and its index is re-derived, never carried over stale.
+    const shifted = [...wire.slice(0, 1), { type: "reasoning", summary: [{ type: "summary_text", text: "" }] }, ...wire.slice(1)];
+    const after = collectSeparatorManifest(shifted, ordered.slots, JSON.stringify({ input: shifted }));
+    assert.ok(after, "the carrier is still present, so the claim survives");
+    assert.equal(after.claims[0]!.index, before.claims[0]!.index + 1, "the index follows the carrier, not the old position");
+    assert.equal(shifted[after.claims[0]!.index], ordered.slots[0]!.carrier);
+});
+
+test("#2627 provenance: an altered carrier fails revalidation", () => {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    const wire = coreToResponses(ordered.messages) as Item[];
+    const body = JSON.stringify({ input: wire });
+    const manifest = collectSeparatorManifest(wire, ordered.slots, body)!;
+    const mutated = wire.map((item, k) => (k === manifest.claims[0]!.index ? { ...item, content: `${RESPONSES_TURN_SEPARATOR} (edited)` } : item));
+    assert.equal(separatorProvenanceSet(manifest, mutated, JSON.stringify({ input: mutated })).size, 0, "a rewritten body drops the claims");
+    const reparsed = JSON.parse(body) as { input: Item[] };
+    assert.equal(separatorProvenanceSet(manifest, reparsed.input, body).size, 1, "a fresh parse of the exact body keeps the proven claim");
+});
+
+test("#2627 provenance: the actual wire judge accepts only body-bound producer claims", () => {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    const wire = coreToResponses(ordered.messages) as Item[];
+    const entry = responsesToCore({ input: coreToResponses(SEPARATOR_FOLDED) } as Parameters<typeof responsesToCore>[0]).msgs;
+    const body = JSON.stringify({ input: wire });
+    const manifest = collectSeparatorManifest(wire, ordered.slots, body)!;
+    const verdicts: { ok: boolean }[] = [];
+    _setInvariantJudgeForTest(true, (verdict) => { verdicts.push(verdict); });
+    try {
+        maybeRunInvariantJudge({ originalMessages: entry, body, parsed: JSON.parse(body), protocol: "responses", separatorManifest: manifest });
+        assert.equal(verdicts.at(-1)?.ok, true, "a fresh parse of the real codec output accepts its producer-owned separator");
+
+        const changedBody = `${body} `;
+        maybeRunInvariantJudge({ originalMessages: entry, body: changedBody, parsed: JSON.parse(changedBody), protocol: "responses", separatorManifest: manifest });
+        assert.equal(verdicts.at(-1)?.ok, false, "semantically equal but changed bytes cannot borrow the old provenance");
+
+        const prose: CoreMessage = { id: `${RESPONSES_TURN_SEPARATOR_ID_PREFIX}99`, role: "user", contentType: "text", text: RESPONSES_TURN_SEPARATOR };
+        const spoofWire = coreToResponses([...ordered.messages.slice(0, 1), prose, ...ordered.messages.slice(1)]) as Item[];
+        const spoofBody = JSON.stringify({ input: spoofWire });
+        const spoofManifest = collectSeparatorManifest(spoofWire, ordered.slots, spoofBody);
+        maybeRunInvariantJudge({ originalMessages: entry, body: spoofBody, parsed: JSON.parse(spoofBody), protocol: "responses", separatorManifest: spoofManifest });
+        assert.equal(verdicts.at(-1)?.ok, false, "client-authored look-alike text and a reserved-looking id remain judgeable");
+    } finally {
+        _setInvariantJudgeForTest(false);
+    }
+});
+
+test("#2627 provenance: multipart and opaque layout items survive with a marker", () => {
+    const multipart = { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }, { type: "input_text", text: " world" }] };
+    const opaque = { type: "item_reference", id: "opaque_ref" };
+    const originalWire: Item[] = [
+        multipart,
+        { type: "reasoning", id: "rsA", encrypted_content: "ENC_A", summary: [] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "TEXT-A" }] },
+        opaque,
+        { type: "message", role: "user", content: "turn removed by folding" },
+        { type: "reasoning", id: "rsB", encrypted_content: "ENC_B", summary: [] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "TEXT-B" }] },
+    ];
+    const parsed = responsesToCore({ input: originalWire } as unknown as Parameters<typeof responsesToCore>[0]);
+    const original = parsed.msgs as CoreMessage[];
+    const folded = original.filter((message) => message.text !== "turn removed by folding");
+    const ordered = repairResponsesAssistantOrdering(folded, original);
+    assert.equal(ordered.slots.length, 1, "folding joined two reasoning-bearing assistant turns");
+    const rebuilt = patchResponsesInput(parsed, ordered.messages) as Item[];
+    assert.deepEqual(rebuilt.find((item) => item["type"] === "item_reference"), opaque);
+    assert.deepEqual(rebuilt.find((item) => item["role"] === "user"), multipart);
+    assert.deepEqual(rebuilt.filter((item) => item["type"] === "reasoning"), originalWire.filter((item) => item["type"] === "reasoning"));
+    const body = JSON.stringify({ input: rebuilt });
+    const manifest = collectSeparatorManifest(rebuilt, ordered.slots, body);
+    assert.ok(manifest);
+    const reparsed = JSON.parse(body) as { input: Item[] };
+    assert.equal(separatorProvenanceSet(manifest, reparsed.input, body).size, 1);
+});
+

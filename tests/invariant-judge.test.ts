@@ -486,3 +486,85 @@ test("#4241 wiring: maybeRunInvariantJudge honors renderTailStart (green on rend
     _setInvariantJudgeForTest(false);
   }
 });
+
+// --- #564/#2627 producer-owned separator provenance --------------------
+// bili's ordering separators exist only outbound, so the judge used to file a
+// mid-insertion finding for each. The producer now names the exact outbound
+// indexes it owns; only those are exempt. Client prose with the same text is
+// NOT owned, so it still reads as an insertion.
+
+const SEP_TEXT = "[The exchange between these two assistant turns was compressed.]";
+
+test("#2627 POS owned separator between two assistant turns is exempt", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  const legacy = judgeInboundOutbound(entry, exit);
+  assert.equal(legacy.ok, false, "without provenance the separator reads as an insertion");
+  assert.equal(legacy.violations.some((finding) => finding.kind === "mid-insertion"), true);
+  const owned = judgeInboundOutbound(entry, exit, { separatorProvenance: new Set([2]) });
+  assert.equal(owned.ok, true, JSON.stringify(owned.violations));
+});
+
+test("#2627 NEG identical CLIENT prose at a different index still fires", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  const v = judgeInboundOutbound(entry, exit, { separatorProvenance: new Set([3]) });
+  assert.equal(v.ok, false, "the unowned separator at index 1 is judged");
+  assert.equal(v.violations.some((finding) => finding.kind === "mid-insertion"), true);
+});
+
+test("#2627 NEG an empty/absent provenance set never exempts a separator", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  assert.equal(judgeInboundOutbound(entry, exit, { separatorProvenance: new Set() }).ok, false);
+  assert.equal(judgeInboundOutbound(entry, exit, {}).ok, false);
+});
+
+// --- #4862 compress pairing: complete pair vs vanished result -----------
+
+test("I3 POS a COMPLETE compress pair outbound is valid, not a finding", () => {
+  const entry = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+  ];
+  const exit = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+  ];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("I3 NEG compress call answered in the BASELINE whose result vanished outbound is a finding", () => {
+  const entry = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+    mk("assistant", "text", "summarized"),
+  ];
+  const exit = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("assistant", "text", "summarized"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false, "a completed compress pair losing its result is bili breaking the pair");
+  assert.equal(v.violations.some((finding) => finding.kind === "unpaired-tool-call"), true);
+});
+
+test("I3 POS truly PENDING compress call (no baseline answer) stays exempt", () => {
+  for (const name of ["compress", "mcp__bili__compress"]) {
+    const entry = [mk("user", "text", "compress it"), mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" })];
+    const exit = [mk("user", "text", "compress it"), mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" })];
+    assert.equal(judgeInboundOutbound(entry, exit).ok, true, name);
+  }
+});
+
+test("I3 POS original-host orphan attribution survives for compress ids", () => {
+  // The CLIENT sent the compress call orphaned (entry has no result for c_1):
+  // bili must not be blamed for a pair the host broke itself.
+  const entry = [mk("user", "text", "q"), mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" })];
+  const exit = [mk("user", "text", "q"), mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" })];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
