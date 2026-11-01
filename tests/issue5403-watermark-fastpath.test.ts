@@ -228,6 +228,6 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
     } finally {
         if (savedEnv === undefined) delete process.env[ENV];
         else process.env[ENV] = savedEnv;
-        // DIAG: cleanup disabled
+        for (const root of roots) rmSync(root, { recursive: true, force: true });
     }
 });
