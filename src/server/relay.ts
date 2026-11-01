@@ -58,7 +58,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, effectiveCalibration, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
@@ -750,8 +750,8 @@ async function forwardCaptured(
         // #4383: the write itself lives in noteOutboundContextEstimates so the
         // stamp contract (and its "estimate" freshness mark, which
         // usageAnchorCycleStale reads) is testable.
-        const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
-        const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
+        const cal = effectiveCalibration(prepared.session.stats, prepared.session.metadata?.lastModel, upstreamUrl);
+        const scaledText = applyEstimateCalibration(est.textOverhead, cal.k, cal.origin, normalizeUpstreamOrigin(upstreamUrl));
         noteOutboundContextEstimates(prepared.session, {
             upperBound: est.upperBound,
             scaledText,
@@ -1272,6 +1272,48 @@ async function forwardCaptured(
             // forever. The refold below re-runs prepare and re-notes a fresh
             // pair for the folded body (#1195), so retiring the consumed pair
             // here cannot mispair a later report.
+            // #5373: retain the overflow's stated count as a PROVISIONAL estimator
+            // scale for this route. The ring above publishes only from ≥2 agreeing
+            // samples and is a single slot any other-origin/model settle clobbers,
+            // so on a fresh overflow-only session (resume-miss sub-session, no usage
+            // history) it can never publish while every forward keeps overflowing —
+            // a permanent 400 loop. The first overflow must steer local judgments
+            // immediately: effectiveCalibration falls back to this when the ring has
+            // nothing applicable to the decision route. Keep the MAX ratio seen for
+            // this origin+model (conservative direction — over-folding costs summary
+            // tokens, never wire integrity); model-gated so a sidecar overflow on
+            // another model cannot clobber the main lane's evidence. Runs BEFORE
+            // settleOverflowCalibration retires the pending pair it reads.
+            if (measured !== undefined && typeof s.stats.lastLocalTextEstimate === "number" && s.stats.lastLocalTextEstimate > 0) {
+                const biasOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                const biasModel = typeof s.metadata?.lastModel === "string" && s.metadata.lastModel !== "" ? s.metadata.lastModel : reqModel;
+                const rawRatio = measured / s.stats.lastLocalTextEstimate;
+                if (biasOrigin !== undefined && Number.isFinite(rawRatio) && rawRatio > 0) {
+                    const policyOrigin = s.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(s.stats.lastCalibrationPolicyOrigin) : undefined;
+                    const policy = policyOrigin === biasOrigin ? s.stats.lastCalibrationPolicy : undefined;
+                    if (policy?.disabled !== true) {
+                        // A ratio outside the band means the stated count
+                        // describes ≥4× / ≤¼ of bili's own view of this payload
+                        // — content bili does not hold (#3450 shape). Retain it
+                        // flagged so a later sane measurement can supersede it,
+                        // but effectiveCalibration must not steer off it.
+                        const mismatched = rawRatio < CALIBRATION_CLAMP_MIN || rawRatio > CALIBRATION_CLAMP_MAX;
+                        let ratio = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, rawRatio));
+                        if (policy?.max !== undefined) ratio = Math.min(ratio, policy.max);
+                        const prev = s.stats.overflowBias;
+                        const sameLane = prev !== undefined && normalizeUpstreamOrigin(prev.origin) === biasOrigin
+                            && !(prev.model !== undefined && biasModel !== undefined && prev.model !== biasModel);
+                        // Trust beats distrust: a sane sample replaces a
+                        // mismatched one even when smaller; within one trust
+                        // class keep the MAX (conservative direction).
+                        const replace = !sameLane || (mismatched !== (prev.mismatched === true) ? !mismatched : ratio > prev.ratio);
+                        if (replace) {
+                            s.stats.overflowBias = { ratio, origin: biasOrigin, ...(biasModel !== undefined ? { model: biasModel } : {}), measured, estimate: s.stats.lastLocalTextEstimate, ...(mismatched ? { mismatched: true } : {}) };
+                            log("info", `[${s.id}] retained overflow-stated bias r=${ratio.toFixed(3)}${mismatched ? ` (raw ${rawRatio.toFixed(2)} outside [${CALIBRATION_CLAMP_MIN}, ${CALIBRATION_CLAMP_MAX}] — stated count does not match bili's view, NOT steering)` : ""} (upstream stated ${measured} vs local est ${Math.round(s.stats.lastLocalTextEstimate)}, model=${biasModel ?? "unknown"}) — steering local judgments on this route until the ring supersedes (#5373)`);
+                        }
+                    }
+                }
+            }
             if (measured !== undefined) settleOverflowCalibration(s, measured, upstreamUrl);
         } else {
             // No window number stated — nothing to learn (and #987

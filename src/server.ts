@@ -124,7 +124,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, effectiveCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -3828,9 +3828,14 @@ export async function preflightCompressIfNeeded(
     // settleUsageReport). Unknown/mismatched origin → raw estimate, i.e. the
     // uncalibrated legacy behavior. #2117 B: the model dimension gates too — a
     // factor learned on another model acts as absent here rather than deciding
-    // with a cross-model billing scale (currentCalibrationFactor).
-    const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
-    const kOrigin = session.stats.calibratedEstimateOrigin;
+    // with a cross-model billing scale (currentCalibrationFactor). #5373: when
+    // the ring has published nothing applicable to this route, fall back to the
+    // provisional overflow-stated bias retained at arm time — on a fresh
+    // overflow-only session ring publication can never happen while every
+    // forward keeps overflowing, so the first overflow must steer from here.
+    const calibration = effectiveCalibration(session.stats, session.metadata?.lastModel, currentOrigin);
+    const kFactor = calibration.k;
+    const kOrigin = calibration.origin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
     const calibratedPayload = calibratedText + imageTokens;
     const tokenCount = unknownBaseline
@@ -4202,7 +4207,11 @@ export async function preflightCompressIfNeeded(
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
         foldedCalibratedSize = rebuiltCalibrated;
-        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
+        // Quote savings from THIS line's own endpoints (#5373): result.savedTokens
+        // is the preflight meter (floored per round by the baseline), which can
+        // clamp to 0 while the quoted estimates still show real reduction — the
+        // incident logged "~0 tokens saved (913329 → 875788)".
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${Math.max(0, tokenCount - foldedCalibratedSize)} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
         fits = unknownBaseline ? result.fitsWindow : rebuiltCalibrated < limit;
         // #1820: anchor the meter to the rebuilt payload's measured size — the
         // rebuild request's own usage report (the only sample that can supersede

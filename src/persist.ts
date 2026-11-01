@@ -206,6 +206,7 @@ interface PersistedSession {
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
         calibrationRing?: { origin: string; values: number[] };
+        overflowBias?: { ratio: number; origin: string; model?: string; measured: number; estimate: number; mismatched?: boolean };
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -3700,6 +3701,32 @@ function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Ma
     return blockContents;
 }
 
+// #5373: same discipline for the provisional overflow-stated bias — every
+// field validated, ratio clamped into the published band, non-positive
+// measurements dropped. A corrupt entry must degrade to absent (raw estimate),
+// never steer a decision off-scale.
+function restoreOverflowBias(v: unknown): { ratio: number; origin: string; model?: string; measured: number; estimate: number; mismatched?: boolean } | undefined {
+    if (!v || typeof v !== "object") return undefined;
+    const b = v as Record<string, unknown>;
+    if (typeof b.origin !== "string" || b.origin.length === 0) return undefined;
+    if (typeof b.ratio !== "number" || !Number.isFinite(b.ratio) || b.ratio <= 0) return undefined;
+    if (typeof b.measured !== "number" || !Number.isFinite(b.measured) || b.measured <= 0) return undefined;
+    if (typeof b.estimate !== "number" || !Number.isFinite(b.estimate) || b.estimate <= 0) return undefined;
+    // A stored ratio outside the band can only have come from an old writer;
+    // re-derive the distrust flag from the clamped value's neighbors so a
+    // corrupt file never steers decisions off-scale.
+    const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, b.ratio));
+    const mismatched = typeof b.mismatched === "boolean" ? b.mismatched : b.ratio < CALIBRATION_CLAMP_MIN || b.ratio > CALIBRATION_CLAMP_MAX;
+    return {
+        ratio: clamped,
+        origin: b.origin,
+        ...(typeof b.model === "string" && b.model.length > 0 ? { model: b.model } : {}),
+        measured: b.measured,
+        estimate: b.estimate,
+        ...(mismatched ? { mismatched: true } : {}),
+    };
+}
+
 /** #4942: the record→legacy-view adapter the sidecar ingest path runs on
  *  every committed record — exported so the hermetic seam suite can build a
  *  sidecar against a stub backend with the SAME adapter the store uses. */
@@ -3766,6 +3793,7 @@ function buildSession(parsed: PersistedSession): Session {
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
+            overflowBias: restoreOverflowBias(stats.overflowBias),
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the
             // NEXT usage report (#695) — restoring a stale true would mislabel an
