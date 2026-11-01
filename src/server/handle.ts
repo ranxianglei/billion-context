@@ -64,14 +64,14 @@ import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
-import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
+import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logRefusedForeignPath, logUnrecognizedPath } from "./observability.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isModelTrafficOriginFormPath, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
 // #5243: warn-once per model when the live codex model table is unavailable and
@@ -326,6 +326,29 @@ async function handleRequest(
         urlPath = url.split("?", 2)[0];
         responsesCompact = urlPath.endsWith("/responses/compact");
         route = resolveUpstream(opts, req.url ?? "", req);
+        // #5211: origin-form request (no /bili/ tunnel, no absolute form, no
+        // MITM socket) whose path is neither model traffic nor a declared
+        // destination — refuse locally instead of splicing it onto
+        // opts.upstream, which would ship the caller's private payload to an
+        // upstream it never chose. Declared destinations (providers.*),
+        // passthrough marks and bili→bili hop chains keep their verbatim
+        // behavior; global passthrough mode relays everything by design.
+        if (route === undefined
+            && !opts.passthrough
+            && !passthroughMark
+            && headerValue(req, BILI_HOP_HEADER) === undefined) {
+            const foreignDestUrl = `${opts.upstream}${urlPath}`;
+            const foreignDeclared = findRoute(opts.routes, foreignDestUrl);
+            if (!foreignDeclared?.passthrough
+                && findRouteKey(opts.routes, foreignDestUrl) === undefined
+                && !isModelTrafficOriginFormPath(urlPath)) {
+                logRefusedForeignPath(log, urlPath);
+                const selfOrigin = `http://${req.socket.localAddress ?? opts.host}:${req.socket.localPort}`;
+                res.writeHead(404, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "unknown_upstream_path", message: `This is a billion-context compression proxy, not a general-purpose HTTP gateway: only model API paths (/v1/messages, /chat/completions, /responses, /models, …) are forwarded to the upstream. '${urlPath}' was refused locally so its payload never leaves this machine (#5211). Point your base URL at the service you meant to call, or use ${selfOrigin}/bili/<full-upstream-url> for model traffic.` } }));
+                return;
+            }
+        }
         // #409: destination admission for the zero-config /bili/ absolute-URL
         // tunnel. CONNECT has its own gates (mitm.ts); this is the /bili/
         // counterpart — self-proxy, link-local/metadata always denied;

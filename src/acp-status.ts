@@ -17,7 +17,7 @@ import { activeThrottleHolds } from "./upstream-throttle.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
-import { getUnrecognizedPathStats } from "./server/observability.js";
+import { getRefusedForeignPathStats, getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
@@ -587,6 +587,20 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .join(", ");
         extra.push("");
         extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
+    }
+    const refused = getRefusedForeignPathStats();
+    if (refused.total > 0) {
+        // #5211: origin-form paths refused locally instead of spliced onto the
+        // configured upstream — a caller pointed at the proxy port is usually
+        // mistargeted (a local service's private API), and forwarding would
+        // have shipped its payload to a third party.
+        const topRefused = Object.entries(refused.paths)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([p, n]) => `${p}×${n}`)
+            .join(", ");
+        extra.push("");
+        extra.push(`REFUSED FOREIGN PATHS (instance-level): ${refused.total} origin-form request(s) to ${Object.keys(refused.paths).length} path(s) were answered with 404 locally since instance start — the paths are neither model API shapes nor declared destinations, so their payloads were NOT forwarded to the upstream (#5211) (${topRefused}). The caller should point its base URL at the real service, or use <proxy>/bili/<full-upstream-url> for model traffic. Exact per-path counts: the refusedForeignPaths field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

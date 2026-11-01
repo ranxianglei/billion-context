@@ -308,6 +308,34 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     return undefined;
 }
 
+// #5211: origin-form request shape gate. When resolveUpstream returns undefined
+// (bare path — no /bili/ tunnel, no absolute form, no MITM socket), the client
+// pointed its base URL at the proxy port itself, and forwardUpstreamUrl splices
+// the path onto opts.upstream. Splicing an UNRELATED local API path (a host's
+// private endpoint mistargeted at the proxy port, e.g. dsh-im's
+// /api/dsh-im/delivery/messages) would ship that caller's private payload to a
+// third-party upstream it never chose — a privacy leak (#5211). Only paths that
+// ARE model traffic may ride the splice: the protocol table's shapes anchored
+// at the root of the base URL (a provider API mounted on the proxy origin is
+// root-relative by construction), the Google/Vertex model-in-path shapes, and
+// the model-discovery endpoints. Anything else is refused locally with a 404.
+// Deliberately stricter than the client-side isModelApiUrl (which matches any
+// trailing /messages segment): this predicate guards what LEAVES the machine.
+// Prefixed bases (/x/v1/messages) and exotic endpoints keep working through
+// the existing escape hatches unchanged: /bili/<full-url>, providers.*
+// declarations for the destination, or passthrough marks.
+const ORIGIN_FORM_MODEL_PATH = /^\/(?:v\d+\/)?(?:messages|chat\/completions|llm_raw_chat|responses)(?:\/compact)?\/?$/;
+export function isModelTrafficOriginFormPath(path: string): boolean {
+    const p = path.split("?", 2)[0];
+    if (ORIGIN_FORM_MODEL_PATH.test(p)) return true;
+    // Anthropic /v1/messages/count_tokens: first-class model traffic per
+    // isCountTokensRequest; NOT covered by ORIGIN_FORM_MODEL_PATH above.
+    if (/^\/(?:v\d+\/)?messages\/count_tokens\/?$/.test(p)) return true;
+    if (/^\/(?:v\d+\/)?models\/?$/.test(p)) return true;
+    if (googlePathKind(p) !== null) return true;
+    return vertexAnthropicModelFromPath(p) !== undefined;
+}
+
 // #806: request-scoped IDLE watchdog. A wedged request (accepted, logged
 // "forward", then never dispatched/answered) had NO deadline of its own —
 // undici timeouts don't apply across CONNECT tunnels and bili's fetch timer
@@ -4613,7 +4641,7 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
     loggerLog(level, msg);
 }
 
-export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
+export { getRefusedForeignPathStats, getUnrecognizedPathStats, logDumpFailure, logRefusedForeignPath, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
 export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
