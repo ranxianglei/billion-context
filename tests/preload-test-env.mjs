@@ -57,3 +57,4 @@ process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 // (EBUSY …/sessions/perf.sqlite — the whole w22 matrix, run of 2026-11-01).
 // Tests that need it opt in per-file by DELETING the key (the dedicated
 // tests/issue5460-perf-telemetry.test.ts does exactly that).
+process.env.BILI_PERF_TELEMETRY = "0";
