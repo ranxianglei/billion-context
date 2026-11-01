@@ -240,6 +240,64 @@ export function bodyMightCarryImages(bodyText: string, protocol: WireProtocol): 
  * shapes, which is a handful per process. */
 const conversionWarned = new Set<string>();
 
+/** #5489: spill + record one ref's images into the index. Shared by the
+ *  sidecar pass (messageImageBytes) and the raw-body rescan pass so both keep
+ *  identical metadata/path/dims handling. */
+function indexRefImages(
+    index: Map<string, IndexedImage[]>,
+    ref: string,
+    imgs: RestorableImage[],
+    sessionId: string,
+): void {
+    const arr = index.get(ref) ?? [];
+    if (!index.has(ref)) index.set(ref, arr);
+    imgs.forEach((im, i) => {
+        // #1995 review: spill at index-time so the session retains only
+        // metadata + path (never base64). Skip-if-exists keeps the steady
+        // state to one stat per image per turn, not a full decode + write.
+        const path = writeRestoredImage(ref, i, im, sessionId);
+        if (!path) return;
+        let width: number | undefined;
+        let height: number | undefined;
+        try {
+            const d = decodeImageDims(im.b64);
+            if (d) { width = d.w; height = d.h; }
+        } catch {}
+        arr.push({ mediaType: im.mediaType, bytes: im.bytes, width, height, path });
+    });
+}
+
+/** #5489: the OpenAI chat codec reduces assistant/tool content (and the leading
+ *  system/developer run) to text-only via stringContent, discarding any
+ *  image_url parts WITHOUT a sidecar — so messageImageBytes (which reads only
+ *  the user-sidecar fields) never sees them and they were never spilled, making
+ *  them unrecoverable even though the client re-sends the pixels every turn.
+ *  Scan the RAW body for that surviving drop class and return its carryable
+ *  (data-URL) images tagged with their originating wire-message index. User
+ *  messages are excluded: openaiToCore already carries them through
+ *  rawOpenaiContent/rawOpenaiContentParts/imageBase64, which the sidecar pass
+ *  indexes — scanning them too would double-index. Remote-URL parts carry no
+ *  bytes and yield nothing, matching messageImageBytes. */
+function openaiDroppedImageParts(body: unknown): Array<RestorableImage & { wireIndex: number }> {
+    const out: Array<RestorableImage & { wireIndex: number }> = [];
+    if (!isObj(body)) return out;
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return out;
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (!isObj(m) || m.role === "user") continue;
+        if (!Array.isArray(m.content)) continue;
+        for (const p of m.content) {
+            if (!isObj(p) || p.type !== "image_url") continue;
+            const u = isObj(p.image_url) ? p.image_url.url : undefined;
+            const r = dataUrlRef(u);
+            if (!r?.b64) continue;
+            out.push({ mediaType: r.mediaType ?? "image/png", b64: r.b64, bytes: b64Bytes(r.b64), wireIndex: i });
+        }
+    }
+    return out;
+}
+
 /** Parse the INBOUND wire body into core messages and index every carried image
  *  by its mNNNNN ref. A message is indexed only when it is already known to the
  *  session (`state.messageRefs.byRaw[message.id]` resolves) — brand-new tail
@@ -278,27 +336,43 @@ export function buildIncomingImageIndex(
     }
     const msgs = coreMsgsOf(result);
     if (!msgs) return index;
+    // #5489: map each originating wire-message index to ONE ref (a text-content
+    // core's ref when the message has one, else its first core's ref) so the
+    // raw-body rescan below hangs recovered images off the right mNNNNN without
+    // re-deriving kernel identity host-side. Two passes: text anchors win, then
+    // fill any remaining slots.
+    const refByWireIndex = new Map<number, string>();
+    for (const m of msgs) {
+        const wi = (m as BiliMessage).wireIndex;
+        if (wi === undefined || !m.id) continue;
+        const ref = byRaw[m.id];
+        if (!ref || m.contentType !== "text") continue;
+        if (!refByWireIndex.has(wi)) refByWireIndex.set(wi, ref);
+    }
+    for (const m of msgs) {
+        const wi = (m as BiliMessage).wireIndex;
+        if (wi === undefined || !m.id) continue;
+        const ref = byRaw[m.id];
+        if (!ref) continue;
+        if (!refByWireIndex.has(wi)) refByWireIndex.set(wi, ref);
+    }
     for (const m of msgs) {
         const ref = m.id ? byRaw[m.id] : undefined;
         if (!ref) continue;
         const imgs = messageImageBytes(m);
         if (imgs.length === 0) continue;
-        const arr = index.get(ref) ?? [];
-        if (!index.has(ref)) index.set(ref, arr);
-        imgs.forEach((im, i) => {
-            // #1995 review: spill at index-time so the session retains only
-            // metadata + path (never base64). Skip-if-exists keeps the steady
-            // state to one stat per image per turn, not a full decode + write.
-            const path = writeRestoredImage(ref, i, im, sessionId);
-            if (!path) return;
-            let width: number | undefined;
-            let height: number | undefined;
-            try {
-                const d = decodeImageDims(im.b64);
-                if (d) { width = d.w; height = d.h; }
-            } catch {}
-            arr.push({ mediaType: im.mediaType, bytes: im.bytes, width, height, path });
-        });
+        indexRefImages(index, ref, imgs, sessionId);
+    }
+    // #5489: recover the assistant/tool-borne (and mid system/developer) OpenAI
+    // images the codec drops without a sidecar — parity with the other three
+    // wires' tool-result recovery and with the fold path. The leading
+    // system/developer run has no core/ref, so it is skipped naturally.
+    if (protocol === "openai") {
+        for (const im of openaiDroppedImageParts(parsed)) {
+            const ref = refByWireIndex.get(im.wireIndex);
+            if (!ref) continue;
+            indexRefImages(index, ref, [im], sessionId);
+        }
     }
     return index;
 }
