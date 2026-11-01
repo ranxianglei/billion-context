@@ -148,6 +148,8 @@
 | `BILI_FAKE_BUF_CAP` | fake-completion 缓冲上限，16 MiB |
 | `BILI_CONFLICT_SCAN` | thirdparty-scan 冲突扫描开关 |
 | `BILI_INVARIANT_JUDGE` | diagnostics.invariantJudge，默认 on——I1/I2 出站不变量法官（L1 顾问：violation 只 warn、流量永不拦；`=0` 解除武装，#3938 decision ②） |
+| `BILI_LOG_RETENTION_HOURS` | diagnostics.logRetentionHours，默认 48（下限 1h）——私有 `bili.log` 的目标覆盖窗口：活动文件 10 MiB 封存为不可变、名字唯一的一代；字节预算永远优先，报告的覆盖是**实测跨度**且 `continuity` 恒为 `unknown`（不宣称未中断）；非法值回落到默认而非文件层（env 一旦设置即拥有开关） |
+| `BILI_LOG_BUDGET_BYTES` | diagnostics.logBudgetBytes，默认 268435456（256 MiB，下限 1 MiB）——活动日志 + 全部封存分代的硬总字节预算，超限按封存时间戳**最旧优先**整代删除；活动文件永不删除（单文件超预算只报告、不截断）；与 `BILI_LOG_RETENTION_HOURS` 冲突时预算赢 |
 
 ### 2.6 安全 / 运维通道
 
