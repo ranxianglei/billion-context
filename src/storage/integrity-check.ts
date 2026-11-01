@@ -20,9 +20,10 @@
  *     read-only connection in a worker thread (WAL allows concurrent
  *     readers, and the main handle has already run recovery, so the
  *     read-only open cannot hit WAL-recovery). Boot returns in
- *     milliseconds; a failure is recorded loudly and cached so the NEXT
- *     open throws StorageIntegrityError and reuses the #4175
- *     quarantine-and-reopen-fresh machinery. Small stores keep the
+ *     milliseconds; a failure is recorded loudly as an ALARM ONLY — never
+ *     persisted as a boot-blocker (2026-10-30 owner policy: a running
+ *     store's background finding must not refuse future boots; each next
+ *     boot re-scans fresh). No automatic file moves, #4175.
  *     synchronous pre-migration check — the #4175 premise (a corrupt file
  *     must never be migrated against) stays intact wherever it is cheap.
  *     The one concession: on a big store's first boot after upgrade,
@@ -64,7 +65,6 @@ interface IntegrityCache {
 type IntegrityMode =
     | { kind: "skip" }
     | { kind: "cached-ok" }
-    | { kind: "cached-fail"; detail: string }
     | { kind: "sync" }
     | { kind: "async"; sizeBytes: number };
 
@@ -130,7 +130,10 @@ export function integrityModeFor(dbPath: string, env: { BILI_STORAGE_QUICK_CHECK
             cache.schema === STORAGE_SCHEMA_VERSION;
         if (matches) {
             if (cache.ok) return { kind: "cached-ok" };
-            return { kind: "cached-fail", detail: cache.detail ?? "cached quick_check failure" };
+            // A stale FAIL verdict planted by an OLDER version (this one never
+            // caches failures anymore) no longer refuses boots — owner policy
+            // 2026-10-30: treat it as a cache miss and let a FRESH scan decide.
+            loggerLog("warn", `[storage] previous quick_check verdict for ${dbPath} was FAIL (${cache.detail ?? "no detail"}) — stale verdicts no longer block boots; re-checking with a fresh scan (2026-10-30 owner policy)`);
         }
     }
     const size = statPart(dbPath)?.s ?? 0;
@@ -157,7 +160,15 @@ try {
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
     parentPort.postMessage({ ok: true, verdict });
 } catch (err) {
-    parentPort.postMessage({ ok: false, error: String(err) });
+    // #5108/#4816: a corruption-shaped THROW out of quick_check (truncated file,
+    // garbage header, broken overflow chain) is a FAIL VERDICT, not "could not
+    // run" — classify it exactly like src/storage/sqlite-errors.ts does (inlined
+    // here because this string is bundled verbatim and cannot import modules;
+    // keep the two in sync, the worker-facet regression test pins both).
+    const m = String((err && err.message) || err);
+    const c = String((err && err.code) || "").toUpperCase();
+    const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
+    parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
 }
 `;
 
@@ -166,9 +177,10 @@ try {
 const inflight = new Set<string>();
 
 /** Fire-and-forget background quick_check on a second read-only connection
- * (#4609). Records the outcome, caches it (ok or fail — a cached fail makes
- * the NEXT open throw and quarantine via the #4175 path), and tells the
- * caller's store instance so a clean close can refresh the cache key. */
+ * (#4609). Records the outcome for the operator's alarms (ok or fail —
+ * 2026-10-30 owner policy: background findings are ALARMS ONLY, never
+ * boot-blockers — no cache write on failure), and tells the caller's store
+ * instance so a clean close can refresh the PASS cache key. */
 export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean) => void): void {
     const size = statPart(dbPath)?.s ?? 0;
     loggerLog("info", `[storage] background quick_check started for ${dbPath} (${(size / (1024 * 1024)).toFixed(1)} MiB over the ${Math.round(effectiveSyncThreshold() / (1024 * 1024))} MiB sync threshold) — serving continues; the verdict lands in /__bili/status (#4609)`);
@@ -190,7 +202,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
             worker.unref();
         }
     };
-    worker.on("message", (msg: { ok?: boolean; verdict?: string; error?: string }) => {
+    worker.on("message", (msg: { ok?: boolean; corrupt?: boolean; verdict?: string; error?: string }) => {
         finish(() => {
             if (msg.ok === true) {
                 const verdict = String(msg.verdict ?? "");
@@ -199,16 +211,26 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                     writeIntegrityCache(dbPath, true);
                     onVerdict?.(true);
                 } else {
-                    // A real integrity failure found post-open: record loudly,
-                    // cache the fail so the next open quarantines + reopens
-                    // fresh (#4175 path), and keep serving (writes into a
-                    // corrupt store are quarantined with it; envelopes are
-                    // the recovery source).
+                    // A real integrity failure found post-open: record loudly as an
+                    // ALARM (owner policy 2026-10-30). It is NOT cached as a
+                    // boot-blocker — the NEXT boot re-scans and decides from fresh
+                    // evidence; files stay exactly where they are (no automatic
+                    // rename, #4175); keep serving now (writes into a provably-
+                    // corrupt store surface as ingest errors that are retried on
+                    // every subsequent save; envelopes are the recovery source).
                     recordIntegrityOutcome(dbPath, false, 0, verdict.slice(0, 400));
-                    writeIntegrityCache(dbPath, false, verdict.slice(0, 400));
-                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — verdict cached; the next open quarantines this file set and reopens fresh (JSON envelopes remain the recovery source, #4175/#4609)`);
+                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — ALARM ONLY, no boot-blocking verdict written (owner policy 2026-10-30: runtime findings never refuse future boots — each boot re-scans fresh); files left UNTOUCHED (back up ${dbPath}{,-wal,-shm} and move them aside only if you want to force a rebuild); JSON envelopes remain the recovery source (#4175/#4609)`);
                     onVerdict?.(false);
                 }
+            } else if (msg.corrupt === true) {
+                // #5108/#4816: the scan itself threw a corruption-shaped error
+                // (the throwing shapes of CORRUPT/NOTADB). Same ALARM-ONLY
+                // consequences as a bad verdict row (owner policy 2026-10-30:
+                // loud alarm, no cache write, next boot re-scans fresh).
+                const detail = String(msg.error ?? "").slice(0, 400);
+                recordIntegrityOutcome(dbPath, false, 0, detail);
+                loggerLog("error", `[storage] background quick_check threw a corruption-shaped error for ${dbPath}: ${detail} — ALARM ONLY, no boot-blocking verdict written (owner policy 2026-10-30); files left UNTOUCHED`);
+                onVerdict?.(false);
             } else {
                 loggerLog("warn", `[storage] background quick_check could not run for ${dbPath}: ${String(msg.error)} — the store serves unverified; the next boot rechecks`);
             }

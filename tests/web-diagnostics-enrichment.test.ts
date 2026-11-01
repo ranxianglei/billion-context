@@ -43,6 +43,9 @@ function makeFixture(): { root: string; dshHome: string; stateHome: string; conf
     const configPath = path.join(root, "billion-context.json");
     const alphaDeps = path.join(dshHome, "profiles", "alpha", "node_modules", "@deepseek-ai");
     const desktopDeps = path.join(dshHome, "profiles", "desktop", "node_modules", "@deepseek-ai");
+    // #5146: a DESKTOP-bundle-style profile whose node_modules holds no
+    // @deepseek-ai packages at all (the app ships them outside the profile)
+    mkdirSync(path.join(dshHome, "profiles", "bare"), { recursive: true });
     mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
     writeJson(path.join(alphaDeps, "dsh", "package.json"), { name: "@deepseek-ai/dsh", version: "0.9.17" });
     writeJson(path.join(alphaDeps, "dsh-compaction-basic", "package.json"), { name: "@deepseek-ai/dsh-compaction-basic", version: "0.2.9" });
@@ -81,6 +84,11 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     assert.ok(blob.includes("dsh profile alpha: dsh 0.9.17, dsh-compaction-basic 0.2.9, dsh-web-app ?"),
         `per-profile package versions incl. absent-as-?, got:\n${blob}`);
     assert.ok(blob.includes("dsh profile desktop: dsh 0.9.17, dsh-compaction-basic ?, dsh-web-app ?"), "second profile listed");
+    // #5146: a profile where NONE of the three resolve gets an explanatory line
+    // instead of three bare "?"s (desktop-bundle installs keep the core out of
+    // the profile's node_modules).
+    assert.ok(blob.includes("dsh profile bare: (no @deepseek-ai packages under this profile bundle — on desktop installs the core ships inside the app; include the app version)"),
+        `package-free profile annotated, got:\n${blob}`);
 
     assert.ok(blob.includes("--- bili config (secrets masked) ---"), "config section present");
     assert.ok(blob.includes('"apiKey":"***"'), "secret value replaced by ***");

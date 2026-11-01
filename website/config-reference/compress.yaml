@@ -233,6 +233,17 @@ entries:
     desc_zh: "在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。"
     site_en: "Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration)."
     site_zh: "在 compress/decompress/search_context/acp_status 结果后追加 📦/❌ 可见性标记（默认开；关闭可抑制模型模仿叙述）。"
+  - key: compress.messageTimestamps
+    type: boolean
+    default: "true"
+    env: BILI_MESSAGE_TIMESTAMPS
+    group: compress
+    id: ct.mt
+    render: compress-row
+    desc_en: "Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly."
+    desc_zh: "为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time=\"…\" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。"
+    site_en: "Message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; ON by default. Set `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS=0 to keep every byte identical to pre-feature master. Env wins when defined (0 forces off, any other value forces on); resolved once per instance — changing the flag needs a restart, and the first restart with the flag on pays one frozen-prefix cache rewrite per active session."
+    site_zh: "消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认开启。设 `compress.messageTimestamps: false` 或 env BILI_MESSAGE_TIMESTAMPS=0 可让线上字节与特性前逐字节一致。env 有定义时优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启，开关生效后的首个重启每个活跃会话付一次冻结前缀缓存重写。"
   - key: compress.rules
     type: boolean
     default: "false"
