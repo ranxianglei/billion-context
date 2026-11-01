@@ -1,15 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-    composeStreamFilters,
-    createBiliArtifactFilter,
     createIdentityStreamFilter,
-    createMarkerLineFilter,
     createTagEchoFilter,
-    mayStartBiliInternal,
     mayStartDegenerateRenderTag,
-    mayStartMarkerLine,
-    mayStartRenderTag,
     stripAcpTags,
     stripDriftResidue,
 } from "../src/loop/tag-echo-filter.ts";
@@ -31,25 +25,6 @@ import type { Session } from "../src/session.ts";
 const REPORTED =
     "acpt> </acpt> <acpt m17138></acpt>  </apct> </apct>" +
     " <acpt m17140></acpt>  </apct> </apct> <acpt m17142></acpt>  </apct> </apct>";
-
-function streamThrough(chunks: string[]): string {
-    const tagFilter = composeStreamFilters(
-        composeStreamFilters(createTagEchoFilter(), createMarkerLineFilter()),
-        createBiliArtifactFilter(),
-    );
-    let out = "";
-    for (const delta of chunks) {
-        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDegenerateRenderTag(delta) && !tagFilter.pending()) {
-            out += delta;
-            continue;
-        }
-        // #5175: mirror `pushField` exactly — the filter releases, then the
-        // release-point adjudication runs `stripDriftResidue`. Testing only the
-        // filter hides the gate bug that let the bytes skip both.
-        out += stripDriftResidue(tagFilter.push(delta));
-    }
-    return out + stripDriftResidue(tagFilter.flush());
-}
 
 function chunked(s: string, size: number): string[] {
     const chunks: string[] = [];
