@@ -31,6 +31,7 @@ import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 interface CoverageGeneration {
     path: string;
     sizeBytes: number;
+    active?: boolean;
 }
 
 /** The slice of the retention policy coverage needs. Same reason: structural. */
@@ -62,6 +63,8 @@ export interface LogCoverage {
      *  the operator-facing reports that predate this module. */
     oldestAgeMs: number | null;
     totalBytes: number;
+    /** Current active-sink bytes; sealed generations are excluded. */
+    activeBytes: number;
     /** How many on-disk files were enumerated (sealed + legacy + active). */
     generations: number;
     /** How many of those could not be READ while measuring. Non-zero means the
@@ -178,11 +181,16 @@ export function computeCoverage(
     cause: CoverageCause,
     enumerationFailed = false,
 ): LogCoverage {
-    const totalBytes = gens.reduce((n, g) => n + g.sizeBytes, 0);
+    let totalBytes = 0;
+    let activeBytes = 0;
+    for (const generation of gens) {
+        totalBytes += generation.sizeBytes;
+        if (generation.active) activeBytes = generation.sizeBytes;
+    }
     const { oldest, unreadable } = oldestLogLineMs(gens);
     const target = formatWindow(policy.targetMs);
     const base = {
-        totalBytes, generations: gens.length, unreadable, available: unreadable === 0 && !enumerationFailed,
+        totalBytes, activeBytes, generations: gens.length, unreadable, available: unreadable === 0 && !enumerationFailed,
         continuity: continuityOf(gens),
     } as const;
     if (enumerationFailed) {

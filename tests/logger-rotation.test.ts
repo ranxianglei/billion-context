@@ -9,7 +9,8 @@ import {
     closeLogger,
     setLogCapture,
 } from "../src/logger.ts";
-import { logGenerations } from "../src/log-retention.ts";
+import { configureLogRetention, defaultLogRetentionPolicy, logGenerations } from "../src/log-retention.ts";
+import { logRetentionStatus } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** Poll until the file exists with a stable non-zero size (open completed,
@@ -94,6 +95,46 @@ test("reopen failure: degrades to stderr-only with one [warn], no crash", async 
     } finally {
         setLogCapture(null);
         closeLogger();
+        rmrf(dir);
+    }
+});
+
+test("direct forensic appends are sealed before the next logger line", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-direct-append-"));
+    const file = path.join(dir, "bili.log");
+    configureLogRetention({ segmentBytes: 1 });
+    configureLogger(file);
+    try {
+        log("info", "before-external-append");
+        await settle(file);
+        fs.appendFileSync(file, "external forensic line\n");
+        log("info", "after-external-append");
+        await settle(file);
+        const sealed = logGenerations(file).filter((g) => !g.active).map((g) => fs.readFileSync(g.path, "utf8")).join("");
+        assert.match(sealed, /before-external-append/);
+        assert.match(sealed, /external forensic line/);
+        assert.match(fs.readFileSync(file, "utf8"), /after-external-append/);
+    } finally {
+        closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
+test("retention status reports current active bytes, not an open-time snapshot", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-active-budget-"));
+    const file = path.join(dir, "bili.log");
+    configureLogRetention({ budgetBytes: 1 });
+    configureLogger(file);
+    try {
+        log("info", "active file grew past its one-byte budget after opening");
+        await settle(file);
+        const coverage = logRetentionStatus();
+        assert.equal(coverage?.activeBytes, fs.statSync(file).size);
+        assert.match(coverage?.message ?? "", /active log alone/);
+    } finally {
+        closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
         rmrf(dir);
     }
 });

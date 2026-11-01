@@ -104,12 +104,6 @@ let writeProven = false;
 let logPath: string | undefined;
 let bytesWritten = 0;
 let reopenWarned = false;
-// Set when the last open-time trim could not get under budget because only the
-// live sink remained: a file we append to can never be shrunk here, so the
-// condition is remembered and reported by logRetentionStatus() instead of
-// being dropped on the floor (the trim happens once, at open).
-let activeOnlyExcess = false;
-
 let capture: ((level: string, msg: string) => void) | null = null;
 
 let stderrDead = false;
@@ -236,7 +230,7 @@ function openStream(file: string): WriteStream {
     // Migrate the pre-generation logger's single `.old` into the ordered set so
     // upgrading does not delete the only retained history.
     if (logRetention().migrateLegacyOld) migrateLegacyOld(file);
-    activeOnlyExcess = applyLogRetention(file).activeOnlyExcess;
+    applyLogRetention(file);
     // Bind the descriptor before any queued write can race a path rotation.
     const fd = openSync(file, "a", LOG_FILE_MODE);
     let s: WriteStream;
@@ -262,18 +256,17 @@ function openStream(file: string): WriteStream {
     return s;
 }
 
-/** True when the stream's fd no longer points at the current log path — the
- *  file was renamed/replaced out from under us (orphan inode). A renamed fd
- *  never errors, so this inode compare is the only reliable detection. */
-function isOrphaned(s: WriteStream): boolean {
-    if (stream === s && streamFd === undefined) return false; // open still in flight
+/** Size of the current path when it still names this stream's inode; undefined
+ *  after an external rename/replacement. The size also captures direct appenders
+ *  that bypass this process's write counter. */
+function activeFileSize(s: WriteStream): number | undefined {
+    if (stream === s && streamFd === undefined) return 0; // open still in flight
     try {
         const fdStat = fstatSync(streamFd!);
         const pathStat = statSync(logPath!);
-        return fdStat.ino !== pathStat.ino || fdStat.dev !== pathStat.dev;
+        return fdStat.ino === pathStat.ino && fdStat.dev === pathStat.dev ? pathStat.size : undefined;
     } catch {
-        // path gone (ENOENT) or fd invalid (EBADF) — treat as orphaned.
-        return true;
+        return undefined;
     }
 }
 
@@ -316,7 +309,13 @@ function warnReopenFailed(err: unknown): void {
  *  stderr-only if the file cannot be (re)opened. */
 function getStream(): WriteStream | undefined {
     if (!logPath) return undefined;
-    if (stream && stream.writable && !isOrphaned(stream)) return stream;
+    if (stream && stream.writable) {
+        const size = activeFileSize(stream);
+        if (size !== undefined) {
+            bytesWritten = Math.max(bytesWritten, size);
+            return stream;
+        }
+    }
     if (stream) closeQuietly(stream);
     stream = undefined;
     streamFd = undefined;
@@ -371,18 +370,16 @@ export function configureLogger(file?: string): string | undefined {
 /** What the retained log set measures right now — the honest answer to "is 48
  *  hours here?", including the reason when it is not and the fact that
  *  continuity is unproven. Reads the disk; never mutates. Undefined when file
- *  logging is off. An over-budget live sink cannot be shrunk by the trim (this
- *  process is appending to it), so that condition is carried from the last trim
- *  as its own fact rather than being folded into the coverage numbers. */
+ *  logging is off. An over-budget live sink cannot be shrunk by the trim, so
+ *  current active bytes are reported separately from the coverage totals. */
 export function logRetentionStatus(): LogCoverage | undefined {
     if (!logPath) return undefined;
     const coverage = logCoverage(logPath);
-    if (!activeOnlyExcess) return coverage;
     const policy = logRetention();
-    const total = coverage.totalBytes;
+    if (coverage.activeBytes <= policy.budgetBytes) return coverage;
     return {
         ...coverage,
-        message: `${coverage.message}; the active log alone (${formatBytes(total)}) exceeds the ${formatBytes(policy.budgetBytes)} budget, and a live sink is never truncated`,
+        message: `${coverage.message}; the active log alone (${formatBytes(coverage.activeBytes)}) exceeds the ${formatBytes(policy.budgetBytes)} budget, and a live sink is never truncated`,
     };
 }
 
