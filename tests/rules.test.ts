@@ -142,7 +142,7 @@ test("executeRule: clear removes all rules and reports the count; empty clear is
 test("executeRule: delete/clear are mutually exclusive with each other and with rule", () => {
     const { session, ctx } = makeRuleCtx();
     executeRule({ rule: "survivor" }, ctx);
-    const conflict = "[acp_rule FAILED: Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).]";
+    const conflict = "Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).";
     assert.equal(executeRule({ delete: "rule1", clear: true }, ctx).text, conflict);
     assert.equal(executeRule({ delete: "rule1", rule: "new" }, ctx).text, conflict);
     assert.equal(executeRule({ clear: true, rule: "new" }, ctx).text, conflict);

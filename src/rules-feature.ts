@@ -69,7 +69,7 @@ export function executeRule(args: Record<string, unknown>, ctx: RuleExecCtx): Pr
     const rule = typeof raw === "string" ? raw.trim() : "";
     const ops = [delId.length > 0, wantsClear, rule.length > 0].filter(Boolean).length;
     if (ops > 1) {
-        return toolFail("[acp_rule FAILED: Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).]");
+        return toolFail("Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).");
     }
     if (wantsClear) {
         const result = clearRules(state);
