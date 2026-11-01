@@ -859,6 +859,32 @@ export function __stashPiIncrementalOriginalForTests(conversationId: string, pay
     stashPiIncrementalOriginal(conversationId, payload);
 }
 
+// #4894 (pi lane): the declared context window of the session's CURRENT model,
+// recorded on every before_provider_headers event. The shared oversize arm in
+// directSendOrRefuse (native-intercept.ts) prefers the stamped
+// x-bili-plugin-context-window header — but this lane stamps that header only
+// on the proxy branch, so a request that finds NO live proxy (respawn failed /
+// spawn budget missed) carried none and the arm stayed disarmed in exactly the
+// state where an uncompressed egress is likeliest to blow the window: the raw
+// history then rode straight to the provider and came back as "input exceeds
+// the context window", unrecoverable while the proxy stayed down. Recorded
+// BEFORE the proxy-readiness early return below for the same reason.
+// `undefined` means UNKNOWN (no ctx.model / no window configured) and the arm
+// then fails open rather than guessing a window for this request.
+let piDeclaredWindow: number | undefined;
+
+/** #4894: window reader the native intercept arms as declaredWindowForDirect
+ *  (see pi-native.ts). Process-scoped: pi dispatches model requests
+ *  sequentially per session and subagents run in their own processes. */
+export function piDeclaredWindowForDirect(): number | undefined {
+    return piDeclaredWindow;
+}
+
+/** Test hook: forget the recorded window (fixtures share one process). */
+export function _resetPiDeclaredWindowForTest(): void {
+    piDeclaredWindow = undefined;
+}
+
 /** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
  *  it on its NativeInterceptState). A body that IS an incremental envelope
  *  was swapped by maybeIncrementalTurn → restore the stashed original
@@ -1285,6 +1311,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         }
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
+                // #4894: record this request's window FIRST — the
+                // proxy-readiness return right below is precisely the
+                // degraded direct-send path the guard measures against, so
+                // the window must not depend on the proxy being up.
+                const liveWindow = ctx.model?.contextWindow;
+                piDeclaredWindow = typeof liveWindow === "number" && Number.isFinite(liveWindow) && liveWindow > 0 ? Math.floor(liveWindow) : undefined;
                 // #1243: on the native lane the proxy origin lands via an async
                 // bootstrap that writes BILLION_CONTEXT_PROXY only after the spawn;
                 // a one-shot (-p) fires this event exactly once, inside that
