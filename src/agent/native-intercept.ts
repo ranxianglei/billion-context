@@ -1170,7 +1170,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (lastMissingStateLogSeq !== seq) {
                     lastMissingStateLogSeq = seq;
                     let host = "unknown";
-                    try { host = new URL(url).host; } catch {}
+                    try { host = new URL(url).host; } catch { /* unparseable URL — host stays "unknown" */ }
                     const bytes = size === undefined ? "unknown" : `${size.bytes.toLocaleString("en-US")} B`;
                     logHostEvent("warn", "[native-client]", `bili-native: intercept state missing — model request goes direct (uncompressed, ${bytes}, ${host}); bili is not bound to a live state`);
                 }
