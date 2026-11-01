@@ -500,6 +500,59 @@ function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | unde
     return undefined;
 }
 
+/** #5405/#5408: byte count of what a dispatch would actually put on the wire,
+ *  for the silent-direct ceiling. Unlike bodyByteSizeOf it also covers bodies
+ *  riding a Request object (clone-probed — the dispatch payload stays
+ *  sendable, #2496) and Blob/URLSearchParams forms; stream reads stop once
+ *  `cap` is exceeded so memory stays bounded no matter how large the body is.
+ *  Returns undefined when the size cannot be determined WITHOUT consuming the
+ *  payload (init-body streams, FormData, exotic forms) — callers disarm the
+ *  guard then; never a false refusal from missing data (#2924/#4068).
+ *  init.body wins over the Request's own body (spec: init overrides). */
+async function outgoingBodyBytesCapped(input: string | URL | Request, init: RequestInit | undefined, cap: number): Promise<number | undefined> {
+    const body: unknown = init?.body;
+    if (typeof body === "string") return Buffer.byteLength(body);
+    if (ArrayBuffer.isView(body)) return (body as ArrayBufferView).byteLength;
+    if (body instanceof ArrayBuffer) return body.byteLength;
+    if (body instanceof Blob) return body.size;
+    if (body instanceof URLSearchParams) return Buffer.byteLength(body.toString());
+    if (input instanceof Request && body === undefined) {
+        let probe: Request;
+        try {
+            probe = input.clone();
+        } catch {
+            return undefined;
+        }
+        if (probe.body === null) return 0;
+        return streamBytesCapped(probe.body, cap);
+    }
+    return undefined;
+}
+
+async function streamBytesCapped(stream: ReadableStream<Uint8Array>, cap: number): Promise<number | undefined> {
+    try {
+        const reader = stream.getReader();
+        try {
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                total += value.byteLength;
+                if (total > cap) break;
+            }
+            return total;
+        } finally {
+            // The probe is always a CLONE (#2496) — an unconsumed tail is
+            // garbage-collected with it. Do NOT await reader.cancel() here:
+            // on undici's synthesized request-body streams its promise never
+            // settles, and awaiting it would hang every oversized dispatch.
+            reader.releaseLock();
+        }
+    } catch {
+        return undefined;
+    }
+}
+
 /** #2924 direction 1: protocol-shaped local refusal — 422 per the #2709
  *  precedent (not 401/403 credential-class, not 408/429/5xx transient-class),
  *  so hosts and SDKs treat it as a policy refusal of this ONE request and
@@ -1093,7 +1146,6 @@ export function bindLiveStateSlot(state: NativeInterceptState): boolean {
     g[ACTIVE_STATE_SEQ] = seq;
     g[ACTIVE_STATE] = state;
     lastMissingStateLogSeq = undefined;
-    logHostEvent("info", "[native-client]", `bili-native: live-state bound seq=${seq}${firstBind ? " (first bind)" : " (rebind)"}`);
     return firstBind;
 }
 
@@ -1161,9 +1213,13 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // and truncate a prompt the plugin never compressed. Fail locally
             // and say how to restore routing instead.
             if (fetchMethodOf(input, init) === "POST" && isModelApiUrl(url)) {
-                const size = bodyByteSizeOf(init);
-                if (size !== undefined && size.bytes > MAX_SILENT_DIRECT_BODY_BYTES) {
-                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.bytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405)`);
+                // #5408 addendum to #5405: the body may ride a Request object
+                // rather than init — measure what would actually go out
+                // (clone-probed, capped), or hosts that construct Requests
+                // bypass the guard entirely.
+                const size = await outgoingBodyBytesCapped(input, init, MAX_SILENT_DIRECT_BODY_BYTES);
+                if (size !== undefined && size > MAX_SILENT_DIRECT_BODY_BYTES) {
+                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
                     return emptySlotOversizeRefusal(url);
                 }
                 const seq = g[ACTIVE_STATE_SEQ];
@@ -1171,7 +1227,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     lastMissingStateLogSeq = seq;
                     let host = "unknown";
                     try { host = new URL(url).host; } catch { /* unparseable URL — host stays "unknown" */ }
-                    const bytes = size === undefined ? "unknown" : `${size.bytes.toLocaleString("en-US")} B`;
+                    const bytes = size === undefined ? "unknown" : `${size.toLocaleString("en-US")} B`;
                     logHostEvent("warn", "[native-client]", `bili-native: intercept state missing — model request goes direct (uncompressed, ${bytes}, ${host}); bili is not bound to a live state`);
                 }
             }
@@ -1279,22 +1335,31 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                   ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
                   : await directSendBodyMeasure(defaultInput, init);
             const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindow) : undefined;
-            // #5405: the gate's 1M-token floor deliberately keeps small
-            // declared windows from false-refusing, but that also lets a
-            // ~975K-token body through as a silent direct send. A raw-byte
-            // ceiling catches the catastrophic case without second-guessing
-            // the token math.
-            const silentBytes = measured !== undefined ? measured.bytes : bodyByteSizeOf(init)?.bytes;
-            if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST" && silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
-                state.onDispatch?.(dispatchUrl, "refused");
-                logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); would be sent uncompressed (#5405)`);
-                return unattributedByteOversizeRefusal(dispatchUrl);
-            }
             if (doom !== undefined) {
                 state.onDispatch?.(dispatchUrl, "refused");
                 if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — oversized request refused locally instead (~${doom.floorTokens.toLocaleString("en-US")} tok core-text floor > ${doom.window.toLocaleString("en-US")} tok window)`);
                 logHostEvent("error", "[native-client]", `bili-native: oversized request refused locally instead of direct send — core text ~${doom.floorTokens.toLocaleString("en-US")} tok floor (${doom.coreBytes.toLocaleString("en-US")} B / 4; media ${doom.mediaBytes.toLocaleString("en-US")} B excluded, #4111) exceeds the ${doom.window.toLocaleString("en-US")} tok window: ${dispatchUrl}`);
                 return fallbackOversizeRefusal(dispatchUrl, doom, state.lastUnavailableReason);
+            }
+            // #5405/#5408: when no window source exists at all, or the gate's
+            // 1M-token floor disarms doom (a ~975K-token body against a small
+            // declared window), a raw-byte ceiling still catches the
+            // catastrophic case without second-guessing the token math.
+            // Non-degraded call sites only — degraded paths just ran the
+            // window-aware doom above, and a flat ceiling there would override
+            // known large windows. A restored body IS what goes out, so it is
+            // what gets measured.
+            if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST") {
+                const silentBytes = prep.outcome === "restored"
+                    ? Buffer.byteLength(prep.body)
+                    : measured !== undefined
+                      ? measured.bytes
+                      : await outgoingBodyBytesCapped(defaultInput, init, MAX_SILENT_DIRECT_BODY_BYTES);
+                if (silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+                    state.onDispatch?.(dispatchUrl, "refused");
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
+                    return unattributedByteOversizeRefusal(dispatchUrl);
+                }
             }
             if (prep.outcome === "as-is") {
                 state.onDispatch?.(dispatchUrl, "direct");
