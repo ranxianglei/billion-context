@@ -182,11 +182,11 @@ jobs:
         # until they are all green, so coverage is identical — only the
         # executor moved from this job to the parallel lane matrix.
         # raw_publish bypasses this whole gate: its own step below runs
-        # `npm ci` + `npm run build` only (no typecheck, never any test)
+        # `npm run build` only (no typecheck, never any test)
         # before publishing (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
-          npm ci
+          #npm ci
           npm run typecheck
           npm run build
 
@@ -206,7 +206,7 @@ jobs:
         run: |
           set -euo pipefail
           VER="${{ steps.version.outputs.version }}"
-          echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: npm ci + build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
+          echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
           npm ci
           npm run build
           if [ -n "$(npm view billion-context@${VER} version 2>/dev/null || true)" ]; then
