@@ -360,7 +360,12 @@ function collectArticles(root: string): BlogItem[] {
 function collect(): BlogItem[] {
     const root = pkgRoot();
     if (!root) return [];
-    return sortItems([...collectPosts(root), ...collectArticles(root)]);
+    // A manifest entry pointing at a file that ALSO lives in the flat posts
+    // directory would otherwise render twice under one id — the manifest entry
+    // wins (it carries the richer metadata the pipeline keys on).
+    const articles = collectArticles(root);
+    const articleIds = new Set(articles.map((a) => a.id));
+    return sortItems([...collectPosts(root).filter((p) => !articleIds.has(p.id)), ...articles]);
 }
 
 /** Cached feed (bundled content only changes across package updates → one
