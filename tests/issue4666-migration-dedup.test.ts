@@ -44,7 +44,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { UnifiedStore, sha256Hex } from "../src/storage/store.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { STORAGE_DDL_V1_FOR_TESTS } from "../src/storage/schema.ts";
+import { STORAGE_DDL_V1_FOR_TESTS, STORAGE_SCHEMA_VERSION } from "../src/storage/schema.ts";
 import { identityOfStoredContent } from "../src/storage/identity.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { openBackend, type StorageBackend } from "../src/storage/backend.ts";
@@ -155,7 +155,7 @@ test("#4666 sqlite: v8 migration collapses wireIndex-split duplicates and refund
         check = openSqliteDatabase(path.join(dir, "index.db")).db;
 
         const ver = check.prepare("PRAGMA user_version").get() as { user_version: number };
-        assert.equal(ver.user_version, 10, "stamped to v10 (#4313 adds the timestamps column)");
+        assert.equal(ver.user_version, STORAGE_SCHEMA_VERSION, "stamped to the current schema version");
 
         // Exactly the lowest-seq arrival of each (msg_id, identity) group.
         const survivors = check
@@ -371,7 +371,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             // Fresh install lands at v10.
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "10", "fresh install stamped v10");
+            assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "fresh install stamped the current version");
 
             // Downgrade to the legacy v7 shape and plant the dirty fixture.
             await H.rewindToV7();
@@ -381,7 +381,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             await be.close();
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "10", "upgrade stamped v10");
+            assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "upgrade stamped the current version");
 
             const survivors = await H.q("SELECT seq, msg_id, content_hash, identity FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(
@@ -430,7 +430,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             await be.close();
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "10", "re-run completed and stamped v10");
+            assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "re-run completed and stamped the current version");
             const eRows = await H.q("SELECT seq, identity FROM messages WHERE session_id = 's2' ORDER BY seq");
             assert.deepEqual(eRows.map((r) => Number(r.seq)), [5, 13], "unbackfilled dup pair collapsed; the CAS-missing row survives (not a duplicate)");
             assert.notEqual(String(eRows[0].identity), "", "identity backfilled on the re-run");
@@ -537,7 +537,10 @@ test("#4666 mysql: concurrent boots serialize on the migration lock",
             assert.equal(Number(released[0].ok), 1, "lock released exactly once");
             locker.release();
             await migrating;
-            assert.equal(await H.stamp(), "10", "migration completed after the lock freed");
+            // #4796 raised STORAGE_SCHEMA_VERSION to 9; every other stamp pin in
+            // this file moved with it — this one was left on v8, so the mysql
+            // lane asserted a version the migrator no longer writes.
+            assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "migration completed after the lock freed");
             const s1 = await H.q("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(s1.map((r) => Number(r.seq)), [1, 2, 3, 5], "fixture collapsed exactly once — no double-delete");
             const sLock = await H.q("SELECT seq, identity FROM messages WHERE session_id = 's_lock' ORDER BY seq");
