@@ -181,7 +181,7 @@
 | `guardrails` | object | {} (all defaults) | — | 守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。 |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | 模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。 |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。 |
-| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。 |
+| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。false 或 env 0 关闭。 |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | 响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。 |
 | `persist` | object | {} (all defaults) | — | 会话落盘持久化（XDG state 目录之下）。 |
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
@@ -204,6 +204,7 @@
 | `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
 | `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。 |
 | `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。 |
+| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | #4788 二期驻留丢弃的逃生门：把会话内容存储钉在内存（永不折叠）。默认关闭：每次已证明落盘的保存之后，空闲会话的内容存储在请求间隙被释放，需要时从统一索引镜像或伴生文件按需重读；没有可证明落盘副本的会话（如新建 fork 子会话）自动保持驻留。需要零重读延迟且愿意用内存换时可设此项。 |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
 | `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
 | `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
@@ -281,6 +282,7 @@
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
+| `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | 为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time="…" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。 |
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
@@ -362,7 +364,7 @@
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
-| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。 |
+| `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——JSON 信封始终是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底（活的第二写者已于 2026-10-31 移出该拒绝清单：多进程共享一个本地盘 index.db 是受支持拓扑，只提示、永不阻断启动）；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（或留空）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
@@ -770,7 +772,7 @@
 - **类型：** `boolean`
 - **默认值：** `true`
 - **状态：** ACTIVE
-- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的 `<session>\|sub:<fp>` 车道，不再摧毁父会话的折叠基底。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
+- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的车道：首条 user 消息上带 bili SubagentStart hook token 时按派发铸键（`<session>\|sub:<fp>:t:<token>`），否则用本 run 首条 user 消息片段作兼底（`<session>\|sub:<fp>:<userFp>`），同一父 id 下反复派发的同型子代理不再共用一条压缩会话（#5095）；既无有效 token、又无可用 user 文本的借道保留两段式 `<session>\|sub:<fp>` 形态。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
 
 ### `forkAdoption`
 
@@ -1481,7 +1483,25 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `string`（包名，如 `"lean"`）
 - **默认值：** `default`（未设置等同——恒等表面，全部使用内核默认值）
 - **状态：** ACTIVE
-- **说明：** 选择一个具名 prompt pack —— 一套策划好的表面预设，覆盖工具描述、压缩系统提示词段落、nudge 段落 —— 从内核的包解析链解析：**项目** `./.billion-context/packs/<name>.json` → **用户** `<configDir>/packs/<name>.json` → **内置**（`default`、`lean`）。内置 `lean` 把四个 ACP 工具描述换成单行版（无 snippet/guideline 包装），压缩规则保持默认。未知包名回退到恒等表面并记录一次警告。与其他字段一样三级级联合并；包的表面覆盖（工具/段落）直接生效，不经 `acknowledgePromptsRisk` 门控——该门控只管内联 `compress.prompts` 的规则文本覆盖。注意：包文件里的 `prompts` 块会被本代理忽略，规则文本只能经内联 `compress.prompts` 设置。需要 `acp-kernel` >= 0.0.66。
+- **说明：** 选择一个具名 prompt pack —— 一套策划好的表面预设，覆盖工具描述、压缩系统提示词段落、nudge 段落 —— 从宿主侧的包解析链解析：**项目** `./.billion-context/packs/<name>.json` → **用户** `<configDir>/packs/<name>.json` → **随包附带**（`chat`）→ **内核内置**（`default`、`lean`）。内置 `lean` 把四个 ACP 工具描述换成单行版（无 snippet/guideline 包装），压缩规则保持默认。内置 `chat`（#5319）只替换压缩哲学段与 how-to-compress 规则段，面向长期陪伴 / 多会话记忆场景；其余表面全部保持宿主默认，同名的用户/项目文件会覆盖它。未知包名回退到恒等表面并记录一次警告。与其他字段一样三级级联合并；包的表面覆盖（工具/段落）直接生效，不经 `acknowledgePromptsRisk` 门控——该门控只管内联 `compress.prompts` 的规则文本覆盖。注意：包文件里的 `prompts` 块会被本代理忽略，规则文本只能经内联 `compress.prompts` 设置。需要 `acp-kernel` >= 0.0.66。设置面板可以直接管理用户目录里的包文件——对 `<configDir>/packs/` 下的包 新建/编辑/删除（选择器知道每个条目的来源；内置与 shipped 包在那里只读，要用同名用户包覆盖）。编辑对话框有三个页签（#5344）：**表单填写**——逐字段说明文字，可一键载入 `default`/`chat`/`lean` 的现有文案做起稿底本（留空字段不写入包文件，运行时沿用系统默认）；**AI 辅助**——用大白话描述使用场景，把生成的提示词复制到任意大模型执行，再把返回的 JSON 粘回来即可自动填入表单；**高级（JSON）**——原始文件文本，给需要完整控制的用户。
+
+**包文件格式。** 每个 `<dir>/<name>.json` 是一个 pack 对象。未识别的字段会被与所有加载路径相同的 sanitize 器丢弃（`sanitizePackSurface`），所以多写元数据无害：
+
+```json
+{
+  "name": "my-pack",          // 可选 —— 缺省用文件名（去 .json）
+  "version": "1.0.0",         // 可选 —— `bili pack list` 与面板会显示
+  "description": "……",       // 可选
+  "promptSections": {
+    "philosophy": "……",       // 替换整段系统提示词；JSON null = 保留默认文本
+    "howToCompress": "……"     // 可直接从 src/chat-pack.ts 里调好的全文起步
+  }
+}
+```
+
+可选的表面块：`prompts`（内联规则文本覆盖）、`nudgeSections`、`toolPrompts`、`adapters`（宿主专属附加，如 `"pi": { "promptSections": { … } }`）。至少一个字段在 sanitize 后存活，否则写入时会被拒绝。
+
+**安装别人的包。** 任何根目录带 `bili-pack.json`（即上面的 pack 对象）的 npm 包都可安装：`bili pack install <pkg>`——也接受 `name@version`、带 scope 名、git URL、`.tgz` 路径（底层委托本机 `npm`，所以 registry 鉴权行为与普通 npm 一致）。默认落到 `<configDir>/packs/`（`--project` 指向 `./.billion-context/packs/`；已存在同名包时默认拒绝，`--force` 才替换）。之后可用设置面板管理，或 `bili pack remove <name>` / `bili pack list`。
 
 #### `reconcile`
 
@@ -1611,6 +1631,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** `true`
 - **状态：** ACTIVE
 - **说明：** 控制代理执行 proxy 工具调用（`compress` / `decompress` / `search_context` / `acp_status`）后输出的 📦/❌ ACP 可见标记。开启时，每次执行会在响应流中追加一行标记，并/或把标记消息重新注入该轮重建后的历史，让模型在后续回合看到发生了什么。设为 `false` 可完全抑制这两类产物 —— 适用于模型会模仿或围绕标记进行旁白的部署场景（自行输出确认行或中文旁白；见 issue #862）。工具执行本身不受影响：调用照常执行、成对的 tool-call/tool-result 消息照常记录，只是省略标记行/标记消息。与其他字段相同的三级合并。#717 对模型伪造标记的防伪造剥离逻辑独立于本开关，始终生效。
+
+#### `messageTimestamps`
+
+- **类型：** `boolean`
+- **默认值：** `true`
+- **状态：** ACTIVE
+- **说明：** 消息时间戳（#4313，PR #5236；缓存审计跟进后改为默认开）：bili 在每条消息首次出现时铸一个不可变的本地时间戳并渲染出来——线上每条 `<acp>` 压缩标签带上 `time="yyyy-MM-dd HH:mm:ss"` 属性、每次 compress 回执的指纹行追加 `[start – end]` 覆盖跨度、渲染出的块摘要带 Occurred 行。可见成本约每条消息 8 token。存戳是确定性渲染输入（只读存储值、不读墙钟），历史重发逐轮字节稳定——生产会话审计显示开关前后提示词缓存命中率相同。设为 `false` 可精确复现特性前（pre-#4313）的线上字节（无 time 属性、原提示词文案、无指纹跨度）。存储层无论开关都会记录时间戳，之后翻开开关即可浮现全史、无需丢数据。标志首次解析为开的那个重启，每个活跃会话付一次冻结前缀缓存重写。解析顺序：env（`BILI_MESSAGE_TIMESTAMPS`；`0` 强制关，其他任何值强制开，约定同 BILI_RESIGN）＞配置文件，且在每个代理实例启动时一次性解析——改开关需要重启实例。
 
 ### 注入开关（仅全局生效）
 
@@ -1830,6 +1857,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
@@ -1864,6 +1892,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |

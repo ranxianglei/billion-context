@@ -473,12 +473,18 @@ const baseCtx = {
     predecessorTicksLeft: 0,
     predecessorHolds: false,
     lastTriedPort: 18917,
+    newerHolderHolds: false,
 };
 
 test("D: only twin-collision maps to the adopt signal; every other terminal decision exits 1", () => {
     assert.equal(TWIN_ADOPT_EXIT_CODE, 3);
     const twin = decideEaddrinuse({ ...baseCtx, twinHolds: true });
     assert.deepEqual(twin, { kind: "fail-fast", reason: "twin-collision" });
+    assert.equal(eaddrinuseExitCode("twin-collision"), 3);
+    // #4125: a proven strictly-NEWER same-lane holder maps to the SAME adopt
+    // signal — the spawner rides it instead of deadlocking behind it.
+    const newer = decideEaddrinuse({ ...baseCtx, twinHolds: false, newerHolderHolds: true });
+    assert.deepEqual(newer, { kind: "fail-fast", reason: "twin-collision" });
     assert.equal(eaddrinuseExitCode("twin-collision"), 3);
     const strict = decideEaddrinuse({ ...baseCtx, twinHolds: false, strictPort: true });
     assert.equal(strict.kind === "fail-fast" ? strict.reason : undefined, "strict-port");

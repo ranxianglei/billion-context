@@ -12,10 +12,10 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
-import { storedMessagesFor } from "../fold-decomposition-lookup.js";
+import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
@@ -342,7 +342,7 @@ export async function prepareAnthropic(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -357,6 +357,8 @@ export async function prepareAnthropic(
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
         await yieldToEventLoop();
+        // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
+        absorbAbortedTurnGrowth(session, tokenCount);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -559,6 +561,16 @@ export async function prepareAnthropic(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
+        // #4521: armed-but-silent window — a nudge plan with offered ranges
+        // that is NOT being delivered this round (backoff/cadence/decide
+        // veto). Without current refs the model guesses beyond the highest
+        // allocated ref on its next compress attempt, and every guess is a
+        // failed round-trip. Ride the same ephemeral trailing-user-message
+        // carrier as the nudge (never persisted, never in the client's
+        // re-sent history, prefix-cache safe).
+        if (turn.statusLine) {
+            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+        }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
@@ -594,22 +606,26 @@ export async function prepareAnthropic(
     // above failed, processedMessages is empty and the forwarded body is the
     // UNPROCESSED projection — measure that instead so the fallback isn't
     // blinded to a system+tools-only floor.
+    // Unprocessed projection — measure that instead so the fallback isn't
+    // blinded to a system+tools-only floor. The image reserve is shared by
+    // both calibers below (one tree walk instead of two).
+    const imageReserve = imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        + imageReserve;
     // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
     // char-count upper bound) — settleUsageReport pairs it with this turn's
     // usage report to learn the per-route estimate-calibration factor k̂.
     session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+        + imageReserve;
     // #4805: id-membership evidence for the settle gate — the envelope ids
     // when the lane sends them (any rollout state), else the tool-call ids
     // resent in the history. Placed after the payload row above so the
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's

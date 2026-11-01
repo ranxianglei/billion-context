@@ -36,6 +36,17 @@ export function scrubLoneSurrogates(text: string): string {
         .replace(/(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
 }
 
+/** Variant for input that is PROVABLY the output of JSON.stringify: the
+ *  well-formed stringify spec (ES2019, Node \u226512) renders every lone
+ *  surrogate half as `\\uXXXX` escape text, so the serialized string cannot
+ *  carry a real lone-half code unit and the character-level pass above scans
+ *  the full body twice by construction without ever replacing anything.
+ *  Serialized-body call sites use this escape-only form — keep the full
+ *  OnWire scrub for strings of unproven provenance. */
+export function scrubLoneSurrogateEscapesOnJson(text: string): string {
+    return scrubLoneSurrogateEscapes(text);
+}
+
 /** Escape-text counterpart for ALREADY-SERIALIZED JSON bodies. JSON.stringify
  *  renders a lone half as the six-character escape `\uXXXX`, so by the time a
  *  body is on the wire the half is ASCII escape text and scrubLoneSurrogates

@@ -53,7 +53,15 @@ function relayReply(body: string, n: number): string {
         const msgs = parsed.messages ?? [];
         for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i]!.role === "user") {
-                lastUser = msgs[i]!.content;
+                // Ref markers (#4313/#5368, on by default since v0.1.210) render as a
+                // leading "<acp ...>mNNNNN</acp>" line above the real text. Echo the
+                // real text only: an embedded partial render tag makes the host's
+                // model-output sanitizer (src/loop/tag-echo-filter.ts) strip the rest
+                // of the reply, which then starves the soft-protected recent zone of
+                // tokens and no-ops the fold this scenario asserts on.
+                const raw = String(msgs[i]!.content);
+                const stripped = raw.replace(/<acp[^>]*>m\d+\s*<\/acp>/g, "");
+                lastUser = stripped.includes("\n") ? stripped.slice(stripped.lastIndexOf("\n") + 1) : stripped;
                 break;
             }
         }

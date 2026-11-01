@@ -57,9 +57,9 @@
   },
   {
    "i": 9,
-   "sha": "e2417df223e4aa9b6bfd125430568062cacf529269d5b406f9403397768fbf1e",
-   "bytes": 48046,
-   "shaCiteNorm": "b95094b753e5dddea0d078739fb5c6c6de72aab506f4eacda5806a848ab84928"
+   "sha": "eb16572e0439babcba59df5bb7b9599dfb7d9b41af068b1481b0a6586fb5b885",
+   "bytes": 48117,
+   "shaCiteNorm": "0af3a76f7fc8fad93ce5d1cd2be8c41e5382e4af16d43b4f837f9104dbae8a4f"
   },
   {
    "i": 10,
@@ -95,18 +95,18 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "81ee1ad6ff722210226a6f3969162e6715dedf607f3c1bc9b9c9293d9539ca38",
- "stateDigestAligned": "833d3548ede983e7c0c49c685f97c8f62b28fca779a27b211cedd13731fb5c58",
+ "stateDigest": "f509cde54100059e41b218df9e61469c3cbb4e347308038d23b83bf04d79807e",
+ "stateDigestAligned": "2af17815638a6d78ad8722781aa94c7e2c052821ed3fd8c412b6d0e0abeecd62",
  "sectionDigests": {
-  "state": "7f38eb530c6731be",
+  "state": "6028b6f100d714b2",
   "blockContents": "dc7d13d250c94bb4",
-  "stats": "17f1325cb58358bb",
-  "metadata": "a4ab27ced8ed8346"
+  "stats": "09fb5decac108194",
+  "metadata": "a85b64468ffd36ea"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
   "messageRefs": "3d09c9004582bdbc",
-  "nudge": "622ff695216751be",
+  "nudge": "7edf1d70ee5cb00d",
   "stats": "23312f7d5a0b9e27",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",
@@ -124,6 +124,7 @@
   "emergencyTruncateLatch": "74234e98afe7498f",
   "renderDeferredRefs": "74234e98afe7498f",
   "viewLatches": "74234e98afe7498f",
+  "tsStamps": "74234e98afe7498f",
   "viewLatchConfigDigest": "74234e98afe7498f"
  },
  "stateShape": {
