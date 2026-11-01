@@ -1599,3 +1599,65 @@ test("wordBagDigest: non-negative double-safe, order-independent, edit-sensitive
     assert.equal(wordBagDigest(""), 1);
     assert.equal(wordBagDigest("   []{}   "), 1, "no word tokens digests as the empty bag");
 });
+
+// ---------------------------------------------------------------------------
+// #2438 F1-a: fold-substrate vacuum — stored folds expose no anchorable
+// covered surface (the host resent history matching none of the folded
+// originals). The covered-empty early exit used to be fully silent: the
+// terminal state showed healthy book values and zero log lines (v0.1.195
+// retest, #2438 floor 18). Now: one ERROR line + one conflict-ledger entry
+// per session lifetime. Zero behaviour change beyond the report.
+describe("reconcileFoldCoverage: fold-substrate vacuum report (#2438 F1-a)", () => {
+    function vacuumSession(blocks: object[]): Session {
+        return { state: { blocks }, metadata: {} } as unknown as Session;
+    }
+    const ten = (): CoreMessage[] => Array.from({ length: 10 }, (_, i) => msg(`v${i}`, "user", `stable body ${i}`));
+    function run(session: Session) {
+        const lines: string[] = [];
+        const result = reconcileFoldCoverage(session, ten(), { mode: "repair", sessionId: "svac", log: (lvl, m) => lines.push(`${lvl}:${m}`) });
+        return { result, lines };
+    }
+
+    test("active block with emptied id list reports once, then stays quiet", () => {
+        const session = vacuumSession([{ active: true, effectiveMessageIds: [] as string[] }]);
+        const first = run(session);
+        assert.equal(first.result.kind, "noop");
+        const errs = first.lines.filter((l) => l.startsWith("error:"));
+        assert.equal(errs.length, 1);
+        assert.match(errs[0], /\[svac\] \[fold-reconcile\] fold substrate vacuum: 1 stored block\(s\)/);
+        assert.match(errs[0], /summaries retained \(#2438 F1-a\)/);
+        assert.equal(conflictEventsOf(session).filter((e) => e.kind === "fold-vacuum").length, 1);
+        const second = run(session);
+        assert.equal(second.lines.length, 0, "dedup latch: one report per session lifetime");
+        assert.equal(conflictEventsOf(session).filter((e) => e.kind === "fold-vacuum").length, 1);
+    });
+
+    test("deactivated block with EMPTY id list reports; intact ids do not (#4050 recovery candidates)", () => {
+        const session = vacuumSession([{ active: false, effectiveMessageIds: [] as string[] }]);
+        const { lines } = run(session);
+        assert.equal(lines.filter((l) => l.startsWith("error:")).length, 1);
+        // #4050: a deactivated lineage whose ids survive re-enters the claim ladder
+        // via recoveryCandidateIds, so covered is non-empty and this is NOT a vacuum.
+        const intact = vacuumSession([{ active: false, effectiveMessageIds: ["a", "b"] }]);
+        const second = run(intact);
+        assert.ok(!second.lines.some((l) => /fold substrate vacuum/.test(l)), "deactivated-with-ids must stay on the #4050 recovery path");
+        assert.equal(conflictEventsOf(intact).filter((e) => e.kind === "fold-vacuum").length, 0);
+    });
+
+    test("fresh session without blocks stays silent", () => {
+        const session = vacuumSession([]);
+        const { result, lines } = run(session);
+        assert.equal(result.kind, "noop");
+        assert.equal(lines.length, 0);
+        assert.equal(conflictEventsOf(session).length, 0);
+    });
+
+    test("healthy coverage does not report and does not set the latch", () => {
+        const msgs = ten();
+        const ids = msgs.map((m) => m.id!);
+        const session = vacuumSession([{ active: true, effectiveMessageIds: ids, directMessageIds: ids }]);
+        const { lines } = run(session);
+        assert.ok(!lines.some((l) => /fold substrate vacuum/.test(l)), `unexpected vacuum line in: ${lines.join(" | ")}`);
+        assert.equal((session.metadata as Record<string, unknown>)["foldVacuumNoted"], undefined);
+    });
+});
