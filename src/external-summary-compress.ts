@@ -45,8 +45,8 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
-    recoverEvictedView(ctx);
-    const noView = noVisibleContextRefusal(ctx, parsed.ranges);
+    const tailViewReason = recoverEvictedView(ctx);
+    const noView = noVisibleContextRefusal(ctx, parsed.ranges, { tailViewReason });
     if (noView) return noView;
     const state = ctx.session.state;
     const revision = ctx.session.revisionEpoch;

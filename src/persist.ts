@@ -2256,6 +2256,19 @@ export class SessionStore {
         }
     }
 
+    /** #5111: same read as unifiedTailViewRows, but WHY it came back empty is
+     *  part of the answer — the no-visible-context refusal quotes this reason so
+     *  a reporter can distinguish "store never had a copy" from "store degraded". */
+    unifiedTailViewDiagnostic(sessionId: string): { rows: import("./storage/store.js").MessageRow[] | null; reason: string } {
+        if (!this.shadow) return { rows: null, reason: "unified-store-off" };
+        if (this.shadow.stats.disabled) return { rows: null, reason: "sidecar-degraded" };
+        try {
+            return { rows: this.shadow.tailViewRows(sessionId), reason: "ok" };
+        } catch {
+            return { rows: null, reason: "read-error" };
+        }
+    }
+
     /** #4738: per-ref message bodies from the unified store — the web fallback
      *  for hosts whose native compaction pruned the resident window. Null when
      *  the unified store is unavailable — callers keep their legacy "missing"
@@ -4038,26 +4051,29 @@ function peekStoreForStamp(): SessionStore | null {
  *  session from the unified transcript. Read-only and peek-only — the module
  *  singleton must already exist (never construct a store on a compress path);
  *  a disabled/unavailable sidecar, zero rows, or ANY unparsable row returns
- *  null so callers keep their honest refusal instead of folding against a
- *  half-readable view. Rows are the raw client view caliber (#2627 — what a
- *  live model request would have re-sent), persisted on every save via the
- *  raw-tail ingest. */
-export function peekStoredTailView(sessionId: string): BiliMessage[] | null {
+ *  unreadable (view: null + named reason) so callers keep their honest
+ *  refusal instead of folding against a half-readable view. Rows are the raw
+ *  client view caliber (#2627 — what a live model request would have
+ *  re-sent), persisted on every save via the raw-tail ingest. #5111: the
+ *  failure reason is named, so the refusal receipt can say WHY no fallback
+ *  copy was readable instead of only that none was. */
+export function storedTailViewStatus(sessionId: string): { view: BiliMessage[] | null; reason: string } {
     const store = peekStoreForStamp();
-    if (!store) return null;
-    const rows = store.unifiedTailViewRows(sessionId);
-    if (!rows || rows.length === 0) return null;
+    if (!store) return { view: null, reason: "store-inactive" };
+    const { rows, reason } = store.unifiedTailViewDiagnostic(sessionId);
+    if (!rows) return { view: null, reason };
+    if (rows.length === 0) return { view: null, reason: "no-persisted-rows" };
     const messages: BiliMessage[] = [];
     for (const row of rows) {
         try {
             const parsed = JSON.parse(row.content) as BiliMessage;
-            if (typeof parsed?.id !== "string" || typeof parsed?.role !== "string") return null;
+            if (typeof parsed?.id !== "string" || typeof parsed?.role !== "string") return { view: null, reason: "unparsable-row" };
             messages.push(parsed);
         } catch {
-            return null;
+            return { view: null, reason: "unparsable-row" };
         }
     }
-    return messages;
+    return { view: messages, reason: "recovered" };
 }
 
 export function getStore(): SessionStore {
