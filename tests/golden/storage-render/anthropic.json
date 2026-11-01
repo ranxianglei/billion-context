@@ -95,16 +95,16 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "f509cde54100059e41b218df9e61469c3cbb4e347308038d23b83bf04d79807e",
- "stateDigestAligned": "2af17815638a6d78ad8722781aa94c7e2c052821ed3fd8c412b6d0e0abeecd62",
+ "stateDigest": "c55df7a16052ccdf85b79b7bf63d63afb228f17b56a500369e2fc391d7c49267",
+ "stateDigestAligned": "68e8548571b7866e4819ad2f7c792bd503730033b348a01ea44598f3ce42b49c",
  "sectionDigests": {
-  "state": "6028b6f100d714b2",
+  "state": "beac1337f3efbb3b",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "09fb5decac108194",
-  "metadata": "a85b64468ffd36ea"
+  "metadata": "0a03dd9e63a5cf36"
  },
  "stateKeyDigests": {
-  "blocks": "3a454b9a16e4f0b9",
+  "blocks": "0b3e92894a946c46",
   "messageRefs": "3d09c9004582bdbc",
   "nudge": "7edf1d70ee5cb00d",
   "stats": "23312f7d5a0b9e27",
@@ -140,8 +140,8 @@
    "h_7fab6026ce5a72e7",
    "h_b5b946fa2455d77e",
    "h_e40995eea3f07d55_1",
-   "h_ce9559b8e1773afc",
-   "h_e40995eea3f07d55_2"
+   "h_e40995eea3f07d55_2",
+   "h_5e8c02240a65740e_1"
   ]
  }
 }

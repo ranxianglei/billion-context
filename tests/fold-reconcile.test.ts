@@ -650,12 +650,22 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.ok(cov, "coverage record retained across the drop passes");
         assert.equal(cov.z, 0, "sanctioned reasoning drop never reads as substrate loss");
         assert.equal(session.state.blocks.length, 1, "majority-reasoning block not reaped after 4 drop passes");
+        // #3849: the nine dead reasoning cores retire on their third
+        // evidence-less pass instead of wedging the denominator forever —
+        // one ledger entry, and only the live text cores keep coverage.
+        const dropConflicts = session.metadata.conflictEvents as Array<{ kind: string }>;
+        assert.equal(dropConflicts.filter((e) => e.kind === "absent-retire").length, 1, "one-time absent-retire entry for the dead cores");
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            ["t1", "t2", "t3"],
+            "live text cores survive the retirement of the dead span",
+        );
         // Control: a genuine decimation (text substrate gone too) still
         // reaps on the third consecutive loss pass — #2695 semantics intact.
         for (let i = 0; i < 3; i++) reconcileFoldCoverage(session, filler(`dx${i}`), opts);
         assert.equal(session.state.blocks.length, 0, "real substrate loss still reaps after 3 passes");
-        const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
-        assert.equal(conflict?.kind, "orphan-reap");
+        const reap = (session.metadata.conflictEvents as Array<{ kind: string }>).find((e) => e.kind === "orphan-reap");
+        assert.ok(reap, "the control decimation records the orphan-reap");
     });
 
     test("short wire requests expanded into many cores never reap main folds", () => {
@@ -1070,7 +1080,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, retired: 0, unmatched: 0, expectedRetired: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -1521,7 +1531,18 @@ describe("reconcileFoldCoverage model-switch churn (#2636)", () => {
         assert.equal(logs.filter((l) => l.level === "error").length, 0, "sanctioned reasoning drop must not escalate");
         assert.equal(session.metadata.foldDriftStreak, undefined, "tolerated drop accrues no destroy streak");
         assert.equal(session.metadata.foldDriftEscalated, undefined, "the latch must not set on a healthy fold");
-        assert.equal(logs.filter((l) => /covered reasoning core\(s\) dropped by the host/.test(l.msg)).length, 5, "each tolerated pass reports info once");
+        // #3849: the tolerated-drop info runs until the dead cores retire on
+        // their third evidence-less pass; afterwards the passes are clean and
+        // only the live text cores keep coverage.
+        assert.equal(logs.filter((l) => /covered reasoning core\(s\) dropped by the host/.test(l.msg)).length, 3, "tolerated-drop info stops when the dead cores retire");
+        const retired = logs.filter((l) => l.level === "info" && /retired from fold coverage/.test(l.msg));
+        assert.equal(retired.length, 1, "one-time retirement notice for the 12 dead cores");
+        assert.match(retired[0].msg, /12 covered id\(s\)/);
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            survivors.map((m) => m.id!),
+            "only the live text cores keep coverage after retirement",
+        );
     });
 
     test("reasoning drop plus one honest user edit still never escalates (#2193 follow-up)", () => {

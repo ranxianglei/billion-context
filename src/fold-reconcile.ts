@@ -126,6 +126,29 @@
 // legitimately replaces the covered history (the agent's own compress runs
 // against its private state), so absence there is sanctioned.
 //
+// Absent-residual retirement (#3849) — bounded lifetime for persistent
+// unmatched residuals. A covered id that stays missing with NO anchor match
+// every pass (a mid-session wire/dialect switch whose old-dialect bytes —
+// e.g. standalone reasoning items — never reappear under the new projection)
+// used to live in the coverage set forever: the generic drift warn repeated
+// per turn and the block's p/r/t denominator stayed wedged above what the
+// wire can ever satisfy again (freezing the #2202 ledger accrual). Each such
+// id now carries a consecutive-absence streak (METADATA_ABSENT_STREAKS,
+// rebuilt per pass so presence or a claim resets it; side-request passes skip
+// the step entirely); at ABSENT_RETIRE_PASSES the id is RETIRED from every
+// block's id lists and its anchor dropped. No claim is made — an identity
+// assertion is what this step refuses to make — so any surviving content
+// rides unfolded until the next fold re-covers it under the current dialect.
+// Both lanes (plugin + proxy): shrinking a covered set is not #2695's
+// whole-block reap, whose proxy-only gate defended against agent-sanctioned
+// absence; here the bytes are simply gone and the bookkeeping must converge.
+// Ordering matters: the step runs AFTER the reap, so a block whose substrate
+// stayed majority-absent three passes is reaped WHOLE first — per-id
+// retirement only touches survivors (retiring first would shrink the
+// denominator below the majority-loss threshold and starve the reap).
+// One info line + conflict record per retirement event; ids re-entering
+// verbatim later ride unfolded honestly instead of resurrecting dead coverage.
+//
 // Modes (config `compress.reconcile`, env BILI_FOLD_RECONCILE):
 //   "off"    — disabled (pre-#1921 behavior).
 //   "warn"   — compute + log only, no rewrite.
@@ -202,6 +225,11 @@ const METADATA_TAIL_TRUNC_NOTED = "foldTailTruncationNoted";
 /** #3641: the wire order frozen at the moment the drift episode began — the
  *  baseline against which truncation-vs-replacement is decided. */
 const METADATA_EPISODE_ORDER = "foldEpisodeOrder";
+/** #3849: per-id consecutive-absence streaks for the unmatched residual set.
+ *  Rebuilt from scratch on every qualifying pass (an id that is present or
+ *  claimed drops out — presence resets its counter), so steady state stores
+ *  nothing and side-request passes neither advance nor reset anything. */
+const METADATA_ABSENT_STREAKS = "foldAbsentStreaks";
 /** #3641 helper: true while the session waits for epoch confirmation.
  *  Read through this helper (the preflight fold gate does), never the raw
  *  metadata key. */
@@ -213,6 +241,11 @@ export function epochConfirmPending(session: Session): boolean {
  *  escalate once from warn to error and name the suspect cause instead of
  *  letting the same warn print hundreds of times. */
 const FOLD_DRIFT_ESCALATE_PASSES = 3;
+/** #3849: consecutive evidence-less passes before an unmatched covered id is
+ *  retired from block coverage. Same cadence as the escalation/reap streaks;
+ *  three passes ≈ three model requests, well past any transient re-encoding
+ *  window while still bounded for the prefix-cache-taxing case. */
+const ABSENT_RETIRE_PASSES = 3;
 /** #3641: the shape pass only fires on MASS churn — at least this many
  *  residual missing cells must sit in the churn region before order-pairing
  *  is admissible evidence. Below it, honest unmatched (per-pass warn) is
@@ -343,6 +376,9 @@ function resetFoldDriftState(session: Session): void {
     // id-level truth and survives episodes on purpose; only its one-shot log
     // latch clears here.
     delete md[METADATA_EXPECTED_REBASE_NOTED];
+    // #3849: episode boundary — the per-id absence streaks die with the rest
+    // of the episode state (a clean pass also self-clears them).
+    delete md[METADATA_ABSENT_STREAKS];
 }
 
 /** Per-covered-id anchor recorded from the last pass in which the id was seen.
@@ -480,6 +516,10 @@ export interface FoldReconcileResult {
     /** #2695: fold blocks reaped this pass (removed from state.blocks after
      *  a majority-loss zombie streak). */
     reaped: number;
+    /** #3849: covered ids retired from block coverage this pass (persistent
+     *  unmatched residual, ABSENT_RETIRE_PASSES consecutive evidence-less
+     *  passes). */
+    retired: number;
     unmatched: number;
     /** #5142: covered ids accounted as EXPECTED host behavior (retired
      *  one-shot carriers / image-offload rewrites) — excluded from drift. */
@@ -1692,7 +1732,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, retired: 0, unmatched: 0, expectedRetired: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
@@ -1702,7 +1742,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, retired: 0, unmatched: 0, expectedRetired: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -1715,9 +1755,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS || (opts.inboundMessageCount !== undefined && opts.inboundMessageCount < SIDE_REQUEST_MAX_MSGS)) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, retired: 0, unmatched: 0, expectedRetired: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, retired: 0, unmatched: 0, expectedRetired: 0 };
 
     let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -2019,6 +2059,8 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         session.metadata[METADATA_POSITIONS] = { ids: nextOrder, canon: plan.nextCanon.slice(-MAX_ORDER) };
     }
 
+    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+
     // #2202: per-block coverage evidence for the ledger's conditional accrual
     // (METADATA_FOLD_COVERAGE). Present = verbatim on this pass's wire;
     // reclaimed = matched onto churned bytes (still spared — honest coverage).
@@ -2278,6 +2320,90 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             }
         }
     }
+    // #3849: bounded lifetime for persistent unmatched residuals. A covered id
+    // that stays missing with no anchor match every pass (mid-session
+    // wire/dialect switch: the old-dialect bytes never reappear under the new
+    // projection) used to ride the coverage set forever — the generic drift
+    // warn repeated per turn and the block's p/r/t denominator stayed wedged
+    // above what the wire can ever satisfy again. Per-id streaks are
+    // independent of the global episode streak (#3641's shape census kept
+    // resetting THAT while this warn looped), rebuilt from scratch each pass
+    // so presence or a claim resets an id's counter. Retiring makes no claim
+    // (no identity assertion): the id stops counting as covered, any surviving
+    // content rides unfolded, and the next fold re-covers it under the current
+    // dialect. Two orderings keep the pre-existing terminal mechanisms intact:
+    // it runs AFTER the #2695 reap (a block whose substrate stayed
+    // majority-absent three passes is reaped WHOLE first), and it only touches
+    // MAJORITY-PRESENT blocks — a block whose non-reasoning covered ids are
+    // majority-absent this pass belongs to the escalation/reap machinery
+    // (#2193/#2695), and shrinking its denominator would starve the z-streak
+    // and the destroy verdict (and turn the episode into a "clean" pass that
+    // resets foldDriftStreak/foldDriftEscalated). Majority-present is the
+    // #3849 residual shape: the block is healthy, the leftover ids are the
+    // defect. Stored coverage below is adjusted for the shrinkage. Both lanes:
+    // shrinking a healthy survivor is not #2695's whole-block reap, whose
+    // proxy-only gate defended agent-sanctioned absence in plugin mode.
+    let retiredCount = 0;
+    if (mode === "repair") {
+        const prevStreaks = (session.metadata[METADATA_ABSENT_STREAKS] as Record<string, number> | undefined) ?? {};
+        const nextStreaks: Record<string, number> = {};
+        for (const id of plan.unmatched) {
+            nextStreaks[id] = Math.min((prevStreaks[id] ?? 0) + 1, ABSENT_RETIRE_PASSES);
+        }
+        if (Object.keys(nextStreaks).length > 0) {
+            session.metadata[METADATA_ABSENT_STREAKS] = nextStreaks;
+            // Same majority test as the z-accrual below (non-reasoning ids
+            // only — sanctioned reasoning drops never read as loss), applied
+            // WITHOUT the e/z gates: in doubt, protect.
+            const protectedIds = new Set<string>();
+            for (const block of session.state.blocks as BlockLike[]) {
+                const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
+                if (ids.length === 0) continue;
+                let pr = 0;
+                for (const id of ids) if (byId.has(id) || plan.claims.has(id)) pr++;
+                const hard = ids.filter((id) => anchors[id]?.c !== "reasoning");
+                if (hard.length > 0 && 2 * pr < hard.length) {
+                    for (const id of ids) protectedIds.add(id);
+                }
+            }
+            const ripe = plan.unmatched.filter((id) => nextStreaks[id] === ABSENT_RETIRE_PASSES && !protectedIds.has(id));
+            if (ripe.length > 0) {
+                const ripeSet = new Set(ripe);
+                const retiredPerBlock = new Map<string, number>();
+                for (const block of session.state.blocks as BlockLike[]) {
+                    // t counts EFFECTIVE ids only (separators excluded upstream),
+                    // so the denominator adjustment counts that list alone —
+                    // the direct list mirrors the splice but not the count.
+                    let removed = 0;
+                    const eff = block.effectiveMessageIds;
+                    if (eff !== undefined) {
+                        for (let i = eff.length - 1; i >= 0; i--) {
+                            const cid = eff[i];
+                            if (cid !== undefined && ripeSet.has(cid)) { eff.splice(i, 1); removed++; }
+                        }
+                    }
+                    const dir = block.directMessageIds;
+                    if (dir !== undefined) {
+                        for (let i = dir.length - 1; i >= 0; i--) {
+                            const cid = dir[i];
+                            if (cid !== undefined && ripeSet.has(cid)) dir.splice(i, 1);
+                        }
+                    }
+                    if (removed > 0 && block.blockId !== undefined && block.blockId !== "") retiredPerBlock.set(block.blockId, removed);
+                }
+                for (const id of ripeSet) delete nextAnchors[id];
+                for (const [bid, removed] of retiredPerBlock) {
+                    const rec = nextCov[bid];
+                    if (rec !== undefined) rec.t = Math.max(0, rec.t - removed);
+                }
+                retiredCount = ripe.length;
+                recordConflict(session, "absent-retire", `${ripe.length} covered id(s) absent ${ABSENT_RETIRE_PASSES} consecutive passes with no anchor match — retired from fold coverage (#3849)`);
+                opts.log?.("info", `${tag}[fold-reconcile] ${ripe.length} covered id(s) stayed missing with no anchor match for ${ABSENT_RETIRE_PASSES} consecutive passes — retired from fold coverage: they stop counting as covered now, any surviving content rides unfolded until the next fold re-covers it under the current dialect (#3849)`);
+            }
+        } else {
+            delete session.metadata[METADATA_ABSENT_STREAKS];
+        }
+    }
     session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
 
     if (plan.claims.size > 0 && mode === "repair") {
@@ -2310,7 +2436,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-
     // side history rewrite. One error line per episode names it instead of
     // letting the identical warn print hundreds of times.
-    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);
@@ -2394,7 +2519,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // so it reports like a plain resend (the drift-warn cascade below must not
     // fire for carrier retirement / offload rewrites).
     if (realUnmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0, expectedRetired: expectedSize };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, retired: retiredCount, unmatched: 0, expectedRetired: expectedSize };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
@@ -2442,6 +2567,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byImage: plan.byImage,
         byShape: plan.byShape,
         reaped: reapedCount,
+        retired: retiredCount,
         unmatched: realUnmatched.length,
         expectedRetired: expectedSize,
     };
