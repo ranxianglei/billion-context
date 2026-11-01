@@ -37,7 +37,7 @@ export type DirectSendPrep =
  *  "send-failed" marks the send-failure recovery paths (the held origin
  *  answered its probe but the send threw, and recover() produced no
  *  replacement) so a give-up line can name that branch too. */
-export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed";
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed" | "stale-client-restart-required";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -62,11 +62,21 @@ export interface NativeInterceptState {
     /** #3654: set before createLiveOriginResolver returns undefined — why
      *  nothing was routable (see UnavailableReason: "busy-exhausted" | "dead"
      *  | "bootstrap-failed", plus #4125's "send-failed" set by the send-failure
-     *  recovery paths just before they fire onGiveUp); cleared on the next
+     *  recovery paths just before they fire onGiveUp, plus #5072's
+     *  "stale-client-restart-required" set when the launcher proved the loaded
+     *  plugin build differs from disk/proxy); cleared on the next
      *  successful resolution. The refusal builder reads it to keep a
      *  live-but-saturated proxy out of "proxy unavailable" wording; the dsh
      *  give-up seam appends it to the client event line (#4125). */
     lastUnavailableReason?: UnavailableReason;
+    /** #5072: set by the pi bootstrap catch when the launcher terminal error
+     *  carries the stale-client signal (attach/rotation/adopt all refused:
+     *  code-fingerprint-mismatch vs an exit-3 twin proof), cleared on any
+     *  later successful bootstrap. While true, createLiveOriginResolver tags
+     *  the bootstrap-death reason "stale-client-restart-required" so local
+     *  oversize refusals and degraded-dispatch lines keep saying RESTART THE
+     *  HOST PROCESS instead of degrading silently. */
+    staleClientRestartRequired?: boolean;
     /** #4516: how long a request may hold while an IN-FLIGHT respawn settles
      *  before degrading to direct/refuse — the owner knows its own bring-up
      *  budget (pi spawn mode: SPAWN_BUDGET_MS + margin). Without it the
@@ -641,7 +651,9 @@ function fallbackOversizeRefusal(
             ? "the bili proxy died and no replacement came up"
             : reason === "busy-exhausted"
               ? "the bili proxy is alive but unresponsive within the wait budget (#3654)"
-              : "the bili proxy did not come up (spawn failed or is still starting past the wait budget)";
+              : reason === "stale-client-restart-required"
+                ? "this host process holds a bili plugin older than the proxy serving it — restart the host process to reload it (#5072)"
+                : "the bili proxy did not come up (spawn failed or is still starting past the wait budget)";
     const windowNote =
         doom.declaredWindow === doom.window
             ? `the model context window (${doom.window.toLocaleString("en-US")})`
@@ -1479,9 +1491,24 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         if (origin === undefined) {
             // Bootstrap failed or timed out — NEVER break the agent: refuse
             // what provably cannot fit, send the rest direct (uncompressed),
-            // and log every transition into this state (#4516).
-            state.lastUnavailableReason = everHeldOrigin ? "dead" : "bootstrap-failed";
-            return directSendOrRefuse(url, input, init, everHeldOrigin ? "proxy respawn failed — model requests go direct (uncompressed)" : "proxy not ready — model requests go direct (uncompressed)");
+            // and log every transition into this state (#4516). #5072: a
+            // bootstrap death carrying the launcher's stale-client evidence is
+            // tagged as such — the reason rides along on local oversize
+            // refusals and the dispatch-transition line, so the restart
+            // directive travels with every later degradation too (noteDispatchMode
+            // logs transitions only, so this stays bounded noise).
+            const staleClient = !everHeldOrigin && state.staleClientRestartRequired === true;
+            state.lastUnavailableReason = everHeldOrigin ? "dead" : staleClient ? "stale-client-restart-required" : "bootstrap-failed";
+            return directSendOrRefuse(
+                url,
+                input,
+                init,
+                everHeldOrigin
+                    ? "proxy respawn failed — model requests go direct (uncompressed)"
+                    : staleClient
+                      ? "stale bili plugin loaded into this host process — compression disabled, RESTART THE HOST PROCESS; model requests go direct (uncompressed) meanwhile (#5072)"
+                      : "proxy not ready — model requests go direct (uncompressed)",
+            );
         }
         state.lastUnavailableReason = undefined;
         everHeldOrigin = true;

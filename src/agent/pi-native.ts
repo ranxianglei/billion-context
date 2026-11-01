@@ -27,7 +27,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS, STALE_CLIENT_RESTART_SIGNAL } from "../launcher.js";
+import { VERSION } from "../version.js";
 import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
@@ -137,17 +138,36 @@ state.prepareDirectSend = createPiDirectSendGuard();
 
 async function bootstrap(): Promise<string | undefined> {
     try {
-        const handle = await ensureProxyRunning(
+        const handle = await (_ensureProxyForTest ?? ensureProxyRunning)(
             { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "pi" },
             { scriptPath: nativeProxyScriptPath() },
         );
         const origin = handle.origin;
+        // #5072: a retry bootstrap that succeeds means the skew is gone — stop
+        // tagging degraded dispatches restart-required (the interceptor also
+        // clears lastUnavailableReason on its own next successful resolution).
+        state.staleClientRestartRequired = false;
         state.origin = origin;
         process.env.BILLION_CONTEXT_PROXY = origin;
         warnLegacyBcpCoResident();
         return origin;
     } catch (err) {
-        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
+        const msg = errMessage(err);
+        if (msg.includes(STALE_CLIENT_RESTART_SIGNAL)) {
+            // #5072: the launcher proved the loaded plugin build differs from
+            // the disk/proxy build — plain "goes direct" left users silent on
+            // the only remedy (host restart). Keep the same host-event channel
+            // (this IS the pi-lane user surface) but say the actionable part,
+            // and mark the degraded state so later refusals/dispatches carry
+            // the same directive.
+            state.staleClientRestartRequired = true;
+            logHostEvent("error", "[native-client]", `bili-native: STALE CLIENT — the bili plugin loaded into THIS pi process (v${VERSION}) no longer matches the build on disk / served by the proxy (attach refused: code-fingerprint-mismatch; every recovery path hit the same gate). Compression is DISABLED for this host process — model requests go direct (uncompressed) until you ${STALE_CLIENT_RESTART_SIGNAL} (restart pi so it reloads the updated plugin).\nfull diagnosis: ${msg}`);
+        } else {
+            // Generic bootstrap failure — must NOT be labeled stale-client:
+            // the launcher's evidence triple did not fire, so the fix may not
+            // be a restart (port squatter, spawn crash, …).
+            logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${msg}`);
+        }
         return undefined;
     }
 }
@@ -158,6 +178,24 @@ let _spawnForTest: (() => Promise<string | undefined>) | undefined;
  *  spawn) with a stub. Pass undefined to restore. */
 export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
     _spawnForTest = fn;
+}
+
+let _ensureProxyForTest: typeof ensureProxyRunning | undefined;
+
+/** Test hook (#5072): replace the launcher entry inside bootstrap() — its sole
+ *  external call — so the stale-client signal sniff runs hermetically. */
+export function _setEnsureProxyForTest(fn?: typeof ensureProxyRunning): void {
+    _ensureProxyForTest = fn;
+}
+
+/** Test hook (#5072): the private bootstrap entry, including its failure logging. */
+export function _bootstrapForTest(): () => Promise<string | undefined> {
+    return bootstrap;
+}
+
+/** Test hook (#5072): observe the stale-client flag bootstrap set on failure. */
+export function _staleClientFlagForTest(): boolean {
+    return state.staleClientRestartRequired === true;
 }
 
 /** #1135/#1365: the attached origin can go stale — at startup (the owning
@@ -365,6 +403,8 @@ export function _resetNativeStateForTest(): void {
     state.spawnWaitMs = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
+    _ensureProxyForTest = undefined;
+    state.staleClientRestartRequired = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;
     delete process.env.BILI_PI_INLINE;
 }
