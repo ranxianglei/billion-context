@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+* **#5460(P1):实时性能采集落地(SQLite 存储)**。近期所有性能事故(#5403 OOM×6、#4528 主线程卡死、#5385 前缀钉死)都是用户先发现、CI 零预警。现在 DB 存储模式(sqlite/mysql)下每处理一个请求,就在会话目录旁的新小库 `perf.sqlite` 落一行(消息数/进出字节/本地耗时/会话号),另有每 30 秒一条内存水位采样(rss/heap/external)——OOM 类事故从此有爬坡曲线可查。写路径与服务完全隔离:任何写失败只停采集(一次性警告),绝不影响服务;纯 JSON 存储模式冻结零足迹(owner 定)。`BILI_PERF_TELEMETRY=0` 整体关闭。后续:P2 场景夹具+`bili bench`(只记录不判)、P3 基线容差带接 FULL/夜间 CI(普通 PR CI 零性能 job)、P4 `/stats`+Web 面板性能页+外部看门狗——跟踪单 #5460。
+
 ### Changed
 - **AGENTS.md 瘦身（owner 指令 2026-11-08）：76 KB → 50.6 KB（−34%），规则零丢失，编号不变**。KDD 分两级：Tier A（#2/#4/#6/#7/#8/#10，每会话操作规则）留 AGENTS.md 全文；Tier B（#1/#3/#5/#9/#11–#18）全文逐字搬入新文件 `reference/design-decisions.md`（append-only 台账，**KDD 编号 = 稳定公共 API，原样保留**），AGENTS.md 每条留 1–3 行操作性后果 + 指针。Issue 分类与标签规则整节搬入 `reference/triage.md`（p1 口径与总账讨论链接留在正文）。E2E/Release 细则收敛为指向既有 `reference/testing.md` / `reference/release.md` 的硬规则。被反向引用的 heading 锚点（`#4-git-safety-rules-mandatory` 等 6 处）文本原样不动。
 - **系统架构文档体系落地（owner 指令 2026-11-08）：`docs/architecture/` 成为实时维护的架构枢纽**：新增 `docs/architecture.md` / `docs/architecture.zh-CN.md` 总枢纽（整体架构图中英双版转正 + 8 模块总表），首个样板模块页 `docs/architecture/storage.{md,zh-CN.md}`（统一存储：职责/原理/工作机制/硬不变量，配模块图中英双版）。文件级地图 `reference/architecture.md` 补齐 125 个缺失条目（新存储层 / marker / fastpath / lanes 等全部新模块）并升级为 CI 强制全量覆盖。新增 CI 车道 `architecture-docs`（`tools/check-architecture-docs.mjs`）：地图覆盖全 `src/` 文件、总表↔页面成对、图 svg 优先 + png 备选齐备、SVG 基础良构（未转义 `&` 曾让英文图线上破图）。AGENTS.md「Documentation Layout」新增实时维护规则：改结构 ⇒ 同 PR 更新页 + 图 + 总表。其余 7 个模块页（pipeline / lanes / kernel / identity / fastpaths / webui / update）同一 PR 全部补齐——总表 8 行全 ✅（每页 = 中英双版文档 + 中英双版图）。
