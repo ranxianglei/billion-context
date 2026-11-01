@@ -26,6 +26,7 @@ import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { getResolverWedgeState } from "./resolver-wedge.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
 import { loadOptions } from "./config.js";
 import { pckNoticeActive } from "./pck-notice.js";
@@ -490,6 +491,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
+    }
+    // #5221 phase 2 (owner ruling 2026-10-31): suspected persistent local-resolver
+    // wedge — detection-only alarm surface, same lane as the advisory above.
+    const rw = getResolverWedgeState();
+    if (rw) {
+        extra.push("");
+        extra.push(`RESOLVER WEDGE SUSPECTED (instance-level): this process's OS name resolution keeps failing for ${rw.hosts.length} host(s) that resolved fine before (${rw.hosts.slice(0, 5).join(", ")}${rw.hosts.length > 5 ? ", …" : ""}) — model requests 502 until the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy). Live state: the resolverWedge field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     const updateAction = updateBannerPayload(upd);

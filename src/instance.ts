@@ -281,6 +281,41 @@ export async function findVerifiedSameLaneTwin(
     return undefined;
 }
 
+/** #4977: the recovery-window complement to findVerifiedSameLaneTwin. A registry
+ *  twin whose health probe is SILENT while its socket still accepts connections
+ *  is present but unserviceable — dying or event-loop-wedged (#3654 three-state
+ *  liveness), NOT a healthy peer. The verified path correctly refuses to adopt
+ *  such an occupant; pre-#4977 the child then proceeded into persistence
+ *  initialization, opening index.db under the zombie before its own listen
+ *  failed EADDRINUSE — a real two-writer window on one store (#3923/#3959) plus
+ *  a misleading "another process is already writing" report, all on a round
+ *  that ends in the twin-collision exit anyway (the late EADDRINUSE policy
+ *  classifies the same registry evidence and fail-fasts). Positive-evidence-only
+ *  discipline (#4341): the socket check runs FIRST and is decisive in the
+ *  negative — no live listener means nothing to adjudicate (stale marker over a
+ *  free or foreign port), so we fall through and let the bind proceed; a health
+ *  probe that ANSWERS also falls through — matches belong to the verified path,
+ *  mismatches must not be refused here. */
+export async function findPresentUnverifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+    socketAlive: (origin: string) => Promise<boolean>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        if (!(await socketAlive(entry.origin))) continue;
+        const health = await healthOf(entry.origin);
+        if (health !== undefined) continue;
+        return entry;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same
@@ -301,6 +336,28 @@ export function entryScriptFingerprint(scriptPath?: string): string | undefined 
     }
     scriptFingerprints.set(resolved, digest);
     return digest;
+}
+
+/** #4125: env channel carrying the SPAWNER's entry-script hash to its child
+ *  (set by the launcher at spawn time). */
+export const SPAWN_FINGERPRINT_ENV = "BILI_SPAWN_FINGERPRINT";
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+/** #4125: fingerprint a CHILD records for itself — preferring the value its
+ *  spawner computed from the very script it exec'd ($BILI_SPAWN_FINGERPRINT)
+ *  over re-hashing. Re-hashing is unsafe across the spawn window: an in-place
+ *  update (auto-update extraction between the spawner's hash and the child's
+ *  own read) changes the bytes under both feet, so spawner-side attach/rotate
+ *  gates keyed on digest X would be judging against a child registry record
+ *  saying digest Y — one side sees a mismatch where the other sees its own
+ *  twin. The env value is trusted only when well-formed sha256 hex; garbage or
+ *  absence (manual / unspawned starts) falls back to the local re-hash, which
+ *  is pre-fix behavior. */
+export function resolveOwnFingerprint(spawnedValue: string | undefined, scriptPath: string | undefined): string | undefined {
+    const trimmed = spawnedValue?.trim();
+    if (trimmed !== undefined && SHA256_HEX_RE.test(trimmed)) return trimmed;
+    return entryScriptFingerprint(scriptPath);
 }
 
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn

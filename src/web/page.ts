@@ -35,6 +35,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="split-brain-banner" class="banner err" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="resolver-wedge-banner" class="banner warn" hidden></div>
 <div id="update-policy-banner" class="banner warn" hidden></div>
 <div id="plugin-advisory-banner" class="banner warn" hidden></div>
 <div id="pck-banner" class="banner warn" hidden></div>

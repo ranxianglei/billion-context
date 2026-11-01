@@ -172,6 +172,33 @@ export const WEB_CLIENT = `(function () {
             if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
+    // #5319 (web half): resolved pack names from GET /__bili/packs — filled by
+    // loadConfig(); empty until then and the picker falls back to default+lean.
+    // #5328: per-name provenance + the user-pack dir (server authority) so the
+    // panel knows which entries 新建/编辑/删除 may touch.
+    let packNames = [];
+    let packSources = {};
+    let packUserDir = "";
+    // #5328: indirections so the inventory refresher lives at panel scope
+    // (loadConfig can call it before/after the quick-config block is built)
+    // while DOM and selection handling stay where the elements exist.
+    let packSelEl = null;
+    let rerenderQuick = null;
+    async function refreshPackInventory() {
+        try {
+            const p = await json(API_ROOT + "/packs");
+            if (!p || !Array.isArray(p.packs)) return;
+            packNames = p.packs.map((x) => String(x.name));
+            packSources = {};
+            for (const x of p.packs) packSources[String(x.name)] = String(x.source || "");
+            if (p.userDir) packUserDir = String(p.userDir) + "/";
+        } catch (e) { }
+        const prev = packSelEl ? packSelEl.value : "";
+        // Option reconstruction never fires the change listener — restore a
+        // still-present custom selection manually.
+        if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
+        if (rerenderQuick) rerenderQuick();
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
@@ -1452,6 +1479,21 @@ function changelogCatOf(rawLine) {
                 ab.hidden = true;
                 ab.classList.remove("show");
                 ab.innerHTML = "";
+            }
+        }
+        // #5221 phase 2 (owner ruling 2026-10-31): persistent local-resolver
+        // wedge — detection-only alarm banner beside the defect advisory.
+        const wb = $("resolver-wedge-banner");
+        if (wb) {
+            const w = d.resolverWedge;
+            if (w && w.tripped) {
+                wb.hidden = false;
+                wb.classList.add("show");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+            } else {
+                wb.hidden = true;
+                wb.classList.remove("show");
+                wb.innerHTML = "";
             }
         }
         const pb = $("plugin-advisory-banner");
@@ -3619,7 +3661,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     async function loadConfig() {
         try {
-            const cfg = await json(API_ROOT + "/config");
+                        const cfg = await json(API_ROOT + "/config");
+            // #5319/#5328: refresh the resolved pack inventory (+ per-name
+            // source + user-pack dir) so the picker and the editor stay in
+            // sync with what is actually on disk.
+            refreshPackInventory();
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -3822,11 +3868,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
-            ["default", "lean"].forEach((name) => {
+            (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
                 const o = document.createElement("option");
                 o.value = name;
                 o.textContent = name;
@@ -3971,6 +4018,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -3979,15 +4046,371 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         plab.textContent = t("cfg.q_pack");
         pw.appendChild(plab);
         pw.appendChild(packSel);
+        packSelEl = packSel;
+        rerenderQuick = () => syncAll();
         box.appendChild(pw);
         const packNote = document.createElement("div");
         packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
         function updatePackNote() {
             if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
             else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else if (packSel.value === "chat") packNote.textContent = t("cfg.q_pack_chat_desc");
             else packNote.textContent = t("cfg.q_pack_custom");
         }
         box.appendChild(packNote);
+        // #5328: user-dir pack management — 新建/编辑/删除 under the dir the
+        // server reported via GET /__bili/packs (userDir). Builtin/shipped
+        // packs are read-only here; guidance says "override with a same-named
+        // file" instead of pretending they can be edited in place.
+        const pmRow = document.createElement("div");
+        pmRow.style.cssText = "margin:4px 0 2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+        const pmName = document.createElement("input");
+        pmName.type = "text";
+        pmName.className = "field-input mono";
+        pmName.placeholder = t("cfg.q_pack_name_ph");
+        pmName.style.cssText = "width:200px";
+        const pmNew = document.createElement("button");
+        pmNew.className = "btn sm";
+        pmNew.textContent = t("cfg.q_pack_new");
+        const pmEdit = document.createElement("button");
+        pmEdit.className = "btn sm";
+        pmEdit.textContent = t("cfg.q_pack_edit");
+        const pmDel = document.createElement("button");
+        pmDel.className = "btn sm";
+        pmDel.textContent = t("cfg.q_pack_del");
+        const pmStatus = document.createElement("span");
+        pmStatus.style.cssText = "flex-basis:100%;font-size:12px;color:#57606a";
+        pmRow.append(pmName, pmNew, pmEdit, pmDel, pmStatus);
+        const peBox = document.createElement("div");
+        peBox.hidden = true;
+        peBox.style.cssText = "margin:4px 0";
+        // #5344: the editor is a three-tab panel (guided form / AI assist /
+        // raw JSON); the bare-JSON box below becomes the third tab.
+        // WEB_CLIENT embedding rules: no backtick literals; runtime \n
+        // escapes are written \\n in this source file.
+        const peTabs = document.createElement("div");
+        peTabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px";
+        const PE_TAB_DEFS = [
+            { key: "form", label: t("cfg.q_pack_tab_form") },
+            { key: "ai", label: t("cfg.q_pack_tab_ai") },
+            { key: "json", label: t("cfg.q_pack_tab_json") },
+        ];
+        const peTabBtns = {};
+        for (const def of PE_TAB_DEFS) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.textContent = def.label;
+            btn.style.borderBottom = "2px solid transparent";
+            (function (key) { btn.addEventListener("click", () => showPeTab(key)); })(def.key);
+            peTabBtns[def.key] = btn;
+            peTabs.appendChild(btn);
+        }
+        function showPeTab(key) {
+            for (const def of PE_TAB_DEFS) {
+                const btn = peTabBtns[def.key];
+                btn.style.fontWeight = def.key === key ? "700" : "400";
+                btn.style.borderBottom = def.key === key ? "2px solid #0969da" : "2px solid transparent";
+            }
+            peFormPane.hidden = key !== "form";
+            peAiPane.hidden = key !== "ai";
+            peJsonPane.hidden = key !== "json";
+        }
+        const peTa = document.createElement("textarea");
+        peTa.className = "editor mono codebox";
+        peTa.spellcheck = false;
+        peTa.rows = 10;
+        peTa.placeholder = '{\\n  "promptSections": {\\n    "philosophy": "…"\\n  }\\n}';
+        const peBtns = document.createElement("div");
+        peBtns.style.cssText = "margin-top:6px;display:flex;gap:8px";
+        const peSave = document.createElement("button");
+        peSave.className = "btn sm";
+        peSave.textContent = t("cfg.q_pack_save");
+        const peCancel = document.createElement("button");
+        peCancel.className = "btn sm";
+        peCancel.textContent = t("cfg.q_pack_cancel");
+        peBtns.append(peSave, peCancel);
+        // #5344 tab 1: guided form — start from a base text, tweak, save.
+        const peFormPane = document.createElement("div");
+        const peAiPane = document.createElement("div");
+        const peJsonPane = document.createElement("div");
+        peFormPane.hidden = false;
+        peAiPane.hidden = true;
+        peJsonPane.hidden = true;
+        peJsonPane.append(peTa, peBtns);
+        const baseRow = document.createElement("div");
+        baseRow.style.cssText = "display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap";
+        const baseLab = document.createElement("label");
+        baseLab.htmlFor = "pack-base-sel";
+        baseLab.textContent = t("cfg.q_pack_base_label");
+        baseLab.style.cssText = "font-size:12px;color:#57606a";
+        const baseSel = document.createElement("select");
+        baseSel.id = "pack-base-sel";
+        baseSel.className = "field-input";
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            baseSel.appendChild(opt);
+        });
+        const btnBaseLoad = document.createElement("button");
+        btnBaseLoad.type = "button";
+        btnBaseLoad.className = "btn sm";
+        btnBaseLoad.textContent = t("cfg.q_pack_base_load");
+        baseRow.append(baseLab, baseSel, btnBaseLoad);
+        const descWrap = document.createElement("div");
+        descWrap.style.cssText = "margin:8px 0";
+        const descLab = document.createElement("div");
+        descLab.textContent = t("cfg.q_pack_desc");
+        descLab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+        const descIn = document.createElement("input");
+        descIn.type = "text";
+        descIn.className = "field-input";
+        descIn.placeholder = t("cfg.q_pack_desc_ph");
+        descIn.style.cssText = "width:100%;box-sizing:border-box";
+        descWrap.append(descLab, descIn);
+        function packSectionField(label, helpText, rows) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "margin:8px 0";
+            const lab = document.createElement("div");
+            lab.textContent = label;
+            lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+            const help = document.createElement("div");
+            help.textContent = helpText;
+            help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
+            const ta = document.createElement("textarea");
+            ta.className = "field-input mono";
+            ta.spellcheck = false;
+            ta.rows = rows;
+            ta.style.cssText = "width:100%;box-sizing:border-box";
+            wrap.append(lab, help, ta);
+            return { wrap, ta };
+        }
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
+        const taPh = phF.ta;
+        const taHc = hcF.ta;
+        const formHint = document.createElement("div");
+        formHint.textContent = t("cfg.q_pack_form_hint");
+        formHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0";
+        const btnFormSave = document.createElement("button");
+        btnFormSave.type = "button";
+        btnFormSave.className = "btn sm";
+        btnFormSave.textContent = t("cfg.q_pack_form_save");
+        peFormPane.append(baseRow, descWrap, phF.wrap, hcF.wrap, formHint, btnFormSave);
+        // #5344 tab 2: AI assist — plain-language need -> self-contained
+        // prompt -> copy to any LLM -> paste its JSON back -> fills the form.
+        const aiNeedLab = document.createElement("div");
+        aiNeedLab.textContent = t("cfg.q_pack_ai_need");
+        aiNeedLab.style.cssText = "font-size:13px;font-weight:600;margin:2px 0";
+        const aiNeed = document.createElement("textarea");
+        aiNeed.className = "field-input";
+        aiNeed.rows = 3;
+        aiNeed.placeholder = t("cfg.q_pack_ai_need_ph");
+        aiNeed.style.cssText = "width:100%;box-sizing:border-box";
+        const aiBtnRow = document.createElement("div");
+        aiBtnRow.style.cssText = "display:flex;gap:8px;margin:6px 0";
+        const btnAiGen = document.createElement("button");
+        btnAiGen.type = "button";
+        btnAiGen.className = "btn sm";
+        btnAiGen.textContent = t("cfg.q_pack_ai_gen");
+        const btnAiCopy = document.createElement("button");
+        btnAiCopy.type = "button";
+        btnAiCopy.className = "btn sm";
+        btnAiCopy.textContent = t("cfg.q_pack_ai_copy");
+        aiBtnRow.append(btnAiGen, btnAiCopy);
+        const aiOut = document.createElement("textarea");
+        aiOut.className = "editor mono codebox";
+        aiOut.readOnly = true;
+        aiOut.rows = 8;
+        aiOut.spellcheck = false;
+        aiOut.style.cssText = "width:100%;box-sizing:border-box";
+        const aiHint = document.createElement("div");
+        aiHint.textContent = t("cfg.q_pack_ai_hint");
+        aiHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0 2px";
+        const aiIn = document.createElement("textarea");
+        aiIn.className = "editor mono codebox";
+        aiIn.rows = 8;
+        aiIn.spellcheck = false;
+        aiIn.placeholder = '{"promptSections": {"philosophy": "..."}}';
+        aiIn.style.cssText = "width:100%;box-sizing:border-box";
+        const btnAiApply = document.createElement("button");
+        btnAiApply.type = "button";
+        btnAiApply.className = "btn sm";
+        btnAiApply.textContent = t("cfg.q_pack_ai_apply");
+        const aiApplyRow = document.createElement("div");
+        aiApplyRow.style.cssText = "display:flex;gap:8px;margin-top:6px";
+        aiApplyRow.append(btnAiApply);
+        peAiPane.append(aiNeedLab, aiNeed, aiBtnRow, aiOut, aiHint, aiIn, aiApplyRow);
+        async function loadBaseText() {
+            const baseName = baseSel.value;
+            if (!baseName) { descIn.value = ""; taPh.value = ""; taHc.value = ""; return; }
+            try {
+                const r = await json(API_ROOT + "/packs/templates");
+                const pk = r && r.packs ? r.packs[baseName] : null;
+                if (!pk) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+                descIn.value = typeof pk.description === "string" ? pk.description : "";
+                taPh.value = typeof pk.philosophy === "string" ? pk.philosophy : "";
+                taHc.value = typeof pk.howToCompress === "string" ? pk.howToCompress : "";
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        }
+        btnBaseLoad.addEventListener("click", () => loadBaseText());
+        // Shared pack-name normalizer (WEB_CLIENT rule: charCode, no regex
+        // with backslashes) for both save paths.
+        function packNameForSave() {
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            return (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+        }
+        btnFormSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.indexOf("..") !== -1) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            const phil = taPh.value.trim();
+            const hc = taHc.value.trim();
+            if (!phil && !hc) { pmSet(t("cfg.q_pack_form_empty"), true); return; }
+            const obj = { promptSections: {} };
+            if (phil) obj.promptSections.philosophy = phil;
+            if (hc) obj.promptSections.howToCompress = hc;
+            const desc = descIn.value.trim();
+            if (desc) obj.description = desc;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(obj, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
+        btnAiGen.addEventListener("click", () => {
+            const need = aiNeed.value.trim();
+            if (!need) { pmSet(t("cfg.q_pack_ai_need_empty"), true); return; }
+            aiOut.value = [t("cfg.q_pack_ai_p1", { need }), t("cfg.q_pack_ai_p2"), t("cfg.q_pack_ai_p3")].join("\\n\\n");
+            pmSet(t("cfg.q_pack_ai_gen_ok"));
+        });
+        btnAiCopy.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(aiOut.value); pmSet(t("cfg.q_pack_ai_copied")); }
+            catch (e) { pmSet(String(e), true); }
+        });
+        btnAiApply.addEventListener("click", () => {
+            // Tolerate markdown fences around the model's reply (build the
+            // fence from charCodes — no backtick literals here).
+            const FENCE = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);
+            let text = (aiIn.value || "").trim();
+            const lines = text.split("\\n");
+            if (lines.length > 0 && lines[0].trim().indexOf(FENCE) === 0) lines.shift();
+            if (lines.length > 0 && lines[lines.length - 1].trim() === FENCE) lines.pop();
+            text = lines.join("\\n").trim();
+            let obj = null;
+            try { obj = JSON.parse(text); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+            const ps = (obj.promptSections && typeof obj.promptSections === "object") ? obj.promptSections : {};
+            descIn.value = typeof obj.description === "string" ? obj.description : "";
+            taPh.value = typeof ps.philosophy === "string" ? ps.philosophy : "";
+            taHc.value = typeof ps.howToCompress === "string" ? ps.howToCompress : "";
+            const extra = Object.keys(obj).filter((k) => k !== "name" && k !== "version" && k !== "description" && k !== "promptSections");
+            Object.keys(ps).forEach((k) => { if (k !== "philosophy" && k !== "howToCompress") extra.push("promptSections." + k); });
+            peTa.value = JSON.stringify(obj, null, 2);
+            showPeTab("form");
+            pmSet(extra.length ? t("cfg.q_pack_ai_extra", { names: extra.join(", ") }) : t("cfg.q_pack_ai_apply_ok"));
+        });
+        peBox.append(peTabs, peFormPane, peAiPane, peJsonPane);
+        box.append(pmRow, peBox);
+        showPeTab("form");
+        let editingPack = "";   // "" = closed; otherwise the name being edited
+        let editingNew = false;
+        function pmSet(text, isError) {
+            pmStatus.textContent = text || "";
+            pmStatus.style.color = isError ? "#cf222e" : "#57606a";
+        }
+        function selectedIsUserPack(name) {
+            return packUserDir !== "" && String(packSources[name] || "").startsWith(packUserDir);
+        }
+        pmNew.addEventListener("click", () => {
+            editingPack = "";
+            editingNew = true;
+            pmName.value = "";
+            peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            baseSel.value = "";
+            descIn.value = "";
+            taPh.value = "";
+            taHc.value = "";
+            aiNeed.value = "";
+            aiOut.value = "";
+            aiIn.value = "";
+            peBox.hidden = false;
+            pmSet("");
+            showPeTab("form");
+        });
+        pmEdit.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!name || name === "default") { pmSet(t("cfg.q_pack_ro_default"), true); return; }
+            if (!selectedIsUserPack(name)) {
+                const src = String(packSources[name] || "");
+                pmSet(src.startsWith("file:") ? t("cfg.q_pack_ro_project") : t("cfg.q_pack_ro_builtin"), true);
+                return;
+            }
+            try {
+                const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
+                peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                let loadedObj = null;
+                try { loadedObj = peTa.value ? JSON.parse(peTa.value) : null; } catch (e) { loadedObj = null; }
+                const loadedPs = (loadedObj && loadedObj.promptSections && typeof loadedObj.promptSections === "object") ? loadedObj.promptSections : {};
+                descIn.value = (loadedObj && typeof loadedObj.description === "string") ? loadedObj.description : "";
+                taPh.value = (typeof loadedPs.philosophy === "string") ? loadedPs.philosophy : "";
+                taHc.value = (typeof loadedPs.howToCompress === "string") ? loadedPs.howToCompress : "";
+                editingPack = name;
+                editingNew = false;
+                pmName.value = name;
+                peBox.hidden = false;
+                pmSet("");
+                showPeTab("form");
+            } catch (e) { pmSet(String(e), true); }
+        });
+        pmDel.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!selectedIsUserPack(name)) { pmSet(t("cfg.q_pack_ro_del"), true); return; }
+            if (typeof confirm === "function" && !confirm(t("cfg.q_pack_confirm_del", { name }))) return;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), { method: "DELETE" });
+                pmSet(t("cfg.q_pack_deleted"));
+                refreshPackInventory();
+            } catch (e) { pmSet(String(e), true); }
+        });
+        peCancel.addEventListener("click", () => {
+            peBox.hidden = true;
+            editingPack = "";
+            editingNew = false;
+            pmSet("");
+        });
+        peSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            let parsed;
+            try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(parsed, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
         packSel.addEventListener("change", () => commit((d) => {
             if (!compressOf(d)) d.compress = {};
             if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
