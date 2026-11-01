@@ -1196,7 +1196,11 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 # — runtime effects -------------------------------------------------------------
 
 # The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
-_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# The HTTP pair and NO_PROXY are here too, so a plain-http provider is unrouted with the rest.
+_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1216,6 +1220,13 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
                 _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
+        # A plain-http provider base_url (a LAN llama.cpp / vLLM / ollama server) is only routed
+        # by HTTP_PROXY; with the HTTPS pair alone its traffic bypasses the proxy entirely and
+        # the session gets no compression. The proxy forwards absolute-form http requests.
+        os.environ["HTTP_PROXY"] = origin
+        os.environ["http_proxy"] = origin
+        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
+        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
