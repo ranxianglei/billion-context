@@ -92,6 +92,12 @@ interface WireClientSignals {
     readonly conversationSourceName: string | undefined;
     /** The shared codex UA/header detection (isCodexClient). */
     readonly codexUserAgent: boolean;
+    /** #XXXX: host-level opt-out for the instructions-fingerprint split
+     *  (config `personaSplit:false` / env BILI_PERSONA_SPLIT=0). The
+     *  fingerprint exists to keep DISJOINT subagent blobs off the main
+     *  lane; on a plain-proxy lane whose system prompt legitimately
+     *  changes every turn it forks the MAIN conversation instead. */
+    readonly personaSplitOff?: boolean;
 }
 
 interface WireClientEntry {
@@ -128,7 +134,15 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
  * unknown clients resolve ANONYMOUS — instructions key VERBATIM for them,
  * #1106). */
 export function resolveWireClientProfile(signals: WireClientSignals): HostProfile {
-    for (const entry of WIRE_CLIENTS) if (entry.matches(signals)) return entry.profile;
+    for (const entry of WIRE_CLIENTS) {
+        if (!entry.matches(signals)) continue;
+        // #XXXX: the switch only disables the FINGERPRINT split; every other
+        // profile field (identity, caching rules, tool surface) stays.
+        if (signals.personaSplitOff && entry.profile.instructionsFingerprintKeyed) {
+            return { ...entry.profile, instructionsFingerprintKeyed: false };
+        }
+        return entry.profile;
+    }
     return ANONYMOUS;
 }
 // ③ LaneDecisions — the frozen decision object every gate reads.
