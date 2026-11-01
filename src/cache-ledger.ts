@@ -738,7 +738,7 @@ export function generationParamFp(body: Record<string, unknown> | null | undefin
 /** #5466: one entry of the outbound `tools` array, reduced to what the seam
  *  monitor needs — a display name (never the raw schema) and an order-sensitive
  *  fingerprint of the whole entry. */
-export interface ToolEntry {
+interface ToolEntry {
     name: string;
     fp: string;
 }
