@@ -630,6 +630,25 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
     );
 }
 
+// #5432: Anthropic's mid-conversation system rule is TWO-sided — a non-directive
+// entry must FOLLOW a user message (or an assistant ending in a server tool
+// result) AND PRECEDE an assistant message or end the array. bili's ephemeral
+// tail injections (sysNotes/nudge/retrieval notes) append AFTER coreToAnthropic's
+// position heal; when the client history ends in a legal trailing system run, a
+// plain tail append puts a user after it and the request 400s ("role 'system'
+// must precede an 'assistant' message or end the array"). Insert the ephemerals
+// BEFORE that trailing run instead: the client's systems stay verbatim and still
+// end the array, and the new user also repairs the run's follow side when its
+// predecessor was an assistant. The kernel owns the full two-sided rule
+// (healIllegalSystemPositions); this only orders host-injected tails — no
+// demotion logic duplicated here.
+export function insertBeforeTrailingSystemRun<T extends { role: string }>(messages: T[], additions: readonly T[]): T[] {
+    if (additions.length === 0) return messages;
+    let i = messages.length;
+    while (i > 0 && messages[i - 1]!.role === "system") i--;
+    return [...messages.slice(0, i), ...additions, ...messages.slice(i)];
+}
+
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or
