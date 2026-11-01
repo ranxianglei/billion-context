@@ -9,6 +9,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
@@ -17,6 +20,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { peekSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 interface Captured {
@@ -28,10 +32,12 @@ interface Harness {
     proxyPort: number;
     upstreamPort: number;
     captured: Captured[];
+    store: SessionStore;
+    storeEnabled: boolean;
     close(): Promise<void>;
 }
 
-async function startHarness(): Promise<Harness> {
+async function startHarness(storeDir?: string): Promise<Harness> {
     const captured: Captured[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -52,7 +58,12 @@ async function startHarness(): Promise<Harness> {
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as AddressInfo).port;
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    // Real file-backed persistence only for the restart-simulation test below.
+    const storeEnabled = storeDir !== undefined;
+    const store = storeEnabled
+        ? new SessionStore({ dir: storeDir, enabled: true, debounceMs: 0 })
+        : new SessionStore({ enabled: false });
+    _setStoreForTest(store);
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0,
@@ -82,10 +93,13 @@ async function startHarness(): Promise<Harness> {
         proxyPort: (proxy.address() as AddressInfo).port,
         upstreamPort,
         captured,
+        store,
+        storeEnabled,
         async close() {
             proxy.close();
             proxy.closeIdleConnections?.();
             await once(proxy, "close");
+            if (storeEnabled) store.closeQuietly();
             upstream.close();
             upstream.closeIdleConnections?.();
             await once(upstream, "close");
@@ -263,5 +277,50 @@ test("#5300: plugin lane — compress tool call refused loudly on an excluded se
         assert.notEqual(control.status, 409);
     } finally {
         await h.close();
+    }
+});
+
+test("#5300: the flag survives a restart — persisted with the record, re-armed from disk", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-5300-persist-"));
+    try {
+        // Phase 1 (live instance): bind the session, disable compression, pin it to disk.
+        _resetSessionsForTest();
+        const h1 = await startHarness(dir);
+        try {
+            assert.equal(await modelRequest(h1, "sess-5300-restart"), 200);
+            assert.equal((await setCompression(h1, "sess-5300-restart", false)).status, 200);
+            const live = peekSession("sess-5300-restart");
+            assert.ok(live, "session resident after its first model request");
+            await h1.store.writeNow(live);
+            const got1 = await getCompression(h1, "sess-5300-restart");
+            assert.deepEqual(got1.json.compression, { enabled: false });
+            assert.equal(got1.json.resident, true);
+        } finally {
+            await h1.close();
+        }
+
+        // Phase 2 (process-death stand-in): empty resident pool, fresh store over the same dir.
+        // The flag must come back THROUGH THE FILE — a serialization change that thins
+        // metadata would silently re-enable compression and break both assertions below.
+        _resetSessionsForTest();
+        const h2 = await startHarness(dir);
+        try {
+            const got2 = await getCompression(h2, "sess-5300-restart");
+            assert.equal(got2.status, 200);
+            assert.deepEqual(got2.json.compression, { enabled: false });
+            const body = JSON.stringify({ model: "gpt-test", messages: [{ role: "user", content: "hi" }] });
+            const resp = await fetch(`${baseUrl(h2)}/bili/http://127.0.0.1:${h2.upstreamPort}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "sess-5300-restart" },
+                body,
+            });
+            assert.equal(resp.status, 200);
+            await resp.text();
+            assert.equal(h2.captured[0].body, body, "restarted instance still forwards the excluded session verbatim");
+        } finally {
+            await h2.close();
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
     }
 });
