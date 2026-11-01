@@ -160,6 +160,6 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 
 - **#4788 内存有界化**(v0.1.210 发布):D1-A 单会话硬上限 `sessions.hardMaxBytes`;D2 轮间卸载(`src/persist.ts` `runIdleSpill`);phase 2 卸载 content store(逃生门 `sessions.contentStorePin`)。**已知缺陷**:D2 四个可丢弃字段共享同一全局门 `durableRevision === revisionEpoch`——保存持续落后/失败(慢盘、EPERM 类、逐出→冷读高频抖动)时全等永不成立 → 零卸载,而上限告警仍宣称 "discharging…"。独立跟踪:#5474;候选方向是按字段持久化证明替代全局全等。
 - **#3756 快照渲染**(v0.1.210,rollout `snapshotRender` 默认 0%):出站前缀直接由服务端统一转录组装。完整教义与诚实边界见 MESSAGE-IDENTITY.md「Snapshot Render Engine」节。
-- **#5418 水位快路径**(PR #5469,待人工评审):计数水位验证命中时服务端只解码新增尾窗;前缀 cores 复用代理上轮自己接受的产物;`lastMessages` 只钉尾。信任边界与多模态尾部降级边界(#5468)见 AGENTS.md KDD #15 与 PR 描述。
+- **#5418 水位快路径**(PR #5469,待人工评审):计数水位验证命中时服务端只解码新增尾窗;前缀 cores 复用代理上轮自己接受的产物;`lastMessages` 只钉尾。信任边界与多模态尾部降级边界(#5468)见 PR #5469 的 AGENTS.md KDD #15(随该 PR 合入)与其 PR 描述。
 
 关系:三者**叠加而非替代**——快路径消灭**生产**(每轮解析峰值 + 新增驻留),#4788 负责**呼吸**(稳态卸载,门控修复待 #5474),快照渲染管**组装**(非插件车道)。彻底关闭 #5403 需要快路径合并放量**加上** #5474 修复两条腿。
