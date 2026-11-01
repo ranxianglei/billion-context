@@ -125,7 +125,7 @@ interface LedgerLine {
      *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
      *  above instead. Lets the web trajectory chart paint the same bucket
      *  membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep";
+    prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" | "tools";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -296,6 +296,11 @@ interface CacheLedger {
          *  the break — kept out of the unexplained seam tally. */
         orphanSweepSeams: number;
         orphanSweepMissed: number;
+        /** #5466: mid-history breaks attributed to a mid-session change in the
+         *  request's tools array (wire prefix = system + tools + messages) — kept
+         *  out of the unexplained seam tally like the other host/provider buckets. */
+        toolSeams: number;
+        toolSeamMissed: number;
         /** #2929: the provider-side arm split by idle gap — samples settled more
          *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
          *  expiry, not an abnormal provider failure. */
@@ -394,6 +399,12 @@ export interface SeamEvent {
      *  rebuild artifact. Carries the divergent message's role/length/class
      *  (never raw content). */
     client?: { idx: number; role: string; len: number; cls: string };
+    /** #5466: present iff booked as a TOOLS-array change — the request's tool table
+     *  flipped between two turns ahead of the message prefix (the message-only view
+     *  cannot see it), so the cached span broke at the tool boundary. Carries which
+     *  entries appeared/disappeared/were redefined and how many reordered (names
+     *  only, never schemas). */
+    tools?: ToolsDelta;
 }
 
 const SEAM_BODY_CAP = 512 * 1024;
@@ -442,6 +453,14 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #5466: per-entry fingerprints of the outbound body's `tools` array (order-
+     *  sensitive), captured from the full parse at the send chokepoint. The wire
+     *  prefix is system + tools + messages, so a mid-session tool-table change
+     *  breaks the cached span without touching any message — detectSeam compares
+     *  prev/cur to attribute that break to the tool table instead of the client.
+     *  undefined = no tools array / unparseable body (unknown never flags); [] =
+     *  present-but-empty. Preserved across byte-identical re-notes like effFp. */
+    tools?: ToolEntry[];
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -716,6 +735,97 @@ export function generationParamFp(body: Record<string, unknown> | null | undefin
     return "sha256:" + createHash("sha256").update(canonicalJson(parts), "utf8").digest("hex").slice(0, 16);
 }
 
+/** #5466: one entry of the outbound `tools` array, reduced to what the seam
+ *  monitor needs — a display name (never the raw schema) and an order-sensitive
+ *  fingerprint of the whole entry. */
+interface ToolEntry {
+    name: string;
+    fp: string;
+}
+
+/** #5466: per-entry fingerprints of the outbound body's `tools` array, in order.
+ *  The Anthropic wire prefix is system + tools + messages, so a mid-session change
+ *  to the tool table invalidates the cached span WITHOUT touching any message — the
+ *  message-only seam view cannot see it. Each entry is fingerprinted via
+ *  canonicalJson (wire-agnostic: whole-entry, key-order-insensitive, so identical
+ *  tools never flip while a real schema/description/rename flip is caught); the
+ *  ORDER is preserved because a moved tool breaks the prefix exactly like an edited
+ *  one. Returns undefined when the body has no `tools` array (unknown never flags);
+ *  a present-but-empty array returns [] (distinct from undefined, so a real 0→N
+ *  late registration is still caught by the length diff). */
+export function toolsArrayFps(body: Record<string, unknown> | null | undefined): ToolEntry[] | undefined {
+    if (!body || typeof body !== "object") return undefined;
+    const t = body.tools;
+    if (!Array.isArray(t)) return undefined;
+    return t.map((entry) => {
+        const e = (entry ?? {}) as Record<string, unknown>;
+        const fn = e.function;
+        const nested = fn !== null && typeof fn === "object" ? (fn as Record<string, unknown>).name : undefined;
+        const rawName = typeof e.name === "string" ? e.name : typeof nested === "string" ? nested : undefined;
+        const name = rawName ?? "?";
+        const fp = "sha256:" + createHash("sha256").update(canonicalJson(entry), "utf8").digest("hex").slice(0, 16);
+        return { name, fp };
+    });
+}
+
+/** #5466: how two consecutive requests' tool tables differ, for the report. Names
+ *  only (never schemas); `null` = identical (nothing to say). */
+interface ToolsDelta {
+    /** First divergent tool index (a positional mismatch, or the shorter array's
+     *  length when the difference is purely a trailing add/remove). */
+    idx: number;
+    /** Tool names present in the later request but not the earlier. */
+    appeared: string[];
+    /** Tool names present in the earlier request but not the later. */
+    disappeared: string[];
+    /** Same name in both, but its entry fingerprint differs (schema/description
+     *  rewrite under an unchanged name). */
+    edited: string[];
+    /** Entries present in both (stable set) whose order shifted. Counted only when
+     *  nothing appeared/disappeared/was redefined, so it reads as "reordered". */
+    moved: number;
+    /** One-line human summary for the log/report. */
+    summary: string;
+}
+
+function describeToolsChange(prev: ToolEntry[], cur: ToolEntry[]): ToolsDelta | null {
+    const n = Math.min(prev.length, cur.length);
+    let identical = prev.length === cur.length;
+    if (identical) {
+        for (let i = 0; i < n; i++) {
+            if (prev[i].fp !== cur[i].fp) { identical = false; break; }
+        }
+    }
+    if (identical) return null;
+    let idx = n;
+    for (let i = 0; i < n; i++) {
+        if (prev[i].fp !== cur[i].fp) { idx = i; break; }
+    }
+    const prevByName = new Map<string, string>();
+    for (const e of prev) prevByName.set(e.name, e.fp);
+    const curByName = new Map<string, string>();
+    for (const e of cur) curByName.set(e.name, e.fp);
+    const appeared: string[] = [];
+    const disappeared: string[] = [];
+    const edited: string[] = [];
+    for (const [name, fp] of curByName) {
+        if (!prevByName.has(name)) appeared.push(name);
+        else if (prevByName.get(name) !== fp) edited.push(name);
+    }
+    for (const [name] of prevByName) if (!curByName.has(name)) disappeared.push(name);
+    let moved = 0;
+    if (appeared.length === 0 && disappeared.length === 0 && edited.length === 0) {
+        for (let i = 0; i < n; i++) if (prev[i].name !== cur[i].name) moved++;
+    }
+    const bits: string[] = [];
+    if (appeared.length) bits.push(`added ${appeared.join(", ")}`);
+    if (disappeared.length) bits.push(`removed ${disappeared.join(", ")}`);
+    if (edited.length) bits.push(`redefined ${edited.join(", ")}`);
+    if (moved > 0) bits.push(`${moved} reordered`);
+    const summary = bits.length > 0 ? bits.join("; ") : "tool table changed";
+    return { idx, appeared, disappeared, edited, moved, summary };
+}
+
 /** Record the body of the upstream round that is about to be sent. Called at
  *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
  *  the next settleUsageReport pairs it with the usage report it produced.
@@ -724,8 +834,9 @@ export function generationParamFp(body: Record<string, unknown> | null | undefin
  *  settle re-noting the same wireBody), the earlier count is kept. `keyFp` is
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. `effFp` is
- *  the generation-parameter fingerprint (#3803) — same inheritance rule. */
-export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string, effFp?: string): void {
+ *  the generation-parameter fingerprint (#3803) — same inheritance rule.
+ *  `toolsFps` is the per-entry tools-array fingerprint (#5466) — same rule. */
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string, effFp?: string, toolsFps?: ToolEntry[]): void {
     // #2868: encode to UTF-8 ONCE here — digest, capped head and retained full
     // body all consume this same buffer, so no later comparison re-encodes.
     // Caps are BYTES (the old code-unit caps overshot them up to 3× on CJK).
@@ -751,6 +862,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        tools: toolsFps ?? (samePayload ? prior.tools : undefined),
     };
     if ("round" in transient && transient.round > 1) {
         delete transient.imageFacts;
@@ -1084,6 +1196,31 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // means CLIPPED (bytes > cap) — an exactly-at-cap body is fully stored.
         const prevCapped = prev.bytes > SEAM_BODY_CAP;
         const curCapped = cur.bytes > SEAM_BODY_CAP;
+        // #5466: the tools table sits BEFORE messages in the Anthropic wire prefix
+        // (system + tools + messages), so a mid-session change to the request's
+        // tools array invalidates the cached span without touching any message — the
+        // message-only arms below cannot see it and would blame the first incidental
+        // divergence (client / seam-suspect / provider-side). Runs FIRST: a tools
+        // change is the earliest break in the prefix. Fail soft when either side
+        // lacks a captured tools array (no tools on the wire / unparseable body →
+        // undefined → legacy arms), mirroring the client arm's missing-capture rule.
+        const tPrev = prev.tools;
+        const tCur = cur.tools;
+        if (tPrev !== undefined && tCur !== undefined) {
+            const td = describeToolsChange(tPrev, tCur);
+            if (td !== null) {
+                line.prov = "tools";
+                agg.toolSeams += 1;
+                agg.toolSeamMissed += line.tr;
+                if (led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) led.seamEvents.shift();
+                const forensics = f ?? seamLcp(prev.head, cur.head);
+                (led.seamEvents ?? (led.seamEvents = [])).push({ seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs, tools: td });
+                if (agg.toolSeams === 1) {
+                    loggerLog("warn", `[${session.id}] [cache-seam] tools-array change: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok) — the request's tools table changed (${td.summary}) ahead of the message prefix, so the cached span broke at the tool boundary, not from client history churn (#5466)`);
+                }
+                return;
+            }
+        }
         // Client reverted/trimmed history: the miss is the sanctioned
         // one-time re-bill of the retained prefix (or the gap's TTL). Only
         // trust the parsed counts when BOTH sides are fully stored — a side
@@ -1222,6 +1359,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
             "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed", "orphanSweepSeams", "orphanSweepMissed",
+            "toolSeams", "toolSeamMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -1238,7 +1376,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0, toolSeams: 0, toolSeamMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -2111,7 +2249,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
+    lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" | "tools" }>;
     modelSwitches: ModelSwitchStats;
     /** #3803: host generation-parameter switches (reasoning effort / thinking config) — a provider cache-namespace flip that re-bills the whole stable prefix once, distinct from any byte change. */
     effSwitches: ModelSwitchStats;
@@ -2135,7 +2273,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number } };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number }; tools: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -2325,7 +2463,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed }, tools: { count: a.toolSeams, missed: a.toolSeamMissed } },
     };
 }
 
@@ -2477,12 +2615,12 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.suspects > 0) {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
-        // #3307: seamEvents holds BOTH suspect and #3023 client-side events
-        // (one shared capped ring), so listing every event here echoed host-owned
-        // rewrites under the "suspected bili rebuild" header — the ✎ CLIENT
-        // section below already owns those. List only suspects here so the two
-        // sections stay disjoint and a client insert is never misread as a seam.
-        const suspectEvents = r.seam.events.filter((e) => !e.client);
+        // #3307: seamEvents holds suspect, #3023 client-side AND #5466 tools-array
+        // events (one shared capped ring), so listing every event here echoed
+        // host-owned breaks under the "suspected bili rebuild" header — the ✎ CLIENT
+        // and 🔧 TOOLS sections below already own those. List only true suspects so
+        // the sections stay disjoint and a host-side break is never misread as a seam.
+        const suspectEvents = r.seam.events.filter((e) => !e.client && !e.tools);
         for (const e of suspectEvents) {
             out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
@@ -2509,6 +2647,13 @@ function formatSeam(r: BiliCacheReport): string {
         out.push(`  ${r.seam.client.count} sample(s) · ${fmtTok(r.seam.client.missed)} tok — the client's own resent history broke mid-list, so bili's faithful rebuild carried the break to the wire (host plugin insert / paste hoisting / re-render). Client-owned re-bill, not a rebuild seam.`);
         for (const e of r.seam.events) {
             if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
+        }
+    }
+    if (r.seam.tools.count > 0) {
+        out.push("🔧 TOOLS-ARRAY CHANGE (host flipped the request's tool table — NOT a bili seam)");
+        out.push(`  ${r.seam.tools.count} sample(s) · ${fmtTok(r.seam.tools.missed)} tok re-billed when the request's tools array changed mid-session — the wire prefix is system + tools + messages, so the cached span broke at the tool boundary without any message changing. Host-owned re-bill (late plugin registration / dynamic tool enable), not a rebuild seam.`);
+        for (const e of r.seam.events) {
+            if (e.tools) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · ${e.tools.summary} · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
     }
     if (r.seam.orphanSweep.count > 0) {

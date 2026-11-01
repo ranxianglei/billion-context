@@ -2084,11 +2084,12 @@ function changelogCatOf(rawLine) {
             providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
             rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
             client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            tools: { count: (raw.tools && Number(raw.tools.count)) || 0, missed: (raw.tools && Number(raw.tools.missed)) || 0 },
             abortCorrelated: Number(raw.abortCorrelated) || 0,
         };
     }
     function detailSeamActive(seam) {
-        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.tools.count > 0 || seam.abortCorrelated > 0));
     }
     // #2489/#3484: zoom-to-selection over the detail charts. The data is already
     // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
@@ -2910,6 +2911,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
                 if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
                 if (seam.client.count > 0) sub.push(legendItem("background:#0969da", t("det.leg_client")));
+                if (seam.tools.count > 0) sub.push(legendItem("background:#0e7490", t("det.leg_tools")));
                 sub.push(legendItem("background:#9aa1a8", t("det.leg_rest")));
                 parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
                     + legendItem("background:#8250df", t("det.cause_unattrib"))
@@ -3047,15 +3049,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // tile (label · value · then the parts, top to bottom) — containment
             // rendered as layout, not as a caption floating beside the tiles.
             const plainUnattrib = () => '<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + "</div></div>";
-            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0)) {
+            if (seam && (seam.missed > 0 || seam.providerTtl.count > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.tools.count > 0)) {
                 var uChips = [];
                 if (seam.missed > 0 || seam.suspects > 0) uChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + t("det.attr_seam") + " " + fmtW(seam.missed) + (seam.suspects > 0 ? " ×" + seam.suspects : "") + pctU(seam.missed) + "</span>");
                 if (seam.providerTtl.missed > 0 || seam.providerTtl.count > 0) uChips.push('<span style="color:#1a7f37" title="' + escapeHtml(t("det.attr_ttl_tip")) + '">' + t("det.attr_ttl") + " " + fmtW(seam.providerTtl.missed) + (seam.providerTtl.count > 0 ? " ×" + seam.providerTtl.count : "") + pctU(seam.providerTtl.missed) + "</span>");
                 if (seam.providerSide.missed > 0 || seam.providerSide.count > 0) uChips.push('<span style="color:#f0883e" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + t("det.attr_provider") + " " + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? " ×" + seam.providerSide.count : "") + pctU(seam.providerSide.missed) + "</span>");
                 if (seam.rewinds.missed > 0 || seam.rewinds.count > 0) uChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + t("det.attr_rewind") + " " + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? " ×" + seam.rewinds.count : "") + pctU(seam.rewinds.missed) + "</span>");
                 if (seam.client.missed > 0 || seam.client.count > 0) uChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_client_tip")) + '">' + t("det.attr_client") + " " + fmtW(seam.client.missed) + (seam.client.count > 0 ? " ×" + seam.client.count : "") + pctU(seam.client.missed) + "</span>");
+                if (seam.tools.missed > 0 || seam.tools.count > 0) uChips.push('<span style="color:#0e7490" title="' + escapeHtml(t("det.attr_tools_tip")) + '">' + t("det.attr_tools") + " " + fmtW(seam.tools.missed) + (seam.tools.count > 0 ? " ×" + seam.tools.count : "") + pctU(seam.tools.missed) + "</span>");
                 if (seam.abortCorrelated > 0) uChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + t("det.attr_abort") + " ×" + seam.abortCorrelated + "</span>");
-                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed - seam.client.missed);
+                var uRest = Math.max(0, (tot.ttlRepay || 0) - seam.missed - seam.providerTtl.missed - seam.providerSide.missed - seam.rewinds.missed - seam.client.missed - seam.tools.missed);
                 if (uRest > 8192) uChips.push('<span style="color:#9aa1a8" title="' + escapeHtml(t("det.attr_rest_tip")) + '">' + t("det.attr_rest", { x: fmtW(uRest) }) + pctU(uRest) + "</span>");
                 if (uChips.length) {
                     parts.push('<div class="stat"><div class="k">' + t("det.ce_ttl") + '</div><div class="v mono">' + fmtW(tot.ttlRepay || 0) + pctIn(tot.ttlRepay || 0) + '</div>'
