@@ -136,6 +136,7 @@
 | `BILI_STORAGE_QUICK_CHECK` | 默认开——index.db 开库在迁移前跑 PRAGMA quick_check 自检；失败=影子层隔离文件组（.corrupt-<ts>）+重建新库（JSON 信封为恢复源）；=0 跳过（超大库启动时间敏感场景，#4175） |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
+| `BILI_PERF_TELEMETRY` | `=0/false` 关闭 #5460 实时性能采集（缺省开）。DB 存储模式（sqlite/mysql）下每请求一行 + 30s 内存采样 → sessions 目录旁 `perf.sqlite`；纯 JSON 存储模式冻结不采集；写失败一次性降级停采，绝不影响服务 |
 
 ### 2.5 诊断
 

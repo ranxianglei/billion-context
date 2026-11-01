@@ -25,6 +25,7 @@
  * for the full config-file schema (which also supports `debug`, `port`, etc.
  * — flags are just convenient overrides).
  */
+import fs from "node:fs";
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer, restartForceCloseOf } from "./server.js";
 import { serveStartupFailurePage } from "./startup-failure-page.js";
@@ -47,6 +48,8 @@ import { installPackFromNpm, removePackFile } from "./pack-install.js";
 import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
+import { BENCH_SCENARIOS, runBench } from "./bench.js";
+import { generateFixture } from "./perf-fixture.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
@@ -132,6 +135,16 @@ Usage:
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
+   bili bench [scenario]            perf harness (#5460 P2): boots a hermetic proxy
+                                    against a deterministic fake upstream in throwaway
+                                    XDG dirs, replays a seeded fixture as full-resend
+                                    rounds, reports p50/p95/HWM from perf.sqlite —
+                                    RECORD ONLY, never judges metrics; no scenario
+                                    lists the catalog (--rounds N, --out FILE,
+                                    --keep-workdir, --dist PATH)
+   bili fixture-gen                 emit a deterministic perf fixture — pure function
+                                    of --seed K --msgs N --shape openai|anthropic
+                                    (--out FILE writes JSON instead of stdout)
   bili --version                   print version
   bili --help                      show this help
 
@@ -195,7 +208,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack" | "bench" | "fixture-gen";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -227,6 +240,14 @@ type Parsed = {
     jsonOutput?: boolean;
     doctorJson?: boolean;
     doctorFix?: boolean;
+    benchScenario?: string;
+    benchRounds?: number;
+    benchKeepWorkdir?: boolean;
+    benchDist?: string;
+    outFile?: string;
+    fixtureSeed?: number;
+    fixtureMsgs?: number;
+    fixtureShape?: "openai" | "anthropic";
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -263,6 +284,14 @@ export function parseArgs(argv: string[]): Parsed {
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
+    let benchScenario: string | undefined;
+    let benchRounds: number | undefined;
+    let benchKeepWorkdir = false;
+    let benchDist: string | undefined;
+    let outFile: string | undefined;
+    let fixtureSeed: number | undefined;
+    let fixtureMsgs: number | undefined;
+    let fixtureShape: Parsed["fixtureShape"];
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -405,6 +434,78 @@ export function parseArgs(argv: string[]): Parsed {
                 acpCacheSession = val;
                 break;
             }
+            case "--out": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                outFile = val;
+                break;
+            }
+            case "--rounds": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 1) {
+                    console.error(`bili: --rounds expects a positive integer (got "${val}")`);
+                    process.exit(2);
+                }
+                benchRounds = n;
+                break;
+            }
+            case "--keep-workdir":
+                benchKeepWorkdir = true;
+                break;
+            case "--dist": {
+                const val = argv[++i];
+                if (val === undefined || val.length === 0) {
+                    console.error(`bili: ${a} requires a non-empty value`);
+                    process.exit(2);
+                }
+                benchDist = val;
+                break;
+            }
+            case "--seed": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 0) {
+                    console.error(`bili: --seed expects a non-negative integer (got "${val}")`);
+                    process.exit(2);
+                }
+                fixtureSeed = n;
+                break;
+            }
+            case "--msgs": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 1) {
+                    console.error(`bili: --msgs expects a positive integer (got "${val}")`);
+                    process.exit(2);
+                }
+                fixtureMsgs = n;
+                break;
+            }
+            case "--shape": {
+                const val = argv[++i];
+                if (val !== "openai" && val !== "anthropic") {
+                    console.error(`bili: --shape expects openai or anthropic (got "${val ?? ""}")`);
+                    process.exit(2);
+                }
+                fixtureShape = val;
+                break;
+            }
             case "-F":
             case "--port":
             case "--host":
@@ -540,17 +641,22 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
                 process.exit(2);
             }
+        } else if (cmd === "bench") {
+            command = "bench";
+            benchScenario = positional[1];
+        } else if (cmd === "fixture-gen") {
+            command = "fixture-gen";
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce, benchScenario, benchRounds, benchKeepWorkdir, benchDist, outFile, fixtureSeed, fixtureMsgs, fixtureShape };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce, benchScenario, benchRounds, benchKeepWorkdir, benchDist, outFile, fixtureSeed, fixtureMsgs, fixtureShape } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -559,6 +665,46 @@ export async function main(): Promise<void> {
         // "0.1.187 (8f9faf9e)" — the commit identifies the exact build for
         // locally-installed test trees whose semver matches a released version.
         process.stdout.write(`${VERSION} (${BUILD_COMMIT})\n`);
+        return;
+    }
+    if (command === "fixture-gen") {
+        try {
+            if (fixtureSeed === undefined || fixtureMsgs === undefined) {
+                console.error("bili fixture-gen: --seed K and --msgs N are required (try one of: bili bench <scenario>)");
+                process.exit(2);
+            }
+            const fx = generateFixture({ seed: fixtureSeed, msgs: fixtureMsgs, shape: fixtureShape ?? "openai" });
+            const text = JSON.stringify({ seed: fx.seed, shape: fx.shape, count: fx.count, bytes: fx.bytes, messages: fx.messages }, null, 1);
+            if (outFile) {
+                fs.writeFileSync(outFile, text);
+            } else {
+                process.stdout.write(text + "\n");
+            }
+        } catch (error) {
+            console.error(`bili fixture-gen: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "bench") {
+        if (benchScenario === undefined) {
+            const lines = BENCH_SCENARIOS.map((s) => `  ${s.id.padEnd(34)} [${s.tier.padEnd(7)}] ${s.desc}`);
+            process.stdout.write(`bench scenarios (#5460 P2 — record-only, never judges):\n${lines.join("\n")}\n\nrun: bili bench <scenario> [--rounds N] [--out FILE] [--keep-workdir] [--dist PATH]\n`);
+            return;
+        }
+        try {
+            const { artifact } = await runBench({ scenarioId: benchScenario, rounds: benchRounds, dist: benchDist, keepWorkdir: benchKeepWorkdir, log: (m) => console.error(m) });
+            const text = JSON.stringify(artifact, null, 1);
+            if (outFile) {
+                fs.writeFileSync(outFile, text);
+                console.error(`bench artifact written to ${outFile}`);
+            } else {
+                process.stdout.write(text + "\n");
+            }
+        } catch (error) {
+            console.error(`bili bench: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
         return;
     }
     if (command === "acp-cache") {

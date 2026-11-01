@@ -37,6 +37,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { perfTelemetryInit } from "./perf-telemetry.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -591,6 +592,10 @@ export class SessionStore {
                 fileStorageMysqlDsn(),
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
+                // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
+                // Pure-JSON ("legacy") mode stays frozen even when it rides this
+                // branch (a mysql backend with storage.unified=legacy) — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "mysql", { dir: this.sessionsDir, log: baseLog });
             });
             // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
             // (no degradation in any case). Boot awaits ready() and exits
@@ -612,8 +617,14 @@ export class SessionStore {
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
                 this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
+                // Pure-JSON ("legacy") mode flows through this branch too
+                // (maybeOpen returns null for it) but stays frozen — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "sqlite", { dir: this.sessionsDir, log: baseLog });
             } else {
+                // #5460: pure-JSON storage mode is frozen — telemetry stays off there.
                 this.shadow = undefined;
+                perfTelemetryInit("json", { log: baseLog });
             }
         }
         this.store = new StateStore<PersistedSession>({

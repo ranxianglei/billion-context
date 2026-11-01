@@ -366,6 +366,7 @@
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
 | `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——JSON 信封始终是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底（活的第二写者已于 2026-10-31 移出该拒绝清单：多进程共享一个本地盘 index.db 是受支持拓扑，只提示、永不阻断启动）；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（或留空）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
+| `BILI_PERF_TELEMETRY` | boolean-ish | on | — | #5460 实时性能采集总开关。DB 存储模式（sqlite/mysql）下默认开启：每处理一个请求落一行，外加每 30 秒一条内存水位采样，写入 index.db 旁边的独立小库 perf.sqlite —— 独立文件，与用户自己的库崩溃/体积隔离；纯 JSON 存储模式冻结、永不采集。0/false 整体关闭采集。任何打开/插入失败只降级采集（一次性告警 + 死标记），绝不影响服务。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
@@ -2109,6 +2110,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `bili plugin list` | 显示每个宿主的安装状态 |
 | `bili mcp` | 独立运行 bili MCP 服务器（stdio） |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | 预绑定会话 id 到插件模式（高级用法） |
+| `bili bench [scenario] [--rounds N] [--out FILE] [--keep-workdir] [--dist PATH]` | 只记录不评判的性能基准（#5460 P2）：把本代理作为子进程拉起，对着一次性 XDG 目录里的确定性假上游重放种子 fixture（全量重发回合），从 `perf.sqlite` 读 p50/p95/HWM 出 JSON 报告 —— 指标慢不会让运行失败，只有 harness 故障才失败；不带 scenario 时列出全部场景 |
+| `bili fixture-gen --seed K --msgs N [--shape openai\|anthropic] [--out FILE]` | 生成确定性合成会话 fixture —— seed/msgs/shape 的纯函数（同输入 ⇒ 字节级一致）；大数据按需生成，永不入库 |
 | `bili --version` / `bili --help` | 打印版本 / 帮助 |
 
 launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- print "hi"`）。
@@ -2125,6 +2128,13 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 | `--no-passthrough` | 强制开启压缩（覆盖配置文件） |
 | `--no-auto-update` | 本次运行禁用后台自动更新 |
 | `--mitm-domain <domain>` | 追加 MITM 白名单域名（可重复；仅 launcher） |
+| `--rounds <N>` | `bench`：每个场景的重放轮数（默认 `1`；每轮各自记入产物 `runs[]`，消费方可跨 N 轮取中位数） |
+| `--out <FILE>` | `bench` / `fixture-gen`：JSON 产物 / fixture 写入 FILE，而非 stdout |
+| `--keep-workdir` | `bench`：保留一次性 XDG 工作目录（日志、会话状态、`perf.sqlite`）供排查 |
+| `--dist <PATH>` | `bench`：拉起哪个 `dist/index.js`（默认：当前运行入口；测试缝 env `E2E_BILI_DIST`） |
+| `--seed <K>` | `fixture-gen`：PRNG 种子，非负整数（与 `--msgs` 同必填） |
+| `--msgs <N>` | `fixture-gen`：消息条数，正整数（与 `--seed` 同必填） |
+| `--shape <wire>` | `fixture-gen`：线路形状，`openai`（默认）或 `anthropic` |
 
 ---
 
