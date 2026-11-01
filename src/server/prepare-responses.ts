@@ -33,7 +33,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, carriesConversationTurns, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, normalizeForgedEntries, pruneForgedEntries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING, FORGED_SUMMARY_INJECT_WARN_PCT } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
@@ -427,9 +427,35 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // message so the pre-compaction content is never lost. When the echo
         // DID come back, the replacement message carries the summaries and
         // the injection is suppressed to avoid duplicating them.
-        const forgedSummaries = echoReplaced
-            ? []
-            : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
+        // #4600: the ledger is debt with a lifecycle — prune entries whose
+        // block's summary was folded into a represented newer block (provably
+        // redundant, persisted), and inject nothing into requests that replay
+        // no conversation (context-only probes/sidecars have no replayed
+        // history to protect and must not pay the accumulated tax, which used
+        // to fail them with 413 once the ledger exceeded the window).
+        let forgedSummaries: string[] = [];
+        if (!echoReplaced) {
+            const forgedEntries = normalizeForgedEntries(session.metadata.codexForgedSummaries);
+            if (forgedEntries.length > 0) {
+                if (carriesConversationTurns(parsed.input)) {
+                    const kept = pruneForgedEntries(forgedEntries, session.state.blocks);
+                    forgedSummaries = kept.map((e) => e.text);
+                    if (kept.length < forgedEntries.length) {
+                        session.metadata.codexForgedSummaries = kept;
+                        markDirty(session);
+                        log("info", `[${sessionId}] [inject] pruned ${forgedEntries.length - kept.length} superseded forged-summary entrie(s) from the handoff ledger (${kept.length} remain)`);
+                    }
+                } else {
+                    log("debug", `[${sessionId}] [inject] skipped ${forgedEntries.length} forged-summary entrie(s): request replays no conversation (auxiliary/probe traffic)`);
+                }
+            }
+        }
+        if (forgedSummaries.length > 0 && config.modelContextLimit > 0) {
+            const injectedTokens = defaultCountTokens(forgedSummaries.join("\n\n---\n\n"));
+            if (injectedTokens >= config.modelContextLimit * FORGED_SUMMARY_INJECT_WARN_PCT) {
+                log("warn", `[${sessionId}] [inject] large forged-summary re-injection: ${forgedSummaries.length} entrie(s) ≈ ${injectedTokens} tokens (${Math.round((injectedTokens / config.modelContextLimit) * 100)}% of the ${config.modelContextLimit}-token window)`);
+            }
+        }
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, messageTimestampSections(surface?.promptSections, responsesTextProtocol ? "hybrid" : "function"))
@@ -579,9 +605,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         && isCodexHost(req.headers) // #3686: host policy, not wire profile
         && codexCompactGate(session, config.modelContextLimit, transformOk)) {
         const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
-        const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
-        const captured = mergeForgedSummaries(prevForged, session.state.blocks);
-        if (captured.length !== (prevForged?.length ?? 0)) {
+        // #4600: capture + prune in one pass so the persisted ledger never
+        // keeps entries superseded by an already-represented newer block.
+        const prevEntries = normalizeForgedEntries(session.metadata.codexForgedSummaries);
+        const captured = pruneForgedEntries(mergeForgedSummaries(session.metadata.codexForgedSummaries, session.state.blocks), session.state.blocks);
+        if (captured.length !== prevEntries.length) {
             session.metadata.codexForgedSummaries = captured;
             markDirty(session);
         }
