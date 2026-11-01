@@ -133,8 +133,8 @@ Usage:
                                     at their host's updater — never overwritten
   bili plugin list                 show install status + installed (on-disk) version for every host
   bili mcp                         run the bili MCP server standalone (stdio)
-   bili plugin-register <id>        pre-bind a conversation to the plugin mode
-                                     (--origin URL, --agent name)
+  bili plugin-register <id>        pre-bind a conversation to the plugin mode
+                                    (--origin URL, --agent name)
    bili bench [scenario]            perf harness (#5460 P2): boots a hermetic proxy
                                     against a deterministic fake upstream in throwaway
                                     XDG dirs, replays a seeded fixture as full-resend
@@ -145,7 +145,7 @@ Usage:
    bili fixture-gen                 emit a deterministic perf fixture — pure function
                                     of --seed K --msgs N --shape openai|anthropic
                                     (--out FILE writes JSON instead of stdout)
-   bili --version                   print version
+  bili --version                   print version
   bili --help                      show this help
 
 Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
