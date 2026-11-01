@@ -253,11 +253,57 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
     );
 }
 
+/** opencode plan-mode state identity (#5458): OpenCode v2 injects ONE-SHOT
+ *  state notices when the user switches between the plan and build agents —
+ *  exactly two templates, both \x3csystem-reminder\x3e-wrapped user-role
+ *  messages (source: extracted verbatim from the shipped OpenCode v2 CLI
+ *  bundle, the `opencode.plan` effect):
+ *    enter: "You are in Plan mode. Discuss the plan with the user directly
+ *            … Tell them they need to switch agents."
+ *    exit:  "You are NO LONGER in Plan mode. The previous Plan restrictions
+ *            no longer apply. Any Plan mode instructions from earlier in
+ *            this conversation are no longer active."
+ *  Each notice is emitted ONCE per switch and never re-emitted (one-shot
+ *  state semantics — unlike the per-turn UI-event reminders such as
+ *  "Note: the user opened the file …", which stay consumable), so one fold
+ *  of the LATEST notice silently reverts the session to the previous state
+ *  forever: #5458's incident kept the stale "in Plan mode" notice visible at
+ *  the head while the exit notice was folded, and the model obeyed plan-mode
+ *  restrictions for 20+ turns after switching to build. Both variants project
+ *  to the SAME identity on purpose — like the runtime-context populated/
+ *  cleared pair (#2481), every instance fully declares the current state of
+ *  the dimension, so under the default latest-per-identity policy exactly the
+ *  newest declaration stays pinned and superseded ones fold away: the visible
+ *  state converges to the current one instead of piling up contradictory
+ *  notices. Matching on the state sentences rather than the wrapper follows
+ *  the #2419 marker-over-wrapper rationale (a future wrapper change must not
+ *  silently disarm the classifier); the sentences are host-specific templates,
+ *  so a false positive only pins one tiny matching message. The exit sentence
+ *  is checked first: it is the more distinctive of the two, and the enter
+ *  marker is NOT a substring of it ("NO LONGER" sits between "are" and "in").
+ *  Enumerating the shipped build's whole \x3csystem-reminder\x3e template
+ *  family found no other one-shot state carrier, so this is the complete
+ *  class for this lane today. #2766: assistant-role messages are never
+ *  carriers (see dshSkillCatalogPath). */
+export function opencodePlanModePath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        (msg.text.includes("You are NO LONGER in Plan mode") || msg.text.includes("You are in Plan mode"))
+        ? "durable/plan-mode"
+        : undefined;
+}
+
+/** opencode lane classifier (#5458): the one-shot plan/build agent-switch
+ *  notices project to their durable identity. */
+function opencodeDurableToolPath(msg: CoreMessage): string | undefined {
+    return opencodePlanModePath(msg);
+}
+
 /** Lane → classifier registry. Only lanes with traffic evidence of the
  *  durable-user-message carrier belong here (KDD #9). Keyed by the value of
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
 export const durableMessageToolPaths: Record<string, DurableMessageClassifier> = {
     dsh: dshDurableToolPath,
+    opencode: opencodeDurableToolPath,
 };
 
 /** True when a pattern list already classifies the durable identity space —
