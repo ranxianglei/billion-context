@@ -394,9 +394,15 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 7, "seven known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 11, "eleven raw markers for the ten known dsh carrier families");
+        // Markers that only occur mid-template need their fixed left context to
+        // be a standalone classifiable shape (the relay wrapper's sender-id slot
+        // varies, so the joint alone cannot classify).
+        const MARKER_CONTEXT: Record<string, string> = {
+            " sent a message: ": "Agent session-1",
+        };
         for (const marker of dshCarrierRawMarkers) {
-            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: marker } as CoreMessage;
+            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}` } as CoreMessage;
             assert.notEqual(cls(msg), undefined, `marker ${JSON.stringify(marker)} no longer matches any dsh classifier`);
         }
     });
