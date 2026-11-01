@@ -432,7 +432,7 @@ async function forwardCaptured(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model);
+            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
                 wireBody = JSON.stringify(stamped);
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
@@ -1750,7 +1750,7 @@ async function forwardCaptured(
                     signal: clientAbort.signal,
                     session: prepared.session,
                     log,
-                    model: prepared.model,
+                    model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
@@ -1795,7 +1795,7 @@ async function forwardCaptured(
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
-                            model: prepared.model,
+                            model: prepared.model ?? prepared.google?.model,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -1824,7 +1824,7 @@ async function forwardCaptured(
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
-                            model: prepared.model,
+                            model: prepared.model ?? prepared.google?.model,
                         }),
                         targetOrigin,
                         absorbInstructed,
@@ -1897,7 +1897,7 @@ async function forwardCaptured(
                 signal: clientAbort.signal,
                 session: prepared.session,
                 log,
-                model: prepared.model,
+                model: prepared.model ?? prepared.google?.model,
             });
             responseBody = bufferToStream(resolvedBuf);
         }
@@ -1959,7 +1959,7 @@ async function forwardCaptured(
                         signal: clientAbort.signal,
                         log,
                         label: prepared.session.id,
-                        model: prepared.model,
+                        model: prepared.model ?? prepared.google?.model,
                     }),
                     undefined,
                     undefined,
@@ -2005,7 +2005,7 @@ async function forwardCaptured(
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
-                        model: p.model,
+                        model: p.model ?? p.google?.model,
                     }),
                     undefined,
                     undefined,
@@ -2031,7 +2031,7 @@ async function forwardCaptured(
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
-                        model: p.model,
+                        model: p.model ?? p.google?.model,
                     }),
                     undefined,
                     undefined,
