@@ -13,7 +13,16 @@ on:
     # lane or a bugfix-release/** carve-out get the CORE matrix directly;
     # backport.yml's token pushes compensate by dispatching this workflow
     # on the carry/lane ref.
-    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
+    # 2026-11-01 owner decision: drop `master` here. Post-merge re-runs had
+    # zero consumers (nothing blocks on them or reads their red; artifacts
+    # and release lanes fire on their own master-push triggers), so every
+    # merge paid full-shard minutes for a signal nobody saw. Master coverage
+    # does not lapse: the :03/:33 schedule cron below re-runs the FULL
+    # matrix whenever master moved since the last green scheduled run
+    # (bounded ~30 min window), and PR-side blocking still gates everything
+    # pre-merge. Release/bugfix push arms stay — they exist because
+    # bot-authored PR checks sit in action_required (#772).
+    branches: ["*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
     # bugfix-v*: carry PRs INTO the current patch lane (backport/carry-N)
@@ -29,8 +38,10 @@ on:
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
     types: [opened, synchronize, reopened, labeled]
-  # Three-layer CI (#3295): PRs and master pushes pay for the CORE matrix
-  # only. Every 30 minutes this cron asks the plan job whether master moved
+  # Three-layer CI (#3295): PRs pay for the CORE matrix only (master pushes
+  # stopped paying in 2026-11-01 — see the push arm above;
+  # this cron is now master's standing verifier).
+  # Every 30 minutes this cron asks the plan job whether master moved
   # since the last green scheduled run; only then does the FULL matrix run.
   # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
   # cron pattern on their own offsets.

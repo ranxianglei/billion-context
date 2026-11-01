@@ -37,6 +37,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
@@ -343,6 +344,13 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
+// #5408: a cold-loaded view older than this on a session that has compressed
+// is treated as stale (its fold state predates unseen turns). Observability
+// only — the warn never changes what is served.
+const STALE_COLD_LOAD_WARN_MIN = 30;
+// #5408: how often the frozen-skip ERROR may repeat per session.
+const FROZEN_SKIP_NOTICE_COOLDOWN_MS = 10 * 60_000;
+
 export class SessionStore {
     /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
      *  and failed, the save path retries maybeOpen on a cooldown; intentional
@@ -465,6 +473,10 @@ export class SessionStore {
      *  synchronously on EVERY call; a microtask-batched run per turn keeps
      *  the immediate-ish semantics while coalescing same-tick calls. */
     private readonly writerOffPending = new Map<string, () => void>();
+    /** #5408: per-session cooldown for the frozen-skip ERROR log (epoch ms of
+     *  the last notice) — a live session saves every turn, so without it the
+     *  line would spam; one notice per cooldown still makes the freeze loud. */
+    private readonly frozenNoticeAt = new Map<string, number>();
     /** #3406: host-owned debounced envelope saves (id → armed timer / latest builder).
      *  The debounce lives HERE instead of inside the kernel store so each landed
      *  write goes through the stamped path (store.writeNow + stampOwnWrite): a
@@ -1577,6 +1589,18 @@ export class SessionStore {
         if (refs > 0 && blocks === 0) {
             this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (compressions=${compressions}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
         }
+        // #5408: a STALE view on a session that DID compress is the incident
+        // signature — its fold state predates turns that happened while the
+        // session was invisible to the proxy, so preflight judges against a
+        // baseline far behind the live surface (123K persisted vs 542K
+        // measured in the incident). Warn once per cold load.
+        if (savedAt !== undefined && ageMin !== undefined && ageMin > STALE_COLD_LOAD_WARN_MIN && compressions > 0) {
+            this.log("warn", `[persist] ${id} cold-loaded view is ~${ageMin} min old (savedAt ${new Date(savedAt).toISOString()}) with ${compressions} prior compression(s) — the served fold state predates unseen turns; expect preflight pressure to catch up sharply when traffic resumes (#5408)`);
+        }
+        // #5408: a hot-at-attach session must show model traffic shortly after
+        // this load or the request path detached somewhere upstream of us —
+        // arm the observation heartbeat (no-op when the view is not hot).
+        noteColdLoad(id, source, savedAt);
     }
 
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
@@ -2859,9 +2883,24 @@ export class SessionStore {
      *  store.writeNow AND gets stamped (stampOwnWrite), which the kernel's
      *  internal debounce could not do: every per-turn save then proved its
      *  bytes on disk and the ownership fast path stayed live. */
+    /** #5408: rate-limited ERROR for a save routed index-only because THIS
+     *  process froze the session's envelope writes after digest-drift
+     *  escalation. Before this, a frozen session saved silently for hours —
+     *  the freeze was only discoverable by grepping old drift lines. */
+    private noteFrozenSkip(sessionId: string, route: string): void {
+        const now = Date.now();
+        const last = this.frozenNoticeAt.get(sessionId) ?? 0;
+        if (now - last < FROZEN_SKIP_NOTICE_COOLDOWN_MS) return;
+        this.frozenNoticeAt.set(sessionId, now);
+        const info = this.shadow?.envelopeFrozenInfo(sessionId);
+        const since = info ? new Date(info.sinceMs).toISOString() : "?";
+        loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
+    }
+
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
@@ -3102,6 +3141,7 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
@@ -3347,6 +3387,7 @@ export class SessionStore {
         if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "flushSync");
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
