@@ -329,18 +329,18 @@ test("incremental lane: legacy-only storage answers 503 with the enablement hint
 test("incremental marker divert: probe reports the rollout state", async () => {
     const h = await harness("full");
     try {
-        const off = await h.probe();
-        assert.equal(off.status, 200);
-        const offBody = off.body as { ok: boolean; enabled: boolean; feature: string; protocol: number };
-        assert.equal(offBody.ok, true);
-        assert.equal(offBody.feature, "pluginIncrementalTurns");
-        assert.equal(offBody.protocol, 1);
-        assert.equal(offBody.enabled, false, "default rollout percent is 0 — probe must report disabled");
-        process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+        const on = await h.probe();
+        assert.equal(on.status, 200);
+        const onBody = on.body as { ok: boolean; enabled: boolean; feature: string; protocol: number };
+        assert.equal(onBody.ok, true);
+        assert.equal(onBody.feature, "pluginIncrementalTurns");
+        assert.equal(onBody.protocol, 1);
+        assert.equal(onBody.enabled, true, "GA default is 100% — the probe reports the lane enabled with no operator action");
+        process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "0";
         try {
-            const on = await h.probe();
-            assert.equal(on.status, 200);
-            assert.equal((on.body as { enabled: boolean }).enabled, true, "env force flips the probe");
+            const off = await h.probe();
+            assert.equal(off.status, 200);
+            assert.equal((off.body as { enabled: boolean }).enabled, false, "the env escape hatch still turns the lane off");
         } finally {
             delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
         }
@@ -402,6 +402,9 @@ test("incremental marker divert: marker on a non-incremental body rides the norm
 });
 
 test("incremental marker divert: rollout off answers 503 on shaped turns only", async () => {
+    // GA is ON by default (src/rollout.ts), so the OFF path is driven through
+    // the env escape hatch instead of relying on the baked-in plan.
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "0";
     const h = await harness("full");
     try {
         const shaped = await h.markerTurn("/v1/messages", { conversationId: "conv-marker-off", sinceSeq: 0, request: { max_tokens: 512 }, messages: [userTurn(1)] });
@@ -411,6 +414,7 @@ test("incremental marker divert: rollout off answers 503 on shaped turns only", 
         const plain = await h.markerRaw("/v1/messages", { model: "claude-test", max_tokens: 512, messages: [{ role: "user", content: "plain while off" }] });
         assert.equal(plain.status, 200);
     } finally {
+        delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
         await h.close();
     }
 });

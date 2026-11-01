@@ -379,6 +379,25 @@ test("derivedInstallId: discriminates hosts/users — no cross-machine collision
     assert.equal(a, rollout.derivedInstallId("C:\\Users\\dog", "DESKTOP-ABC", "dog"), "deterministic across restarts");
 });
 
+test("pluginIncrementalTurns ships GA: the baked-in plan is 100% and both escape hatches still work", () => {
+    // #3248/#5156: the incremental lane is GA. A fresh install must answer
+    // "enabled" from the baked-in plan alone — no env var, no config file.
+    const id = randomUUID();
+    const shipped = rollout.ROLLOUT_FEATURES.pluginIncrementalTurns?.percent;
+    assert.equal(shipped, 100, "the version plan ships the lane at 100% (GA), not behind a canary");
+    const on = rollout.resolveRollout("pluginIncrementalTurns", { id, env: {}, file: {} });
+    assert.equal(on.enabled, true, "a fresh install enables the lane with no operator action");
+    assert.equal(on.source, "bucket", "GA still resolves through the bucketing tier (percent 100 = every bucket)");
+    // Escape hatch 1: the config boolean forces it off for an install.
+    const cfg = rollout.resolveRollout("pluginIncrementalTurns", { id, env: {}, file: { features: { pluginIncrementalTurns: { enabled: false } } } });
+    assert.equal(cfg.enabled, false, "config enabled:false still turns the lane off");
+    assert.equal(cfg.source, "config");
+    // Escape hatch 2: the env tier wins over everything.
+    const env = rollout.resolveRollout("pluginIncrementalTurns", { id, env: { BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS: "0" }, file: {} });
+    assert.equal(env.enabled, false, "BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0 still turns the lane off");
+    assert.equal(env.source, "env");
+});
+
 test("cleanup hooks", () => {
     // Restore env for other suites sharing this process (defensive).
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
