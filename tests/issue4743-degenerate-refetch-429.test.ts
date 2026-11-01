@@ -20,6 +20,11 @@ import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottle
 // Both assertions are RED on master (no gate call, no notes): the hold case
 // records a real server hit on master, and the 429 case leaves the governor
 // un-armed.
+//
+// #5201: the governor hold key gained a model dimension — arm/gate/clear
+// below therefore pass the same CHAT_BODY the egress send carries, so every
+// call lands on the same hold key (a body-less call would key differently
+// and miss the hold).
 
 const CHAT_BODY = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
 
@@ -57,9 +62,9 @@ test("#4743 A: an armed 429 hold answers the continuation refetch locally — th
     try {
         // arm the governor for this exact upstream (same streak shape as the
         // loop-lane contract test: two consecutive verdicts)
-        noteUpstreamThrottle429(srv.url, {}, null);
-        noteUpstreamThrottle429(srv.url, {}, null);
-        assert.ok(upstreamThrottleLocalReject(srv.url, {}), "precondition: hold armed");
+        noteUpstreamThrottle429(srv.url, {}, null, Date.now(), CHAT_BODY);
+        noteUpstreamThrottle429(srv.url, {}, null, Date.now(), CHAT_BODY);
+        assert.ok(upstreamThrottleLocalReject(srv.url, {}, Date.now(), CHAT_BODY), "precondition: hold armed");
 
         const refetch = makeContinuationRefetch(opts(srv.url, "gate-4743"));
         const out = await refetch();
@@ -67,7 +72,7 @@ test("#4743 A: an armed 429 hold answers the continuation refetch locally — th
         assert.equal(srv.hits(), 0, "the armed hold must NOT burn an upstream slot on the retry");
     } finally {
         await srv.close();
-        noteUpstreamThrottleResolved(srv.url, {}, 200);
+        noteUpstreamThrottleResolved(srv.url, {}, 200, Date.now(), CHAT_BODY);
     }
 });
 
@@ -75,12 +80,12 @@ test("#4743 B: the refetch's own 429 verdict arms the governor; a resolved retry
     const rejected = await recordedServer(429, JSON.stringify({ error: { message: "rate limited" } }));
     const ok = await recordedServer(200, "event: message_start\ndata: {}\n\n");
     try {
-        assert.equal(upstreamThrottleLocalReject(rejected.url, {}), undefined, "precondition: no hold yet");
+        assert.equal(upstreamThrottleLocalReject(rejected.url, {}, Date.now(), CHAT_BODY), undefined, "precondition: no hold yet");
 
         const first = await makeContinuationRefetch(opts(rejected.url, "storm-4743"))();
         assert.equal(first, null, "a rejected retry passes the empty turn through");
 
-        const armed = upstreamThrottleLocalReject(rejected.url, {});
+        const armed = upstreamThrottleLocalReject(rejected.url, {}, Date.now(), CHAT_BODY);
         assert.ok(armed, "the refetch's 429 verdict must reach the governor (arm for the next main-lane send)");
 
         const second = await makeContinuationRefetch(opts(ok.url, "lift-4743"))();
@@ -88,9 +93,9 @@ test("#4743 B: the refetch's own 429 verdict arms the governor; a resolved retry
         // the ok settle resolved the (different-host) governor key of its own
         // upstream; verify the observe pair by checking the rejected host's
         // hold is still armed until an explicit resolved verdict lifts it
-        assert.ok(upstreamThrottleLocalReject(rejected.url, {}), "hold on the storming host persists until a resolved verdict");
-        noteUpstreamThrottleResolved(rejected.url, {}, 200);
-        assert.equal(upstreamThrottleLocalReject(rejected.url, {}), undefined, "resolved verdict lifts the hold");
+        assert.ok(upstreamThrottleLocalReject(rejected.url, {}, Date.now(), CHAT_BODY), "hold on the storming host persists until a resolved verdict");
+        noteUpstreamThrottleResolved(rejected.url, {}, 200, Date.now(), CHAT_BODY);
+        assert.equal(upstreamThrottleLocalReject(rejected.url, {}, Date.now(), CHAT_BODY), undefined, "resolved verdict lifts the hold");
     } finally {
         await rejected.close();
         await ok.close();

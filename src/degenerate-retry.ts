@@ -89,7 +89,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             // the client's already-open response stream). A 429 verdict arms
             // the hold for the NEXT main-lane send; any other resolved status
             // clears it — same one-observation-per-request discipline as relay.
-            const throttleReject = upstreamThrottleLocalReject(opts.upstreamUrl, opts.reqHeaders);
+            const throttleReject = upstreamThrottleLocalReject(opts.upstreamUrl, opts.reqHeaders, Date.now(), opts.body);
             if (throttleReject !== undefined) {
                 opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the empty turn through`);
                 return null;
@@ -107,12 +107,12 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             );
             if (!r.response.ok || !r.response.body) {
                 r.clearTimer();
-                if (r.response.status === 429) noteUpstreamThrottle429(opts.upstreamUrl, opts.reqHeaders, r.response.headers.get("retry-after"));
-                else noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status);
+                if (r.response.status === 429) noteUpstreamThrottle429(opts.upstreamUrl, opts.reqHeaders, r.response.headers.get("retry-after"), Date.now(), opts.body);
+                else noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status, Date.now(), opts.body);
                 opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
                 return null;
             }
-            noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status);
+            noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status, Date.now(), opts.body);
             const body = r.response.body as ReadableStream<Uint8Array>;
             // The retry stream is spliced into a response the caller already
             // owns, so its own idle timer is dropped — a stalled retry then ends
