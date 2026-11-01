@@ -409,6 +409,11 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // plugin → pass through direct, never hit a disposed context.
             const state = (globalThis as GlobalRecord)[ACTIVE_STATE] as NativeInterceptState | undefined;
             if (target === undefined || state === undefined) return new RoutedWebSocket(url, ...rest);
+            // #4841 sync-by-contract: providers MUST answer this no-init
+            // (WS-shaped) call with a NON-Promise verdict — a Promise never
+            // matches === false below and the refusal would be silently lost
+            // (connection rewritten onto the proxy instead of direct). See the
+            // takeoverGate field doc in native-intercept.ts.
             if (state.takeoverGate !== undefined && state.takeoverGate(target) === false) {
                 state.onDispatch?.(target, "refused");
                 return new RoutedWebSocket(url, ...rest);

@@ -158,7 +158,14 @@ export interface NativeInterceptState {
      *  recoverable refusal for a body that provably cannot fit the model's
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
-     *  call without re-reading the request. */
+     *  call without re-reading the request.
+     *  #4841: lanes that decide SYNCHRONOUSLY (the WS intercept,
+     *  native-ws-intercept.ts — it cannot await before the socket opens)
+     *  compare the verdict with === false, so providers MUST return a
+     *  non-Promise verdict for no-init (WS-shaped) calls: a Promise never
+     *  matches and the refusal is silently lost (connection rewritten onto
+     *  the proxy instead of direct). dsh keeps every arm sync for that shape
+     *  (none: by construction; threw: no-init fast path). */
     takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
