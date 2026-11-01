@@ -478,3 +478,43 @@ test("an already-safe user part order round-trips byte-identical through coreToG
   };
   assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
 });
+
+test("normalizeGoogleUserPartOrder: Claude-family target keeps natural responses-first order (#5392)", () => {
+  const fr: GooglePart = {
+    functionResponse: { name: "add", response: { result: 66 }, id: "c1" },
+  };
+  const parts: GooglePart[] = [fr, { text: "nudge" }];
+  assert.deepEqual(normalizeGoogleUserPartOrder(parts), [
+    { text: "nudge" },
+    fr,
+  ]);
+  // Anthropic-behind-Google needs tool_result(functionResponse) to LEAD the user
+  // message — the input order is returned byte-for-byte (same reference).
+  for (const m of ["claude-opus-4-8", "Claude-Sonnet-4-6"]) {
+    assert.equal(normalizeGoogleUserPartOrder(parts, { model: m }), parts);
+  }
+});
+
+test("coreToGoogle: Claude-family target emits functionResponse before text (#5392)", () => {
+  const body: GoogleRequestBody = {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [{ functionCall: { name: "add", args: { a: 37, b: 29 }, id: "c1" } }],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+          { text: "nudge" },
+        ],
+      },
+    ],
+  };
+  const contents = coreToGoogle(googleToCore(body).msgs, { model: "claude-opus-4-8" });
+  assert.deepEqual(contents[2]!.parts, [
+    { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+    { text: "nudge" },
+  ]);
+});

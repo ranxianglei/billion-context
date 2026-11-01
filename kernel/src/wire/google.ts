@@ -309,6 +309,16 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
   return { msgs, systemText: googleSystemText(body) };
 }
 
+/** #5392 — Claude-family backends routed through Google's v1internal / Cloud
+ *  Code Assist wire translate role:"user" parts into Anthropic content blocks
+ *  IN ORDER, and Anthropic requires every tool_result block to LEAD the user
+ *  message that follows an assistant tool_use turn — the OPPOSITE of the Gemini
+ *  text-first rule below. Reordering such a body to text-first 400s it ("Each
+ *  'tool_use' block must have a corresponding 'tool_result' block in the next
+ *  message"). Matched against the TARGET model name (case-insensitive), the same
+ *  signal the host threads through every google-wire boundary. */
+const CLAUDE_WIRE_MODEL = /claude/i;
+
 /** #3159 — Vertex rejects a request whose user content carries plain text
  *  AFTER a functionResponse part ("Requests ending with a model turn are not
  *  supported"); text-before-functionResponse is accepted (controlled A/B on
@@ -317,8 +327,16 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
  *  text ahead of every non-text part; otherwise return the input untouched so
  *  already-safe shapes stay byte-identical (prefix-cache anchor). Signed text
  *  parts, thought parts and all non-text parts keep their relative order —
- *  nothing is dropped, renamed or rewritten. */
-export function normalizeGoogleUserPartOrder(parts: GooglePart[]): GooglePart[] {
+ *  nothing is dropped, renamed or rewritten.
+ *  #5392 — when `opts.model` names a Claude-family target the input order is
+ *  returned untouched: its natural responses-first shape is exactly what an
+ *  Anthropic-behind-Google backend requires, so the text-first partition below
+ *  applies only to non-Claude targets. */
+export function normalizeGoogleUserPartOrder(
+  parts: GooglePart[],
+  opts?: { model?: string },
+): GooglePart[] {
+  if (opts && typeof opts.model === "string" && CLAUDE_WIRE_MODEL.test(opts.model)) return parts;
   const firstFr = parts.findIndex((p) => p.functionResponse !== undefined);
   if (firstFr === -1) return parts;
   const movable = (p: GooglePart) =>
@@ -359,7 +377,7 @@ export function normalizeGoogleUserPartOrder(parts: GooglePart[]): GooglePart[] 
  *  roles), and its output order is the canonical one. Do not reorder this
  *  emission without moving the pins in
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
-export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
+export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string }): GoogleContent[] {
   const out: GoogleContent[] = [];
   let model: {
     reasoning: GooglePart[];
@@ -375,10 +393,10 @@ export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
   };
   const flushUser = () => {
     if (!user) return;
-    const parts = normalizeGoogleUserPartOrder([
-      ...user.responses,
-      ...user.content,
-    ]);
+    const parts = normalizeGoogleUserPartOrder(
+      [...user.responses, ...user.content],
+      { model: opts?.model },
+    );
     user = null;
     if (parts.length > 0) out.push({ role: "user", parts });
   };
