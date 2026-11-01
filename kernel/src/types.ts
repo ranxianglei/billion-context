@@ -133,6 +133,20 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
+  /** #5415: growth debt + absorb count booked by the host's #5293
+   *  abort-absorb. absorbAbortedTurnGrowth() re-anchors the reference to
+   *  the current meter, which skips not just the aborted turn's unreported
+   *  partial (intended, #5293) but also the MEASURED growth from the old
+   *  reference up to the pre-abort anchor. That skipped-but-real growth is
+   *  banked here; absorbCount tracks how many absorbs happened. Debt pays
+   *  into the growth floor (and unlocks the backlog-drain guard) only once
+   *  absorbCount >= 2 — a SINGLE abort stays exactly as quiet as #5293
+   *  pinned (no nudge on the user's redirect), while abort-heavy clients
+   *  (85 absorbs in one reported 4.5h log) recover the 209-era cadence
+   *  instead of starving with a huge ready mass idle for hours. Both reset
+   *  by applyCompression alongside the other baselines. */
+  absorbedDebt?: number;
+  absorbCount?: number;
 }
 
 export interface CompressionStats {

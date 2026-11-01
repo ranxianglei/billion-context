@@ -848,6 +848,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // (which may have consumed blocks of tier N to produce tier N+1), every
       // tier should be eligible to re-evaluate from the new token count.
       state.nudge.lastShownByTier = {};
+      // #5415: the #5293 abort-absorb debt bank drained with the backlog it
+      // tracked — a fresh cadence starts from a clean slate.
+      state.nudge.absorbedDebt = 0;
+      state.nudge.absorbCount = 0;
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -2052,8 +2056,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     baseline === 0 &&
     usage >= config.nudge.minContextLimitPct &&
     Math.max(t1Eff, t2Pen, t3Pen) >= nudgeGrowthTokens;
+  // #5415: the #5293 abort-absorb re-anchors the growth reference to the
+  // current meter, zeroing growth on every user-aborted turn. Abort-heavy
+  // clients (85 absorbs in one 4.5h log) then never cross the floor and a
+  // huge ready mass sits idle for hours ("growth 4450 < floor 33750, ready:
+  // T1 302220"). The host banks the repeatedly-skipped MEASURED growth into
+  // state.nudge.absorbedDebt and counts the absorbs. Debt (and the drain
+  // guard below) pay ONLY once absorbCount >= 2: a SINGLE abort stays
+  // byte-identically quiet as #5293 pinned — its debt may be large (one
+  // abort after a long quiet stretch banks the whole interval) but it must
+  // not re-fire the cadence on the user's redirect. The SECOND absorb is
+  // the proof the session is abort-heavy, not redirect-polite, so the bank
+  // pays into the floor like live growth and the 209-era cadence recovers.
+  const absorbedDebt = state.nudge.absorbedDebt ?? 0;
+  const absorbCount = state.nudge.absorbCount ?? 0;
+  const repeatAbsorbs = absorbCount >= 2;
+  const payableDebt = repeatAbsorbs ? absorbedDebt : 0;
+  // Backlog-drain guard (#5415; same philosophy as the #194 first-sight
+  // bypass — the floor paces WITHIN a backlog, it must not gate draining
+  // one): when absorbs have REPEATEDLY disturbed the cadence (count >= 2),
+  // no nudge is outstanding (lastNudgeShownTokens === 0 — an ignored nudge
+  // keeps it set, so this never re-fires on an unresponsive session), and
+  // the ready mass is at least double the T1 threshold, drain now instead
+  // of idling behind the starved growth leg. Single-absorb and debt-free
+  // sessions decide byte-identically: the bypass cannot touch them.
+  const backlogDrainReady =
+    repeatAbsorbs &&
+    absorbedDebt > 0 &&
+    state.nudge.lastNudgeShownTokens === 0 &&
+    Math.max(t1Eff, t2Pen, t3Pen) >= 2 * tierThresholds[1] &&
+    usage >= config.nudge.minContextLimitPct;
   const growthReady =
-    firstSightMassReady || growthSinceReference >= growthFloor;
+    firstSightMassReady ||
+    backlogDrainReady ||
+    growthSinceReference + payableDebt >= growthFloor;
   const t2Count = tiers[2]?.targetBlocks.length ?? 0;
   const t3Count = tiers[3]?.targetBlocks.length ?? 0;
 
@@ -2191,7 +2227,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (pendingShort)
       parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
-      parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
+      parts.push(
+        absorbedDebt > 0 && !repeatAbsorbs
+          ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} held (single abort, #5293) < floor ${growthFloor}`
+          : payableDebt > 0
+            ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} across ${absorbCount} aborts < floor ${growthFloor}`
+            : `growth ${growthSinceReference} < floor ${growthFloor}`,
+      );
     if (parts.length === 0)
       parts.push(
         `max compressible ${maxPending}, growth ${growthSinceReference}`,
