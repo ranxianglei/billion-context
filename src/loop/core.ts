@@ -1144,9 +1144,10 @@ export async function* runCompressLoop(
                     }
                 }
 
-                // #2303: a terminal turn that DID deliver visible prose but ends with a
-                // compression-draft closing tag (summary/analysis close forms) and no
-                // tool call — the model wrote a handoff/compression draft in prose
+                // #2303: a terminal turn that DID deliver visible prose but carries a
+                // compression-draft dump (tail close form, or the analysis-to-summary
+                // envelope mid-text, #5175) and no tool call — the model wrote a
+                // handoff/compression draft in prose
                 // instead of issuing the action it described, most often after the
                 // upstream cut the final tool call out of the step (149 silent stops /
                 // 70 sessions, DSH native). Same non-convergence as the zero-visible
@@ -1179,7 +1180,7 @@ export async function* runCompressLoop(
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                    ctx.log(`[acp-loop] round ${round}: terminal turn carries a compression-draft dump (tail or mid-text envelope) and no tool call; retrying once with continuation nudge (#2303)`);
                     loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
                     const nudge: CoreMessage = {
                         id: `acp_draft_tail_retry_r${round}`,
