@@ -184,8 +184,14 @@ jobs:
         # raw_publish bypasses this whole gate: its own step below downloads the
         # dependencies (lockfile fetch, no code runs) and builds only,
         # then publishes (#5430 nuclear option).
+        # Deps install restored here (#5444 follow-up): dc56aa3 dropped it and the
+        # gate died on fresh runners with `tsup: not found` (run 41299003460) —
+        # typecheck/build need node_modules and no other step installs them.
+        # Plain lockfile install, not `npm ci` (owner 2026-11-01: the literal
+        # "npm ci" in logs reads like "running CI"; #5443 renames the rest).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
+          npm install --no-audit --no-fund
           npm run typecheck
           npm run build
 
