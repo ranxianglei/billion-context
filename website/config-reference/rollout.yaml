@@ -57,3 +57,11 @@ entries:
     group: behavior
     desc_en: "Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out."
     desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"
+  - key: rollout.features.pluginFullResendWatermark
+    type: "boolean | number"
+    default: "0 (off)"
+    default_zh: "0(关)"
+    env: BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK
+    group: behavior
+    desc_en: "Plugin-lane full-resend watermark (#5418): for enabled installs, a dsh chat-completions request that echoes a valid count watermark (`x-bili-pf-count`) matching the server's stored authority skips the per-round full JSON.parse of the whole resent body and parses only the uncovered tail window (`src/server/fastpath-scan.ts`), killing the OOM-producing parse peak + cross-round AST pinning (#5403). The outbound projection stays byte-identical to the legacy path; any mismatch degrades to legacy for one round and 5 consecutive mismatches circuit-break the session back to plain full-resend. Requires storage.unified readable. Default 0% — no behavior change until rolled out."
+    desc_zh: "插件车道全量重发水位线(#5418):对已放量的安装,dsh 的 chat-completions 请求若回显一个与服务器存储权威一致的有效计数字水位线(`x-bili-pf-count`),则跳过对整段重发 body 的每轮全量 JSON.parse,只解析未覆盖尾段窗口(`src/server/fastpath-scan.ts`),从而消灭产生 OOM 的解析峰值 + 跨轮 AST 钉扎(#5403)。出站投影与 legacy 路径保持逐字节一致;任何失配都退回 legacy 一整轮,连续 5 次失配熔断该会话回到纯全量重发。需统一存储可读。默认 0%,放量前无行为变化。"
