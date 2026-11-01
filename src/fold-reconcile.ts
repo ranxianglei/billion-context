@@ -140,6 +140,7 @@ import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
 import { dshCarrierRawMarkers, oneShotCarrierPaths } from "./durable-message-guards.js";
+import { storedMessagesById } from "./fold-decomposition-lookup.js";
 import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
@@ -258,6 +259,20 @@ const SIDE_REQUEST_MAX_MSGS = 10;
  *  Exported for prefix-affinity's #2601 normalized tail fingerprint, which
  *  must project the appended/placeholder-stripped replay as equal. */
 export const USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
+/** #5395: known host-side mutation sentinels — literal markers a host's
+ *  compression plugin splices between preserved head and tail when pruning a
+ *  long tool result (`dsh-compaction-tool-result-pruner`: thresholdChars=8192,
+ *  headChars=4096, tailChars=1024 by default). Built-in table on purpose: the
+ *  strings are VERSIONED by their host plugin, so a new variant lands as a code
+ *  change with traffic evidence, not a config knob (config surface is
+ *  owner-gated). */
+const PRUNE_MARKERS: readonly string[] = [
+    "\n\n[... tool result middle pruned ...]\n\n",
+];
+/** #5395: cap on stored-original rows pulled per pass for pruner-shape byte
+ *  verification (the candidate pre-filter already bounds this to a handful;
+ *  the cap is the hard ceiling for pathological drift episodes). */
+const PRUNE_VERIFY_MAX_IDS = 64;
 
 /** #5142: covered ids whose permanent absence is EXPECTED host behavior,
  *  accounted out of drift so mega sessions stop paying the O(full-history)
@@ -421,6 +436,11 @@ interface ReconciliationPlan {
      *  Order-paired under wordbag + simhash corroboration, or k-th family
      *  pairing for textless anchors; only fires on mass events (≥4 cells). */
     byShape: number;
+    /** #5395: claims made by the pruner-shape pass — a host-side tool-result
+     *  pruner mutated folded content (sentinel spliced between preserved
+     *  head/tail); the resent bytes byte-verify against the STORED original,
+     *  so identity is re-anchored on positive evidence. */
+    byPrune: number;
     /** #2915: order breaks the positional scans resynced over (gaps claimed
      *  as order-carried spans past a fingerprint break) — observability for
      *  the order-centric doctrine, surfaced in the drift log line. */
@@ -477,6 +497,9 @@ export interface FoldReconcileResult {
     /** #3641: cells re-anchored by the shape-census pass (mass churn with
      *  word evidence: protocol switch, image offload). */
     byShape: number;
+    /** #5395: cells re-anchored onto host-pruned variants (byte-verified
+     *  sentinel splice against the stored original). */
+    byPrune: number;
     /** #2695: fold blocks reaped this pass (removed from state.blocks after
      *  a majority-loss zombie streak). */
     reaped: number;
@@ -877,6 +900,39 @@ function recoveryCandidateIds(blocks: ReadonlyArray<BlockLike>): Set<string> {
  *  stored positional fingerprint copy {ids, canon} (#2487's self-contained
  *  storage shape, adopted); Pass 0 claims by position + canonical fingerprint
  *  before the anchor passes run. */
+/** #5395: cheap superset gate shared by the caller-side storage pre-filter and
+ *  the planner's claim loop — role and content-class agreement plus the length
+ *  shrink. Deliberately NO toolCallId equality: hosts re-mint tool-call ids
+ *  across provider projections (#2396), and that is exactly the condition
+ *  under which the pruner drift goes PERMANENT (every exact channel starves) —
+ *  the byte verification below is the identity proof and does not depend on
+ *  the id surviving. */
+function pruneCandidateMatches(anchor: FoldAnchor, message: CoreMessage): boolean {
+    if (anchor.r !== undefined && anchor.r !== message.role) return false;
+    if (anchor.c !== undefined && message.contentType !== undefined && anchor.c !== message.contentType) return false;
+    return true;
+}
+
+/** #5395: does `mutated` decompose as head + marker + tail where head/tail are
+ *  exact prefix/suffix of `original` with a NON-EMPTY deleted middle? The
+ *  length guard also excludes overlapping prefix/suffix matches (head+tail
+ *  longer than the original would satisfy both suffix tests vacuously). Tries
+ *  every marker occurrence — a double-pruned message repeats the sentinel. */
+function verifyPruneShape(original: string, mutated: string, marker: string): boolean {
+    let idx = mutated.indexOf(marker);
+    while (idx >= 0) {
+        const headLen = idx;
+        const tail = mutated.slice(idx + marker.length);
+        if (original.length >= headLen + tail.length + 1
+            && original.startsWith(mutated.slice(0, headLen))
+            && original.endsWith(tail)) {
+            return true;
+        }
+        idx = mutated.indexOf(marker, idx + marker.length);
+    }
+    return false;
+}
+
 export function planReconciliation(
     oldOrder: string[],
     anchors: Record<string, FoldAnchor>,
@@ -888,8 +944,12 @@ export function planReconciliation(
      *  the missing computation so their permanent absence never triggers the
      *  multi-channel alignment (the O(full-history) tax of #5139). */
     expectedAbsent?: ReadonlySet<string>,
+    /** #5395: stored originals for missing covered ids (unified index), keyed
+     *  by covered id — byte-verification source for the pruner-shape pass.
+     *  Absent → that pass is inert (honest unmatched). */
+    storedById?: Map<string, CoreMessage>,
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, absentEverywhere: [], nearDupResidual: [] };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, byPrune: 0, absentEverywhere: [], nearDupResidual: [] };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -1547,6 +1607,57 @@ export function planReconciliation(
             }
         }
     }
+    // #5395 — pruner-shape pass, LAST channel and strongest evidence: a host
+    // compression plugin (tool-result pruner) spliced a known sentinel between
+    // preserved head/tail of a folded tool result, so EVERY identity channel
+    // above starves on this shape by construction (the middle deletion breaks
+    // norm/twin equality, wordbag equality and simhash distance; the changed
+    // id sits in the churn region but no positional fence survives to verify
+    // it). Without this pass the covered id is PERMANENTLY unmatched — reported
+    // every turn forever, riding unfolded until #2438/#5223 escalation. Here
+    // the resent bytes byte-verify against the STORED original (verifyPruneShape),
+    // which no other channel can offer: two distinct originals cannot both
+    // decompose around the same sentinel into the same resent bytes. Runs after
+    // every other pass so it only fires when nothing else could claim; k-th
+    // discipline over missingMiddle (same iteration order as the exact passes);
+    // one candidate serves at most one old id.
+    if (storedById !== undefined && storedById.size > 0) {
+        const markerCands: Array<{ c: (typeof candidates)[number]; marker: string }> = [];
+        for (const c of candidates) {
+            if (claimedCandidates.has(c.id)) continue;
+            const text = c.message.text;
+            if (typeof text !== "string" || text.length === 0) continue;
+            for (const marker of PRUNE_MARKERS) {
+                if (text.includes(marker)) { markerCands.push({ c, marker }); break; }
+            }
+        }
+        if (markerCands.length > 0) {
+            for (const oldId of missingMiddle) {
+                if (plan.claims.has(oldId)) continue;
+                const anchor = anchors[oldId];
+                if (anchor === undefined || anchor.b === undefined) continue;
+                const stored = storedById.get(oldId);
+                if (stored === undefined || typeof stored.text !== "string" || stored.text.length === 0) continue;
+                for (const { c, marker } of markerCands) {
+                    if (claimedCandidates.has(c.id)) continue;
+                    if (!pruneCandidateMatches(anchor, c.message)) continue;
+                    const mutated = c.message.text ?? "";
+                    if (mutated.length >= anchor.b) continue;
+                    if (!verifyPruneShape(stored.text, mutated, marker)) continue;
+                    plan.claims.set(oldId, [c.id]);
+                    claimedCandidates.add(c.id);
+                    plan.byPrune++;
+                    break;
+                }
+            }
+            if (plan.byPrune > 0) {
+                // plan.unmatched was frozen at the end of the exact passes; drop
+                // what this pass claimed so the census/suspect/churn accounting
+                // below sees the post-claim state.
+                plan.unmatched = plan.unmatched.filter((id) => !plan.claims.has(id));
+            }
+        }
+    }
     // #3641 census of what STILL did not claim — the verdict classifier's
     // evidence: absentEverywhere (content truly off the wire → benign
     // truncation / sanctioned deletion) vs nearDupResidual (word evidence
@@ -1692,7 +1803,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, byPrune: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
@@ -1702,7 +1813,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, byPrune: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -1715,9 +1826,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS || (opts.inboundMessageCount !== undefined && opts.inboundMessageCount < SIDE_REQUEST_MAX_MSGS)) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, byPrune: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, byPrune: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
 
     let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1794,14 +1905,49 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     let expectedSize = Object.keys(expected).length;
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, new Set(Object.keys(expected)));
+    // #5395: locate host-pruner mutations BEFORE the plan runs. The substring
+    // scan is the only steady-state cost (one indexOf per marker per message);
+    // stored originals are pulled ONLY when a marker-bearing resend exists, and
+    // only for the missing covered ids it could have come from (superset gate
+    // pruneCandidateMatches + length shrink). No marker on the wire → zero
+    // storage reads, exactly as before this pass existed.
+    let pruneStored: Map<string, CoreMessage> | undefined;
+    if (opts.sessionId !== undefined) {
+        const markerMsgs: CoreMessage[] = [];
+        for (const m of msgs) {
+            if (m.id === undefined || covered.has(m.id) || typeof m.text !== "string") continue;
+            if (PRUNE_MARKERS.some((mk) => m.text!.includes(mk))) markerMsgs.push(m);
+        }
+        if (markerMsgs.length > 0) {
+            const needed: string[] = [];
+            for (const id of covered) {
+                if (byId.has(id)) continue;
+                const anchor = anchors[id];
+                if (anchor === undefined || anchor.b === undefined) continue;
+                if (!markerMsgs.some((m) => pruneCandidateMatches(anchor, m) && (m.text?.length ?? 0) < anchor.b!)) continue;
+                needed.push(id);
+                if (needed.length >= PRUNE_VERIFY_MAX_IDS) break;
+            }
+            if (needed.length > 0) pruneStored = storedMessagesById(opts.sessionId, needed);
+        }
+    }
+    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, new Set(Object.keys(expected)), pruneStored);
     if (plan.pass0Desync) {
         loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
     }
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
-        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} expected=${expectedSize} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} bySim=${plan.bySim} byOrder=${plan.byOrder} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} expected=${expectedSize} byPos=${plan.byPos} resyncs=${plan.resyncs} byTool=${plan.byTool} byTwin=${plan.byTwin} bySim=${plan.bySim} byOrder=${plan.byOrder} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} byPrune=${plan.byPrune} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+    }
+
+    // #5395 fix B: a byte-verified host-pruner mutation IS confirmed second-
+    // compressor evidence — land it in the conflict ledger so the double-
+    // compression banner/advice surfaces instead of staying a log-only drift.
+    // Self-limiting by construction: repair mode re-covers the pruned ids via
+    // the claims, so the NEXT pass sees them present and byPrune falls to zero.
+    if (plan.byPrune > 0) {
+        recordConflict(session, "host-content-mutation", `${plan.byPrune} covered tool-result id(s) re-anchored onto host-pruned variants — byte-verified sentinel splice: a host-side tool-result pruner mutated content bili had folded; disable the host pruner or accept coexistence (#5395)`);
     }
 
     // #5142 channels 2+3 — stored-byte evidence (drift passes only).
@@ -2394,15 +2540,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // so it reports like a plain resend (the drift-warn cascade below must not
     // fire for carrier retirement / offload rewrites).
     if (realUnmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0, expectedRetired: expectedSize };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, byPrune: 0, reaped: reapedCount, unmatched: 0, expectedRetired: expectedSize };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(realUnmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + realUnmatched.length} covered id(s) missing${expectedNote} — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} by simhash corroboration` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} by order bracket` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}${plan.byShape > 0 ? `, ${plan.byShape} by shape census` : ""}) onto churned bytes, ${realUnmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + realUnmatched.length} covered id(s) missing${expectedNote} — reanchored ${plan.claims.size} (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} order break(s) resynced` : ""}, ${plan.byTool} by toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} by toolCallId twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} by simhash corroboration` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} by order bracket` : ""}, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}${plan.byShape > 0 ? `, ${plan.byShape} by shape census` : ""}${plan.byPrune > 0 ? `, ${plan.byPrune} by pruner-shape byte verification` : ""}) onto churned bytes, ${realUnmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + realUnmatched.length} covered id(s) missing${expectedNote}, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} simhash` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} order-bracket` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + realUnmatched.length} covered id(s) missing${expectedNote}, ${plan.claims.size} matchable by anchor (${plan.byPos} positional${plan.resyncs > 0 ? `, ${plan.resyncs} resynced` : ""}, ${plan.byTool} toolCallId${plan.byTwin > 0 ? `, ${plan.byTwin} twin` : ""}${plan.bySim > 0 ? `, ${plan.bySim} simhash` : ""}${plan.byOrder > 0 ? `, ${plan.byOrder} order-bracket` : ""}, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}${plan.byPrune > 0 ? `, ${plan.byPrune} pruner-shape` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (reasoningOnlyDrop) {
             opts.log("info",
                 `${tag}[fold-reconcile] ${realUnmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
@@ -2441,6 +2587,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byTurn: plan.byTurn,
         byImage: plan.byImage,
         byShape: plan.byShape,
+        byPrune: plan.byPrune,
         reaped: reapedCount,
         unmatched: realUnmatched.length,
         expectedRetired: expectedSize,
