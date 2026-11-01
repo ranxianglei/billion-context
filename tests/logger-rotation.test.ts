@@ -139,6 +139,36 @@ test("retention status reports current active bytes, not an open-time snapshot",
     }
 });
 
+test("budget reclamation waits for the rotated stream to drain", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-drain-retention-"));
+    const file = path.join(dir, "bili.log");
+    const generation = path.join(dir, "bili.log.archive", "20200101T000000000-1-1", "bili.log");
+    fs.mkdirSync(path.dirname(generation), { recursive: true });
+    fs.writeFileSync(generation, "x".repeat(2 * 1024 * 1024));
+    configureLogger(file);
+    configureLogRetention({ segmentBytes: 10 * 1024 * 1024, budgetBytes: 1024 * 1024 });
+    const originalEnd = fs.WriteStream.prototype.end;
+    let releaseDrain: (() => void) | undefined;
+    try {
+        log("info", "before-rotation");
+        fs.WriteStream.prototype.end = function (this: fs.WriteStream, callback?: () => void) {
+            releaseDrain = callback;
+            return Reflect.apply(originalEnd, this, []);
+        } as typeof originalEnd;
+        configureLogRetention({ segmentBytes: 1, budgetBytes: 1024 * 1024 });
+        log("info", "new-active");
+        assert.ok(fs.existsSync(generation), "reclamation must wait for end() completion");
+        assert.ok(releaseDrain, "the replacement path must subscribe to stream completion");
+        releaseDrain();
+        assert.ok(!fs.existsSync(generation), "the last completed drain releases the pending budget pass");
+    } finally {
+        fs.WriteStream.prototype.end = originalEnd;
+        await closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
 test("internal 10MB rotation: post-rotation line lands in the fresh file", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-"));
     const file = path.join(dir, "bili.log");

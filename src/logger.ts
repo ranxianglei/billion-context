@@ -207,7 +207,9 @@ export function setLogCapture(fn: ((level: string, msg: string) => void) | null)
     capture = fn;
 }
 
-function openStream(file: string): WriteStream {
+let pendingRetentionDrains = 0;
+
+function openStream(file: string, deferRetention = false): WriteStream {
     mkdirSync(path.dirname(file), { recursive: true });
     // Rotate if oversized: seal the active file into an immutable, uniquely
     // named generation (rename, so nothing is lost and a concurrent reader keeps
@@ -230,7 +232,7 @@ function openStream(file: string): WriteStream {
     // Migrate the pre-generation logger's single `.old` into the ordered set so
     // upgrading does not delete the only retained history.
     if (logRetention().migrateLegacyOld) migrateLegacyOld(file);
-    applyLogRetention(file);
+    if (!deferRetention) applyLogRetention(file);
     // Bind the descriptor before any queued write can race a path rotation.
     const fd = openSync(file, "a", LOG_FILE_MODE);
     let s: WriteStream;
@@ -271,8 +273,9 @@ function activeFileSize(s: WriteStream): number | undefined {
 }
 
 /** end() first so buffered lines drain to their file instead of being lost. */
-function closeQuietly(s: WriteStream): void {
-    try { s.end(); } catch { /* already closed/destroyed */ }
+function closeQuietly(s: WriteStream, onEnd?: () => void): void {
+    try { s.end(onEnd); }
+    catch { onEnd?.(); }
 }
 
 /** First DELIVERED write proves the leg live (#3857): ends any degradation
@@ -316,12 +319,19 @@ function getStream(): WriteStream | undefined {
             return stream;
         }
     }
-    if (stream) closeQuietly(stream);
+    if (stream) {
+        const replacedPath = logPath;
+        pendingRetentionDrains++;
+        closeQuietly(stream, () => {
+            pendingRetentionDrains--;
+            if (pendingRetentionDrains === 0 && replacedPath) applyLogRetention(replacedPath);
+        });
+    }
     stream = undefined;
     streamFd = undefined;
     writeProven = false;
     try {
-        stream = openStream(logPath);
+        stream = openStream(logPath, pendingRetentionDrains > 0);
         return stream;
     } catch (err) {
         stream = undefined;
@@ -426,13 +436,10 @@ export const log: Logger = (level, msg) => {
     let s = getStream();
     if (s) {
         // Runtime rotation: if we've crossed the segment size since last check,
-        // close the old stream (end() drains its buffer) and reopen against the
-        // current path (openStream seals the oversized file into a generation
-        // and enforces the byte budget).
+        // seal the oversized file, then let getStream close the old stream and
+        // reopen. Its byte-budget pass waits until every replaced stream drains.
         if (bytesWritten >= MAX_BYTES()) {
-            closeQuietly(s);
             sealActiveLog(logPath!);
-            stream = undefined;
             s = getStream();
         }
         if (s) {

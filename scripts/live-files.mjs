@@ -107,6 +107,9 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // Retention children use per-test mkdtemp roots and stdio/IPC only;
+    // they bind no port and share no logger or generation directory.
+    "tests/log-retention.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
