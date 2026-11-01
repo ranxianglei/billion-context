@@ -25,6 +25,10 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
+// This file pins the #4438 LANE contract (stateless passthrough forwarding, no
+// |sub: fork) — run it with the #4634 default block opted out so the two suites
+// cover complementary behaviors instead of colliding on the default.
+process.env.BILI_DSH_AUTOREVIEW_BLOCK = "0";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
