@@ -22,6 +22,11 @@
  * is unreachable from large parts of the world; api.github.com works everywhere).
  * Node >= 20 (global fetch). Fails loud: any error exits non-zero and the next
  * qualifying push retries from scratch.
+ *
+ * BILI_BLOG_DRY_RUN=1 runs the entire pipeline (manifest read, category
+ * resolution, idempotency scans, title/body build) against a real repository
+ * but makes NO write calls: creations are printed instead and no write-back
+ * commit is pushed. Used for pre-merge verification.
  */
 import { readFileSync } from "node:fs";
 
@@ -33,6 +38,7 @@ const BASE = "https://api.github.com";
 const GRAPHQL = `${BASE}/graphql`;
 const MANIFEST_REL = "website/articles.json";
 const WRITE_BACK_PREFIX = "[bili-blog-pipeline]";
+const DRY_RUN = process.env.BILI_BLOG_DRY_RUN === "1";
 const DISCUSSION_SCAN_PAGES = 2; // 100 per page — plenty for a human-sized repo
 if (!TOKEN) {
     console.error("blog-discussions: GITHUB_TOKEN is required");
@@ -298,12 +304,20 @@ async function main() {
                 console.log(`zh_file ${entry.zh_file} unreadable — English-only mirror`);
             }
         }
+        const body = threadBody(slug, entry.file, title, enRaw, zhRaw);
+        if (DRY_RUN) {
+            console.log(`[dry-run] would create discussion "${title}" (categoryId=${categoryId})`);
+            console.log(`[dry-run] body chars=${body.length}`);
+            console.log("[dry-run] --- head ---\n" + body.slice(0, 300));
+            console.log("[dry-run] --- tail ---\n" + body.slice(-160));
+            continue;
+        }
         const repoIdValue = await repoId();
         const d = await gql(
             `mutation($input: CreateDiscussionInput!) {
                createDiscussion(input: $input) { node { number url } }
              }`,
-            { input: { repositoryId: repoIdValue, categoryId, title, body: threadBody(slug, entry.file, title, enRaw, zhRaw) } },
+            { input: { repositoryId: repoIdValue, categoryId, title, body } },
         );
         console.log(`created discussion #${d.createDiscussion.node.number}: ${title}`);
         toRecord.push({ index, num: d.createDiscussion.node.number });
@@ -312,7 +326,7 @@ async function main() {
     if (toRecord.length > 0) {
         await writeBackManifest(manifestText, toRecord);
     } else {
-        console.log("all posts have verifiable threads — nothing to do");
+        console.log(DRY_RUN ? "dry-run complete — nothing was created or written" : "all posts have verifiable threads — nothing to do");
     }
 }
 
