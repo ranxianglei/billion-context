@@ -572,6 +572,11 @@ const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is 
 // keeps the legacy wording — small leftovers outside the offer must not re-nag
 // on every fold. Material leaks (the #4331 class: tens of K tokens raw) override it.
 const UNCOVERED_RECEIPT_FLOOR_TOKENS = 10_000;
+// #5186: stored summaries quote refs verbatim and those quotes outlive the
+// ledger generation they came from (a session switch or native compaction
+// restarts refs at m00001). Teach the source-of-truth split where new summaries
+// land, not only in failure diagnostics.
+const HISTORICAL_REFS_NOTE = "\nRefs quoted in stored summaries are historical snapshots: after a session reset (model/upstream switch or native compaction) this session's refs restart from m00001, so an old quote may no longer resolve. Compose ranges only from acp_status output or the live ranges listed in this receipt.";
 
 // #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
 // set the model acted on) minus the just-folded spans — NOT a fresh post-fold
@@ -1471,6 +1476,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // design (#1718), so it keeps neither the fingerprints nor this note.
         if (changedBlocks.length > 0) {
             msg += "\nFingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
+            msg += HISTORICAL_REFS_NOTE;
+            logMsg += HISTORICAL_REFS_NOTE;
         }
         // #189 staged compression (gated): a rewrite above the configured max
         // shrink is the shape that trips provider risk-control; steer the model
