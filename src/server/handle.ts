@@ -51,7 +51,7 @@ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encodin
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
@@ -812,6 +812,13 @@ async function handleRequest(
                     if (runtimeAgent !== undefined && pluginWindow === undefined && runtimeWindow === undefined) {
                         log("warn", `[window] model=${model} agent=${runtimeAgent} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource}`);
                     }
+                    // #5490: NOTHING resolved — not even the built-in table or the
+                    // registry — so the session rides the anonymous default window.
+                    // Today that read as a healthy info line; say it is a guess,
+                    // once per process, with the declaration that fixes it.
+                    if (nativeFromFallback && native === undefined) {
+                        log("warn", `[window] model=${model} resolved to NOTHING (no tier evidence, plugin/launcher report, configured declaration, registry entry, or built-in table match) — sizing against the anonymous default ${reqConfig.modelContextLimit}; declare providers.<upstream>.models.${model}.context (and .output) for this deployment to size it properly (#5490)`);
+                    }
                 }
             }
             if (routeKey === undefined && providerKeys.length > 0) warnRouteMissIfNew(diagOrigin, model, providerKeys, log);
@@ -1431,6 +1438,14 @@ async function handleRequest(
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // #5490: the first-sight warn above needs no session identity; this one
+        // does — recurrence across DISTINCT sessions is what turns "a model I
+        // haven't declared" into "an alias this host resolves internally that
+        // will ride the anonymous default forever". Once per model per process.
+        if (reqModelId !== undefined && wsSourceForLog === "default" && nativeFromFallback
+            && noteUnresolvedModelSession(reqModelId, session.id)) {
+            log("warn", `[window] model=${reqModelId} still unresolved after ${UNRESOLVED_MODEL_SESSION_THRESHOLD}+ sessions (no table/registry/configured/plugin evidence; anonymous default ${reqConfig.modelContextLimit} in force) — declare providers.<upstream>.models.${reqModelId}.context (and .output) to stop sizing against the guess (#5490)`);
+        }
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
@@ -2375,7 +2390,14 @@ async function handleRequest(
                 const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
                 const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
                 if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
-                    log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
+                    // #5490: landing mid-session on the ANONYMOUS DEFAULT (the new
+                    // model resolved to nothing) is the dangerous shape — a long
+                    // conversation suddenly judged against a guessed base, which
+                    // is how a 1M-resident session reads 1567% and EMERGENCY-folds
+                    // on one picker click. Operator-tuned "default" keeps info:
+                    // that value is owned by the operator, not a guess.
+                    const landsOnAnonymousDefault = curRes.s === "default" && nativeFromFallback;
+                    log(landsOnAnonymousDefault ? "warn" : "info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s})${landsOnAnonymousDefault ? ` LANDING ON THE ANONYMOUS DEFAULT: model=${curRes.m} has no window evidence — the session now judges against the guessed base until it is declared (providers.<upstream>.models.${curRes.m}.context) (#5490)` : ""} (#2283)`);
                 }
                 if (session.metadata) session.metadata.lastWindowResolution = curRes;
             }
