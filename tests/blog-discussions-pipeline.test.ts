@@ -226,7 +226,7 @@ test("push made only of our own write-back commits -> early no-op after reading 
             verifyRule("verify-7", 7, true),
             threadNodesRule("gql-thread-scan", []),
             createRule("gql-create", 88),
-            putMasterRule("put-master"),
+
         ]);
         const err = await runScript(5);
         assert.equal(err, undefined);
