@@ -621,9 +621,13 @@ export function containsRenderTagText(s: string): boolean {
 // #2190: post-audit shape check — a bare ref immediately followed by ANY close
 // tag is echo residue by construction (genuine prose never puts mNNNNN right
 // before </word>; the kernel wraps refs in tags, so a naked ref IS the leak).
-// Used where bytes bypassed or escaped the filter and must be logged, not
-// dropped: fast-path gate sites and filter release points.
-const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]|(?:type="text"|tokens="\d+")\s*>\s*m\d{4,}/;
+// #5195: opener-less variant joins — anchor attr (type="text" / tokens=N) plus
+// a ref glued to the terminator. Quotes tolerate JSON escaping (\") because
+// fast-path gate sites test RAW wire strings where " inside values arrives
+// escaped; decoded-text sites match the plain form. Gate sites use it to
+// ENGAGE the strip pass (both shapes are stripped there); release points log
+// what still escapes.
+const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]|(?:type=\\?"text\\?"|tokens=\\?"\d+\\?")\s*>\s*m\d{4,}/;
 export function containsEchoResidue(s: string): boolean {
     return ECHO_RESIDUE.test(s);
 }

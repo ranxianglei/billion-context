@@ -5,7 +5,7 @@ import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyToolAsync } from "./loop/core.js";
 import { drainPendingRetrievals } from "./store.js";
 import { runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
-import { containsBareRefHeadText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAssistantProse } from "./loop/tag-echo-filter.js";
+import { containsBareRefHeadText, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAssistantProse } from "./loop/tag-echo-filter.js";
 
 export async function rewriteGoogleJsonResponseAsync(body: unknown, ctx: RewriteCtx, signal?: AbortSignal): Promise<unknown> {
     return runJsonRewriteAsync(rewriteGoogleJsonSteps(body, ctx), async (call) => (await executeProxyToolAsync(call.name, call.args as Record<string, unknown>, ctx, call.id, undefined, signal)).text);
@@ -41,7 +41,7 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
         // #1960/KDD#10: a thought part carries a thoughtSignature the client
         // echoes back verbatim — rewriting its text desyncs the signature and
         // bricks replay. Strip prose only from non-thought parts.
-        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || containsBareRefHeadText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
+        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || containsEchoResidue(part.text) || containsBareRefHeadText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
             ctx.log(`[tag-echo] stripped: non-stream google output ACP echo (render tags/markers/internal artifacts): ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAssistantProse(part.text, absorbArmed, requestText);
         }

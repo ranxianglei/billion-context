@@ -83,3 +83,15 @@ test("#5195: audit predicate detects the opener-less residue at release points",
     // clean prose is not flagged
     assert.equal(containsEchoResidue(`all good here`), false);
 });
+
+test("#5195: audit predicate fires on raw-JSON-escaped forms (gate sites test raw wire strings)", () => {
+    // Fast-path gate sites (pipePluginJson, Responses done/completed frames,
+    // adapter item events) run this predicate on RAW wire strings where every "
+    // inside a value arrives escaped as \". Both quote forms must match.
+    assert.equal(containsEchoResidue(`{"choices":[{"message":{"content":"Done.  type=\\"text\\">m00106 tail"}}]}`), true);
+    assert.equal(containsEchoResidue(`{"content":"see tokens=\\"5\\">m00106"}`), true);
+    // decoded-text gate sites still match the plain form
+    assert.equal(containsEchoResidue(`Done. type="text"${GTE}m00106 tail`), true);
+    // wrong attr value stays inert in escaped form too
+    assert.equal(containsEchoResidue(`{"content":" type=\\"video\\">m00106"}`), false);
+});

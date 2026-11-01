@@ -4,7 +4,7 @@ import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { effectiveAbsorbConfig } from "./absorb.js";
-import { containsBareRefHeadText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAssistantProse } from "./loop/tag-echo-filter.js";
+import { containsBareRefHeadText, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAssistantProse } from "./loop/tag-echo-filter.js";
 
 export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     return runJsonRewrite(rewriteOpenaiJsonSteps(body, ctx), (call) => applyRanges(parseCompressInput(call.args, call.id), ctx).text);
@@ -56,7 +56,7 @@ function* rewriteOpenaiJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     // cannot tell an emission from a user-quoted fragment.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
-    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText) || containsBareRefHeadText(existingText) || (absorbArmed && containsToolCallEmissionText(existingText)))) {
+    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText) || containsEchoResidue(existingText) || containsBareRefHeadText(existingText) || (absorbArmed && containsToolCallEmissionText(existingText)))) {
         ctx.log(`[tag-echo] stripped: non-stream openai output ACP echo (render tags/markers/internal artifacts): ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
         existingText = stripAssistantProse(existingText, absorbArmed, requestText);
         msg.content = existingText;
