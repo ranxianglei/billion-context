@@ -2475,8 +2475,13 @@ async function handleRequest(
                     // #2228: model-decided nudge timing — resolved through the standard
                     // three-level compress cascade; presence of the object enables the
                     // side-call decision path at tier-1 arms (off unless explicitly set).
+                    // #5030: timeoutMs / reasoning ride the same cascade.
                     const decide = cs.nudgeModelDecided === true
-                        ? { maxTokens: typeof cs.nudgeDecisionMaxTokens === "number" && cs.nudgeDecisionMaxTokens > 0 ? Math.floor(cs.nudgeDecisionMaxTokens) : DEFAULT_DECIDE_MAX_TOKENS }
+                        ? {
+                            maxTokens: typeof cs.nudgeDecisionMaxTokens === "number" && cs.nudgeDecisionMaxTokens > 0 ? Math.floor(cs.nudgeDecisionMaxTokens) : DEFAULT_DECIDE_MAX_TOKENS,
+                            timeoutMs: typeof cs.nudgeDecisionTimeoutMs === "number" && cs.nudgeDecisionTimeoutMs > 0 ? Math.floor(cs.nudgeDecisionTimeoutMs) : undefined,
+                            reasoning: cs.nudgeDecisionReasoning,
+                        }
                         : undefined;
                     // #1279: stamp this request's effective cache-economics price
                     // profile on the session so request-context-free report faces

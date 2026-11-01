@@ -86,7 +86,8 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DEFAULT_DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
+
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
@@ -3159,6 +3160,17 @@ export function buildForwardTarget(
     return { upstreamUrl, headers, proxyUrl: decision.proxy, skippedProxy: decision.skippedProxy };
 }
 
+/** #5030: pull choices[0].finish_reason out of an OpenAI-wire completion for
+ *  diagnostics (used to distinguish budget-exhaustion empties from real
+ *  empty contents). Returns "" for other protocols / absent field. */
+function openaiFinishReason(json: Record<string, unknown> | null): string {
+    if (!json) return "";
+    const choices = json.choices;
+    const c0 = Array.isArray(choices) ? (choices[0] as Record<string, unknown> | undefined) : undefined;
+    const fr = c0 ? c0.finish_reason : undefined;
+    return typeof fr === "string" ? fr : "";
+}
+
 // #2228: model-decided nudge timing — the side-channel decision call. It
 // reuses the main request's forward target (same URL/headers/proxy/resign
 // arm) so the session's stable prefix lands on the SAME cache line as the
@@ -3175,8 +3187,13 @@ export async function runNudgeDecision(args: {
     sideBody: Record<string, unknown>;
     session: Session;
     log: (level: string, msg: string) => void;
+    /** #5030: per-deployment timeout via DecideConfig (three-level cascade,
+     *  default DEFAULT_DECIDE_TIMEOUT_MS = 15 s). Full-context side calls on
+     *  some providers prefill 25–60 s even on a 99.99 % cache hit; a 15 s
+     *  hard wall turns every arm into a timeout ladder climb. */
+    timeoutMs?: number;
 }): Promise<DecisionOutcome> {
-    const { req, opts, protocol, sideBody, session, log } = args;
+    const { req, opts, protocol, sideBody, session, log, timeoutMs } = args;
     let outcome: DecisionOutcome;
     try {
         const route = resolveUpstream(opts, req.url ?? "", req);
@@ -3195,7 +3212,7 @@ export async function runNudgeDecision(args: {
                 log("warn", `[acp-decide] session=${session.id} re-sign failed; sending the previous signature: ${String(err)}`);
             }
         }
-        const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, DECIDE_TIMEOUT_MS);
+        const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, timeoutMs ?? DEFAULT_DECIDE_TIMEOUT_MS);
         try {
             if (!response.ok) {
                 outcome = { kind: "failed", detail: `HTTP ${response.status}` };
@@ -3207,7 +3224,21 @@ export async function runNudgeDecision(args: {
                 } catch {
                     json = null;
                 }
-                outcome = parseDecision(json !== null ? extractDecisionText(protocol, json) : extractSummaryFromSse(protocol, text));
+                const answer = json !== null ? extractDecisionText(protocol, json) : extractSummaryFromSse(protocol, text);
+                // #5030: an empty answer with finish_reason "length" means the
+                // output budget was consumed before any visible text existed
+                // (typically hidden reasoning on hybrid-thinking models) — a
+                // budget problem, not a provider glitch. Surface it in the
+                // failure detail so operators can tell the two apart in logs.
+                if (!answer) {
+                    const finish = openaiFinishReason(json);
+                    outcome = parseDecision("");
+                    if (outcome.kind === "failed" && finish) {
+                        outcome = { kind: "failed", detail: `empty response (finish_reason "${finish}" — output budget exhausted before any visible text; raise nudgeDecisionMaxTokens or set nudgeDecisionReasoning "off")` };
+                    }
+                } else {
+                    outcome = parseDecision(answer);
+                }
             }
         } finally {
             clearTimer();
