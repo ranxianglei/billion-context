@@ -518,14 +518,19 @@ test("install: a missing live-state slot refuses an oversized direct model reque
         // Simulate the exact #3394 teardown shape: the slot is empty but the
         // shared fetch chain is still installed.
         liveStateSlotEffect(state)()();
-        await assert.rejects(
-            () => globalThis.fetch("http://127.0.0.1:8199/v1/messages", {
-                method: "POST",
-                body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
-            }),
-            /refusing oversized direct model request while intercept state is missing/,
-        );
-        assert.deepEqual(sink, [], "the oversized request must not reach the provider");
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+        // Negative rows: small model POSTs, GETs, and non-model URLs keep the
+        // clean by-design direct path while the slot is empty.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages")).status, 200);
+        assert.equal((await globalThis.fetch("https://example.com/upload", { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) })).status, 200);
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages", "http://127.0.0.1:8199/v1/messages", "https://example.com/upload"], "only the oversized model POST is refused");
     } finally {
         globalThis.fetch = saved;
         _resetForTest();
@@ -565,13 +570,13 @@ test("install: an unattributed oversized request is refused before direct send (
         takeoverGate: () => false,
     };
     const { sink } = await withPatch(state, async (fetch) => {
-        await assert.rejects(
-            () => fetch("http://127.0.0.1:8199/v1/messages", {
-                method: "POST",
-                body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
-            }),
-            /refusing oversized unattributed direct model request/,
-        );
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
     });
     assert.deepEqual(sink, [], "the oversized request must not reach the provider");
 });

@@ -538,6 +538,37 @@ function unattributedOversizeRefusal(url: string): Response {
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed", message, retryable: false } }), { status: 422, headers });
 }
 
+/** #5405: the empty-slot branch has no attribution and no window knowledge.
+ *  Small by-design direct sends must still pass; a multi-megabyte model POST
+ *  is the one shape that cannot be allowed to ride out silently. Return a
+ *  protocol-shaped 422 (not a throw) so the host treats it as a policy
+ *  refusal of one request; the slot normally rebinds on the next activation,
+ *  so retryable:true is honest. */
+function emptySlotOversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and this model request is larger than the silent-direct byte ceiling — forwarding it would send the prompt to the provider uncompressed (#5405). " +
+        "The slot normally rebinds on the next plugin activation; retry shortly. If it persists, restart the host so the interceptor can rebind.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-no-live-state" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_no_live_state", message, retryable: true } }), { status: 422, headers });
+}
+
+/** #5405: same byte ceiling for an unattributed gate verdict. This is not a
+ *  window-doom verdict (the 1M floor may still allow the body), so it needs
+ *  its own marker and wording; retryable:true because attribution can return. */
+function unattributedByteOversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: it is not attributed to a bili-managed session and its body is larger than the silent-direct byte ceiling, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
+        "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed_bytes", message, retryable: true } }), { status: 422, headers });
+}
+
 // ———— Oversized doom math (#2924/#4068, media-aware since #4111) ——————
 // Serves both the dsh takeoverGate arms and the shared direct-fallback arm
 // below — the gateless lanes (pi/omp/opencode-V1) have no size judgment at
@@ -1129,11 +1160,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // one case we must not forward silently: the provider would bill
             // and truncate a prompt the plugin never compressed. Fail locally
             // and say how to restore routing instead.
-            if (isModelApiUrl(url)) {
+            if (fetchMethodOf(input, init) === "POST" && isModelApiUrl(url)) {
                 const size = bodyByteSizeOf(init);
                 if (size !== undefined && size.bytes > MAX_SILENT_DIRECT_BODY_BYTES) {
-                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.bytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); restart the host`);
-                    throw new TypeError("billion-context: refusing oversized direct model request while intercept state is missing; restart the host");
+                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.bytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405)`);
+                    return emptySlotOversizeRefusal(url);
                 }
                 const seq = g[ACTIVE_STATE_SEQ];
                 if (lastMissingStateLogSeq !== seq) {
@@ -1254,10 +1285,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // ceiling catches the catastrophic case without second-guessing
             // the token math.
             const silentBytes = measured !== undefined ? measured.bytes : bodyByteSizeOf(init)?.bytes;
-            if (degradeLog === undefined && silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+            if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST" && silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
                 state.onDispatch?.(dispatchUrl, "refused");
-                logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) — would be sent uncompressed`);
-                throw new TypeError("billion-context: refusing oversized unattributed direct model request");
+                logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); would be sent uncompressed (#5405)`);
+                return unattributedByteOversizeRefusal(dispatchUrl);
             }
             if (doom !== undefined) {
                 state.onDispatch?.(dispatchUrl, "refused");
