@@ -7,16 +7,13 @@
  * without a recorded discussion number it creates ONE bilingual discussion
  * (English section first, then Chinese, per owner decision 2026-11-01) whose
  * body mirrors the article at creation time plus a canonical-source reference,
- * then records the numbers into website/articles.json in a single commit
- * prefixed "[bili-blog-pipeline]" (that prefix is also the re-trigger loop
- * guard: push events consisting only of our own write-backs exit early).
- *
- * Master carries strict required-status-check branch protection and the
- * Actions token is not exempt, so a direct commit to master is always tried
- * FIRST and, when rejected, falls back to updating the fixed branch
- * bili-blog-pipeline-manifest and opening/refreshing one PR for it (the same
- * posture as release-manual.yml). Merging that PR is a human step by house
- * rules; until it lands the button simply stays hidden.
+ * then records the numbers into website/articles.json on the fixed branch
+ * bili-blog-pipeline-manifest plus one open PR (the same posture as
+ * release-manual.yml). Repo policy: the pipeline NEVER pushes to master —
+ * every manifest change lands in that one PR, which a human merges by house
+ * rules; until it lands the button simply stays hidden. Write-back commits
+ * are prefixed "[bili-blog-pipeline]": when that PR merges, the push event
+ * consists only of our own write-backs and the run exits early.
  *
  * Idempotency is three-layered so a crash between "created" and "committed"
  * can never silently make a second thread:
@@ -113,8 +110,8 @@ const AUTOPR_BODY = [
     "Automated by the blog pipeline (scripts/blog-discussions.mjs).",
     "",
     "Records newly created Discussion thread numbers into website/articles.json.",
-    "Direct commits to " + BRANCH + " are blocked by its required-status-check",
-    "protection, so this PR is the fallback (same posture as release-manual.yml).",
+    "Repo policy: the pipeline never pushes " + BRANCH + " directly; numbers land here",
+    "as exactly one PR for a human merge (same posture as release-manual.yml).",
     "",
     "- One file changed: website/articles.json.",
     "- Safe to squash-merge. If the pipeline runs again before this merges,",
@@ -122,12 +119,9 @@ const AUTOPR_BODY = [
     "- Until merged, the discussion button stays hidden — nothing breaks.",
 ].join("\n");
 
-function looksLikeProtectionRejection(status, text) {
-    return (status === 403 || status === 422 || status === 409)
-        && (/protect/i.test(text) || /not allowed to (create or )?push/i.test(text) || /locked for state changes/i.test(text));
-}
-
-async function fallbackWriteBackAsPr(next, summary) {
+/** The ONLY write-back path: a commit on the fixed branch + exactly one PR.
+ *  Never touches "master" (owner decision 2026-11-02: no direct pushes, ever). */
+async function writeBackViaPr(next, summary) {
     // 1) make sure the fixed branch exists at the branch head
     const refRes = await rawFetch(`${BASE}/repos/${REPO}/git/ref/heads/${WRITE_BACK_BRANCH}`);
     if (refRes.status === 404) {
@@ -163,7 +157,7 @@ async function fallbackWriteBackAsPr(next, summary) {
                 base: BRANCH,
             }),
         });
-        console.log(`direct push to ${BRANCH} is blocked by branch protection; write-back opened as PR #${pr.number} — merge it to finish recording`);
+        console.log(`write-back opened as PR #${pr.number} — merge it to finish recording`);
     }
 }
 
@@ -303,30 +297,10 @@ async function writeBackManifest(manifestText, updatesByIndex) {
     const next = JSON.stringify(obj, null, 2) + "\n";
     const summary = updatesByIndex.map((u) => `${slugOf(obj.articles[u.index])}→#${u.num}`).join(", ");
     if (DRY_RUN) {
-        console.log(`[dry-run] would record ${summary} (direct commit to ${BRANCH}, falling back to a PR if protection rejects it)`);
+        console.log(`[dry-run] would record ${summary} (commit on ${WRITE_BACK_BRANCH} + one PR, per repo policy: the pipeline never pushes ${BRANCH})`);
         return;
     }
-    const sha = await shaOf(MANIFEST_REL);
-    try {
-        await ghJson(`${BASE}/repos/${REPO}/contents/${MANIFEST_REL}`, {
-            method: "PUT",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-                message: `${WRITE_BACK_PREFIX} record discussion threads (${summary})`,
-                content: Buffer.from(next, "utf8").toString("base64"),
-                branch: BRANCH,
-                ...(sha ? { sha } : {}),
-            }),
-        });
-        console.log(`manifest updated on ${BRANCH}: ${summary}`);
-    } catch (e) {
-        const m = String(e.message).match(/ → (\d{3}) ([\s\S]*)$/);
-        if (m && looksLikeProtectionRejection(Number(m[1]), m[2])) {
-            await fallbackWriteBackAsPr(next, summary);
-            return;
-        }
-        throw e; // anything that is not a protection rejection still fails loud
-    }
+    await writeBackViaPr(next, summary);
 }
 
 /** Loop guard: our own manifest write-back lands on master and would re-match

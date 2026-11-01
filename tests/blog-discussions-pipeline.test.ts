@@ -113,15 +113,18 @@ const createRule = (name: string, number: number): Rule => ({
     json: { data: { createDiscussion: { node: { number, url: `https://example.invalid/d/${number}` } } } },
 });
 
-const putMasterRule = (name: string, opts: { blocked?: boolean } = {}): Rule => ({
-    name,
-    match: (m, _u, body) => m === "PUT" && _u.includes("/contents/website/articles.json")
-        && (body as { branch?: string })?.branch === "master",
-    status: opts.blocked ? 403 : 200,
-    json: opts.blocked
-        ? { message: "You are not allowed to push here. The branch master is protected." }
-        : {},
-});
+const wbRules = (
+    putName: string,
+    prPostName: string = "post-pr-open",
+): Rule[] => [
+    { name: "get-wb-ref-missing", match: (m, u) => m === "GET" && u === "https://api.github.com/repos/o/r/git/ref/heads/bili-blog-pipeline-manifest", status: 404, json: { message: "Not Found" } },
+    { name: "post-wb-ref", match: (m, u) => m === "POST" && u === "https://api.github.com/repos/o/r/git/refs", json: {} },
+    { name: "get-head-sha", match: (m, u) => m === "GET" && u === "https://api.github.com/repos/o/r/commits/master", json: { sha: "abc123" } },
+    { name: "get-wb-file-sha", match: (m, u) => m === "GET" && u.includes("/contents/website/articles.json?ref=bili-blog-pipeline-manifest"), json: { sha: "filesha1" } },
+    { name: putName, match: (m, _u, body) => m === "PUT" && _u.includes("/contents/website/articles.json") && (body as { branch?: string })?.branch === "bili-blog-pipeline-manifest", json: {} },
+    { name: "get-open-prs-none", match: (m, u) => m === "GET" && u.includes("/repos/o/r/pulls?head=o:bili-blog-pipeline-manifest"), json: [] },
+    { name: prPostName, match: (m, u) => m === "POST" && u === "https://api.github.com/repos/o/r/pulls", json: { number: 77 } },
+];
 
 /* ---------------------------------- facets ---------------------------------- */
 
@@ -135,13 +138,12 @@ test("recorded number still resolves -> entry skipped; nothing created, nothing 
         repoIdRule,
         threadNodesRule("gql-thread-scan", []),
         createRule("gql-create", 88),
-        putMasterRule("put-master"),
     ]);
     const err = await runScript(1);
     assert.equal(err, undefined);
     assert.ok(hits.includes("verify-7"));
     assert.ok(!hits.includes("gql-create"), "must not create when the recorded thread still exists");
-    assert.ok(!hits.includes("put-master"), "no numbers changed -> no write-back");
+    assert.ok(!hits.some((h) => h.startsWith("put-")), "no numbers changed -> no write-back of any kind");
 });
 
 test("unverifiable recorded number -> fails loud, never duplicates the thread", async () => {
@@ -153,7 +155,6 @@ test("unverifiable recorded number -> fails loud, never duplicates the thread", 
         categoriesRule,
         repoIdRule,
         createRule("gql-create", 88),
-        putMasterRule("put-master"),
     ]);
     const err = await runScript(2);
     assert.ok(err instanceof Error);
@@ -171,19 +172,20 @@ test("marker already present in a recent thread -> records that number without c
         repoIdRule,
         threadNodesRule("gql-thread-scan", [{ number: 42, bodyText: "mirror <!-- bili-blog:a --> tail" }]),
         createRule("gql-create", 88),
-        putMasterRule("put-master"),
+        ...wbRules("put-wb-branch"),
     ]);
     const err = await runScript(3);
     assert.equal(err, undefined);
     assert.ok(!hits.includes("gql-create"), "marker found -> no second thread");
-    assert.ok(hits.includes("put-master"), "the discovered number must be recorded");
-    const pb = bodies.find((b) => b.name === "put-master")!.body as { content: string; message: string };
+    assert.ok(hits.includes("put-wb-branch"), "the discovered number must be recorded via the fixed branch");
+    assert.ok(!hits.some((h) => h.startsWith("put-") && !h.startsWith("put-wb")), "nothing is ever PUT directly onto master");
+    const pb = bodies.find((b) => b.name === "put-wb-branch")!.body as { content: string; message: string };
     const decoded = JSON.parse(Buffer.from(pb.content, "base64").toString("utf8")) as { articles: Array<{ discussion?: number }> };
     assert.equal(decoded.articles[0].discussion, 42);
     assert.match(pb.message, /^\[bili-blog-pipeline\] record discussion threads \(a→#42\)$/);
 });
 
-test("direct write-back blocked by branch protection -> fixed branch + exactly one PR", async () => {
+test("unrecorded post -> thread created; numbers land on the fixed branch + one PR, master untouched", async () => {
     const entries = [{ file: "website/blog/posts/a.md", slug: "a" }];
     setEnv(JSON.stringify({ articles: entries }));
     const { hits, bodies } = installFetch([
@@ -197,35 +199,14 @@ test("direct write-back blocked by branch protection -> fixed branch + exactly o
             match: (m, u) => m === "GET" && u.includes("/repos/o/r/contents/website/blog/posts/a.md"),
             json: { encoding: "base64", content: b64("---\ntitle: Test A\ntitle_zh: 测试A\n---\n\n# Test A\n\nEnglish body line.\n") },
         },
-        putMasterRule("put-master-blocked", { blocked: true }),
-        {
-            name: "get-wb-ref-missing",
-            match: (m, u) => m === "GET" && u === "https://api.github.com/repos/o/r/git/ref/heads/bili-blog-pipeline-manifest",
-            status: 404,
-            json: { message: "Not Found" },
-        },
-        { name: "post-wb-ref", match: (m, u) => m === "POST" && u === "https://api.github.com/repos/o/r/git/refs", json: {} },
-        { name: "get-head-sha", match: (m, u) => m === "GET" && u === "https://api.github.com/repos/o/r/commits/master", json: { sha: "abc123" } },
-        {
-            name: "get-wb-file-sha",
-            match: (m, u) => m === "GET" && u.includes("/contents/website/articles.json?ref=bili-blog-pipeline-manifest"),
-            json: { sha: "filesha1" },
-        },
-        {
-            name: "put-wb-branch",
-            match: (m, _u, body) => m === "PUT" && _u.includes("/contents/website/articles.json")
-                && (body as { branch?: string })?.branch === "bili-blog-pipeline-manifest",
-            json: {},
-        },
-        { name: "get-open-prs-none", match: (m, u) => m === "GET" && u.includes("/repos/o/r/pulls?head=o:bili-blog-pipeline-manifest"), json: [] },
-        { name: "post-pr-open", match: (m, u) => m === "POST" && u === "https://api.github.com/repos/o/r/pulls", json: { number: 77 } },
+        ...wbRules("put-wb-branch"),
     ]);
     const err = await runScript(4);
     assert.equal(err, undefined);
-    assert.ok(hits.filter((h) => h.startsWith("put-master")).length === 1, "exactly one (rejected) attempt on master");
-    assert.ok(hits.includes("post-wb-ref"), "fallback must cut the fixed branch");
+    assert.ok(hits.includes("post-wb-ref"), "the fixed branch must be cut");
     assert.ok(hits.includes("put-wb-branch"), "numbers land on the fixed branch");
     assert.ok(hits.includes("post-pr-open"), "one PR opened for the human merge step");
+    assert.ok(!hits.some((h) => h === "put-master" || h.includes("master")), "master is never targeted by any request");
     const pr = bodies.find((b) => b.name === "post-pr-open")!.body as { title: string; head: string; base: string };
     assert.match(pr.title, /^\[bili-blog-pipeline\] record discussion threads \(a→#99\)$/);
     assert.equal(pr.head, "bili-blog-pipeline-manifest");
