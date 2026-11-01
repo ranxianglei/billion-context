@@ -1975,13 +1975,14 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278, OPT-IN — default stays the spawned proxy, #4687
-     *  reverts the #4571 default flip): run the pi lane's compression
-     *  IN-PROCESS — no proxy server spawned. Enable with `true` (or
-     *  BILI_PI_INLINE=1/on/yes/TRUE). Resolved env > file; an explicit
-     *  inline choice beats an announced attach target (launcher-set
-     *  BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly
-     *  as before (attach/spawn). */
+     *  `inline` (#3278, DEFAULT-ON since #5428 — supersedes the #4687 opt-in
+     *  rule): run the pi lane's compression IN-PROCESS — no proxy server
+     *  spawned. Unset env+file runs INLINE; an announced attach target
+     *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default,
+     *  so `bili pi` keeps its launcher proxy. Opt OUT with `false` (or
+     *  BILI_PI_INLINE=0/false/no/off) — restores attach/spawn. Resolved
+     *  env > file > default; an explicit inline choice beats an announced
+     *  attach target. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
      *  stays the spawned proxy, per owner decision on #4687): run the

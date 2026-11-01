@@ -11,6 +11,8 @@
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
+ *   bili -i pi                     launch pi on the IN-PROCESS engine (≡ bili pi-inline)
+ *   bili -s pi                     force the proxy posture: spawn/attach, never inline
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
@@ -175,6 +177,10 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
 Options (override config file / env):
+  -i, --inline                     run the client's compression IN-PROCESS (pi/opencode;
+                                   same as "bili pi-inline"; must precede the client name)
+  -s, --server                     force the proxy posture — spawn/attach, never inline
+                                   (pi/opencode; overrides an inherited BILI_PI_INLINE=1)
   -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (start: 8787; launcher default: random free port)
@@ -235,6 +241,7 @@ export function parseArgs(argv: string[]): Parsed {
     const positional: string[] = [];
     let client: ClientName | undefined;
     let clientArgs: string[] = [];
+    let posture: "inline" | "server" | undefined;
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
@@ -283,6 +290,22 @@ export function parseArgs(argv: string[]): Parsed {
             case "--version":
             case "-V":
                 command = "version";
+                break;
+            case "-i":
+            case "--inline":
+                if (posture === "server") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "inline";
+                break;
+            case "-s":
+            case "--server":
+                if (posture === "inline") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "server";
                 break;
             case "--debug":
                 overrides.ACP_DEBUG = "1";
@@ -543,6 +566,32 @@ export function parseArgs(argv: string[]): Parsed {
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
+        }
+    }
+
+    // -i/-s posture flags (#5428): translate onto the existing lanes so the
+    // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
+    // + extension preflight + BILI_PI_INLINE=1, no proxy spawned), and
+    // `-s pi` pins BILI_PI_INLINE=0 on the child so an inherited/ambient
+    // inline env can't flip it while the launcher proxy runs.
+    if (posture !== undefined) {
+        if (!client) {
+            console.error(`bili: ${posture === "inline" ? "-i/--inline" : "-s/--server"} needs a client lane — e.g. \`bili -${posture === "inline" ? "i" : "s"} pi\``);
+            process.exit(2);
+        }
+        const inlineVariant = client === "pi" || client === "pi-inline" ? "pi-inline" : client === "opencode" || client === "opencode-inline" ? "opencode-inline" : undefined;
+        if (inlineVariant === undefined) {
+            console.error(`bili: -i/-s only apply to the pi and opencode lanes (got "${client}")`);
+            process.exit(2);
+        }
+        if (posture === "inline") {
+            client = inlineVariant;
+        } else if (client === inlineVariant) {
+            console.error(`bili: ${client} IS the inline lane — use \`bili -s ${inlineVariant === "pi-inline" ? "pi" : "opencode"}\``);
+            process.exit(2);
+        } else {
+            if (inlineVariant === "pi-inline") overrides.BILI_PI_INLINE = "0";
+            else overrides.BILI_OPENCODE_INLINE = "0";
         }
     }
 

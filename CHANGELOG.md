@@ -5,6 +5,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Changed
+- **pi 内联压缩通道默认开启(#5428,取代 #4687 的手动开启规则)**:装了 bili 扩展的裸 `pi`(没设任何环境变量、没写配置)现在直接跑**进程内引擎**,不再自己派生代理进程。新优先级:kill-switch > /bili/ 改写启动 > 显式内联(`BILI_PI_INLINE=1/on/yes/TRUE` 或 `"pi": {"inline": true}`)> 宣告的附着目标(launcher 预置的 `BILLION_CONTEXT_PROXY/ATTACH`,`bili pi` 照旧用自己的 launcher 代理)> **默认内联** > spawn。**人类入口(短旗标,必须放在子命令前)**:`bili -i pi`(≡ `bili pi-inline`,强制内联+预检扩展+清理继承代理变量)与 `bili -s pi`(钉死代理姿态:子进程预置 `BILI_PI_INLINE=0`,压过继承的内联变量;opencode 同理)。不想用内联:`bili -s pi`、`BILI_PI_INLINE=0/false/no/off` 或 `"pi": {"inline": false}`——都恢复旧的 attach/spawn 姿态(有宣告代理就附着,否则自己派生代理)。`bili pi-inline` 一键车道保留(同 `-i pi`);空白 `BILI_PI_INLINE=""` 按未设置折叠。opencode 通道的默认不变(仍手动开启,`-i/-s` 两个旗标对它可用)。
+
 ### Fixed
 
 * **#5412: 异步存储后端的「压缩冻结会话」现在也能自愈。** #5408 事故(一个会话连续 17 次摘要漂移后被保护机制冻住、8 小时无人知晓)的主修复 #5409 只教了同步存储路径(SQLite 直写)自救:漂移挂起期间保存会自动升级为全量重导入并清掉索引里的残留行。异步路径(opt-in 网络后端,如 mysql)那份孪生代码没搬——同样被冻住的会话在那上面永远救不回来,每次保存都重写不完整视图、下轮采样继续漂移。本 PR 在 `src/storage/shadow.ts` 的异步入队路径补上同一行对齐(`completeLog = hasRawTail || driftedSessions.has(id)`),行为与同步路径逐字一致;回归测试同时钉住正门(latch 挂起的折叠保存清掉外来行)与负门(未挂起保存不清扫)。

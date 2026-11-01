@@ -6123,11 +6123,24 @@ function parsePort(raw: string | undefined): number {
     return port;
 }
 
+/** -s/--server posture pins (#5491): parseArgs records them in overrides, but
+ *  the launch path skips the generic env merge the start/update lanes use —
+ *  mirror that merge for these keys so each lane's child-env spread delivers
+ *  the pin to the child. Without this, an ambient BILI_PI_INLINE=1 flips a
+ *  `-s pi` launch onto the inline lane and the launcher proxy idles. */
+export function applyPosturePins(overrides: Record<string, string | undefined>): void {
+    for (const key of ["BILI_PI_INLINE", "BILI_OPENCODE_INLINE"]) {
+        const v = overrides[key];
+        if (v !== undefined) process.env[key] = v;
+    }
+}
+
 export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}): Promise<void> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
+    applyPosturePins(params.overrides);
 
     const base = baseClientName(params.client);
     // #535: for pi and omp, discovery must read the REAL home — a stale
@@ -7047,6 +7060,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
+    applyPosturePins(params.overrides);
 
     const config = loadClientConfig(process.env, process.cwd());
     const domains = dedupeInOrder([
