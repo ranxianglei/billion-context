@@ -22,7 +22,7 @@ export const WEB_STYLES = String.raw`
     --amber: #9a6700;
     --amber-soft: rgba(154, 103, 0, 0.1);
     --purple: #8250df;
-    /* #5419: treemap per-tier node fills. Light values are the pre-existing
+    /* #5417: treemap per-tier node fills. Light values are the pre-existing
        hardcoded hues verbatim (zero light-mode drift); the dark counterparts
        below give each tier a legible low-luminance ground in dark mode. */
     --tm-base-fill: #ffffff;

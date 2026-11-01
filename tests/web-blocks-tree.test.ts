@@ -349,7 +349,7 @@ test("#4737 review: pane surfaces follow the theme and list markdown rules keep 
     }
 });
 
-test("#5419: the treemap node fills follow the theme instead of pinning light hues", () => {
+test("#5417: the treemap node fills follow the theme instead of pinning light hues", () => {
     // Dark mode turns var(--text) light; a pinned light fill would bury it. Node fills must stay var-driven.
     const nodeRules = [".g-node rect", ".g-node.tier-1 rect", ".g-node.tier-2 rect", ".g-node.tier-3 rect", ".g-node.tier-n rect"];
     for (const sel of nodeRules) {
