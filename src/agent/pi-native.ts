@@ -59,12 +59,15 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down — its URLs are
  *  already proxy-shaped. BILI_PI_INLINE (#3278) outranks ambient attach envs:
  *  it is a deliberate choice about WHERE compression runs (in this process),
- *  not just which proxy to use. Resolved env > file > default(off): the
+ *  not just which proxy to use. Resolved env > file > default: the
  *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
- *  false disables over the file. OPT-IN ONLY (owner decision on #4687:
- *  never flip defaults) — unset env/file behaves exactly as before the
- *  #4571 default flip (attach > spawned proxy); `bili pi-inline` presets
- *  BILI_PI_INLINE=1 for the one-command lane. */
+ *  false disables over the file. DEFAULT INLINE since #5428 (supersedes the
+ *  #4687 opt-in rule): unset env+file runs the in-process lane — opt out
+ *  with BILI_PI_INLINE=0/false/no/off or `"pi": {"inline": false}` to
+ *  restore the old attach/spawn posture. An ANNOUNCED attach target
+ *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default —
+ *  `bili pi` keeps its launcher proxy; only explicit inline outranks attach.
+ *  `bili pi-inline` presets BILI_PI_INLINE=1 for the one-command lane. */
 export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
@@ -78,10 +81,16 @@ export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undef
     // still suppresses a file-true value (env > file, #3278 contract):
     if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
+    // An ANNOUNCED attach target beats the #5428 inline default: `bili pi`
+    // sets BILLION_CONTEXT_PROXY before the child starts, and its launcher
+    // proxy must keep serving that child.
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
-    // …then spawn: the historical default (owner decision on #4687 — inline
-    // is opt-in only, the #4571 default flip is reverted; a proxy server is
-    // spawned unless BILI_PI_INLINE / pi.inline=true opted into in-process).
+    // #5428 default flip (supersedes #4687): with NO explicit choice anywhere
+    // (env unset/blank AND file unset) the lane runs INLINE in-process. Reach
+    // spawn only via explicit opt-out — BILI_PI_INLINE=0/false/no/off or
+    // "pi": {"inline": false} — which restores the pre-#5428 posture above
+    // (attach when announced, else a spawned proxy).
+    if ((inlineEnv === undefined || inlineEnv === "") && fileInline === undefined) return { mode: "inline" };
     return { mode: "spawn" };
 }
 
