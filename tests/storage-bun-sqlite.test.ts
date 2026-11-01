@@ -29,6 +29,7 @@ import * as path from "node:path";
 import {
     isBunRuntime,
     openSqliteDatabase,
+    probeBunSqlite,
     resolvedSqliteEngineInfo,
     setBunDatabaseFactoryForTests,
     setPreferredSqliteEngineForTests,
@@ -172,10 +173,11 @@ test("bun probe is false on real Node, so the #2833 ladder stays authoritative t
             assert.deepEqual(resolvedSqliteEngineInfo(), { name: "bun:sqlite", source: "builtin" });
             db.close();
         } else {
-            // On Node there is no bun:sqlite to load: an engine chosen there could
-            // never open, so step 0 of the ladder must decline.
+            // On Node there is no bun:sqlite to load, so step 0 of the ladder must
+            // decline. Pin the probe itself — openSqliteDatabase() on a fake path
+            // throws CANTOPEN before it could report its engine (review finding).
             assert.throws(() => require("bun:sqlite"), () => true);
-            assert.equal(openSqliteDatabase("/unused/index.db").engine === "bun:sqlite", false);
+            assert.equal(probeBunSqlite(), false);
         }
     } finally {
         reset();
