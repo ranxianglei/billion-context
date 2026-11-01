@@ -118,8 +118,8 @@ test("chokepoint: routed model request carries count+tail-ids; the response lear
     });
     assert.equal(sink[1].headers["x-bili-pf-count"], "2");
     assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "m2,m3");
-    // the lane's own plugin header survives the merge
-    assert.ok(!("x-bili-plugin" in sink[1].headers) || true);
+    // the chokepoint fabricates no lane identity of its own
+    assert.ok(!("x-bili-plugin" in sink[1].headers), "chokepoint must not add a lane plugin header");
 });
 
 test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-plane never is", async () => {
