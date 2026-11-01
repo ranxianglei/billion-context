@@ -125,9 +125,10 @@ function scriptTurns(): Array<{ messages: unknown[]; max_tokens: number; stream:
 }
 
 // The only sanctioned normalization: kernel time="…" attributes carry wall
-// clock and differ run-to-run; nothing else may differ.
+// clock and differ run-to-run; nothing else may differ. Captured bodies are
+// JSON, so the quotes arrive escaped (time=\"…\"); match both forms (#5471).
 function normalize(raw: string): string {
-    return raw.replace(/\stime="[0-9T:.Z+-]+"/g, ' time="X"');
+    return raw.replace(/\stime=\\?"[0-9T:.Z+\-]+\\?"/g, ' time="X"');
 }
 
 async function runClient(origin: string, upstreamUrl: string, sid: string, turns: Array<{ messages: unknown[]; max_tokens: number; stream: boolean }>): Promise<(number | null)[]> {
