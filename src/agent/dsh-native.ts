@@ -2395,15 +2395,18 @@ export function apply(ctx: PluginContext): void {
             // #5418 v2 (owner identity ladder, msgid over order): ship the
             // HOST's own message ids for the watermark window — element
             // K-1 (the prev anchor) plus every NEW element, "几个而不是几十
-            // 个". Join+encodeURIComponent: the separator comma stays literal
-            // while commas inside ids encode (%2C), so the proxy's split is
-            // unambiguous. Same all-or-nothing capture as the incremental
+            // 个". Per-segment encodeURIComponent joined by LITERAL commas
+            // (the proxy splits on literal commas, then decodes each segment
+            // — whole-list encoding would %2C the separators and the proxy
+            // would read one comma-bearing id instead of N): any comma inside
+            // an id travels as %2C, so the split is unambiguous for arbitrary
+            // id alphabets. Same all-or-nothing capture as the incremental
             // envelope (#4491): no usable ids ⇒ pure count mode, never a
             // partial or mis-aligned list — a bad length costs ONE credited
             // verification round server-side and self-heals via restamp.
             const pfIds = dispatchScope.getStore()?.msgIds;
             if (pfIds !== undefined && pfIds.length >= pfCount) {
-                headers[PF_TAIL_IDS_HEADER_NAME] = encodeURIComponent(pfIds.slice(pfCount - 1).join(","));
+                headers[PF_TAIL_IDS_HEADER_NAME] = pfIds.slice(pfCount - 1).map(encodeURIComponent).join(",");
             }
         }
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
