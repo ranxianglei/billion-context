@@ -24,9 +24,9 @@
  *    a high-signal credential scrubber, NOT a general privacy filter: it does not
  *    mask arbitrary URLs or paths, and the far stronger guarantee here is
  *    structural — only this one nested string is ever read, never a body dump.
- *  - Bounded to `MAX_DIAGNOSTIC_CHARS`; ALL whitespace collapsed so a newline
- *    (including the `\r\n` frame-injection shape) can never forge a second log
- *    field.
+ *  - Bounded to `MAX_DIAGNOSTIC_CHARS`; ALL control characters (C0+C1, incl.
+ *    NEL U+0085) and whitespace collapsed so a newline (the `\r\n` shape or any
+ *    C1 line-break) can never forge a second log field.
  *  - Absent, non-string, empty, or structurally-unrelated payloads return
  *    `undefined`: the caller then logs exactly what it logged before, so a
  *    rejection that carries no attempt detail is unchanged byte-for-byte.
@@ -55,9 +55,11 @@ interface DiagnosticResult {
     attempts: number;
 }
 
-/** Collapse ALL whitespace (newlines included) and clamp to the bound. */
+/** Collapse control chars (C0+C1 — incl. NEL U+0085) and all whitespace to
+ *  single spaces, then clamp, so no control byte can survive as a forged field
+ *  break in the log line. */
 function bound(text: string): string {
-    const collapsed = text.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+    const collapsed = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
     if (collapsed.length <= MAX_DIAGNOSTIC_CHARS) return collapsed;
     return `${collapsed.slice(0, MAX_DIAGNOSTIC_CHARS)} …`;
 }
