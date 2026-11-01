@@ -7,10 +7,13 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { stripKernelSummaries } from "../src/server.ts";
-import { repairResponsesAssistantOrdering, collectSeparatorManifest, separatorCoreProvenance, separatorProvenanceSet, isSeparatorCarrier, RESPONSES_TURN_SEPARATOR } from "../src/server/responses-ordering.ts";
+import { repairResponsesAssistantOrdering, collectSeparatorManifest, reanchorSeparatorManifest, separatorCoreProvenance, separatorProvenanceSet, isSeparatorCarrier, RESPONSES_TURN_SEPARATOR } from "../src/server/responses-ordering.ts";
+import { stampOutbound } from "../src/chain-checkpoint.ts";
+import { applyCompatRolesJson } from "../src/compat-roles.ts";
+import { dropCompatFieldsJson } from "../src/compat-drop.ts";
 import { patchResponsesInputWithToolImages as patchResponsesInput } from "../src/responses-tool-output.ts";
 import { RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "../src/turn-separator.ts";
-import { _setInvariantJudgeForTest, maybeRunInvariantJudge } from "../src/invariant-judge.ts";
+import { _setInvariantJudgeForTest, maybeRunInvariantJudge, type JudgeVerdict } from "../src/invariant-judge.ts";
 
 // #564 regression: after a successful compress, upstream must still receive a
 // valid Responses assistant history. Within one assistant run the order is
@@ -389,3 +392,242 @@ test("#2627 provenance: multipart and opaque layout items survive with a marker"
     assert.equal(separatorProvenanceSet(manifest, reparsed.input, body).size, 1);
 });
 
+
+// --- #2627 final-wire re-anchoring (relay boundary) ---------------------
+// prepare binds its claims to the exact bytes it serialized, and the relay then
+// rewrites those bytes (compat roles, output steering, dropFields, the chain
+// checkpoint). Those transforms mutate the parsed graph IN PLACE, so a marker's
+// carrier keeps its object identity while its INDEX can move. The relay therefore
+// runs them on the graph `collectSeparatorManifest` was handed — not on a fresh
+// `JSON.parse`, which would hand it unrelated objects and prove nothing. Each test
+// below builds that same graph, mutates it, and re-anchors.
+
+function manifestWithSeparator() {
+    const ordered = repairResponsesAssistantOrdering(SEPARATOR_FOLDED, SEPARATOR_ORIGINAL);
+    const wire = coreToResponses(ordered.messages) as Item[];
+    const body = JSON.stringify({ input: wire });
+    const manifest = collectSeparatorManifest(wire, ordered.slots, body);
+    assert.ok(manifest, "fixture produces a real producer-owned claim");
+    // The relay's working graph: the SAME objects, wrapped as prepare wraps them.
+    const graph = { input: wire } as { input: Item[] } & Record<string, unknown>;
+    return { ordered, wire, graph, body, manifest };
+}
+
+test("#2627 re-anchor: a role rewrite that leaves carriers canonical keeps the claim", () => {
+    const { ordered, graph, body, manifest } = manifestWithSeparator();
+    // `assistant` → `developer` touches real assistant turns only; the marker
+    // carrier is a `user` message and stays canonical.
+    const rewritten = applyCompatRolesJson(graph, "responses", { assistant: "developer" });
+    assert.ok(rewritten > 0, "fixture actually changed a role");
+    const finalBody = JSON.stringify(graph);
+    assert.notEqual(finalBody, body, "the rewrite produced different bytes");
+    assert.equal(separatorProvenanceSet(manifest, graph.input, finalBody).size, 0, "the prepare-time binding no longer describes these bytes");
+    const reanchored = reanchorSeparatorManifest(manifest, graph.input, finalBody);
+    assert.ok(reanchored, "carrier identity survives the rewrite");
+    assert.equal(reanchored.claims.length, 1);
+    assert.equal(graph.input[reanchored.claims[0]!.index], ordered.slots[0]!.carrier, "the claim still points at the producer's own carrier object");
+    assert.deepEqual([...separatorProvenanceSet(reanchored, graph.input, finalBody)], [reanchored.claims[0]!.index], "and the re-bound manifest is accepted against the final bytes");
+});
+
+test("#2627 re-anchor: a role rewrite that de-canonicalizes a carrier drops only that claim", () => {
+    const { ordered, graph, manifest } = manifestWithSeparator();
+    // `user` → `developer` rewrites the marker carrier itself out of its
+    // canonical `{type:"message", role:"user"}` shape — the claim cannot be
+    // honoured, and re-anchoring must NOT hand it to the neighbour.
+    const rewritten = applyCompatRolesJson(graph, "responses", { user: "developer" });
+    assert.ok(rewritten > 0, "fixture actually changed a role");
+    assert.equal(graph.input.indexOf(ordered.slots[0]!.carrier) >= 0, true, "the object is still there");
+    const finalBody = JSON.stringify(graph);
+    assert.equal(reanchorSeparatorManifest(manifest, graph.input, finalBody), undefined, "a non-canonical carrier proves nothing");
+    assert.equal(separatorProvenanceSet(manifest, graph.input, finalBody).size, 0, "and nothing is exempted for the judge");
+});
+
+test("#2627 re-anchor: a fresh JSON.parse of the same body proves nothing (seeding regression)", () => {
+    const { ordered, graph, body, manifest } = manifestWithSeparator();
+    // The relay must seed its working graph from prepare's OWN parsed object
+    // (`prepared.parsedBody`), because that object is the one
+    // `collectSeparatorManifest` walked. A fresh parse of the identical bytes
+    // yields equal-looking but DIFFERENT objects, so no claim can re-anchor —
+    // this is why seeding from `parsedBody` (not `JSON.parse(prepared.body)`)
+    // is load-bearing rather than an optimization.
+    const reparsed = JSON.parse(body) as { input: Item[] };
+    assert.deepEqual(reparsed.input, graph.input, "the bodies are identical as JSON");
+    assert.equal(reanchorSeparatorManifest(manifest, reparsed.input, body), undefined, "but a re-parse carries no object identity, so it re-anchors nothing");
+    const seeded = reanchorSeparatorManifest(manifest, graph.input, body);
+    assert.ok(seeded, "the prepare-owned graph does re-anchor");
+    assert.equal(graph.input[seeded.claims[0]!.index], ordered.slots[0]!.carrier);
+});
+
+test("#2627 re-anchor: an appended checkpoint keeps the claim on its own carrier", () => {
+    const { ordered, graph, manifest } = manifestWithSeparator();
+    const marker = ordered.slots[0]!.carrier;
+    assert.ok(graph.input.indexOf(marker) >= 0, "fixture carries the marker");
+    const stamped = stampOutbound(graph, "responses", "proc-1", 1_700_000_000_000) as { input: Item[] };
+    assert.ok(stamped, "fixture stamped");
+    assert.notEqual(stamped.input.length, graph.input.length, "the checkpoint added a carrier");
+    const finalBody = JSON.stringify(stamped);
+    const reanchored = reanchorSeparatorManifest(manifest, stamped.input, finalBody);
+    assert.ok(reanchored, "the marker carrier is still in the graph");
+    const claim = reanchored.claims[0]!;
+    assert.equal(stamped.input[claim.index], marker, "re-indexed onto the same object, never a neighbour");
+    assert.equal(claim.index, stamped.input.indexOf(marker), "the claim index IS the carrier's position in the final array");
+    assert.equal(isSeparatorCarrier(stamped.input[claim.index]), true, "and it is still a canonical carrier there");
+});
+
+test("#2627 re-anchor: a checkpoint inserted BEFORE the marker shifts the claim with it", () => {
+    const { ordered, graph, manifest } = manifestWithSeparator();
+    // Force a real pre-marker insertion: a trailing compaction_trigger makes the
+    // checkpoint land before it, and a marker that sits after the insertion point
+    // must keep pointing at itself while its index moves.
+    const marker = ordered.slots[0]!.carrier as Item;
+    const shifted = { input: [{ type: "message", role: "user", content: "pre" } as Item, ...graph.input, { type: "compaction_trigger" } as Item] };
+    assert.ok(shifted.input.indexOf(marker) > graph.input.indexOf(marker), "fixture shifted the marker");
+    const stamped = stampOutbound(shifted, "responses", "proc-1", 1_700_000_000_000) as { input: Item[] };
+    assert.ok(stamped, "fixture stamped");
+    const reanchored = reanchorSeparatorManifest(manifest, stamped.input, JSON.stringify(stamped));
+    assert.ok(reanchored, "the marker survived the insertion");
+    assert.equal(reanchored.claims.length, 1, "and only the producer's marker is claimed");
+    assert.equal(stamped.input[reanchored.claims[0]!.index], marker, "the claim followed the marker, not the old index");
+    assert.notEqual(reanchored.claims[0]!.index, manifest.claims[0]!.index, "the prepare-time index would have pointed at the wrong item");
+});
+
+test("#2627 re-anchor: the real judge accepts a stamped turn without a false I1/I2", () => {
+    const { graph, manifest } = manifestWithSeparator();
+    const entry = responsesToCore({ input: coreToResponses(SEPARATOR_FOLDED) } as Parameters<typeof responsesToCore>[0]).msgs;
+    const stamped = stampOutbound(graph, "responses", "proc-1", 1_700_000_000_000) as { input: Item[] };
+    const finalBody = JSON.stringify(stamped);
+    const reanchored = reanchorSeparatorManifest(manifest, stamped.input, finalBody);
+    assert.ok(reanchored);
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, (verdict) => { verdicts.push(verdict); });
+    try {
+        // Without the re-anchor the stale binding exempts nothing, so the judge
+        // reports the marker as a mid-history insertion.
+        maybeRunInvariantJudge({ originalMessages: entry, body: finalBody, parsed: JSON.parse(finalBody), protocol: "responses", separatorManifest: manifest });
+        assert.equal(verdicts.at(-1)?.ok, false, "an unproven separator is judged as an insertion");
+
+        maybeRunInvariantJudge({ originalMessages: entry, body: finalBody, parsed: JSON.parse(finalBody), protocol: "responses", separatorManifest: reanchored });
+        assert.equal(verdicts.at(-1)?.ok, true, "the re-anchored claim excuses exactly the producer's marker");
+        assert.deepEqual(verdicts.at(-1)?.violations ?? [], [], "no I1/I2 finding survives the re-anchor");
+    } finally {
+        _setInvariantJudgeForTest(false);
+    }
+});
+
+test("#2627 re-anchor: a client look-alike is never adopted by the re-anchor", () => {
+    const { ordered, graph, manifest } = manifestWithSeparator();
+    // A client item with the separator's exact text (and a reserved-looking id in
+    // its payload) sits next to the producer's marker.
+    graph.input.splice(0, 0, { type: "message", role: "user", content: RESPONSES_TURN_SEPARATOR, id: `${RESPONSES_TURN_SEPARATOR_ID_PREFIX}99` } as Item);
+    const finalBody = JSON.stringify(graph);
+    const reanchored = reanchorSeparatorManifest(manifest, graph.input, finalBody);
+    assert.ok(reanchored, "the producer's marker is still present");
+    assert.equal(reanchored.claims.length, 1, "the look-alike adds no claim even though its shape matches");
+    assert.equal(graph.input[reanchored.claims[0]!.index], ordered.slots[0]!.carrier, "the single claim is the producer's object");
+    assert.notEqual(reanchored.claims[0]!.index, 0, "the client item at index 0 is not adopted");
+    const owned = separatorProvenanceSet(reanchored, graph.input, finalBody);
+    assert.deepEqual([...owned], [reanchored.claims[0]!.index], "the judge exempts only the producer's index");
+});
+
+test("#2627 re-anchor: a replaced or dropped carrier fails closed", () => {
+    const { ordered, graph, manifest } = manifestWithSeparator();
+    // Replaced with a fresh look-alike object (an opaque rewrite or re-serialize).
+    const replaced = { input: graph.input.map((item) => (item === ordered.slots[0]!.carrier ? { type: "message", role: "user", content: RESPONSES_TURN_SEPARATOR } as Item : item)) };
+    assert.equal(reanchorSeparatorManifest(manifest, replaced.input, JSON.stringify(replaced)), undefined, "a substituted object proves no lineage");
+    // Dropped entirely.
+    const removed = { input: graph.input.filter((item) => item !== ordered.slots[0]!.carrier) };
+    assert.equal(reanchorSeparatorManifest(manifest, removed.input, JSON.stringify(removed)), undefined, "an absent carrier claims nothing");
+    // A body the caller cannot vouch for (no string) also fails closed.
+    assert.equal(reanchorSeparatorManifest(manifest, graph.input, null), undefined, "no body binding, no claims");
+});
+
+test("#2627 drop-fields: an unrelated dotted drop keeps only the real claim", () => {
+    const { ordered, graph, body, manifest } = manifestWithSeparator();
+    // A configured drop that touches a plain object elsewhere on the wire. The
+    // marker carrier is untouched by reference, so its claim survives — the
+    // blanket "any dotted path ⇒ discard all claims" rule was too broad.
+    graph.plausible = { nested: { keep: 1, gone: 2 } } as never;
+    const dropped = dropCompatFieldsJson(graph as Record<string, unknown>, ["plausible.nested.gone"]);
+    assert.equal(dropped, 1, "fixture actually deleted a key");
+    const finalBody = JSON.stringify(graph);
+    assert.notEqual(finalBody, body, "the drop produced different bytes");
+    const reanchored = reanchorSeparatorManifest(manifest, graph.input, finalBody);
+    assert.ok(reanchored, "an unrelated structural deletion destroys no lineage");
+    assert.equal(reanchored.claims.length, 1, "exactly the producer's marker stays claimed");
+    assert.equal(graph.input[reanchored.claims[0]!.index], ordered.slots[0]!.carrier);
+    assert.deepEqual([...separatorProvenanceSet(reanchored, graph.input, finalBody)], [reanchored.claims[0]!.index]);
+});
+
+test("#2627 drop-fields: a root drop that deletes `input` grants nothing", () => {
+    const { graph, manifest } = manifestWithSeparator();
+    // The carrier is deleted with its whole array: no claim may be handed to
+    // anything else, and the manifest must not survive.
+    const dropped = dropCompatFieldsJson(graph as Record<string, unknown>, ["input"]);
+    assert.equal(dropped, 1, "fixture deleted the carrier container");
+    assert.equal("input" in graph, false, "the array itself is gone");
+    assert.equal(reanchorSeparatorManifest(manifest, undefined, JSON.stringify(graph)), undefined, "no carriers ⇒ no claims");
+});
+
+test("#2627 unknown ownership: an opaque rewrite reports no separator I1/I2 but stays armed", () => {
+    const { graph, manifest } = manifestWithSeparator();
+    const entry = responsesToCore({ input: coreToResponses(SEPARATOR_ORIGINAL) } as Parameters<typeof responsesToCore>[0]).msgs;
+    const body = JSON.stringify(graph);
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, (verdict) => { verdicts.push(verdict); });
+    try {
+        // BASELINE: with the manifest proven against these bytes the marker is
+        // exempt, so the same send is clean.
+        maybeRunInvariantJudge({ originalMessages: entry, body, parsed: JSON.parse(body), protocol: "responses", separatorManifest: manifest });
+        assert.equal(verdicts.at(-1)?.ok, true, "the anchored claim exempts the producer's own marker");
+
+        // ABSENT (the pre-fix bug): dropping the manifest without recording that
+        // ownership is unknown makes the judge read bili's marker as a client
+        // insertion — the false I1 this feature exists to prevent.
+        maybeRunInvariantJudge({ originalMessages: entry, body, parsed: JSON.parse(body), protocol: "responses" });
+        assert.equal(verdicts.at(-1)?.ok, false, "no claims at all ⇒ the marker is judged as an insertion");
+        assert.ok((verdicts.at(-1)?.violations ?? []).some((v) => v.kind === "mid-insertion"), "and the finding is specifically an insertion");
+
+        // UNKNOWN: an opaque host rewrite destroyed the proof, so the same send
+        // must not be accused of an insertion bili itself made.
+        maybeRunInvariantJudge({ originalMessages: entry, body, parsed: JSON.parse(body), protocol: "responses", separatorOwnershipUnknown: true });
+        assert.equal(verdicts.at(-1)?.ok, true, "unknown ownership does not accuse the client of bili's own marker");
+        assert.deepEqual(verdicts.at(-1)?.violations ?? [], [], "and no I1/I2 survives it");
+
+        // ...while a NON-separator integrity finding still fires under unknown
+        // ownership: an orphaned tool call is a tool-pair problem, not a
+        // separator question, so it must not be excused.
+        const orphaned = { input: [...graph.input, { type: "function_call", call_id: "call_orphan", name: "f", arguments: "{}" } as unknown as Item] };
+        maybeRunInvariantJudge({ originalMessages: entry, body: JSON.stringify(orphaned), parsed: orphaned as never, protocol: "responses", separatorOwnershipUnknown: true });
+        assert.equal(verdicts.at(-1)?.ok, false, "unknown separator ownership does not disarm unrelated checks");
+        assert.ok((verdicts.at(-1)?.violations ?? []).some((v) => v.kind === "unpaired-tool-call"), "the tool-pair finding is still reported");
+    } finally {
+        _setInvariantJudgeForTest(false);
+    }
+});
+
+test("#2627 unknown ownership: a client-only look-alike is still judged", () => {
+    // No producer manifest at all ⇒ ownership is ABSENT, not unknown. A client
+    // that sends a separator-shaped item on its own gets the normal verdict —
+    // and adding a manifest for someone else's turn does not change that.
+    const entry = responsesToCore({ input: coreToResponses(SEPARATOR_ORIGINAL) } as Parameters<typeof responsesToCore>[0]).msgs;
+    // Mid-history, where an unexplained element is an INSERTION: appending after
+    // the whole inbound is a legitimate client tail, not a false exemption.
+    const items = coreToResponses(SEPARATOR_ORIGINAL) as Item[];
+    const outbound = {
+        input: [
+            items[0]!,
+            { type: "message", role: "user", content: RESPONSES_TURN_SEPARATOR } as Item,
+            ...items.slice(1),
+        ],
+    };
+    const body = JSON.stringify(outbound);
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, (verdict) => { verdicts.push(verdict); });
+    try {
+        maybeRunInvariantJudge({ originalMessages: entry, body, parsed: JSON.parse(body), protocol: "responses" });
+        assert.equal(verdicts.at(-1)?.ok, false, "a client-origin look-alike is a real insertion when nothing is unknown");
+        assert.ok((verdicts.at(-1)?.violations ?? []).some((v) => v.kind === "mid-insertion"), "and it is reported as an insertion");
+    } finally {
+        _setInvariantJudgeForTest(false);
+    }
+});

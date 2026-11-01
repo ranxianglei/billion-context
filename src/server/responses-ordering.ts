@@ -32,12 +32,20 @@
  *     looks each item up in a `Map` keyed by carrier object identity, and records
  *     the index where its carrier was found. No codec call, no per-item
  *     serialization, no text/id/prefix matching, no layout guess.
- *  4. THE RELAY REVALIDATES. Bind those proven indexes to the already serialized
- *     immutable body string. A fresh parse may use them only when its source
- *     string equals that exact binding; any byte-changing rewrite fails closed.
- *     Canonical shape then validates the already-owned indexes, not ownership.
+ *  4. THE RELAY RE-ANCHORS BY THE SAME IDENTITY. Relay-level transforms (compat
+ *     roles, output steering, `compat.dropFields`, the chain checkpoint) mutate
+ *     the parsed body and may change bytes without touching a marker, so the
+ *     prepare-time index list can go stale while still being true about the graph.
+ *     `reanchorSeparatorManifest` walks the FINAL array once, looks each claim's
+ *     carrier up by identity, and re-records the index where it now sits — an
+ *     inserted checkpoint moves the claim with its carrier, it never re-points it.
+ *     The result binds to the relay's own serialized string.
+ *  5. THE JUDGE REVALIDATES BY BODY EQUALITY. A fresh parse may use the claims
+ *     only when its source string equals that exact binding; any byte-changing
+ *     rewrite fails closed. Canonical shape then validates the already-owned
+ *     indexes, not ownership.
  *
- * Only indexes surviving all four steps are exempt in the judge; every other
+ * Only indexes surviving every step are exempt in the judge; every other
  * element — including identical prose at any index — is judged normally. The
  * carrier-shape check is validation of a claim, never evidence of ownership.
  */
@@ -83,6 +91,21 @@ export function isSeparatorCarrier(item: unknown, text: string = RESPONSES_TURN_
   const keys = Object.keys(record);
   if (keys.length !== 3) return false;
   return record["type"] === "message" && record["role"] === "user" && record["content"] === text;
+}
+
+/**
+ * Shape test for a CoreMessage that could be a serialized turn separator.
+ *
+ * This is deliberately a SHAPE test, not an ownership test: it answers "could
+ * this core be an unattributable marker?" — never "does the producer own it?".
+ * Only used where ownership is already proven UNKNOWN (an opaque host rewrite
+ * destroyed the proof), so that a genuine host marker is not reported as a
+ * client insertion. A client that copies the exact prose is indistinguishable
+ * here, which is precisely why this predicate must never be used to GRANT an
+ * exemption.
+ */
+export function isSeparatorCoreShaped(core: CoreMessage, text: string = RESPONSES_TURN_SEPARATOR): boolean {
+  return core.role === "user" && core.contentType === "text" && core.text === text;
 }
 
 /**
@@ -254,6 +277,33 @@ function resolveSeparatorIndexes(
 }
 
 /**
+ * Does `manifest` still describe `wire` + `body` exactly as the producer left it?
+ *
+ * Two independent proofs, both required:
+ *  1. `manifest.body` is byte-identical to the body being examined — a manifest
+ *     for other bytes says nothing about these.
+ *  2. every claimed index holds that claim's own carrier object in `wire`, and
+ *     that object is still a canonical carrier.
+ *
+ * This is the entry gate for re-anchoring: a relay may only treat a manifest as
+ * live lineage after passing it. Fails closed on any missing array/body.
+ */
+export function separatorManifestAnchored(
+  manifest: SeparatorManifest | undefined,
+  wire: readonly unknown[] | null | undefined,
+  body: string | null | undefined,
+): boolean {
+  if (manifest === undefined || typeof body !== "string" || body.length === 0) return false;
+  if (manifest.body !== body) return false;
+  if (!Array.isArray(wire)) return false;
+  for (const claim of manifest.claims) {
+    const item = wire[claim.index];
+    if (item !== claim.carrier || !isSeparatorCarrier(item, manifest.text)) return false;
+  }
+  return true;
+}
+
+/**
  * Build the manifest the judge consumes, bound to the serialized body.
  *
  * `finalWire` must be the array that becomes `body.input` and `body` the EXACT
@@ -277,6 +327,68 @@ export function collectSeparatorManifest(
   const claims = resolveSeparatorIndexes(finalWire, slots);
   if (claims.length === 0) return undefined;
   return { text: RESPONSES_TURN_SEPARATOR, claims, length: finalWire.length, body };
+}
+
+/**
+ * Re-anchor a manifest's claims onto the FINAL wire array, keeping the binding.
+ *
+ * The relay sits between prepare and the wire and rewrites the parsed body (compat
+ * roles, output steering, `compat.dropFields`, the chain checkpoint). Those
+ * transforms can change bytes — a role flip, a stamped checkpoint — without
+ * touching any marker, so the prepare-time index list and body string are no
+ * longer true statements about the bytes about to leave.
+ *
+ * The carriers are what make re-anchoring possible: `finalWire` must be the array
+ * belonging to `finalBody`, built by those transforms from the SAME parsed graph
+ * prepare produced, so every surviving item — marker carriers included — is still
+ * the same object reference. Identity, not index, is re-derived:
+ *
+ *  - a claim survives only when its own `carrier` object is found in `finalWire`
+ *    at a canonical carrier position; a transform that replaced, re-serialized or
+ *    dropped the item leaves the claim behind;
+ *  - indexes are never shifted onto a neighbour, so an inserted checkpoint moves
+ *    the claim with its carrier instead of re-pointing it;
+ *  - the returned manifest binds to `finalBody` (the caller's own serialized
+ *    string, never a re-render), so the judge's byte-equality test still proves
+ *    the claims belong to the body it holds.
+ *
+ * `undefined` when the manifest is absent, `finalBody` is not the exact body the
+ * array was serialized to, or no carrier survived — the caller then passes no
+ * manifest and the judge exempts nothing (fail closed).
+ *
+ * One linear walk, one map lookup per item; no codec call, no re-serialization,
+ * no per-item `JSON.stringify`.
+ */
+export function reanchorSeparatorManifest(
+  manifest: SeparatorManifest | undefined,
+  finalWire: readonly unknown[] | null | undefined,
+  finalBody: string | null | undefined,
+  origin?: { readonly wire: readonly unknown[] | null | undefined; readonly body: string | null | undefined },
+): SeparatorManifest | undefined {
+  if (!manifest || !Array.isArray(finalWire)) return undefined;
+  if (typeof finalBody !== "string" || finalBody.length === 0) return undefined;
+  if (manifest.claims.length === 0) return undefined;
+  // When the caller can name the graph this step started from, the manifest must
+  // prove itself against THAT graph and body before any claim is carried over.
+  // Without the proof, object identity in `finalWire` could belong to a different
+  // lineage that merely happens to hold the same references.
+  if (origin !== undefined && !separatorManifestAnchored(manifest, origin.wire, origin.body)) return undefined;
+  // Provenance of the INPUT to this step: each claim is still its own carrier's
+  // claim. Anything else (a forged/synthetic manifest) yields no re-anchor.
+  const expected = new Map<unknown, SeparatorClaim>();
+  for (const claim of manifest.claims) expected.set(claim.carrier, claim);
+  if (expected.size === 0) return undefined;
+  const claims: SeparatorClaim[] = [];
+  for (let index = 0; index < finalWire.length; index++) {
+    const item = finalWire[index];
+    const claim = expected.get(item);
+    if (claim === undefined) continue;
+    if (!isSeparatorCarrier(item, manifest.text)) continue;
+    claims.push({ id: claim.id, index, carrier: claim.carrier });
+    expected.delete(item);
+  }
+  if (claims.length === 0) return undefined;
+  return { text: manifest.text, claims, length: finalWire.length, body: finalBody };
 }
 
 /**

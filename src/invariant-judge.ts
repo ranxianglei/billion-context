@@ -48,7 +48,7 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
-import { collectSeparatorManifest, separatorCoreProvenance, SeparatorManifest, separatorProvenanceSet, type SeparatorSlot } from "./server/responses-ordering.js";
+import { collectSeparatorManifest, isSeparatorCoreShaped, separatorCoreProvenance, SeparatorManifest, separatorProvenanceSet, type SeparatorSlot } from "./server/responses-ordering.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -117,6 +117,15 @@ interface JudgeOptions {
    *  ids, so identical client prose at any other index stays judgeable.
    *  Absent ⇒ legacy behavior (no separator is exempt). */
   separatorProvenance?: ReadonlySet<number>;
+  /** #564/#2627: bili DID mint separator claims for this request, but an opaque
+   *  host rewrite (compat/steering/drop/stamp/shed/scrub) destroyed the proof,
+   *  so ownership of this send's separators is UNKNOWN — not "no claims exist".
+   *  With this set, a separator-shaped outbound element is treated as
+   *  unattributable: the separator-ownership rules (insertion / carrier-drift)
+   *  skip it instead of accusing the client, and it still grants NO exemption.
+   *  Every non-separator check (frozen prefix, drops, rewrites, tool-pair
+   *  integrity, the count-bounded ledger) stays armed. Absent ⇒ legacy. */
+  separatorOwnershipUnknown?: boolean;
 }
 
 function normText(m: CoreMessage): string {
@@ -312,7 +321,14 @@ export function judgeInboundOutbound(
   // #564/#2627: indexes the PRODUCER owns. Empty ⇒ legacy behavior everywhere
   // below, so non-Responses wires and separator-free turns are byte-identical.
   const ownedSep = opts.separatorProvenance;
-  const isOwnedSeparator = (k: number): boolean => ownedSep !== undefined && ownedSep.has(k);
+  const ownershipUnknown = opts.separatorOwnershipUnknown === true;
+  // #564/#2627 unknown-ownership: when an opaque host rewrite destroyed the
+  // provenance proof, a separator-shaped element cannot be attributed to bili OR
+  // to the client. Skipping it here suppresses exactly the ownership verdict
+  // (insertion / carrier-drift for a marker), while every other element keeps
+  // being judged — and it grants no exemption to anything.
+  const isProvenOrUnattributableSeparator = (k: number): boolean =>
+    (ownedSep !== undefined && ownedSep.has(k)) || (ownershipUnknown && isSeparatorCoreShaped(exit[k]!));
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
@@ -355,7 +371,7 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
-        if (isOwnedSeparator(k)) continue;
+        if (isProvenOrUnattributableSeparator(k)) continue;
         scanned++;
         if (scanned > cap) break;
         if (stableEqual(e, x)) { found = k; break; }
@@ -371,7 +387,7 @@ export function judgeInboundOutbound(
       if (located) {
         for (let k = j; k < found; k++) {
           const x = exit[k];
-          if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+          if (isCarrier(x) || isReasoning(x) || isProvenOrUnattributableSeparator(k)) continue;
           violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before tail inbound[${i}]: ${fp(x)}` });
         }
       }
@@ -400,7 +416,7 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
-        if (isOwnedSeparator(k)) continue;
+        if (isProvenOrUnattributableSeparator(k)) continue;
         scanned++;
         if (scanned > maxGap) break;
         if (stableEqual(e, x)) { found = k; break; }
@@ -419,7 +435,7 @@ export function judgeInboundOutbound(
 
       for (let k = j; k < found; k++) {
         const x = exit[k];
-        if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+        if (isCarrier(x) || isReasoning(x) || isProvenOrUnattributableSeparator(k)) continue;
         violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
       }
       matched++;
@@ -431,7 +447,7 @@ export function judgeInboundOutbound(
     if (folded && sumIdx > matched) {
       for (let k = matched; k < sumIdx; k++) {
         const x = exit[k];
-        if (isCarrier(x) || isReasoning(x) || isOwnedSeparator(k)) continue;
+        if (isCarrier(x) || isReasoning(x) || isProvenOrUnattributableSeparator(k)) continue;
         violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
         break;
       }
@@ -498,6 +514,11 @@ interface InvariantJudgeInput {
   /** Producer-owned claims bound to the exact serialized Responses body.
    *  Validated here against the same parsed wire used for the exit projection. */
   separatorManifest?: SeparatorManifest;
+  /** #564/#2627: bili minted separator claims for this request, then an opaque
+   *  host rewrite destroyed their proof. Ownership is UNKNOWN (not "absent"), so
+   *  the judge must not report separator-ownership findings for this send while
+   *  still running every non-separator check. See JudgeOptions. */
+  separatorOwnershipUnknown?: boolean;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -576,7 +597,11 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const separatorProvenance = input.separatorManifest !== undefined && input.protocol === "responses" && Array.isArray(parsed?.input)
       ? separatorCoreProvenance(separatorProvenanceSet(input.separatorManifest, parsed.input, typeof input.body === "string" ? input.body : undefined), exitCores)
       : undefined;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, ...(separatorProvenance !== undefined ? { separatorProvenance } : {}) });
+    const v = judgeInboundOutbound(entry, exitCores, {
+      renderTailStart: input.renderTailStart,
+      ...(separatorProvenance !== undefined ? { separatorProvenance } : {}),
+      ...(input.separatorOwnershipUnknown === true ? { separatorOwnershipUnknown: true } : {}),
+    });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
