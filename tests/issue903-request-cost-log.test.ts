@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { formatBytes } from "../src/server/request-cost.ts";
 
 // #903: long sessions keep resending the full harness history to bili even
 // when the folded context stays small — the per-request cost line makes that
@@ -36,21 +37,13 @@ function inboundBytesOf(line: string): number {
     return Math.round(v * mult);
 }
 
-function outboundBytesOf(line: string): number {
-    const m = line.match(/outbound=(\d+(?:\.\d+)?)(B|KiB|MiB|GiB)/);
-    assert.ok(m, `no outbound field in: ${line}`);
-    const v = Number(m![1]);
-    const mult = m![2] === "B" ? 1 : m![2] === "KiB" ? 1024 : m![2] === "MiB" ? 1024 ** 2 : 1024 ** 3;
-    return Math.round(v * mult);
-}
-
 test("e2e: per-request cost line reports msg count, inbound wire size and local duration", async () => {
-    let upstreamSeen = 0;
+    const upstreamBodies: Buffer[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            upstreamSeen = Buffer.concat(chunks).length;
+            upstreamBodies.push(Buffer.concat(chunks));
             res.writeHead(200, { "content-type": "application/json" });
             res.end(okJson());
         });
@@ -79,7 +72,7 @@ test("e2e: per-request cost line reports msg count, inbound wire size and local 
         chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
-        compat: { roles: {} },
+        compat: { roles: { assistant: "rewritten-assistant-role-with-a-deliberately-long-name" } },
         streamErrorShape: "protocol",
         passthroughSource: null,
         autoRestartOnUpdate: false,
@@ -114,13 +107,15 @@ test("e2e: per-request cost line reports msg count, inbound wire size and local 
         const r1 = await fetch(url, { method: "POST", headers, body: first.raw });
         assert.equal(r1.status, 200);
         await r1.text();
-        const up1 = upstreamSeen;
+        assert.equal(upstreamBodies.length, 1);
+        const up1 = upstreamBodies[0]!.length;
 
         const second = mkBody(3);
         const r2 = await fetch(url, { method: "POST", headers, body: second.raw });
         assert.equal(r2.status, 200);
         await r2.text();
-        const up2 = upstreamSeen;
+        assert.equal(upstreamBodies.length, 2);
+        const up2 = upstreamBodies[1]!.length;
 
         // Blocked side request (#554 gate): tiny output budget + raw-history
         // estimate reaching the effective window -> 413 locally, upstream never
@@ -138,12 +133,12 @@ test("e2e: per-request cost line reports msg count, inbound wire size and local 
         const l1 = costLines[0]!;
         assert.match(l1, /^\[cost-sess\] request: 5 msgs, inbound=\d+(?:\.\d+)?(B|KiB|MiB|GiB), outbound=\d+(?:\.\d+)?(B|KiB|MiB|GiB), local=\d+ms$/);
         assert.ok(Math.abs(inboundBytesOf(l1) - Buffer.byteLength(first.raw)) <= 100, `inbound ${l1} vs sent ${Buffer.byteLength(first.raw)}`);
-        assert.ok(Math.abs(outboundBytesOf(l1) - up1) <= 100, `outbound ${l1} vs upstream-received ${up1}`);
+        assert.ok(l1.includes(`outbound=${formatBytes(up1)}`), `outbound ${l1} vs upstream-received ${up1}`);
 
         const l2 = costLines[1]!;
         assert.match(l2, /^\[cost-sess\] request: 7 msgs, inbound=\d+(?:\.\d+)?(B|KiB|MiB|GiB), outbound=\d+(?:\.\d+)?(B|KiB|MiB|GiB), local=\d+ms$/);
         assert.ok(Math.abs(inboundBytesOf(l2) - Buffer.byteLength(second.raw)) <= 100, `inbound ${l2} vs sent ${Buffer.byteLength(second.raw)}`);
-        assert.ok(Math.abs(outboundBytesOf(l2) - up2) <= 100, `outbound ${l2} vs upstream-received ${up2}`);
+        assert.ok(l2.includes(`outbound=${formatBytes(up2)}`), `outbound ${l2} vs upstream-received ${up2}`);
         assert.ok(inboundBytesOf(l2) > inboundBytesOf(l1), "growing history must show up as growing inbound");
 
         const l3 = costLines[2]!;

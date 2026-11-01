@@ -71,7 +71,8 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
 // #5243: warn-once per model when the live codex model table is unavailable and
@@ -2604,7 +2605,6 @@ async function handleRequest(
                     if (mode === "intercept" && gatePre) prepared = await runPrepare();
                     if (prepared) memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                     if (prepared?.codexForge) {
-                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         return { body: prepared.body, prepared };
                     }
                     // runPrepare may have mutated parsed before failing to forge.
@@ -2616,7 +2616,6 @@ async function handleRequest(
                     const forwardBody = normalized ? Buffer.from(JSON.stringify({ ...original, input: items })) : bodyBuffer;
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
                     log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
-                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
                 }
                 // #3450: ONE wall per request — on the refold path the
@@ -2804,7 +2803,6 @@ async function handleRequest(
                 // forward — anything that queued during the turn is served
                 // here rather than behind the response stream setup.
                 await yieldToEventLoop();
-                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
             // #1884/#2090 (un-armed signed traffic): a request that already
@@ -2890,7 +2888,9 @@ async function handleRequest(
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta);
+                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, (outbound) => {
+                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
+                });
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
