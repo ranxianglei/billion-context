@@ -302,6 +302,18 @@ const PARITY_SHAPES: Array<[string, string]> = [
 //      STRUCTURE (held/preHeld/swallowed) — and adding it collides with the
 //      #2190 balanced-markup contract.
 //
+// There is no span-local shortcut for (2), and that was MEASURED, not assumed:
+// the residual at every one of the 50 byte cuts is one of exactly three shapes —
+// `acct> </apct>   </apct> </apct>` (34x), `</apct> </apct>` (8x), `</apct>`
+// (8x). Deleting a lone close there does not balance the line, it UNBALANCES the
+// one thing still balanced: the headless `acct>` open was already released as
+// prose in an earlier push, so removing its close produces a dangling open —
+// the very shape #2190 round 3 forbids — while removing both would require
+// retracting bytes the client already has. A rule keyed on "two orphan closes of
+// different drift names" matches none of the three shapes either. The
+// whole-field pass is the only unit that can see both halves, which is why
+// stripAcpTags cleans it and this seam cannot.
+//
 // Everything the lane CAN decide is asserted exactly, in the test below.
 // The only streaming leftover this lane cannot remove is ORPHAN drift tags
 // carrying no ref content: halves whose `\x3c` was lost upstream (`acpt>`, which
