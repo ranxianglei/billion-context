@@ -1570,6 +1570,8 @@ function changelogCatOf(rawLine) {
                 hb.hidden = true;
                 hb.classList.remove("show");
                 hb.innerHTML = "";
+            }
+        }
         // #4634: default-on auto-review block notice — only shows once at least
         // one review request was locally answered (count + saved estimate + how
         // to turn auto-review itself off; the block only stops bili's egress).
@@ -1586,8 +1588,6 @@ function changelogCatOf(rawLine) {
                 arb.classList.remove("show");
                 arb.innerHTML = "";
             }
-            }
-        }
         }
         // #5079: prompt_cache_key default-off upgrade notice — dismissal is
         // server-side (POST /__bili/notices/dismiss) so one close silences

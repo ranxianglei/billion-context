@@ -1000,8 +1000,6 @@ export type ProxyOptions = {
  *  (irreversible), so no opt-in remains. Live keys: `authoredCompaction`
  *  (#3723/#3901), `contextTab`/`contextTabLabel` (#4237), `autoReviewBlock`
  *  (#4634). Leftover removed keys still sit in old
- *  (irreversible), so no opt-in remains. The one live key is
- *  `authoredCompaction` (#3723/#3901). Leftover removed keys still sit in old
  *  files: the section stays RECOGNIZED so they don't trip the unknown-key
  *  warning, and each is ignored with a once-per-process deprecation note
  *  (warnRemovedDshAllowKey). */
