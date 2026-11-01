@@ -1927,8 +1927,9 @@ export function apply(ctx: PluginContext): void {
                 const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
                 // #5403/#5418: feed the SAME id list into the watermark channel
                 // (the fetch chokepoint emits count + tail-ids; core =
-                // pf-channel.ts). No-ops on empty/unusable lists.
-                if (scope.msgIds !== undefined) pfChannel.pfCaptureIds(sid, scope.msgIds);
+                // pf-channel.ts). A failed resolution (undefined) CLEARS the
+                // stored list like every other adapter — never ride a stale one.
+                pfChannel.pfCaptureIds(sid, scope.msgIds);
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance — the
                 // run() below covers the former, wrapScopedIterable the latter.
