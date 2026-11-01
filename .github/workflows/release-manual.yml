@@ -228,6 +228,18 @@ jobs:
           case "$VER" in *-*) NPMTAG="dev"; PRERELEASE="true";; esac
           npm publish --tag "$NPMTAG" --access public
           echo "::warning::RAW PUBLISHED v${VER} to npm (tag ${NPMTAG}) with zero typecheck/test/CI coverage. master is NOT updated yet."
+          # Land the workspace bump as a commit BEFORE tagging / pushing the sync branch:
+          # without it the tag points at a tree that still carries the OLD version
+          # (poisoning later bugfix-lane cuts-from-tag), and the sync branch is byte-
+          # identical to master -> empty diff -> GitHub 422 -> master never converges
+          # and the next NORMAL one-click aborts on the drift guard. On the pending_
+          # bump path nothing is staged and the commit harmlessly no-ops (head already
+          # carries the bumped version).
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git commit -q -m "release v${VER} (emergency raw publish; convergence via sync PR)"; then
+            echo "::warning::nothing staged to commit (pending_bump path or clean tree) — tag/sync branch point at the current head as before"
+          fi
           # --- convergence bookkeeping (best effort; a failure here never un-publishes) ---
           LAST_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1 2>/dev/null || true)"
           if [ -n "$LAST_TAG" ]; then
