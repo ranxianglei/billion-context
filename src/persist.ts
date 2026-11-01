@@ -593,7 +593,9 @@ export class SessionStore {
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
                 // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
-                perfTelemetryInit("mysql", { dir: this.sessionsDir, log: baseLog });
+                // Pure-JSON ("legacy") mode stays frozen even when it rides this
+                // branch (a mysql backend with storage.unified=legacy) — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "mysql", { dir: this.sessionsDir, log: baseLog });
             });
             // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
             // (no degradation in any case). Boot awaits ready() and exits
@@ -616,7 +618,9 @@ export class SessionStore {
                 this.syncSidecarOpen = { legacyLoad };
                 this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
                 // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
-                perfTelemetryInit("sqlite", { dir: this.sessionsDir, log: baseLog });
+                // Pure-JSON ("legacy") mode flows through this branch too
+                // (maybeOpen returns null for it) but stays frozen — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "sqlite", { dir: this.sessionsDir, log: baseLog });
             } else {
                 // #5460: pure-JSON storage mode is frozen — telemetry stays off there.
                 this.shadow = undefined;
