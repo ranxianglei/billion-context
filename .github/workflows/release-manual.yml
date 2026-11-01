@@ -92,6 +92,14 @@ jobs:
                && ! git ls-remote --exit-code --tags origin "v$TREE_V" >/dev/null 2>&1; then
               echo "::notice::$WHAT package.json ($TREE_V) is one patch ahead of npm latest ($NPM_V) — pending-bump state; publishing $TREE_V straight from master (no new bump commit)."
               echo "pending_bump=true" >> "$GITHUB_OUTPUT"
+            elif [ "${{ inputs.raw_publish }}" = "true" ]; then
+              # Emergency channel (owner decision 2026-11-01): raw_publish ships the tree
+              # AS-IS and never pushes master, so a master/npm version skew must NOT block
+              # a second back-to-back emergency publish (the sync PR from publish #1 is
+              # still unmerged — that is the whole point of this button). Drift is logged
+              # loudly; nothing gates on it. Duplicate-publish protection stays in the
+              # Raw emergency publish step, which refuses an npm version that already exists.
+              echo "::warning::EMERGENCY CHANNEL: $WHAT package.json ($TREE_V) != npm latest ($NPM_V) — raw_publish ships the current tree anyway and does not touch master. Drift logged, not blocking; converge master via the version-sync PR after the dust settles."
             else
               echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
               exit 1
