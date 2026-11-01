@@ -5,6 +5,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Changed
+- **自动更新的错峰抽取窗口上限从 48 小时拉长到 7 天**:发现新版本后,每台实例在 15 分钟 – 7 天内随机抽一个时刻到点再升(原来 48 小时)。改动同时落在两处:内置默认值(`STAGGER_MAX_DELAY_DEFAULT_MS`,远程策略文件不可达/未配置时的兑底)和本仓库官方策略文件 `auto-update-policy.json` 的 `default.maxDelay`(2d→7d,远程默认优先于内置,不改它的话内置改动不会生效)。已抽中的时刻按 `(dist-tag, 版本)` 落盘持久化,升级到本版后**不会重摇**——已生效的旧抽取照旧到点执行,只有升级后新发现的版本才在 7 天窗口内抽。手动 `bili update`、`staggerMinDelayMs:0 + staggerMaxDelayMs:0`(或对应环境变量)照旧绕过/恢复立即升级;远程策略与本机 config/env 的优先级不变(本地 > 远程 > 内置)。
+
 ### Fixed
 
 * **#5412: 异步存储后端的「压缩冻结会话」现在也能自愈。** #5408 事故(一个会话连续 17 次摘要漂移后被保护机制冻住、8 小时无人知晓)的主修复 #5409 只教了同步存储路径(SQLite 直写)自救:漂移挂起期间保存会自动升级为全量重导入并清掉索引里的残留行。异步路径(opt-in 网络后端,如 mysql)那份孪生代码没搬——同样被冻住的会话在那上面永远救不回来,每次保存都重写不完整视图、下轮采样继续漂移。本 PR 在 `src/storage/shadow.ts` 的异步入队路径补上同一行对齐(`completeLog = hasRawTail || driftedSessions.has(id)`),行为与同步路径逐字一致;回归测试同时钉住正门(latch 挂起的折叠保存清掉外来行)与负门(未挂起保存不清扫)。

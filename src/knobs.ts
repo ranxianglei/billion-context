@@ -516,7 +516,7 @@ export function updateStaggerMinDelayMs(): number | undefined {
     return Number.isInteger(v) && v >= 0 ? Math.floor(v) : undefined;
 }
 
-/** BILI_UPDATE_STAGGER_MAX_MS > update.staggerMaxDelayMs > undefined (built-in 48 h).
+/** BILI_UPDATE_STAGGER_MAX_MS > update.staggerMaxDelayMs > undefined (built-in 7 days).
  *  0 is valid: together with min 0 it restores legacy immediate upgrades.
  *  Same string-duration support as the min knob above. */
 export function updateStaggerMaxDelayMs(): number | undefined {
