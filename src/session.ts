@@ -1573,6 +1573,16 @@ export function findSessionByCanonicalId(canonicalId: string): Session | undefin
     return undefined;
 }
 
+/** #5300: per-session compression opt-out — exact session id, runtime-set via
+ *  POST /__bili/session/<id>/compress, read back via GET on the same path.
+ *  While true the pipeline forwards that session's model requests verbatim
+ *  (the passthrough tail): no fold, no nudge, no tool/philosophy injection,
+ *  no preflight; explicit compress tool calls are refused loudly. Prospective
+ *  only — spans folded before exclusion stay folded (decompress restores). */
+export function isCompressionDisabled(session: Session): boolean {
+    return session.metadata.compressionDisabled === true;
+}
+
 /** Overwrite the session's full-conversation snapshot with the latest client
  *  raw request messages (originalMessages from prepare*). One array per
  *  session, replaced every request — bounded, always the newest state. Empty
