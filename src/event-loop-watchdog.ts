@@ -13,11 +13,16 @@
  * Mechanism: a worker thread has its OWN event loop, so it keeps running while
  * the main thread spins. The main thread posts a heartbeat every 5 s; the
  * worker measures the gap and, after SOFT_WARN_MS of continuous silence, logs
- * a warning; after HARD_TIMEOUT_MS it writes a forensic line and exits the
- * WHOLE process (code 1) so the spawner respawns onto the freed port. Legit
- * work never blocks the loop for five straight minutes — compression runs in
- * sync slices that complete in seconds to minutes and yield between requests —
- * so the hard threshold is deadlock detection, not load detection.
+ * a warning; after HARD_TIMEOUT_MS it writes a forensic line and kills the
+ * WHOLE process (SIGKILL to its own pid — see the trip branch) so the spawner
+ * respawns onto the freed port. The five-minute hard limit is an availability
+ * policy, not proof of deadlock: exceptionally long legitimate synchronous
+ * work can also trip it. Forced termination may lose unflushed state.
+ *
+ * Worker process.exit() terminates only that worker, not the serving process.
+ * Asking the parent to exit also cannot work while its event loop is blocked.
+ * The worker therefore signals the shared OS pid directly; SIGKILL cannot be
+ * delayed by a queued JavaScript shutdown handler.
  *
  * Scope discipline: plugin-injection mode (dist/agent/*) never calls
  * startServer, so a wedged HOST process is never at risk of being killed by
@@ -38,6 +43,7 @@
  * so the condition has to be structural, not defensive.
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
+import { logTimestamp } from "./logger.js";
 
 export const WATCHDOG_HEARTBEAT_MS = 5_000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
@@ -68,8 +74,8 @@ interface ArmEventLoopWatchdogOptions {
     softWarnMs?: number;
     hardTimeoutMs?: number;
     checkIntervalMs?: number;
-    /** "exit" (production): the worker calls process.exit itself — required,
-     *  because a wedged main thread can never receive a message asking it to
+    /** "exit" (production): the worker SIGKILLs the process by pid — required,
+     *  because a wedged main thread can never run a callback asking it to
      *  die. "report": the worker posts {type:"trip"} and stays alive — test
      *  seam so the suite process is not killed. */
     fatalMode?: "exit" | "report";
@@ -109,6 +115,10 @@ interface WatchdogTripMsg {
 // exist in eval workers (ReferenceError, verified on Node 22), so the port
 // must be fetched from the module itself.
 const WORKER_CODE = [
+    // tsx/esbuild keepNames wraps nested helpers with __name; eval workers
+    // receive only this source, so provide its identity runtime explicitly.
+    "const __name = (fn, _name) => fn;",
+    logTimestamp.toString(),
     "let parentPort = null;",
     "try { parentPort = require(\"worker_threads\").parentPort; } catch (e) {}",
     "let logFile = null;",
@@ -133,8 +143,8 @@ const WORKER_CODE = [
     "}",
     "",
     "function line(level, msg) {",
-    "  const row = new Date().toISOString() + \" [\" + level + \"][v=\" + version + \"] \" + msg + \"\\n\";",
-    "  try { if (logFile !== null) require(\"fs\").appendFileSync(logFile, row); } catch (e) {}",
+    "  const row = logTimestamp() + \" [\" + level + \"] [v=\" + version + \"] \" + msg + \"\\n\";",
+    "  try { if (logFile !== null) require(\"fs\").appendFileSync(logFile, row, { mode: 0o600 }); } catch (e) {}",
     "  if (emitStderr) { try { process.stderr.write(row); } catch (e) {} }",
     "}",
     "",
@@ -143,12 +153,17 @@ const WORKER_CODE = [
     "  const v = verdict(gap);",
     "  if (v === \"warn\") {",
     "    warned = true;",
-    "    line(\"warn\", \"[event-loop-watchdog] main event loop silent for \" + fmt(gap) + \" (soft threshold \" + fmt(softWarnMs) + \") — self-exit after \" + fmt(hardTimeoutMs) + \" of continuous block (#4762)\");",
+    "    line(\"warn\", \"[event-loop-watchdog] main event loop silent for \" + fmt(gap) + \" (soft threshold \" + fmt(softWarnMs) + \") — process kill after \" + fmt(hardTimeoutMs) + \" of continuous block (#4762)\");",
     "  } else if (v === \"trip\" && !tripped) {",
     "    tripped = true;",
-    "    line(\"error\", \"[event-loop-watchdog] FATAL: main event loop silent for \" + fmt(gap) + \" (hard threshold \" + fmt(hardTimeoutMs) + \") — exiting so the spawner can respawn onto the freed port (#4762)\");",
+    "    line(\"error\", \"[event-loop-watchdog] FATAL: main event loop silent for \" + fmt(gap) + \" (hard threshold \" + fmt(hardTimeoutMs) + \") — killing the process (SIGKILL) so the spawner can respawn onto the freed port (#4762)\");",
     "    try { parentPort.postMessage({ type: \"trip\", gapMs: gap }); } catch (e) {}",
-    "    if (fatalMode === \"exit\") process.exit(1);",
+    // Worker process.exit() leaves the serving parent alive. Signal the shared
+    // OS pid directly so termination does not depend on the blocked event loop.
+    // The forensic append above completes before the uncatchable signal.
+    "    if (fatalMode === \"exit\") {",
+    "      process.kill(process.pid, \"SIGKILL\");",
+    "    }",
     "  }",
     "}",
     "",

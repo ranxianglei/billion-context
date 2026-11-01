@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { Worker } from "node:worker_threads";
 import {
     WATCHDOG_HEARTBEAT_MS,
@@ -63,12 +66,96 @@ test("wedged main loop trips the watchdog: warn + fatal forensic lines land in t
         assert.match(content, /\[event-loop-watchdog\] main event loop silent for \d+(?:ms|s) \(soft threshold 60ms\)/);
         assert.match(content, /\[event-loop-watchdog\] FATAL: main event loop silent for \d+(?:ms|s) \(hard threshold 150ms\)/);
         assert.match(content, /\[v=0\.0\.0-test\]/);
+        assert.match(content, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} \[(?:warn|error)\] \[v=/m);
+        assert.doesNotMatch(content, /Z \[/);
         // report mode latches: exactly ONE fatal line per wedge episode
         assert.equal((content.match(/FATAL/g) ?? []).length, 1);
     } finally {
         // stop() in finally: an assertion failure must not leak the live worker
         handle?.stop();
         await sleep(20);
+        await rmrf(dir);
+    }
+});
+
+// A file-based child avoids propagating --input-type=module to the eval worker.
+const EXIT_MODE_CHILD_SOURCE = `import net from "node:net";
+import { pathToFileURL } from "node:url";
+const [modulePath, logFile] = process.argv.slice(2);
+// The parent selects its checkout at runtime; this fixture lives outside it.
+const { armEventLoopWatchdog } = await import(pathToFileURL(modulePath).href);
+const listener = net.createServer((socket) => socket.end());
+listener.on("error", (error) => { console.error(error); process.exit(2); });
+listener.listen(0, "127.0.0.1", () => {
+    process.send({ port: listener.address().port });
+    armEventLoopWatchdog({
+        logFile, version: "0.0.0-child", heartbeatMs: 20,
+        checkIntervalMs: 20, softWarnMs: 100, hardTimeoutMs: 500,
+    });
+    // Wall-clock silence crosses worker/process boundaries; fake timers cannot model it.
+    setTimeout(() => { for (;;) { /* blocked serving loop */ } }, 60);
+});
+`;
+
+interface ChildOutcome {
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    stderr: string;
+    port: number;
+    timedOut: boolean;
+}
+
+async function runExitModeChild(logFile: string, srcFile: string): Promise<ChildOutcome> {
+    const modulePath = path.resolve(import.meta.dirname, "../src/event-loop-watchdog.ts");
+    const child = spawn(process.execPath, ["--import", "tsx", srcFile, modulePath, logFile], {
+        stdio: ["ignore", "ignore", "pipe", "ipc"],
+    });
+    let stderr = "";
+    let port = 0;
+    let timedOut = false;
+    child.stderr!.on("data", (data) => { stderr += String(data); });
+    child.on("message", (message) => {
+        if (message && typeof message === "object" && "port" in message && typeof message.port === "number") {
+            port = message.port;
+        }
+    });
+    // This deadline bounds a real out-of-process wedge; always await child reaping.
+    const deadline = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+    }, 20_000);
+    deadline.unref();
+    try {
+        const [code, signal] = await once(child, "close");
+        return { code, signal, stderr, port, timedOut };
+    } finally {
+        clearTimeout(deadline);
+    }
+}
+
+test("exit mode terminates a blocked serving process and releases its listener", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-watchdog-exit-"));
+    const logFile = path.join(dir, "bili.log");
+    const srcFile = path.join(dir, "exit-mode-child.mjs");
+    let rebound: net.Server | undefined;
+    try {
+        fs.writeFileSync(srcFile, EXIT_MODE_CHILD_SOURCE);
+        const outcome = await runExitModeChild(logFile, srcFile);
+        assert.equal(outcome.timedOut, false, `watchdog left child alive: ${outcome.stderr}`);
+        assert.ok(outcome.port > 0, "child must own a listener before it blocks");
+        const content = fs.readFileSync(logFile, "utf8");
+        assert.match(content, /FATAL: main event loop silent for \d+(?:ms|s) \(hard threshold 500ms\)/);
+        assert.match(content, /\[v=0\.0\.0-child\]/);
+        assert.equal((content.match(/FATAL/g) ?? []).length, 1);
+        if (process.platform !== "win32") assert.equal(fs.statSync(logFile).mode & 0o077, 0, "worker-created forensic file must be owner-only");
+        rebound = net.createServer();
+        rebound.listen(outcome.port, "127.0.0.1");
+        await once(rebound, "listening");
+    } finally {
+        if (rebound?.listening) {
+            rebound.close();
+            await once(rebound, "close");
+        }
         await rmrf(dir);
     }
 });
