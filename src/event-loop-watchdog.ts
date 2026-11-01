@@ -44,10 +44,10 @@
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
-const WATCHDOG_HEARTBEAT_MS = 5_000;
+export const WATCHDOG_HEARTBEAT_MS = 5_000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
-const WATCHDOG_SOFT_WARN_MS = 30_000;
-const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
+export const WATCHDOG_SOFT_WARN_MS = 30_000;
+export const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
 
 type WatchdogVerdict = "ok" | "warn" | "trip";
 

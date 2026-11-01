@@ -7,7 +7,13 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { Worker } from "node:worker_threads";
-import { armEventLoopWatchdog, watchdogVerdict } from "../src/event-loop-watchdog.ts";
+import {
+    WATCHDOG_HEARTBEAT_MS,
+    WATCHDOG_HARD_TIMEOUT_MS,
+    WATCHDOG_SOFT_WARN_MS,
+    armEventLoopWatchdog,
+    watchdogVerdict,
+} from "../src/event-loop-watchdog.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -26,6 +32,12 @@ test("watchdogVerdict: threshold boundaries and warn-once semantics", () => {
     assert.equal(watchdogVerdict(30_000, true, 30_000, 300_000), "ok");
     assert.equal(watchdogVerdict(299_999, true, 30_000, 300_000), "ok");
     assert.equal(watchdogVerdict(300_000, true, 30_000, 300_000), "trip");
+});
+
+test("defaults are deadlock-scale, not load-scale (#4762)", () => {
+    assert.equal(WATCHDOG_HEARTBEAT_MS, 5_000);
+    assert.equal(WATCHDOG_SOFT_WARN_MS, 30_000);
+    assert.equal(WATCHDOG_HARD_TIMEOUT_MS, 300_000);
 });
 
 test("wedged main loop trips the watchdog: warn + fatal forensic lines land in the log file (#4762)", async () => {
