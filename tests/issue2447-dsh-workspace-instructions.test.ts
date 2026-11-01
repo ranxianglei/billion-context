@@ -135,12 +135,17 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshWorkspaceInstructionsPath(msg("text", INSTR_MSG)), "durable/agents-md", "the merged global+project baseline projects");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", "plain prose about workspace setup")), undefined);
-    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase reconciliation variants stay consumable history");
+    // #4921: the baseline classifier stays case-sensitive on the exact
+    // uppercase label — revision notices are NOT baseline shapes and are
+    // projected by dshWorkspaceInstructionsRevisionPath instead (lane-chain
+    // assertion below).
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase revision variants are not baseline shapes (#4921)");
     assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "Instructions from: AGENTS.md")), undefined, "non-text content types never match");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
     assert.ok(dshClassifier, "dsh lane is registered");
     assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
+    assert.equal(dshClassifier!(msg("text", CHANGE_MSG)), "durable/agents-md-update/AGENTS.md", "#4921: the lane chain projects the revision notice to its per-path identity");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
