@@ -69,6 +69,15 @@ import type {
 
 export interface Ports {
   countTokens?: (text: string) => number;
+  /** #4313 (toggle, PR #5236): enable immutable message timestamps — first-
+   *  sight stamp minting into state.tsStamps and the <acp> tag's time
+   *  attribute on the render node. Default false: neither runs, so a
+   *  flag-off core renders byte-identically to pre-#4313 masters (hydrated
+   *  ts values are carried but never displayed). Set true by hosts whose
+   *  session opted in via compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS.
+   *  Resolved ONCE per core (instance scope) — storage-layer stamping stays
+   *  unconditional either way, so enabling later renders full history times. */
+  timestamps?: boolean;
 }
 
 export interface CompressionCore {
@@ -291,6 +300,9 @@ function applyRefolds(input: {
 
 export function createCore(ports: Ports = {}): CompressionCore {
   const countTokens = ports.countTokens ?? defaultCountTokens;
+  // #4313 toggle: single gate for both pipeline nodes (stamp + render);
+  // captured once per core so every lane built from this core agrees.
+  const timestampsOn = ports.timestamps === true;
 
   function applyCompression(
     input: ApplyCompressionInput,
@@ -836,6 +848,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // (which may have consumed blocks of tier N to produce tier N+1), every
       // tier should be eligible to re-evaluate from the new token count.
       state.nudge.lastShownByTier = {};
+      // #5415: the #5293 abort-absorb debt bank drained with the backlog it
+      // tracked — a fresh cadence starts from a clean slate.
+      state.nudge.absorbedDebt = 0;
+      state.nudge.absorbCount = 0;
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -1015,6 +1031,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
   function buildNodes(strategy: RenderStrategy): PipelineNode[] {
     const base: PipelineNode[] = [
       reconcileLiveIdsNode,
+      createStampTimestampsNode(timestampsOn),
       assignRefsNode,
       syncBlocksNode,
       pruneNode,
@@ -1031,7 +1048,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       emergencyTruncateNode,
     ];
     if (strategy === "none") return base;
-    return [...base, createRenderRefsNode(strategy)];
+    return [...base, createRenderRefsNode(strategy, { timestamps: timestampsOn })];
   }
 
   return {
@@ -1057,6 +1074,53 @@ const reconcileLiveIdsNode: PipelineNode = {
     return { ...io, messages: remintCoveredLiveIds(io.messages, io.state) };
   },
 };
+
+// #4313: stamp each message with its immutable local time-of-occurrence,
+// ONCE — for GENUINELY NEW arrivals only. Runs after reconcile-live-ids (so
+// the final post-remint id is what gets stamped, matching ledger rows) and
+// before assign-refs, whose byRaw map is still pre-this-pass: an id absent
+// from it is arriving now (Date.now() mints its stamp); an id already
+// present is a PRE-FEATURE / previously-seen message and must never be
+// backfilled (spec §5 + #3939 philosophy: NULL means unknown, and fabricating
+// "today" for an old message would be a lie). Hydrated ids carry their stored
+// ts (column value) and merely record it here; a persisted stamp outranks any
+// carried value (single source of truth = the ledger). Values persist in
+// state.tsStamps (tokenSnapshot discipline): restarts replay byte-identical
+// tags, and the render path only ever READS the stored value — it never calls
+// Date.now() (prefix-cache invariant). Ephemeral retrieval injections never
+// consume a stamp (same exemption as ref assignment).
+// Factory (#4313 toggle, PR #5236): with `enabled` false the node is a full
+// no-op — it mints nothing, backfills nothing and never touches tsStamps,
+// keeping flag-off sessions byte-identical to pre-#4313 masters (the render
+// side gates independently in render-refs.ts).
+function createStampTimestampsNode(enabled: boolean): PipelineNode {
+  if (!enabled) return { name: "stamp-timestamps", run(io) { return io; } };
+  return {
+  name: "stamp-timestamps",
+  run(io) {
+    const stamps = { ...(io.state.tsStamps ?? {}) };
+    const knownIds = io.state.messageRefs.byRaw;
+    let changed = false;
+    const messages = io.messages.map((m) => {
+      if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
+      const stamped = stamps[m.id];
+      if (stamped !== undefined) {
+        if (m.ts === stamped) return m;
+        changed = true;
+        return { ...m, ts: stamped };
+      }
+      const carried = typeof m.ts === "number" ? m.ts : undefined;
+      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      if (ts === undefined) return m;
+      stamps[m.id] = ts;
+      changed = true;
+      return { ...m, ts };
+    });
+    if (!changed) return io;
+    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+  },
+  };
+}
 
 const assignRefsNode: PipelineNode = {
   name: "assign-refs",
@@ -1992,8 +2056,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     baseline === 0 &&
     usage >= config.nudge.minContextLimitPct &&
     Math.max(t1Eff, t2Pen, t3Pen) >= nudgeGrowthTokens;
+  // #5415: the #5293 abort-absorb re-anchors the growth reference to the
+  // current meter, zeroing growth on every user-aborted turn. Abort-heavy
+  // clients (85 absorbs in one 4.5h log) then never cross the floor and a
+  // huge ready mass sits idle for hours ("growth 4450 < floor 33750, ready:
+  // T1 302220"). The host banks the repeatedly-skipped MEASURED growth into
+  // state.nudge.absorbedDebt and counts the absorbs. Debt (and the drain
+  // guard below) pay ONLY once absorbCount >= 2: a SINGLE abort stays
+  // byte-identically quiet as #5293 pinned — its debt may be large (one
+  // abort after a long quiet stretch banks the whole interval) but it must
+  // not re-fire the cadence on the user's redirect. The SECOND absorb is
+  // the proof the session is abort-heavy, not redirect-polite, so the bank
+  // pays into the floor like live growth and the 209-era cadence recovers.
+  const absorbedDebt = state.nudge.absorbedDebt ?? 0;
+  const absorbCount = state.nudge.absorbCount ?? 0;
+  const repeatAbsorbs = absorbCount >= 2;
+  const payableDebt = repeatAbsorbs ? absorbedDebt : 0;
+  // Backlog-drain guard (#5415; same philosophy as the #194 first-sight
+  // bypass — the floor paces WITHIN a backlog, it must not gate draining
+  // one): when absorbs have REPEATEDLY disturbed the cadence (count >= 2),
+  // no nudge is outstanding (lastNudgeShownTokens === 0 — an ignored nudge
+  // keeps it set, so this never re-fires on an unresponsive session), and
+  // the ready mass is at least double the T1 threshold, drain now instead
+  // of idling behind the starved growth leg. Single-absorb and debt-free
+  // sessions decide byte-identically: the bypass cannot touch them.
+  const backlogDrainReady =
+    repeatAbsorbs &&
+    absorbedDebt > 0 &&
+    state.nudge.lastNudgeShownTokens === 0 &&
+    Math.max(t1Eff, t2Pen, t3Pen) >= 2 * tierThresholds[1] &&
+    usage >= config.nudge.minContextLimitPct;
   const growthReady =
-    firstSightMassReady || growthSinceReference >= growthFloor;
+    firstSightMassReady ||
+    backlogDrainReady ||
+    growthSinceReference + payableDebt >= growthFloor;
   const t2Count = tiers[2]?.targetBlocks.length ?? 0;
   const t3Count = tiers[3]?.targetBlocks.length ?? 0;
 
@@ -2131,7 +2227,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (pendingShort)
       parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
-      parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
+      parts.push(
+        absorbedDebt > 0 && !repeatAbsorbs
+          ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} held (single abort, #5293) < floor ${growthFloor}`
+          : payableDebt > 0
+            ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} across ${absorbCount} aborts < floor ${growthFloor}`
+            : `growth ${growthSinceReference} < floor ${growthFloor}`,
+      );
     if (parts.length === 0)
       parts.push(
         `max compressible ${maxPending}, growth ${growthSinceReference}`,
@@ -2217,6 +2319,10 @@ function cloneState(state: CompressionState): CompressionState {
       byRef: { ...state.messageRefs.byRef },
     },
     tokenSnapshot: { ...(state.tokenSnapshot ?? {}) },
+    // #4313: first-sight time stamps ride every clone — dropping them here
+    // loses the block coverage window (and re-arm nothing: already-refed ids
+    // are never re-minted, so the loss would be silent).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
     nudge: { ...state.nudge, anchors: { ...state.nudge.anchors } },
     stats: { ...state.stats },
     absorbed: (state.absorbed ?? []).map((record) => ({ ...record })),

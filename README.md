@@ -63,6 +63,10 @@ QQ Group:
 
 A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model calls, 18.76B cumulative input tokens (~24.7B across all hosts), zero window violations on 204,800-token models, marathon sessions of 8,584–12,049 calls.
 
+### 📊 Independent Third-Party Benchmarks
+
+- **[1,500-Item Cross-Benchmark Evaluation (`LongMemEval-S` · `ContextBench` · `MemoryAgentBench`)](./benchmarks/third-party-1500/README.md)** ([中文版](./benchmarks/third-party-1500/README.zh-CN.md)) — head-to-head comparison of `billion-context` (`v0.1.202`) against `full` context and 3 RAG arms (`bm25`, `embedding`, `embedding-rerank`) with `DeepSeek V4.1 Flash`, `Qwen3-Embedding-8B`, `Qwen3-Reranker-4B`, and `Pi Agent`: **#1 on ContextBench** (`0.3097` Utilized F1, `-58.3%` cost vs `full`), **+16.6% over best RAG on LongMemEval-S** (`79.20%` vs `62.60%`, `-71.1%` independent-session cost vs `full`), and **100% survival on 1.48M-token MemoryAgentBench TTL** (`30×` steady-state compression where `full` fails `199/199`).
+
 ---
 
 `billion-context` sits between **any** agent and its model API, rewriting Anthropic/OpenAI streams with [acp-kernel](https://github.com/ranxianglei/acp-kernel) compression. The model decides **when** and **what** to compress into high-fidelity summaries — not a hard truncation limit.
@@ -515,6 +519,12 @@ When an install keeps failing (unwritable or host-managed dir, network error, �
 
 The same bounded retry now covers the **owner-managed lanes** the global self-update drives instead of writing the copy itself — the dsh desktop in-place copy, the dsh profile bundles, and pi's npm copy (#2192). Each lane keeps its own failure streak keyed by lane + target version, so a persistently broken desktop layout no longer re-downloads the full tarball every cycle (up to ~480 downloads/day per affected machine before the fix); three strikes arms the same exponential cooldown, and the one-time hint names the failing lane and its manual fix (`dsh plugin --profile <name> add …`, `pi update --extension …`, or recreate the desktop profile). Host-managed instances additionally check on their own slower cadence — 30 minutes plus up to 15 minutes of jitter, tracked under a separate throttle marker — instead of consuming the global 3-minute budget. Failure streaks are shared across every bili process on the machine through a small state file in the cache dir (`.install-backoff.json`), so several running instances don't each burn their own retry budget; a clean `bili plugin update` disarms the dsh profile lane immediately. The file is written atomically (tmp+rename) and every writer merges with what is already on disk, so concurrent instances cooperate instead of overwriting each other's streaks; long-lived processes re-read it when it changes, so a manual disarm by one copy is visible to the others on their next check. It is fail-safe in the retry direction — a corrupt file or jumped clock is dropped, never allowed to silence a lane for long. `bili plugin update` clears the dsh-profile lane's key; a repaired desktop lane clears its own key on its next successful in-place refresh.
 
+### Stale local DNS after a network/VPN change (#5224)
+
+A **long-lived** standalone proxy can keep holding stale OS-resolver state after a WSL/VPN/TUN topology change — the process caches its system resolver and libuv's `getaddrinfo` does not re-read `/etc/resolv.conf` on its own. Symptom: every model request through the `/bili/` tunnel answers HTTP 502 `tunnel_destination_denied` with detail `unresolvable`, even though a freshly started `bili` resolves the same host fine at that moment and `curl` from a new shell works. Either remedy clears it:
+- **Restart the proxy process** — a fresh process re-reads the system resolver. In the launcher lanes and the dsh web-profile lane the proxy is a *separate registered* process (the instance registry), so restarting only the client/host re-adopts the same wedged proxy and does **not** help — you must stop and relaunch the proxy itself. (In embedded plugin mode the proxy runs inside the host, so restarting the host *does* clear it.)
+- **Route egress through an upstream proxy** — `-F http://<host:port>` or `BILI_UPSTREAM_PROXY=… BILI_UPSTREAM_PROXY_MODE=auto`: the destination is then resolved remotely by that proxy, so bili never consults its own (stale) resolver for admission.
+
 ### Critical-defect advisories (forced updates)
 
 Independent of auto-update (#1481): even with `autoUpdate` off, the proxy polls a small companion npm package (`billion-context-advisories`, published by CI from this repo's [`advisories/`](advisories/) directory) on the same 3-minute cadence. Each advisory names a semver range of broken versions (`affected`), the exact version to install (`target` — which may be *older* than the current one, i.e. a rollback), and a user-facing `reason`. When the local version falls inside `affected`, bili force-installs `target` through the self-updater's full safety chain (cross-process lock, backup + verify + rollback; source checkouts and host-managed installs are refused with manual instructions instead) and warns prominently: a one-time `[advisory] ⚠️ …` log line per process per advisory id, a banner on the web UI showing the reason and the exact manual upgrade command, and the active entry under `advisory` in `/__bili/status`. The check is fail-open by design: an unreachable or malformed advisory source only produces a warning — model traffic is never blocked by it. Disable via config (`"advisoryCheck": false`) or env (`BILI_ADVISORY_CHECK=0`); point at a custom document with `"advisoryUrl"` / `BILI_ADVISORY_URL`.
@@ -645,20 +655,24 @@ Consequences for anyone tempted to put several instances behind one Service:
   single-instance by design.
 
 **Single machine, multiple installs (#5046).** The topology above covers
-deployment replicas; one desktop has a sibling hazard: two installs on ONE
+deployment replicas; one desktop has a sibling situation: two installs on ONE
 machine (e.g. two DSH profiles — desktop + bot, or a global npm copy beside a
 host-tree copy) each start their own proxy and, unless isolated, both resolve
-the SAME default XDG sessions directory and the same config file. With
-`storage.unified` on (shadow/full), two processes then double-write one
-`index.db`: the log shows `[instances] another bili instance is running …`
-and, for overlapping lanes, `[storage] … two processes on one index.db
-corrupt it`; SQLite write-lock contention (`SQLITE_BUSY` / `database is
-locked`) can fail whole model turns, and sustained double-writing risks
-corruption. The fix is isolation: give each install its own
-`BILI_SESSIONS_DIR` (plus `BILI_CONFIG_FILE` when the config should differ
-too) through that install's launcher/profile environment — no global env
-changes needed. Once isolated, the installs coexist safely and the
-`[instances]` notice drops to info level (different dirs ⇒ no shared state).
+the SAME default XDG sessions directory and the same config file. Multiple
+processes writing ONE local-disk `index.db` is the SUPPORTED topology
+(#5082/#5091) — SQLite WAL is multi-process safe on a local filesystem — so
+startup NEVER blocks on a live foreign writer: the peer shows up as an
+info-level `[storage] process pid … is also using …` line plus the status wire,
+nothing more (policy settled 2026-10-31, withdrawing the #5046/B-era
+refuse-to-start for exactly this shape). What genuinely remains hazardous is
+two installs walking the SAME *session* concurrently — that case alarms
+separately (split-brain contest, #3923). If you still want strictly separate
+histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
+`BILI_CONFIG_FILE` when the config should differ too) through that install's
+launcher/profile environment — no global env changes needed. Once isolated,
+the `[instances]` notice drops off entirely. Note the distinction from the
+deployment case above: local disk with SQLite WAL tolerates many writers;
+shared RWX/NFS storage does NOT and keeps requiring one writer per volume.
 
 Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
 (from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
@@ -679,6 +693,7 @@ bili sessions ls                 # id, label, decoded size, last-updated, storag
 bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
 bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
 bili sessions restore <id>       # bring an archived session back from the log line
+bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
 ```

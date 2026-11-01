@@ -28,7 +28,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, StorageSecondWriterError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -163,6 +163,10 @@ export class UnifiedShadow {
      *  saves index-only) so a multi-writer ping-pong (#394) can no longer
      *  churn the file copy; the first clean sample re-admits. */
     readonly frozenEnvelopeIds = new Set<string>();
+    /** #5408: when (epoch ms) this process froze each session's envelope
+     *  writes — feeds the status wire and the skip-save logs so a frozen
+     *  session surfaces WITH an age and a reason instead of only a count. */
+    private readonly frozenEnvelopeSince = new Map<string, number>();
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -254,10 +258,8 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
             } catch (err) {
-                // #5046/B: a live foreign writer owns this db — never touch it (the file is NOT corrupt) and never take over its lock; the outer catch REFUSES.
-                if (err instanceof StorageSecondWriterError) throw err;
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
                 // (#4626-era owner decision, 2026-10-30).
@@ -291,15 +293,6 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
-            // #5046/B (owner decision 2026-10-29): refuse to become a persistent second writer — degrade to legacy-only with ONE actionable error. Availability is preserved (legacy persist keeps compression working); CCR / checkpoints / the unified fast-read path are off until isolated. The status wire carries the same fact via recordSidecarOpenFailure (#3040).
-            if (err instanceof StorageSecondWriterError) {
-                loggerLog(
-                    "error",
-                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write and REFUSES TO START until isolated (#5046 owner chain 2026-10-30: no silent degradation of any kind). Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068); or force legacy explicitly (BILI_STORAGE_UNIFIED=legacy).`,
-                );
-                recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); refusing to start until then (#5046)`);
-                throw err;
-            }
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
             // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
@@ -310,7 +303,7 @@ export class UnifiedShadow {
             // above handles them (loud alarm + boot WITHOUT the index).
             // #4626-era owner decision chain (2026-10-30): every OTHER
             // sidecar-open failure REFUSES TO START instead of degrading —
-            // no-engine/CANTOPEN/readonly/second-writer: availability at the
+            // no-engine/CANTOPEN/readonly/OS-level: availability at the
             // price of a silently different storage path was withdrawn by
             // owner instruction "在任何情况下不降级". Intentional opt-outs
             // (legacy mode / encryption opt-out / persistence off) resolve to
@@ -445,7 +438,16 @@ export class UnifiedShadow {
                 const plan = planIngest(legacy);
                 // #3285: only a raw-tail plan is the complete log — that is
                 // what lets the full path sweep foreign rows as stale.
-                this.sync.ingestSession(plan, undefined, { completeLog: hasRawTail });
+                // #5408: while drift-latched the ENVELOPE is what loadSync
+                // serves (the latch exists because the index diverged from
+                // it), so the index must converge to THAT view — sweep on
+                // every latched full ingest even without a raw tail. Before
+                // this, a folded-resident save (no raw tail) never swept:
+                // foreign rows rode every replay and the drift could never
+                // clear on its own (the incident behind #5408 sat frozen for
+                // 8h on exactly this shape).
+                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
+                this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -492,8 +494,26 @@ export class UnifiedShadow {
                     // store keeps receiving every save either way).
                     const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
                     this.driftStreaks.set(legacy.id, streak);
+                    // #3919: the digest says WHICH bytes disagree but not WHERE —
+                    // append the field-level diagnosis (diverged dimensions +
+                    // first divergent tail slot, fingerprints only, never body
+                    // text) so one log line is enough to classify the trigger.
+                    // The line prefix stays byte-identical for existing greps.
+                    // #5408: computed BEFORE the escalation so the ESCALATED
+                    // warn carries it too — that line is the one operators see
+                    // when they grep for the freeze, and "diverged: state"
+                    // without the sub-key drill-down left #5408 undiagnosable.
+                    let diagnosis = "";
+                    try {
+                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
+                    } catch {
+                        // diagnostics must never break the heal path
+                    }
                     if (streak === DRIFT_ESCALATE_STREAK) {
                         this.frozenEnvelopeIds.add(legacy.id);
+                        // #5408: stamp WHEN this process froze the writes — the
+                        // skip-save logs and the status wire surface the age.
+                        this.frozenEnvelopeSince.set(legacy.id, Date.now());
                         let sides = "";
                         try {
                             const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
@@ -502,7 +522,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}${diagnosis}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -516,17 +536,6 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.sync.clearIngestWatermark(legacy.id);
-                    // #3919: the digest says WHICH bytes disagree but not WHERE —
-                    // append the field-level diagnosis (diverged dimensions +
-                    // first divergent tail slot, fingerprints only, never body
-                    // text) so one log line is enough to classify the trigger.
-                    // The line prefix stays byte-identical for existing greps.
-                    let diagnosis = "";
-                    try {
-                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
-                    } catch {
-                        // diagnostics must never break the heal path
-                    }
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
@@ -538,6 +547,7 @@ export class UnifiedShadow {
                     // this process's envelope writes for the session.
                     this.driftStreaks.delete(legacy.id);
                     if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                        this.frozenEnvelopeSince.delete(legacy.id);
                         loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
                     }
                 }
@@ -662,6 +672,21 @@ export class UnifiedShadow {
         return this.sync !== null && this.frozenEnvelopeIds.has(id);
     }
 
+    /** #5408: freeze metadata for status surfaces — null when not frozen. */
+    envelopeFrozenInfo(id: string): { sinceMs: number } | null {
+        if (!this.envelopeFrozen(id)) return null;
+        return { sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() };
+    }
+
+    /** #5408: every frozen session with its freeze time, sorted by id — the
+     *  /__bili/status wire detail behind the frozenEnvelopeSessions count. */
+    frozenEnvelopeDetails(): { id: string; sinceMs: number }[] {
+        const out: { id: string; sinceMs: number }[] = [];
+        for (const id of this.frozenEnvelopeIds) out.push({ id, sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() });
+        out.sort((a, b) => a.id.localeCompare(b.id));
+        return out;
+    }
+
     /** #4323: active block rows the unified store holds for `id` — null when
      *  the sqlite fast lane is unavailable; callers must not guess from null. */
     activeBlockCount(id: string): number | null {
@@ -701,6 +726,7 @@ export class UnifiedShadow {
         this.ingestCounts.delete(id);
         this.driftStreaks.delete(id);
         this.frozenEnvelopeIds.delete(id);
+        this.frozenEnvelopeSince.delete(id);
         try {
             this.sync.deleteSession(id);
         } catch (err) {
@@ -819,6 +845,29 @@ export class UnifiedShadow {
         return this.sync.archiveSession(sessionId, opts);
     }
 
+    /** #5312: full transcript id set + block rows for the foreign-block sweep
+     *  (reads degrade like the neighboring sync facades on network backends). */
+    allMessageIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.allMessageIds(sessionId);
+    }
+
+    getBlocks(sessionId: string): ReturnType<import("./store.ts").UnifiedStore["getBlocks"]> {
+        if (this.sync === null) return [];
+        return this.sync.getBlocks(sessionId);
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block archive unavailable" };
+        return this.sync.archiveBlock(sessionId, blockId, opts);
+    }
+
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block restore unavailable" };
+        return this.sync.restoreBlock(sessionId, blockId, opts);
+    }
+
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);
@@ -842,9 +891,9 @@ export class UnifiedShadow {
         return this.sync.activeForeignWriter();
     }
 
-    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] {
         if (this.sync === null) return [];
-        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
@@ -1059,7 +1108,16 @@ export class UnifiedShadow {
                 } catch {
                     applied = false;
                 }
-                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog: hasRawTail });
+                // #5412: mirror the sync path's latched-sweep promotion (#5408
+                // B1 / #4323). While the sampler has latched this session as
+                // drift-latched, the envelope is the view loadSync serves —
+                // the full re-ingest must claim authoritative-set authority
+                // even without a raw tail so its stale sweep retires foreign
+                // residue rows; otherwise every latched save re-takes the
+                // incomplete view, the next sample drifts again, and the
+                // frozen session never self-heals.
+                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
+                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog });
                 this.stats.ingests++;
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
@@ -1212,8 +1270,8 @@ export class UnifiedShadow {
         return this.viaAsync({ ok: false, reason: "async backend" }, () => this.restoreArchived(sessionId, opts), () => this.enqueue(() => this.backend!.restoreArchived(sessionId, opts)));
     }
 
-    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string }[]> {
-        return this.viaAsync([], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content })));
+    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string; ts: number | null }[]> {
+        return this.viaAsync([] as { seq: number; content: string; ts: number | null }[], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null })));
     }
 
     tailSeqsAsync(sessionId: string): Promise<number[] | null> {
@@ -1355,6 +1413,10 @@ interface DriftSlotFingerprint {
 interface DriftDiagnostics {
     /** Top-level view keys whose canonicalized JSON differs, sorted. */
     keys: string[];
+    /** #5408: state sub-keys that disagree (when `state` itself diverged) —
+     *  "diverged: state" alone cannot be acted on because every full re-ingest
+     *  converges the tables it owns; the sub-key names the actual residue. */
+    stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
     tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
 }
@@ -1367,6 +1429,7 @@ class BatchedViewVerification {
     private readonly orphans: LegacySessionLike["blockContents"];
     private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
     private readonly keys = new Set<string>();
+    private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
     private blockCount = 0;
     private activeBlocks = 0;
@@ -1391,7 +1454,11 @@ class BatchedViewVerification {
         if (shadowDigest(expect) !== shadowDigest(got)) {
             this.drift = true;
             try {
-                for (const key of describeViewDivergence(expect, got).keys) this.keys.add(key);
+                const diag = describeViewDivergence(expect, got);
+                // #5408: retain the header-level drill-down (state sub-keys) —
+                // the bulk phases below can only name "state" coarsely.
+                this.headerDiag = diag;
+                for (const key of diag.keys) this.keys.add(key);
             } catch {
                 // Diagnostic detail must not suppress a proven drift.
             }
@@ -1455,6 +1522,7 @@ class BatchedViewVerification {
         this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
+        if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;
         if (this.tailSlot) diagnostics.tailSlot = this.tailSlot;
         return { matches: !this.drift, activeBlocks: this.activeBlocks, tailGaps: this.tailGaps, diagnostics };
     }
@@ -1497,6 +1565,22 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };
+    if (keys.includes("state")) {
+        // #5408: drill one level into the state object so the log names which
+        // sub-field disagrees (messageRefs / kstate residue / coverage), not
+        // just that "state" as a whole does.
+        const es = e["state"];
+        const gs = g["state"];
+        if (es !== null && typeof es === "object" && !Array.isArray(es) && gs !== null && typeof gs === "object" && !Array.isArray(gs)) {
+            const eo = es as Record<string, unknown>;
+            const go = gs as Record<string, unknown>;
+            const subKeys: string[] = [];
+            for (const k of [...new Set([...Object.keys(eo), ...Object.keys(go)])].sort()) {
+                if (ser(eo[k]) !== ser(go[k])) subKeys.push(k);
+            }
+            if (subKeys.length > 0) diagnostics.stateKeys = subKeys;
+        }
+    }
     if (keys.includes("lastMessages") && Array.isArray(e["lastMessages"]) && Array.isArray(g["lastMessages"])) {
         const et = e["lastMessages"] as unknown[];
         const gt = g["lastMessages"] as unknown[];
@@ -1521,6 +1605,7 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
 /** Compact log-suffix form of describeViewDivergence (""-free: always starts with a space). */
 export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
+    if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
         const { index, expect: ex, got: go } = d.tailSlot;
         parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);

@@ -95,18 +95,18 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "a22a93eb7e5bd8e07377bb666b6a78e7f88bdc710855c3b8c122f6d4d76ce94c",
- "stateDigestAligned": "2af17815638a6d78ad8722781aa94c7e2c052821ed3fd8c412b6d0e0abeecd62",
+ "stateDigest": "1ba4bafebbcce0dbe646104d2ad5d7fbe9f64218dd402bedb828193bb8548812",
+ "stateDigestAligned": "4a6a09cf679ebfa27401771ebadc3649a273b2d28246e70c3fc9732faf94c6f7",
  "sectionDigests": {
-  "state": "6028b6f100d714b2",
+  "state": "c24a56506d0e75d7",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "09fb5decac108194",
-  "metadata": "6056528d7b79dc40"
+  "metadata": "a85b64468ffd36ea"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
   "messageRefs": "3d09c9004582bdbc",
-  "nudge": "7edf1d70ee5cb00d",
+  "nudge": "d3b6889f2d75ab2b",
   "stats": "23312f7d5a0b9e27",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",
@@ -124,6 +124,7 @@
   "emergencyTruncateLatch": "74234e98afe7498f",
   "renderDeferredRefs": "74234e98afe7498f",
   "viewLatches": "74234e98afe7498f",
+  "tsStamps": "74234e98afe7498f",
   "viewLatchConfigDigest": "74234e98afe7498f"
  },
  "stateShape": {

@@ -84,7 +84,7 @@ test("#4796 v9: fresh install carries idx_content_refcount and candidate selecti
             seedContentRows(rawDb(store), 20_000, 1, "live");
             seedContentRows(rawDb(store), 50, 0, "orphan");
             const ver = rawDb(store).prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9);
+            assert.equal(ver.user_version, 10);
             const idx = rawDb(store)
                 .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_content_refcount'")
                 .get();
@@ -118,7 +118,7 @@ test("#4796 v9: reopening a v8-era db gains the index", () => {
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = rawDb(store).prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9);
+            assert.equal(ver.user_version, 10);
             const idx = rawDb(store)
                 .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_content_refcount'")
                 .get();
@@ -243,7 +243,7 @@ test("#4796 e2e: v8 identity backfill releases wireIndex twins -> gc collects th
         try {
             const db2 = rawDb(reopened);
             const ver = db2.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9);
+            assert.equal(ver.user_version, 10);
             const twinLeft = db2
                 .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND seq = ?")
                 .get(sessId, twinSeq) as { n: number };

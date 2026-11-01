@@ -90,6 +90,17 @@ export function conversationHeaderSource(headers: Record<string, string | string
     return undefined;
 }
 
+/** Memory workers replay the parent history but keep their tool tail private. */
+export function zcodeMemoryConversation(parent: string, headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (headers["x-zcode-query-source"] !== "project_memory_extract"
+        || headers["x-zcode-session-type"] !== "other"
+        || headers["x-session-id"] !== parent) return undefined;
+    const query = headers["x-query-id"];
+    if (typeof query !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(query)) return undefined;
+    // |sub: descendants can take over host-stamped management calls; workers cannot.
+    return `${parent}|aux:zcode-memory:${query}`;
+}
+
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
  *  participate in the compression-session key at all. Inverted allowlist: the
  *  fingerprint is OFF by default and applies ONLY to signals with a verified
@@ -278,6 +289,36 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
         }
     }
     return texts.join("\n\n");
+}
+
+/** #5095 D1-B: per-run discriminator for the claude-anthropic derived-persona
+ *  lane key. Same-type subagents re-dispatched under one parent id carry a
+ *  byte-identical system (the persona tag), so the dispatch task prompt —
+ *  the first user message with extractable text — is what tells runs apart;
+ *  it is unique per run and stable for the agent's whole lifetime. Users
+ *  whose content holds no top-level text (pure tool_result) are skipped. ""
+ *  when nothing is usable → the call site degrades to the two-segment lane
+ *  key. Body-only read: no header literals here (B-class guard). */
+export function anthropicFirstUserFrag(messages: unknown): string {
+    const list = Array.isArray(messages) ? messages : [];
+    const cap = 1024;
+    for (const m of list) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) return content.slice(0, cap);
+        } else if (Array.isArray(content)) {
+            const parts: string[] = [];
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+                    parts.push((part as { text: string }).text);
+                }
+            }
+            const joined = parts.join("\n\n");
+            if (joined.length > 0) return joined.slice(0, cap);
+        }
+    }
+    return "";
 }
 
 /**

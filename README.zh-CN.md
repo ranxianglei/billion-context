@@ -63,6 +63,10 @@ QQ群:
 
 生产规模纵向研究:四个半月、三宿主、174,327 次模型调用、187.6 亿累计输入 token(三宿主合计约 247 亿),204,800-token 窗口零违规,马拉松会话 8,584–12,049 次调用。
 
+### 📊 第三方独立评测基准
+
+- **[1,500 题三大基准横评报告（`LongMemEval-S` · `ContextBench` · `MemoryAgentBench`）](./benchmarks/third-party-1500/README.zh-CN.md)**（[English](./benchmarks/third-party-1500/README.md)）—— 基于 `DeepSeek V4.1 Flash`、`Qwen3-Embedding-8B`、`Qwen3-Reranker-4B` 与 `Pi Agent`，对 `billion-context` (`v0.1.202`)、`full` 全量上下文及 3 条 RAG 管线（`bm25`、`embedding`、`embedding-rerank`）进行全成本归因盲测：**ContextBench 端到端有效 F1 夺得全场第一**（`0.3097`，比 `full` 省钱 `58.3%`）、**LongMemEval-S 领先最强 RAG 达 +16.6%**（`79.20%` vs `62.60%`，比独立会话 `full` 省钱 `71.1%`）、**MemoryAgentBench 1.48M 超长会话实现 100% 存活与 30× 稳态压缩**（`full` 199 题全部爆窗崩溃）。
+
 ---
 
 `billion-context` 架在**任意**编程助手与其模型 API 之间,用 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 压缩重写 Anthropic/OpenAI 流。何时压缩、压缩什么 —— <strong>由模型决定</strong>,而非硬截断。
@@ -371,6 +375,12 @@ bili --no-auto-update        # 本次启动禁用自动更新
 当安装反复失败(目录不可写或受宿主托管、网络错误等)时,自动更新不再每个 3 分钟周期都重复下载并重试。连续失败三次后,它按指数退避(5 分钟 → 10 → 20 …,上限 6 小时),打印一次性的可操作提示(修复权限 / npm prefix、以用户级重装,或用 `"autoUpdate": false` / `ACP_AUTO_UPDATE=0` 禁用),并在冷却期间不再为这次失败输出日志(不下载、不打重试行);一旦故障消除或目标版本变化即恢复(#1603)。
 
 同样的有界重试现在也覆盖全局自更新代为驱动的 **owner 托管通道** —— dsh desktop 原位副本、dsh profile bundle 与 pi 的 npm 副本(#2192)。每条通道按「通道 + 目标版本」维护独立的失败计数,desktop 布局持续损坏时不再每周期重新下载整个 tarball(修复前每台受影响机器每天最多约 480 次下载);连续失败三次进入同样的指数冷却,一次性提示会指明出错的通道与手动修复方式(`dsh plugin --profile <name> add …`、`pi update --extension …`,或重建 desktop profile)。宿主托管实例另走更慢的独立检查节奏 —— 30 分钟加最多 15 分钟抖动,记在独立的节流标记里 —— 不再占用全局 3 分钟预算。失败计数通过缓存目录下的一个小状态文件(`.install-backoff.json`)在机器上所有 bili 进程间共享,多个运行中的实例不会各自烧掉独立的重试预算;`bili plugin update` 成功一次会立即解除 dsh profile 通道的冷却。该文件以原子方式写入(tmp+rename),且每次写入都与磁盘上已有内容合并,并发实例互相协作而不是覆盖彼此的计数;长驻进程会在文件变化时重新读取,任一副本执行的手动解除会在其它副本的下次检查时可见。它的一切失败模式都偏向重试 —— 损坏的文件或时钟跳跃会被丢弃,绝不允许长期沉默某条更新通道。`bili plugin update` 清除 dsh profile 通道的键;修复好的 desktop 通道则在下次成功的原位刷新时清除自己的键。
+
+### 网络/VPN 切换后本地 DNS 陈旧(#5224)
+
+**长驻**的独立代理在 WSL/VPN/TUN 拓扑变化后可能一直持有陈旧的 OS 解析器状态 —— 进程会缓存其系统解析器,而 libuv 的 `getaddrinfo` 不会自行重读 `/etc/resolv.conf`。症状:经 `/bili/` 隧道发出的每个模型请求都返回 HTTP 502 `tunnel_destination_denied`(detail `unresolvable`),尽管同一时刻新起的 `bili` 能正常解析同一主机、新 shell 里的 `curl` 也正常。两种解决办法任选其一即可清除:
+- **重启代理进程** —— 新进程会重读系统解析器。在 launcher 车道和 dsh web-profile 车道里,代理是一个**独立登记的**进程(instance registry),所以只重启客户端/宿主会从 registry 重新收养同一个楔死的代理,**不起作用** —— 必须停掉并重新启动代理本身。(内嵌插件模式下代理跑在宿主内部,重启宿主**能**清除。)
+- **让出口走上游代理** —— `-F http://<host:port>` 或 `BILI_UPSTREAM_PROXY=… BILI_UPSTREAM_PROXY_MODE=auto`:目标改由那个上游代理远端解析,bili 准入时不再查询自己(已陈旧的)解析器。
 
 ### 严重缺陷公告(强制更新)
 

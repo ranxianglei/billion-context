@@ -7,9 +7,9 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "./persist.js";
-import { StorageSecondWriterError } from "./storage/store.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
+import { scanForeignBlocks, applyForeignBlockSweep, type ForeignBlockPlan } from "./foreign-block-sweep.js";
 
 interface StorageCommandResult {
     code: number;
@@ -243,11 +243,68 @@ async function runGc(store: SessionStore, days: number | undefined, vacuum: "ful
     return { code: 0, text: `${text}\n` };
 }
 
+function renderForeignPlan(plan: ForeignBlockPlan): string {
+    const lines = [`foreign fold-block sweep (judged against each session's full persisted transcript)`];
+    lines.push(`  sessions scanned:          ${plan.scannedSessions}${plan.skippedEmptyTranscript > 0 ? ` (+${plan.skippedEmptyTranscript} skipped: empty transcript)` : ""}`);
+    lines.push(`  archivable (zero overlap): ${plan.archivable.length}`);
+    lines.push(`  collision (needs option B):${plan.collision.length}`);
+    lines.push(`  no-covered (undecidable):  ${plan.noCovered.length}`);
+    if (plan.archivable.length > 0) {
+        lines.push("");
+        lines.push(renderTable(["SESSION", "BLOCK", "TIER", "ACTIVE", "COVERED"], plan.archivable.map((f) => [f.sessionId, f.blockId, String(f.tier), f.active ? "yes" : "no", String(f.coveredCount)])));
+    }
+    if (plan.collision.length > 0) {
+        lines.push("");
+        lines.push("collision blocks (NOT archived — covered ids intersect the transcript; needs the kernel lineage field, option B):");
+        for (const f of plan.collision.slice(0, 50)) lines.push(`    ${f.sessionId} / ${f.blockId}  overlap=${f.overlap}/${f.coveredCount}`);
+        if (plan.collision.length > 50) lines.push(`    … and ${plan.collision.length - 50} more`);
+    }
+    return lines.join("\n");
+}
+
+async function runForeignBlocks(store: SessionStore, json: boolean, apply: boolean, restoreTarget?: string): Promise<StorageCommandResult> {
+    if (!store.replicasAvailable()) return fail(`sessions foreign-blocks ${UNIFIED_REQUIRED}`, json);
+    if (restoreTarget) {
+        // Split on the LAST colon so a session id that itself contains ":" still parses;
+        // block ids are plain (bNN) and never carry a colon.
+        const sep = restoreTarget.lastIndexOf(":");
+        if (sep <= 0) return fail("usage: bili sessions foreign-blocks --restore <sessionId>:<blockId>", json);
+        const sid = restoreTarget.slice(0, sep);
+        const bid = restoreTarget.slice(sep + 1);
+        const res = store.unifiedRestoreBlock(sid, bid);
+        if (!res || !res.ok) return fail(`block restore failed for ${sid}:${bid}: ${res?.reason ?? "not found"}`, json, { sessionId: sid, blockId: bid, ok: false, reason: res?.reason });
+        if (json) return { code: 0, text: `${JSON.stringify({ sessionId: sid, blockId: bid, ok: true }, null, 2)}\n` };
+        return { code: 0, text: `restored block ${bid} into session ${sid}\n` };
+    }
+    const plan = scanForeignBlocks(store);
+    if (!plan) return fail("foreign-block sweep failed: unified store unavailable", json);
+    const data: Record<string, unknown> = { dryRun: !apply, ...plan };
+    let text = renderForeignPlan(plan);
+    if (!apply) {
+        if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
+        return { code: 0, text: `${text}\ndry-run: nothing executed (re-run with --apply to archive)\n` };
+    }
+    const result = applyForeignBlockSweep(store, plan);
+    if (!result) return fail("foreign-block sweep failed mid-run (see log)", json, data);
+    data.result = result;
+    if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
+    text += `\nexecuted:\n  archived blocks:      ${result.archived.length}`;
+    for (const f of result.archived) text += `\n    ${f.sessionId} / ${f.blockId} (tier ${f.tier}, covered ${f.coveredCount})`;
+    if (result.failed.length > 0) {
+        text += `\n  failed:               ${result.failed.length}`;
+        for (const f of result.failed) text += `\n    ${f.finding.sessionId} / ${f.finding.blockId}: ${f.reason ?? "unknown"}`;
+    }
+    text += "\nnote: takes effect on next session load/restart — a running host keeps its in-memory copy until reload";
+    return { code: 0, text: `${text}\n` };
+}
+
 export async function runSessionsCommand(opts: {
-    sub: "ls" | "rm" | "archive" | "restore";
+    sub: "ls" | "rm" | "archive" | "restore" | "foreign-blocks";
     target?: string;
     json?: boolean;
     noVacuum?: boolean;
+    apply?: boolean;
+    restoreTarget?: string;
     dir?: string;
 }): Promise<StorageCommandResult> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
@@ -261,6 +318,8 @@ export async function runSessionsCommand(opts: {
                 return await runArchive(store, opts.target, !!opts.json);
             case "restore":
                 return await runRestore(store, opts.target, !!opts.json);
+            case "foreign-blocks":
+                return await runForeignBlocks(store, !!opts.json, !!opts.apply, opts.restoreTarget);
         }
     } finally {
         store.closeQuietly();
@@ -278,17 +337,11 @@ export async function runStorageGcCommand(opts: {
     try {
         store = new SessionStore({ dir: opts.dir, enabled: true });
     } catch (err) {
-        // #4612: under the no-degradation policy a live foreign writer makes the
-        // unified open REFUSE (constructor throws) before runGc's own guard can
-        // answer. Surface the same actionable refusal the in-process guard
-        // produces instead of leaking a stack trace through the CLI.
-        if (err instanceof StorageSecondWriterError) {
-            const reason = `refused: another process (pid ${err.pid}) is actively writing index.db — 'storage gc --vacuum full' rewrites the whole database under an exclusive write lock and would starve the other instance's writes until its storage layer degrades. Stop the other process (or wait for it to exit) and retry, or use --vacuum incremental for an online-safe shrink.`;
-            if (opts.dryRun) return { code: 0, text: `${reason}\ndry-run: nothing executed\n` };
-            const data: Record<string, unknown> = { refused: true, writerPid: err.pid, vacuum: opts.vacuum ?? "full", dryRun: false };
-            if (opts.json) return { code: 1, text: `${JSON.stringify(data, null, 2)}\n` };
-            return { code: 1, text: `${reason}\n` };
-        }
+        // #4612: a live foreign writer does NOT make the unified open refuse
+        // anymore (owner decision 2026-10-31: second-writer conditions are
+        // informational, never blocking) — the full-VACUUM starvation guard
+        // lives in runGc itself (store.unifiedActiveWriter()), so no special
+        // branch is needed here.
         throw err;
     }
     try {
