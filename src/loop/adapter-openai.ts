@@ -2,7 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBareRefHeadFilter, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
@@ -272,6 +272,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // m00885: the shipped request text lets the filter keep an
             // emission-shaped span the user asked to be output verbatim.
             const requestText = JSON.stringify(requestBody);
+            // #5259: outermost — the bare-ref head guard acts on final outgoing bytes.
             const makeFieldFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
@@ -284,9 +285,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
                 ),
-                createBiliArtifactFilter((snippet) => {
-                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
+                composeStreamFilters(
+                    createBiliArtifactFilter((snippet) => {
+                        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createBareRefHeadFilter((snippet) => {
+                        loggerLog("warn", `[bare-ref-head] stripped model-emitted bare ref head (#5259): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
             );
             // Both instances exist up front: the degenerate gate below reads
             // the CONTENT filter's stats only (visible prose), and a reasoning-

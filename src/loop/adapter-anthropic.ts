@@ -3,7 +3,7 @@ import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBareRefHeadFilter, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
@@ -344,6 +344,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // m00885: the shipped request text lets the filter keep an
             // emission-shaped span the user asked to be output verbatim.
             const requestText = JSON.stringify(requestBody);
+            // #5259: outermost — the bare-ref head guard acts on final outgoing bytes.
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
@@ -356,9 +357,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
                 ),
-                createBiliArtifactFilter((snippet) => {
-                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
+                composeStreamFilters(
+                    createBiliArtifactFilter((snippet) => {
+                        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createBareRefHeadFilter((snippet) => {
+                        loggerLog("warn", `[bare-ref-head] stripped model-emitted bare ref head (#5259): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
             );
             const tagFilter = makeFilter();
             let lastTextIndex: number | null = null;

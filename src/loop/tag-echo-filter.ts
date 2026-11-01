@@ -586,6 +586,17 @@ export function normalizeEchoArtifacts(text: string): string {
     return stripAcpTags(text);
 }
 
+/** Assistant-PROSE normalization for outbound model text fields: the ACP
+ *  artifact set (stripAcpTags) plus the #5259 first-line bare-ref-head guard.
+ *  Use ONLY on assistant-output fields (response bodies / deltas / done
+ *  events) — never on inbound history: a user message may legitimately open
+ *  with a quoted ref, and no inbound-stripping path exists today. Keeping the
+ *  positional rule OUT of stripAcpTags itself keeps that boundary enforced by
+ *  construction (stripAcpTags stays position-independent). */
+export function stripAssistantProse(text: string, dropToolCallEmission = false, requestText?: string): string {
+    return stripBareRefHead(stripAcpTags(text, dropToolCallEmission, requestText));
+}
+
 // Raw-wire pre-check for forged confirmation markers (#717): the literal
 // "[ACP]" survives JSON escaping unscathed (brackets are not escaped), so a
 // plain includes() on the raw SSE/JSON string is sound and cheap. The
@@ -615,6 +626,58 @@ export function containsRenderTagText(s: string): boolean {
 const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]|(?:type="text"|tokens="\d+")\s*>\s*m\d{4,}/;
 export function containsEchoResidue(s: string): boolean {
     return ECHO_RESIDUE.test(s);
+}
+
+// ─── #5259: bare kernel-ref head (no tag at all) ─────────────────────────────
+// Shape census (dsh desktop, OpenAI lane, v0.1.209): an assistant reply whose
+// first text block is a bare ledger ref plus one stray letter — `m01464b\n` —
+// no tag opener, no attribute text, nothing for a shape match to key on. The
+// model imitated a copyable ref literal from its context at generation time;
+// the reasoning channel shows no decision to emit it. Every existing channel
+// misses this shape: the tag-echo family keys on \x3c-headed names or anchor
+// attributes (#206/#5195), the marker line on "[ACP]" (#717). What IS
+// available is position + shape: the WHOLE first line of an assistant text
+// channel equals m + 4..6 digits + at most one letter. Width bound: kernel
+// refs start four-digit (m0001), six digits means ~1M messages — far past any
+// real session — so the candidate prefix stays ≤8 chars and every hold is
+// bounded. Strict byte-0 (no leading whitespace) and strict \n (no CRLF):
+// observed residue is byte-0, \n-terminated; widening either axis buys only
+// false-positive surface. First LINE of the channel only — later lines are
+// out of scope by design (the reported shape; residue elsewhere stays
+// observable, not silently rewritten).
+const BARE_REF_LINE = /^m\d{4,6}[a-zA-Z]?$/;
+
+/** Whole-text counterpart: drop a FIRST line consisting solely of the
+ *  residue shape (its \n included); anything else passes through. */
+export function stripBareRefHead(text: string): string {
+    const nl = text.indexOf("\n");
+    const line = nl < 0 ? text : text.slice(0, nl);
+    if (!BARE_REF_LINE.test(line)) return text;
+    return nl < 0 ? "" : text.slice(nl + 1);
+}
+
+/** Field-level engage predicate for the whole-text strips (stream*.ts): does
+ *  this text open with the residue shape as its complete first line? */
+export function containsBareRefHeadText(s: string): boolean {
+    if (!s.startsWith("m")) return false;
+    const nl = s.indexOf("\n");
+    return BARE_REF_LINE.test(nl < 0 ? s : s.slice(0, nl));
+}
+
+/** Raw-wire pre-check for done-event / JSON-body rebuild gates: a JSON
+ *  `text` value opening exactly with the shape (followed by an escaped
+ *  newline or the closing quote). Coarse by design — the false positive costs
+ *  one no-op strip pass; strictness lives in stripBareRefHead. */
+const BARE_REF_HEAD_WIRE = /"text"\s*:\s*"m\d{4,6}[a-zA-Z]?(?:\\n|")/;
+export function containsBareRefHeadWire(s: string): boolean {
+    return BARE_REF_HEAD_WIRE.test(s);
+}
+
+/** Streaming fast-path gate (per-chunk): could this chunk OPEN the shape?
+ *  Mid-channel engagement is a no-op — the filter disarms after its first
+ *  line decision (same doctrine as mayStartMarkerLine). */
+export function mayStartBareRefHead(s: string): boolean {
+    return s === "m" || /^m\d/.test(s);
 }
 
 // #468: some upstreams stream a model-imitated render tag in tokenizer-sized
@@ -1668,7 +1731,7 @@ function stripParts(content: unknown, drop: boolean, requestText?: string): unkn
     if (!Array.isArray(content)) return content;
     return content.map((part) => {
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string, drop, requestText) };
+            return { ...(part as Record<string, unknown>), text: stripAssistantProse((part as Record<string, unknown>).text as string, drop, requestText) };
         }
         return part;
     });
@@ -1691,7 +1754,7 @@ function stripItemContent(it: unknown, drop: boolean, requestText?: string): unk
 }
 
 function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown {
-    return typeof v === "string" ? stripAcpTags(v, drop, requestText) : v;
+    return typeof v === "string" ? stripAssistantProse(v, drop, requestText) : v;
 }
 
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
@@ -1765,9 +1828,9 @@ export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText
 export function stripResponsesText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
-    if (typeof o.text === "string") o.text = stripAcpTags(o.text, drop, requestText);
+    if (typeof o.text === "string") o.text = stripAssistantProse(o.text, drop, requestText);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
-        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string, drop, requestText) };
+        o.part = { ...(o.part as Record<string, unknown>), text: stripAssistantProse((o.part as Record<string, unknown>).text as string, drop, requestText) };
     }
     if (o.item && typeof o.item === "object") {
         o.item = stripItemContent(o.item, drop, requestText);
@@ -1871,6 +1934,88 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
         },
         dropped: () => droppedAny,
         pending: () => buf.length > 0,
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
+    };
+}
+
+// #5259 streaming counterpart of stripBareRefHead. Line-based like
+// createMarkerLineFilter: while undecided it holds at most the undecidable
+// candidate prefix (≤8 chars) until a newline, a shape-breaking byte, or EOF
+// decides the first line, then disarms forever — later bytes pass through
+// zero-overhead. Chunk-split deterministic by construction (decisions only on
+// \n / break byte / EOF). Text channels ONLY: never wire it onto signed
+// thinking/reasoning filters (#1960/KDD#10) or tool-call argument streams
+// (#1039).
+export function createBareRefHeadFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+    let buf = "";
+    let decided = false;
+    let droppedAny = false;
+    let notified = false;
+    let inputChars = 0;
+    let outputChars = 0;
+    let dropCount = 0;
+
+    const noteDrop = (snippet: string): void => {
+        droppedAny = true;
+        dropCount++;
+        if (!notified) {
+            notified = true;
+            onDrop?.(snippet);
+        }
+    };
+
+    // Still possibly `m\d{4,6}[a-zA-Z]?` awaiting its terminating newline.
+    const isCandidatePrefix = (s: string): boolean =>
+        /^m\d{0,6}$/.test(s) || /^m\d{4,6}[a-zA-Z]$/.test(s);
+
+    const process = (chunk: string): string => {
+        if (chunk.length === 0) return "";
+        inputChars += chunk.length;
+        if (decided) {
+            outputChars += chunk.length;
+            return chunk;
+        }
+        buf += chunk;
+        let out = "";
+        for (;;) {
+            const nl = buf.indexOf("\n");
+            if (nl >= 0) {
+                const line = buf.slice(0, nl);
+                if (BARE_REF_LINE.test(line)) noteDrop(buf.slice(0, nl + 1));
+                else out += buf.slice(0, nl + 1);
+                buf = buf.slice(nl + 1);
+                decided = true;
+                out += buf;
+                buf = "";
+                break;
+            }
+            if (isCandidatePrefix(buf)) return out;
+            out += buf;
+            buf = "";
+            decided = true;
+            break;
+        }
+        outputChars += out.length;
+        return out;
+    };
+
+    return {
+        push: (delta: string): string => process(delta),
+        flush(): string {
+            if (decided || buf.length === 0) return "";
+            if (BARE_REF_LINE.test(buf)) {
+                noteDrop(buf);
+                buf = "";
+                return "";
+            }
+            const tail = buf;
+            buf = "";
+            decided = true;
+            outputChars += tail.length;
+            return tail;
+        },
+        dropped: () => droppedAny,
+        pending: () => !decided && buf.length > 0,
         stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
