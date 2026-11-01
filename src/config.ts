@@ -604,14 +604,15 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
-    /** EXPERIMENTAL view transform A (default OFF): move a still-visible
-     *  compress call/result pair from its original tail-adjacent position to
-     *  its own fold point, so resent history ends "[folded region] – [pair] –
-     *  [protected messages]" instead of a tool exchange at the very end (which
-     *  weak-attention models read as a fresh command). Purely view-side — refs
-     *  and state are untouched; identical layout is recomputed every turn.
-     *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
-     *  applyCompressSettings resolves it per request. Maps to kernel
+    /** View transform A (default ON since real-model verification, #5470):
+     *  move a still-visible compress call/result pair from its original
+     *  tail-adjacent position to its own fold point, so resent history ends
+     *  "[folded region] – [pair] – [protected messages]" instead of a tool
+     *  exchange at the very end (which weak-attention models read as a fresh
+     *  command). Purely view-side — refs and state are untouched; identical
+     *  layout is recomputed every turn. Explicit off = byte-identical to the
+     *  pre-feature layout. Env BILI_COMPRESS_AT_FOLD_POINT wins over every
+     *  level; applyCompressSettings resolves it per request. Maps to kernel
      *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
     compressAtFoldPoint?: boolean;
     /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop

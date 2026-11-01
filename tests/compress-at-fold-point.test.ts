@@ -24,17 +24,17 @@ function withEnv(key: string, value: string | undefined, fn: () => void): void {
     }
 }
 
-test("resolveCompressAtFoldPoint: env tier wins, garbage falls through, default off", () => {
+test("resolveCompressAtFoldPoint: env tier wins, garbage falls through, default on", () => {
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "1" } as NodeJS.ProcessEnv), true);
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "ON" } as NodeJS.ProcessEnv), true);
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: " 0 " } as NodeJS.ProcessEnv, true), false, "env 0 beats file true");
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "bogus" } as NodeJS.ProcessEnv, true), true, "garbage env falls to file");
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "" } as NodeJS.ProcessEnv, false), false);
-    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv), false, "opt-in default off (#5470)");
-    assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "off" } as NodeJS.ProcessEnv), false, "explicit env off");
+    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv), true, "default on (#5470 promoted)");
+    assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "off" } as NodeJS.ProcessEnv), false, "explicit env off disables the default");
     assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, true), true, "file bool honored");
     assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, false), false, "file false honored");
-    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, "yes"), false, "non-bool file falls to default off");
+    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, "yes"), true, "non-bool file falls to default on");
 });
 
 test("resolveCompressAtFoldPointClearThinking: same tiers, default off", () => {
@@ -62,7 +62,7 @@ test("applyCompressSettings: maps file flags and lets env override", () => {
             assert.equal(on.compressAtFoldPoint, true);
             assert.equal(on.compressAtFoldPointClearThinking, true);
             const unset = applyCompressSettings(base, 200000, {});
-            assert.equal(unset.compressAtFoldPoint, false, "unset file flag resolves to opt-in default off (explicit pass-through)");
+            assert.equal(unset.compressAtFoldPoint, true, "unset file flag resolves to default on (explicit pass-through)");
             assert.equal(unset.compressAtFoldPointClearThinking, false, "clear-thinking stays opt-in");
         });
     });
@@ -76,25 +76,23 @@ test("applyCompressSettings: maps file flags and lets env override", () => {
     });
 });
 
-test("resolveRequestConfig: env-only fold-point opt-in reaches lanes with zero compress settings", () => {
+test("resolveRequestConfig: runs the mapping so the fold-point defaults reach lanes with zero compress settings", () => {
     const base = defaultConfig(200000);
     const model = "model-x";
-    // nothing set anywhere -> legacy short-circuit preserved byte-for-byte
     withEnv("BILI_COMPRESS_AT_FOLD_POINT", undefined, () => {
         withEnv("BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING", undefined, () => {
             const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
-            assert.equal(resolved, base, "both-falsy knobs keep returning base untouched");
+            assert.notEqual(resolved, base, "no settings, but the ON default must still be stamped");
+            assert.equal(resolved.compressAtFoldPoint, true);
+            assert.equal(resolved.compressAtFoldPointClearThinking, false);
         });
     });
-    // env-only switch-A must still be stamped (env never joins the file
-    // cascade, so hasCompressSettings alone cannot see it)
-    withEnv("BILI_COMPRESS_AT_FOLD_POINT", "on", () => {
+    // explicit env-off restores the old short-circuit: same object reference
+    withEnv("BILI_COMPRESS_AT_FOLD_POINT", "off", () => {
         const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
-        assert.notEqual(resolved, base, "env-only opt-in must not die in the short-circuit");
-        assert.equal(resolved.compressAtFoldPoint, true);
-        assert.equal(resolved.compressAtFoldPointClearThinking, false);
+        assert.equal(resolved, base, "all-falsy knobs keep returning base untouched");
     });
-    // env-only switch-B alone must also force the mapping to run
+    // switch-B alone must also force the mapping to run
     withEnv("BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING", "on", () => {
         const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
         assert.notEqual(resolved, base);

@@ -165,15 +165,15 @@ entries:
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
   - key: compress.compressAtFoldPoint
     type: boolean
-    default: "false"
+    default: "true"
     env: BILI_COMPRESS_AT_FOLD_POINT
     group: compress
     id: cw.cafp
     render: compress-row
-    desc_en: "EXPERIMENTAL, default off: move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; off = byte-identical layout."
-    desc_zh: "实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。"
-    site_en: "EXPERIMENTAL boolean (default false): relocate a visible compress call/result pair to its fold point in the outbound view so a trailing tool exchange is not mistaken for a new user command. View-only and deterministic per turn; off = byte-identical to the default layout."
-    site_zh: "实验性布尔开关（默认 false）：把可见的压缩调用/结果对移到出站视图的折叠点处，避免历史末尾的工具交换被模型误读为新命令。纯视图变换、每轮确定性重算；关闭 = 与原布局字节级一致。"
+    desc_en: "Default on (promoted after real-model verification, #5470): move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; explicitly off = byte-identical to the pre-feature layout."
+    desc_zh: "默认开启（#5470 真实模型验证后转正）：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；显式关闭 = 与功能引入前布局字节级不变。"
+    site_en: "boolean (default true): relocate a visible compress call/result pair to its fold point in the outbound view so a trailing tool exchange is not mistaken for a new user command. View-only and deterministic per turn; explicit off = byte-identical to the legacy layout."
+    site_zh: "布尔开关（默认 true）：把可见的压缩调用/结果对移到出站视图的折叠点处，避免历史末尾的工具交换被模型误读为新命令。纯视图变换、每轮确定性重算；显式关闭 = 与旧布局字节级一致。"
   - key: compress.compressAtFoldPointClearThinking
     type: boolean
     default: "false"

@@ -430,11 +430,10 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    // #5470 opt-in reachability: an env-only enablement of either fold-point
-    // switch is invisible to hasCompressSettings (env never joins the file
-    // cascade), so without these checks such a lane would hit the short-circuit
-    // below and the knob would silently die. Both-falsy keeps the original
-    // short-circuit byte-for-byte (zero behavior change when nothing is set).
+    // #5470 default-on: the fold-point switch resolves ON even when no
+    // compress settings are configured at all — and env=off must stay able to
+    // disable that default — so the "nothing configured" short-circuit also
+    // requires both fold-point knobs to resolve falsy.
     const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
     const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
     if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
