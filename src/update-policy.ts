@@ -5,7 +5,7 @@
  *
  * 1. STAGGER — when an instance discovers a new version it does not upgrade
  *    immediately; it draws ONE random moment inside [minDelay, maxDelay]
- *    (default 15 min .. 48 h) and upgrades when that moment arrives. The draw
+ *    (default 15 min .. 7 days) and upgrades when that moment arrives. The draw
  *    is persisted under the cache dir keyed by (dist-tag, target version), so
  *    process restarts never re-roll — a restart-heavy machine must not keep
  *    drawing early values and defeat the spread. All copies on one machine
@@ -47,7 +47,7 @@ import { parseDurationField } from "./duration.js";
 // --- defaults & constants ---
 
 export const STAGGER_MIN_DELAY_DEFAULT_MS = 15 * 60_000; // 15 min
-export const STAGGER_MAX_DELAY_DEFAULT_MS = 48 * 3_600_000; // 48 h
+export const STAGGER_MAX_DELAY_DEFAULT_MS = 7 * 86_400_000; // 7 days
 export const POLICY_URL_DEFAULT = "https://raw.githubusercontent.com/ranxianglei/billion-context/master/auto-update-policy.json";
 
 const POLICY_SCHEMA_VERSION = 1;
@@ -363,7 +363,7 @@ export function normalizePolicyDoc(raw: unknown): { doc: UpdatePolicyDoc | undef
 
 /** Compose the effective stagger window for `candidate`:
  *  local config/env replaces the BASE window (remote `default` or the built-in
- *  15min..48h); remote `overrides` then stack ON TOP per version (an operator
+ *  15min..7d); remote `overrides` then stack ON TOP per version (an operator
  *  tuning a specific release outranks a single-machine preference). Exact
  *  `version` matches beat `range` matches; the first matching override wins.
  *  A min>max result clamps to a single point at max (conservative). */
