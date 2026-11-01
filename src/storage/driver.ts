@@ -248,7 +248,7 @@ export interface BunSqliteDatabase {
     close(): void;
 }
 
-export type BunSqliteCtor = new (path: string) => BunSqliteDatabase;
+type BunSqliteCtor = new (path: string) => BunSqliteDatabase;
 
 let bunDatabaseFactoryForTests: ((path: string) => BunSqliteDatabase) | null = null;
 
