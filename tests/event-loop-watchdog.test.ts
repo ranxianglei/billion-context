@@ -66,6 +66,8 @@ test("wedged main loop trips the watchdog: warn + fatal forensic lines land in t
         assert.match(content, /\[event-loop-watchdog\] main event loop silent for \d+(?:ms|s) \(soft threshold 60ms\)/);
         assert.match(content, /\[event-loop-watchdog\] FATAL: main event loop silent for \d+(?:ms|s) \(hard threshold 150ms\)/);
         assert.match(content, /\[v=0\.0\.0-test\]/);
+        assert.match(content, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} \[(?:warn|error)\] \[v=/m);
+        assert.doesNotMatch(content, /Z \[/);
         // report mode latches: exactly ONE fatal line per wedge episode
         assert.equal((content.match(/FATAL/g) ?? []).length, 1);
     } finally {

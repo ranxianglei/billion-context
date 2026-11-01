@@ -43,6 +43,7 @@
  * so the condition has to be structural, not defensive.
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
+import { logTimestamp } from "./logger.js";
 
 export const WATCHDOG_HEARTBEAT_MS = 5_000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
@@ -114,6 +115,10 @@ interface WatchdogTripMsg {
 // exist in eval workers (ReferenceError, verified on Node 22), so the port
 // must be fetched from the module itself.
 const WORKER_CODE = [
+    // tsx/esbuild keepNames wraps nested helpers with __name; eval workers
+    // receive only this source, so provide its identity runtime explicitly.
+    "const __name = (fn, _name) => fn;",
+    logTimestamp.toString(),
     "let parentPort = null;",
     "try { parentPort = require(\"worker_threads\").parentPort; } catch (e) {}",
     "let logFile = null;",
@@ -138,7 +143,7 @@ const WORKER_CODE = [
     "}",
     "",
     "function line(level, msg) {",
-    "  const row = new Date().toISOString() + \" [\" + level + \"][v=\" + version + \"] \" + msg + \"\\n\";",
+    "  const row = logTimestamp() + \" [\" + level + \"] [v=\" + version + \"] \" + msg + \"\\n\";",
     "  try { if (logFile !== null) require(\"fs\").appendFileSync(logFile, row, { mode: 0o600 }); } catch (e) {}",
     "  if (emitStderr) { try { process.stderr.write(row); } catch (e) {} }",
     "}",
