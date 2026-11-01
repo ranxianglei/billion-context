@@ -11,9 +11,18 @@ on:
   push:
     branches: [master]
 
+# 2026-10-31 queue-starvation incident: same fix as release.yml — serialize the
+# per-merge run pile (eight stacked on a busy day) instead of letting them all
+# start concurrently once capacity returns. No cancel-in-progress: back-to-back
+# kernel releases must publish in order (#3071 discipline).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-kernel:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: write
       actions: write

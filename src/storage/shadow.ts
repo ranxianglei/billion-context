@@ -16,9 +16,12 @@
  *     env), but the unified index is the load path.
  *
  * Failure policy: sidecar problems must NEVER break the legacy write path.
- * All work is try/catch'd; after MAX_CONSECUTIVE_FAILURES consecutive
- * failures the sidecar disables itself for the process (warn once) — in
- * full mode that also flips reads back to legacy-only.
+ * All work is try/catch'd. The sidecar NEVER gives up on index writes
+ * (2026-10-30 owner policy): an ingest failure is recorded loudly — one warn
+ * per DISTINCT error message, so a stuck failure mode does not spam every
+ * turn's log line — and every subsequent save retries the index write as
+ * usual. No self-disable / circuit breaker exists anymore; the JSON envelope
+ * remains the recovery source either way.
  */
 
 import { log as loggerLog } from "../logger.js";
@@ -26,7 +29,6 @@ import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendB
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -35,7 +37,15 @@ import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
-export const MAX_CONSECUTIVE_FAILURES = 3;
+// True once quick_check proved this process's index corrupt. such a boot is
+// alarm-only by design (files stay put; the operator repairs/moves them by
+// hand), so the #5188 demand-driven reopen must NOT keep re-scanning the same
+// broken file set forever.
+let integrityQuickCheckFailed = false;
+export function hadIntegrityQuickCheckFailure(): boolean {
+    return integrityQuickCheckFailed;
+}
+
 const VERIFY_BATCH_SIZE = 32;
 
 /** Bound transient CAS strings during normal cold loads, not the retained history. */
@@ -47,27 +57,6 @@ interface ResidentFields {
     blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
 }
 
-/** #5188: ingest errors meaning "the resource was briefly unavailable",
- *  not "the storage is broken" — a concurrent lock held past busy_timeout,
- *  a momentary disk-full or fd spike, an EBUSY from the OS. These ride
- *  plain WAL/resource churn under load (CI shards hammering one runner),
- *  and counting them toward the permanent disable latch turned ordinary
- *  spikes into whole-process degradations. The companion half of #5188
- *  (SessionStore.tryRecoverSidecar, src/persist.ts) heals the other end:
- *  a FIRST open that dies on such a spike is retried on a cooldown instead
- *  of staying absent for the process lifetime. Contention-class errors here
- *  refresh stats.lastError for observability only — the very next save
- *  retries and succeeds automatically, so nothing else needs to happen.
- *  Breakage-class errors (corruption, schema violations, readonly refusal,
- *  'file is not a database') stay the real evidence and keep striking.
- *  NOTE: 'unable to open database file' (CANTOPEN) is deliberately counted
- *  as transient-at-ingest: at write time it is the fd-exhaustion / bad-share
- *  signature, and a persistently failing store keeps its lastError visible
- *  plus the per-read fallback warns (#3933 viewFor degrade lines). */
-export function isTransientContentionError(err: unknown): boolean {
-    const s = String(err);
-    return /\bSQLITE_BUSY\b|\bSQLITE_LOCKED\b|database is busy|database is locked|table .*locked|\bEBUSY\b|\bENOSPC\b|database or disk is full|\bSQLITE_FULL\b|too many open files|\bE(M)?FILE\b|unable to open database file|\bSQLITE_IOERR\b/i.test(s);
-}
 
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
@@ -129,6 +118,9 @@ interface ShadowStats {
     verifyOk: number;
     verifyDrift: number;
     imports: number;
+    /** Retained on the status wire for panel compatibility. Never set to true
+     *  anymore — the self-disable breaker was removed (2026-10-30 owner policy:
+     *  index writes are never abandoned). Always false. */
     disabled: boolean;
     lastError: string | null;
     /** #3818: records skipped from the mirror because they carry orphan
@@ -171,6 +163,10 @@ export class UnifiedShadow {
      *  saves index-only) so a multi-writer ping-pong (#394) can no longer
      *  churn the file copy; the first clean sample re-admits. */
     readonly frozenEnvelopeIds = new Set<string>();
+    /** #5408: when (epoch ms) this process froze each session's envelope
+     *  writes — feeds the status wire and the skip-save logs so a frozen
+     *  session surfaces WITH an age and a reason instead of only a count. */
+    private readonly frozenEnvelopeSince = new Map<string, number>();
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -190,6 +186,9 @@ export class UnifiedShadow {
      *  Ingest-failure warnings must name it — "staying legacy-only" without a
      *  path left users hunting %TEMP% logs for which file said what. */
     private readonly dbPath: string | null;
+    /** Streak gauge for diagnostics/wire only — it never disables anything
+     *  (the breaker was removed, 2026-10-30 owner policy); resets on the next
+     *  successful ingest. */
     private consecutiveFailures = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
@@ -203,27 +202,18 @@ export class UnifiedShadow {
         this.dbPath = dbPath ?? null;
     }
 
-    /** #5103: one ingest failure recorded — the FIRST failure of a streak now
-     *  warns with the file named (before, strikes one and two were silent and
-     *  the user learned of the degradation from missing features, not logs);
-     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before.
-     *  #5188: "briefly unavailable" contention (lock held by a concurrent
-     *  save, disk full) never strikes — see isTransientContentionError; it
-     *  refreshes lastError so the panels stay honest while it settles, and a
-     *  latch that already tripped stops re-warning on every save after.
-     *  Breakage-class failures keep the byte-for-byte old behavior. */
+    /** #5103 / 2026-10-30 owner policy (never abandon index writes): record
+     *  every ingest failure with the file named — but a streak of the SAME
+     *  error message warns once (a permanently broken index must not add a log
+     *  line to every turn), while any NEW message warns immediately. Nothing is
+     *  ever disabled; the next save retries the write unconditionally. */
     private noteIngestFailure(err: unknown): void {
+        const prev = this.stats.lastError ?? "";
         const errStr = String(err);
+        this.consecutiveFailures += 1;
         this.stats.lastError = errStr;
-        if (isTransientContentionError(errStr)) return;
-        if (this.stats.disabled) return;
-        this.consecutiveFailures++;
-        if (this.consecutiveFailures === 1) {
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
-        }
-        if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            this.stats.disabled = true;
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} disabled after ${this.consecutiveFailures} consecutive failures (last: ${errStr})${sqliteOpenFailureHint(errStr)} — staying legacy-only`);
+        if (errStr !== prev) {
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${errStr})${sqliteOpenFailureHint(errStr)} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
     }
 
@@ -270,40 +260,32 @@ export class UnifiedShadow {
             try {
                 store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
             } catch (err) {
-                // #4175: quick_check failed — the file set is provably corrupt.
-                // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
-                // discipline as the session envelopes) and retry ONCE with a
-                // fresh file: the JSON envelopes remain the recovery source
-                // (full mode re-imports organically on load). No auto-delete —
-                // the corrupt original is kept for forensics.
+                // #4175: anything else throwing StorageIntegrityError means quick_check
+                // proved the file set corrupt — handled below WITHOUT moving any file
+                // (#4626-era owner decision, 2026-10-30).
                 if (!(err instanceof StorageIntegrityError)) throw err;
-                const stamp = Date.now();
-                const quarantined: string[] = [];
-                for (const suffix of ["", "-wal", "-shm"]) {
-                    const from = `${dir}/index.db${suffix}`;
-                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
-                    try {
-                        renameSync(from, to);
-                        quarantined.push(path.basename(to));
-                    } catch {
-                        /* absent sidecar files are fine */
-                    }
-                }
-                // #4609: the verdict cache belongs to the quarantined file set —
-                // move it along so the fresh store starts with a clean cache
-                // (its stats differ anyway; this keeps the directory honest).
-                try {
-                    const cacheFrom = `${dir}/index.db.chk`;
-                    renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
-                    quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
-                } catch {
-                    /* absent cache is fine */
-                }
+                // #4626-era owner decision chain — FINAL form (2026-10-30):
+                // quick_check PROVED this file set corrupt. Nothing moves,
+                // nothing is copied, nothing is rebuilt automatically
+                // (auto-recovery from the JSON envelopes was withdrawn too:
+                // with BILI_STORAGE_JSON_WRITER=off the index is the sole
+                // durable copy), and bili STARTS ANYWAY, serving from the
+                // envelopes — with a loud alarm naming the manual fix.
+                // writerOffActive() sees no sidecar, so even a jsonWriter=off
+                // operator keeps persisting every turn to the envelopes; no
+                // turn ever lands somewhere unsafe. The corrupt set stays
+                // EXACTLY in place: an operator repairs it or moves it aside
+                // by hand (back up first) and the next start picks up a fresh
+                // index that re-imports the envelopes. Transient open
+                // failures below are a different category ("environment
+                // broken", not "data proven bad") and still refuse.
                 loggerLog(
                     "error",
-                    `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
+                    `[storage] index.db FAILED its integrity quick_check (${err.detail}) — starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#4175/#4626/#4816)`,
                 );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                recordSidecarOpenFailure(`integrity quick_check failed: ${err.detail}`);
+                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
+                return null;
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -311,30 +293,33 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
-            // #2771: a corrupt/unreadable index.db must degrade to legacy-only
-            // (same shape as the encryption opt-out), never brick SessionStore
-            // construction. No auto-delete: the index may hold pinned checkpoint
-            // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
             // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
             // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
-            // session state in unified-full mode). The delete advice fits only a genuine corrupt
-            // file; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            // session state in unified-full mode). The Node.js upgrade lever is surfaced via
+            // /__bili/status + the bootstrap warn.
+            // Corruption-shaped failures never reach here — the inner catch
+            // above handles them (loud alarm + boot WITHOUT the index).
+            // #4626-era owner decision chain (2026-10-30): every OTHER
+            // sidecar-open failure REFUSES TO START instead of degrading —
+            // no-engine/CANTOPEN/readonly/OS-level: availability at the
+            // price of a silently different storage path was withdrawn by
+            // owner instruction "在任何情况下不降级". Intentional opt-outs
+            // (legacy mode / encryption opt-out / persistence off) resolve to
+            // mode===legacy above and never reach here.
             const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : hint !== ""
-                    ? hint
-                    : "; delete the file to reset the index";
+                : hint !== "" ? `; ${hint}` : "; check file/OS state (CANTOPEN/readonly) or move index.db{,-wal,-shm} aside after backing up to force a fresh rebuild";
             loggerLog(
-                "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
+                "error",
+                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — REFUSING TO START (owner policy 2026-10-30: NO degradation in any case — fix the environment or set BILI_STORAGE_UNIFIED=legacy explicitly to serve JSON-only${tail})`,
             );
             recordSidecarOpenFailure(errStr);
-            return null;
+            throw err;
         }
-        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, `${dir}/index.db`);
+        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, path.join(dir, "index.db"));
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
@@ -367,9 +352,10 @@ export class UnifiedShadow {
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
         if (!dsn) {
-            loggerLog("warn", "[storage] storage.backend=mysql selected but no DSN is configured (BILI_MYSQL_DSN or storage.mysql.dsn) — staying legacy-only; see the CONFIGURATION storage section");
+            const msg = "[storage] storage.backend=mysql selected but no DSN is configured (BILI_MYSQL_DSN or storage.mysql.dsn) — REFUSING TO START; configure the DSN or unset storage.backend (see the CONFIGURATION storage section)";
+            loggerLog("error", msg);
             recordSidecarOpenFailure("mysql backend selected without a DSN");
-            return null;
+            throw new Error(msg);
         }
         try {
             const backend = await openBackend("mysql", dsn);
@@ -380,15 +366,24 @@ export class UnifiedShadow {
             return shadow;
         } catch (err) {
             const errStr = String(err);
-            loggerLog("warn", `[storage] mysql backend failed to open (${errStr}) — staying legacy-only`);
+            loggerLog("error", `[storage] mysql backend failed to open (${errStr}) — REFUSING TO START (no degradation in any case, 2026-10-30 owner policy); fix the connection or unset storage.backend`);
             recordSidecarOpenFailure(errStr);
-            return null;
+            throw err;
         }
     }
 
-    /** True when reads should go unified-first (full mode, sidecar healthy). */
+    /** #4942 test seam: build a shadow directly on an async backend without
+     *  env-driven open or sidecar-instance registration (hermetic suites
+     *  stub the StorageBackend contract; see tests/storage-mysql-seam.test.ts). */
+    static fromBackend(mode: StorageMode, backend: StorageBackend, legacyLoad?: (record: unknown) => LegacySessionLike | null): UnifiedShadow {
+        return new UnifiedShadow(mode, null, legacyLoad ?? (() => null), backend);
+    }
+
+    /** True when reads should go unified-first (full mode). A failing sidecar
+     *  still serves reads through the drift/lag guards (loadSync watermark +
+     *  #4323 richer-view pick), so ingest health is not part of this gate. */
     get readsUnified(): boolean {
-        return this.mode === "full" && !this.stats.disabled;
+        return this.mode === "full";
     }
 
     // engine/engineSource introspection lives in engineInfo (sqlite-only
@@ -404,12 +399,11 @@ export class UnifiedShadow {
      *  accounting stays honest. */
     record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         // #3931 step 3: network backend — the ingest runs on the serial
-        // queue (fire-and-forget; failures feed the same 3-strike disable).
+        // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
             return;
         }
-        if (this.stats.disabled) return;
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
@@ -444,7 +438,16 @@ export class UnifiedShadow {
                 const plan = planIngest(legacy);
                 // #3285: only a raw-tail plan is the complete log — that is
                 // what lets the full path sweep foreign rows as stale.
-                this.sync.ingestSession(plan, undefined, { completeLog: hasRawTail });
+                // #5408: while drift-latched the ENVELOPE is what loadSync
+                // serves (the latch exists because the index diverged from
+                // it), so the index must converge to THAT view — sweep on
+                // every latched full ingest even without a raw tail. Before
+                // this, a folded-resident save (no raw tail) never swept:
+                // foreign rows rode every replay and the drift could never
+                // clear on its own (the incident behind #5408 sat frozen for
+                // 8h on exactly this shape).
+                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
+                this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -491,8 +494,26 @@ export class UnifiedShadow {
                     // store keeps receiving every save either way).
                     const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
                     this.driftStreaks.set(legacy.id, streak);
+                    // #3919: the digest says WHICH bytes disagree but not WHERE —
+                    // append the field-level diagnosis (diverged dimensions +
+                    // first divergent tail slot, fingerprints only, never body
+                    // text) so one log line is enough to classify the trigger.
+                    // The line prefix stays byte-identical for existing greps.
+                    // #5408: computed BEFORE the escalation so the ESCALATED
+                    // warn carries it too — that line is the one operators see
+                    // when they grep for the freeze, and "diverged: state"
+                    // without the sub-key drill-down left #5408 undiagnosable.
+                    let diagnosis = "";
+                    try {
+                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
+                    } catch {
+                        // diagnostics must never break the heal path
+                    }
                     if (streak === DRIFT_ESCALATE_STREAK) {
                         this.frozenEnvelopeIds.add(legacy.id);
+                        // #5408: stamp WHEN this process froze the writes — the
+                        // skip-save logs and the status wire surface the age.
+                        this.frozenEnvelopeSince.set(legacy.id, Date.now());
                         let sides = "";
                         try {
                             const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
@@ -501,7 +522,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}${diagnosis}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -515,17 +536,6 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.sync.clearIngestWatermark(legacy.id);
-                    // #3919: the digest says WHICH bytes disagree but not WHERE —
-                    // append the field-level diagnosis (diverged dimensions +
-                    // first divergent tail slot, fingerprints only, never body
-                    // text) so one log line is enough to classify the trigger.
-                    // The line prefix stays byte-identical for existing greps.
-                    let diagnosis = "";
-                    try {
-                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
-                    } catch {
-                        // diagnostics must never break the heal path
-                    }
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
@@ -537,6 +547,7 @@ export class UnifiedShadow {
                     // this process's envelope writes for the session.
                     this.driftStreaks.delete(legacy.id);
                     if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                        this.frozenEnvelopeSince.delete(legacy.id);
                         loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
                     }
                 }
@@ -594,7 +605,6 @@ export class UnifiedShadow {
     viewFor(id: string): LegacySessionLike | null {
         const store = this.sync;
         if (store === null) return null;
-        if (this.stats.disabled) return null;
         try {
             const unified = store.readSnapshot(() => {
                 const sessionRow = store.getSessionRow(id);
@@ -624,7 +634,7 @@ export class UnifiedShadow {
     /** Lazy resident fields share the same source header without rebuilding a session. */
     readResidentFieldsFor(id: string, fields: { metadata?: boolean; blockContents?: boolean }): ResidentFields | null {
         const store = this.sync;
-        if (store === null || this.stats.disabled) return null;
+        if (store === null) return null;
         try {
             return store.readSnapshot(() => {
                 const header = store.getLoadHeader(id);
@@ -662,11 +672,25 @@ export class UnifiedShadow {
         return this.sync !== null && this.frozenEnvelopeIds.has(id);
     }
 
+    /** #5408: freeze metadata for status surfaces — null when not frozen. */
+    envelopeFrozenInfo(id: string): { sinceMs: number } | null {
+        if (!this.envelopeFrozen(id)) return null;
+        return { sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() };
+    }
+
+    /** #5408: every frozen session with its freeze time, sorted by id — the
+     *  /__bili/status wire detail behind the frozenEnvelopeSessions count. */
+    frozenEnvelopeDetails(): { id: string; sinceMs: number }[] {
+        const out: { id: string; sinceMs: number }[] = [];
+        for (const id of this.frozenEnvelopeIds) out.push({ id, sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() });
+        out.sort((a, b) => a.id.localeCompare(b.id));
+        return out;
+    }
+
     /** #4323: active block rows the unified store holds for `id` — null when
      *  the sqlite fast lane is unavailable; callers must not guess from null. */
     activeBlockCount(id: string): number | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getBlocks(id).filter((b) => b.active).length;
         } catch {
@@ -678,7 +702,6 @@ export class UnifiedShadow {
      *  seen so future loads serve from the unified store. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return null;
@@ -703,7 +726,7 @@ export class UnifiedShadow {
         this.ingestCounts.delete(id);
         this.driftStreaks.delete(id);
         this.frozenEnvelopeIds.delete(id);
-        if (this.stats.disabled) return;
+        this.frozenEnvelopeSince.delete(id);
         try {
             this.sync.deleteSession(id);
         } catch (err) {
@@ -718,31 +741,26 @@ export class UnifiedShadow {
 
     createCheckpoint(cp: Parameters<UnifiedStore["insertCheckpoint"]>[0]): void {
         if (this.sync === null) throw new Error('[storage] sync checkpoint API unavailable on a network backend — use the async twin');
-        this.assertLive();
         this.sync.insertCheckpoint(cp);
     }
 
     listCheckpoints(sessionId?: string): CheckpointRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listCheckpoints(sessionId);
     }
 
     getCheckpoint(cpId: string): CheckpointRow | undefined {
         if (this.sync === null) return undefined;
-        this.assertLive();
         return this.sync.getCheckpoint(cpId);
     }
 
     checkpointState(cpId: string): { stateJson: string; byteLen: number } {
         if (this.sync === null) throw new Error('[storage] sync checkpoint API unavailable on a network backend — use the async twin');
-        this.assertLive();
         return this.sync.checkpointState(cpId);
     }
 
     deleteCheckpoint(cpId: string): boolean {
         if (this.sync === null) return false;
-        this.assertLive();
         return this.sync.deleteCheckpoint(cpId);
     }
 
@@ -750,24 +768,21 @@ export class UnifiedShadow {
      *  ingested). See SessionStore.buildForLoadAll for the race this guards. */
     sessionUpdatedAt(sessionId: string): number | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.sessionUpdatedAt(sessionId);
     }
 
     /** Absolute-seq tip of the session's message log (+1 = next free seq).
-     *  Used as a checkpoint's seq_at. */
+     *  Used as a checkpoint's seq_at. #4739 follow-up: one MAX(seq) aggregate
+     *  over live rows (#4730's lastLiveSeq) instead of materializing the whole
+     *  log (rows + CAS reads + media hydration) just to reduce it to a scalar. */
     sessionTipSeq(sessionId: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
-        let tip = 0;
-        for (const m of this.sync.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
-        return tip;
+        return (this.sync.lastLiveSeq(sessionId) ?? -1) + 1;
     }
 
     /** #3301: message rows for specific ids (+ seq±1 neighbors) — stored
      *  decompositions for fold-anchor backfill after a wire-shape flip. */
     messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
-        this.assertLive();
         if (!this.sync) return []; // network backends cannot serve the sync decomposition lookup (#3931 architecture)
         return this.sync.messagesForIds(sessionId, msgIds, includeNeighbors);
     }
@@ -777,30 +792,26 @@ export class UnifiedShadow {
      *  enumerable. */
     listSessionIds(): string[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listSessionIds();
     }
 
     /** Identity lookup passthrough (#2960 R2.1). */
     lookupConversation(namespace: string, conversationId: string): string | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.lookupConversation(namespace, conversationId);
     }
 
     /** #3049: O(1) counter probe backing the persist stale-guard fast path.
-     *  Safe on a disabled sidecar? NO — call sites must check stats first
-     *  (this throws like every other pass-through; the guard treats any
-     *  failure as "no fast path" and falls back to the full envelope read). */
+     *  Throws like every other pass-through when the store rejects it; the
+     *  guard treats any failure as "no fast path" and falls back to the full
+     *  envelope read. */
     sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.sessionCounters(sessionId);
     }
 
     listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listConversationBindings(namespace);
     }
 
@@ -834,6 +845,29 @@ export class UnifiedShadow {
         return this.sync.archiveSession(sessionId, opts);
     }
 
+    /** #5312: full transcript id set + block rows for the foreign-block sweep
+     *  (reads degrade like the neighboring sync facades on network backends). */
+    allMessageIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.allMessageIds(sessionId);
+    }
+
+    getBlocks(sessionId: string): ReturnType<import("./store.ts").UnifiedStore["getBlocks"]> {
+        if (this.sync === null) return [];
+        return this.sync.getBlocks(sessionId);
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block archive unavailable" };
+        return this.sync.archiveBlock(sessionId, blockId, opts);
+    }
+
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block restore unavailable" };
+        return this.sync.restoreBlock(sessionId, blockId, opts);
+    }
+
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);
@@ -857,17 +891,15 @@ export class UnifiedShadow {
         return this.sync.activeForeignWriter();
     }
 
-    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] {
         if (this.sync === null) return [];
-        this.assertLive();
-        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
      *  (tail_json.tailSeqs). Null when absent/malformed. */
     tailSeqs(sessionId: string): number[] | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.tailSeqs(sessionId);
     }
 
@@ -880,20 +912,17 @@ export class UnifiedShadow {
     /** #D5-5: identity-only rows (no content bytes) for the render lane. */
     messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.messageIdRows(sessionId);
     }
 
     /** #D5-5: content rows outside the covered intervals only. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.uncoveredRows(sessionId, intervals);
     }
 
     tailViewRows(sessionId: string): MessageRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.getMessages(sessionId);
     }
 
@@ -902,20 +931,17 @@ export class UnifiedShadow {
      *  compaction pruned the resident window. */
     messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
-        this.assertLive();
         return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.sessionSummaries();
     }
 
     /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
     getCcr(sessionId: string): MessageContentStore | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getCcr(sessionId);
     }
 
@@ -925,7 +951,6 @@ export class UnifiedShadow {
      *  falls back to the envelope, exactly like today's sync loadSync). */
     getSessionMetadata(sessionId: string): Record<string, unknown> | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getSessionMetadata(sessionId);
         } catch {
@@ -938,7 +963,6 @@ export class UnifiedShadow {
      *  getSessionMetadata. */
     getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
         } catch {
@@ -952,13 +976,11 @@ export class UnifiedShadow {
      *  or nothing — a stale map would re-bind citations wrongly. */
     seqByRaw(sessionId: string): Map<string, number> | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.seqByRaw(sessionId);
     }
 
     /** #4316 PR3/3: live (non-retired) message row count. */
     liveRowCount(sessionId: string): number {
-        this.assertLive();
         if (this.sync !== null) return this.sync.liveRowCount(sessionId);
         return -1;
     }
@@ -968,7 +990,6 @@ export class UnifiedShadow {
      *  store is unavailable or the session has no live rows. */
     lastLiveSeq(sessionId: string): number | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.lastLiveSeq(sessionId);
     }
 
@@ -980,7 +1001,6 @@ export class UnifiedShadow {
      *  (sync === null) cannot serve this sync facade — the fork lane awaits
      *  cloneSessionRowsAsync instead (#4911). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
-        this.assertLive();
         if (this.sync !== null) return this.sync.cloneSessionRows(parentId, childId, throughSeq);
         return false;
     }
@@ -988,7 +1008,6 @@ export class UnifiedShadow {
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
     webSummaryRows(): WebSummaryRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.webSummaryRows();
     }
 
@@ -1000,49 +1019,41 @@ export class UnifiedShadow {
 
     setSessionExt(sessionId: string, key: string, value: unknown): void {
         if (this.sync === null) return;
-        this.assertLive();
         this.sync.setSessionExt(sessionId, key, value);
     }
 
     getSessionExt(sessionId: string, key: string): unknown {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getSessionExt(sessionId, key);
     }
 
     listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listSessionExt(sessionId);
     }
 
     deleteSessionExt(sessionId: string, key?: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
         return this.sync.deleteSessionExt(sessionId, key);
     }
 
     setKv(namespace: string, key: string, value: unknown): void {
         if (this.sync === null) return;
-        this.assertLive();
         this.sync.setKv(namespace, key, value);
     }
 
     getKv(namespace: string, key: string): unknown {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getKv(namespace, key);
     }
 
     listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listKv(namespace, keyPrefix);
     }
 
     deleteKv(namespace: string, key?: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
         return this.sync.deleteKv(namespace, key);
     }
 
@@ -1063,10 +1074,9 @@ export class UnifiedShadow {
     /** record()'s async port — MUST stay in lockstep with the sync body
      *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
-     *  shadow queue; failures feed the same 3-strike disable. */
+     *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         void this.enqueue(async () => {
-            if (this.stats.disabled) return;
             try {
                 const backend = this.backend!;
                 const loaded0 = this.legacyLoad(record);
@@ -1141,7 +1151,6 @@ export class UnifiedShadow {
 
     viewForAsync(id: string): Promise<LegacySessionLike | null> {
         return this.viaAsync(null, () => this.viewFor(id), async () => {
-            if (this.stats.disabled) return null;
             try {
                 const backend = this.backend!;
                 const loaded = await backend.readSnapshot(async (reader) => {
@@ -1170,7 +1179,6 @@ export class UnifiedShadow {
 
     importRecordAsync(record: unknown): Promise<LegacySessionLike | null> {
         return this.viaAsync(null, () => this.importRecord(record), async () => {
-            if (this.stats.disabled) return null;
             try {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
@@ -1220,9 +1228,8 @@ export class UnifiedShadow {
 
     sessionTipSeqAsync(sessionId: string): Promise<number> {
         return this.viaAsync(0, () => this.sessionTipSeq(sessionId), async () => {
-            let tip = 0;
-            for (const m of await this.backend!.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
-            return tip;
+            const max = await this.backend!.lastLiveSeq(sessionId);
+            return (max ?? -1) + 1;
         });
     }
 
@@ -1254,8 +1261,8 @@ export class UnifiedShadow {
         return this.viaAsync({ ok: false, reason: "async backend" }, () => this.restoreArchived(sessionId, opts), () => this.enqueue(() => this.backend!.restoreArchived(sessionId, opts)));
     }
 
-    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string }[]> {
-        return this.viaAsync([], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content })));
+    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string; ts: number | null }[]> {
+        return this.viaAsync([] as { seq: number; content: string; ts: number | null }[], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null })));
     }
 
     tailSeqsAsync(sessionId: string): Promise<number[] | null> {
@@ -1271,7 +1278,6 @@ export class UnifiedShadow {
      *  facade; sqlite delegates to the identical sync body via viaAsync. */
     lastLiveSeqAsync(sessionId: string): Promise<number | null> {
         return this.viaAsync(null, () => this.lastLiveSeq(sessionId), async () => {
-            if (this.stats.disabled) return null;
             try {
                 return await this.backend!.lastLiveSeq(sessionId);
             } catch (err) {
@@ -1285,11 +1291,10 @@ export class UnifiedShadow {
      *  adoption row clone through the backend on network backends; sqlite
      *  delegates to the identical sync body. Serialized on the shadow queue
      *  like every other write twin so it can never race a pending parent
-     *  ingest. A failed or disabled sidecar degrades to the kernel-only
+     *  ingest. A failing sidecar degrades to the kernel-only
      *  fork (false) — the fork itself must never fail for a storage nicety. */
     cloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
         return this.viaAsync(false, () => this.cloneSessionRows(parentId, childId, throughSeq), async () => {
-            if (this.stats.disabled) return false;
             try {
                 return await this.enqueue(() => this.backend!.cloneSessionRows(parentId, childId, throughSeq));
             } catch (err) {
@@ -1302,14 +1307,12 @@ export class UnifiedShadow {
     /** Fork publication is strict: clone and initial state land together, or
      * nothing lands. Unlike shadow mirrors, an error cannot mean success. */
     createForkAsync(parentId: string, child: LegacySessionLike): Promise<boolean> {
-        if (this.stats.disabled) throw new Error("fork storage unavailable");
         const initial = planIngest(child);
         if (this.sync !== null) {
             const throughSeq = this.sync.lastLiveSeq(parentId);
             return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial));
         }
         return this.enqueue(async () => {
-            if (this.stats.disabled) throw new Error("fork storage unavailable");
             const throughSeq = await this.backend!.lastLiveSeq(parentId);
             return this.backend!.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial);
         });
@@ -1365,10 +1368,6 @@ export class UnifiedShadow {
         await this.backend?.close();
     }
 
-    private assertLive(): void {
-        if (this.stats.disabled) throw new Error("[storage] unified sidecar is disabled (repeated failures) — replica operations are unavailable");
-    }
-
     close(): void {
         if (this.sync === null) return;
         try {
@@ -1405,6 +1404,10 @@ interface DriftSlotFingerprint {
 interface DriftDiagnostics {
     /** Top-level view keys whose canonicalized JSON differs, sorted. */
     keys: string[];
+    /** #5408: state sub-keys that disagree (when `state` itself diverged) —
+     *  "diverged: state" alone cannot be acted on because every full re-ingest
+     *  converges the tables it owns; the sub-key names the actual residue. */
+    stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
     tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
 }
@@ -1417,6 +1420,7 @@ class BatchedViewVerification {
     private readonly orphans: LegacySessionLike["blockContents"];
     private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
     private readonly keys = new Set<string>();
+    private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
     private blockCount = 0;
     private activeBlocks = 0;
@@ -1441,7 +1445,11 @@ class BatchedViewVerification {
         if (shadowDigest(expect) !== shadowDigest(got)) {
             this.drift = true;
             try {
-                for (const key of describeViewDivergence(expect, got).keys) this.keys.add(key);
+                const diag = describeViewDivergence(expect, got);
+                // #5408: retain the header-level drill-down (state sub-keys) —
+                // the bulk phases below can only name "state" coarsely.
+                this.headerDiag = diag;
+                for (const key of diag.keys) this.keys.add(key);
             } catch {
                 // Diagnostic detail must not suppress a proven drift.
             }
@@ -1505,6 +1513,7 @@ class BatchedViewVerification {
         this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
+        if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;
         if (this.tailSlot) diagnostics.tailSlot = this.tailSlot;
         return { matches: !this.drift, activeBlocks: this.activeBlocks, tailGaps: this.tailGaps, diagnostics };
     }
@@ -1547,6 +1556,22 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };
+    if (keys.includes("state")) {
+        // #5408: drill one level into the state object so the log names which
+        // sub-field disagrees (messageRefs / kstate residue / coverage), not
+        // just that "state" as a whole does.
+        const es = e["state"];
+        const gs = g["state"];
+        if (es !== null && typeof es === "object" && !Array.isArray(es) && gs !== null && typeof gs === "object" && !Array.isArray(gs)) {
+            const eo = es as Record<string, unknown>;
+            const go = gs as Record<string, unknown>;
+            const subKeys: string[] = [];
+            for (const k of [...new Set([...Object.keys(eo), ...Object.keys(go)])].sort()) {
+                if (ser(eo[k]) !== ser(go[k])) subKeys.push(k);
+            }
+            if (subKeys.length > 0) diagnostics.stateKeys = subKeys;
+        }
+    }
     if (keys.includes("lastMessages") && Array.isArray(e["lastMessages"]) && Array.isArray(g["lastMessages"])) {
         const et = e["lastMessages"] as unknown[];
         const gt = g["lastMessages"] as unknown[];
@@ -1571,6 +1596,7 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
 /** Compact log-suffix form of describeViewDivergence (""-free: always starts with a space). */
 export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
+    if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
         const { index, expect: ex, got: go } = d.tailSlot;
         parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);

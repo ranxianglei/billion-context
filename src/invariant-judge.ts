@@ -459,6 +459,11 @@ interface InvariantJudgeInput {
   originalMessages?: readonly CoreMessage[];
   /** Outbound request body (the exact bytes forwarded) — re-parsed to core here. */
   body?: string | Buffer;
+  /** #2078 handoff: the caller's pre-parsed form of `body` (same bytes —
+   *  projecting it is identical to re-parsing the string). null means the
+   *  caller's parse already failed (skip, exactly like an unparseable body);
+   *  undefined means parse `body` here (legacy callers). */
+  parsed?: Record<string, unknown> | null;
   protocol?: string;
   sessionId?: string;
   /** #4241: set when prepare's snapshot render served this turn's outbound prefix —
@@ -473,17 +478,19 @@ interface InvariantJudgeInput {
 // snapshots diverges for reasons unrelated to the invariant (token estimation,
 // ref re-minting, ordering repairs). Same codec on both sides ⇒ directly
 // comparable and wire-neutral, which is also what makes cross-wire work.
-function parseExitCores(body: string | Buffer | undefined, protocol: string | undefined): CoreMessage[] | null {
+function parseExitCores(body: string | Buffer | undefined, protocol: string | undefined, parsed?: Record<string, unknown> | null): CoreMessage[] | null {
   if (!body || !protocol) return null;
-  const text = typeof body === "string" ? body : body.toString("utf8");
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { return null; }
+  let value: unknown = parsed;
+  if (value === undefined) {
+    const text = typeof body === "string" ? body : body.toString("utf8");
+    try { value = JSON.parse(text); } catch { return null; }
+  }
   try {
     switch (protocol) {
-      case "openai": return openaiToCore(parsed as Parameters<typeof openaiToCore>[0]).msgs;
-      case "anthropic": return anthropicToCore(parsed as Parameters<typeof anthropicToCore>[0]).msgs;
-      case "responses": return responsesToCore(parsed as Parameters<typeof responsesToCore>[0]).msgs;
-      case "google": return googleToCore(parsed as Parameters<typeof googleToCore>[0]).msgs;
+      case "openai": return openaiToCore(value as Parameters<typeof openaiToCore>[0]).msgs;
+      case "anthropic": return anthropicToCore(value as Parameters<typeof anthropicToCore>[0]).msgs;
+      case "responses": return responsesToCore(value as Parameters<typeof responsesToCore>[0]).msgs;
+      case "google": return googleToCore(value as Parameters<typeof googleToCore>[0]).msgs;
       default: return null;
     }
   } catch { return null; }
@@ -531,7 +538,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
     const entry = input.originalMessages ?? [];
-    const exitCores0 = parseExitCores(input.body, input.protocol);
+    const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
