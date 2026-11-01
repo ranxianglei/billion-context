@@ -11,8 +11,14 @@
 //    migration of the user's own store: crash/size isolation from index.db,
 //    zero schema-version coupling, trivially deletable by the owner.
 //  * BILI_PERF_TELEMETRY=0 force-disables (registered in LIFECYCLE.md §2.4).
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+//  * Engine acquisition goes through the shared storage driver seam
+//    (src/storage/driver.js, #2833 order: builtin node:sqlite → host
+//    better-sqlite3 → self-downloaded prebuilt) — NEVER a direct static
+//    node:sqlite import: that builtin is absent on Node <22.5 while
+//    package.json claims engines >=20, and a static import would crash the
+//    whole CLI at module load instead of degrading telemetry alone.
 import * as path from "node:path";
+import { openSqliteDatabase, type SqliteDatabase } from "./storage/driver.js";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -28,7 +34,7 @@ const DEFAULT_MEM_INTERVAL_MS = 30_000;
 interface InitOptions { dir?: string; memIntervalMs?: number; log?: (level: "warn" | "error" | "info", msg: string) => void; }
 
 interface PerfState {
-    db: DatabaseSync | null;      // lazily opened on first record
+    db: SqliteDatabase | null;    // lazily opened on first record
     mode: string;                 // "sqlite" | "mysql" | "json"(off)
     dir: string | null;
     dead: boolean;                // first insert/open failure → degrade forever
@@ -81,15 +87,15 @@ function warnDegrade(w: (level: "warn" | "error" | "info", msg: string) => void,
     try { w("warn", `[perf] telemetry degraded: ${what} — metrics collection stopped for this process (serving unaffected)`); } catch { /* last resort */ }
 }
 
-function ensureDb(): DatabaseSync | null {
+function ensureDb(): SqliteDatabase | null {
     if (state.db) return state.db;
     // Degrade contract (#5327 discipline): one failure → dead forever. Without
-    // this check a broken dir would retry new DatabaseSync on EVERY request
+    // this check a broken dir would retry opening the DB on EVERY request
     // and every mem tick instead of stopping collection once.
     if (state.dead) return null;
     if (!state.dir) return null;
     try {
-        const db = new DatabaseSync(dbPath(state.dir));
+        const { db } = openSqliteDatabase(dbPath(state.dir));
         // synchronous=NORMAL matches index.db (src/storage/schema.ts): under WAL
         // the SQLite default (FULL) would fsync on EVERY commit — one per request
         // row on the hot path. Telemetry data is re-collectable; batch the fsyncs.
@@ -103,7 +109,7 @@ function ensureDb(): DatabaseSync | null {
     }
 }
 
-function insertRow(db: DatabaseSync, row: Record<string, unknown>, w: (level: "warn" | "error" | "info", msg: string) => void): void {
+function insertRow(db: SqliteDatabase, row: Record<string, unknown>, w: (level: "warn" | "error" | "info", msg: string) => void): void {
     if (state.dead) return;
     try {
         db.prepare(
@@ -116,7 +122,7 @@ function insertRow(db: DatabaseSync, row: Record<string, unknown>, w: (level: "w
             (row.outbound_bytes as number) ?? null,
             (row.total_ms as number) ?? null,
             (row.parse_ms as number) ?? null,
-            ((row.payload_json as string | undefined) ?? null) satisfies SQLInputValue,
+            (row.payload_json as string | undefined) ?? null,
         );
         pushRing(row);
         if (++state.insertsSinceSweep >= RETENTION_SWEEP_EVERY) {
