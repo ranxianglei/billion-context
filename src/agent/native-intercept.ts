@@ -584,6 +584,12 @@ const CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
  *  restart the host so the interceptor can rebind. */
 export const MAX_SILENT_DIRECT_BODY_BYTES = 2 * 1024 * 1024;
 
+/** #5405 follow-up: emit at most one state-missing warning per live-state
+ *  generation. A missing slot is a process-wide condition, not a per-request
+ *  event; without this gate a direct-send window would write one line for
+ *  every turn. Reset on bind/clear so a new empty window is still visible. */
+let lastMissingStateLogSeq: unknown = Symbol("unset");
+
 function declaredWindowFromHeaders(input: string | URL | Request, init: RequestInit | undefined): number | undefined {
     const headers = outgoingHeadersOf(input, init);
     if (headers === undefined) return undefined;
@@ -1052,8 +1058,11 @@ export function withRestoredBody(input: string | URL | Request, init: RequestIni
 export function bindLiveStateSlot(state: NativeInterceptState): boolean {
     const g = globalThis as Record<PropertyKey, unknown>;
     const firstBind = g[ACTIVE_STATE] === undefined;
-    g[ACTIVE_STATE_SEQ] = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
+    const seq = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
+    g[ACTIVE_STATE_SEQ] = seq;
     g[ACTIVE_STATE] = state;
+    lastMissingStateLogSeq = undefined;
+    logHostEvent("info", "[native-client]", `bili-native: live-state bound seq=${seq}${firstBind ? " (first bind)" : " (rebind)"}`);
     return firstBind;
 }
 
@@ -1125,6 +1134,14 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (size !== undefined && size.bytes > MAX_SILENT_DIRECT_BODY_BYTES) {
                     logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.bytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); restart the host`);
                     throw new TypeError("billion-context: refusing oversized direct model request while intercept state is missing; restart the host");
+                }
+                const seq = g[ACTIVE_STATE_SEQ];
+                if (lastMissingStateLogSeq !== seq) {
+                    lastMissingStateLogSeq = seq;
+                    let host = "unknown";
+                    try { host = new URL(url).host; } catch {}
+                    const bytes = size === undefined ? "unknown" : `${size.bytes.toLocaleString("en-US")} B`;
+                    logHostEvent("warn", "[native-client]", `bili-native: intercept state missing — model request goes direct (uncompressed, ${bytes}, ${host}); bili is not bound to a live state`);
                 }
             }
             return send(input, init);
@@ -1607,7 +1624,11 @@ export function liveStateSlotEffect(state: NativeInterceptState): () => (() => v
         const g = globalThis as Record<PropertyKey, unknown>;
         const seq = g[ACTIVE_STATE_SEQ];
         return () => {
-            if (g[ACTIVE_STATE_SEQ] === seq && g[ACTIVE_STATE] === state) delete g[ACTIVE_STATE];
+            if (g[ACTIVE_STATE_SEQ] === seq && g[ACTIVE_STATE] === state) {
+                delete g[ACTIVE_STATE];
+                lastMissingStateLogSeq = undefined;
+                logHostEvent("warn", "[native-client]", `bili-native: live-state cleared seq=${String(seq)} — model requests will direct-send until rebound`);
+            }
         };
     };
 }
@@ -1621,6 +1642,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    lastMissingStateLogSeq = Symbol("unset");
     respawnCooldownOverrideMs = undefined;
     resetFetchChainForTest(opts);
 }

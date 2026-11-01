@@ -532,6 +532,32 @@ test("install: a missing live-state slot refuses an oversized direct model reque
     }
 });
 
+test("install: a missing live-state slot logs direct sends once per generation (#5405)", async () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5405-state-log-"));
+    process.env.XDG_STATE_HOME = root;
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40907", ready: Promise.resolve("http://127.0.0.1:40907") };
+        const { sink } = await withPatch(state, async (fetch) => {
+            liveStateSlotEffect(state)()();
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+        });
+        assert.equal(sink.length, 2, "small direct sends still reach the provider");
+        const lines = fs.readFileSync(logFile, "utf8").split("\n");
+        const missing = lines.filter((l) => l.includes("intercept state missing"));
+        assert.equal(missing.length, 1, "one warning per live-state generation");
+        assert.match(missing[0], /\[warn\]/);
+        assert.match(missing[0], /127\.0\.0\.1:8199/);
+        assert.equal(lines.filter((l) => l.includes("live-state cleared")).length, 1);
+        assert.equal(lines.filter((l) => l.includes("live-state bound")).length, 1);
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test("install: an unattributed oversized request is refused before direct send (#5405)", async () => {
     const state: NativeInterceptState = {
         origin: "http://127.0.0.1:40906",
