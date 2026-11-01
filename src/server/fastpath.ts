@@ -205,6 +205,36 @@ export function evaluateWatermarkFastpath(
         const windowCounts = stripRawStage(windowFragment, "openai");
         const headCores = openaiToCore(headFragment as OpenAIRequestBody);
         if (headCores.systemText !== seed.systemText) return miss("head-drift", true);
+        // In-place head EDIT detection. The system-text check alone would miss
+        // an in-place rewrite of any non-system head element (dsh message-edit
+        // flows): counts stay equal, the stamp stays honest, and the stale
+        // seed byte would ride the outbound again — the costliest divergence
+        // class. Compare every stashed prefix core against its freshly parsed
+        // counterpart: openaiToCore is deterministic per element bytes, so
+        // structural inequality (cluster id / role / content) marks a rewrite.
+        // Uncredited: a genuine client edit is not a lying stamp, so the
+        // breaker must not arm on it; finalizeWatermarkTurn reseeds from the
+        // legacy full parse of THIS turn, so the very next turn hits against
+        // the new baseline (self-healing). Shape mismatch covers small
+        // histories where the head fragment reaches past seed coverage —
+        // those turns legitimately go legacy.
+        // Compare ONLY the part of the head still under seed coverage: on small
+        // histories the 8-element head fragment legitimately reaches INTO the
+        // fresh tail region, whose content differs from nothing stashed yet —
+        // positions >= coverage are verified by the window conversion itself.
+        const headElements = Array.isArray((headFragment as { messages?: unknown }).messages)
+            ? ((headFragment as { messages: unknown[] }).messages.filter((m): m is { role?: unknown } => typeof m === "object" && m !== null && (m as { role?: unknown }).role !== "system")).length
+            : -1;
+        if (headElements >= 0 && seed.cores.length > 0) {
+            const compareUpTo = Math.min(headElements, headCores.msgs.length, seed.cores.length);
+            const seedHead = seed.cores.slice(0, compareUpTo);
+            if (headCores.msgs.length < seedHead.length) return miss("head-shape", false);
+            for (let hi = 0; hi < seedHead.length; hi++) {
+                const a = headCores.msgs[hi];
+                const b = seedHead[hi];
+                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false);
+            }
+        }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
         if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);

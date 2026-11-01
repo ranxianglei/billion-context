@@ -169,6 +169,29 @@ test("head-system drift is a CREDITED miss and the next turn recovers", () => {
     assert.equal(r3.out.decision, "hit", LOGS.join("\n"))
 });
 
+test("in-place HEAD edit is caught by prefix-core comparison, uncredited, self-heals on reseed", () => {
+    makeStubStore();
+    const session = freshSession("pf-headedit");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e"), USR("f"), USR("g")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    // rewrite element #3 IN PLACE (prefix counts unchanged, system identical, stamp honest)
+    // and append one turn — only the per-core prefix comparison can see the rewrite.
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c-EDITED"), USR("d"), USR("e"), USR("f"), USR("g"), ASST("h")]);
+    const { out } = runTurn(session, { [PF_COUNT_HEADER]: "8" }, b2);
+    assert.equal(out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(out.creditedMiss, false);
+    // the missed turn went legacy + reseeded from real bytes; resending the SAME body is no-progress
+    const same = runTurn(session, { [PF_COUNT_HEADER]: "9" }, b2);
+    assert.equal(same.out.decision, "no-progress");
+    // ...and one growth past the fresh watermark HITS with the EDITED bytes, not the stale seed byte
+    const b3 = bodyOf([...JSON.parse(b2).messages, USR("i")]);
+    const r3 = runTurn(session, { [PF_COUNT_HEADER]: "9" }, b3);
+    assert.equal(r3.out.decision, "hit", LOGS.join("\n"));
+    const texts = r3.out.hit!.view.map((m) => String((m as { text?: unknown }).text ?? ""));
+    assert.ok(texts.some((t) => t.includes("c-EDITED")), "edited content must ride, stale byte must not");
+    assert.ok(!texts.some((t) => t.trim() === "c"), "stale pre-edit element must be gone from the view");
+});
+
 test("system element appearing at the WINDOW head degrades (hoist hazard)", () => {
     makeStubStore();
     const session = freshSession("pf-hoist");
