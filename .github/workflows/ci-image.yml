@@ -80,7 +80,7 @@ jobs:
           cache: npm
 
       - name: Install deps
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       # The suite drives src/*.ts through tsx like the other hermetic lanes —
       # no build step needed, but a typecheck pass keeps the lane from going
