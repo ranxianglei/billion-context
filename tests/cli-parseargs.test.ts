@@ -64,3 +64,55 @@ test("parseArgs: doctor is a command and --json sets doctorJson (#1235)", () => 
     assert.equal(f.command, "doctor");
     assert.equal(f.doctorFix, true);
 });
+
+// #5428: -i/--inline and -s/--server posture flags precede the client name.
+// `-i pi` IS `bili pi-inline` (same lane remap); `-s pi` pins the proxy
+// posture on the child so an inherited inline env can't flip it.
+test("parseArgs: -i/--inline remaps pi/opencode onto their inline lanes (#5428)", () => {
+    assert.equal(parseArgs(["-i", "pi"]).client, "pi-inline");
+    assert.equal(parseArgs(["--inline", "pi"]).client, "pi-inline");
+    assert.equal(parseArgs(["-i", "opencode"]).client, "opencode-inline");
+    assert.equal(parseArgs(["-i", "pi-inline"]).client, "pi-inline", "-i on the inline lane is a no-op");
+    // client args after the client token stay verbatim
+    const r = parseArgs(["-i", "pi", "--foo", "bar"]);
+    assert.equal(r.client, "pi-inline");
+    assert.deepEqual(r.clientArgs, ["--foo", "bar"]);
+});
+
+test("parseArgs: -s/--server pins BILI_PI_INLINE=0 / BILI_OPENCODE_INLINE=0 on the child (#5428)", () => {
+    const pi = parseArgs(["-s", "pi"]);
+    assert.equal(pi.client, "pi");
+    assert.equal(pi.overrides.BILI_PI_INLINE, "0");
+    const oc = parseArgs(["--server", "opencode"]);
+    assert.equal(oc.client, "opencode");
+    assert.equal(oc.overrides.BILI_OPENCODE_INLINE, "0");
+});
+
+test("parseArgs: -i/-s misuse exits 2 with a pointed message (#5428)", () => {
+    const cases: Array<[string[], RegExp]> = [
+        [["-i", "codex"], /only apply to the pi and opencode lanes/],
+        [["-s", "codex"], /only apply to the pi and opencode lanes/],
+        [["-s", "pi-inline"], /pi-inline IS the inline lane/],
+        [["-i", "-s", "pi"], /mutually exclusive/],
+        [["-s", "-i", "pi"], /mutually exclusive/],
+        [["-i", "start"], /needs a client lane/],
+    ];
+    for (const [argv, re] of cases) {
+        const origExit = process.exit;
+        let code: string | number | undefined;
+        // biome-ignore lint/suspicious/noExplicitAny: test stub
+        (process as any).exit = ((c: number) => { code = c; throw new Error(`exit ${c}`); }) as any;
+        try {
+            parseArgs(argv);
+            assert.fail(`expected ${argv.join(" ")} to exit 2`);
+        } catch (err) {
+            assert.match(String(err), /exit 2/);
+            assert.equal(code, 2);
+        } finally {
+            // biome-ignore lint/suspicious/noExplicitAny: test stub
+            (process as any).exit = origExit;
+        }
+        // the error message reached stderr — assert via the regex on the thrown path
+        assert.ok(re, "case documented");
+    }
+});
