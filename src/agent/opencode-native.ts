@@ -264,10 +264,32 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
     };
 }
 
+// #5032 (the #5025 family): the shared guard measures an oversized body against
+// a window it takes from the stamped header OR this reader. The V1 header stamp
+// below only runs once an origin is known (`if (base === undefined) return;`),
+// so on the direct fallback both sources used to be empty and a history that had
+// outgrown the window egressed uncompressed into a guaranteed upstream 400.
+// Record the SAME client-declared number before that early return; unknown model
+// or window records undefined, so the guard keeps failing open (never a guess).
+let opencodeDeclaredWindow: number | undefined;
+
+/** Recorded window for the direct-send guard (#5032); undefined ⇒ fail open. */
+export function opencodeDeclaredWindowForDirect(): number | undefined {
+    return opencodeDeclaredWindow;
+}
+
+/** Test hook: drop the recorded window so suites start from a clean slate. */
+export function _resetOpencodeDeclaredWindowForTest(): void {
+    opencodeDeclaredWindow = undefined;
+}
+
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 // #3304: the opencode swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
 state.prepareDirectSend = createPrepareDirectSend();
+// #5032: arm the guard's second window source — the V1 header stamp never runs
+// on the no-proxy path, so without this arm the reader was always empty there.
+state.declaredWindowForDirect = opencodeDeclaredWindowForDirect;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -459,6 +481,11 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
     return state.respawn;
 }
 
+/** Test hook (#5032): expose the armed direct-send window reader. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
+}
+
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
 export function _noteRoutedForTest(url: string): void {
     noteRoutedOrigin(state, url);
@@ -475,6 +502,7 @@ export function _resetNativeStateForTest(): void {
     state.onGiveUp = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
+    opencodeDeclaredWindow = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;
 }
 
@@ -809,6 +837,16 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 // forward their traffic verbatim (no injection, no binding).
                 output.headers["x-bili-plugin-bypass"] = "1";
                 return;
+            }
+            // #5032: record the window BEFORE the no-origin return — the stamp
+            // below never runs on the direct fallback, which left the shared
+            // guard with nothing to measure an oversized history against.
+            const declaredModel = input.model;
+            if (declaredModel && typeof declaredModel.providerID === "string" && typeof declaredModel.id === "string") {
+                const declared = windows.get(`${declaredModel.providerID}/${declaredModel.id}`);
+                opencodeDeclaredWindow = typeof declared === "number" && Number.isFinite(declared) && declared > 0 ? Math.floor(declared) : undefined;
+            } else {
+                opencodeDeclaredWindow = undefined;
             }
             const base = getOrigin();
             // No live proxy: traffic goes direct — stamping would leak the
