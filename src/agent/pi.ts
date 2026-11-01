@@ -286,9 +286,9 @@ function proxyBaseForCtx(ctx: Ctx | undefined, branchEntries?: unknown): string 
     return detectProxyBase(ctx?.model?.baseUrl);
 }
 
-function sessionIdOf(ctx: Ctx): string | undefined {
+function sessionIdOf(ctx: Ctx | undefined): string | undefined {
     try {
-        const sid = ctx.sessionManager?.getSessionId?.();
+        const sid = ctx?.sessionManager?.getSessionId?.();
         return typeof sid === "string" ? sid : undefined;
     } catch {
         return undefined;
@@ -335,9 +335,9 @@ function reportSessionName(ctx: Ctx | undefined, name: string): void {
  *  an ambiguous alias resolves to nothing rather than guessing). Returns
  *  undefined for root sessions, unreadable parents, or hosts without getHeader
  *  — derivation reporting is strictly best-effort and never blocks registration. */
-export function parentConversationIdOf(ctx: Ctx): string | undefined {
+export function parentConversationIdOf(ctx: Ctx | undefined): string | undefined {
     try {
-        const header = ctx.sessionManager?.getHeader?.() as { parentSession?: unknown } | null | undefined;
+        const header = ctx?.sessionManager?.getHeader?.() as { parentSession?: unknown } | null | undefined;
         const ref = typeof header?.parentSession === "string" ? header.parentSession.trim() : "";
         if (!ref) return undefined;
         // omp fork records the parent session id verbatim; pi records a path.
@@ -734,7 +734,7 @@ function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent:
     logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542)`);
 }
 
-async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
+async function registerTools(pi: ExtensionAPI, ctx: Ctx | undefined, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
     let proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined && awaitNativeOrigin) proxyBase = await awaitNativeProxyOrigin();
     if (proxyBase === undefined) return;
@@ -920,9 +920,39 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // — ahead of round 1. Native mode (#519) sets BILLION_CONTEXT_PROXY
         // only after async bootstrap, so no prime exists there and round 1
         // stays on wire mode (residual; the host would have to await us).
+        // #5459/#4998: pi snapshots each round's payload (tools array + system
+        // prompt) BEFORE its provider hooks run, so registration that waits for
+        // round 1's awaited hooks lands too late: request 1 goes out without
+        // bili's tools while already stamped x-bili-plugin (plugin mode never
+        // injects server-side), and request 2's gained tools + rebuilt system
+        // prompt break the provider prefix cache for the rest of the session.
+        // Register as soon as the manifest source exists instead. The guard
+        // skips once any registration landed (a faster first request may have
+        // claimed it with a real sid — never clobber that); concurrent entries
+        // dedupe through state.pending inside registerTools.
+        const armEarlyRegistration = (tools: Promise<ManifestTool[] | undefined>): void => {
+            void tools.then((t) => {
+                if (t !== undefined && state.toolsFor === undefined) {
+                    void registerTools(pi, undefined, state, agent).catch((err: unknown) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): early tool registration failed (${err instanceof Error ? err.message : String(err)})`));
+                }
+            });
+        };
         const primeBase = detectProxyBase(undefined);
         if (primeBase !== undefined) {
             state.manifestPrime = { base: primeBase, tools: fetchManifest(primeBase).then((t) => t, () => undefined) };
+            armEarlyRegistration(state.manifestPrime.tools);
+        } else {
+            // Native mode (#519): no env base at load — bootstrap publishes the
+            // origin asynchronously; arm registration at publication so round 1
+            // is ready without any request having fired yet. No waiter outside
+            // native entries → resolves undefined immediately → no-op.
+            void awaitNativeProxyOrigin().then(
+                (base) => {
+                    if (base === undefined || state.toolsFor !== undefined) return;
+                    void registerTools(pi, undefined, state, agent).catch((err: unknown) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+                },
+                (err: unknown) => logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): native-origin wait failed (${err instanceof Error ? err.message : String(err)}) — tools register on first request as before`),
+            );
         }
         // #535: file-free routing — override provider baseUrls at load from
         // the launcher-passed manifest (see buildPiEnv). registerProvider is
