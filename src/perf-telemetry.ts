@@ -90,7 +90,10 @@ function ensureDb(): DatabaseSync | null {
     if (!state.dir) return null;
     try {
         const db = new DatabaseSync(dbPath(state.dir));
-        db.exec(`PRAGMA journal_mode=WAL; ${PERF_EVENTS_DDL}; CREATE INDEX IF NOT EXISTS idx_perf_events_ts ON ${PERF_TABLE}(ts);`);
+        // synchronous=NORMAL matches index.db (src/storage/schema.ts): under WAL
+        // the SQLite default (FULL) would fsync on EVERY commit — one per request
+        // row on the hot path. Telemetry data is re-collectable; batch the fsyncs.
+        db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; ${PERF_EVENTS_DDL}; CREATE INDEX IF NOT EXISTS idx_perf_events_ts ON ${PERF_TABLE}(ts);`);
         state.db = db;
         return db;
     } catch (e) {
