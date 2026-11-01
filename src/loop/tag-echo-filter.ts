@@ -1596,6 +1596,30 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // unit and dies whole, exactly as whole-text drops it. Without this the
             // opening is unknown to the machine, its halves are released as prose one
             // push at a time, and the client renders the imitation verbatim.
+            // Three rules here, not the whole-text pass's four: DRIFT_BARE_MISMATCH
+            // is deliberately absent from this candidate list, and the asymmetry is
+            // measured rather than an oversight -- do not "complete the set".
+            //
+            // Adding it is worse, not better, and the reason is counter-intuitive.
+            // The fourth rule does delete the unit's span, so no kernel pointer
+            // survives either way. But the filter then releases the unit's REF-LESS
+            // HALVES as prose, and that residue counts as visible text -- so the
+            // degenerate/empty-turn retry no longer fires, and the client is handed
+            // the leftover markup instead of a regenerated answer. Measured on the
+            // reported shape, responses lane, 4-rule list vs this one:
+            //     this list : calls=1  client="the real answer"
+            //     4 rules   : calls=0  client="acpt> </apct>   </apct> </apct>"
+            // Omitting the rule here is what keeps the turn visibly EMPTY, which is
+            // exactly the condition the retry exists for: the caller replaces that
+            // empty turn with a real one. The invariant that matters -- no kernel
+            // ref reaches the client -- holds on both paths.
+            //
+            // The fourth rule stays in the whole-text pass because there the field
+            // is at rest and no swallow can claim the shape first, so it is the only
+            // owner. Here a live unit already dies whole above, and a unit the
+            // swallow did not take is released with its ref already gone. Same
+            // invariant, different job: the seam is defined on the released SPAN,
+            // not on matching regex sets.
             DRIFT_PAIR.lastIndex = 0;
             DRIFT_ATTR.lastIndex = 0;
             DRIFT_ATTR_MISMATCH.lastIndex = 0;
