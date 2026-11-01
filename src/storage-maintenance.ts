@@ -129,14 +129,24 @@ async function runRm(store: SessionStore, target: string | undefined, json: bool
     let vacuumed = false;
     let vacuumNote: string | undefined;
     if (!noVacuum && unified) {
-        try {
-            store.unifiedVacuum("full");
-            vacuumed = true;
-        } catch (err) {
-            // VACUUM lost the SQLITE_BUSY race (another bili instance holds
-            // the db): the deletion itself is committed — say so, don't lose it.
-            const detail = /SQLITE_BUSY|database is locked/i.test(String(err)) ? "database busy" : String(err);
-            vacuumNote = `shrink skipped (${detail}) — deletion committed; freed pages return on the next gc/vacuum`;
+        const writer = store.unifiedActiveWriter();
+        if (writer !== null) {
+            // #4612/#5236: a full VACUUM rewrites the whole database under the
+            // exclusive write lock — with a live foreign writer (e.g. a running
+            // proxy) it would starve that process's writes until the rewrite
+            // finishes. The deletion is a short transaction and stays committed;
+            // skip only the shrink, same as the SQLITE_BUSY path below.
+            vacuumNote = `shrink skipped: another process (pid ${writer}) is actively writing index.db — the default full VACUUM rewrites the whole database under an exclusive write lock and would starve that process's writes. Deletion committed; freed pages return on the next gc/vacuum, or run 'bili storage gc --vacuum incremental' for an online-safe shrink.`;
+        } else {
+            try {
+                store.unifiedVacuum("full");
+                vacuumed = true;
+            } catch (err) {
+                // VACUUM lost the SQLITE_BUSY race (another bili instance holds
+                // the db): the deletion itself is committed — say so, don't lose it.
+                const detail = /SQLITE_BUSY|database is locked/i.test(String(err)) ? "database busy" : String(err);
+                vacuumNote = `shrink skipped (${detail}) — deletion committed; freed pages return on the next gc/vacuum`;
+            }
         }
     }
     const dbAfter = indexDbSize(store.dir);
