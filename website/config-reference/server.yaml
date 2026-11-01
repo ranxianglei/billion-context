@@ -229,8 +229,8 @@ entries:
     group: behavior
     id: tt.subagent
     site_group: beh
-    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session."
-    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。"
+    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session. Anthropic-wire only — on the Responses wire this switch is a no-op (see the `subagentSplit` / BOTH-mechanisms scope note)."
+    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。"
     site_en: "<code>subagentSplit</code> — Claude subagents get their own session namespace (on by default)."
     site_zh: "<code>subagentSplit</code> —— Claude 子代理拥有独立会话命名空间（默认开）。"
   - key: forkAdoption
