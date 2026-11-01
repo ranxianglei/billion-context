@@ -300,3 +300,63 @@ test("buildIncomingImageIndex: end-to-end nested tool_result recovery (anthropic
     assert.ok(existsSync(imgs[0].path), "nested image spilled at index time");
     assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "nested pixels round-trip");
 });
+
+test("buildIncomingImageIndex (#5489): OpenAI tool-result image_url is archived + recoverable", () => {
+    // The reported loss class: a screenshot tool returns an image_url part riding
+    // the tool message. openaiToCore reduces it to text-only with no sidecar, so
+    // pre-fix nothing was spilled and decompress({ imageRef }) found nothing.
+    const body = { model: "gpt", messages: [
+        { role: "user", content: "take a screenshot" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "screenshot", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: [
+            { type: "text", text: "here you go" },
+            { type: "image_url", image_url: { url: dataUrl } },
+        ] },
+    ] };
+    const idx = buildIndex("openai", body);
+    assert.equal(idx.size, 1, "the tool-result image is indexed");
+    const [ref, imgs] = [...idx.entries()][0];
+    assert.match(ref, /^m\d+$/);
+    assert.ok(existsSync(imgs[0].path), "spilled to retrieve/img at index time");
+    assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "pixels round-trip");
+    assert.match(resolveDecompress({ imageRef: ref }, ctxWith(idx)).text, /Restored 1 image\(s\)/, "decompress now finds the previously-lost pixels");
+});
+
+test("buildIncomingImageIndex (#5489): assistant-carried image_url is archived under its text ref", () => {
+    const idx = buildIndex("openai", { model: "gpt", messages: [
+        { role: "user", content: "show me" },
+        { role: "assistant", content: [
+            { type: "text", text: "look at this" },
+            { type: "image_url", image_url: { url: dataUrl } },
+        ] },
+    ] });
+    assert.equal(idx.size, 1, "the assistant-carried image is indexed");
+    const [, imgs] = [...idx.entries()][0];
+    assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"));
+});
+
+test("buildIncomingImageIndex (#5489): user + tool images coexist without double-indexing", () => {
+    const idx = buildIndex("openai", { model: "gpt", messages: [
+        { role: "user", content: [{ type: "text", text: "see" }, { type: "image_url", image_url: { url: dataUrl } }] },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shot", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: [{ type: "image_url", image_url: { url: dataUrl } }] },
+    ] });
+    assert.equal(idx.size, 2, "user image (sidecar pass) and tool image (rescan pass) land under distinct refs");
+    for (const imgs of idx.values()) assert.equal(imgs.length, 1, "same pixels never indexed twice under one ref");
+});
+
+test("buildIncomingImageIndex (#5489): leading-system and remote-URL images stay an honest no-op", () => {
+    // Leading system/developer run is hoisted out of the fold space (no core, no
+    // ref), so there is no mNNNNN to hang the pixels off — must stay a no-op.
+    const sys = buildIndex("openai", { model: "gpt", messages: [
+        { role: "system", content: [{ type: "text", text: "sys" }, { type: "image_url", image_url: { url: dataUrl } }] },
+        { role: "user", content: "hi" },
+    ] });
+    assert.equal(sys.size, 0, "leading-system image has no ref to recover under");
+    // A remote-URL image carries no bytes bili could archive.
+    const remote = buildIndex("openai", { model: "gpt", messages: [
+        { role: "user", content: "x" },
+        { role: "tool", tool_call_id: "c", content: [{ type: "image_url", image_url: { url: "https://files.example.com/x.png" } }] },
+    ] });
+    assert.equal(remote.size, 0, "remote-URL image_url has no carried bytes to archive");
+});
