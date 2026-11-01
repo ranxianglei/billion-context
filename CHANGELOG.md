@@ -31,7 +31,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 - **行为变更(旧→关→开)**:增量车道（宿主只发对话增量、不再每轮全量重发历史，#3248/#5155/#5156）此前 `rollout.features.pluginIncrementalTurns` 打包值为 `percent: 0`——**每个安装都要运营者手动开**。四个当年阻塞它的缺陷已全部关闭并修复：#3343（marker divert 缺回环校验，安全）、#3433（dsh-native 未接入 `wireMessagesLookAnthropic`，OpenAI 车道会丢 `tool_calls`）、#3352（opencode 原生零收益）、#3369（一次瞬时失败永久降级）。现在打包值改为 **`percent: 100`**：新装用户无需任何配置文件、环境变量或面板操作，装上即走增量车道。
 - **为什么默认翻转是安全的**:快车道只在**全部**验证命中时接手——请求体形状（`incrementalTurnBodyShape`）、宿主 GET 探针、统一存储 sidecar、回执。任何一项不满足就整轮回落到原有的全量重发路径，字节与从前完全一致。所以这个默认值只改变**宿主发出多少字节**（#5156 的收益），不改变任何正确性保证。安全面同理：形状化请求在进入 `applyTurn` 之前先过 `adminGateDenial` 回环校验（#3343），非回环/隧道/不可信来源一律 403，默认开启不扩大攻击面。
-- **单一开关 + 两个逃生口**:文件 `rollout.features.pluginIncrementalTurns: false`（或任意 percent 灰度）、环境变量 `BILI_ROLLOUT_<FEATURE>=0`。两者语义与顺序不变：env > config > 打包 percent > 关闭（fail closed）。
+- **单一开关 + 两个逃生口**:文件 `rollout.features.pluginIncrementalTurns: false`（或任意 percent 灰度）、环境变量 `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0`。两者语义与顺序不变：env > config > 打包 percent > 关闭（fail closed）。
 - **升级提示**:已在跑增量车道的安装字节不变（它们本来就开着）；从默认关升上来的安装，第一个回合起即走增量路径，无需重启以外的任何操作。需要保回旧行为的用户设上面任一逃生口即可。
 - 测试：`tests/incremental-lane.test.ts` 的探针用例按新契约翻转（默认报 enabled，env `0` 才关）；503 用例改由 env 逃生口驱动；新增 `tests/rollout.test.ts` 内的 GA 打包值 + 双逃生口断言，以及 `tests/incremental-lane-default-on.test.ts`（干净 XDG 根、无配置文件、真实 `featureEnabled`/`incrementalTurnsEnabled`/`GET /__bili/plugin/turn` 三段驱动；反向对照证明默认回退到 0 时 1/2/5 三条必须变红）。
 
