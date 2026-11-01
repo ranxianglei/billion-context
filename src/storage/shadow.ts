@@ -1071,7 +1071,17 @@ export class UnifiedShadow {
                 } catch {
                     applied = false;
                 }
-                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog: hasRawTail });
+                // #3285: only a raw-tail plan is the complete log — that is
+                // what lets the full path sweep foreign rows as stale.
+                // #5415: async parity with the sync sidecar (#5408/#5409). While
+                // drift-latched the ENVELOPE is what load routing serves on both
+                // backends (persist.ts lazySource mirrors loadSync: latched id ->
+                // file), so the index must converge to THAT view — sweep on every
+                // latched full ingest even without a raw tail. Before this a
+                // folded-resident save never swept here: foreign rows rode every
+                // replay, each sampled verify kept drifting, the watermark was
+                // cleared every time, and the latch could never release.
+                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog: hasRawTail || this.driftedSessions.has(legacy.id) });
                 this.stats.ingests++;
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
