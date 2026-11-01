@@ -22,6 +22,14 @@ export const WEB_STYLES = String.raw`
     --amber: #9a6700;
     --amber-soft: rgba(154, 103, 0, 0.1);
     --purple: #8250df;
+    /* #5419: treemap per-tier node fills. Light values are the pre-existing
+       hardcoded hues verbatim (zero light-mode drift); the dark counterparts
+       below give each tier a legible low-luminance ground in dark mode. */
+    --tm-base-fill: #ffffff;
+    --tm-t1-fill: #f2f7ff;
+    --tm-t2-fill: #f6f3ff;
+    --tm-t3-fill: #fffaf0;
+    --tm-tn-fill: #f7f8fa;
     --shadow: 0 1px 3px rgba(31, 35, 40, 0.06), 0 1px 2px rgba(31, 35, 40, 0.04);
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -51,6 +59,11 @@ export const WEB_STYLES = String.raw`
         --amber: #d29922;
         --amber-soft: rgba(210, 153, 34, 0.14);
         --purple: #a371f7;
+        --tm-base-fill: #161b22;
+        --tm-t1-fill: #182338;
+        --tm-t2-fill: #241a38;
+        --tm-t3-fill: #2c2416;
+        --tm-tn-fill: #1c2129;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     }
 }
@@ -73,6 +86,11 @@ export const WEB_STYLES = String.raw`
     --amber: #d29922;
     --amber-soft: rgba(210, 153, 34, 0.14);
     --purple: #a371f7;
+    --tm-base-fill: #161b22;
+    --tm-t1-fill: #182338;
+    --tm-t2-fill: #241a38;
+    --tm-t3-fill: #2c2416;
+    --tm-tn-fill: #1c2129;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 :root[data-theme="light"] {
@@ -297,11 +315,11 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
-.g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
-.g-node.tier-1 rect { stroke: var(--accent); fill: #f2f7ff; }
-.g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
-.g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
-.g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
+.g-node rect { fill: var(--tm-base-fill); stroke: var(--border-soft); stroke-width: 1.4; }
+.g-node.tier-1 rect { stroke: var(--accent); fill: var(--tm-t1-fill); }
+.g-node.tier-2 rect { stroke: #7a5af8; fill: var(--tm-t2-fill); }
+.g-node.tier-3 rect { stroke: #bf8700; fill: var(--tm-t3-fill); }
+.g-node.tier-n rect { stroke: #8a8f99; fill: var(--tm-tn-fill); }
 .g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
 .g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }

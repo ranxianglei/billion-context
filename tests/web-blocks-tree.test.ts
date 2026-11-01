@@ -348,3 +348,22 @@ test("#4737 review: pane surfaces follow the theme and list markdown rules keep 
         assert.match(WEB_STYLES, new RegExp(`\\.block-item \\.body\\.md ${sel},`), `list-mode ${sel} rule keeps its element suffix`);
     }
 });
+
+test("#5419: the treemap node fills follow the theme instead of pinning light hues", () => {
+    // Dark mode turns var(--text) light; a pinned light fill would bury it. Node fills must stay var-driven.
+    const nodeRules = [".g-node rect", ".g-node.tier-1 rect", ".g-node.tier-2 rect", ".g-node.tier-3 rect", ".g-node.tier-n rect"];
+    for (const sel of nodeRules) {
+        const rule = WEB_STYLES.match(new RegExp("^" + sel.replace(/\./g, "\\.") + " \\{[^}]*}", "m"))?.[0];
+        assert.ok(rule, `rule present: ${sel}`);
+        assert.match(rule, /fill:\s*var\(--tm-[a-z0-9-]+-fill\)/, `${sel}: fill must be a themed --tm-*-fill var`);
+        assert.ok(!/fill:\s*#[0-9a-fA-F]{3,8}\b/i.test(rule), `${sel}: no hardcoded fill hex (breaks dark mode)`);
+    }
+    const tmVars = ["--tm-base-fill", "--tm-t1-fill", "--tm-t2-fill", "--tm-t3-fill", "--tm-tn-fill"];
+    const darkMedia = WEB_STYLES.match(/@media \(prefers-color-scheme: dark\) \{[\s\S]*?\n    \}/)?.[0] ?? "";
+    const darkPin = WEB_STYLES.match(/:root\[data-theme="dark"\] \{[\s\S]*?\n\}/)?.[0] ?? "";
+    assert.ok(darkMedia.length > 0 && darkPin.length > 0, "both dark palettes located");
+    for (const v of tmVars) {
+        assert.ok(darkMedia.includes(v + ":"), `OS-dark palette defines ${v}`);
+        assert.ok(darkPin.includes(v + ":"), `pinned-dark palette defines ${v}`);
+    }
+});
