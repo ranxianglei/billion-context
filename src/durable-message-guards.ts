@@ -350,6 +350,13 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshTimeContextPath(msg) ??
         dshPastedImagePath(msg) ??
         dshToolJobNoticePath(msg),
+    // #5458: OpenCode emits each plan-mode notice exactly once and never
+    // re-sends it — a folded SUPERSEDED instance (latest-per-identity
+    // demotion) leaves the resent history forever, exactly the retirement
+    // shape this accounting exists for (#5142). Without this entry the fix's
+    // own convergence fold would mint a permanent drift id on every later
+    // turn of the session.
+    opencode: opencodePlanModePath,
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
