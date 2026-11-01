@@ -96,7 +96,6 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
-import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -153,7 +152,6 @@ import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandar
 import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
-import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
@@ -4542,38 +4540,6 @@ export function headerValue(req: http.IncomingMessage, name: string): string | u
         if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
     }
     return undefined;
-}
-
-function formatBytes(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
-    return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`;
-}
-
-// #903: per-request local-cost line, logged at every point where bili finishes
-// its own processing and hands the request off (upstream forward, forged local
-// response, or fail-fast error) — see handle(). outbound is the exact body value
-// handed to forward() (string OR Buffer — Prepared.body is string|Buffer); wire
-// bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
-// for string bodies (.length would count UTF-16 chars and undercount any
-// non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: inbound histories past this size pay an O(messages) synchronous scan
-// pass per turn on the main thread, large enough to starve the event loop and
-// freeze every endpoint on the same listener — warn so a pathological session
-// shows up in the log instead of being found through a frozen UI.
-const SLOW_SESSION_MSG_WARN = 1000;
-export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
-    const ms = Math.max(0, Math.round(performance.now() - t0));
-    const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
-    const view = currentFetchTransport() ? ", view=ws-expanded" : "";
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
-    // #5408: this line is THE observation point — a hot-at-attach session that
-    // never produces one is silent compression loss (the incident signature).
-    noteRequest(sessionId);
-    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
-    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body

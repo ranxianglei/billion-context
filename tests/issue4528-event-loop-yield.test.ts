@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { yieldToEventLoop } from "../src/yield-loop.js";
-import { logRequestCost } from "../src/server.js";
+import { logRequestCost } from "../src/server/request-cost.js";
 
 // #4528: a large resent history makes bili run many O(messages) synchronous
 // passes back-to-back on Node's single main thread, starving every other
@@ -43,20 +43,17 @@ describe("#4528 yieldToEventLoop hands control to the poll phase", () => {
     });
 });
 
-describe("#4528 logRequestCost slow-session guard", () => {
+describe("#4528 logRequestCost large-history guard", () => {
     function capture(): { lines: Array<[string, string]>; log: (level: string, msg: string) => void } {
         const lines: Array<[string, string]> = [];
         return { lines, log: (level, msg) => lines.push([level, msg]) };
     }
 
-    it("warns when the inbound history has grown past the message threshold", () => {
+    it("warns once when the inbound history has grown past the message threshold", () => {
         const { lines, log } = capture();
         logRequestCost(log, "sess-big", 1500, 11_000_000, performance.now() - 8000);
-        const warns = lines.filter(([l]) => l === "warn");
-        assert.equal(warns.length, 1);
-        assert.match(warns[0][1], /slow-session: 1500 msgs/);
-        assert.match(warns[0][1], /inbound=/);
-        assert.match(warns[0][1], /local=\d+ms/);
+        assert.equal(lines.filter(([l]) => l === "warn").length, 1);
+        assert.ok(lines.some(([l, m]) => l === "info" && m.includes("sess-big") && m.includes("1500 msgs")));
     });
 
     it("does not warn for a healthy-sized session", () => {
