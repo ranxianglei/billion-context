@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CompressionBlock } from "acp-kernel";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
@@ -159,6 +159,19 @@ export function isBiliCompactionItem(item: unknown): boolean {
     if (typeof it.id === "string" && it.id.startsWith(CODEX_COMPACT_ID_PREFIX)) return true;
     if (typeof it.encrypted_content === "string" && it.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL)) return true;
     return false;
+}
+
+/** Native opaque checkpoints are explicit epoch boundaries; never decode them.
+ *  The last checkpoint identifies the current epoch across echoes and restarts. */
+export function nativeCompactionKey(input: unknown): string | undefined {
+    if (!Array.isArray(input)) return undefined;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const item = input[i] as { type?: unknown; encrypted_content?: unknown } | null;
+        if (!item || item.type !== "compaction" || isBiliCompactionItem(item)) continue;
+        if (typeof item.encrypted_content !== "string" || item.encrypted_content.length === 0) continue;
+        return createHash("sha256").update(item.encrypted_content).digest("hex");
+    }
+    return undefined;
 }
 
 export function stripBiliCompactionItems<T>(input: T[]): T[] {
