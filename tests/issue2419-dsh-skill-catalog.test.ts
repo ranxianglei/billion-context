@@ -131,7 +131,7 @@ test("dshSkillCatalogPath: projects the catalog marker to durable/skill-catalog 
     assert.equal(dshSkillCatalogPath(msg("text", "plain prose without any catalog")), undefined);
     assert.equal(dshSkillCatalogPath(msg("tool-call", CATALOG_MARKER)), undefined, "non-text content types never match");
     assert.equal(dshSkillCatalogPath(msg("text", undefined)), undefined, "missing text is safe");
-    assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
+    assert.deepEqual(Object.keys(durableMessageToolPaths).sort(), ["dsh", "opencode"], "allowlist stays evidence-backed (KDD #9) — no wholesale lanes");
 });
 
 /** Grow a dsh-lane conversation whose fold range POSITIONALLY covers the
