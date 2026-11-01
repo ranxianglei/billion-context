@@ -2384,6 +2384,13 @@ export function apply(ctx: PluginContext): void {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #5418: feed back the proxy-measured element count of THIS
+        // conversation's last accepted body. Sent on every shape (anthropic
+        // bodies carry no top-level messages array — the proxy's scanner
+        // rejects and never evaluates); absent entry ⇒ first turn, unseeded
+        // verification on the server.
+        const pfCount = pfSeqByConversation.get(sid);
+        if (pfCount !== undefined) headers[PF_COUNT_HEADER_NAME] = String(pfCount);
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -2465,6 +2472,19 @@ export function apply(ctx: PluginContext): void {
     // pipeline — dropping it is a separate follow-up, not this PR.
     const INC_PENDING_TTL_MS = 30_000; // matches omp-native / opencode-native
     const incPendingAcks = new Map<string, { sid: string; url: string; messages: IncrementalWireMessage[]; system: unknown; base: string; at: number }>();
+    // #5418/#5403 full-resend watermark echo (chat-completions wire of the
+    // openai api profile): the proxy measures each body's top-level element
+    // count T, verifies the client's previously stamped K against its own
+    // seed, and answers the applied T in x-bili-pf-seq — we feed it back as
+    // x-bili-pf-count next turn (both names mirror src/server/fastpath.ts
+    // PF_*_HEADER; inlined here on purpose — agent bundles must not import
+    // server modules, #3482 leaf rule). One number per conversation; a stale
+    // entry can only cost the server ONE verification round (its verdict
+    // ladder restamps the truth on every evaluated response), and the map is
+    // bounded hard below.
+    const PF_COUNT_HEADER_NAME = "x-bili-pf-count";
+    const PF_SEQ_HEADER_NAME = "x-bili-pf-seq";
+    const pfSeqByConversation = new Map<string, number>();
     async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
         if (!register.toolsReady || init === undefined) return;
         const attr = attributionOf(ctx);
@@ -2527,6 +2547,16 @@ export function apply(ctx: PluginContext): void {
         incPendingAcks.set(turnId, { sid, url, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base, at: Date.now() });
     }
     state.onResponse = (_url, response, headers) => {
+        // #5418: learn the watermark BEFORE the incremental-turn early return
+        // — plain full-resend responses are exactly the ones carrying it.
+        const pfSeq = response.status === 200 ? response.headers.get(PF_SEQ_HEADER_NAME) : null;
+        if (pfSeq !== null && /^\d+$/.test(pfSeq)) {
+            const conv = headers?.["x-bili-plugin-conversation"];
+            if (conv !== undefined && conv.length > 0) {
+                if (pfSeqByConversation.size >= 1024) pfSeqByConversation.clear();
+                pfSeqByConversation.set(conv, Number(pfSeq));
+            }
+        }
         const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
         if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
         const pending = incPendingAcks.get(turnId);
