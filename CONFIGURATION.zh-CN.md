@@ -2110,6 +2110,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `bili plugin list` | 显示每个宿主的安装状态 |
 | `bili mcp` | 独立运行 bili MCP 服务器（stdio） |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | 预绑定会话 id 到插件模式（高级用法） |
+| `bili bench [scenario] [--rounds N] [--out FILE] [--keep-workdir] [--dist PATH]` | 只记录不评判的性能基准（#5460 P2）：把本代理作为子进程拉起，对着一次性 XDG 目录里的确定性假上游重放种子 fixture（全量重发回合），从 `perf.sqlite` 读 p50/p95/HWM 出 JSON 报告 —— 指标慢不会让运行失败，只有 harness 故障才失败；不带 scenario 时列出全部场景 |
+| `bili fixture-gen --seed K --msgs N [--shape openai\|anthropic] [--out FILE]` | 生成确定性合成会话 fixture —— seed/msgs/shape 的纯函数（同输入 ⇒ 字节级一致）；大数据按需生成，永不入库 |
 | `bili --version` / `bili --help` | 打印版本 / 帮助 |
 
 launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- print "hi"`）。
@@ -2126,6 +2128,13 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 | `--no-passthrough` | 强制开启压缩（覆盖配置文件） |
 | `--no-auto-update` | 本次运行禁用后台自动更新 |
 | `--mitm-domain <domain>` | 追加 MITM 白名单域名（可重复；仅 launcher） |
+| `--rounds <N>` | `bench`：每个场景的重放轮数（默认 `1`；每轮各自记入产物 `runs[]`，消费方可跨 N 轮取中位数） |
+| `--out <FILE>` | `bench` / `fixture-gen`：JSON 产物 / fixture 写入 FILE，而非 stdout |
+| `--keep-workdir` | `bench`：保留一次性 XDG 工作目录（日志、会话状态、`perf.sqlite`）供排查 |
+| `--dist <PATH>` | `bench`：拉起哪个 `dist/index.js`（默认：当前运行入口；测试缝 env `E2E_BILI_DIST`） |
+| `--seed <K>` | `fixture-gen`：PRNG 种子，非负整数（与 `--msgs` 同必填） |
+| `--msgs <N>` | `fixture-gen`：消息条数，正整数（与 `--seed` 同必填） |
+| `--shape <wire>` | `fixture-gen`：线路形状，`openai`（默认）或 `anthropic` |
 
 ---
 

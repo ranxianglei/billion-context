@@ -2137,6 +2137,8 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili plugin list` | Show install status for every host |
 | `bili mcp` | Run the bili MCP server standalone on stdio |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | Pre-bind a conversation id to plugin mode (advanced) |
+| `bili bench [scenario] [--rounds N] [--out FILE] [--keep-workdir] [--dist PATH]` | Record-only perf harness (#5460 P2): boots this proxy as a child against a hermetic deterministic fake upstream in throwaway XDG dirs, replays a seeded fixture as full-resend rounds, reports p50/p95/HWM from `perf.sqlite` — slow metrics never fail a run, only harness failures do; no scenario lists the catalog |
+| `bili fixture-gen --seed K --msgs N [--shape openai\|anthropic] [--out FILE]` | Emit a deterministic synthetic conversation fixture — pure function of seed/msgs/shape (same input ⇒ byte-identical bytes); big fixtures are generated on demand, never committed |
 | `bili --version` / `bili --help` | Print version / help |
 
 Anything after `--` in a launcher command is passed through to the client verbatim (`bili pi -- print "hi"`).
@@ -2153,6 +2155,13 @@ Anything after `--` in a launcher command is passed through to the client verbat
 | `--no-passthrough` | Force compression on (overrides config) |
 | `--no-auto-update` | Disable background self-update for this run |
 | `--mitm-domain <domain>` | Extra MITM whitelist entry (repeatable; launcher only) |
+| `--rounds <N>` | `bench`: replay runs per scenario (default `1`; each run lands as a separate `runs[]` entry in the artifact, so consumers can take a median over N) |
+| `--out <FILE>` | `bench` / `fixture-gen`: write the JSON artifact / fixture to FILE instead of stdout |
+| `--keep-workdir` | `bench`: keep the throwaway XDG workdir (logs, session state, `perf.sqlite`) for inspection |
+| `--dist <PATH>` | `bench`: which `dist/index.js` to boot (default: the running entry point; test seam env `E2E_BILI_DIST`) |
+| `--seed <K>` | `fixture-gen`: PRNG seed, non-negative integer (required with `--msgs`) |
+| `--msgs <N>` | `fixture-gen`: message count, positive integer (required with `--seed`) |
+| `--shape <wire>` | `fixture-gen`: wire shape, `openai` (default) or `anthropic` |
 
 ---
 

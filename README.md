@@ -483,6 +483,15 @@ bili --bin /path/to/client   # launcher: spawn this exact client binary instead 
 
 Flags override env vars and the config file. `bili --help` lists them all.
 
+### Performance tooling (`bili bench` / `bili fixture-gen`, #5460)
+
+Record-only performance harness: `bili bench <scenario>` boots the real proxy as a child process against an in-process deterministic fake upstream in throwaway XDG dirs (random ports, auto-update off), replays a seeded fixture as sequential full-resend rounds (the dsh plugin lane's traffic shape), then reads the child's `perf.sqlite` (#5460 P1) and prints a JSON artifact — `total_ms` p50/p95/max/min/mean, inbound/outbound byte totals, memory HWM, per-round errors. **It records, never judges:** slow metrics still exit 0; only harness failures (server never ready, every round failed, telemetry did not arm, mid-run crash) exit 1. Tolerance bands / baseline ratchet / FULL+nightly CI wiring are follow-ups (#5460 P3). `bili bench` with no scenario lists the catalog: `smoke-openai-tiny`, `proxy-append-openai-s-small`, `proxy-append-openai-s-med`, `proxy-append-anthropic-s-med`, `proxy-compress-openai-s-med` (declares a 16K window to force fold density), `proxy-append-openai-s-large` (~80 MiB fixture mirroring #5403 — nightly tier).
+
+```bash
+bili bench proxy-append-openai-s-med --rounds 3 --out report.json  # --keep-workdir keeps the throwaway dir; --dist PATH picks which dist/index.js to boot
+bili fixture-gen --seed 42 --msgs 2000 --shape anthropic > fx.json # pure function of seed/msgs/shape: same input ⇒ byte-identical output; --out FILE writes instead of stdout
+```
+
 ### Remote agents (`--host`)
 
 By default the proxy binds `127.0.0.1` and only accepts loopback connections. To serve agents on other machines: `bili --host 0.0.0.0` (or your LAN IP); remote agents point their model `baseURL` at `http://<this-host>:<port>/bili/…`.
