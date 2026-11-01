@@ -51,3 +51,10 @@ for (const name of ["sessions", "data", "state", "cache", "config"]) mkdirSync(p
 // tests/message-timestamps-default-on.test.ts). Storage-layer stamping runs
 // regardless of this flag.
 process.env.BILI_MESSAGE_TIMESTAMPS = "0";
+// #5460: pin realtime perf telemetry OFF suite-wide. SessionStore auto-arms
+// it (src/persist.ts), and its persistent WAL handle makes Windows runners
+// fail every sandbox teardown that rimrafs a sessions dir
+// (EBUSY …/sessions/perf.sqlite — the whole w22 matrix, run of 2026-11-01).
+// Tests that need it opt in per-file by DELETING the key (the dedicated
+// tests/issue5460-perf-telemetry.test.ts does exactly that).
+process.env.BILI_PERF_TELEMETRY = "0";
