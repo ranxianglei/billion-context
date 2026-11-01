@@ -80,7 +80,8 @@ billion-context/
 │   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
-│   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
+│   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499) — immutable journal, never rewrites the legacy file
+│   ├── snapshot-journal.ts       # Immutable-publication journal shared by the two state snapshots: a private staging dir is renamed onto a unique never-reused `pub-*` name (atomic, no overwrite, no hard links, no copy), corruption-preserving per-input census; reclamation is coverage-gated — a census leaf is unlinked only when the caller's `covers(output, input)` holds for that leaf's own privately parsed data, so a bounded/merged view keeps the leaves holding records its cap dropped (reported once as `PublishResult.uncovered`)
 │   ├── cache-warn.ts             # Upstream prompt-cache collapse warning (#499)
 │   ├── cache-ledger.ts           # Per-round cache usage ledger (wire-protocol aware, #1536)
 │   ├── billing.ts                # Per-model USD prices (#4899): billing.prices overrides > models.dev; stamps per request, bills session.stats.costUsd; panel $ faces derive live from the current price table incl. a compression payback view
