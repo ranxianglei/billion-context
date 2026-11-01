@@ -16,7 +16,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { getSession, _resetSessionsForTest, type Session } from "../src/session.ts";
+import { getSession, _resetSessionsForTest, isDroppedMetadata, type Session } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #2129: buildRecord() persists the entire stats object, but buildSession()
@@ -321,10 +321,28 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
         await store.writeNow(s);
         await store.flushAll([]);
         const env = JSON.parse(readFileSync(findRecordFile(dir), "utf8")) as { payload: { stats?: StatsBlob; metadata?: StatsBlob } };
-        assert.equal(env.payload.stats?.calibratedEstimate, preRestart.k, "k̂ must be on disk after restart");
-        assert.equal(env.payload.stats?.lastUsageGradeTokens, preRestart.anchor, "usage anchor must be on disk after restart");
-        assert.equal(env.payload.stats?.localInputEstimate, preRestart.est, "per-turn estimate must be on disk after restart");
-        assert.ok(env.payload.metadata?.anonymousPrefixAffinity, "PFA stamp must be on disk after restart");
+        try {
+            assert.equal(env.payload.stats?.calibratedEstimate, preRestart.k, "k̂ must be on disk after restart");
+            assert.equal(env.payload.stats?.lastUsageGradeTokens, preRestart.anchor, "usage anchor must be on disk after restart");
+            assert.equal(env.payload.stats?.localInputEstimate, preRestart.est, "per-turn estimate must be on disk after restart");
+            assert.ok(env.payload.metadata?.anonymousPrefixAffinity, "PFA stamp must be on disk after restart");
+        } catch (err) {
+            // #5381: unreproducible locally — on failure dump what landed on disk vs. what
+            // was set so the next occurrence self-diagnoses; each read is guarded so a
+            // lazy-metadata proxy trap can't mask the real assertion error.
+            const diag = (label: string, get: () => unknown): void => {
+                let v: unknown;
+                try { v = get(); } catch (e) { v = `<threw ${String(e)}>`; }
+                console.error(`[2129-diag] ${label}=${typeof v === "string" ? v : JSON.stringify(v)}`);
+            };
+            diag("stats.onDisk", () => env.payload.stats ?? null);
+            diag("metadata.onDiskKeys", () => Object.keys(env.payload.metadata ?? {}));
+            diag("metadata.pfa", () => env.payload.metadata?.anonymousPrefixAffinity ?? null);
+            diag("expected", () => ({ k: preRestart.k, anchor: preRestart.anchor, est: preRestart.est }));
+            diag("live.metadata.droppedProxy", () => isDroppedMetadata(s.metadata));
+            diag("store.hasPending", () => store.hasPending("i2129-e2e"));
+            throw err;
+        }
         _resetSessionsForTest();
         store2 = new SessionStore({ dir, debounceMs: 5, enabled: true });
         _setStoreForTest(store2);
