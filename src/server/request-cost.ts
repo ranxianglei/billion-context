@@ -3,12 +3,12 @@ import { currentFetchTransport } from "../fetch-transport.js";
 
 // #903: per-request local-cost line, logged at every point where bili finishes
 // its own processing and hands the request off (upstream forward, forged local
-// response, or fail-fast error) — see handle(). outbound is the exact body value
-// handed to forward() (string OR Buffer — Prepared.body is string|Buffer); wire
+// response, or fail-fast error) — see handle(). outbound is the final body value
+// handed to fetch (string OR Buffer) after relay and V1 transformations; wire
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
     if (n < 1024) return `${n}B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
     if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MiB`;

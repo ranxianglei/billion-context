@@ -267,12 +267,14 @@ async function forwardCaptured(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
+    onWireBody?: (body?: Buffer | string) => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
+        onWireBody?.();
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
@@ -659,11 +661,13 @@ async function forwardCaptured(
             }
         }
     }
+    const requestBody = req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
-        body: req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody),
+        body: requestBody,
     };
+    onWireBody?.(requestBody);
     if (dispatcher) init.dispatcher = dispatcher;
     // #1843 L1: capture this round's image facts at the SEND chokepoint so the
     // turn's usage settle pairs with the bytes actually sent — streamed turns
@@ -725,7 +729,8 @@ async function forwardCaptured(
     // previous request's body. Loop re-fetches re-note their own rebuilt bodies
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
-    if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+    const mainSend = prepared !== null && prepared.session !== undefined && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD";
+    if (mainSend && prepared?.session) {
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #2078: ONE parse of the outbound body for the whole seam block — the
         // estimate's projection, its wire-overhead term, and the image reserve
