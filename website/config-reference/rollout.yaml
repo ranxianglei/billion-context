@@ -57,3 +57,11 @@ entries:
     group: behavior
     desc_en: "Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out."
     desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"
+  - key: rollout.features.pluginIncrementalTurns
+    type: "boolean | number"
+    default: "100 (on)"
+    default_zh: "100(开)"
+    env: BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS
+    group: behavior
+    desc_en: "Incremental turn lane (#3248): for enabled installs, native plugin hosts send only the conversation delta each turn (with the host-msgid envelope) instead of re-sending the whole history; bili rebuilds the outbound request from the unified transcript through the normal fold/render pipeline. GA since this version — fresh installs are delta-by-default. Installs without the unified-storage sidecar stay on full-resend automatically (probe reports storage=legacy-only). Opt out with false / a percent override, or BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0."
+    desc_zh: "增量回合车道(#3248):对已放量的安装,原生插件宿主每回合只发对话增量(带宿主 msgid 信封),不再整段重发历史;bili 从统一 transcript 重建出站请求并走正常折叠/渲染管道。本版本起 GA——全新安装开箱即增量。没有统一存储 sidecar 的安装自动保持全量重发(探测响应 storage=legacy-only)。用 false / percent 覆盖或 BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0 可关。"
