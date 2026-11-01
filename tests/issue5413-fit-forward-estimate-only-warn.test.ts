@@ -16,7 +16,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { setLogCapture } from "../src/logger.ts";
 
-// #5414: the D2 stale-view guard shipped in #5409 with no regression pin.
+// #5413: the D2 stale-view guard shipped in #5409 with no regression pin.
 // When the #4288 fit-forward exit judges on ESTIMATE ONLY (no usage baseline
 // backing the fit) and the payload estimate reaches >= 85% of the HARD window
 // limit (FIT_FORWARD_ESTIMATE_ONLY_MARGIN in src/preflight.ts), a WARN must
@@ -108,7 +108,7 @@ function walkRan(captured: Captured[]): Captured[] {
 }
 
 async function startProxyCase(tag: string): Promise<{ port: number; upstreamPort: number; summaryCalls: () => number; close: () => Promise<void> }> {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `bili-5414-${tag}-`));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `bili-5413-${tag}-`));
     let summaryCalls = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -179,7 +179,7 @@ async function startProxyCase(tag: string): Promise<{ port: number; upstreamPort
     };
 }
 
-test("e2e #5414 D2 positive: fit-forward on an estimate-only judgment at >= 85% of the window warns exactly once", async () => {
+test("e2e #5413 D2 positive: fit-forward on an estimate-only judgment at >= 85% of the window warns exactly once", async () => {
     // 48 × 2700 = 129.6k ASCII chars → message estimate ≈ 32.4k + ACP tags +
     // injected-tool wire overhead (~4.3k, measured) ≈ 37.2k, tuned to sit
     // INSIDE [0.85*40k, 40k) with margin on both sides; the char upper bound
@@ -223,7 +223,7 @@ test("e2e #5414 D2 positive: fit-forward on an estimate-only judgment at >= 85% 
     }
 });
 
-test("e2e #5414 D2 negative: identical shape just under the 85% margin stays completely quiet", async () => {
+test("e2e #5413 D2 negative: identical shape just under the 85% margin stays completely quiet", async () => {
     // Same anonymous/fresh-session shape, 48 × 2200 = 105.6k chars: the char
     // upper bound still exceeds the window (trigger fires, the walk runs and
     // exits fit-forward) but the optimistic estimate ≈ 26.4k + tags + wire
@@ -254,7 +254,7 @@ test("e2e #5414 D2 negative: identical shape just under the 85% margin stays com
     }
 });
 
-test("unit #5414 D2 boundary: the margin itself — at/above 0.85*window warns, just under stays quiet", async () => {
+test("unit #5413 D2 boundary: the margin itself — at/above 0.85*window warns, just under stays quiet", async () => {
     // Direct preflightCompress pins the constant's semantics without the
     // trigger layer: estimate-only fit (baselineFloor = 0) at exactly 90% of
     // the window warns once; at 80% it is silent. Same exit either way
@@ -280,7 +280,7 @@ test("unit #5414 D2 boundary: the margin itself — at/above 0.85*window warns, 
 
     const run = async (fillerChars: number): Promise<{ warns: number; fits: boolean; ranges: number; failure?: string }> => {
         const lines: Captured[] = [];
-        const session = getSession(`issue5414-${Math.random().toString(36).slice(2)}`);
+        const session = getSession(`issue5413-${Math.random().toString(36).slice(2)}`);
         const config = defaultConfig(WINDOW, { preserveRecentMessages: 0, preserveRecentTokens: 0 });
         const messages: CoreMessage[] = [
             { id: "first", role: "user", contentType: "text", text: "Keep the task goal." },
