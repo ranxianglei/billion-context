@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseArgs } from "../src/cli.ts";
+import { applyPosturePins } from "../src/launcher.ts";
 
 // #346: the gost-style `-F <url>` (forward) flag sets bili's upstream proxy.
 // bili flags must precede the client name; everything after the client name is
@@ -117,5 +118,23 @@ test("parseArgs: -i/-s misuse exits 2 with a pointed message (#5428)", () => {
             (process as any).exit = origExit;
             console.error = origError;
         }
+    }
+});
+
+test("parseArgs+applyPosturePins: -s pins reach the launcher env the child inherits (#5491)", () => {
+    const origPi = process.env.BILI_PI_INLINE;
+    const origOc = process.env.BILI_OPENCODE_INLINE;
+    try {
+        delete process.env.BILI_PI_INLINE;
+        delete process.env.BILI_OPENCODE_INLINE;
+        applyPosturePins(parseArgs(["-s", "pi"]).overrides);
+        assert.equal(process.env.BILI_PI_INLINE, "0");
+        assert.equal(process.env.BILI_OPENCODE_INLINE, undefined, "only the pinned lane's key is set");
+        delete process.env.BILI_PI_INLINE;
+        applyPosturePins(parseArgs(["pi"]).overrides);
+        assert.equal(process.env.BILI_PI_INLINE, undefined, "no -s → no pin → env untouched");
+    } finally {
+        if (origPi === undefined) delete process.env.BILI_PI_INLINE; else process.env.BILI_PI_INLINE = origPi;
+        if (origOc === undefined) delete process.env.BILI_OPENCODE_INLINE; else process.env.BILI_OPENCODE_INLINE = origOc;
     }
 });
