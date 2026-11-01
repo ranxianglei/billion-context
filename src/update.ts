@@ -34,7 +34,7 @@ import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
 import { convergeDshLedger } from "./dsh-ledger.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
-import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
+import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs, updatePolicyUrl as knobUpdatePolicyUrl, updateStaggerMinDelayMs as knobUpdateStaggerMinDelayMs, updateStaggerMaxDelayMs as knobUpdateStaggerMaxDelayMs } from "./knobs.js";
@@ -1354,6 +1354,76 @@ async function refreshOwnerManagedCopies(
     await refreshDshProfileCopy(installDir, opts, env, log);
     await refreshPiNpmCopy(installDir, opts, env, log);
 }
+
+/** Plugin dir name under <hermes home>/plugins — twin of HERMES_PLUGIN_ID in
+ *  src/plugin-install.ts (kept local to avoid an update→plugin-install import
+ *  cycle; that module already imports this one). */
+const HERMES_PLUGIN_DIR = "billion-context";
+
+/** Best-effort atomic text write (tmp+rename), same convention as the
+ *  backoff/last-install state files. */
+async function atomicWriteText(file: string, text: string): Promise<void> {
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, text, "utf-8");
+    await rename(tmp, file);
+}
+
+/** #4282: converge the hermes plugin's Python shell onto THIS install's
+ *  `hermes-plugin/` sources. The shell (`__init__.py` + `plugin.yaml`) has no
+ *  owner channel of its own — its only writers were `bili plugin install|update
+ *  hermes` (src/plugin-install.ts) — so every other update path (global
+ *  self-update, advisory install, manual `npm i -g`) left it frozen at install
+ *  time while dist/ moved on. Byte-compare each file against the on-disk copy
+ *  and atomically rewrite only what differs; plugin.yaml's version line is
+ *  rewritten from <installDir>/package.json exactly as hermesInstallCore does.
+ *  Never touches bili.json (nodePath/proxyScript belong to the install
+ *  environment) and never creates the plugin dir — an absent __init__.py means
+ *  "hermes was never installed" and stays untouched. Best-effort: any failure
+ *  only warns and never fails the update; a failed refresh retries on the next
+ *  check cycle via the periodic call site in checkForUpdate. */
+export async function refreshHermesPluginCopy(
+    installDir: string | undefined,
+    env: NodeJS.ProcessEnv,
+    log: Logger,
+): Promise<void> {
+    if (!installDir) return;
+    try {
+        const dir = path.join(resolveHermesHome(env), "plugins", HERMES_PLUGIN_DIR);
+        const installedInit = path.join(dir, "__init__.py");
+        let initExists = true;
+        try {
+            await access(installedInit);
+        } catch {
+            initExists = false;
+        }
+        if (!initExists) return; // not installed — never create the plugin
+        const srcInit = await readFile(path.join(installDir, "hermes-plugin", "__init__.py"));
+        const srcYaml = (await readFile(path.join(installDir, "hermes-plugin", "plugin.yaml"))).toString("utf-8");
+        const version = (await readDiskVersion(installDir)) ?? "0.0.0";
+        const expectedYaml = srcYaml.replace(/^version:.*/m, `version: "${version}"`);
+        let changed = false;
+        const installedInitBuf = await readFile(installedInit);
+        if (!installedInitBuf.equals(srcInit)) {
+            await atomicWriteText(installedInit, srcInit.toString("utf-8"));
+            changed = true;
+        }
+        const targetYaml = path.join(dir, "plugin.yaml");
+        let yamlDrifts = true;
+        try {
+            yamlDrifts = (await readFile(targetYaml)).toString("utf-8") !== expectedYaml;
+        } catch {
+            yamlDrifts = true; // missing or unreadable — rewrite it
+        }
+        if (yamlDrifts) {
+            await atomicWriteText(targetYaml, expectedYaml);
+            changed = true;
+        }
+        if (changed) log("info", `[update] hermes plugin refreshed to ${version} — restart hermes to load it`);
+    } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        log("warn", `[update] hermes plugin refresh failed: ${detail} — manual fix: run \`bili plugin update hermes\`; retries next check cycle`);
+    }
+}
 /** Registry-pinned dsh profile copies whose installed version is older
  *  than the global one ("name@version" per entry). Dev pins (link:/file:)
  *  and declared-but-not-installed mounts are out of scope: neither
@@ -1616,6 +1686,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             // version — dsh reads the yml from here but the entry module from
             // each profile, so a stale copy hard-crashes dsh at boot.
             await convergeDshProfileBundles(installDir, diskVersion, process.env);
+            // #4282: same periodic convergence for the hermes Python shell —
+            // a manual `npm i -g` leaves no install event for the post-install
+            // hook to see, so only this cycle-by-cycle byte compare catches it.
+            await refreshHermesPluginCopy(installDir, process.env, loggerLog);
             return;
         }
 
@@ -1692,6 +1766,9 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 // never fails the update itself.
                 await runProfileBundlesRefresh(target, loggerLog);
                 await refreshDshDesktopCopy(target, loggerLog, process.env, opts.resolveProxy);
+                // #4282: the hermes Python shell has no owner channel — without
+                // this it stays frozen at `bili plugin install` time.
+                await refreshHermesPluginCopy(installDir, process.env, loggerLog);
                 notifyStaleInstall(opts, target);
             } else {
                 await recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
@@ -2210,6 +2287,9 @@ export async function forceInstallVersion(
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);
+            // #4282: advisory installs are update events too — converge the
+            // hermes Python shell alongside the dsh copies.
+            await refreshHermesPluginCopy(installDir, process.env, loggerLog);
             notifyStaleInstall(opts, targetVersion);
             return { ok: true };
         }
