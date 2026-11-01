@@ -7,9 +7,16 @@
  * without a recorded discussion number it creates ONE bilingual discussion
  * (English section first, then Chinese, per owner decision 2026-11-01) whose
  * body mirrors the article at creation time plus a canonical-source reference,
- * then writes the recorded numbers back into website/articles.json in a single
- * commit prefixed "[bili-blog-pipeline]" (that prefix is also the re-trigger
- * loop guard: push events consisting only of our own write-backs exit early).
+ * then records the numbers into website/articles.json in a single commit
+ * prefixed "[bili-blog-pipeline]" (that prefix is also the re-trigger loop
+ * guard: push events consisting only of our own write-backs exit early).
+ *
+ * Master carries strict required-status-check branch protection and the
+ * Actions token is not exempt, so a direct commit to master is always tried
+ * FIRST and, when rejected, falls back to updating the fixed branch
+ * bili-blog-pipeline-manifest and opening/refreshing one PR for it (the same
+ * posture as release-manual.yml). Merging that PR is a human step by house
+ * rules; until it lands the button simply stays hidden.
  *
  * Idempotency is three-layered so a crash between "created" and "committed"
  * can never silently make a second thread:
@@ -47,17 +54,21 @@ if (!TOKEN) {
 
 /* ---------------------------- small HTTP layer ---------------------------- */
 
-async function ghJson(url, init = {}) {
-    const res = await fetch(url, {
+const authHeaders = () => ({
+    authorization: `Bearer ${TOKEN}`,
+    "user-agent": "bili-blog-pipeline",
+});
+
+async function rawFetch(url, init = {}) {
+    return fetch(url, {
         ...init,
-        headers: {
-            authorization: `Bearer ${TOKEN}`,
-            "user-agent": "bili-blog-pipeline",
-            accept: "application/vnd.github+json",
-            ...(init.headers ?? {}),
-        },
+        headers: { accept: "application/vnd.github+json", ...authHeaders(), ...(init.headers ?? {}) },
         signal: AbortSignal.timeout(30_000),
     });
+}
+
+async function ghJson(url, init = {}) {
+    const res = await rawFetch(url, init);
     if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`${init.method ?? "GET"} ${url} → ${res.status} ${text.slice(0, 300)}`);
@@ -92,11 +103,72 @@ async function readRepoFile(rel) {
     return Buffer.from(j.content, "base64").toString("utf8");
 }
 
-async function shaOf(rel) {
-    const res = await fetch(`${BASE}/repos/${REPO}/contents/${rel}?ref=${BRANCH}`, {
-        headers: { authorization: `Bearer ${TOKEN}`, "user-agent": "bili-blog-pipeline" },
-        signal: AbortSignal.timeout(30_000),
+async function headSha(ref) {
+    const j = await ghJson(`${BASE}/repos/${REPO}/commits/${ref}`);
+    return j.sha;
+}
+
+const WRITE_BACK_BRANCH = "bili-blog-pipeline-manifest";
+const AUTOPR_BODY = [
+    "Automated by the blog pipeline (scripts/blog-discussions.mjs).",
+    "",
+    "Records newly created Discussion thread numbers into website/articles.json.",
+    "Direct commits to " + BRANCH + " are blocked by its required-status-check",
+    "protection, so this PR is the fallback (same posture as release-manual.yml).",
+    "",
+    "- One file changed: website/articles.json.",
+    "- Safe to squash-merge. If the pipeline runs again before this merges,",
+    "  the same branch/PR is refreshed in place.",
+    "- Until merged, the discussion button stays hidden — nothing breaks.",
+].join("\n");
+
+function looksLikeProtectionRejection(status, text) {
+    return (status === 403 || status === 422 || status === 409)
+        && (/protect/i.test(text) || /not allowed to (create or )?push/i.test(text) || /locked for state changes/i.test(text));
+}
+
+async function fallbackWriteBackAsPr(next, summary) {
+    // 1) make sure the fixed branch exists at the branch head
+    const refRes = await rawFetch(`${BASE}/repos/${REPO}/git/ref/heads/${WRITE_BACK_BRANCH}`);
+    if (refRes.status === 404) {
+        await ghJson(`${BASE}/repos/${REPO}/git/refs`, {
+            method: "POST",
+            body: JSON.stringify({ ref: `refs/heads/${WRITE_BACK_BRANCH}`, sha: await headSha(BRANCH) }),
+        });
+    }
+    // 2) update the file ON THAT BRANCH (the contents API cannot create branches itself)
+    let sha;
+    try { sha = await shaOf(MANIFEST_REL, WRITE_BACK_BRANCH); } catch { sha = null; }
+    await ghJson(`${BASE}/repos/${REPO}/contents/${MANIFEST_REL}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            message: `${WRITE_BACK_PREFIX} record discussion threads (${summary})`,
+            content: Buffer.from(next, "utf8").toString("base64"),
+            branch: WRITE_BACK_BRANCH,
+            ...(sha ? { sha } : {}),
+        }),
     });
+    // 3) open — or reuse — exactly one PR for it
+    const openPrs = await ghJson(`${BASE}/repos/${REPO}/pulls?head=${OWNER}:${WRITE_BACK_BRANCH}&state=open`);
+    if (Array.isArray(openPrs) && openPrs.length > 0) {
+        console.log(`write-back branch updated; PR #${openPrs[0].number} now carries the latest numbers — merge it to finish recording`);
+    } else {
+        const pr = await ghJson(`${BASE}/repos/${REPO}/pulls`, {
+            method: "POST",
+            body: JSON.stringify({
+                title: `${WRITE_BACK_PREFIX} record discussion threads (${summary})`,
+                body: AUTOPR_BODY,
+                head: WRITE_BACK_BRANCH,
+                base: BRANCH,
+            }),
+        });
+        console.log(`direct push to ${BRANCH} is blocked by branch protection; write-back opened as PR #${pr.number} — merge it to finish recording`);
+    }
+}
+
+async function shaOf(rel, ref = BRANCH) {
+    const res = await rawFetch(`${BASE}/repos/${REPO}/contents/${rel}?ref=${encodeURIComponent(ref)}`);
     if (!res.ok) return null;
     const j = await res.json();
     return typeof j.sha === "string" ? j.sha : null;
@@ -186,7 +258,11 @@ async function verifyRecorded(entry, slug) {
             { owner: OWNER, name: NAME, num: entry.discussion },
         );
         if (!d.repository.discussion) {
-            console.log(`recorded number #${entry.discussion} for "${slug}" no longer resolves — will recreate`);
+            // Deliberate (owner-reviewed): a vanished thread is NOT resurrected
+            // automatically. The recorded value stays authoritative; removing
+            // the discussion field from the manifest is how one asks for a new
+            // thread. Keeps "deleted a thread on purpose" from coming back.
+            console.log(`recorded number #${entry.discussion} for "${slug}" no longer resolves — keeping the recorded value; remove the discussion field to request a new thread`);
             return false;
         }
         return true;
@@ -203,7 +279,7 @@ async function findMarkerInRecentDiscussions(slug) {
         const d = await gql(
             `query($owner: String!, $name: String!, $after: String) {
                repository(owner: $owner, name: $name) {
-                 discussions(first: 100, after: $after) {
+                 discussions(first: 100, after: $after, orderBy: {field: CREATED_AT, direction: DESC}) {
                    pageInfo { hasNextPage endCursor }
                    nodes { number bodyText }
                  }
@@ -225,19 +301,32 @@ async function writeBackManifest(manifestText, updatesByIndex) {
     const obj = JSON.parse(manifestText);
     updatesByIndex.forEach(({ index, num }) => { obj.articles[index].discussion = num; });
     const next = JSON.stringify(obj, null, 2) + "\n";
-    const sha = await shaOf(MANIFEST_REL);
     const summary = updatesByIndex.map((u) => `${slugOf(obj.articles[u.index])}→#${u.num}`).join(", ");
-    await ghJson(`${BASE}/repos/${REPO}/contents/${MANIFEST_REL}`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-            message: `${WRITE_BACK_PREFIX} record discussion threads (${summary})`,
-            content: Buffer.from(next, "utf8").toString("base64"),
-            branch: BRANCH,
-            ...(sha ? { sha } : {}),
-        }),
-    });
-    console.log(`manifest updated: ${summary}`);
+    if (DRY_RUN) {
+        console.log(`[dry-run] would record ${summary} (direct commit to ${BRANCH}, falling back to a PR if protection rejects it)`);
+        return;
+    }
+    const sha = await shaOf(MANIFEST_REL);
+    try {
+        await ghJson(`${BASE}/repos/${REPO}/contents/${MANIFEST_REL}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                message: `${WRITE_BACK_PREFIX} record discussion threads (${summary})`,
+                content: Buffer.from(next, "utf8").toString("base64"),
+                branch: BRANCH,
+                ...(sha ? { sha } : {}),
+            }),
+        });
+        console.log(`manifest updated on ${BRANCH}: ${summary}`);
+    } catch (e) {
+        const m = String(e.message).match(/ → (\d{3}) ([\s\S]*)$/);
+        if (m && looksLikeProtectionRejection(Number(m[1]), m[2])) {
+            await fallbackWriteBackAsPr(next, summary);
+            return;
+        }
+        throw e; // anything that is not a protection rejection still fails loud
+    }
 }
 
 /** Loop guard: our own manifest write-back lands on master and would re-match
@@ -282,6 +371,7 @@ async function main() {
     }
 
     const categoryId = await resolveCategoryId();
+    const repoIdValue = await repoId(); // stable — resolved once, not per entry
     const toRecord = [];
     for (const { entry, index } of entries) {
         if (hasRecorded(entry)) continue;
@@ -306,13 +396,12 @@ async function main() {
         }
         const body = threadBody(slug, entry.file, title, enRaw, zhRaw);
         if (DRY_RUN) {
-            console.log(`[dry-run] would create discussion "${title}" (categoryId=${categoryId})`);
+            console.log(`[dry-run] would create discussion "${title}" (categoryId=${categoryId}, repositoryId=${repoIdValue})`);
             console.log(`[dry-run] body chars=${body.length}`);
             console.log("[dry-run] --- head ---\n" + body.slice(0, 300));
             console.log("[dry-run] --- tail ---\n" + body.slice(-160));
             continue;
         }
-        const repoIdValue = await repoId();
         const d = await gql(
             `mutation($input: CreateDiscussionInput!) {
                createDiscussion(input: $input) { node { number url } }
@@ -330,7 +419,16 @@ async function main() {
     }
 }
 
-main().catch((e) => {
-    console.error(`blog-discussions failed: ${e?.message ?? e}`);
-    process.exit(1);
-});
+{
+    const failed = await main().catch((e) => {
+        console.error(`blog-discussions failed: ${e?.message ?? e}`);
+        return e;
+    });
+    if (failed) {
+        if (process.env.NODE_TEST_CONTEXT !== undefined || process.env.BILI_BLOG_PIPELINE_TEST === "1") {
+            globalThis.__biliBlogPipelineError = failed; // test mode: surface, don't exit
+        } else {
+            process.exit(1);
+        }
+    }
+}
