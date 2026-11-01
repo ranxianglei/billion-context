@@ -3871,7 +3871,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
-            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
+            cafRow.inp.checked = cp ? cp.compressAtFoldPoint !== false : true;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -4039,20 +4039,21 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
         }));
         void tsRow.ctl;
-        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
-        // deletes the key so the file stays clean (mirrors the absorb row).
+        // #5470 fold-point carrier relocation — default ON (promoted after
+        // real-model verification); unchecking writes an EXPLICIT false
+        // (deleting the key would silently resolve back to on). Mirrors the
+        // message-ts default-on row, not the absorb row.
         const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
         qCtrls.push(cafRow.inp);
         cafRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
             if (cafRow.inp.checked) {
-                if (!compressOf(d)) d.compress = {};
-                d.compress.compressAtFoldPoint = true;
+                if (!c) return;
+                delete c.compressAtFoldPoint;
+                if (Object.keys(c).length === 0) delete d.compress;
             } else {
-                const c = compressOf(d);
-                if (c) {
-                    delete c.compressAtFoldPoint;
-                    if (Object.keys(c).length === 0) delete d.compress;
-                }
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.compressAtFoldPoint = false;
             }
         }));
         const cafHint = document.createElement("span");
