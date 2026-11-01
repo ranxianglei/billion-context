@@ -6,7 +6,7 @@
 
 import { resolveProxyOrigin } from "../mcp.js";
 import { reportRuntimeInfo, runSessionStartHook } from "../agent/shared.js";
-import { planNativeZcode, routeZcodeConfig, waitForProxyHealthy, zcodePolicyFromEnv } from "./native.js";
+import { defaultLog, detectZcodeBuiltinAccount, planNativeZcode, reportZcodeBuiltinAccount, routeZcodeConfig, waitForProxyHealthy, zcodePolicyFromEnv } from "./native.js";
 
 const HOOK_HEALTH_DEADLINE_MS = 4000;
 
@@ -41,6 +41,9 @@ export async function main(): Promise<void> {
         // #1622: pass the resolved policy — routeZcodeConfig's default ignores BILI_ZCODE_ROUTE / providers direct.
         const policy = zcodePolicyFromEnv(process.env);
         if (policy.route === "none") return;
+        // #4692: independent entry point from the authoritative MCP child — report the same built-in-account blind spot on stderr, like the hook's other diagnostics.
+        const builtin = detectZcodeBuiltinAccount(process.env);
+        if (builtin !== undefined) reportZcodeBuiltinAccount(builtin, defaultLog);
         const origin = plan.mode === "attach" ? plan.attachOrigin : resolveProxyOrigin();
         if (!(await waitForProxyHealthy(origin, HOOK_HEALTH_DEADLINE_MS))) return;
         const applied = await routeZcodeConfig({ origin, policy });
