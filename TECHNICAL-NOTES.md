@@ -570,7 +570,7 @@ A hard CI/runtime audit gate is deliberately deferred: it would stay red because
 
 ## Memory & render stack — three mechanisms on three layers (#4788 boundedness · #3756 snapshot render · #5418 watermark fastpath)
 
-Long-session OOM-class defects (#3050/#4788/#4967/#5403) have three INDEPENDENT cost contributors on three layers, and the three mechanisms below attack different layers. Confusing them keeps misdirecting triage (see the #5403 thread), so they are recorded together here once. The persistence substrate underneath all of them is unified storage (`storage.unified`, defaulted to `full` since v0.1.210 / #3818): raw bytes live in sqlite CAS + row pointers and reloads are windowed — it decides WHERE data lives, not which layer saves cost.
+Long-session OOM-class defects (#3050/#4788/#4967/#5403) have three INDEPENDENT cost contributors on three layers, and the three mechanisms below attack different layers. Confusing them keeps misdirecting triage (see the #5403 thread), so they are recorded together here once. The persistence substrate underneath all of them is unified storage (`storage.unified`, defaulted to `full` since v0.1.203 — the #3818 flip, shipped via #3819): raw bytes live in sqlite CAS + row pointers and reloads are windowed — it decides WHERE data lives, not which layer saves cost.
 
 |  | Memory boundedness #4788 | Snapshot render #3756 | Watermark fastpath #5418 |
 |---|---|---|---|
