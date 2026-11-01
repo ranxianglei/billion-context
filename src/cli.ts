@@ -563,7 +563,7 @@ export async function main(): Promise<void> {
     }
     if (command === "acp-cache") {
         try {
-            const report = runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
+            const report = await runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
             process.stdout.write(jsonOutput ? renderJson(report) : renderText(report));
         } catch (error) {
             console.error(`bili acp-cache: ${error instanceof Error ? error.message : String(error)}`);

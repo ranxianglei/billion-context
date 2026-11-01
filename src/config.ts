@@ -2236,6 +2236,11 @@ type FileConfig = {
          *  oldest-first deletion when exceeded. Unset/0 = off (default). */
         maxTotalBytes?: number;
         maxAgeDays?: number;
+        /** Private log retention (bili.log): target wall-clock hours kept before
+         *  the hard byte budget trims the oldest sealed generation. Defaults 48 h
+         *  and 256 MiB; env BILI_LOG_RETENTION_HOURS / BILI_LOG_BUDGET_BYTES win. */
+        logRetentionHours?: number;
+        logBudgetBytes?: number;
     };
     /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
     fakeCompletion?: { retries?: number; bufCapBytes?: number };

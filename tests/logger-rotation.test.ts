@@ -9,6 +9,8 @@ import {
     closeLogger,
     setLogCapture,
 } from "../src/logger.ts";
+import { configureLogRetention, defaultLogRetentionPolicy, logGenerations } from "../src/log-retention.ts";
+import { logRetentionStatus } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** Poll until the file exists with a stable non-zero size (open completed,
@@ -33,7 +35,7 @@ async function settle(file: string, timeoutMs = 3000): Promise<void> {
     throw new Error(`settle timed out: ${file} never reached a stable non-zero size within ${timeoutMs}ms`);
 }
 
-test("external rename: subsequent lines land in the new file, .old frozen", async () => {
+test("external rename: subsequent lines land in the new file, the renamed-away file stays frozen", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-"));
     const file = path.join(dir, "bili.log");
     configureLogger(file);
@@ -42,9 +44,12 @@ test("external rename: subsequent lines land in the new file, .old frozen", asyn
         log("info", "before-2");
         await settle(file);
 
-        fs.renameSync(file, file + ".old");
-        const oldSize = fs.statSync(file + ".old").size;
-        assert.ok(oldSize > 0, "pre-rename lines must be flushed to .old");
+        // Operator-side rename (logrotate, a manual copy-out). The name is
+        // arbitrary; what matters is that the held fd is detected as orphaned.
+        const moved = path.join(dir, "operator-rotated.log");
+        fs.renameSync(file, moved);
+        const movedSize = fs.statSync(moved).size;
+        assert.ok(movedSize > 0, "pre-rename lines must be flushed to the renamed-away file");
 
         log("info", "after-1");
         log("info", "after-2");
@@ -55,7 +60,7 @@ test("external rename: subsequent lines land in the new file, .old frozen", asyn
         assert.ok(content.includes("after-1"), "new file must receive post-rename lines");
         assert.ok(content.includes("after-2"));
         assert.ok(!content.includes("before-1"), "pre-rename lines must not leak into the new file");
-        assert.equal(fs.statSync(file + ".old").size, oldSize, ".old must not grow after rotation");
+        assert.equal(fs.statSync(moved).size, movedSize, "the renamed-away file must not grow");
     } finally {
         closeLogger();
         rmrf(dir);
@@ -94,6 +99,76 @@ test("reopen failure: degrades to stderr-only with one [warn], no crash", async 
     }
 });
 
+test("direct forensic appends are sealed before the next logger line", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-direct-append-"));
+    const file = path.join(dir, "bili.log");
+    configureLogRetention({ segmentBytes: 1 });
+    configureLogger(file);
+    try {
+        log("info", "before-external-append");
+        await settle(file);
+        fs.appendFileSync(file, "external forensic line\n");
+        log("info", "after-external-append");
+        await settle(file);
+        const sealed = logGenerations(file).filter((g) => !g.active).map((g) => fs.readFileSync(g.path, "utf8")).join("");
+        assert.match(sealed, /before-external-append/);
+        assert.match(sealed, /external forensic line/);
+        assert.match(fs.readFileSync(file, "utf8"), /after-external-append/);
+    } finally {
+        closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
+test("retention status reports current active bytes, not an open-time snapshot", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-active-budget-"));
+    const file = path.join(dir, "bili.log");
+    configureLogRetention({ budgetBytes: 1 });
+    configureLogger(file);
+    try {
+        log("info", "active file grew past its one-byte budget after opening");
+        await settle(file);
+        const coverage = logRetentionStatus();
+        assert.equal(coverage?.activeBytes, fs.statSync(file).size);
+        assert.match(coverage?.message ?? "", /active log alone/);
+    } finally {
+        closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
+test("budget reclamation waits for the rotated stream to drain", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-drain-retention-"));
+    const file = path.join(dir, "bili.log");
+    const generation = path.join(dir, "bili.log.archive", "20200101T000000000-1-1", "bili.log");
+    fs.mkdirSync(path.dirname(generation), { recursive: true });
+    fs.writeFileSync(generation, "x".repeat(2 * 1024 * 1024));
+    configureLogger(file);
+    configureLogRetention({ segmentBytes: 10 * 1024 * 1024, budgetBytes: 1024 * 1024 });
+    const originalEnd = fs.WriteStream.prototype.end;
+    let releaseDrain: (() => void) | undefined;
+    try {
+        log("info", "before-rotation");
+        fs.WriteStream.prototype.end = function (this: fs.WriteStream, callback?: () => void) {
+            releaseDrain = callback;
+            return Reflect.apply(originalEnd, this, []);
+        } as typeof originalEnd;
+        configureLogRetention({ segmentBytes: 1, budgetBytes: 1024 * 1024 });
+        log("info", "new-active");
+        assert.ok(fs.existsSync(generation), "reclamation must wait for end() completion");
+        assert.ok(releaseDrain, "the replacement path must subscribe to stream completion");
+        releaseDrain();
+        assert.ok(!fs.existsSync(generation), "the last completed drain releases the pending budget pass");
+    } finally {
+        fs.WriteStream.prototype.end = originalEnd;
+        await closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
 test("internal 10MB rotation: post-rotation line lands in the fresh file", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-"));
     const file = path.join(dir, "bili.log");
@@ -110,8 +185,9 @@ test("internal 10MB rotation: post-rotation line lands in the fresh file", async
         const content = fs.readFileSync(file, "utf8");
         assert.ok(content.includes("post-rotation"), "post-rotation line must land in the fresh file");
         assert.ok(!content.includes("xxx"), "oversized line must have rotated out");
-        const oldSize = fs.statSync(file + ".old").size;
-        assert.ok(oldSize >= 11 * 1024 * 1024, ".old must hold the rotated oversized file");
+        const gens = logGenerations(file).filter((g) => !g.active);
+        assert.equal(gens.length, 1, "the oversized file was sealed into exactly one generation");
+        assert.ok(gens[0]!.sizeBytes >= 11 * 1024 * 1024, "the sealed generation holds the rotated oversized file");
     } finally {
         closeLogger();
         Object.defineProperty(process, "stderr", { value: origStderr, configurable: true });

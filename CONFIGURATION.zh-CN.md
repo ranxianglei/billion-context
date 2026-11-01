@@ -242,6 +242,8 @@
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | 单个 4xx 转储文件的大小上限。 |
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | 调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。 |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | 调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。 |
+| `diagnostics.logRetentionHours` | number | 48（下限 1） | BILI_LOG_RETENTION_HOURS | **私有**运行日志（`bili.log`）目标覆盖的历史小时数。日志器在 10 MiB 处把活动文件封存为**不可变、名字唯一**的一代，取代单个 `bili.log.old`，于是每一代都可枚举、窗口是真实的而不是碰巧的。这是**目标**而非承诺：`diagnostics.logBudgetBytes` 是硬上限且永远优先——更短的窗口会被如实报告，绝不悄悄宣称完整。报告的覆盖是**实测跨度**（最旧保留行 → 现在）：分代文件里没有谱系证据，所以 `continuity` 恒为 `unknown`，任何状态都不宣称窗口未中断（时间戳错序同样不被当作历史缺失）。下限 1 小时；非正数或非数值回落到默认 48 小时；按「env 一旦设置即拥有该开关」的约定，非法的 `BILI_LOG_RETENTION_HOURS` 回落到该默认值而不是本键。 |
+| `diagnostics.logBudgetBytes` | number | 268435456（256 MiB，下限 1 MiB） | BILI_LOG_BUDGET_BYTES | 活动日志 + 全部封存分代的总字节硬预算；超出时按**最旧优先**整代删除——排序按封存时间戳（遗留 `.old` 用自己的 mtime），所以迁移来的历史按其真实年代被回收，而不会被跳过、先去删更新的分代。它约束繁忙机器上的磁盘占用与隐私暴露面。当 `logRetentionHours` 所需的字节超出预算时**预算赢**，且不足会被上报（启动时一行 `[warn]`，以及 `GET /__bili/logs` 里的 `retention` 对象）。活动文件永不删除，所以单个活动文件本身就超过预算时会被报告为超预算，而不是被截断。下限 1 MiB；非正数或非数值回落到默认 256 MiB，且与小时键同理：设置了的 `BILI_LOG_BUDGET_BYTES` 拥有该开关。日志文件仅属主可读：首字节起 0600，归档目录 0700（win32 无 POSIX 权限位，由状态目录 ACL 决定）。 |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | 禁用所有 ACP 标签渲染（原始线路研究模式）。 |
 | `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | 保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。 |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | 停止向请求注入 acp_compress 工具定义。 |
@@ -1857,7 +1859,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LOG_BUDGET_BYTES` | `diagnostics.logBudgetBytes` | 268435456 (256 MiB, floor 1 MiB) |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
+| `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |

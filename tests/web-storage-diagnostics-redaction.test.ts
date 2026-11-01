@@ -58,6 +58,30 @@ function withEnv<T>(home: string | undefined, overrides: Record<string, string |
     }
 }
 
+/** Async sibling for reports that now stream their log tails. */
+async function withEnvAsync<T>(home: string | undefined, overrides: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+    const saved = saveEnv();
+    const savedHome = process.env.HOME;
+    const savedProfile = process.env.USERPROFILE;
+    if (home !== undefined) {
+        process.env.HOME = home;
+        process.env.USERPROFILE = home;
+    }
+    for (const k of ENV_KEYS) {
+        if (overrides[k] !== undefined) process.env[k] = overrides[k];
+        else delete process.env[k];
+    }
+    try {
+        return await fn();
+    } finally {
+        restoreEnv(saved);
+        if (savedHome === undefined) delete process.env.HOME;
+        else process.env.HOME = savedHome;
+        if (savedProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = savedProfile;
+    }
+}
+
 test("#4427 maskPathsForPublish rewrites this machine's $HOME to ~, anchored on both flanks", () => {
     withEnv("/home/alice", {}, () => {
         assert.equal(maskPathsForPublish("/home/alice/.local/share/billion-context/x.db"), "~/.local/share/billion-context/x.db");
@@ -86,7 +110,7 @@ test("#4427 redactForPublish composes secret scrub + host mask + home-path strip
     });
 });
 
-test("#4427 storage-legacy-only blob leaks no credentials, private hosts, or home paths (unconditional)", () => {
+test("#4427 storage-legacy-only blob leaks no credentials, private hosts, or home paths (unconditional)", async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-store-root-"));
     const home = mkdtempSync(path.join(os.tmpdir(), "bili-diag-store-home-"));
     const stateHome = path.join(root, "state");
@@ -102,7 +126,7 @@ test("#4427 storage-legacy-only blob leaks no credentials, private hosts, or hom
     ].join("\n") + "\n");
     const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: path.join(root, "absent.json") };
     try {
-        const rep = withEnv(home, env, () => buildDiagnostics("storage-legacy-only"));
+        const rep = await withEnvAsync(home, env, () => buildDiagnostics("storage-legacy-only"));
         const blob = rep.blob;
 
         assert.ok(blob.includes("--- storage ---"), "storage section present");
@@ -129,7 +153,7 @@ test("#4427 storage-legacy-only blob leaks no credentials, private hosts, or hom
     }
 });
 
-test("#4427 publish redaction holds even when local host-masking is disabled", () => {
+test("#4427 publish redaction holds even when local host-masking is disabled", async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-store-off-"));
     const stateHome = path.join(root, "state");
     mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
@@ -139,7 +163,7 @@ test("#4427 publish redaction holds even when local host-masking is disabled", (
     const prev = isMaskHostsEnabled();
     try {
         setMaskHostsEnabled(false); // operator opted out of LOCAL log host-masking
-        const blob = withEnv(undefined, env, () => buildDiagnostics("storage-legacy-only")).blob;
+        const blob = (await withEnvAsync(undefined, env, () => buildDiagnostics("storage-legacy-only"))).blob;
         assert.ok(!blob.includes("corp-relay.internal.corp"), "private host masked in PUBLISHED blob despite local switch OFF");
         assert.ok(blob.includes("<private-host>"), "masked-host placeholder present under switch-OFF");
     } finally {

@@ -12,7 +12,8 @@ import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { getResolverWedgeState } from "../resolver-wedge.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
-import { log as loggerLog, getLogPath } from "../logger.js";
+import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
@@ -38,12 +39,15 @@ import { handleChangelogGet } from "../web/changelog.js";
 import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
-import { queryLogLines } from "../web/logs-query.js";
+import { queryLogFiles } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
 import { FAVICON_ICO_BASE64 } from "../web/favicon.js";
 import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { readLogFileLines, readLogLines } from "../log-file-lines.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -252,7 +256,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
-    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return await sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     // #4173: compact fold-edge feed for the live tree thumbnail (5s client poll).
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/tree")) return sendWebSessionTree(res, req.url);
@@ -1351,7 +1355,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
 
 /** #3040: generic diagnostics report — copyable blob + prefilled GitHub issue
  *  link. Loopback-gated like every other /__bili/* route; never throws. */
-function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
+async function sendDiagnostics(res: http.ServerResponse, url: string | null): Promise<void> {
     let topic: string | undefined;
     try {
         topic = new URL(url ?? "/__bili/diagnostics", "http://localhost").searchParams.get("topic") ?? undefined;
@@ -1359,7 +1363,7 @@ function sendDiagnostics(res: http.ServerResponse, url: string | null): void {
         topic = undefined;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(buildDiagnostics(topic), null, 2));
+    res.end(JSON.stringify(await buildDiagnostics(topic), null, 2));
 }
 
 /** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
@@ -1407,21 +1411,22 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
     res.end(JSON.stringify(body, null, 2));
 }
 
-/** #1426 web UI run-log viewer: tail of the rotated logger files (bili.log.old
- *  + bili.log), optionally filtered by a case-insensitive substring (?q=).
- *  ?lines= caps the tail at 2000; ?raw=1 streams the same tail as a .txt download. */
+/** #1426 web UI run-log viewer: tail of the retained logger generations (sealed
+ *  history oldest-first, then bili.log), optionally filtered by a
+ *  case-insensitive substring (?q=). ?lines= caps the tail at 2000; ?raw=1
+ *  streams the same tail as a .txt download. */
 async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/logs", "http://localhost");
     const q = (u.searchParams.get("q") ?? "").trim();
     const fullDownload = u.searchParams.get("raw") === "1" && u.searchParams.get("all") === "1";
     let n = Number(u.searchParams.get("lines") ?? "500");
     if (!Number.isFinite(n) || n <= 0) n = 500;
-    // Full download is the forensic escape hatch: ignore `lines`, capped only
-    // by the memory guard below so users can export the whole .old + cur pair.
-    n = fullDownload ? 100_000 : Math.min(Math.floor(n), 2000);
+    // The viewer and filtered download are bounded tails. Full exports stream
+    // every readable retained row below instead of silently applying a tail cap.
+    n = Math.min(Math.floor(n), 2000);
     // Context expansion (ctx=N rows around each hit) and time window (win=Ss
     // around [firstHit, lastHit]) — selection logic lives in web/logs-query.ts
-    // (unit-tested pure function); win wins over ctx when both are given.
+    // (unit-tested streaming selector); win wins over ctx when both are given.
     let ctx = Number(u.searchParams.get("ctx") ?? "0");
     if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
     ctx = Math.min(Math.floor(ctx), 50);
@@ -1429,24 +1434,56 @@ async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage):
     if (!Number.isFinite(win) || win < 0) win = 0;
     win = Math.min(Math.floor(win), 3600);
     const logFile = getLogPath() ?? defaultLogFile();
-    // Cross-platform dir extraction: a naive "/" split yields "" on Windows
-    // paths and the candidates would silently resolve against cwd.
-    const dir = logFile ? path.dirname(logFile) + path.sep : "";
-    const candidates = [dir + "bili.log.old", dir + "bili.log"];
-    const existing = candidates.filter((f) => {
-        try { return fs.statSync(f).isFile(); } catch { return false; }
-    });
-    let all: string[] = [];
-    for (const f of existing) {
-        let text: string;
-        try { text = fs.readFileSync(f, "utf8"); } catch { continue; }
-        all = all.concat(text.split("\n").filter((l) => l.length > 0));
+    // ONE enumeration shared with every other default reader: the active file
+    // plus every immutable sealed generation, oldest first.
+    const existing = logGenerations(logFile).map((g) => g.path);
+    const unreadable: string[] = [];
+    const onReadError = (file: string, error: NodeJS.ErrnoException): void => {
+        unreadable.push(file);
+        process.stderr.write(`[logs] cannot read ${file}: ${error.code ?? error.message}\n`);
+    };
+    if (fullDownload) {
+        // Probe the first complete line before sending headers, using the same
+        // reader and cleanup path. Later rotation/read failures abort the body;
+        // this is a best-effort traversal, never a stable snapshot.
+        const readable: string[] = [];
+        for (const file of existing) {
+            let opened = true;
+            for await (const _line of readLogFileLines(file, {
+                onError: (failed, error) => { opened = false; onReadError(failed, error); },
+            })) break;
+            if (opened) readable.push(file);
+        }
+        res.writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "content-disposition": "attachment; filename=\"billion-context-full-log.txt\"",
+            ...(unreadable.length > 0 ? { "x-bili-log-incomplete": String(unreadable.length) } : {}),
+        });
+        async function* exportedLines(): AsyncGenerator<string> {
+            let first = true;
+            for await (const line of readLogLines(readable)) {
+                yield first ? line : "\n" + line;
+                first = false;
+            }
+        }
+        try {
+            await pipeline(Readable.from(exportedLines(), { objectMode: false }), res);
+        } catch (error) {
+            // pipeline closes the response and source iterator. A failed body
+            // must reject the download, not masquerade as a complete export.
+            process.stderr.write(`[logs] full download interrupted: ${String(error)}\n`);
+            res.destroy();
+        }
+        return;
     }
-    const r = queryLogLines(all, q, { ctx, winSec: win, n });
+    const r = await queryLogFiles(existing, q, { ctx, winSec: win, n }, { onError: onReadError });
     if (u.searchParams.get("raw") === "1") {
         res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
-            "content-disposition": `attachment; filename="${fullDownload ? "billion-context-full-log.txt" : "billion-context-log.txt"}"`,
+            "content-disposition": "attachment; filename=\"billion-context-log.txt\"",
+            // A download cannot carry an inline caveat without corrupting the
+            // data, so an incomplete answer is flagged in the headers instead.
+            ...(unreadable.length > 0 ? { "x-bili-log-incomplete": String(unreadable.length) } : {}),
         });
         res.end(r.lines.join("\n"));
         return;
@@ -1454,11 +1491,18 @@ async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage):
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: logFile,
+        // Honest retention answer: which generations exist, how much history
+        // they really span, and why it is short when it is. Never claims a
+        // 48h window the budget did not keep.
+        retention: logRetentionStatus() ?? null,
         total: r.total,
         shown: r.shown,
         omitted: r.omitted,
         lines: r.lines,
         ...(r.isMatch ? { isMatch: r.isMatch } : {}),
+        // Non-empty means the answer covers only the readable generations; the
+        // client must not present it as the whole retained history.
+        ...(unreadable.length > 0 ? { unreadable } : {}),
     }, null, 2));
 }
 
