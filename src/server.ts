@@ -4566,10 +4566,11 @@ function formatBytes(n: number): string {
 const SLOW_SESSION_MSG_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
+    const outboundBytes = outbound !== undefined ? Buffer.byteLength(outbound) : null;
     // #5460 P1: structured mirror of this line into perf.sqlite (inert unless
     // a DB-backed storage mode armed the module; degrades, never throws).
-    perfRecordRequest({ sessionId, msgs, inboundBytes, outboundBytes: outbound !== undefined ? Buffer.byteLength(outbound) : null, totalMs: ms });
-    const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
+    perfRecordRequest({ sessionId, msgs, inboundBytes, outboundBytes, totalMs: ms });
+    const outboundField = outboundBytes !== null ? `, outbound=${formatBytes(outboundBytes)}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
     // #5408: this line is THE observation point — a hot-at-attach session that
