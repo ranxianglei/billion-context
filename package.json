@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.209",
+  "version": "0.1.210",
   "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -62,7 +62,7 @@
   },
   "dependencies": {
     "mysql2": "^3.15.3",
-    "zod": "4.1.8"
+    "zod": "4.6.7"
   },
   "optionalDependencies": {
     "jimp": "1.6.1"

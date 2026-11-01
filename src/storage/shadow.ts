@@ -808,6 +808,29 @@ export class UnifiedShadow {
         return this.sync.archiveSession(sessionId, opts);
     }
 
+    /** #5312: full transcript id set + block rows for the foreign-block sweep
+     *  (reads degrade like the neighboring sync facades on network backends). */
+    allMessageIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.allMessageIds(sessionId);
+    }
+
+    getBlocks(sessionId: string): ReturnType<import("./store.ts").UnifiedStore["getBlocks"]> {
+        if (this.sync === null) return [];
+        return this.sync.getBlocks(sessionId);
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block archive unavailable" };
+        return this.sync.archiveBlock(sessionId, blockId, opts);
+    }
+
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block restore unavailable" };
+        return this.sync.restoreBlock(sessionId, blockId, opts);
+    }
+
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);
@@ -831,9 +854,9 @@ export class UnifiedShadow {
         return this.sync.activeForeignWriter();
     }
 
-    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] {
         if (this.sync === null) return [];
-        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
@@ -1201,8 +1224,8 @@ export class UnifiedShadow {
         return this.viaAsync({ ok: false, reason: "async backend" }, () => this.restoreArchived(sessionId, opts), () => this.enqueue(() => this.backend!.restoreArchived(sessionId, opts)));
     }
 
-    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string }[]> {
-        return this.viaAsync([], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content })));
+    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string; ts: number | null }[]> {
+        return this.viaAsync([] as { seq: number; content: string; ts: number | null }[], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null })));
     }
 
     tailSeqsAsync(sessionId: string): Promise<number[] | null> {

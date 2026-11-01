@@ -6,16 +6,17 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
-import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
+import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
+import { getResolverWedgeState } from "../resolver-wedge.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
-import { defaultLogFile } from "../paths.js";
+import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
@@ -26,13 +27,13 @@ import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-not
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
-import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
 import { pckAblations } from "../pck-probe.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePackTemplatesGet, handlePricingGet, handleUserPackDelete, handleUserPackGet, handleUserPackPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
 import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
@@ -235,6 +236,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
+    // #5146: per-host upstream health (alerts + open circuits) for DSH's frame-level
+    // banner — loopback-gated like every other /__bili/* route above. The DSH
+    // renderer polls this CROSS-ORIGIN from its own web port, so echo the
+    // requesting origin as ACAO exactly like the /__bili/ shell and
+    // /__bili/plugin/status do: only origins the trusted-origin gate admitted
+    // reach this line, and the payload is a bounded in-memory snapshot.
+    if (req.method === "GET" && req.url === "/__bili/upstreams") {
+        const reqOrigin = req.headers.origin;
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (typeof reqOrigin === "string" && reqOrigin.length > 0) headers["access-control-allow-origin"] = reqOrigin;
+        res.writeHead(200, headers);
+        res.end(JSON.stringify(getUpstreamHealthReport()));
+        return;
+    }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
@@ -335,6 +350,29 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #4899: pricing editor data — resolved per-model prices (user overrides >
     // models.dev snapshot) for the panel's billing settings card. Read-only.
     if (req.method === "GET" && req.url === "/__bili/pricing") return handlePricingGet(res);
+    // #5319 (web half): resolved prompt-pack inventory for the panel picker —
+    // the project > user > shipped > builtin chain, first-wins per name.
+    // Read-only; every /__bili/ URL already passed the loopback/origin gates.
+    if (req.method === "GET" && req.url === "/__bili/packs") {
+        const packs = listResolvedPacks()
+            .map((p) => ({ name: p.name, version: p.version ?? null, description: p.description ?? null, source: p.source }));
+        // #5328: the panel needs the user-pack dir to decide which listed
+        // entries it may edit/delete; the server is the authority on it.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ packs, userDir: path.join(configDir(), "packs") }));
+        return;
+    }
+    // #5344: base texts for the guided pack-editor form (tri-state resolved
+    // exactly like buildCompressSystemPrompt). Read-only; same gates.
+    if (req.method === "GET" && req.url === "/__bili/packs/templates") return handlePackTemplatesGet(res);
+    // #5328: user-dir pack management — GET/PUT/DELETE <configDir>/packs/
+    // <name>.json. The route regex shapes the name to the pack-name charset
+    // ([A-Za-z0-9][A-Za-z0-9._-]*) before dispatch; the handlers re-validate
+    // with isValidPackName. Everything else under /__bili/ is untouched.
+    const mUserPack = /^\/__bili\/packs\/user\/([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(req.url ?? "");
+    if (mUserPack !== null && req.method === "GET") return handleUserPackGet(res, mUserPack[1]);
+    if (mUserPack !== null && req.method === "PUT") return handleUserPackPut(req, res, mUserPack[1]);
+    if (mUserPack !== null && req.method === "DELETE") return handleUserPackDelete(res, mUserPack[1]);
     // #3719: per-release notes for the panel's changelog section — same
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
@@ -1239,7 +1277,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -1295,6 +1333,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),
+        resolverWedge: getResolverWedgeState(),
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),

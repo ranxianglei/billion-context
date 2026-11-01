@@ -181,7 +181,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `guardrails` | object | {} (all defaults) | — | Guardrails: tool-output guardrails for the pi/omp plugin bundles (#3066) plus the proxy-side text-run stream guard (#3406). |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default). |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output. |
-| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it. |
+| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). false / env 0 disables it. |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
@@ -282,6 +282,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
+| `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly. |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
@@ -1491,7 +1492,25 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `string` (pack name, e.g. `"lean"`)
 - **Default:** `default` *(unset is equivalent — identity surface, kernel defaults everywhere)*
 - **Status:** ACTIVE
-- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the kernel's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66.
+- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the host's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **shipped** (`chat`) → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Built-in `chat` (#5319) rewrites only the compress philosophy and how-to-compress prose for long-term companionship / multi-session memory use; every other surface piece stays at the host defaults, and a same-name user or project file overrides it. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; pack-surface sections (tool/section overrides) apply directly, without the `acknowledgePromptsRisk` gate — that gate governs only inline `compress.prompts` rule-text overrides. Note a pack's `prompts` block is ignored by this proxy: rule-text overrides are possible only via inline `compress.prompts`. Requires `acp-kernel` >= 0.0.66. The settings panel can manage the user-dir files directly — New/Edit/Delete for packs under `<configDir>/packs/` (the picker knows each entry's provenance; builtins and shipped packs stay read-only there, override them with a same-named user pack instead). The Edit dialog has three tabs (#5344): **Guided form** — per-field help text plus one-click base text loaded from `default`/`chat`/`lean` (empty fields are omitted and fall back to system defaults at runtime); **AI assist** — describe your scenario in plain words, copy the generated prompt to any LLM, paste its JSON back and it parses straight into the form; **Advanced (JSON)** — raw file text for full control.
+
+**Pack file format.** Each `<dir>/<name>.json` holds one pack object. Unknown fields are dropped by the same sanitizer used on every load path (`sanitizePackSurface`), so extra metadata is harmless:
+
+```json
+{
+  "name": "my-pack",          // optional — defaults to the file name without .json
+  "version": "1.0.0",         // optional — shown by `bili pack list` and the panel
+  "description": "…",         // optional
+  "promptSections": {
+    "philosophy": "…",        // replace a whole system-prompt section; JSON null keeps the default
+    "howToCompress": "…"      // start from the tuned texts in src/chat-pack.ts
+  }
+}
+```
+
+Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`, `toolPrompts`, and `adapters` (host-specific extras, e.g. `"pi": { "promptSections": { … } }`). At least one recognized field must survive sanitizing or the file is refused when written.
+
+**Installing other people's packs.** Any npm package whose root contains a `bili-pack.json` (the pack object above) is installable: `bili pack install <pkg>` — also accepts `name@version`, scoped names, git URLs and `.tgz` paths (it delegates to your local `npm`, so registry auth behaves normally). Files land in `<configDir>/packs/` by default (`--project` targets `./.billion-context/packs/`; `--force` replaces an existing pack instead of refusing). Afterwards manage them from the settings panel, or via `bili pack remove <name>` / `bili pack list`.
 
 #### `reconcile`
 
@@ -1621,6 +1640,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Since #913, `false` also drops the #862 silence clause from the marker-integrity note appended to nudges and the injected compress prompt — an invisible deployment has no marker for the model to imitate or narrate around, so the clause is pure noise there. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
+
+#### `messageTimestamps`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Message timestamps (#4313, PR #5236; ON by default since the leak-audit follow-up): bili mints each message one immutable local-time stamp at first sight and renders it — a `time="yyyy-MM-dd HH:mm:ss"` attribute on every `<acp>` compression tag on the wire, a `[start – end]` coverage span appended to each compress-receipt fingerprint line, and an Occurred line in rendered block summaries. Cost is about 8 tokens per message when visible. Stamps are deterministic render inputs (rendered from stored values, never wall clock), so re-rendered history stays byte-stable turn over turn; live-session audits showed identical prompt-cache hit rates with the flag on vs off. Set `false` to reproduce the pre-#4313 bytes exactly (no time attribute, original prompt texts, no fingerprint span). Storage records the stamps either way, so opting in later surfaces full history without data loss. The first restart after which the flag resolves true pays one frozen-prefix cache rewrite per active session. Resolution is env (`BILI_MESSAGE_TIMESTAMPS`; `0` forces off, any other value forces on, same convention as BILI_RESIGN) over the config file, resolved once per proxy instance — changing the flag needs a restart.
 
 ### Injection toggles (global only)
 
@@ -1848,6 +1874,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |

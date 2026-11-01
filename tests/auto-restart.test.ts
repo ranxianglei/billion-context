@@ -174,8 +174,11 @@ function makeReadyStub(name: string): string {
         "if (!Number.isFinite(port)) process.exit(64);",
         // #3182: a stolen port must be distinguishable from a product
         // failure — exit 91 lets the retry wrapper below re-run the scenario.
+        // EACCES/EPERM = the OS refused the bind outright (Windows dynamic
+        // exclusion ranges on shared runners) — same "port unusable" class,
+        // not a product failure.
         "const srv = http.createServer((_req, res) => res.end('ok'));",
-        "srv.on('error', (e) => process.exit(e && e.code === 'EADDRINUSE' ? 91 : 1));",
+        "srv.on('error', (e) => process.exit(e && ['EADDRINUSE', 'EACCES', 'EPERM'].includes(e.code) ? 91 : 1));",
         "srv.listen(port, '127.0.0.1');",
     ].join("\n"));
     return p;
