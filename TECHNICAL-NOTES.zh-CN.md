@@ -131,7 +131,7 @@ dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求
 
 pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。
 
-## 插件车道全量重发水位线(#5420)
+## 插件车道全量重发水位线(#5418)
 
 **问题。** dsh 插件车道每个模型请求都全量重发整个会话 body(约 81 MiB,随历史折叠涨到数百 MB)。bili 的请求路径对该整段 body 做 `JSON.parse` 成 AST(`src/server/handle.ts`),然后 `openaiToCore` 遍历全部约 2 万条消息逐条复核身份后再折叠。两个生产者喂出用户侧 6× OOM(#5403):(1) 每轮全量解析的峰值(AST ≈ body 体积的 3–4×);(2) 跨轮 AST 钉扎(`snapshotMessages` 把解析后的 body 钉进 `session.lastMessages`,只有经 `foldResidentTail` 才释放,而它需要一份持久化证明,在 evict/冷重载抖动 + Windows EPERM 下会卡住)。本节覆盖移除这两个生产者的机制;**它不减少传输量**(重发的字节仍过线 —— 那个终态活归增量车道,#3248)。
 

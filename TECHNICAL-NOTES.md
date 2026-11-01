@@ -528,7 +528,7 @@ Behavior change (disclosed): old = unconditional "already at its minimum" on off
 
 Tests: `tests/issue4331-uncovered-history.test.ts` (hole session → honest verdict + named span; drained session → verbatim contract string; sub-floor silence; tier precedence; **tier-2 distillation coverage pin** — three T1s distilled into one T2 parent via the real host path must not leak child spans into the audit; both acp_status directions; formatter caps) + `tests/compress-success-tail.test.ts` UNCHANGED from master (its < 10K-residue fixtures pin the floor), `tests/issue2029-status-baseline-provenance.test.ts` (every status-reader kernel call feeds the provenance baseline), `tests/issue847-compress-failure-guards.test.ts` (sub-gate residue visible in the diagnostic, still never offered).
 
-## Plugin-lane full-resend watermark (#5420)
+## Plugin-lane full-resend watermark (#5418)
 
 **Problem.** On the dsh plugin lane every model request re-sends the ENTIRE conversation body (~81 MiB growing to hundreds of MB as history folds). bili's request path does `JSON.parse` of that whole body into an AST (`src/server/handle.ts`), then `openaiToCore` walks all ~20k messages to reconcile per-message identity before folding. Two producers feed the user-side 6× OOM (#5403): (1) the per-round full-parse PEAK (AST ≈ 3–4× body size), and (2) the cross-round AST PINNING (`snapshotMessages` pins the parsed body into `session.lastMessages`, released only via `foldResidentTail` which needs a durability proof that stalls under evict/cold-reload churn + Windows EPERM). This note covers the mechanism that removes both producers; it does NOT reduce transport size (the resent bytes still cross the wire — that terminal job belongs to the incremental lane, #3248).
 

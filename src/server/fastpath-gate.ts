@@ -1,5 +1,5 @@
 /**
- * #5420 — the full-resend watermark gate: a PURE decision over its inputs.
+ * #5418 — the full-resend watermark gate: a PURE decision over its inputs.
  *
  * The design replaces per-message identity re-reconciliation with a count
  * assertion and, on a match, parses only the uncovered tail window instead of

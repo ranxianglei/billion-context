@@ -1,10 +1,10 @@
 /**
- * #5420 — offset-only depth scan of a raw JSON body string.
+ * #5418 — offset-only depth scan of a raw JSON body string.
  *
  * The plugin-lane full-resend OOM producer (#5403) is the per-round full
  * `JSON.parse` of an 81 MiB body: one pass that allocates a hundreds-of-MB AST
  * which then rides resident in `session.lastMessages`. The watermark design
- * (issue #5420) replaces the per-message re-reconciliation with a count
+ * (issue #5418) replaces the per-message re-reconciliation with a count
  * assertion and, on a match, parses ONLY the uncovered tail window. This module
  * is the primitive that makes "parse only the tail" possible WITHOUT first
  * parsing the whole body: it walks the raw string once, records where the

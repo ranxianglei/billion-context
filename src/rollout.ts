@@ -86,7 +86,7 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
-    // #5420 plugin-lane full-resend watermark: a dsh chat-completions request that
+    // #5418 plugin-lane full-resend watermark: a dsh chat-completions request that
     // echoes a valid count watermark (`x-bili-pf-count`) matching the server's
     // stored authority skips the per-round full JSON.parse of the whole resent
     // body and parses only the uncovered tail window (src/server/fastpath-scan.ts),
