@@ -50,7 +50,7 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
 
 /** Decide this process's native posture (#886/#983 mechanism, ported to the pi
  *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > explicit
- *  inline > attach > spawn (DEFAULT). A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
+ *  inline > attach > inline (DEFAULT since #5428) > spawn. A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
  *  stand-down: the pseudo-attach hole (preset env + bare pi) used to disarm
  *  routing entirely while tools still found the proxy through the env — model
  *  traffic went direct and uncompressed, the proxy never saw the session, and
