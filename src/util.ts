@@ -527,18 +527,30 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     };
 }
 
-// #4452: an intermediate gateway that rewrites EVERY rejection into one generic
-// body (Cherry Studio et al. strip the token counts / window from each overflow
-// 400) makes inspectContextOverflow return isOverflow:false even when the payload
-// really overflows — so bili's whole overflow self-heal (#1195 same-request
-// refold, armOverflowShrink, window learn) keys off a marker that is never there
-// and silently never engages, starving the route of calibration. This predicate
-// names exactly that shape — a 4xx overflow-SHAPED reject whose body matches no
-// pattern — so the relay can log it loudly instead of the opaque `← upstream 400`
-// line. Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
+// #4452: an intermediate gateway that rewrites a payload-size rejection into one
+// generic body (Cherry Studio et al. strip the token counts / window) makes
+// inspectContextOverflow return isOverflow:false even when the payload really
+// was too large — so bili's whole overflow self-heal (#1195 same-request refold,
+// armOverflowShrink, window learn) keys off a marker that is never there and
+// silently never engages, starving the route of calibration. This predicate
+// names exactly that shape — an unmarked size-wall reject whose body matches no
+// pattern — so the relay can log it loudly instead of the opaque
+// `← upstream 413` line.
+//
+// ONLY 413 carries that meaning on its own. A 400 is the generic "malformed /
+// schema-invalid / role-rejected / auth-shaped" bucket across relays: the SAME
+// opaque body (`{"error":{"message":"Internal server error",
+// "code":"bad_request"}}`) is emitted for a truncated JSON body, an unsupported
+// field and a genuinely oversized payload alike, so treating every unmarked 400
+// as evidence of overflow manufactured a false overflow diagnosis for ordinary
+// malformed requests (#4452 follow-up). 413 Request Entity Too Large is the
+// status whose SEMANTICS are already the payload-size verdict, which is why it
+// can be diagnosed without a body marker.
+//
+// Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
 // #604) and any body that DOES carry a marker (self-heal engages normally then).
 export function isMarkerlessOverflowReject(status: number, bodyText: string): boolean {
-    return (status === 400 || status === 413) && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
+    return status === 413 && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the

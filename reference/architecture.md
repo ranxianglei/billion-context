@@ -28,6 +28,7 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── rejection-diagnostics.ts #   Bounded terminal provider cause from direct or nested aggregate rejections
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)

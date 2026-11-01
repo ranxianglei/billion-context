@@ -66,6 +66,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
+import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
@@ -1558,14 +1559,18 @@ async function forwardCaptured(
                 }
                 log("warn", `[${s.id}] upstream image-count wall (cap ${info.imageCountCap}, request carried ${info.imageCountSeen ?? "?"}) — learned for pre-send convergence on this route; no token-space arm (#4124)`);
             } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
-                // #4452: the gateway rewrote this overflow-shaped reject into a body with no
-                // parseable marker, so bili's self-heal cannot engage from it — name that here
-                // (+ the last meter reading) so a body-rewriting gateway's silent starvation is
-                // diagnosable from the log rather than the opaque line further down.
+                // #4452: a 413 IS the payload-size verdict, yet this body carries no
+                // parseable marker, so bili's self-heal cannot engage from it — name that
+                // here (+ the last meter reading) so a body-rewriting gateway's silent
+                // starvation is diagnosable from the log rather than the opaque line
+                // further down. Only 413 reaches this branch: an unmarked 400 is the
+                // generic malformed/schema-rejected bucket across relays and says nothing
+                // about size, so it is never diagnosed as overflow here (see
+                // isMarkerlessOverflowReject).
                 const est = s.stats.lastInputTokens > 0 ? s.stats.lastInputTokens : 0;
                 const win = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
                 const meterNote = est > 0 && win > 0 ? `; last settled input ~${Math.round(est)} vs effective window ${win}` : "";
-                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
+                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the payload-size rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -1601,7 +1606,15 @@ async function forwardCaptured(
         let snippet = bodyText.slice(0, 600).replace(/\s+/g, " ").trim();
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
-        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4452: a relay that fans out to several targets answers a total failure
+        // with ONE aggregate body whose real cause sits in the LAST attempt's
+        // `details.error.message` — past the 600-byte snippet above, so the log
+        // showed only "all targets failed". Append that single terminal cause
+        // (bounded + credential-scrubbed by the helper; empty when absent, leaving
+        // this line byte-identical to before). Read-only: no recovery decision
+        // here depends on it.
+        const terminalCause = rejectionDiagnosticSuffix(bodyText);
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
         // #4204: feed the egress throttle governor with this send's FINAL verdict
         // (one observation per request — in-request refolds/resends above all
         // converge into this same response handling). A 429 arms/extends the
