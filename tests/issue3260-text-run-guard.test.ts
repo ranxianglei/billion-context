@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
     createRunawayGuard,
     wrapStreamWithRunawayGuard,
+    textRunTripHint,
     TEXT_RUN_THRESHOLD,
     type RunawayVerdict,
 } from "../src/runaway-guard.ts";
@@ -407,4 +408,62 @@ test("knob: threshold 0 disables ONLY the text-run lane — acp-tag flood still 
         assert.equal(verdicts.length, 1);
         assert.equal(verdicts[0].reason, "acp-enumeration", "disabling the text-run lane must not disarm the other lanes");
     });
+});
+
+test("#5036: detail.textRunThreshold reports the enforced threshold (default 200)", () => {
+    const saved = process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    delete process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    try {
+        const g = createRunawayGuard();
+        const v = g.feedText("=".repeat(TEXT_RUN_THRESHOLD));
+        assert.equal(v.tripped, true);
+        assert.equal(v.reason, "text-run");
+        assert.equal(v.detail?.textRunThreshold, TEXT_RUN_THRESHOLD);
+    } finally {
+        if (saved !== undefined) process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD = saved;
+    }
+});
+
+test("#5036: detail.textRunThreshold follows the knob (env tier 1000)", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        const g = createRunawayGuard();
+        const v = g.feedText("=".repeat(1000));
+        assert.equal(v.tripped, true);
+        assert.equal(v.detail?.textRunThreshold, 1000);
+    });
+});
+
+test("#5036: detail.textRunThreshold present on near-miss (non-trip) results too", () => {
+    const saved = process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    delete process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    try {
+        const g = createRunawayGuard();
+        const v = g.feedText("z".repeat(180));
+        assert.equal(v.tripped, false);
+        assert.equal(v.detail?.textRunThreshold, TEXT_RUN_THRESHOLD);
+    } finally {
+        if (saved !== undefined) process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD = saved;
+    }
+});
+
+test("#5036: textRunTripHint names the knob + env + enforced value for a text-run trip", () => {
+    const saved = process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    delete process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    try {
+        const g = createRunawayGuard();
+        const v = g.feedText("=".repeat(TEXT_RUN_THRESHOLD));
+        const hint = textRunTripHint(v);
+        assert.ok(hint.includes("guardrails.textRunThreshold"), hint);
+        assert.ok(hint.includes("BILI_GUARDRAIL_TEXT_RUN_THRESHOLD"), hint);
+        assert.ok(hint.includes(String(TEXT_RUN_THRESHOLD)), hint);
+        assert.ok(hint.includes("0 disables"), hint);
+    } finally {
+        if (saved !== undefined) process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD = saved;
+    }
+});
+
+test("#5036: textRunTripHint is empty for the other two lanes (no user-facing knob)", () => {
+    const base = { acpTags: 0, toolXmlFragments: 0, toolXmlGapBytes: 0, maxMonotonicRefRun: 0, zeroTokenFraction: 0, maxTextRun: 0 };
+    assert.equal(textRunTripHint({ tripped: true, reason: "acp-enumeration", detail: base }), "");
+    assert.equal(textRunTripHint({ tripped: true, reason: "tool-xml-flood", detail: base }), "");
 });
