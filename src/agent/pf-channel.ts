@@ -18,11 +18,22 @@
 // x-bili-pf-tail-ids = percent-encoded "[id(K-1)] + new element ids" joined
 // with LITERAL commas (commas INSIDE ids travel %2C — unambiguous). A captured
 // list missing or shorter than K degrades to count-only: never partial.
-
+//
+// Owner ruling 2026-11-02 (m02989): hosts compress and REWRITE their histories,
+// so all-or-nothing alignment proofs against the wire fight reality and kill
+// the channel (a single compacted summary entry used to poison every later
+// turn). The identity ladder does not need the proofs: msgids are unique
+// forever (kernel contract), ORDER binds them to positions inside the
+// verified delta window, and the byte-level head check remains the boundary
+// truth. Capture therefore screens SLOTS, not the list as a whole — an
+// id-bearing element travels with its id, an id-less one (native-compaction
+// summaries, personas) rides the UNIDENTIFIED placeholder below; nothing is
+// ever dropped from or re-ordered inside the captured span.
 const COUNT_HEADER = "x-bili-pf-count";
 const TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 const CONVERSATION_HEADER = "x-bili-plugin-conversation";
 const SEQ_HEADER = "x-bili-pf-seq";
+export const PF_SLOT_UNKNOWN = "?";
 
 const MAX_ID_LEN = 512;
 const RESERVED_PREFIX = "acp_summary_";
@@ -65,12 +76,13 @@ export function pfLearnStamp(headersIn: Record<string, string>, respStatus: numb
 /** Thin capture adapter contract (called ONCE PER outbound model request,
  *  before the send, by whatever event gives that client access to its
  *  message list — dsh llm/stream scope, pi/omp before_provider_request,
- *  opencode messages.transform): store the ALL-OR-NOTHING id list for THIS
- *  turn's wire elements. A FAILED resolution (null/undefined/malformed)
- *  CLEARS the stored list for the session: a stale list from an earlier turn
- *  sliced at today's K could slip past the anchor check and surface as a
- *  length fault — honest absence (count-only) is always preferred.
- *  Any failed screen drops the WHOLE list: never partial onto the wire. */
+ *  opencode messages.transform): store the per-slot id sequence for THIS
+ *  turn's wire elements, position-indexed exactly as the host gave it.
+ *
+ *  Per-slot discipline (owner 2026-11-02): format-invalid entries become the
+ *  UNIDENTIFIED placeholder — they NEVER poison neighbouring slots anymore.
+ *  A whole failed resolution (null/undefined/non-array) still clears the
+ *  stored list: honest absence beats a stale, mis-positioned one. */
 export function pfCaptureIds(sid: string, ids: unknown): void {
     if (sid.length === 0) return;
     const slot = takeSlot(sid);
@@ -79,28 +91,22 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
         return;
     }
     const seen = new Set<string>();
+    let known = 0;
     const out: string[] = [];
     for (const v of ids) {
-        if (typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN) {
-            delete slot.ids;
-            return;
-        }
-        if (v.startsWith(RESERVED_PREFIX)) {
-            delete slot.ids;
-            return;
-        }
-        if (BAD_ID_CHARS.test(v)) {
-            delete slot.ids;
-            return;
-        }
-        if (seen.has(v)) {
-            delete slot.ids;
-            return;
+        if (
+            typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN ||
+            v.startsWith(RESERVED_PREFIX) || BAD_ID_CHARS.test(v) || seen.has(v)
+        ) {
+            out.push(PF_SLOT_UNKNOWN); // id-less slot (summary/persona/foreign shape) — travel as unknown
+            continue;
         }
         seen.add(v);
+        known++;
         out.push(v);
     }
-    slot.ids = out;
+    // Nothing identifiable in the whole span ⇒ count-only beats noise.
+    slot.ids = known > 0 ? out : undefined;
 }
 
 /** Chokepoint emit (native-intercept routed-send site): the handshake headers

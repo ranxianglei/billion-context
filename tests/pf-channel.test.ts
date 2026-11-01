@@ -43,16 +43,36 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2" });
 });
 
-test("pf-channel: failed capture CLEARS the stored list (no stale slice)", () => {
+test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
     const sid = "sid-clear-1";
     const inH = { [CONVO]: sid };
     learn(inH, "2");
     pfChannel.pfCaptureIds(sid, ["a", "b"]);
     assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "b");
-    for (const bad of [null, undefined, "not-an-array", [], 42, ["ok", 7], ["ok", ""], ["acp_summary_x", "y"], ["a b", "c"], ["c", "c"], ["z".repeat(513), "w"]]) {
+    for (const bad of [null, undefined, "not-an-array", [], 42, Array.from({ length: 2049 }, (_, i) => `m${i}`)]) {
         pfChannel.pfCaptureIds(sid, bad);
         assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" }, `bad=${String(bad)} must clear`);
     }
+});
+
+test("pf-channel: bad SLOTS ride '?' — one id-less element never poisons the list (owner 2026-11-02)", () => {
+    const sid = "sid-slots-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "2"); // K=2 ⇒ this turn's wire carries slots[1..]
+    for (const row of [
+        [["ok", 7], "%3F"],
+        [["ok", ""], "%3F"],
+        [["acp_summary_x", "y"], "y"],
+        [["a b", "c"], "c"],
+        [["c", "c"], "%3F"], // duplicate real id collapses its repeat to unknown
+        [["z".repeat(513), "w"], "w"],
+    ] as const) {
+        pfChannel.pfCaptureIds(sid, [...row[0]]);
+        assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], row[1], `slots=${JSON.stringify(row[0])}`);
+    }
+    // an ALL-unknown span degrades back to pure count mode (noise beats signal)
+    pfChannel.pfCaptureIds(sid, ["", 7]);
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
 });
 
 test("pf-channel: stamp learning screens input", () => {

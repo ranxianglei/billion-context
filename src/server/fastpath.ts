@@ -44,6 +44,10 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
+// #5418 v3: UNIDENTIFIED slot marker — an element that carries no host id
+// (native-compaction summary, persona sidecar, foreign shape) travels as "?".
+// Wire literal duplicated per #3482 (agent bundles stay import-free leaves).
+export const PF_SLOT_UNKNOWN = "?";
 const HEAD_CHECK_ELEMENTS = 8;
 const PF_BREAKER_MISSES = 5;
 const PF_DISABLED_TTL_MS = 60 * 60 * 1000;
@@ -137,8 +141,13 @@ function parseTailIds(raw: string): string[] | null {
         try { id = decodeURIComponent(seg); } catch { return null; }
         if (id.length === 0 || id.length > 512) return null;
         if (/[\s\p{C}]/u.test(id)) return null;
-        if (seen.has(id)) return null;
-        seen.add(id);
+        // #5418 v3 (owner ruling): "?" repeats are EXPECTED — hosts compress/
+        // rewrite histories and those elements carry no host id. REAL ids
+        // stay uniqueness-screened.
+        if (id !== PF_SLOT_UNKNOWN) {
+            if (seen.has(id)) return null;
+            seen.add(id);
+        }
         ids.push(id);
     }
     return ids;
@@ -234,21 +243,26 @@ export function evaluateWatermarkFastpath(
     if (seed !== undefined && seed.stampT === stamped && seed.model === input.model) {
         // --- hit candidate: verify head + decode window ---------------------
         const K = stamped;
-        // #5418 v2 (owner identity ladder msgid>顺序>#11): when OUR shim is in
-        // the loop it ships the host's own message ids alongside the stamp —
-        // element [K-1] plus every NEW element, "几个不是几十个". Shape/dup
-        // faults mark a shim<->proxy desync (CREDITED toward the breaker);
-        // a prevId mismatch marks a legit in-place rewrite of the anchor
-        // (uncredited — the legacy reseed re-baselines the next turn).
-        // Absent header = pure count mode (every pre-v2 behavior unchanged).
+        // #5418 v3 (owner ruling 2026-11-02): hosts compress/rewrite, so no
+        // alignment proof may gate this channel — msgids are unique forever,
+        // ORDER binds them inside the verified delta, and the byte-level head
+        // check below stays the boundary truth. A "?" slot rides an id-less
+        // element; a "?" anchor merely means identity-unverified (no penalty).
+        // Shape faults are shim/proxy drift — SILENTLY uncredited, never
+        // toward the breaker (the legacy path + restamp self-heal). Absent
+        // header = pure count mode (every pre-v2 behavior unchanged).
         const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
         let tailIds: string[] | undefined;
         if (rawTailIds !== undefined) {
             const parsed = typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
-            if (parsed === null || parsed.length !== T - K + 1) return miss("tail-ids-shape", true);
+            if (parsed === null || parsed.length !== T - K + 1) return miss("tail-ids-shape", false);
             tailIds = parsed;
-            const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
-            if (prevKnown !== undefined && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false);
+            if (tailIds[0] !== PF_SLOT_UNKNOWN) {
+                const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
+                // "?" on EITHER side = no identity claim — no penalty; the
+                // byte-level head checks below remain the boundary truth
+                if (prevKnown !== undefined && prevKnown !== PF_SLOT_UNKNOWN && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false);
+            }
         }
         if (seed.multimodal) return miss("seeded-multimodal", false, tailIds);
         const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);

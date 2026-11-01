@@ -1199,6 +1199,24 @@ function hostMsgIdsOf(messages: unknown): string[] | undefined {
     return ids;
 }
 
+/** #5418 v3 watermark-capture variant of hostMsgIdsOf: per-slot instead of
+ *  all-or-nothing. Hosts compress/rewrite histories, so one id-less element
+ *  (native-compaction summary, persona sidecar) must NOT poison its
+ *  neighbours' ids — unknown slots ride the "?" placeholder and stay in
+ *  position (order is the binding carrier, #11). */
+function pfSlotIdsOf(messages: unknown): string[] | undefined {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const out: string[] = [];
+    for (const m of messages) {
+        let id: unknown = m === null || typeof m !== "object" ? undefined : (m as { id?: unknown }).id;
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /\s\p{C}/u.test(id)) {
+            id = undefined;
+        }
+        out.push(typeof id === "string" ? id : pfChannel.PF_SLOT_UNKNOWN);
+    }
+    return out;
+}
+
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the
@@ -1925,11 +1943,13 @@ export function apply(ctx: PluginContext): void {
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
                 const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
-                // #5403/#5418: feed the SAME id list into the watermark channel
-                // (the fetch chokepoint emits count + tail-ids; core =
-                // pf-channel.ts). A failed resolution (undefined) CLEARS the
-                // stored list like every other adapter — never ride a stale one.
-                pfChannel.pfCaptureIds(sid, scope.msgIds);
+                // #5403/#5418 v3: feed the per-slot id sequence into the
+                // watermark channel (the fetch chokepoint emits count +
+                // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
+                // elements without poisoning the rest. A failed resolution
+                // (no usable message list at all) CLEARS like every other
+                // adapter — never ride a stale one.
+                pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance — the
                 // run() below covers the former, wrapScopedIterable the latter.

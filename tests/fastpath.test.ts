@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
@@ -220,7 +220,7 @@ test("tail-ids: prevId chain rides consecutive hits; a broken anchor is uncredit
     assert.equal(h5.out.decision, "hit", LOGS.join("\n"));
 });
 
-test("tail-ids: wrong length / duplicate / bad segment are CREDITED shape faults", () => {
+test("tail-ids: wrong length / duplicate / bad segment are UNcredited shape faults (silent degrade)", () => {
     makeStubStore();
     const session = freshSession("pf-tailbad");
     const b1 = bodyOf([SYS("s"), USR("a")]);
@@ -230,18 +230,47 @@ test("tail-ids: wrong length / duplicate / bad segment are CREDITED shape faults
     const g = (n: number): string => bodyOf([SYS("s"), USR("a"), ...Array.from({ length: n }, (_, j) => USR(`g${j}`))]);
     const shortList = runTurn(session, { [PF_COUNT_HEADER]: "2", ...TAIL(["only-prev"]) }, g(1));
     assert.equal(shortList.out.decision, "tail-ids-shape", LOGS.join("\n"));
-    assert.equal(shortList.out.creditedMiss, true);
-    assert.ok((watermarkDebugState(session).missCount ?? 0) >= 1);
+    assert.equal(shortList.out.creditedMiss, false);
     const dup = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["x", "x", "x"]) }, g(2));
     assert.equal(dup.out.decision, "tail-ids-shape");
-    assert.equal(dup.out.creditedMiss, true);
+    assert.equal(dup.out.creditedMiss, false);
     const badseg = runTurn(session, { [PF_COUNT_HEADER]: "4", ...{ [PF_TAIL_IDS_HEADER]: "x%zz,x%zz" } }, g(3));
     assert.equal(badseg.out.decision, "tail-ids-shape");
-    assert.equal(badseg.out.creditedMiss, true);
-    // five consecutive verified misses arm the breaker; held turns still restamp
-    let heldDecision = "";
-    for (let i = 4; i <= 7; i++) heldDecision = runTurn(session, { [PF_COUNT_HEADER]: String(i + 1), ...TAIL(["q", "q", "q"]) }, g(i)).out.decision;
-    assert.equal(heldDecision, "breaker-armed", LOGS.join("\n"));
+    assert.equal(badseg.out.creditedMiss, false);
+    // owner ruling 2026-11-02: shape faults are shim/proxy drift, not a lying
+    // client — five consecutive faults must NOT arm the breaker, nothing is
+    // credited (the legacy path + restamp self-heal).
+    let faultDecision = "";
+    for (let i = 4; i <= 7; i++) faultDecision = runTurn(session, { [PF_COUNT_HEADER]: String(i + 1), ...TAIL(["q", "q", "q"]) }, g(i)).out.decision;
+    assert.equal(faultDecision, "tail-ids-shape", LOGS.join("\n"));
+    assert.equal(watermarkDebugState(session).missCount ?? 0, 0);
+}
+);
+
+test("tail-ids: '?' unknown slots ride without penalty (owner 2026-11-02)", () => {
+    makeStubStore();
+    const session = freshSession("pf-slotunk");
+    const U = PF_SLOT_UNKNOWN; // "?" — TAIL() percent-encodes it (%3F on the wire), decode restores
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    assert.equal(runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, b2).out.decision, "hit", LOGS.join("\n"));
+    // unknown anchor = NO identity claim, NOT a fault: the stored prevId
+    // ("h-c") cannot be verified against "?", so the byte-level head check
+    // alone decides — matching prefix still HITS
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d")]);
+    const r3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL([U, "h-d"]) }, b3);
+    assert.equal(r3.out.decision, "hit", LOGS.join("\n"));
+    assert.deepEqual(r3.out.receivedTailIds, [PF_SLOT_UNKNOWN, "h-d"]);
+    // interior unknown slots are fine too
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e")]);
+    const r4 = runTurn(session, { [PF_COUNT_HEADER]: "5", ...TAIL(["h-d", U]) }, b4);
+    assert.equal(r4.out.decision, "hit", LOGS.join("\n"));
+    // an ALL-unknown tail is tolerated as well (unknown anchor verifies no one)
+    const b5 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e"), USR("f")]);
+    const r5 = runTurn(session, { [PF_COUNT_HEADER]: "6", ...TAIL([U, U]) }, b5);
+    assert.equal(r5.out.decision, "hit", LOGS.join("\n"));
+    assert.deepEqual(r5.out.receivedTailIds, [PF_SLOT_UNKNOWN, PF_SLOT_UNKNOWN]);
 }
 );
 
