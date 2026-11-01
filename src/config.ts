@@ -2034,11 +2034,12 @@ type FileConfig = {
          attachPolicy?: "own-lane" | "global-fallback";
          attachUrl?: string;
      };
-    /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
-     *  whole-lane mode ("legacy" | "shadow" | "full"); env
-     *  BILI_STORAGE_UNIFIED wins over this file value, absent/invalid falls
-     *  back to "legacy". Resolved at store construction (lane boot) — hot
-     *  edits apply on the next restart, not mid-session. */
+     /** Unified SQLite storage sidecar (#2671). `storage.unified` selects the
+      *  whole-lane mode ("legacy" | "shadow" | "full"); env
+      *  BILI_STORAGE_UNIFIED wins over this file value; an invalid spelling
+      *  degrades to "legacy", but absent everywhere defaults to "full" (#3818
+      *  flip). Resolved at store construction (lane boot) — hot edits apply
+      *  on the next restart, not mid-session. */
     storage?: {
         unified?: string;
         /** SQLite engine self-download (#2833): when unified storage is
