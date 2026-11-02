@@ -1749,8 +1749,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // upper bound (never undershoots). The regime is caller-decided and fixed
     // for the whole loop — lastInputTokens mutates mid-loop and must not flip it.
     const baselineKnown = deps.unknownBaseline !== true;
+    // #5500: an ESTIMATE-grade baseline (#604/#1498-F1 failure arm persisted at
+    // char-bound scale) or a legacy unprovenanced value is an arming quantity,
+    // not a size measurement — the per-round floor below already refuses it for
+    // measured payloads; the entry reads must apply the same discipline or a
+    // poisoned arm replayed from stats_json inflates entryTokens/overshoot
+    // budgets and the first processTurn meter on every request after restart.
+    const anchorGradeOk = deps.session.stats.lastInputTokensSource === "usage" || deps.session.stats.lastInputTokensSource === "overflow-arm";
     const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
-    let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    let currentTokens = messages.length > 0
+        ? (baselineKnown && anchorGradeOk ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages))
+        : deps.session.stats.lastInputTokens;
     let decisionTokens = 0;
     let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
@@ -1842,7 +1851,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // payloads exit early exactly as before; only genuinely huge payloads burn
     // toward it before the fail-fast reports how far it ran out.
     const entryLocal = (baselineKnown ? estimateCoreMessages(messages) : estimateCoreMessagesUpper(messages)) + imageReserve + wireOverhead;
-    const entryTokens = Math.max(baselineKnown ? deps.session.stats.lastInputTokens : 0, entryLocal);
+    const entryTokens = Math.max(baselineKnown && anchorGradeOk ? deps.session.stats.lastInputTokens : 0, entryLocal);
     const overshootRatio = limit > 0 && entryTokens > 0 ? entryTokens / limit : 1;
     const summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
     const roundBudget = Math.min(MAX_PREFLIGHT_ROUNDS * 2, Math.max(MAX_PREFLIGHT_ROUNDS, Math.ceil(MAX_PREFLIGHT_ROUNDS * overshootRatio)));
