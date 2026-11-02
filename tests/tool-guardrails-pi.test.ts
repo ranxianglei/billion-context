@@ -357,12 +357,18 @@ test("repetition guard refuses once at abort=5 and only aborts on the repeat aft
     assert.match(fifth?.reason ?? "", /FINAL WARNING/);
     assert.match(fifth?.reason ?? "", /refused and NOT executed/i);
     assert.equal(w.ctx.abortCalls, 0, "the refusal must NOT kill the turn — the model gets one live chance to change approach");
-    const sixth = w.call(statusCall("k6")) as { block?: boolean; reason?: string };
-    assert.equal(sixth?.block, true, "a repeat after the final refusal is blocked");
-    assert.match(sixth?.reason ?? "", /BLOCKED/);
-    assert.equal(w.ctx.abortCalls, 1, "turn must be aborted exactly once, at the repeat after the final refusal");
-    const seventh = w.call(statusCall("k7")) as { block?: boolean };
-    assert.equal(seventh?.block, true, "still blocked after abort");
+    // Calls 6-8: soft stop (abort action) — blocked but no ctx.abort
+    for (let i = 6; i <= 8; i++) {
+        const c = w.call(statusCall(`k${i}`)) as { block?: boolean; reason?: string };
+        assert.equal(c?.block, true, `call ${i} must be blocked`);
+        assert.match(c?.reason ?? "", /BLOCKED/);
+    }
+    assert.equal(w.ctx.abortCalls, 0, "calls 6-8 are soft-stopped (no ctx.abort)");
+    // Call 9: hard abort at backstop (abortThreshold + 4 = 9)
+    const ninth = w.call(statusCall("k9")) as { block?: boolean; reason?: string };
+    assert.equal(ninth?.block, true, "call 9 must be blocked");
+    assert.match(ninth?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
+    assert.equal(w.ctx.abortCalls, 1, "call 9 triggers ctx.abort (hard backstop)");
 });
 
 test("#5225: legit bounded polling survives the final refusal and escapes via changed arguments", () => {
@@ -427,9 +433,17 @@ test("repetition guard honors custom warn/abort thresholds", () => {
     assert.equal(third?.block, true, "final refusal fires at custom abort=3");
     assert.match(third?.reason ?? "", /FINAL WARNING/);
     assert.equal(w.ctx.abortCalls, 0, "custom-abort final refusal keeps the turn alive (#5225)");
-    const fourth = w.call(statusCall("t4")) as { block?: boolean };
-    assert.equal(fourth?.block, true, "a repeat after the final refusal kills the turn");
-    assert.equal(w.ctx.abortCalls, 1);
+    // Calls 4-6: soft stop (abort action) — blocked but no ctx.abort
+    for (let i = 4; i <= 6; i++) {
+        const c = w.call(statusCall(`t${i}`)) as { block?: boolean; reason?: string };
+        assert.equal(c?.block, true, `call ${i} must be blocked`);
+    }
+    assert.equal(w.ctx.abortCalls, 0, "calls 4-6 are soft-stopped (no ctx.abort)");
+    // Call 7: hard abort at backstop (abortThreshold + 4 = 7)
+    const seventh = w.call(statusCall("t7")) as { block?: boolean; reason?: string };
+    assert.equal(seventh?.block, true, "backstop fires at custom abort+4=7");
+    assert.match(seventh?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
+    assert.equal(w.ctx.abortCalls, 1, "call 7 triggers ctx.abort (hard backstop)");
 });
 
 test("#3170: all three ctx handlers tolerate a missing ctx (no throw, block still enforced)", () => {
