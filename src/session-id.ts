@@ -80,8 +80,20 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // for 2.x traffic and is inert for 1.x (header absent); root sessions are
     // unchanged either way (affinity === own id). Client-specific name — same
     // trust class as the headers above.
+    // x-conversation-id: Tencent CodeBuddy / WorkBuddy stamp their per-conversation
+    // UUID here on every model request (verified by dynamic capture against
+    // @tencent-ai/codebuddy-code 2.177.1 and @genie/agent-cli 2.165.0; the header
+    // name is assembled at runtime, so static greps return 0 hits — #5488). The
+    // main conversation carries ONE stable id across the whole transcript,
+    // INCLUDING host-side auto-compaction (a compact-summary rewrites the first
+    // message's content but never rotates this id); the title/topic helper uses a
+    // separate id via x-agent-purpose, correctly a different conversation. Without
+    // it the request is anonymous, falls to prefix-affinity, and forks into a fresh
+    // anonymous session on every host compaction — the two-compactor loop of #5488.
+    // Generic-sounding name, so it ranks in the low-trust generic tier below the
+    // client-specific headers instead of outranking any of them.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
