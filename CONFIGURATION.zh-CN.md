@@ -372,6 +372,7 @@
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
+| `BILI_ANNOUNCEMENTS_URL` | string | official raw URL of announcements/remote.json | — | 覆盖远程公告文档地址（#5548 C 车道）：防火墙后的装机可指向自己中继的 announcements/remote.json；缺省 = 官方 raw 地址。路径重定位类；任何情况下 fail-open（拉不到/文档坏 = 无远程车道，永不阻断启动或流量）。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM 隧道车道的主机白名单。 |
 | `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | 进程退出时回收全局 fetch 补丁的开关。 |
