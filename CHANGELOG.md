@@ -29,6 +29,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 - **快照日志新增必填选项 `covers(output, input)` 与发布结果字段 `uncovered`。** 调用方不再能靠「我点过这个叶的名字」换走它的字节：回收前日志一律用 census 私有解析出的该叶数据(连同它当时读到的原始字节)对照已发布的输出，`false` 即保留并计数；`retained` 为留在原地的叶总数(含 `uncovered`)。census 读不到任何叶(目录不可列举，`incomplete`)时 `leaves` 为空，因此不回收任何叶。
+- **目录屏障失败的发布不再谎报「全覆盖」，`retained` 也只数还在盘上的叶(Windows CI 十项全红)。** 此前 `publishAtomic` 一旦目录 fsync 失败(Windows 打不开目录句柄拿不到 `fsyncSync`，部分网络挂载亦然)就直接返回 `uncovered: 0`——等于向调用方断言「盘上每一条记录都在这个输出里」，可输出本身可能是被界外截断的视图；同时 `retained` 按 `census.leaves.length` 计，把**兄弟进程已经回收掉**的叶也算成「还在原地」，两个数字都不可信。现在覆盖判定 `covers(data, leaf.data)` 在持久性分支**之前**算完：屏障失败仍然回收**零**个输入、旧输入一字不动、`reclaimed: 0`，但 `uncovered` 报出输出真实没覆盖的叶数并照旧打那条有界告警，`retained` 只计入 `stillParsed` 确认仍在盘上的叶。覆盖是数据层面的回答，持久性是另一件事；这次只让**失败路径**把这两件事分开，成功的持久性语义、无条件回收判据和无回收屏障一律不动。
 - **消息时间戳渲染默认开启（#4313 后续）**:此前 `compress.messageTimestamps` 为可选特性（默认关，线上字节与特性前逐字节一致）。生产会话的缓存审计（同会话开关前后命中率均 95.0%、无一条时间戳导致的前缀重写 miss、全部异常可归因上游 TTL 驱逐）证实存戳渲染跨轮逐字节稳定，故默认翻转为**开**：`time=` 压缩标签属性、回执指纹行 `[起 – 止]` 覆盖跨度、摘要 Occurred 行对所有人默认可见（每条消息首次出现时铸一次不可变墙钟戳，渲染只读存戳不读墙钟）。关闭方式不变：文件 `compress.messageTimestamps: false` 或 `BILI_MESSAGE_TIMESTAMPS=0`，关闭后每个出站字节与 pre-#4313 master 一致。升级用户的一次性代价：标志首次解析为开的那个重启后，每个活跃会话付一次冻结前缀缓存重写（旧消息补上 time= 属性 + 提示词变体切换），之后稳定。测试基线：tests/preload-test-env.mjs 整套件 pin 显示门控关，字节对比型金标保持特性前形态；issue4313 toggle 套件按新契约翻转并新增 message-timestamps-default-on.test.ts 钉住生产默认路径。
 
 ### #5079 — `prompt_cache_key` 自注入默认关闭,`promptCache.routing` 一个开关管住两条 wire

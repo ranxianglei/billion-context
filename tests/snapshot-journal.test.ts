@@ -103,6 +103,42 @@ function readAll(dir: string): Rec[] {
     return [...byId.values()];
 }
 
+/**
+ * Does THIS filesystem let this process fsync a directory?
+ *
+ * The journal treats a failed directory barrier as "not durable" and then
+ * reclaims NOTHING — correct, but it means reclaim assertions only hold on a
+ * platform that can sync a directory. Windows refuses to open a directory for
+ * reading (EISDIR/EPERM on `fsyncSync` of a dir fd) and some mounts refuse the
+ * fsync itself, so on those the same code legitimately retains every input.
+ *
+ * Probed ONCE, inside this test's own temp root: the answer depends on the
+ * filesystem under `os.tmpdir()` on THIS machine, not on `process.platform`.
+ * Every reclaim assertion below is stated for the capable case and paired with
+ * the incapable case's honest report, so neither platform is skipped and
+ * neither is allowed to excuse a deletion.
+ */
+let durable: boolean | undefined;
+
+function dirFsyncWorks(): boolean {
+    if (durable !== undefined) return durable;
+    const probe = fs.mkdtempSync(path.join(root, "fsync-probe-"));
+    let fd: number | undefined;
+    try {
+        fd = fs.openSync(probe, "r");
+        fs.fsyncSync(fd);
+        durable = true;
+    } catch {
+        durable = false; // no directory barrier: nothing may be called durable
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* already unusable */ }
+        }
+        fs.rmSync(probe, { recursive: true, force: true });
+    }
+    return durable;
+}
+
 /** A journal over `snapshot` whose parse/encode/merge/covers are the two
  *  stores' generic equivalents: union by id, fresher `seen` wins, and an output
  *  covers an input only when it carries that id at `seen >= input.seen`. No
@@ -209,8 +245,18 @@ console.log(JSON.stringify({ census, result }));
 
     assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name).slice().sort(), ["pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"], "the census offers exactly the inputs it parsed");
     assert.deepEqual(out.census.retained, [], "nothing was retained");
-    assert.equal(out.result.reclaimed, 2, "both consumed inputs are reclaimed");
-    assert.deepEqual(publishedNames(journalDir), [out.result.published], "only the new output remains — the old inputs are gone, not orphaned");
+    if (dirFsyncWorks()) {
+        assert.equal(out.result.reclaimed, 2, "both consumed inputs are reclaimed once their journal entry is proven durable");
+        assert.deepEqual(publishedNames(journalDir), [out.result.published], "only the new output remains — the old inputs are gone, not orphaned");
+    } else {
+        // No directory barrier here: the publication is visible but its own
+        // durability is unproven, so NO input may be deleted — and the result
+        // must say so rather than report the coverage it cannot back.
+        assert.equal(out.result.reclaimed, 0, "without a directory barrier nothing may be reclaimed");
+        assert.equal(out.result.retained, 2, "both parsed inputs are still on disk and counted");
+        assert.equal(out.result.uncovered, 0, "the output DOES cover both inputs — coverage is computed from the data, not the barrier");
+        assert.deepEqual(publishedNames(journalDir).sort(), [out.result.published, "pub-1-aaaaaaaaaaaaaaaa", "pub-2-bbbbbbbbbbbbbbbb"].sort(), "the new output is visible beside the inputs it would have replaced");
+    }
     const remaining = readAll(journalDir);
     assert.deepEqual(remaining.map((e: Rec) => e.id).sort(), ["a", "b", "legacy"], "the new output carries the baseline and both inputs");
 });
@@ -313,10 +359,19 @@ console.log(JSON.stringify({ census, result }));
     assert.equal(out.census.incomplete, true, "partial coverage is reported to the caller");
     assert.deepEqual(out.census.records.map((e: Rec) => e.id), ["good"], "readable inputs still merge");
 
-    assert.equal(out.result.reclaimed, 1, "the valid input IS reclaimed — corrupt siblings do not block it");
+    if (dirFsyncWorks()) {
+        assert.equal(out.result.reclaimed, 1, "the valid input IS reclaimed — corrupt siblings do not block it");
+        assert.ok(!fs.existsSync(path.join(journalDir, "pub-3-cccccccccccccccc")), "the input whose record is in the new output is gone");
+    } else {
+        // No directory barrier: the covered input stays too, and the result
+        // reports it — the same honest answer the Windows CI must see.
+        assert.equal(out.result.reclaimed, 0, "without a directory barrier not even a covered input may be deleted");
+        assert.equal(out.result.retained, 1, "the one parsed input is still on disk and counted");
+        assert.equal(out.result.uncovered, 0, "coverage is a data question, unaffected by the barrier");
+        assert.ok(fs.existsSync(path.join(journalDir, "pub-3-cccccccccccccccc", SNAPSHOT_PAYLOAD)), "the covered input survives an unproven publication");
+    }
     assert.ok(fs.existsSync(path.join(journalDir, "pub-1-aaaaaaaaaaaaaaaa", SNAPSHOT_PAYLOAD)), "the corrupt input is preserved for diagnosis");
     assert.ok(fs.existsSync(path.join(journalDir, "pub-2-bbbbbbbbbbbbbbbb", SNAPSHOT_PAYLOAD)), "the ill-shaped input is preserved for diagnosis");
-    assert.ok(!fs.existsSync(path.join(journalDir, "pub-3-cccccccccccccccc")), "the input whose record is in the new output is gone");
     assert.ok(out.census.warnings.length >= 2, "both unusable inputs are reported");
     assert.ok(publishedNames(journalDir).includes(out.result.published), "the writer still publishes its own view");
 });
@@ -341,10 +396,19 @@ console.log(JSON.stringify({ ids }));
     const out = await runChild(script);
 
     assert.equal(out.ids[0].reclaimed, 0, "the first cycle has no valid predecessor to reclaim");
-    for (const step of out.ids.slice(1)) assert.equal(step.reclaimed, 1, "every later cycle reclaims exactly its valid predecessor");
     for (const step of out.ids) assert.equal(step.retained, 1, "the corrupt input is retained every time, unchanged");
-    // 1 corrupt input + the one live publication.
-    assert.equal(publishedNames(journalDir).length, 2, "only the corrupt input and the latest output survive — the corrupt one is not duplicated");
+    if (dirFsyncWorks()) {
+        for (const step of out.ids.slice(1)) assert.equal(step.reclaimed, 1, "every later cycle reclaims exactly its valid predecessor");
+        // 1 corrupt input + the one live publication.
+        assert.equal(publishedNames(journalDir).length, 2, "only the corrupt input and the latest output survive — the corrupt one is not duplicated");
+    } else {
+        // Without a directory barrier every cycle must retain its predecessor
+        // too: growth here is the DOCUMENTED cost of a platform that cannot
+        // prove the publication durable, not a missing reclaim.
+        for (const step of out.ids.slice(1)) assert.equal(step.reclaimed, 0, "an unproven publication reclaims nothing");
+        assert.equal(publishedNames(journalDir).length, 5, "the corrupt input plus every publication — bounded debris, nothing corrupt duplicated");
+        assert.equal(readAll(journalDir).filter((e) => e.id === "r4").length, 1, "the newest record is still exactly one survivor across the store");
+    }
 });
 
 test("an unlistable journal is not an empty journal", async () => {
@@ -391,13 +455,74 @@ try {
 console.log(JSON.stringify({ result, records: journal.census([]).records }));
 `;
         const out = await runChild(script);
-        assert.equal(out.result.reclaimed, 0);
-        assert.equal(out.result.retained, 1);
+        assert.equal(out.result.reclaimed, 0, "a failed barrier authorizes no deletion");
+        assert.equal(out.result.retained, 1, "the one parsed input is still on disk, and reported");
+        assert.equal(out.result.uncovered, 0, "the output DOES cover the old input — the barrier is a durability answer, not a coverage one");
         assert.ok(out.result.published, "complete bytes remain visible on platforms without directory fsync");
         assert.ok(fs.existsSync(path.join(journalDir, old, SNAPSHOT_PAYLOAD)), "prior input cannot be reclaimed without proven durability");
         assert.deepEqual(out.records.map((r: Rec) => r.id).sort(), ["new", "old"]);
     });
 }
+
+test("a non-durable publication reports the coverage it actually has, not zero", async () => {
+    // The Windows-CI shape: the directory barrier fails AND the output is
+    // bounded, so it covers only part of the census. The old result reported
+    // `uncovered: 0` (a claim that everything on disk is in the output) and a
+    // `retained` that counted a leaf a sibling had already taken. Both are lies
+    // the caller acts on, so both are pinned here on every platform.
+    const snapshot = path.join(freshDir("non-durable-truth"), "affinity.json");
+    const journalDir = stageJournal(snapshot, {
+        "pub-1-aaaaaaaaaaaaaaaa": JSON.stringify({ version: 1, entries: [{ id: "kept", value: 1, seen: 1 }] }),
+        "pub-2-bbbbbbbbbbbbbbbb": JSON.stringify({ version: 1, entries: [{ id: "also", value: 2, seen: 2 }] }),
+    });
+    const script = `
+${cappedJournalScript(snapshot, 1)}
+const fs = await import("node:fs").then((m) => m.default);
+const originalOpen = fs.openSync;
+fs.openSync = (file, ...args) => {
+    if (args[0] === "r" && typeof file === "string" && file.startsWith(${JSON.stringify(journalDir)}) && fs.statSync(file).isDirectory()) {
+        throw Object.assign(new Error("injected directory barrier failure"), { code: "EPERM" });
+    }
+    return originalOpen(file, ...args);
+};
+let result;
+try { result = publishWrite([{ id: "only", value: 0, seen: 500 }]).result; }
+finally { fs.openSync = originalOpen; }
+console.log(JSON.stringify({ result, leaves: fs.readdirSync(${JSON.stringify(journalDir)}).filter((n) => n.startsWith("pub-")).length }));
+`;
+    const out = await runChild(script);
+
+    assert.equal(out.result.reclaimed, 0, "an unproven publication deletes nothing");
+    assert.equal(out.result.uncovered, 2, "the cap-1 output covers NEITHER input, and says so even though the barrier failed");
+    assert.equal(out.result.retained, 2, "both inputs are still on disk and both are counted");
+    assert.ok(out.result.published, "the output is visible anyway — a reader can use it at the cost of a re-merge");
+    assert.equal(out.leaves, 3, "the two inputs survive beside the new output");
+
+    // The count is of what remains, not of what the census listed: a sibling
+    // that already took a leaf must not be reported as retained by this one.
+    const second = `
+${cappedJournalScript(snapshot, 1)}
+const fs = await import("node:fs").then((m) => m.default);
+const originalOpen = fs.openSync;
+const census = journal.census([]);
+fs.rmSync(${JSON.stringify(path.join(journalDir, "pub-2-bbbbbbbbbbbbbbbb"))}, { recursive: true });
+fs.openSync = (file, ...args) => {
+    if (args[0] === "r" && typeof file === "string" && file.startsWith(${JSON.stringify(journalDir)}) && fs.statSync(file).isDirectory()) {
+        throw Object.assign(new Error("injected directory barrier failure"), { code: "EPERM" });
+    }
+    return originalOpen(file, ...args);
+};
+let result;
+try { result = journal.publish([{ id: "only2", value: 0, seen: 900 }], census); }
+finally { fs.openSync = originalOpen; }
+console.log(JSON.stringify({ result }));
+`;
+    const after = await runChild(second);
+    // Phase one's visible output is also in this second census: three leaves enter,
+    // one is removed, and the cap-1 only2 output covers none of the other two.
+    assert.equal(after.result.uncovered, 3, "coverage is judged over the whole census, as read");
+    assert.equal(after.result.retained, 2, "but `retained` counts only the leaves actually still on disk");
+});
 
 test("a corrupt legacy baseline is preserved and never flattened into an empty store", async () => {
     const dir = freshDir("corrupt-legacy");
@@ -434,7 +559,10 @@ console.log(JSON.stringify({ census, result }));
     const out = await runChild(script);
 
     assert.deepEqual(out.census.leaves.map((l: { name: string }) => l.name), ["pub-1-aaaaaaaaaaaaaaaa"], "the parsed publication is reclaimable even though the baseline is corrupt");
-    assert.equal(out.result.reclaimed, 1, "conservation is per-input, not all-or-nothing on any corruption");
+    assert.equal(out.result.reclaimed, dirFsyncWorks() ? 1 : 0, dirFsyncWorks()
+        ? "conservation is per-input, not all-or-nothing on any corruption"
+        : "without a directory barrier nothing is reclaimed, corrupt baseline or not");
+    assert.equal(out.result.uncovered, 0, "the output covers the publication, whatever the barrier did");
     assert.equal(fs.readFileSync(snapshot, "utf8"), "{ not json", "the corrupt baseline itself is never deleted or rewritten");
 });
 
@@ -524,7 +652,13 @@ test("synchronized writers publishing disjoint records never drop one another", 
     // (ENOENT is not an error) and report 0. Every record must still survive.
     const published = new Set(results.map((r) => r.published));
     assert.equal(published.size, ids.length, "every writer published a DISTINCT never-reused name");
-    assert.ok(results.some((r) => r.reclaimed === 1), "the winner reclaimed the shared input");
+    if (dirFsyncWorks()) {
+        assert.ok(results.some((r) => r.reclaimed === 1), "the winner reclaimed the shared input");
+    } else {
+        // No directory barrier: not one writer may delete the shared input, and
+        // the union below proves the read-merge-publish path still lost nothing.
+        assert.ok(results.every((r) => r.reclaimed === 0), "no writer reclaims without a proven durable publication");
+    }
     assert.deepEqual(stagingNames(journalDir), [], "no writer left a staging dir behind");
 
     const seen = new Set(readAll(journalDir).map((e) => e.id));
@@ -736,13 +870,18 @@ console.log(JSON.stringify({
     assert.deepEqual(out.published.sort(), ["m1", "m2"], "the cap drops the unique input while the newer m1 supersedes the other leaf");
     assert.equal(out.result.uncovered, 1, "the leaf holding a capped-out record is reported uncovered");
     assert.equal(out.uniqueLeaf, true, "its payload is still on disk: the cap did not license deleting the record's only source");
-    assert.equal(out.oldLeaf, false, "the leaf whose record the output still dominates IS reclaimed");
     assert.deepEqual(out.uniqueAfter, { id: "unique", value: 7, seen: 7 }, "the surviving leaf is still readable by the next census");
 
     // One bounded warning, and it names the gap rather than claiming completeness.
-    assert.equal(out.result.reclaimed, 1, "exactly the dominated leaf was deleted");
     assert.equal(out.result.uncovered, 1, "the capped-out leaf stays and is counted");
     assert.equal(out.result.retained, out.result.uncovered, "retained is the parseable inputs left in place, i.e. the uncovered ones here");
+    if (dirFsyncWorks()) {
+        assert.equal(out.oldLeaf, false, "the leaf whose record the output still dominates IS reclaimed");
+        assert.equal(out.result.reclaimed, 1, "exactly the dominated leaf was deleted");
+    } else {
+        assert.equal(out.oldLeaf, true, "without a directory barrier even the dominated leaf stays");
+        assert.equal(out.result.reclaimed, 0, "an unproven publication deletes nothing — coverage and durability are separate questions");
+    }
 });
 
 test("a capped-out record survives a later wider census and is reclaimed only once covered", async () => {
@@ -780,10 +919,16 @@ console.log(JSON.stringify({ out }));
     assert.equal(out.out[0].present, true, "and leaves its bytes alone");
     assert.deepEqual(out.out[1].ids, ["m1", "unique"], "the later census still sees the capped-out record — nothing was lost");
     assert.equal(out.out[1].consumed, 2, "both leaves are candidates for the wider write");
-    assert.equal(out.out[2].result.reclaimed, 2, "the genuine superset reclaims both inputs");
     assert.equal(out.out[2].result.uncovered, 0, "a covering output reports no gap");
-    assert.equal(out.out[2].present, false, "only now is the record's leaf reclaimed");
-    assert.deepEqual(out.out[2].remaining, ["m1", "unique"], "the output itself is the single durable source of both records");
+    if (dirFsyncWorks()) {
+        assert.equal(out.out[2].result.reclaimed, 2, "the genuine superset reclaims both inputs");
+        assert.equal(out.out[2].present, false, "only now is the record's leaf reclaimed");
+        assert.deepEqual(out.out[2].remaining, ["m1", "unique"], "the output itself is the single durable source of both records");
+    } else {
+        assert.equal(out.out[2].result.reclaimed, 0, "a covering but unproven publication still reclaims nothing");
+        assert.equal(out.out[2].present, true, "so the capped leaf is still on disk");
+        assert.deepEqual(out.out[2].remaining, ["m1", "unique"], "and every record is readable from the surviving leaves");
+    }
 });
 
 test("an uncovered input is never deleted even when the caller nominates it after publishing", async () => {
@@ -837,7 +982,9 @@ console.log(JSON.stringify({ stale, survivedStale, fresh, survivedFresh: fs.exis
     assert.equal(out.stale.reclaimed, 0, "and reclaims nothing");
     assert.equal(out.survivedStale, true, "the leaf survives the older output");
     assert.equal(out.fresh.uncovered, 0, "the newer output does dominate that record");
-    assert.equal(out.survivedFresh, false, "so the leaf it covered is gone");
+    assert.equal(out.survivedFresh, !dirFsyncWorks(), dirFsyncWorks()
+        ? "so the leaf it covered is gone"
+        : "coverage holds, but without a directory barrier it is still not deleted");
 });
 
 test("the real affinity store keeps a durable leaf its write bound capped out", { timeout: 60_000 }, async () => {

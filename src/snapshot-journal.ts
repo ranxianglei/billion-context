@@ -88,14 +88,14 @@ interface PublishResult {
     published: string | null;
     /** Inputs deleted because their records are in this output. */
     reclaimed: number;
-    /** Census inputs left in place: `uncovered` ones plus covered leaves whose
-     *  bytes a sibling changed or that failed to delete, and — when the
-     *  publication was not durable — every leaf. */
+    /** Census inputs left in place: `uncovered` ones, plus covered leaves a sibling
+     *  changed or that failed to delete, plus — when the publication was not
+     *  durable — every census leaf no sibling has already reclaimed. */
     retained: number;
-    /** Parsed inputs the output does NOT hold, so `covers` was false. A subset
-     *  of `retained`; they stay until a wider output dominates them and are
-     *  reported once per publish: a bounded output is never mistaken for
-     *  "everything on disk is in here". */
+    /** Parsed inputs the output does NOT hold, so `covers` was false: they stay
+     *  until a wider output dominates them. Counted from the data alone, BEFORE
+     *  the durability decision, over the whole census — so it MAY exceed
+     *  `retained`, which drops leaves a sibling reclaimed meanwhile. */
     uncovered: number;
 }
 
@@ -286,33 +286,33 @@ class SnapshotJournal<T> {
     publish(data: T, census: Pick<JournaledSnapshot<T>, "leaves">): PublishResult {
         const dir = journalDirOf(this.snapshotPath());
         const leaf = `${PUBLISHED_PREFIX}${uniqueSuffix()}`;
-        fs.mkdirSync(dir, { recursive: true });
-        const bytes = JSON.stringify(this.opts.encode(data));
-        if (!publishAtomic(dir, leaf, bytes)) {
-            // Renamed into place, but its journal entry is not proven durable: a
-            // crash could lose a visible leaf. Reclaim NOTHING.
-            this.opts.log?.("warn", `snapshot journal ${path.basename(dir)}: publication ${leaf} is not durable; reclaiming nothing`);
-            return { published: leaf, reclaimed: 0, retained: census.leaves.length, uncovered: 0 };
-        }
-        // Coverage over the whole census BEFORE a single unlink.
+        // Coverage BEFORE the durability branch, judged once per leaf and reused
+        // below — a non-durable publish must not claim `uncovered: 0`.
         const covering: JournalLeaf<T>[] = [];
         let uncovered = 0;
         for (const input of census.leaves) {
             if (this.opts.covers(data, input.data)) covering.push(input);
             else uncovered++;
         }
+        fs.mkdirSync(dir, { recursive: true });
+        const bytes = JSON.stringify(this.opts.encode(data));
+        if (!publishAtomic(dir, leaf, bytes)) {
+            // Renamed into place but not proven durable: a crash could lose a
+            // visible leaf, so reclaim NOTHING and count only leaves still on disk.
+            this.warnUncovered(dir, leaf, uncovered);
+            this.opts.log?.("warn", `snapshot journal ${path.basename(dir)}: publication ${leaf} is not durable; reclaiming nothing`);
+            const present = census.leaves.filter((input) => this.stillParsed(path.join(dir, input.name), input) !== "missing");
+            return { published: leaf, reclaimed: 0, retained: present.length, uncovered };
+        }
         let reclaimed = 0;
-        let retained = uncovered; // every uncovered leaf stays
+        let retained = uncovered;
         for (const input of covering) {
             const inputDir = path.join(dir, input.name);
             // A sibling may have reclaimed this leaf or replaced it: only the
             // bytes we covered are ours to delete.
             const current = this.stillParsed(inputDir, input);
             if (current === "missing") continue; // a sibling already reclaimed it
-            if (current === "changed") {
-                retained++;
-                continue;
-            }
+            if (current === "changed") { retained++; continue; } // not the bytes judged
             try {
                 // Payload then directory: a crash between the two leaves a
                 // payload-less publication, which the next census treats as a
@@ -325,13 +325,14 @@ class SnapshotJournal<T> {
                 retained++;
             }
         }
-        if (uncovered > 0) {
-            // ONE bounded line per publish: a bounded output is not a claim that
-            // every record on disk is inside it.
-            this.opts.log?.("warn", `snapshot journal ${path.basename(dir)}: published output ${leaf} does not cover ${uncovered} input(s) (store bound dropped records this output lacks); kept in place`);
-        }
+        this.warnUncovered(dir, leaf, uncovered);
         if (reclaimed > 0) fsyncDir(dir);
         return { published: leaf, reclaimed, retained, uncovered };
+    }
+
+    private warnUncovered(dir: string, leaf: string, uncovered: number): void {
+        if (uncovered === 0) return; // ONE bounded line: no claim about the whole on-disk store
+        this.opts.log?.("warn", `snapshot journal ${path.basename(dir)}: published output ${leaf} does not cover ${uncovered} input(s) (store bound dropped records this output lacks); kept in place`);
     }
 
     /** Is `inputDir` still the exact document the census judged? Byte identity ⇒
