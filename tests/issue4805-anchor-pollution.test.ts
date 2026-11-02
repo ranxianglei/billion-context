@@ -198,3 +198,20 @@ test("T3d fork inheritance: a fork child carries the parent's needle from turn 1
     probeRequestMembership(child, [...Array.from({ length: 12 }, (_, i) => `M${i}`), "M12"], 310_000);
     assert.ok(!isForeignMembership(child.transient?.requestMembership), "inherited family joins immediately");
 });
+
+for (const previousMember of [false, true]) {
+    test(`T3e no-ID request clears a previous ${previousMember ? "member" : "foreign"} verdict`, () => {
+        const session = sessionWith(100_000);
+        session.transient!.latestKnownMsgId = "main-call";
+        probeRequestMembership(session, [previousMember ? "main-call" : "foreign-call"], 5_000);
+        assert.equal(session.transient!.requestMembership?.member, previousMember);
+        assert.equal(probeRequestMembership(session, [], 200_000), null);
+        assert.equal(session.transient!.requestMembership, undefined);
+        assert.equal(session.transient!.latestKnownMsgId, "main-call", "abstention must not move the remembered needle");
+        settleUsageReport(session, { total: 200_000, reportedCached: null, protocol: "openai" });
+        assert.equal(session.stats.lastInputTokens, 200_000);
+        probeRequestMembership(session, ["foreign-call"], 5_000);
+        settleUsageReport(session, { total: 5_000, reportedCached: null, protocol: "openai" });
+        assert.equal(session.stats.lastInputTokens, 200_000, "subsequent foreign requests still cannot overwrite the anchor");
+    });
+}

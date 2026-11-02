@@ -351,7 +351,9 @@ function persistForkLineageNow(session: Session, log: (level: string, msg: strin
  *  for life. The link copies nothing at link time; adoption still judges per
  *  block in raw-id set semantics, so a mis-guessed parent can at most be
  *  searched read-only, never adopted from. */
-export function maybeAdoptForkBlocks(args: {
+// #4942: async — the parent load below must reach the DB on network storage
+// backends, or an anonymous fork of a DB-only parent starts fresh.
+export async function maybeAdoptForkBlocks(args: {
     session: Session;
     parentId: string;
     protocol: WireProtocol;
@@ -359,7 +361,7 @@ export function maybeAdoptForkBlocks(args: {
     upstreamOrigin: string;
     enabled: boolean;
     log: (level: string, msg: string) => void;
-}): void {
+}): Promise<void> {
     const { session, parentId, protocol, parsed, upstreamOrigin, enabled, log } = args;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
@@ -367,7 +369,7 @@ export function maybeAdoptForkBlocks(args: {
         return;
     }
     let parent = peekSession(parentId);
-    if (!parent) parent = getStore().loadSync(parentId, { protocol, upstreamOrigin }) ?? undefined;
+    if (!parent) parent = (await getStore().loadAsync(parentId, { protocol, upstreamOrigin })) ?? undefined;
     if (!parent) {
         log("info", `[fork-adoption] fork parent ${parentId} not found (evicted and not persisted); starting fresh (#629)`);
         return;
@@ -525,10 +527,12 @@ export function maybeAdoptDerivedFork(args: {
  * (the parent id came from the plugin register) and belongs with the
  * byte-prefix strong path, which is on by default.
  */
-export function reconcileDerivedLineage(
+// #4942: async — parent loads below must reach the DB on network storage
+// backends, or lineage of DB-only parents is never restored at boot.
+export async function reconcileDerivedLineage(
     sessions: Session[],
     opts: { log: (level: string, msg: string) => void; adoptionEnabled: boolean },
-): number {
+): Promise<number> {
     const { log, adoptionEnabled } = opts;
     if (!adoptionEnabled) return 0;
     let adopted = 0;
@@ -543,10 +547,10 @@ export function reconcileDerivedLineage(
 
         let parent = peekSession(parentId);
         if (!parent) {
-            parent = getStore().loadSync(parentId, {
+            parent = (await getStore().loadAsync(parentId, {
                 protocol: s.meta.protocol,
                 upstreamOrigin: s.meta.upstreamOrigin,
-            }) ?? undefined;
+            })) ?? undefined;
         }
         if (!parent) {
             // Evicted before it was persisted — or restored later. Leave the

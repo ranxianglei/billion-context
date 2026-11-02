@@ -389,11 +389,11 @@ entries:
     desc_zh: "按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。"
   - key: promptCache.routing
     type: "\"auto\" | \"enabled\" | \"disabled\""
-    default: "auto"
+    default: "disabled"
     env: ACP_PROMPT_CACHE_ROUTING
     group: behavior
-    desc_en: "Prompt-cache routing posture for cache-aware lane selection."
-    desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+    desc_en: "Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim."
+    desc_zh: "bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。"
   - key: cacheKeepalive.enabled
     type: boolean
     default: "false"

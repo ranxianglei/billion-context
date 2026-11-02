@@ -40,6 +40,9 @@ const proxy = await startServer({
     promptCache: { routing: "auto" },
     sessionHeader: "x-acp-session",
     log: true,
+    // #5012: honor the suite's ACP_LOG_FILE pin ("off" = no file leg) instead
+    // of always defaulting to the state-dir log
+    logFile: process.env.ACP_LOG_FILE === "off" ? "off" : undefined,
     debug: false,
     passthrough: false,
     autoUpdate: false,
