@@ -955,6 +955,46 @@ export class UnifiedStore {
                         for (const rm of retiredMedia) this.releaseContent(rm.media_hash);
                     }
                 }
+                // #4392 facet C: a genuine content rewrite under a STABLE client id
+                // mints a NEW identity (content-derived, identity.ts), so remap gave the
+                // fresh generation a new seq while the prior same-msg_id generation stayed
+                // resident. The sweep above retires such stale generations only when
+                // opts.completeLog === true; envelope renders (completeLog-less) skip it,
+                // so the stale row rides every replay forever (permanent DIGEST DRIFT +
+                // unbounded growth; #4769 subagent-id-sharing is the common trigger).
+                // Retire prior same-msg_id generations whose identity is absent from THIS
+                // ingest — targeting only msg_ids actively present here (their superseding
+                // generation is in the render), so unlike the global sweep pruned renders
+                // stay safe. Same retire-not-delete + media-ref discipline as above; lane
+                // sessions excluded (#3248 positional audit floor).
+                if (opts?.completeLog !== true && !this.hasLaneExt(s.sessionId)) {
+                    const incomingByIdMsgId = new Map<string, Set<string>>();
+                    for (const m of messages) {
+                        const ident = m.identity ?? identityOfStoredContent(m.content);
+                        let set = incomingByIdMsgId.get(m.msgId);
+                        if (!set) {
+                            set = new Set();
+                            incomingByIdMsgId.set(m.msgId, set);
+                        }
+                        set.add(ident);
+                    }
+                    const activeMsgIds = [...incomingByIdMsgId.keys()];
+                    if (activeMsgIds.length > 0) {
+                        const ph = activeMsgIds.map(() => "?").join(", ");
+                        const priorRows = this.db
+                            .prepare(`SELECT seq, msg_id, identity FROM messages WHERE session_id = ? AND msg_id IN (${ph}) AND retired_at IS NULL`)
+                            .all(s.sessionId, ...activeMsgIds) as { seq: number; msg_id: string; identity: string }[];
+                        for (const row of priorRows) {
+                            if (incomingByIdMsgId.get(row.msg_id)?.has(row.identity)) continue; // unchanged / superseding gen present in render
+                            this.db.prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL").run(Date.now(), s.sessionId, row.seq);
+                            const retiredMedia = this.db
+                                .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
+                                .all(s.sessionId, row.seq) as { media_hash: string }[];
+                            this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                            for (const rm of retiredMedia) this.releaseContent(rm.media_hash);
+                        }
+                    }
+                }
             }
             // Lineage belongs to the first parent, including its nullable fork
             // point. Later metadata must not reparent or mix the stored pair.
