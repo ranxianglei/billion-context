@@ -23,8 +23,10 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { dismissedUpgradeNotices, dismissUpgradeNotice } from "../pck-notice.js";
-import { visibleBuiltInNotices, type NoticeRecord } from "../notices.js";
+import { dismissedUpgradeNotices, dismissPersistentNotice, instanceDismissedNotices, recordInstanceNoticeDismissal } from "../pck-notice.js";
+import { BUILTIN_NOTICES, dismissKeyOf, dismissModeOf, mergeNoticeLayers, noticeVisible, passesTargeting, registerDynamicNoticeIds, sortNotices, visibleBuiltInNotices, type NoticeRecord, type TargetingContext } from "../notices.js";
+import { installIdOf } from "../install-id.js";
+import { loadLocalAnnouncements } from "../local-announcements.js";
 import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -444,7 +446,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #5548: unified announcement payload for non-overview consumers.
     if (req.method === "GET" && req.url === "/__bili/notices") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ notices: visibleNoticesPayload(opts) }, null, 2));
+        res.end(JSON.stringify({ notices: collectVisibleNotices(opts) }, null, 2));
         return;
     }
     // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
@@ -1047,12 +1049,25 @@ async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
         return;
     }
-    if (!dismissUpgradeNotice(id)) {
+    const rec = findNoticeRecord(id);
+    if (!rec) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
         return;
     }
-    log("info", `[notices] notice ${id} dismissed via web UI`);
+    // #5548 §4.4 dismiss modes: always → success without writing; instance →
+    // process memory only; persistent → the id@hash16 store key.
+    const mode = dismissModeOf(rec);
+    if (mode === "always") {
+        log("info", `[notices] dismiss ignored for ${id} (always-shown)`);
+    } else if (mode === "instance") {
+        recordInstanceNoticeDismissal(id);
+    } else if (!dismissPersistentNotice(dismissKeyOf(rec))) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
+        return;
+    }
+    log("info", `[notices] notice ${id} dismissed via web UI (${mode})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
@@ -1309,18 +1324,38 @@ function sendResignStatus(res: http.ServerResponse): void {
     }, null, 2));
 }
 
-// #5548: unified announcement payload — every visible record (lane A built-ins
-// in P1; lanes B/C merge into this same list in later phases), priority-sorted
-// server-side. The wm intro stays visible to EVERY install on its first
-// upgrade until closed unless an explicit rollout override exists.
-function visibleNoticesPayload(opts: ProxyOptions): NoticeRecord[] {
-    return visibleBuiltInNotices(
-        {
-            promptCacheRouting: effectivePromptCacheRouting(opts.promptCache),
-            wmOverridePresent: !featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
-        },
-        { dismissed: dismissedUpgradeNotices(process.env) },
-    );
+// #5548 P2: unified announcement payload — lane A built-ins + lane B local JSON
+// (B overrides A on id collision, §三), targeting gates (versions/percent/
+// since/until) applied to every source, priority-sorted server-side. The wm
+// intro stays visible to EVERY install on its first upgrade until closed unless
+// an explicit rollout override exists.
+function collectVisibleNotices(opts: ProxyOptions): NoticeRecord[] {
+    const dismissed = dismissedUpgradeNotices(process.env);
+    const inst = instanceDismissedNotices();
+    const tctx: TargetingContext = { version: VERSION, installId: installIdOf(process.env), now: Date.now() };
+    const local = loadLocalAnnouncements(process.env).records;
+    registerDynamicNoticeIds(local.map((r) => r.id));
+    const merged = mergeNoticeLayers([
+        local.filter((r) => passesTargeting(r, tctx) && noticeVisible(r, dismissed, inst)),
+        visibleBuiltInNotices(
+            {
+                promptCacheRouting: effectivePromptCacheRouting(opts.promptCache),
+                wmOverridePresent: !featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
+            },
+            { dismissed, instanceDismissed: inst },
+        ),
+    ]);
+    return sortNotices(merged).filter((r) => passesTargeting(r, tctx));
+}
+
+/** Dismissal lookup by id — local lane first (B overrides A), then built-ins. */
+function findNoticeRecord(id: string): NoticeRecord | undefined {
+    const local = loadLocalAnnouncements(process.env).records.find((r) => r.id === id);
+    if (local) return local;
+    const b = BUILTIN_NOTICES.find((x) => x.id === id);
+    if (!b) return undefined;
+    const { active: _active, ...wire } = b;
+    return wire;
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHost?: string): Promise<void> {
@@ -1359,7 +1394,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
-        notices: visibleNoticesPayload(opts),
+        notices: collectVisibleNotices(opts),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

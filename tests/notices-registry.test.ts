@@ -4,9 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-    BUILTIN_NOTICES, KIND_PRIORITY, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID,
+    BUILTIN_NOTICES, NOTICE_KINDS, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID,
     dismissModeOf, knownNoticeIds, noticeVisible, priorityOf, registerDynamicNoticeIds,
-    sortNotices, toneOf, visibleBuiltInNotices, type NoticeRecord,
+    sortNotices, toneOf, visibleBuiltInNotices, type NoticeKind, type NoticeRecord,
 } from "../src/notices.ts";
 import { dismissedUpgradeNotices, dismissUpgradeNotice } from "../src/pck-notice.ts";
 
@@ -55,9 +55,10 @@ test("#5548 P1: dismiss modes — persistent default, instance memory-only, alwa
 });
 
 test("#5548 P1: kind priority table and explicit override", () => {
-    assert.deepEqual(KIND_PRIORITY, { incident: 90, "upgrade-advisory": 80, warning: 70, deprecation: 60, suggestion: 50, "new-feature": 40, other: 30 });
-    for (const kind of Object.keys(KIND_PRIORITY) as Array<keyof typeof KIND_PRIORITY>) {
-        assert.equal(priorityOf({ kind }), KIND_PRIORITY[kind]);
+    const defaults: Record<NoticeKind, number> = { incident: 90, "upgrade-advisory": 80, warning: 70, deprecation: 60, suggestion: 50, "new-feature": 40, other: 30 };
+    assert.deepEqual([...NOTICE_KINDS].sort(), Object.keys(defaults).sort());
+    for (const kind of NOTICE_KINDS) {
+        assert.equal(priorityOf({ kind }), defaults[kind]);
     }
     assert.equal(priorityOf({ kind: "other", priority: 99 }), 99);
     assert.equal(priorityOf({ kind: "incident", priority: null }), 90);
