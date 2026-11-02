@@ -372,6 +372,7 @@ test("repetition guard refuses once at abort=5 and only aborts on the repeat aft
     const tenth = w.call(statusCall("k10")) as { block?: boolean; reason?: string };
     assert.equal(tenth?.block, true, "call 10 must be blocked");
     assert.match(tenth?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
+    assert.doesNotMatch(tenth?.reason ?? "", /turn ends on its own/i, "stuck-report must not claim turn ends on its own");
     assert.equal(w.ctx.abortCalls, 1, "call 10 triggers ctx.abort (hard backstop)");
 });
 
@@ -447,6 +448,7 @@ test("repetition guard honors custom warn/abort thresholds", () => {
     const eighth = w.call(statusCall("t8")) as { block?: boolean; reason?: string };
     assert.equal(eighth?.block, true, "backstop fires at custom abort+5=8");
     assert.match(eighth?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
+    assert.doesNotMatch(eighth?.reason ?? "", /turn ends on its own/i, "stuck-report must not claim turn ends on its own");
     assert.equal(w.ctx.abortCalls, 1, "call 8 triggers ctx.abort (hard backstop)");
 });
 
