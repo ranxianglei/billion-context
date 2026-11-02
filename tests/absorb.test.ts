@@ -135,6 +135,7 @@ test("executeAbsorb: bad ref and invalid input fail with FAILED marker", () => {
     session.state = turn.state;
     const badRef = executeAbsorb({ ref: "m99999", summary: "x" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badRef, /absorb failed: ref m99999/);
+    assert.doesNotMatch(badRef, /\[absorb FAILED:\s*absorb failed/i, "double prefix must stay gone (#5555): " + badRef);
     const badInput = executeAbsorb({ summary: "no ref" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badInput, /\[absorb FAILED: invalid input/);
     assert.equal((session.state.absorbed ?? []).length, 0);

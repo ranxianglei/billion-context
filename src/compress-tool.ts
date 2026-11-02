@@ -531,14 +531,17 @@ export function normalizeCompressInput(input: unknown): unknown {
 // JSON-encoded array as that string is also accepted” invites. Neither layer
 // used to salvage it (object-typed content was wrapped; a STRING-typed content
 // only got line-form/flat treatment) ⇒ refused with kind=content-not-array.
-// Decode once and adopt only when the result is strictly entries-shaped:
-// one plain range object (wrapped to one element) or an all-object array.
+// Decode once and adopt only when the result is strictly ENTRIES-shaped:
+// a single range entry (start+end+summary) wrapped to one element, or an
+// array of such entries. A bounds-less JSON object (the flat-summary payload
+// {summary,…} + top-level refs) is deliberately NOT adopted here — it belongs
+// to the flat-single-range salvage path, not the entry decoder.
 function decodeContentStringEntries(c: unknown): unknown | undefined {
     if (typeof c !== "string") return undefined;
     let v: unknown;
     try { v = JSON.parse(c); } catch { return undefined; }
-    if (isPlainObject(v)) return [v];
-    if (Array.isArray(v) && v.length > 0 && v.every((e) => isPlainObject(e))) return v;
+    if (isPlainObject(v)) return looksLikeRangeEntry(v) ? [v] : undefined;
+    if (Array.isArray(v) && v.length > 0 && v.every((e) => isPlainObject(e) && looksLikeRangeEntry(e))) return v;
     return undefined;
 }
 
