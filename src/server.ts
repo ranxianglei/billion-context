@@ -96,6 +96,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -2370,6 +2371,32 @@ export function applyReasoningDrop(
     return out;
 }
 
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
+}
+
 /** [#651] Strip oversized reasoning from closed compress turns (see
  *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
  *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc
@@ -4567,6 +4594,9 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    // #5408: this line is THE observation point — a hot-at-attach session that
+    // never produces one is silent compression loss (the incident signature).
+    noteRequest(sessionId);
     if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
         log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
     }

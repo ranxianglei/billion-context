@@ -280,6 +280,8 @@ interface StorageRuntimeStatus {
     backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
     /** #4323: sessions whose JSON-envelope writes this process froze after repeated non-converging drift samples. */
     frozenEnvelopeSessions: number;
+    /** #5408: per-session detail behind the count — which sessions and since when. */
+    frozenEnvelopeDetails: { id: string; sinceMs: number }[];
 }
 
 function getStorageRuntimeStatus(): StorageRuntimeStatus {
@@ -347,6 +349,7 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         splitBrain: state.splitBrain,
         backup: state.backup,
         frozenEnvelopeSessions: sidecar?.frozenEnvelopeIds.size ?? 0,
+        frozenEnvelopeDetails: sidecar?.frozenEnvelopeDetails() ?? [],
     };
 }
 
@@ -374,6 +377,8 @@ interface StorageStatusWire {
     backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
     /** #4323: envelope-write freeze count on the wire. */
     frozenEnvelopeSessions: number;
+    /** #5408: which sessions are frozen and since when — a bare count cannot be acted on. */
+    frozenEnvelopeDetails: { id: string; sinceMs: number }[];
 }
 
 function splitBrainWire(cur: SplitBrainContestInput | null): { sessionId: string; title?: string; self: SplitBrainIdentity; peer: SplitBrainIdentity; at: number } | null {
@@ -402,6 +407,7 @@ export function storageStatusWire(): StorageStatusWire {
         splitBrain: splitBrainWire(st.splitBrain),
         backup: st.backup,
         frozenEnvelopeSessions: st.frozenEnvelopeSessions,
+        frozenEnvelopeDetails: st.frozenEnvelopeDetails,
     };
 }
 
@@ -437,6 +443,9 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         `storage.walJournalSizeLimitBytes (config file): ${fileWalLimit ?? "(unset)"}`,
         `BILI_ENCRYPTION_KEY set: ${env.BILI_ENCRYPTION_KEY !== undefined && env.BILI_ENCRYPTION_KEY !== "" ? "yes" : "no"}`,
         `sessions on disk: ${ctx.sessions}`,
+        // #5408: name the frozen sessions in the diagnostics blob — before
+        // this the only trace of an hours-long freeze was old drift lines.
+        ...st.frozenEnvelopeDetails.map((f) => `frozen envelope writes: ${f.id} (since ${new Date(f.sinceMs).toISOString()})`),
     ];
     if (ctx.storageLogLines.length > 0) {
         lines.push("last [storage] log lines:");
