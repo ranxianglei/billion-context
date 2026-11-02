@@ -6,11 +6,11 @@
 // their loaded ids via registerDynamicNoticeIds() when they land (P2/P3).
 // Pure module: no fs, no io — the dismissal store stays in pck-notice.ts.
 
-export type NoticeKind = "new-feature" | "upgrade-advisory" | "warning" | "suggestion" | "incident" | "deprecation" | "other";
-export type NoticeTone = "ok" | "warn" | "info";
-export type NoticeDismiss = "persistent" | "instance" | "always";
+type NoticeKind = "new-feature" | "upgrade-advisory" | "warning" | "suggestion" | "incident" | "deprecation" | "other";
+type NoticeTone = "ok" | "warn" | "info";
+type NoticeDismiss = "persistent" | "instance" | "always";
 /** Multilang copy: locale object (keys like "zh-CN"/"en") or a plain string. */
-export type NoticeText = string | Record<string, string>;
+type NoticeText = string | Record<string, string>;
 
 export interface NoticeRecord {
     id: string;
@@ -37,14 +37,14 @@ export interface NoticeRecord {
 }
 
 /** Server-side state a built-in declaration's active predicate may read. */
-export interface BuiltInContext {
+interface BuiltInContext {
     /** effectivePromptCacheRouting() result ("disabled"/"auto"/"enabled"). */
     promptCacheRouting: string;
     /** True when the user wrote an explicit pluginFullResendWatermark rollout override. */
     wmOverridePresent: boolean;
 }
 
-export interface BuiltinNotice extends NoticeRecord {
+interface BuiltinNotice extends NoticeRecord {
     active: (ctx: BuiltInContext) => boolean;
 }
 
@@ -157,7 +157,7 @@ export function knownNoticeIds(): ReadonlySet<string> {
     return all;
 }
 
-export interface VisibleNoticesOptions {
+interface VisibleNoticesOptions {
     dismissed: ReadonlySet<string>;
     instanceDismissed?: ReadonlySet<string>;
 }
