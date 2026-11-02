@@ -313,6 +313,9 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         if (decision.action === "final-refuse") {
             const msg = buildRepetitionFinalRefuseNotice(decision.toolName, decision.count);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever.
+            tracker.complete(e.toolCallId);
             // Deliberately NO ctx.abort() here: the refusal itself IS the final
             // warning. The model sees this text and can still react (change
             // args / pick another tool => the run resets). Only the NEXT
@@ -326,11 +329,11 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
             // when repetition.backstopEnabled = true (default: false).
             const msg = buildRepetitionAbortNotice(decision.toolName, decision.count, decision.backstop);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
-            ctx?.abort?.();
             // CLEANUP: blocked calls never fire tool_result, so without this
             // pendingStarts entries would accumulate forever. Safe: 0ms duration
             // < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
             tracker.complete(e.toolCallId);
+            ctx?.abort?.();
             return { block: true, reason: msg };
         }
         if (decision.action === "abort") {
