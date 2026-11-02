@@ -8,7 +8,7 @@ import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -150,6 +150,10 @@ export async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
+        if (loopConfig.compressAtFoldPointClearThinking) {
+            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        }
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
