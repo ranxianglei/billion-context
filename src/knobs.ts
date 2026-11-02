@@ -335,11 +335,15 @@ export function guardrailMaxOutputBytes(): number | undefined {
     return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no cap
 }
 
-/** BILI_GUARDRAIL_REPETITION > guardrails.repetition > true (identical-call loop-breaker, warn 3 / abort 5). */
-export function guardrailRepetition(): boolean {
+/** BILI_GUARDRAIL_REPETITION (truthy/disabled) > guardrails.repetition > true
+ *  (identical-call loop-breaker, warn 3 / abort 5). Object form is file-only.
+ *  #5505: object shape { enabled?, warn?, abort?, recovery? }. */
+export function guardrailRepetition(): boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean } {
     const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return loadConfigFile().guardrails?.repetition !== false;
+    const val = loadConfigFile().guardrails?.repetition;
+    // truthy boolean → keep; object form → pass through; undefined/false → normalize
+    return val !== undefined && val !== false ? val : true;
 }
 
 /** #3260 text-run breaker default: parity with pi's findDegenerateRuns minRun

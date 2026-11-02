@@ -181,7 +181,11 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `guardrails` | object | {} (all defaults) | — | Guardrails: tool-output guardrails for the pi/omp plugin bundles (#3066) plus the proxy-side text-run stream guard (#3406). |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default). |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output. |
-| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). The object form additionally accepts a recovery flag (default false): when true, identical calls after the 5th refusal are refused one at a time with a stuck-report while the turn stays alive, and the turn is forcibly terminated only when the identical call reaches abort+5 in a row (#5505). false / env 0 disables it. |
+| `guardrails.repetition` | boolean \| object | true | BILI_GUARDRAIL_REPETITION (boolean truthy/disabled only — object form is file-only) | Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). The object form additionally accepts `enabled` (default true, gate), `warn` (default 3, warning threshold), `abort` (default 5, final-refuse threshold), and `recovery` (default false, opt-in graceful-termination mode: calls 6–(abort+4) are refused with a stuck-report while the turn stays alive, and the turn is forcibly terminated only when the identical call reaches abort+5 in a row (#5505)). false / env 0 disables it. Object sub-fields are file-only (not exposed via env var). |
+| `guardrails.repetition.enabled` | boolean | true | — (file-only) | Gates the identical-call loop-breaker when used with the object form. true (default) enables it; false disables it. Use `repetition: false` (boolean form) for the simpler opt-out. |
+| `guardrails.repetition.warn` | number | 3 | — (file-only) | First warning threshold. Identical calls from this count onward get a WARNING notice appended to results (#3066). Must be less than `abort`. |
+| `guardrails.repetition.abort` | number | 5 | — (file-only) | Final-refuse threshold. The next identical call after this count is blocked and refused without execution, followed by a FINAL WARNING (#5225). Must be greater than `warn`. |
+| `guardrails.repetition.recovery` | boolean | false | — (file-only) | Opt-in graceful-termination mode (#5505). When true, calls after the final refusal (abort) are refused with a stuck-report while the turn stays alive (soft-stop). The turn is forcibly terminated only when the identical call reaches abort+5 (hard backstop, default 10). false (default) = original behavior: ctx.abort() at call 6. |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
@@ -1866,7 +1870,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
 | `BILI_GUARDRAIL_BASH_TIMEOUT` | `guardrails.bashTimeout` | 60 |
 | `BILI_GUARDRAIL_MAX_OUTPUT_BYTES` | `guardrails.maxOutputBytes` | 50000 |
-| `BILI_GUARDRAIL_REPETITION` | `guardrails.repetition` | true |
+| `BILI_GUARDRAIL_REPETITION (boolean truthy/disabled only — object form is file-only)` | `guardrails.repetition` | true |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | `guardrails.textRunThreshold` | 200 |
 | `BILI_HTTP_OUTBOUND_BYTES` | `network.httpOutboundBytes` | 10485760 |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
@@ -1952,6 +1956,10 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
+| `— (file-only)` | `guardrails.repetition.abort` | 5 |
+| `— (file-only)` | `guardrails.repetition.enabled` | true |
+| `— (file-only)` | `guardrails.repetition.recovery` | false |
+| `— (file-only)` | `guardrails.repetition.warn` | 3 |
 <!-- /bili:gen -->
 
 | Variable | Effect |

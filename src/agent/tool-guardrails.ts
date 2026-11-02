@@ -264,7 +264,7 @@ function buildRepetitionWarnNotice(toolName: string, count: number): string {
 }
 
 function buildRepetitionFinalRefuseNotice(toolName: string, count: number): string {
-    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the entire turn will be ABORTED. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
+    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the guardrail will take stronger action. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
 }
 
 function buildRepetitionAbortNotice(toolName: string, count: number): string {

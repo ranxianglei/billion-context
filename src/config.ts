@@ -2249,16 +2249,19 @@ type FileConfig = {
      *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
      *  pi session for a whole day); 0 disables injection (pi-native).
      *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
-     *  cap). `repetition: false` disables the identical-call loop-breaker.
-     *  `textRunThreshold` is the single-codepoint repetition breaker over
-     *  decoded model text (default 200, 0 = off). Env
-     *  BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
-     *  BILI_GUARDRAIL_REPETITION / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD win over
+     *  cap). `repetition` disables the identical-call loop-breaker when false;
+     *  the object form additionally accepts `enabled` (default true),
+     *  `warn` (default 3, first warning threshold), `abort` (default 5,
+     *  final-refuse threshold), and `recovery` (default false, opt-in
+     *  graceful-termination mode). `textRunThreshold` is the
+     *  single-codepoint repetition breaker over decoded model text (default
+     *  200, 0 = off). Env BILI_GUARDRAIL_REPETITION (truthy/disabled, boolean
+     *  only — object form is file-only); other guardrail env vars win over
      *  all. */
     guardrails?: {
         bashTimeout?: number;
         maxOutputBytes?: number;
-        repetition?: boolean;
+        repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean };
         textRunThreshold?: number;
     };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
