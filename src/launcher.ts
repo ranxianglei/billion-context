@@ -172,6 +172,12 @@ type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" 
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
+/** #4566(c): bounded re-probe window for a BUSY candidate (TCP alive, health
+ *  silent — event loop saturated in a large fold). A saturated loop recovers
+ *  within seconds; waiting it out yields a REAL health answer (watchdog state
+ *  included) instead of freezing the blind BUSY verdict. A wedge that never
+ *  answers keeps today's BUSY semantics — the window only bounds the wait. */
+const BUSY_GRACE_MS = 5_000;
 // Env knobs (envMillis contract, #1365): large stores (whole-DB pre-bind open,
 // #4939) and two lanes sharing one index.db (write-lock contention on cold
 // start) have been observed exhausting the fixed budget, kill-spawn looping
@@ -344,6 +350,9 @@ export interface LauncherDeps {
     /** #3654: registry view behind serving-twin adoption after exit code 3
      *  (default: discoverLiveInstances, instance.ts). */
     listAdoptCandidates?: () => ProxyInstanceFile[];
+    /** #4566(c): override of the BUSY-candidate grace window (default
+     *  BUSY_GRACE_MS) — tests drive it against a fake clock. */
+    busyGraceMs?: number;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -4119,11 +4128,23 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
  *  client's, so the attach decision unions the file view with the
  *  multi-instance registry (every instance self-registers on startup) and
  *  health-probes each candidate in parallel. */
+/** #4566(c): bounded re-probe config for BUSY candidates. `eligible` scopes
+ *  the wait to candidates THIS launch could attach to (compatible, own lane /
+ *  user zone / attachExternal, port policy) — an unrelated lane's saturated
+ *  proxy must not stall our bring-up. */
+interface BusyProbeConfig {
+    ms?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+    eligible?: (inst: ProxyInstanceFile) => boolean;
+}
+
 async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
     isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
+    busy?: BusyProbeConfig,
 ): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
@@ -4132,7 +4153,7 @@ async function probeLiveInstances(
     const checked = await Promise.all(
         [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo | undefined } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
-            const health = await fetchHealthInfo(c.origin);
+            let health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) {
                 // #3654: a refused connection and a saturated event loop both
                 // fail this probe — tell them apart in the log: connect-but-
@@ -4146,13 +4167,40 @@ async function probeLiveInstances(
                 // call, on lifecycle evidence. An ANSWERED probe that reports
                 // not-ok (instance draining) stays dropped.
                 if (health === undefined && (await isConnectable(c.origin))) {
-                    diag?.(`native-attach: keep ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654/#4811)`);
-                    return { inst: c, health: undefined };
+                    // #4566(c): a saturated event loop recovers within seconds —
+                    // give an attach-eligible candidate a bounded chance to
+                    // answer before freezing the verdict. An answer during the
+                    // window falls through to the regular gates below with REAL
+                    // data (watchdog state included) instead of the blind BUSY
+                    // bypass; silence keeps today's BUSY semantics unchanged.
+                    if (busy !== undefined && busy.eligible?.(c) !== false) {
+                        const nowFn = busy.now ?? Date.now;
+                        const sleepFn = busy.sleep ?? ((ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)));
+                        const deadline = nowFn() + (busy.ms ?? BUSY_GRACE_MS);
+                        while (nowFn() < deadline) {
+                            await sleepFn(HEALTH_POLL_INTERVAL_MS);
+                            const again = await fetchHealthInfo(c.origin);
+                            if (again !== undefined) { health = again; break; }
+                        }
+                        if (health === undefined && !(await isConnectable(c.origin))) {
+                            diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): died while silent — dead, not BUSY (#4566/#3654)`);
+                            return undefined;
+                        }
+                    }
+                    if (health !== undefined && !health.ok) {
+                        diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
+                        return undefined;
+                    }
+                    if (health === undefined) {
+                        diag?.(`native-attach: keep ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654/#4811)`);
+                        return { inst: c, health };
+                    }
+                } else {
+                    diag?.(health === undefined
+                        ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`
+                        : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
+                    return undefined;
                 }
-                diag?.(health === undefined
-                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`
-                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
-                return undefined;
             }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
@@ -5064,7 +5112,18 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable);
+    // #4566(c): only candidates THIS launch could attach to are worth waiting
+    // out — same predicate family as pickAttachable's BUSY branch (compatible,
+    // port policy, own lane / user zone / attachExternal).
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable, {
+        ms: deps?.busyGraceMs,
+        now,
+        sleep: sleepImpl,
+        eligible: (inst) =>
+            instanceCompatible(inst, opts, codeFingerprint, foreignLanes) === undefined
+            && !(opts.strictPort && inst.port !== opts.port)
+            && ((opts.lane !== undefined && inst.lane === opts.lane) || attachExternal || isUserZoneInstance(inst)),
+    });
     const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
@@ -5183,7 +5242,36 @@ export async function ensureProxyRunning(
         : zoneLane !== undefined
           ? preferredPort(zoneLane)
           : await pickEphemeralPort(opts.host);
-    const settleZonePort = (settled: number): void => {
+    // #4566 (A1, owner decision 2026-10-26): the sticky zone pointer must not
+    // move under a LIVE same-lane bili. When our child had to ladder ABOVE the
+    // preferred port because a same-lane instance still serves it (a different
+    // build after a dist change / auto-update), recording the laddered port
+    // would strand every host pinned to the old origin AND split the sessions
+    // dir across two writers (#3923/#3959). The holder keeps serving until it
+    // exits (the stack restarts it once idle); the freed port is reclaimed —
+    // and the record converges back — by the next launch. A wedged holder
+    // (TCP alive, health silent, live pid) is protected too: busy ≠ dead
+    // (#3654); moving the lane around it ratchets the port forever, so the log
+    // names the pid to kill instead.
+    const zoneHoldCheck = async (settled: number): Promise<boolean> => {
+        if (zoneLane === undefined || settled <= port) return false;
+        const preferredOrigin = proxyOrigin(opts.host, port);
+        const marker = listRegistry().find((e) => e.port === port && e.lane === zoneLane && e.instanceId !== "" && isPidAlive(e.pid));
+        if (marker === undefined) return false;
+        const info = await fetchHealthInfo(preferredOrigin);
+        if (info?.ok && (info.pid === undefined || info.pid === marker.pid)) {
+            attachDiag(`[zone] lane "${zoneLane}" keeps sticky port ${port} — same-lane instance ${marker.instanceId.slice(0, 8)} (pid ${marker.pid}) still serves it; laddered port ${settled} is NOT recorded, the pointer converges when the holder exits (#4566)`);
+            return true;
+        }
+        if (await (deps?.isConnectable ?? tcpConnectable)(preferredOrigin)) {
+            attachDiag(`[zone] lane "${zoneLane}" keeps sticky port ${port} — same-lane instance ${marker.instanceId.slice(0, 8)} (pid ${marker.pid}) answers TCP but never /__bili/health (BUSY/wedged #3654); laddered port ${settled} is NOT recorded — kill ${marker.pid} to reclaim the port (#4566)`);
+            console.error(`bili: lane "${zoneLane}"'s sticky port ${port} is held by an unresponsive same-lane proxy (pid ${marker.pid}) — new launches land on ${settled} without moving the record; kill ${marker.pid} to reclaim ${port} (#4566)`);
+            return true;
+        }
+        return false;
+    };
+    const settleZonePort = async (settled: number): Promise<void> => {
+        if (await zoneHoldCheck(settled)) return;
         if (zoneLane !== undefined) (deps?.writeZonePort ?? writeZonePort)(zoneLane, settled);
     };
     if (!script) throw new Error("bili: cannot resolve launcher script path");
@@ -5489,8 +5577,9 @@ export async function ensureProxyRunning(
                 if (await probeHealth(inst.origin, fetchImpl)) {
                     // #1660: settle the lane's sticky record on the port the
                     // child actually bound (preferred or laddered) so every
-                    // later launch of this lane tries it first.
-                    settleZonePort(inst.port);
+                    // later launch of this lane tries it first. #4566: a live
+                    // same-lane holder on the preferred port keeps the pointer.
+                    await settleZonePort(inst.port);
                     startOwnerHeartbeat(inst.origin, watchPid);
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
@@ -5507,7 +5596,7 @@ export async function ensureProxyRunning(
             if (child.pid !== undefined) {
                 const mine = listRegistry().find((e) => e.pid === child.pid);
                 if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
-                    settleZonePort(mine.port);
+                    await settleZonePort(mine.port);
                     startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
                 }
@@ -5529,7 +5618,7 @@ export async function ensureProxyRunning(
                 const preferredOrigin = proxyOrigin(opts.host, port);
                 const info = await fetchHealthInfo(preferredOrigin);
                 if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
-                    settleZonePort(port);
+                    await settleZonePort(port);
                     startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
                 }
@@ -5684,7 +5773,7 @@ export async function ensureProxyRunning(
             // Rung 1: the preferred port answers healthy with OUR child's pid —
             // the same identity proof the stale-record fallback trusts per-poll,
             // reached here because clobbered records starved it for the budget.
-            settleZonePort(port);
+            await settleZonePort(port);
             startOwnerHeartbeat(proxyOrigin(opts.host, port), watchPid);
             attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${proxyOrigin(opts.host, port)} after ${SPAWN_BUDGET_MS}ms — the instance handshake never matched but the health probe proves this child serves the port; keeping it instead of killing (#4994)`);
             return { origin: proxyOrigin(opts.host, port), port, child, logPath };
@@ -5696,7 +5785,7 @@ export async function ensureProxyRunning(
         if (bound) {
             const info = await fetchHealthInfo(bound.origin);
             if (info?.ok && info.pid === child.pid) {
-                settleZonePort(bound.port);
+                await settleZonePort(bound.port);
                 startOwnerHeartbeat(bound.origin, watchPid);
                 attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${bound.origin} after ${SPAWN_BUDGET_MS}ms — it bound ${bound.port} per its own listen line and answers health under our pid; keeping it instead of killing (#4994)`);
                 return { origin: bound.origin, port: bound.port, child, logPath };
