@@ -204,16 +204,36 @@ test("missing primary key skips its network call and tries the configured backup
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
-test("protected ranges cause no paid call and no fold", async () => {
+test("protected ranges return an idempotent no-op without a paid call", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
-        assert.equal(result.outcome, "refused");
+        assert.equal(result.outcome, "applied", result.text);
+        assert.match(result.text, /^\[Compression no-op:/);
         assert.equal(ctx.session.state.blocks.length, 0);
         assert.equal(calls, 0);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("already-folded ranges return a no-op without another paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const input = args(ctx);
+        const first = await applyConfiguredCompression(input, ctx);
+        assert.equal(first.outcome, "applied", first.text);
+        const blockId = ctx.session.state.blocks[0]?.blockId;
+        assert.ok(blockId);
+        const again = await applyConfiguredCompression(input, ctx);
+        assert.equal(again.outcome, "applied", again.text);
+        assert.match(again.text, /^\[Compression no-op:/);
+        assert.match(again.text, /covered by active block/);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0]?.blockId, blockId);
+        assert.equal(calls, 1);
     }, (_req, res) => { calls++; success(res); });
 });
 
