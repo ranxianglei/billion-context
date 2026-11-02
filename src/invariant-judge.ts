@@ -44,7 +44,7 @@
 // input; the runtime wrapper records events only and never blocks traffic.
 
 import { parseStoredPlaceholder, type CoreMessage } from "acp-kernel";
-import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
+import { openaiToCore, anthropicToCore, responsesToCore, googleToCore, type BiliMessage } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
@@ -182,6 +182,26 @@ function isTruncatedTwin(a: CoreMessage, b: CoreMessage): boolean {
   return pre.length > 0 && post.length > 0 && na.startsWith(pre) && na.endsWith(post);
 }
 
+// #5049 item 2: egress shed (#3701/#4124) archives outbound images to a
+// placeholder NOTE in the outbound copy only — the inbound twin stays the
+// image. Note shape is emitted by exactly one producer (src/egress-shed.ts
+// shedNote): `[image: <mime> <WxH> <mNNNNN> omitted for size limit]`, every
+// bit a space-free token. Anchored full-string match, not a substring scan
+// (#1456 discipline): user/model text merely CONTAINING the phrase does not
+// qualify.
+const SHED_NOTE_RE = /^\[image: [^\s\[\]]+(\s[^\s\[\]]+)* omitted for size limit\]$/;
+
+// Directional structural proof that b is the sanctioned archive of a: b must
+// be EXACTLY a shed note and a must be an image core (all four wire codecs
+// mark image parts with imagePart=true). An exit-side note against a
+// non-image inbound twin, or any other rewrite of an image, stays flagged.
+function isShedArchivedTwin(a: CoreMessage, b: CoreMessage): boolean {
+  if (!SHED_NOTE_RE.test((b.text ?? "").trim())) return false;
+  // Codec output is BiliMessage (the imagePart sidecar rides it); the judge
+  // surface types arrays as CoreMessage, so narrow once here.
+  return (a as BiliMessage).imagePart === true;
+}
+
 function fp(m: CoreMessage): string {
   const id = m.toolCallId ? `#${m.toolCallId}` : "";
   const name = m.contentType === "tool-call" && m.toolName ? `:${m.toolName}` : "";
@@ -198,6 +218,7 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (isCrushedToolResult(b)) return true;
   if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
   if (isTruncatedTwin(a, b)) return true; // #4186 G3
+  if (isShedArchivedTwin(a, b)) return true; // #5049 item 2
   return normText(a) === normText(b);
 }
 
