@@ -5,7 +5,7 @@ import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputIt
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
-import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
+import { currentCalibrationFactor, hardenResponsesFunctionCallArguments, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -599,6 +599,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // can leave a tool-call run without its reasoning item. Repair BEFORE the
     // sentinel sees the array (a normalized body must not fire its own canary).
     if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+    // #5534: Responses-wire twin — function_call.arguments carries the same
+    // tool-call core text; custom_tool_call.input stays free-form.
+    if (Array.isArray(rebuiltInput)) rebuiltInput = hardenResponsesFunctionCallArguments(rebuiltInput, log, sessionId);
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {

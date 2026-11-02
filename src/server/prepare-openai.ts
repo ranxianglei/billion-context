@@ -4,7 +4,7 @@ import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-ker
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
-import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+import { currentCalibrationFactor, hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
@@ -447,6 +447,11 @@ export async function prepareOpenai(
     // #762: repair the strict-echo rejection class BEFORE the sentinel sees
     // the array — a normalized body must not fire its own canary.
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+    // #5534: last line of defense for strict-JSON upstreams — a latch replay
+    // can land clipped prose into a tool-call core's text (= arguments JSON).
+    // Covers BOTH paths: kernel-processed and the catch fallback above (which
+    // forwards parsed.messages verbatim, poison included).
+    rebuiltMessages = hardenOpenaiToolCallArguments(rebuiltMessages, log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
