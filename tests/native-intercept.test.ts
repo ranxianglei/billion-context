@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, MAX_SILENT_DIRECT_BODY_BYTES, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
@@ -505,6 +505,194 @@ test("install: a same-instance re-activation outranks an older activation's late
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
     assert.equal(calls[0].headers["x-bili-test"], "same");
+});
+
+test("install: a missing live-state slot refuses an oversized direct model request (#5405)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40905", ready: Promise.resolve("http://127.0.0.1:40905") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Simulate the exact #3394 teardown shape: the slot is empty but the
+        // shared fetch chain is still installed.
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+        // Negative rows: small model POSTs, GETs, and non-model URLs keep the
+        // clean by-design direct path while the slot is empty.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages")).status, 200);
+        assert.equal((await globalThis.fetch("https://example.com/upload", { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) })).status, 200);
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages", "http://127.0.0.1:8199/v1/messages", "https://example.com/upload"], "only the oversized model POST is refused");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: a missing live-state slot logs direct sends once per generation (#5405)", async () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5405-state-log-"));
+    process.env.XDG_STATE_HOME = root;
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40907", ready: Promise.resolve("http://127.0.0.1:40907") };
+        const { sink } = await withPatch(state, async (fetch) => {
+            liveStateSlotEffect(state)()();
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+        });
+        assert.equal(sink.length, 2, "small direct sends still reach the provider");
+        const lines = fs.readFileSync(logFile, "utf8").split("\n");
+        const missing = lines.filter((l) => l.includes("intercept state missing"));
+        assert.equal(missing.length, 1, "one warning per live-state generation");
+        assert.match(missing[0], /\[warn\]/);
+        assert.match(missing[0], /127\.0\.0\.1:8199/);
+        assert.equal(lines.filter((l) => l.includes("live-state cleared")).length, 1);
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("install: an unattributed oversized request is refused before direct send (#5405)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40906",
+        ready: Promise.resolve("http://127.0.0.1:40906"),
+        takeoverGate: () => false,
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+    });
+    assert.deepEqual(sink, [], "the oversized request must not reach the provider");
+});
+
+test("install: a missing live-state slot refuses an oversized Request-object model body too (#5405/#5408)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40908", ready: Promise.resolve("http://127.0.0.1:40908") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const req = new Request("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) });
+        const res = await globalThis.fetch(req);
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        assert.equal(req.bodyUsed, false, "the probe reads a clone — the original stays sendable (#2496)");
+        assert.deepEqual(sink, [], "Request-carried bodies must be measured, not skipped");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: the ceiling boundary — exactly at it passes, one byte over refuses (#5405/#5408)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40909", ready: Promise.resolve("http://127.0.0.1:40909") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const url = "http://127.0.0.1:8199/v1/chat/completions";
+        const atCeiling = await globalThis.fetch(url, { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES) });
+        assert.equal(atCeiling.status, 200, "at the ceiling the by-design pass-through holds");
+        const over = await globalThis.fetch(url, { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) });
+        assert.equal(over.status, 422);
+        assert.deepEqual(sink, [url], "only the under-ceiling dispatch reached the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an unreadable stream body fails open when the slot is empty (#5405/#5408)", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new Uint8Array(MAX_SILENT_DIRECT_BODY_BYTES + 1));
+            controller.close();
+        },
+    });
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40910", ready: Promise.resolve("http://127.0.0.1:40910") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: stream });
+        assert.equal(res.status, 200, "never a false refusal from missing data");
+        assert.equal(sink.length, 1);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: incident shape — declared window 262144 with a ~3 MiB body is refused by the ceiling, not the floored-out doom math (#5405/#5408)", async () => {
+    // The #4079 floor makes the doom bar max(262144, 1_000_000) tokens ≈ 4 MB
+    // of bytes/4 reach; a 3 MiB body sails past it even though it exceeds the
+    // declared window by ~3.7×. That is how the 975K-token field shape would
+    // have slipped the gate path too.
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40911",
+        ready: Promise.resolve("http://127.0.0.1:40911"),
+        takeoverGate: () => false,
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-bili-plugin-context-window": "262144" },
+            body: "d".repeat(3 * 1024 * 1024),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
+    });
+    assert.deepEqual(sink, []);
+});
+
+test("install: degraded proxy-down direct sends keep window-math-only behavior — the ceiling does not apply (#5405/#5408)", async () => {
+    // Scoping pin: non-degraded callers only. With no window source the doom
+    // math is disarmed and #4079/#4516 say fail open — a known large window on
+    // those paths can genuinely fit a big body (#4894 per-request resolution).
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const { sink, result } = await withPatch(state, async (fetch) => {
+        return fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "e".repeat(3 * 1024 * 1024) });
+    });
+    assert.equal(result.status, 200, "degraded direct send unchanged when the doom math is disarmed");
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/chat/completions"]);
+});
+
+test("install: a restored lane body over the ceiling is refused even if the original request was small (#5405/#5408)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40912",
+        ready: Promise.resolve("http://127.0.0.1:40912"),
+        takeoverGate: () => false,
+        prepareDirectSend: async () => ({ outcome: "restored", body: "f".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) }),
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "{}" });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+    });
+    assert.deepEqual(sink, [], "what goes out is the RESTORED body — measure that, not the original");
 });
 
 test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
