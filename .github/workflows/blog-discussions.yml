@@ -1,0 +1,41 @@
+# Blog pipeline — one bilingual GitHub Discussion per blog post (owner decision 2026-11-01).
+# Fires when the blog surface changes on master; the script no-ops by itself both
+# when there is nothing to do and on its own manifest write-back pushes (commit
+# prefix guard — see scripts/blog-discussions.mjs). No third-party host involved:
+# api.github.com only, so it works from every network the repo itself works from.
+name: blog-discussions
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "website/blog/posts/**"
+      - "website/articles.json"
+
+permissions:
+  contents: write    # single write-back commit recording thread numbers in articles.json
+  discussions: write # creating the threads themselves
+
+concurrency:
+  group: blog-discussions
+  cancel-in-progress: false  # cancelling between "thread created" and "number recorded" would orphan a thread
+
+jobs:
+  sync-discussions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Create missing discussion threads and record their numbers
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: node scripts/blog-discussions.mjs
