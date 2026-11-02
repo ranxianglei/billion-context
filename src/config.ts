@@ -997,8 +997,9 @@ export type ProxyOptions = {
  *  `allowDshCompaction` escape hatch was REMOVED (#3651) — dsh native
  *  compaction is now refused unconditionally by the #1729 wire guard on every
  *  lane, and a landed checkpoint durably shadows the raw history
- *  (irreversible), so no opt-in remains. The one live key is
- *  `authoredCompaction` (#3723/#3901). Leftover removed keys still sit in old
+ *  (irreversible), so no opt-in remains. Live keys: `authoredCompaction`
+ *  (#3723/#3901), `contextTab`/`contextTabLabel` (#4237), `autoReviewBlock`
+ *  (#4634). Leftover removed keys still sit in old
  *  files: the section stays RECOGNIZED so they don't trip the unknown-key
  *  warning, and each is ignored with a once-per-process deprecation note
  *  (warnRemovedDshAllowKey). */
@@ -1019,9 +1020,19 @@ interface DshFileSettings {
     /** #4237: custom label for that tab (display preference, file-only per
      *  #2030 — no env tier). Trimmed non-empty string wins over the built-in
      *  localized "上下文"/"Context"; empty/absent/non-string keeps it. The
-     *  rename exists for machines where another plugin occupies the same name
-     *  (dsh-context ships its own "上下文"). */
+     *  rename exists for machines where another plugin occupies the same
+     *  name (dsh-context ships its own "上下文"). */
     contextTabLabel?: string;
+    /** #4634: block dsh auto-review traffic — answer it locally with a minimal
+     *  low-risk verdict instead of forwarding upstream. ON by default (= absent
+     *  or `true`; `false` or env `BILI_DSH_AUTOREVIEW_BLOCK=0` restores
+     *  forwarding). Every review re-sends a growing self-contained conversation
+     *  snapshot billed in full per call — steady-state miss O(history), whole
+     *  accumulated lane re-billed on a model switch (~728K one-shot measured in
+     *  #4634). Settable from the Web config page (raw JSON editor); resolved
+     *  per request so a running proxy flips without restart. See
+     *  src/server/dsh-auto-review-block.ts for the verdict-shape constraints. */
+    autoReviewBlock?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -2481,9 +2492,11 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     const d = obj.dsh;
     if (d !== null && typeof d === "object" && !Array.isArray(d)) {
         // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
+        // (#4237), autoReviewBlock (#4634) are the LIVE keys in the section —
+        // everything else found here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel", "autoReviewBlock"]);
         // (#4237) are the LIVE keys in the section — everything else found
         // here is removed/unknown and gets named.
-        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
         for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();

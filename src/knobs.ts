@@ -601,6 +601,19 @@ export function dshContextTabEnabled(): boolean {
     return loadConfigFile().dsh?.contextTab !== false;
 }
 
+/** BILI_DSH_AUTOREVIEW_BLOCK > dsh.autoReviewBlock > true (#4634). Whether dsh
+ *  auto-review traffic is answered LOCALLY with an empty completion instead of
+ *  forwarded upstream (cost rationale in src/server/dsh-auto-review-block.ts:
+ *  every review re-sends a growing self-contained snapshot billed in full —
+ *  O(history) steady-state, whole-lane re-bill on a model switch). Default ON
+ *  per owner direction; "0"/"false" (env) or false (file, settable from the Web
+ *  config page) restores forwarding. Read per-request so a running proxy flips
+ *  without a restart. */
+export function dshAutoReviewBlockEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_AUTOREVIEW_BLOCK;
+    if (envRaw !== undefined) return !(envRaw.trim() === "0" || envRaw.trim().toLowerCase() === "false");
+    return loadConfigFile().dsh?.autoReviewBlock !== false;
+}
 /** dsh.contextTabLabel (#4237): custom label for that Context tab. File-only
  *  on purpose (#2030 env-var discipline: a display preference, not a secret /
  *  spawn channel / host posture) and settable from the Web config page. A
