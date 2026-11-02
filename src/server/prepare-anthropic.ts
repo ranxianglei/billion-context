@@ -44,6 +44,7 @@ import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStam
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
+import { observeOutboundPrefix } from "./outbound-prefix.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -599,6 +600,7 @@ export async function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     warnAnthropicThinkingPairs(parsed.messages, rebuiltMessages, log, sessionId);
+    observeOutboundPrefix(sessionId, rebuiltMessages, session.metadata, log);
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
