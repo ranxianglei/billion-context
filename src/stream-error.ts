@@ -292,3 +292,10 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
         }
     }
 }
+
+/** The non-streaming preflight fail-fast JSON body — one source of truth
+ *  shared by the status-code responses (handle.ts) and the committed in-band
+ *  terminal frame appended after the #568 whitespace padding (#3978). */
+export function preflightFailFastBody(message: string, retryable: boolean): string {
+    return JSON.stringify({ error: { type: "server_error", code: "preflight_compress_failed", message, retryable } });
+}
