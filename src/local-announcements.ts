@@ -9,10 +9,10 @@ import { configDir } from "./paths.js";
 import { log } from "./logger.js";
 import { validateNoticeRecord, type NoticeRecord } from "./notices.js";
 
-export const ANNOUNCEMENTS_DIRNAME = "announcements";
+const ANNOUNCEMENTS_DIRNAME = "announcements";
 export const LOCAL_FILE_CAP_BYTES = 64 * 1024; // §六.3 size cap
 
-export interface LocalAnnouncementLoad {
+interface LocalAnnouncementLoad {
     records: NoticeRecord[];
     errors: Array<{ file: string; reason: string }>;
 }
