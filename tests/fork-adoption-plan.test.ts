@@ -79,6 +79,9 @@ test("resume adoption never writes the kernel BLOCKED sentinel into byRef (#2620
             messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
         },
         blockContents: new Map(),
+        // Session metadata is a required field (persist assigns it on every load);
+        // applyForkAdoption writes the #5519 ladder-init flag into it.
+        metadata: {},
     } as unknown as Session;
     const plan = planForkAdoption(parent, new Set(["p1", "p2", "r1"]), { seedAllRefs: true, includeBlocks: false });
     assert.equal(plan.refs.byRaw.p1, BLOCKED_REF, "plan carries the sentinel in byRaw");
