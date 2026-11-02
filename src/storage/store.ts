@@ -429,7 +429,7 @@ export class UnifiedStore {
      * verdict) said the file set is sound — a clean close then refreshes the
      * verdict cache onto the post-checkpoint stats so the next boot skips
      * the rescan. Never true while a check is still in flight or failed. */
-         private lastIntegrityOk = false;
+    private lastIntegrityOk = false;
     /** #5539 secondary finding: releaseContent runs once per released hash
      * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
      * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
