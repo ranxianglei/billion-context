@@ -272,7 +272,7 @@ test("repetitionFingerprint distinguishes different tools with identical args", 
 });
 
 test("RepetitionTracker escalates none -> warn -> final-refuse -> abort (#5225)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
+    const t = new RepetitionTracker({ warn: 3, abort: 5 });
     assert.equal(t.note("x", {}).action, "none");
     assert.equal(t.note("x", {}).action, "none");
     assert.equal(t.note("x", {}).action, "warn");
@@ -283,7 +283,7 @@ test("RepetitionTracker escalates none -> warn -> final-refuse -> abort (#5225)"
 });
 
 test("RepetitionTracker resets on a different fingerprint (args or tool name)", () => {
-    const t = new RepetitionTracker({ warn: 2, abort: 99, backstopEnabled: true });
+    const t = new RepetitionTracker({ warn: 2, abort: 99 });
     t.note("x", { a: 1 });
     t.note("x", { a: 1 });
     assert.equal(t.note("x", { a: 2 }).action, "none");
@@ -291,7 +291,7 @@ test("RepetitionTracker resets on a different fingerprint (args or tool name)", 
 });
 
 test("RepetitionTracker.reset() clears the run", () => {
-    const t = new RepetitionTracker({ warn: 2, abort: 3, backstopEnabled: true });
+    const t = new RepetitionTracker({ warn: 2, abort: 3 });
     t.note("x", {});
     t.note("x", {});
     t.reset();
@@ -318,11 +318,7 @@ function wireRepetition(opts: GuardrailOptions = {}) {
         },
     } as unknown as ExtensionAPI;
     const ctx = makeRepCtx();
-    const merged: GuardrailOptions =
-        opts.repetition === false
-            ? opts
-            : { ...opts, repetition: { ...(opts.repetition as { enabled?: boolean; warn?: number; abort?: number } ?? {}), backstopEnabled: true } };
-    wireToolGuardrails(pi, merged);
+    wireToolGuardrails(pi, opts);
     return {
         call: (event: unknown) => handlers["tool_call"]!(event, ctx),
         result: (event: unknown) => handlers["tool_result"]!(event),
@@ -361,19 +357,35 @@ test("repetition guard refuses once at abort=5 and only aborts on the repeat aft
     assert.match(fifth?.reason ?? "", /FINAL WARNING/);
     assert.match(fifth?.reason ?? "", /refused and NOT executed/i);
     assert.equal(w.ctx.abortCalls, 0, "the refusal must NOT kill the turn — the model gets one live chance to change approach");
-    // Calls 6-9: soft stop (abort action) — blocked but no ctx.abort
+    const sixth = w.call(statusCall("k6")) as { block?: boolean; reason?: string };
+    assert.equal(sixth?.block, true, "a repeat after the final refusal is blocked");
+    assert.match(sixth?.reason ?? "", /BLOCKED/);
+    assert.match(sixth?.reason ?? "", /has been aborted/i, "default-path notice stays truthful: the turn IS aborted");
+    assert.equal(w.ctx.abortCalls, 1, "turn must be aborted exactly once, at the repeat after the final refusal");
+    const seventh = w.call(statusCall("k7")) as { block?: boolean };
+    assert.equal(seventh?.block, true, "still blocked after abort");
+});
+
+test("repetition guard recovery mode soft-stops calls 6-9 and hard-aborts at backstop 10 (#5505)", () => {
+    const w = wireRepetition({ repetition: { recovery: true } });
+    for (const id of ["r1", "r2", "r3", "r4"]) {
+        assert.equal(w.call(statusCall(id)), undefined, "below abort must not block");
+    }
+    const fifth = w.call(statusCall("r5")) as { block?: boolean; reason?: string };
+    assert.equal(fifth?.block, true, "final refusal fires at abort=5 even in recovery mode");
+    assert.equal(w.ctx.abortCalls, 0, "final refusal keeps the turn alive");
     for (let i = 6; i <= 9; i++) {
-        const c = w.call(statusCall(`k${i}`)) as { block?: boolean; reason?: string };
+        const c = w.call(statusCall(`r${i}`)) as { block?: boolean; reason?: string };
         assert.equal(c?.block, true, `call ${i} must be blocked`);
         assert.match(c?.reason ?? "", /BLOCKED/);
+        assert.match(c?.reason ?? "", /forcibly terminated/i, "stuck-report names the backstop promise");
+        assert.doesNotMatch(c?.reason ?? "", /has been aborted/i, "soft-stop must not claim the turn was aborted");
     }
-    assert.equal(w.ctx.abortCalls, 0, "calls 6-9 are soft-stopped (no ctx.abort)");
-    // Call 10: hard abort at backstop (abortThreshold + 5 = 10)
-    const tenth = w.call(statusCall("k10")) as { block?: boolean; reason?: string };
-    assert.equal(tenth?.block, true, "call 10 must be blocked");
-    assert.match(tenth?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
-    assert.doesNotMatch(tenth?.reason ?? "", /turn ends on its own/i, "stuck-report must not claim turn ends on its own");
-    assert.equal(w.ctx.abortCalls, 1, "call 10 triggers ctx.abort (hard backstop)");
+    assert.equal(w.ctx.abortCalls, 0, "calls 6-9 are soft-stopped — no ctx.abort");
+    const tenth = w.call(statusCall("r10")) as { block?: boolean; reason?: string };
+    assert.equal(tenth?.block, true, "backstop call is blocked");
+    assert.match(tenth?.reason ?? "", /has been aborted/i, "hard-abort uses the truthful aborted notice");
+    assert.equal(w.ctx.abortCalls, 1, "backstop triggers ctx.abort exactly once");
 });
 
 test("#5225: legit bounded polling survives the final refusal and escapes via changed arguments", () => {
@@ -438,18 +450,26 @@ test("repetition guard honors custom warn/abort thresholds", () => {
     assert.equal(third?.block, true, "final refusal fires at custom abort=3");
     assert.match(third?.reason ?? "", /FINAL WARNING/);
     assert.equal(w.ctx.abortCalls, 0, "custom-abort final refusal keeps the turn alive (#5225)");
-    // Calls 4-7: soft stop (abort action) — blocked but no ctx.abort
+    const fourth = w.call(statusCall("t4")) as { block?: boolean };
+    assert.equal(fourth?.block, true, "a repeat after the final refusal kills the turn");
+    assert.equal(w.ctx.abortCalls, 1);
+});
+
+test("repetition guard recovery mode honors custom thresholds: soft 4-7, hard abort at backstop 8 (#5505)", () => {
+    const w = wireRepetition({ repetition: { warn: 2, abort: 3, recovery: true } });
+    assert.equal(w.call(statusCall("s1")), undefined);
+    assert.equal(w.call(statusCall("s2")), undefined, "warn=2 queues a warning without blocking");
+    const third = w.call(statusCall("s3")) as { block?: boolean };
+    assert.equal(third?.block, true, "final refusal fires at custom abort=3");
     for (let i = 4; i <= 7; i++) {
-        const c = w.call(statusCall(`t${i}`)) as { block?: boolean; reason?: string };
+        const c = w.call(statusCall(`s${i}`)) as { block?: boolean; reason?: string };
         assert.equal(c?.block, true, `call ${i} must be blocked`);
+        assert.match(c?.reason ?? "", /forcibly terminated/i, "stuck-report names the custom backstop");
     }
-    assert.equal(w.ctx.abortCalls, 0, "calls 4-7 are soft-stopped (no ctx.abort)");
-    // Call 8: hard abort at backstop (abortThreshold + 5 = 8)
-    const eighth = w.call(statusCall("t8")) as { block?: boolean; reason?: string };
+    assert.equal(w.ctx.abortCalls, 0, "soft window runs to backstop-1 without aborting");
+    const eighth = w.call(statusCall("s8")) as { block?: boolean };
     assert.equal(eighth?.block, true, "backstop fires at custom abort+5=8");
-    assert.match(eighth?.reason ?? "", /forcibly terminated/i, "hard-abort must mention forced termination");
-    assert.doesNotMatch(eighth?.reason ?? "", /turn ends on its own/i, "stuck-report must not claim turn ends on its own");
-    assert.equal(w.ctx.abortCalls, 1, "call 8 triggers ctx.abort (hard backstop)");
+    assert.equal(w.ctx.abortCalls, 1, "backstop triggers ctx.abort exactly once");
 });
 
 test("#3170: all three ctx handlers tolerate a missing ctx (no throw, block still enforced)", () => {
