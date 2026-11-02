@@ -42,7 +42,7 @@ for (const wire of WIRES) {
         const record = await driveWire(wire);
         const file = path.join(GOLDEN_DIR, `${wire}.json`);
         if (!fs.existsSync(file)) {
-            assert.fail(`golden missing: ${file} — run \`node --import tsx scripts/update-storage-render-goldens.ts\` and commit the result`);
+            assert.fail(`golden missing: ${file} — run the CI-preloaded regenerator (see scripts/update-storage-render-goldens.ts header) and commit the result`);
         }
         const expected = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
         const actual = JSON.stringify(record, null, 1) + "\n";
@@ -59,7 +59,7 @@ for (const wire of WIRES) {
                 : "";
             assert.fail(
                 `${wire} render/state drifted. foldAt ${record.foldAt} (golden ${exp.foldAt}), editedAt ${record.editedAt} (golden ${exp.editedAt}), stateDigest ${record.stateDigest.slice(0, 16)} (golden ${exp.stateDigest.slice(0, 16)}).${secs}${keys} ` +
-                `If intentional: run \`node --import tsx scripts/update-storage-render-goldens.ts\`, review the diff, justify in the PR body.`,
+                `If intentional: run the CI-preloaded regenerator (guard-enforced command in scripts/update-storage-render-goldens.ts), review the diff, justify in the PR body.`,
             );
         }
         // Structural sanity on top of the byte pin (cheap, keeps a regen honest).
