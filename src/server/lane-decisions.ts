@@ -22,7 +22,7 @@
  * Kernel purity: host-side only, imports nothing from kernel internals.
  */
 
-import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, declaredToolEntries } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
 import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
@@ -52,10 +52,9 @@ interface WireObservation {
 
 function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): ReadonlySet<string> {
     const out = new Set<string>();
-    if (parsed === null || typeof parsed !== "object") return out;
-    const tools = (parsed as Record<string, unknown>)["tools"];
-    if (!Array.isArray(tools)) return out;
-    for (const t of tools) {
+    // #5527: every wire declaration location (top-level tools + Responses
+    // input[].additional_tools), not only the top-level array.
+    for (const t of declaredToolEntries(parsed, protocol)) {
         if (t === null || typeof t !== "object") continue;
         const rec = t as Record<string, unknown>;
         if (typeof rec["name"] === "string" && biliToolsDeclaredOnWire({ tools: [t] }, protocol, rec["name"])) out.add(rec["name"]);
@@ -294,7 +293,8 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
 /** #3884 owner follow-up: make a reachability miss LOUD instead of silent.
  * When an armed nudge stays suppressed because the lane surface is OFF for
  * reachability (not the user's own injectTool=false choice), name what was
- * actually observed on the top-level tool table: the next host omnibus rename
+ * actually observed on the request's declared tool table (every wire
+ * declaration location, #5527): the next host omnibus rename
  * then shows up in bili.log next to the ARMED-SUPPRESSED label as
  * `surface=off(top-level=[new_name])` instead of requiring user archaeology
  * (#3600 and #3884 were both diagnosed from user-reported log dumps). Returns
