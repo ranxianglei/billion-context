@@ -22,7 +22,7 @@
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { createBiliPlugin } from "./pi.js";
+import { createBiliPlugin, piDeclaredWindowForDirect } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -188,6 +188,10 @@ state.beforeSend = ompIncrementalBeforeSend;
 // #3304: the omp swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
 state.prepareDirectSend = createPrepareDirectSend();
+// #5032: arm the guard's second window source — omp never stamps a
+// context-window header (no before_provider_headers), so without this arm
+// the reader was always empty and oversized history egressed on outage.
+state.declaredWindowForDirect = piDeclaredWindowForDirect;
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
@@ -423,6 +427,11 @@ export function _setOmpOriginForTest(origin: string | undefined): void {
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#5032): expose the armed direct-send window reader. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

@@ -29,7 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
-import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
+import { createBiliPlugin, createPiDirectSendGuard, piDeclaredWindowForDirect } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
@@ -134,6 +134,13 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 // sniffs the outgoing envelope and restores the stashed original before any
 // direct-send fall-back reaches the real upstream.
 state.prepareDirectSend = createPiDirectSendGuard();
+// #4894: arm the shared oversize arm for the degraded direct path. pi stamps
+// x-bili-plugin-context-window only on proxy-bound requests (and only when the
+// proxy base resolves), so the not-ready path — the one that egresses the raw
+// history uncompressed — arrives with no header. Without this the guard fell
+// open and a multi-million-token history rode straight to the provider, whose
+// 400 comes back as an unrecoverable "input exceeds the context window".
+state.declaredWindowForDirect = piDeclaredWindowForDirect;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -346,6 +353,11 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#4894): the armed direct-send window reader, if any. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
