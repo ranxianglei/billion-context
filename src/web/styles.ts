@@ -22,6 +22,14 @@ export const WEB_STYLES = String.raw`
     --amber: #9a6700;
     --amber-soft: rgba(154, 103, 0, 0.1);
     --purple: #8250df;
+    /* #5210: compression-tree node-box fills follow the theme. Hardcoded light
+       fills + themed light text were unreadable in dark mode; light values kept
+       byte-identical, dark tints added to both dark palettes below. */
+    --node-fill: #fff;
+    --node-fill-t1: #f2f7ff;
+    --node-fill-t2: #f6f3ff;
+    --node-fill-t3: #fffaf0;
+    --node-fill-n: #f7f8fa;
     --shadow: 0 1px 3px rgba(31, 35, 40, 0.06), 0 1px 2px rgba(31, 35, 40, 0.04);
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -51,6 +59,11 @@ export const WEB_STYLES = String.raw`
         --amber: #d29922;
         --amber-soft: rgba(210, 153, 34, 0.14);
         --purple: #a371f7;
+        --node-fill: #1c2129;
+        --node-fill-t1: #1a2234;
+        --node-fill-t2: #201e32;
+        --node-fill-t3: #28231c;
+        --node-fill-n: #22272e;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     }
 }
@@ -73,6 +86,11 @@ export const WEB_STYLES = String.raw`
     --amber: #d29922;
     --amber-soft: rgba(210, 153, 34, 0.14);
     --purple: #a371f7;
+    --node-fill: #1c2129;
+    --node-fill-t1: #1a2234;
+    --node-fill-t2: #201e32;
+    --node-fill-t3: #28231c;
+    --node-fill-n: #22272e;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 :root[data-theme="light"] {
@@ -283,7 +301,8 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tree-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 2px 0 10px; color: var(--text-muted); }
 .tree-actions { display: flex; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
 /* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
-   (layered block boxes on a light canvas, tier-tinted borders). */
+   (layered block boxes, tier-tinted borders; #5210: node fills follow the
+   theme so the themed text stays readable in dark mode). */
 .tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
 .tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
 .tree-mode { color: var(--text-muted); }
@@ -297,11 +316,11 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
-.g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
-.g-node.tier-1 rect { stroke: var(--accent); fill: #f2f7ff; }
-.g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
-.g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
-.g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
+.g-node rect { fill: var(--node-fill); stroke: var(--border-soft); stroke-width: 1.4; }
+.g-node.tier-1 rect { stroke: var(--accent); fill: var(--node-fill-t1); }
+.g-node.tier-2 rect { stroke: #7a5af8; fill: var(--node-fill-t2); }
+.g-node.tier-3 rect { stroke: #bf8700; fill: var(--node-fill-t3); }
+.g-node.tier-n rect { stroke: #8a8f99; fill: var(--node-fill-n); }
 .g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
 .g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }
