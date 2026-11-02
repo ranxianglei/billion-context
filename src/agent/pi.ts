@@ -669,7 +669,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[]; observedActiveBili?: string[] };
 
 // #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
 // the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
@@ -698,6 +698,31 @@ function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: str
     for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
 }
 
+// #4988: remember which of our registered tools the host currently has ACTIVE.
+// An external loadout manager (pi-loadout) or a manual toggle may deliberately
+// keep a registered bili tool OUT of the loadout, and #3542's recovery must not
+// resurrect those — only tools that were active before the navigation and are
+// gone after it were actually lost to the rewind. session_before_tree fires
+// inside navigateTree BEFORE the leaf switch and the _restoreToolsFromTranscript
+// reset, so a sample taken there IS the pre-navigation loadout; per-request
+// sampling covers hosts without the event. undefined = never sampled → the
+// caller falls back to the original all-registered recovery.
+function sampleActiveBili(pi: ExtensionAPI, state: RegisterState): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return; // nothing registered yet — stay unobserved
+    const getActive = pi.getActiveTools;
+    if (typeof getActive !== "function") return;
+    let names: unknown;
+    try {
+        names = getActive.call(pi);
+        if (!Array.isArray(names)) return;
+    } catch {
+        return; // stale ctx — never guess
+    }
+    const present = new Set(names.filter((n): n is string => typeof n === "string"));
+    state.observedActiveBili = tools.map((t) => t.name).filter((name) => present.has(name));
+}
+
 // #3542: a pi /tree rewind (navigateTree) resets the ACTIVE tool loadout to what
 // the surviving transcript system entries declare (_restoreToolsFromTranscript),
 // discarding the entry that declared our tools whenever it sits after the rewind
@@ -709,6 +734,16 @@ function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: str
 // the host currently holds are never removed), mirroring pi's own reload()
 // precedent of re-activating all extension tools. No loadout query/setter (older
 // pi / omp) or a throwing query → no-op, never a blind set.
+ // #4988: "missing" is judged against the PRE-navigation observation, not against
+ // everything we ever registered — a tool deliberately kept off by an external
+ // loadout manager (or a manual toggle) was inactive before the navigation too, so
+ // it is not among the candidates and its off state survives in either handler
+ // order. Never sampled (host without session_before_tree) → the original
+ // all-registered recovery stands. Known boundary: when SOURCE and TARGET branches
+ // carry DIFFERENT selections (active on source, deliberately off on target), the
+ // post-nav absence looks exactly like a rewind drop from bili's local view — bili
+ // running LAST resurrects it, only the manager-last order keeps the target
+ // selection; closing that needs a coordination signal, not a better local guess.
 function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent: string): void {
     const tools = state.registeredTools;
     if (tools === undefined || tools.length === 0) return;
@@ -724,14 +759,17 @@ function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent:
         return; // stale ctx — same guard as reassertDroppedTools
     }
     const present = new Set(active);
-    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    const registeredNames = tools.map((t) => t.name);
+    const observed = state.observedActiveBili;
+    const candidates = observed === undefined ? registeredNames : registeredNames.filter((name) => observed.includes(name));
+    const missing = candidates.filter((name) => !present.has(name));
     if (missing.length === 0) return;
     try {
         setActive.call(pi, [...active, ...missing]);
     } catch {
         return; // setter rejected — never break the navigation
     }
-    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542)`);
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542/#4988)`);
 }
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
@@ -746,6 +784,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
         // #2708: already registered for this sid — but pi may have rebuilt its
         // registry since and dropped our tools. Re-assert if they vanished.
         reassertDroppedTools(pi, state, agent, proxyBase);
+        // #4988: keep the pre-navigation observation fresh on hosts whose
+        // session_tree is not preceded by a usable session_before_tree sample.
+        sampleActiveBili(pi, state);
         return;
     }
     if (state.pending !== undefined) return state.pending;
@@ -1629,6 +1670,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 }
             }
             state.sid = undefined;
+            // #4988: a new session has no pre-navigation observation yet.
+            state.observedActiveBili = undefined;
             // #1586 review: session_start captures its ctx for the whole
             // session — never suspend across it here. One-shot flows replace
             // the session inside async windows, so an awaited native-origin
@@ -1655,6 +1698,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         pi.on("session_shutdown", () => {
             disposeSubagentSelfReg(subagentReg);
         });
+        // #4988: session_before_tree fires inside navigateTree BEFORE the leaf
+        // switch and the loadout reset — sample our tools' pre-navigation
+        // activity there so the re-assert below can tell a rewind-dropped tool
+        // apart from one deliberately kept off by an external loadout manager.
+        pi.on("session_before_tree", () => sampleActiveBili(pi, state));
         // #3542: a /tree rewind resets the active loadout from the transcript —
         // re-assert ours right after the reset (see reassertLoadoutAfterTree).
         pi.on("session_tree", () => reassertLoadoutAfterTree(pi, state, agent));
