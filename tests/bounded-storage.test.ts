@@ -116,6 +116,25 @@ test("already-persisted sessions are retained when saving newer mutations fails"
     assert.equal(session.metadata.newer, "unsaved work");
 }));
 
+test("releaseInFlight folds raw lastMessages to bounded view when request completes (#3050)", async () => fixture(async (_dir, store) => {
+    const session = getSession("ast-fold-test");
+    acquireInFlight(session);
+    session.lastMessages = [
+        { id: "m1", role: "user", contentType: "text", text: "hello" },
+        { id: "m2", role: "assistant", contentType: "text", text: "world" },
+        { id: "m3", role: "user", contentType: "text", text: "more messages here" },
+    ];
+    session.lastMessagesFolded = false;
+    assert.equal(session.lastMessages.length, 3);
+    assert.equal(session.lastMessagesFolded, false);
+
+    releaseInFlight(session);
+
+    assert.equal(session.inFlight, 0);
+    assert.equal(session.lastMessagesFolded, true);
+    assert.ok(session.lastMessages && session.lastMessages.length > 0);
+}));
+
 test("byte budget pins active state, admits concurrent requests, and releases idle state to disk", async () => fixture(async (_dir, store) => {
     _resetSessionsForTest(256, 32000);
     const session = getSession("large-active");

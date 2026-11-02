@@ -3977,7 +3977,7 @@ function persistTailTokens(): number {
  *  PersistedSession.messages. Truncation keeps whole messages from the NEWEST
  *  end; at least one message always survives (even if it alone exceeds the
  *  budget — a handoff doc with an empty tail is useless). */
-function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
+export function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
     const msgs = session.lastMessages;
     if (!msgs || msgs.length === 0) return undefined;
     const budget = persistTailTokens();

@@ -1,7 +1,7 @@
 import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
-import { getStore, effectiveFileStorageMode } from "./persist.js";
+import { getStore, effectiveFileStorageMode, boundedFoldedSnapshot } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile } from "./config.js";
@@ -1428,10 +1428,21 @@ export function acquireInFlight(session: Session): void {
 /** Release an in-use marker. Decrements; the session becomes evictable again. */
 export function releaseInFlight(session: Session): void {
     if (session.inFlight > 0) session.inFlight--;
+    if (session.inFlight === 0 && session.lastMessages && session.lastMessagesFolded !== true) {
+        // Discharge raw request AST memory once the request cycle has finished
+        const folded = boundedFoldedSnapshot(session);
+        if (folded) {
+            session.lastMessages = folded;
+            session.lastMessagesFolded = true;
+        }
+    }
     residentWeights.delete(session);
     // Active sessions are pinned. Once a request finishes, discharge its
     // growth before admitting more historical sessions into the cache.
     while (residentBytes() > MAX_RESIDENT_BYTES && evictOldest()) { /* bounded cache */ }
+    if (typeof (globalThis as unknown as { gc?: () => void }).gc === "function") {
+        (globalThis as unknown as { gc: () => void }).gc();
+    }
 }
 
 /** Total in-flight requests across all sessions (sum of per-session
