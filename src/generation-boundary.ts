@@ -20,13 +20,27 @@
 // renders for the session's lifetime — static text, byte-stable across turns,
 // prefix-cache safe after the (typically never-visible) one-time append.
 //
+// #5543 adds WITNESSED seeding: the two host-side split points where a new
+// ref-ledger generation is born under an already-running conversation (a
+// persona fork onto a suffixed session key, and the native-compaction rebase)
+// call witnessGenerationReset AT THE MOMENT OF THE SPLIT. Residue detection
+// alone is blind to exactly the worst case — a reset that cut off an execution
+// tail discards the citing text too, so nothing ever triggers detection and
+// the model reports completion of steps whose execution was lost, with zero
+// trace of the reset anywhere user-visible. Witnessing makes the note ride
+// from the first turn of the new generation, stamps the [acp-gen-reset] log
+// marker at the split moment, and feeds the acp_status GENERATION BOUNDARY
+// section. First-wins: the earliest boundary of a generation is the one the
+// model must reason about.
+//
 // Deliberately display-only: no storage rewrite, no ref-space surgery, no gate
 // changes. The text carries no numbers: the frontier advances as the session
 // allocates, and a fixed ceiling would go stale within turns. Concrete ceilings
 // stay with the reactive notes (beyondFrontierNote / frontierClampNote), which
 // fire on the actual failure and always quote the live value.
 
-import { markDirty, type Session } from "./session.js";
+import { markDirty, peekSession, type Session } from "./session.js";
+import { getStore } from "./persist.js";
 import type { CoreMessage } from "acp-kernel";
 
 /** Session-metadata key for the one-shot detection record. */
@@ -45,20 +59,28 @@ const REF_CITATION_RE = /\bm(\d{4,})\b/g;
 const BYREF_KEY_RE = /^m(\d+)$/;
 
 interface GenerationBoundaryRecord {
-    /** First-detection time (ms epoch). */
+    /** First-detection/witness time (ms epoch). */
     at: number;
-    /** This session's highest mapped ref at detection ("mNNNNN" or "" when none) — evidence anchor, log surface only. */
+    /** The previous generation's highest ref ("mNNNNN" or "" when none) — evidence anchor, log/display surface only. */
     frontier: string;
-    /** Highest stale citation seen at detection — log surface only. */
-    maxStaleRef: string;
+    /** Highest stale citation seen at detection — log surface only. Absent on witnessed records (no residue scan ran). */
+    maxStaleRef?: string;
+    /** How the boundary came to be known ("persona-fork" / "native-compaction-rebase"); absent = residue-detected. */
+    reason?: string;
+    /** One-line human context for the witness (keys involved etc.) — display surface only. */
+    detail?: string;
 }
 
 export function readGenerationBoundary(session: Session): GenerationBoundaryRecord | undefined {
     const raw = session.metadata?.[STORAGE_KEY];
     if (!raw || typeof raw !== "object") return undefined;
     const r = raw as Record<string, unknown>;
-    if (typeof r.at !== "number" || typeof r.frontier !== "string" || typeof r.maxStaleRef !== "string") return undefined;
-    return { at: r.at, frontier: r.frontier, maxStaleRef: r.maxStaleRef };
+    if (typeof r.at !== "number" || typeof r.frontier !== "string") return undefined;
+    const rec: GenerationBoundaryRecord = { at: r.at, frontier: r.frontier };
+    if (typeof r.maxStaleRef === "string") rec.maxStaleRef = r.maxStaleRef;
+    if (typeof r.reason === "string") rec.reason = r.reason;
+    if (typeof r.detail === "string") rec.detail = r.detail;
+    return rec;
 }
 
 /** Highest allocated mNNNNN number in the session's ref map (0 when empty).
@@ -120,7 +142,55 @@ export function detectGenerationBoundary(
     return true;
 }
 
+/** #5543: witness a ref-ledger generation reset AT THE MOMENT IT HAPPENS. The
+ *  two host-side split points call this (a persona fork onto a suffixed session
+ *  key, and the native-compaction rebase) so the standing note rides from the
+ *  FIRST turn of the new generation instead of waiting for residue detection —
+ *  which never fires when the reset discarded the citing text too. First-wins:
+ *  an already-recorded boundary (witnessed or detected) is never overwritten.
+ *  Returns true when the record was seeded by this call. */
+export function witnessGenerationReset(
+    session: Session,
+    witness: { reason: string; detail?: string; frontier: number },
+    log?: (level: string, msg: string) => void,
+): boolean {
+    if (readGenerationBoundary(session)) return false;
+    const record: GenerationBoundaryRecord = {
+        at: Date.now(),
+        frontier: witness.frontier > 0 ? indexToRef(witness.frontier) : "",
+        reason: witness.reason,
+    };
+    if (witness.detail) record.detail = witness.detail;
+    (session.metadata ?? (session.metadata = {}))[STORAGE_KEY] = record;
+    markDirty(session);
+    log?.("info", `[${session.id}] [acp-gen-reset] ref-ledger generation reset witnessed (${witness.reason}${witness.detail ? ` — ${witness.detail}` : ""}; previous-generation frontier ${record.frontier || "unknown"}) — refs minted before this session's ledger are inert here; standing generation-boundary note active from this turn (#5543)`);
+    return true;
+}
+
+/** #5543: persona-fork variant of the witness, called from the conversation-
+ *  resolution seam where a request lands on a FRESH suffixed-key session while
+ *  its conversation id already owns a session. Witnesses only when there is a
+ *  previous generation to lose: the forked session is still empty AND the raw
+ *  session has minted refs (a fork born before any main turn — #2156 title-gen
+ *  sidecar — has none). Returns true when the record was seeded. */
+export function witnessForkedGeneration(
+    session: Session,
+    rawSessionId: string,
+    conversationKey: string,
+    log?: (level: string, msg: string) => void,
+): boolean {
+    if (session.state.blocks.length > 0 || highestMappedIndex(session.state) > 0) return false;
+    const rawSess = peekSession(rawSessionId) ?? getStore().loadSync(rawSessionId) ?? undefined;
+    const rawFrontier = rawSess ? highestMappedIndex(rawSess.state) : 0;
+    if (rawFrontier <= 0) return false;
+    return witnessGenerationReset(session, {
+        reason: "persona-fork",
+        detail: `conversation ${rawSessionId} forked onto ${conversationKey}`,
+        frontier: rawFrontier,
+    }, log);
+}
+
 /** Standing model-visible note, appended to the ACP standing system block once
- *  detected. Static by design (see module header) — it must never embed moving
- *  values or the prefix cache breaks every allocation. */
-export const GENERATION_BOUNDARY_NOTE = "Generation boundary: this conversation's message-ref ledger was reset mid-conversation (a model or upstream switch restarted refs at m00001). Refs quoted earlier in your visible history — tool results, summaries, your own earlier replies — may belong to the previous generation: some are permanently inert (compress/decompress targeting them always fails), and any number that happens to exist in the current ledger now points at a DIFFERENT message than before. Before calling compress, verify every ref you plan to target against the current acp_status report; do not trust refs quoted in older tool results or summaries.";
+ *  detected OR witnessed. Static by design (see module header) — it must never
+ *  embed moving values or the prefix cache breaks every allocation. */
+export const GENERATION_BOUNDARY_NOTE = "Generation boundary: this conversation's message-ref ledger was reset mid-conversation (a model or upstream switch restarted refs at m00001). Refs quoted earlier in your visible history — tool results, summaries, your own earlier replies — may belong to the previous generation: some are permanently inert (compress/decompress targeting them always fails), and any number that happens to exist in the current ledger now points at a DIFFERENT message than before. Before calling compress, verify every ref you plan to target against the current acp_status report; do not trust refs quoted in older tool results or summaries. If your last instruction before this boundary involved EXECUTING steps (writing files, running commands, pushing, syncing, deploying), treat any earlier 'done'/'completed' report as UNVERIFIED — the execution tail may have been lost across the boundary while its planning and reporting survived in summaries. Check the real state (disk, git, remotes) before claiming completion.";

@@ -19,6 +19,7 @@ import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports,
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { witnessForkedGeneration } from "../generation-boundary.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
@@ -1432,6 +1433,15 @@ async function handleRequest(
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
+        // #5543: a FRESH persona fork restarts the ref ledger at m00001 under a
+        // suffixed key while the model's visible history keeps citing the RAW
+        // session's refs — witness the generation reset at the split moment so
+        // the standing note, the [acp-gen-reset] marker and the acp_status
+        // GENERATION BOUNDARY section are live from the fork's first turn. The
+        // helper gates itself (fresh fork + raw session with minted refs).
+        if (personaForked && rawPersonaIdentity !== undefined) {
+            witnessForkedGeneration(session, rawPersonaIdentity, conversation, log);
+        }
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
             acquireInFlight(session);

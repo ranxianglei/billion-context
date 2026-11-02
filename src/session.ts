@@ -1,6 +1,7 @@
 import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
+import { witnessGenerationReset } from "./generation-boundary.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
@@ -1703,6 +1704,15 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
         rebasedAt: Date.now(),
     };
     markDirty(session);
+    // #5543: witness the reset at the rebase moment itself — the compacted
+    // resend starts a fresh m00001 ledger while the visible history keeps
+    // citing pre-compaction refs, so the standing note + [acp-gen-reset]
+    // marker go live from the next turn without waiting for residue detection.
+    witnessGenerationReset(session, {
+        reason: "native-compaction-rebase",
+        detail: "client-native compaction rebased the ACP state onto the compacted history",
+        frontier: highestBefore,
+    }, loggerLog);
     return true;
 }
 
