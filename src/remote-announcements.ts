@@ -9,13 +9,13 @@ import { log as loggerLog, type Logger } from "./logger.js";
 import { cacheDir } from "./paths.js";
 import { CHECK_INTERVAL_MS, egressDispatcher } from "./update.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { applyRemoteDoc, REMOTE_DOC_CAP_BYTES, registerDynamicNoticeIds, type NoticeRecord } from "./notices.js";
+import { applyRemoteDoc, REMOTE_DOC_CAP_BYTES, REMOTE_DOC_VERSION, registerDynamicNoticeIds, type NoticeRecord } from "./notices.js";
 
 export const DEFAULT_REMOTE_ANNOUNCEMENTS_URL = "https://raw.githubusercontent.com/ranxianglei/billion-context/master/announcements/remote.json";
 const FETCH_TIMEOUT_MS = 8000;
 const SNAPSHOT_FILE = "announcements-remote-snapshot.json";
 
-export interface RemoteAnnouncementOptions {
+interface RemoteAnnouncementOptions {
     /** Override the feed URL (env BILI_ANNOUNCEMENTS_URL wins over this). */
     url?: string;
     resolveProxy?: (url: string) => string | undefined;
@@ -84,7 +84,7 @@ export function loadRemoteSnapshot(): NoticeRecord[] {
 function saveRemoteSnapshot(entries: readonly NoticeRecord[]): void {
     try {
         fs.mkdirSync(path.dirname(snapshotFile()), { recursive: true });
-        fs.writeFileSync(snapshotFile(), JSON.stringify({ v: 1, entries }, null, 2) + "\n");
+        fs.writeFileSync(snapshotFile(), JSON.stringify({ v: REMOTE_DOC_VERSION, entries }, null, 2) + "\n");
     } catch {
         // cache dir unwritable: in-memory copy still serves this session
     }
