@@ -4974,6 +4974,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
+        for (const id of ["log-ctx", "log-win"]) {
+            const control = $(id);
+            if (control) control.addEventListener("change", loadLogs);
+        }
         for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
             const button = $(buttonId);
             if (button) button.addEventListener("click", async () => {
