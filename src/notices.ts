@@ -383,6 +383,38 @@ export function dismissKeyOf(rec: NoticeRecord): string {
     return `${rec.id}@${noticeHash16(rec)}`;
 }
 
+// ---- P3 lane C: remote document (§五) --------------------------------------
+
+/** Remote document format version; this build reads v1 only. Higher v → the
+ *  WHOLE document is skipped (older builds must never partially parse a newer
+ *  shape, §五.5). */
+export const REMOTE_DOC_VERSION = 1;
+/** Size cap for the remote document body (§六.3): over cap = invalid doc. */
+export const REMOTE_DOC_CAP_BYTES = 512 * 1024;
+
+/** Pure gate for a fetched/published remote document: v header check + each
+ *  entry through the shared whitelist validator. Invalid entries are skipped
+ *  with a warning (reported by the CI gate), never fatal to the rest. */
+export function applyRemoteDoc(raw: unknown): { ok: true; entries: NoticeRecord[]; warnings: string[] } | { ok: false; reason: string } {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "document is not an object" };
+    const doc = raw as Record<string, unknown>;
+    if (doc["v"] !== REMOTE_DOC_VERSION) return { ok: false, reason: `unsupported document version ${JSON.stringify(doc["v"])} (this build reads v${REMOTE_DOC_VERSION})` };
+    const list = doc["entries"];
+    if (!Array.isArray(list)) return { ok: false, reason: "entries missing or not an array" };
+    const entries: NoticeRecord[] = [];
+    const warnings: string[] = [];
+    list.forEach((item, i) => {
+        const r = validateNoticeRecord(item);
+        if (!r.ok) {
+            warnings.push(`entry[${i}]: ${r.reason}`);
+            return;
+        }
+        if (r.droppedFields.length > 0) warnings.push(`entry[${i}]: dropped unknown field(s) ${r.droppedFields.join(", ")}`);
+        entries.push(r.rec);
+    });
+    return { ok: true, entries, warnings };
+}
+
 export const PCK_NOTICE_ID = "pck-default-off";
 export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
 

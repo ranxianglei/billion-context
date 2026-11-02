@@ -1,0 +1,36 @@
+name: announcements-gate
+
+on:
+  # #5548 §五.4: the ONLY new CI touchpoint for the announcement surface —
+  # validate announcements/remote.json with the client's own validator module
+  # so a bad push is blocked before merge (PR) or right after land (push).
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
+    paths:
+      - "announcements/remote.json"
+      - ".github/workflows/announcements-gate.yml"
+  push:
+    branches: [master]
+    paths:
+      - "announcements/remote.json"
+  workflow_dispatch:
+
+concurrency:
+  group: announcements-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: node --import tsx scripts/validate-remote-announcements.ts

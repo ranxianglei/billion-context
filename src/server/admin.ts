@@ -27,6 +27,7 @@ import { dismissedUpgradeNotices, dismissPersistentNotice, instanceDismissedNoti
 import { BUILTIN_NOTICES, dismissKeyOf, dismissModeOf, mergeNoticeLayers, noticeVisible, passesTargeting, registerDynamicNoticeIds, sortNotices, visibleBuiltInNotices, type NoticeRecord, type TargetingContext } from "../notices.js";
 import { installIdOf } from "../install-id.js";
 import { loadLocalAnnouncements } from "../local-announcements.js";
+import { remoteAnnouncementEntries } from "../remote-announcements.js";
 import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -1334,9 +1335,12 @@ function collectVisibleNotices(opts: ProxyOptions): NoticeRecord[] {
     const inst = instanceDismissedNotices();
     const tctx: TargetingContext = { version: VERSION, installId: installIdOf(process.env), now: Date.now() };
     const local = loadLocalAnnouncements(process.env).records;
+    const remote = [...remoteAnnouncementEntries()];
     registerDynamicNoticeIds(local.map((r) => r.id));
+    registerDynamicNoticeIds(remote.map((r) => r.id));
     const merged = mergeNoticeLayers([
         local.filter((r) => passesTargeting(r, tctx) && noticeVisible(r, dismissed, inst)),
+        remote.filter((r) => passesTargeting(r, tctx) && noticeVisible(r, dismissed, inst)),
         visibleBuiltInNotices(
             {
                 promptCacheRouting: effectivePromptCacheRouting(opts.promptCache),
@@ -1348,10 +1352,12 @@ function collectVisibleNotices(opts: ProxyOptions): NoticeRecord[] {
     return sortNotices(merged).filter((r) => passesTargeting(r, tctx));
 }
 
-/** Dismissal lookup by id — local lane first (B overrides A), then built-ins. */
+/** Dismissal lookup by id — local lane first (B > C > A), then built-ins. */
 function findNoticeRecord(id: string): NoticeRecord | undefined {
     const local = loadLocalAnnouncements(process.env).records.find((r) => r.id === id);
     if (local) return local;
+    const remote = remoteAnnouncementEntries().find((r) => r.id === id);
+    if (remote) return remote;
     const b = BUILTIN_NOTICES.find((x) => x.id === id);
     if (!b) return undefined;
     const { active: _active, ...wire } = b;

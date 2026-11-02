@@ -37,6 +37,7 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
+import { startRemoteAnnouncementWatcher } from "./remote-announcements.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -900,4 +901,10 @@ export async function main(): Promise<void> {
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
+    // #5548 lane C: the remote announcement fetch rides the update-check
+    // cadence (§五.2). Unconditional by design: a one-way broadcast with zero
+    // side effects — offline it simply never renders lane C.
+    startRemoteAnnouncementWatcher({
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
 }
