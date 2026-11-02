@@ -339,3 +339,54 @@ test("round2-hold T4: turn-level evidence — a signature seen in round 1 arms t
     assertBlockOrderLegal(out);
     assertNoUnsignedThinkingBlock(out);
 });
+
+// Self-arming: no evidence in history or round 1 — the loop's evidence can only
+// be computed BEFORE the parse starts, so the first round-2 block streams live
+// (nothing arms the hold yet); its signature_delta is what arms the hold for the
+// LATER blocks of the same response. A cut inside the second block must still
+// leave zero unsigned bytes behind, so the blind re-fetch recovers the turn.
+const DEAD_ROUND2_SELFARM = [
+    MESSAGE_START,
+    thinkingStart(0),
+    thinkingDelta(0, "FIRST_BLOCK_PAYLOAD"),
+    signatureDelta(0, "sig_first"),
+    blockStop(0),
+    thinkingStart(1),
+    thinkingDelta(1, "SECOND_BLOCK_HIDDEN"),
+].join("");
+
+test("round2-hold T5: self-arming — a signature seen mid-parse arms the hold for later blocks of the same response", async () => {
+    const { out, calls } = await drainRound2(round1WithCompress({ signedThinking: false }), [DEAD_ROUND2_SELFARM, GOOD_ROUND2], "r2h-t5", UNSIGNED_BODY);
+
+    assert.equal(calls, 2, "the cut second block left nothing unsigned on the wire, so the blind re-fetch fired");
+    assert.ok(!out.includes("SECOND_BLOCK_HIDDEN"), "the self-armed hold kept the second block off the client");
+    assert.ok(out.includes("FIRST_BLOCK_PAYLOAD") && out.includes("sig_first"), "the first block reached the client complete with its signature");
+    assert.ok(out.includes("recovered"), "turn recovered");
+    assert.ok(!/event: error/.test(out), "no client-visible error");
+    assertBlockOrderLegal(out);
+    assertNoUnsignedThinkingBlock(out);
+});
+
+// Opus 5.5 shape in a bili-owned round: start → signature_delta with NO payload
+// deltas between them. The held start must still be released by the signature
+// alone (an empty burst) — otherwise the signature frame would precede its own
+// start and strict clients fall back to non-streaming.
+const COMPLETE_NO_PAYLOAD = [
+    MESSAGE_START,
+    thinkingStart(0),
+    signatureDelta(0, "sig_round2"),
+    blockStop(0),
+    textBlock(1, "done"),
+    MESSAGE_DELTA(),
+    MESSAGE_STOP,
+].join("");
+
+test("round2-hold T6: Opus 5.5 shape — start straight to signature (no payload deltas) releases the held start alone", async () => {
+    const { out, calls } = await drainRound2(round1WithCompress({ signedThinking: false }), [COMPLETE_NO_PAYLOAD], "r2h-t6", SIGNED_HISTORY_BODY);
+
+    assert.equal(calls, 1, "a completed round 2 needs no re-fetch");
+    assert.ok(out.includes("sig_round2"), "the signature reached the client");
+    assert.equal(countEvents(out, (e) => e.type === "content_block_start" && ((e.data.content_block ?? {}) as Record<string, unknown>).type === "thinking"), 1, "exactly one thinking block");
+    assertBlockOrderLegal(out);
+    assertNoUnsignedThinkingBlock(out);
+});
