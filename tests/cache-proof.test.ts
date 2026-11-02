@@ -85,6 +85,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import fs from "node:fs";
+
+// #5483: fold-point carrier relocation became the DEFAULT view transform.
+// This prover keeps pinning the conservative (legacy tail-adjacent) layout so
+// it stays a pure "stable bytes are never rewritten" proof; the relocation's
+// own determinism is proven separately (kernel/tests/relocate-compress.test.ts)
+// until a dedicated byte-stability proof exists for the new default.
+process.env.BILI_COMPRESS_AT_FOLD_POINT = "off";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";

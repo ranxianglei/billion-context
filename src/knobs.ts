@@ -939,23 +939,23 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     return WAL_JOURNAL_SIZE_LIMIT;
 }
 
-/** EXPERIMENTAL fold-point carrier relocation switch (view transform A): when
- *  on, a still-visible compress call/result pair is moved from its original
- *  tail-adjacent position to its own fold point, so resent history ends in
+/** Fold-point carrier relocation switch (view transform A): when on (the
+ *  default, since real-model verification on 2026-11-01 #5470), a still-visible
+ *  compress call/result pair is moved from its original tail-adjacent position
+ *  to its own fold point, so resent history ends in
  *  "[folded region] – [pair] – [protected messages]" instead of a tool exchange
  *  sitting at the very end (which weak-attention models read as a fresh
  *  command). Pure view-side transform — refs/state untouched, recomputed
- *  identically every turn; off = byte-identical to the pre-feature layout.
- *  OPT-IN (default OFF; verified on real models 2026-11-01 #5470, kept opt-in
- *  per owner decision).
+ *  identically every turn. Explicit off = byte-identical to the pre-feature
+ *  layout.
  *  Env BILI_COMPRESS_AT_FOLD_POINT (0/false/off vs 1/true/on) wins over the
- *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = OFF.
+ *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = ON.
  *  Garbage spellings fall through tiers. Pure: never throws. */
 export function resolveCompressAtFoldPoint(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
     const raw = env.BILI_COMPRESS_AT_FOLD_POINT?.trim().toLowerCase();
     if (raw === "1" || raw === "true" || raw === "on") return true;
     if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
+    return typeof fileValue === "boolean" ? fileValue : true;
 }
 
 /** Second opt-in riding on BILI_COMPRESS_AT_FOLD_POINT: drop the contiguous

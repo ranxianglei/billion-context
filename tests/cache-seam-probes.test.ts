@@ -22,6 +22,12 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// #5483: these probes compare adjacent steady-state requests element by
+// element and do not yet declare the fold-point carrier move as an expected,
+// cache-safe divergence. Pin the conservative layout; the shipped default-on
+// bytes are pinned by the storage-render goldens instead (see #5483 body).
+process.env.BILI_COMPRESS_AT_FOLD_POINT = "off";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";

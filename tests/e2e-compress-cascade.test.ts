@@ -66,10 +66,20 @@ test("e2e compress cascade: modelContextLimit resolves percent of native window"
     assert.equal(cfg.modelContextLimit, 100_000, "modelContextLimit '50%' → half of the 200000 native window");
 });
 
-test("e2e compress cascade: nothing configured → base as-is (CCR opt-in); explicit enable flips a fresh config", () => {
+test("e2e compress cascade: zero-config stamps the default-on fold-point knobs (#5483); explicit enable flips a fresh config", () => {
     const plain: ProviderRoutes = { [UPSTREAM]: { models: { "m": { context: 200_000 } } } };
+    // #5483 flipped compressAtFoldPoint to default-on: a lane with NOTHING configured no
+    // longer gets the untouched BASE back — the mapping runs so the stamped defaults reach
+    // every per-request config. CCR opt-in is unchanged (still ccr.enabled === false here);
+    // the fast-path short-circuit survives only when both fold-point knobs resolve falsy.
+    const stripU = (o: object) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
     const cfg = resolveRequestConfig(BASE, plain, UPSTREAM, "m", 200_000, undefined);
-    assert.equal(cfg, BASE, "unset ccr → no default-on flip, fast path returns base (#1207 owner decision)");
+    assert.notEqual(cfg, BASE, "#5483: zero-config lanes receive the stamped fold-point defaults");
+    assert.deepEqual(
+        stripU(cfg),
+        { ...stripU(BASE), compressAtFoldPoint: true, compressAtFoldPointClearThinking: false },
+        "zero-config = base plus exactly the two fold-point stamps (undefined-valued keys ignored)",
+    );
     const armed = resolveRequestConfig(BASE, plain, UPSTREAM, "m", 200_000, { ccr: { enabled: true } });
     assert.notEqual(armed, BASE, "explicit enable → fresh config");
     assert.equal(armed.ccr?.enabled, true, "explicit enable arms");

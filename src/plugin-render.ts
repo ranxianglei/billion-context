@@ -141,9 +141,11 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
     // KNOWN ASYMMETRY (v1, #5470 review): the knob is read from env + the
     // global `compress` file section only, while steady turns resolve through
     // the full cascade — a key set at a provider/model tier moves pairs on
-    // steady turns but not here. Deliberate for now (the feature ships off by
-    // default and global-tier is the common case); wire the resolved value
-    // through in a follow-up.
+    // steady turns but not here. With the default now ON, the no-config and
+    // global-tier cases agree (both on); the divergence only bites when the
+    // knob is set explicitly at a provider/model tier — most plausibly now as
+    // a per-tier opt-OFF. Deliberate for now; wire the resolved value through
+    // in a follow-up.
     if (resolveCompressAtFoldPoint(process.env, loadConfigFile().compress?.compressAtFoldPoint)) {
         merged = relocateCompressCarriers(merged as unknown as Parameters<typeof relocateCompressCarriers>[0], session.state, { isCompressTool: isMcpBiliCompress }) as unknown as BiliMessage[];
     }
