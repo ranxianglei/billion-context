@@ -3382,9 +3382,22 @@ export class SessionStore {
                 }
             };
             this.writerOffPending.set(session.id, run);
-            queueMicrotask(() => {
-                if (this.writerOffPending.get(session.id) === run) run();
-            });
+            // An index-only build is synchronous and costs seconds on a large
+            // session; running it from a microtask mid-request put that cost
+            // between the pipeline and the upstream forward on every turn.
+            // While a request holds the session, re-check on the debounce
+            // interval instead and land the coalesced build once the request
+            // has released it (the legacy JSON writer is likewise debounced).
+            // writeNow / flushSync / shutdown still subsume an armed run.
+            const fire = (): void => {
+                if (this.writerOffPending.get(session.id) !== run) return;
+                if (session.inFlight > 0) {
+                    setTimeout(fire, Math.max(50, this.debounceMs)).unref?.();
+                    return;
+                }
+                run();
+            };
+            queueMicrotask(fire);
             return;
         }
         // #6793-review: the durability arm is only consulted by the writer-off
