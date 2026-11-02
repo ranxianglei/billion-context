@@ -100,10 +100,15 @@ test("#5432 helper: sequential batches keep their relative order before the run"
 const ADAPTER_TRAILING_SYSTEM = "The user hasn't heard from you in a while; continue working.";
 
 function coreEndingInSystem(): ReturnType<typeof anthropicToCore>["msgs"] {
+    // #5438 landed on master: the kernel heal now enforces BOTH sides of the
+    // rule, so the trailing system must FOLLOW a user (or a server-tool-result
+    // assistant) or the kernel demotes it before the host helper runs. q2
+    // makes the fixture legal-follow, matching real Claude Code requests.
     return anthropicToCore({
         messages: [
             { role: "user", content: [{ type: "text", text: "q1" }] },
             { role: "assistant", content: [{ type: "text", text: "a1" }] },
+            { role: "user", content: [{ type: "text", text: "q2" }] },
             { role: "system", content: [{ type: "text", text: ADAPTER_TRAILING_SYSTEM }] },
         ],
     } as never).msgs;
