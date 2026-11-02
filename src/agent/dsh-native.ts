@@ -53,7 +53,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
 import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown, SPAWN_BUDGET_MS } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
@@ -856,6 +856,9 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
+    // #5507: requests racing THIS in-flight launcher spawn hold under the
+    // launcher's own bring-up budget too (rationale at the plan-time arm).
+    state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
     state.onGiveUp = fireGiveUp;
     const landed = start().then((origin) => {
         // #3616: superseded while spawning — report the landing, write nothing.
@@ -1111,6 +1114,8 @@ function maybeRetry(ctx: PluginContext): void {
             if (_spawnForTest === undefined && process.env.NODE_TEST_CONTEXT !== undefined) return;
             respawn = singleFlight(_spawnForTest ?? bootstrap);
             state.respawn = respawn;
+            // #5507: same in-flight-spawn hold as the other arm sites (#4516).
+            state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
         }
         register.retryAt = Date.now() + retryIntervalMs();
         // #3616: same supersession rule as bootstrap()'s own guard — a
@@ -1999,6 +2004,14 @@ export function apply(ctx: PluginContext): void {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
         state.respawn = start;
+        // #5507: a request may hold out for an IN-FLIGHT spawn under the
+        // launcher's own bring-up budget (+margin for health settle) instead of
+        // degrading at the generic 15s readiness cap — a slow cold start must not
+        // refuse or direct-send a turn the proxy would have served had it finished
+        // starting a few seconds later. Same seam pi carries since #4516 (its
+        // #4515 report); this lane previously held only the 15s cap while its
+        // spawn budget was 60s. The attach-mode spawn fallback arms the same hold.
+        state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
         state.onGiveUp = fireGiveUp;
         state.ready = trackChain(start());
     }
@@ -2714,6 +2727,7 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     // survive a reset.
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    state.spawnWaitMs = undefined;
     // #4125: a stale unavailability reason from an earlier scenario must not
     // leak into this scenario's give-up line.
     state.lastUnavailableReason = undefined;
@@ -2796,6 +2810,12 @@ export function _stateToolsReadyForTest(): Promise<unknown> | undefined {
  *  in native-intercept.test.ts; under NODE_TEST_CONTEXT it is not installed). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#5507): expose the in-flight-respawn hold budget armed by the
+ *  launcher-spawn transitions (undefined = generic readiness cap applies). */
+export function _spawnWaitMsForTest(): number | undefined {
+    return state.spawnWaitMs;
 }
 
 /** Test hook (#3380): expose the armed give-up seam so a suite can fire the
