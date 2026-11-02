@@ -178,7 +178,31 @@ export const WIRE_RULES: readonly WireRule[] = [
         summary:
             "consecutive configuration_update items are rejected (400 unsupported_value 'Consecutive configuration_update items are not allowed') — bili folds each adjacent run into one last-wins deep-merged item at every responses-input rebuild/forward boundary",
         provenance:
-            "bili #4882 production 400 (pi lane, master b156c02f, api.anthropic.com: 'messages.1.content.1: Unrecognized request argument. _meta.tool_addition is not supported For details, see https://docs.anthropic.com/en/docs/build-with-claude/tool-use') — pi re-sends mid-conversation system tool-delta messages verbatim; the #4457 fold-orphan fix dropped them to role:user where the control blocks are rejected (they are only legal inside role:system); repair = kernel/src/wire/anthropic.ts healIllegalSystemPositions strips them before demoting, and src/server/prepare-anthropic.ts suppresses the delta sidecar when a fold already covered the change",
+            "bili #1733 production 400 (OMP client via CLIProxyAPI): history compression prunes the messages separating two mid-history configuration_update items (untracked layout slots survive layout shrinkage verbatim) making them adjacent; hoistTrappedToolItems (#766) can also batch two trapped updates together without any compression; fix = mergeAdjacentConfigurationUpdates in src/responses-tool-output.ts applied at patchResponsesInputWithToolImages + all hoistTrappedToolItems call sites",
+    },
+    {
+        id: "WC-010",
+        wire: "anthropic",
+        summary:
+            "at most 4 cache_control breakpoints per request, counted across system blocks + tools entries + message content blocks COMBINED; a 5th is a 400",
+        provenance:
+            "Anthropic prompt-caching API reference ('you can define up to 4 cache breakpoints'); surfaced by the #1639 review — the #1637 stamping emits 1 system + 3 message marks and anthropicToCore harvests client marks from message blocks only, so a client marking only its tools array would have combined into a 5th breakpoint; repair = tools-mark detection suppresses bili's stamps (src/loop/cache-control.ts anthropicToolsCarryCacheControl)",
+    },
+    {
+        id: "WC-013",
+        wire: "responses",
+        summary:
+            "no reasoning.summary — not part of the OpenAI Responses API (reasoning carries effort only); strict-schema upstreams reject the unknown field with 'json: unknown field \"summary\"'. Clients such as pi-ai always send reasoning:{effort,summary:\"auto\"} when a thinking tier is requested, so bili strips it via opt-in compat.dropFields (#1757) — unconfigured, it stays untouched.",
+        provenance:
+            "bili #1757 per-field measurement against SenseNova's Responses gateway https://token.sensenova.cn/v1/responses (2026-09-30): every pi-ai outbound field 200 except reasoning.summary → 400 code InvalidParameter; OpenAI Responses API reference (reasoning.effort is the only documented subfield)",
+    },
+    {
+        id: "WC-014",
+        wire: "responses",
+        summary:
+            "strict Jinja-template backends (Qwen family served by vLLM/SGLang) reject any role:\"system\" message that is not the first chat-producing item — or any second system — raising \"System message must be at the beginning.\" from chat_template.jinja; bili never emits such items itself (front block/anchors ride as developer, nudges/separators as user, top-level instructions stripped), so offenders are client-origin mid-history system items forwarded verbatim by the plugin-mode position-preserving pass-through (#1638); repair = learn-on-failure placement entry (src/compat-roles.ts hasOffHeadSystem → single system→user rewrite hop, remembered per session)",
+        provenance:
+            "bili #1996 production 400 (vLLM /v1/responses serving a Qwen model: artifact:chat_template.jinja Jinja Exception \"System message must be at the beginning.\", code invalid_prompt, every post-compression request of two OMP plugin-mode sessions, 2026-10-03); vLLM Responses→chat passes role-bearing items verbatim (vllm/entrypoints/openai/responses/utils.py _construct_message_from_response_item)",
     },
     {
         id: "WC-023",
