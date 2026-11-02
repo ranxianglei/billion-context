@@ -410,20 +410,22 @@ function isToolUpdateBlock(b: { type?: unknown }): boolean {
 }
 
 /** #5438: does this wire message legitimize a following mid-conversation
- *  system? Only a user message, or an assistant message whose LAST content
- *  block is a server tool_result (per Anthropic's error wording for the two
- *  legal follow positions). */
+ *  system? Per Anthropic's error wording ("an 'assistant' message ending in
+ *  a server tool result"): a user message always does; an assistant message
+ *  does when its LAST content block ends a tool result. On the real wire
+ *  those results ride INSIDE assistant messages as the <name>_tool_result
+ *  family (web_search_tool_result, code_execution_tool_result, … — plain
+ *  tool_result is user-role only, paired with tool_use), so the check takes
+ *  the whole family by suffix: every member shares the convention, future
+ *  server tools inherit it, and no non-result block type ends in
+ *  "tool_result". */
 function legitimatesFollowSide(m: AnthropicWireMessage | undefined): boolean {
   if (!m) return true;
   if (m.role === "user") return true;
-  if (
-    m.role === "assistant" &&
-    Array.isArray(m.content) &&
-    m.content.length > 0 &&
-    m.content[m.content.length - 1]!.type === "tool_result"
-  )
-    return true;
-  return false;
+  if (m.role !== "assistant" || !Array.isArray(m.content) || m.content.length === 0)
+    return false;
+  const lastType = m.content[m.content.length - 1]!.type;
+  return typeof lastType === "string" && lastType.endsWith("tool_result");
 }
 
 function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {

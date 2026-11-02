@@ -103,14 +103,18 @@ function orphanSystems(messages: AnthropicWireMessage[]): number[] {
     while (p >= 0 && messages[p]!.role === "system") p--;
     const pred = p >= 0 ? messages[p] : undefined;
     const pc = pred ? (pred as { content?: unknown }).content : undefined;
+    const lastType =
+      Array.isArray(pc) && pc.length > 0
+        ? ((pc[pc.length - 1] as { type?: unknown } | undefined)?.type)
+        : undefined;
+    // Mirrors legitimatesFollowSide: the whole <name>_tool_result family
+    // legitimizes (plain tool_result included), not just the literal.
     const predOk =
       !pred ||
       pred.role === "user" ||
       (pred.role === "assistant" &&
-        Array.isArray(pc) &&
-        pc.length > 0 &&
-        (pc[pc.length - 1] as { type?: string } | undefined)?.type ===
-          "tool_result");
+        typeof lastType === "string" &&
+        lastType.endsWith("tool_result"));
     const nextOk = !next || next.role === "assistant";
     if (!predOk || !nextOk) bad.push(i);
   }
@@ -223,10 +227,12 @@ test("legal shapes emit verbatim: [user, system, assistant]", () => {
 });
 
 test("server-tool-result-terminated assistant legitimizes the follow side (verbatim)", () => {
-  // Assistant-side tool_result (SERVER tools: web_search & co.) merges with
-  // the preceding assistant core into ONE wire message whose LAST block is a
-  // tool_result — the other legal follow position for a mid-conversation
-  // system. Everything must pass through untouched (cache stability).
+  // INTERNAL construction shape: an assistant core with contentType
+  // "tool-result" merges with the preceding assistant core into ONE wire
+  // message whose LAST block is a literal tool_result — the other legal
+  // follow position for a mid-conversation system. The REAL client wire shape
+  // (<name>_tool_result blocks riding inside the assistant) is pinned by the
+  // next test. Everything must pass through untouched (cache stability).
   const sidecarCore: BiliMessage = {
     id: "s1",
     role: "system",
@@ -257,6 +263,75 @@ test("server-tool-result-terminated assistant legitimizes the follow side (verba
   );
   assert.equal(rebuilt[1]!.role, "system");
   assert.ok(JSON.stringify(rebuilt[1]).includes("tool_addition"));
+});
+
+test("real wire shape: assistant ending in web_search_tool_result legitimizes the follow side (verbatim)", () => {
+  // Production shape (#5432 lane): server-executed tool results ride INSIDE
+  // the assistant message as <name>_tool_result blocks (plain tool_result is
+  // user-role only). anthropicToCore keeps them on the #3410 unknown-block
+  // sidecar, so coreToAnthropic re-emits them verbatim — the merged assistant
+  // ENDS in web_search_tool_result, the API's other legal follow position,
+  // and the sidecar behind it must stay byte-exact (cache stability).
+  const msgs = anthropicToCore({
+    messages: [
+      { role: "user", content: "search for X" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "calling the search" },
+          { type: "server_tool_use", id: "srv_1", name: "web_search" } as never,
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "srv_1",
+            content: [{ type: "text", text: "hits" }],
+          } as never,
+        ],
+      },
+      TOOL_DELTA_SYSTEM,
+      { role: "assistant", content: [{ type: "text", text: "here is what I found" }] },
+    ],
+  } as never).msgs;
+  const rebuilt = coreToAnthropic(msgs);
+  assert.deepEqual(orphanSystems(rebuilt), []);
+  const side = rebuilt.findIndex((m) => m.role === "system");
+  assert.ok(side >= 0, "sidecar survives");
+  const predContent = rebuilt[side - 1]!.content as Array<{ type?: string }>;
+  assert.equal(
+    predContent[predContent.length - 1]!.type,
+    "web_search_tool_result",
+    "merged assistant ends in the real server-tool-result block",
+  );
+  assert.equal(rebuilt[side]!.role, "system", "legal follow side → verbatim, not demoted");
+  assert.ok(JSON.stringify(rebuilt[side]).includes("tool_addition"));
+});
+
+test("gate (both directions): same real shape violating the PRECEDE side is healed", () => {
+  // Follow side LEGAL under the family rule, precede side ILLEGAL (the run's
+  // first non-system follower is a user) → demoted anyway: proves the two
+  // legs are judged independently and the family match did not weaken the
+  // precede half (#4457).
+  const msgs = anthropicToCore({
+    messages: [
+      { role: "user", content: "search for X" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "calling the search" },
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "srv_1",
+            content: [{ type: "text", text: "hits" }],
+          } as never,
+        ],
+      },
+      sys([{ type: "text", text: "delta" }]),
+      { role: "user", content: "next question" },
+    ],
+  } as never).msgs;
+  const rebuilt = coreToAnthropic(msgs);
+  assert.deepEqual(orphanSystems(rebuilt), []);
+  assert.equal(rebuilt[2]!.role, "user", "precede-side violation demotes despite legal follow side");
+  assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "delta" }]);
 });
 
 test("directive-only system behind an assistant stays system (exempt at any position)", () => {
