@@ -35,6 +35,7 @@
 | `BILI_LAUNCHER_DIRECT` | launcher direct-URL 模式 | `=1` 进入直通 URL 模式：LLM 流量不过代理 ⇒ 无压缩（只有 bili MCP 调用可用）；默认 MITM | —（两种模式都是正式入口则移 §2） | opt-in（`=1`） |
 | `BILI_LAUNCHER_PLUGIN` | launcher plugin 车道 | `=0` kill switch 回 wire 注入工具；`=1` 强制 plugin 车道；缺省自动 | plugin 车道成为唯一车道后退役 kill switch | 默认 auto |
 | `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_RESIGN_BENEFIT` / `BILI_CODEARTS_REF` | #1884 / #2090 | 签名上游重签特性族：`=0` 整族下线（回到 #1884 前重写行为）；passthrough 是「此链路不带压缩」的显式确认通道 | 特性族定型后各成员转 §2 | 特性族在用（`=0` 可整族下线） |
+| `BILI_MESSAGE_TIMESTAMPS` | #4313/#5236 | 消息级时间戳注入 opt-in：默认 off（undefined/0），`=1` 开启——统一存储落库 v10 时间戳列并镜像到 ACP 封套时间戳（读点 src/config.ts:2669）；关闭时线上字节逐字不变 | 功能定型转正后转 §2 常设面 |
 | `BILI_FAKE_COMPLETION_RETRIES` | fake-completion fallback | 假完成重试（opt-in，默认 0 = 禁用） | fallback 机制定型后转 §2 | opt-in |
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
@@ -52,6 +53,8 @@
 | `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
+| `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
+| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -77,6 +80,7 @@
 | `BILI_NON_HTTP_PROVIDERS` | #1392 非 http(s) baseUrl provider 白名单传递 |
 | `BILI_PROVIDER_REWRITES` | #535 provider 改写 manifest JSON（存在即关 zcode native） |
 | `BILI_UPGRADE_REPLACEMENT` | #3044 self-restart 替换进程交接标记（UPGRADE_REPLACEMENT_ENV） |
+| `BILI_SPAWN_FINGERPRINT` | #4125 spawner 侧入口脚本 sha256 指纹（SPAWN_FINGERPRINT_ENV，src/instance.ts:343），spawn 时注入供子进程记录自身指纹，避免 auto-update 窗口内 re-hash 漂移 |
 
 ### 2.3 网络调优（#2030 迁移家族：env > 文件 network.* > 默认）
 
@@ -122,6 +126,7 @@
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | `=1/true` 保持单会话 CCR 内容存储（byRef/byHash 原文）常驻内存不折叠（#4788 phase 2 / #3916-E；首次触摸时从 unified ccr 镜像或 .content-store.json 侧车重建）；缺省/0/false = 落盘后折叠（默认） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |

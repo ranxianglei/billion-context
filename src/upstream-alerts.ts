@@ -30,6 +30,9 @@ export interface UpstreamAlert {
      *  the full English string for JSON consumers). Redacted. */
     skippedProxy?: string;
     skippedSource?: string;
+    /** #5146: errno captured at failure time (e.g. ECONNREFUSED) — surfaces in the
+     *  /__bili/upstreams report so the DSH banner can show WHY. */
+    code?: string;
 }
 
 /** v1 scope (#1682): only "fundamentally cannot connect" transport failures.
@@ -62,6 +65,13 @@ function keyFor(kind: UpstreamFailureKind, host: string): string {
     return kind + "\u0000" + host;
 }
 
+/** #5146: pull the errno off a Node error when present (ECONNREFUSED, ENOTFOUND, …) so the
+ *  /__bili/upstreams report can show WHY beyond the classified kind. undefined for non-errors. */
+function errnoCode(error: unknown): string | undefined {
+    const c = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return typeof c === "string" && c.length > 0 ? c : undefined;
+}
+
 /** Record one failed model request. Dedup key (kind, host): repeats refresh
  *  lastSeen/count only. Non-alert kinds are ignored entirely. `skipped` (#2809)
  *  rides along so the banner can name the proxy default-direct mode skipped. */
@@ -70,6 +80,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
     if (!ALERT_KINDS.has(kind)) return;
     const host = hostOf(url);
     const now = Date.now();
+    const code = errnoCode(error);
     const key = keyFor(kind, host);
     const skippedFields = skipped ? { skippedProxy: redactedSkippedProxy(skipped), skippedSource: skipped.source } : {};
     const hint = hintWithSkippedProxy(kind, skipped);
@@ -78,6 +89,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         existing.lastSeen = now;
         existing.count += 1;
         existing.hint = hint;
+        if (code !== undefined) existing.code = code;
         Object.assign(existing, skippedFields);
         return;
     }
@@ -92,7 +104,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         }
         if (oldestKey !== undefined) alerts.delete(oldestKey);
     }
-    alerts.set(key, { kind, host, hint, firstSeen: now, lastSeen: now, count: 1, ...skippedFields });
+    alerts.set(key, { kind, host, hint, firstSeen: now, lastSeen: now, count: 1, ...(code !== undefined ? { code } : {}), ...skippedFields });
 }
 
 /** Any resolved response to this host proves the path works again — clear ALL
@@ -133,6 +145,8 @@ interface UpstreamCircuitFailure {
     kind: string;
     detail: string;
     at: number;
+    /** #5146: errno at failure time for the /__bili/upstreams report. */
+    code?: string;
 }
 
 interface UpstreamCircuit {
@@ -248,6 +262,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     const kind = classifyUpstreamFailure(error, { viaProxy });
     const host = hostOf(url);
     const now = Date.now();
+    const code = errnoCode(error);
     let entry = circuits.get(host);
     if (!entry) {
         if (!ALERT_KINDS.has(kind)) return;
@@ -271,14 +286,14 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     if (c.openedAt !== null) {
         // Open: the half-open probe just finished without a response — release
         // the slot and re-arm the cooldown regardless of kind (see above).
-        c.lastFailure = { kind, detail: shortDetail, at: now };
+        c.lastFailure = { kind, detail: shortDetail, at: now, ...(code !== undefined ? { code } : {}) };
         entry.probeInFlight = false;
         c.nextProbeAt = now + circuitProbeCooldownMs;
         loggerLog("warn", `[acp-proxy] upstream circuit probe FAILED for ${host} (${kind}) — re-armed until ${new Date(c.nextProbeAt).toISOString()} (#3148)`);
         return;
     }
     if (!ALERT_KINDS.has(kind)) return;
-    c.lastFailure = { kind, detail: shortDetail, at: now };
+    c.lastFailure = { kind, detail: shortDetail, at: now, ...(code !== undefined ? { code } : {}) };
     c.consecutiveFailures += 1;
     if (c.consecutiveFailures >= CIRCUIT_OPEN_AFTER) {
         c.openedAt = now;
@@ -304,6 +319,89 @@ export function getOpenUpstreamCircuits(): UpstreamCircuit[] {
         .filter((e) => e.state.openedAt !== null)
         .map((e) => ({ ...e.state }))
         .sort((a, b) => (b.openedAt ?? 0) - (a.openedAt ?? 0));
+}
+
+// #5146: the read contract behind GET /__bili/upstreams — the loopback-gated
+// surface DSH's frame-level banner polls (contract settled in #4254; that PR's
+// landing of this half was dropped when it closed unmerged, which is exactly
+// why the shipped banner polled a route that never existed). bili is a
+// transparent pipe, so this reports per HOST (the only identity it knows),
+// never per conversation; DSH filters that down to the hosts its own
+// conversations point at. Merges the two existing tables into one stable
+// shape: the open circuit is the authoritative "currently down" signal
+// (fail-fast stops minting new alerts once open), while the alert rows carry
+// the actionable hint and cover the pre-circuit window.
+
+export interface UpstreamHealthEntry {
+    /** Host[:port] the failing traffic targeted — raw (endpoint is loopback-gated). */
+    host: string;
+    port: number | null;
+    /** Primary failure kind: the circuit's last failure when open, else the most
+     *  recently seen alert for the host. */
+    kind: string;
+    /** errno captured at failure time (ECONNREFUSED, …) when available. */
+    code?: string;
+    /** Actionable hint (most recent alert of the primary kind, else circuit detail). */
+    hint?: string;
+    /** Observed failure count — circuit strikes when open, else summed alert counts. */
+    count: number;
+    firstSeen: number;
+    lastSeen: number;
+    /** Present only while a circuit is OPEN; null in the alert-only window. */
+    circuit: { state: "open"; nextProbeInMs: number } | null;
+}
+
+export interface UpstreamHealthReport {
+    upstreams: UpstreamHealthEntry[];
+}
+
+export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealthReport {
+    interface Acc {
+        alerts: UpstreamAlert[];
+        circuit: UpstreamCircuit | null;
+    }
+    const byHost = new Map<string, Acc>();
+    const touch = (host: string): Acc => {
+        let acc = byHost.get(host);
+        if (!acc) {
+            acc = { alerts: [], circuit: null };
+            byHost.set(host, acc);
+        }
+        return acc;
+    };
+    for (const a of alerts.values()) touch(a.host).alerts.push(a);
+    for (const e of circuits.values()) {
+        if (e.state.openedAt !== null) touch(e.state.host).circuit = e.state;
+    }
+    const upstreams: UpstreamHealthEntry[] = [];
+    for (const [host, { alerts: hostAlerts, circuit }] of byHost.entries()) {
+        const latest = hostAlerts.length > 0 ? hostAlerts.reduce((m, a) => (a.lastSeen > m.lastSeen ? a : m)) : undefined;
+        const kind = circuit?.lastFailure?.kind ?? latest?.kind ?? "unknown";
+        const code = circuit?.lastFailure?.code ?? latest?.code;
+        const hint = latest?.hint ?? circuit?.lastFailure?.detail;
+        const count = circuit ? circuit.consecutiveFailures : hostAlerts.reduce((s, a) => s + a.count, 0);
+        const beginTimes = [...hostAlerts.map((a) => a.firstSeen), ...(circuit ? [circuit.openedAt ?? now] : [])];
+        const endTimes = [...hostAlerts.map((a) => a.lastSeen), ...(circuit ? [circuit.lastFailure?.at ?? now] : [])];
+        let port: number | null = null;
+        const colon = host.lastIndexOf(":");
+        if (colon >= 0) {
+            const p = Number(host.slice(colon + 1));
+            if (Number.isInteger(p) && p > 0 && p <= 65535) port = p;
+        }
+        upstreams.push({
+            host,
+            port,
+            kind,
+            ...(code !== undefined ? { code } : {}),
+            ...(hint !== undefined ? { hint } : {}),
+            count,
+            firstSeen: Math.min(...beginTimes),
+            lastSeen: Math.max(...endTimes),
+            circuit: circuit ? { state: "open", nextProbeInMs: Math.max(0, (circuit.nextProbeAt ?? now) - now) } : null,
+        });
+    }
+    upstreams.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { upstreams };
 }
 
 export function _resetUpstreamCircuitsForTest(): void {

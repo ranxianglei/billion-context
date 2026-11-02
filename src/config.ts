@@ -408,6 +408,24 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** #4313 (PR #5236; default-on follow-up): stamp each message with its
+     *  immutable local time-of-occurrence and render it in the <acp> tag
+     *  (`time="..."`) — DEFAULT ON since the leak-audit follow-up: stamps are
+     *  deterministic render inputs, so on-by-default costs nothing beyond ONE
+     *  frozen-prefix rewrite per active session at the enabling restart.
+     *  Set `false` to reproduce the pre-#4313 wire bytes exactly (no time
+     *  attribute, original prompt texts, no fingerprint span). The env override
+     *  BILI_MESSAGE_TIMESTAMPS wins over this file value (any defined non-"0"
+     *  value enables it; "0" forces pre-feature bytes even against an explicit
+     *  true). Resolved ONCE per proxy instance at engine creation (#394
+     *  single-instance assumption — no per-session fork), so changing it
+     *  mid-run requires a restart; storage stamps are written regardless of the
+     *  flag, so opting in later renders full history times. Global level only
+     *  (provider/model overrides are ignored for display, mirroring how the
+     *  gate flows into one shared CompressionCore). NOTE:
+     *  tests/preload-test-env.mjs pins the display gate OFF for the suite,
+     *  keeping byte-comparing baselines on pre-feature wire bytes. */
+    messageTimestamps?: boolean;
      /** Force preflight summarization calls to use streaming (SSE) instead of
       *  the default non-stream call (#2133). The error-driven self-learn flag
       *  (`session.metadata.preflightStreamSummary`) fires on any 400 from a
@@ -586,6 +604,25 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
+    /** EXPERIMENTAL view transform A (default OFF): move a still-visible
+     *  compress call/result pair from its original tail-adjacent position to
+     *  its own fold point, so resent history ends "[folded region] – [pair] –
+     *  [protected messages]" instead of a tool exchange at the very end (which
+     *  weak-attention models read as a fresh command). Purely view-side — refs
+     *  and state are untouched; identical layout is recomputed every turn.
+     *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
+     *  applyCompressSettings resolves it per request. Maps to kernel
+     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
+    compressAtFoldPoint?: boolean;
+    /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
+     *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
+     *  relocated pair at the moment of repositioning (the turn's think about
+     *  the fold itself). Both switches must be set for anything to be dropped,
+     *  and the host additionally refuses any core carrying a wire signature or
+     *  running under strict reasoning-echo (#1658/#684 doctrine). Env
+     *  BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over every level.
+     *  Maps to kernel Config.compressAtFoldPointClearThinking. */
+    compressAtFoldPointClearThinking?: boolean;
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -2295,12 +2332,14 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
+    // Experimental fold-point carrier relocation switches (view-only).
+    "compressAtFoldPoint", "compressAtFoldPointClearThinking",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2641,6 +2680,29 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return undefined;
+}
+
+/** #4313 (PR #5236; default-on follow-up): global message-timestamp display gate.
+ *  BILI_MESSAGE_TIMESTAMPS follows BILI_RESIGN semantics — defined and not
+ *  "0" enables; any other value disables even against an explicit file true;
+ *  unset ⇒ file `compress.messageTimestamps !== false`; default TRUE —
+ *  first-sight immutable stamps are deterministic render inputs (never wall
+ *  clock at render time), so bytes stay stable turn over turn; the leak audit
+ *  on live sessions showed identical hit-rates with the flag on vs off.
+ *  Upgrading users pay ONE frozen-prefix rewrite per active session at the
+ *  restart after which the flag first resolves true, then stable.
+ *  Opt-out: file `compress.messageTimestamps: false` or env "0" keeps every
+ *  byte identical to pre-#4313 master. GLOBAL level only: provider/model
+ *  settings are ignored because the gate flows into one shared CompressionCore
+ *  + prompt exits resolved at engine creation (#394 single-instance
+ *  assumption). Storage-layer stamping (v10 ts column, ledger rows) runs
+ *  regardless of this flag, so opting in later renders full history times.
+ *  NOTE: tests/preload-test-env.mjs pins the display gate OFF for the whole
+ *  suite so byte-comparing baselines keep their pre-feature wire bytes. */
+export function resolveMessageTimestamps(fileCompress?: CompressSettings, env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = env.BILI_MESSAGE_TIMESTAMPS;
+    if (raw !== undefined) return raw !== "0";
+    return fileCompress?.messageTimestamps !== false;
 }
 
 /** #1660: explicit override of the zcode lane's port (env only — the store
@@ -3025,6 +3087,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
     }
+    // Experimental fold-point relocation pair (see CompressSettings docs): plain
+    // booleans; absent = off. Without this, file-tier/panel values are silently
+    // dropped by the parser while env resolution still honors them.
+    for (const key of ["compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const) {
+        if (!(key in obj)) continue;
+        if (typeof obj[key] !== "boolean") {
+            ok = false;
+            continue;
+        }
+        out[key] = obj[key];
+    }
     // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
     // >= 0 instead of takeNumber's plain finite check.
     if ("minPressureBenefitTokens" in obj) {
@@ -3057,6 +3130,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("messageTimestamps" in obj) {
+        if (typeof obj.messageTimestamps !== "boolean") ok = false;
+        else out.messageTimestamps = obj.messageTimestamps;
     }
     if ("streamSummary" in obj) {
         if (typeof obj.streamSummary !== "boolean") ok = false;

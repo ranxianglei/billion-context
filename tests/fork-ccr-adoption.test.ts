@@ -98,9 +98,9 @@ function armParent(body: Body, fold: { startId: string; endId: string }, ccr: bo
     return { parent, core, config, blockId: block.blockId, turnMsgs: turn.messages };
 }
 
-function forkChild(a: Armed, forkBody: Body): Session {
+async function forkChild(a: Armed, forkBody: Body): Promise<Session> {
     const child = getSession(sid("child"), META);
-    maybeAdoptForkBlocks({
+    await maybeAdoptForkBlocks({
         session: child,
         parentId: a.parent.id,
         protocol: "openai",
@@ -137,7 +137,7 @@ test("cloneStoreForRefs: ref-filtered independent clone", () => {
     assert.equal(cloneStoreForRefs(createContentStore(), []), null);
 });
 
-test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341)", () => {
+test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341)", async () => {
     const body: Body = {
         model: "test-model",
         messages: [
@@ -160,7 +160,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
 
     const forkBody = structuredClone(body);
     forkBody.messages[7] = { role: "tool", tool_call_id: "call_b", content: `${BIG_B}\n(edited branch)` };
-    const child = forkChild(armed, forkBody);
+    const child = await forkChild(armed, forkBody);
 
     assert.equal(child.state.blocks.length, 1);
     assert.ok(child.state.blocks[0].active);
@@ -193,7 +193,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     assert.equal(child.contentStoreDirty, true);
 });
 
-test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)", () => {
+test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)", async () => {
     // Small tool output in the shared prefix (never placeholderized, so the
     // block stays adoptable); the big result sits OUTSIDE the fold span and
     // is stored at arrival time as m00007.
@@ -241,7 +241,7 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
             { role: "assistant", content: "yes, fixed" },
         ],
     };
-    const child = forkChild(armed, forkBody);
+    const child = await forkChild(armed, forkBody);
 
     const cstore = contentStoreOf(child);
     assert.ok(cstore.byRef["m00007"], "cited ref adopted into child store");
@@ -282,7 +282,7 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     assert.ok(reAck.includes(BIG_B.slice(0, 200)), "still retrievable in the tool result after the fold");
 });
 
-test("child persists its own companion and survives a proxy restart (#1341)", () => {
+test("child persists its own companion and survives a proxy restart (#1341)", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-fork-ccr-"));
     _setStoreForTest(new SessionStore({ dir, debounceMs: 0 }));
     try {
@@ -300,7 +300,7 @@ test("child persists its own companion and survives a proxy restart (#1341)", ()
         const armed = armParent(body, { startId: "m00001", endId: "m00005" }, true);
         const forkBody = structuredClone(body);
         forkBody.messages[7] = { role: "tool", tool_call_id: "call_b", content: `${BIG_B}\n(edited branch)` };
-        const child = forkChild(armed, forkBody);
+        const child = await forkChild(armed, forkBody);
         assert.equal(contentStoreOf(child).byRef["m00003"] ? true : false, true);
 
         assert.ok(getStore().flushSync(child), "flush wrote the child's records");
@@ -321,7 +321,7 @@ test("child persists its own companion and survives a proxy restart (#1341)", ()
     }
 });
 
-test("fork of a CCR-less parent is unchanged: no store, no artifact (#1341)", () => {
+test("fork of a CCR-less parent is unchanged: no store, no artifact (#1341)", async () => {
     const body: Body = {
         model: "test-model",
         messages: [
@@ -336,14 +336,14 @@ test("fork of a CCR-less parent is unchanged: no store, no artifact (#1341)", ()
     };
     const armed = armParent(body, { startId: "m00001", endId: "m00005" }, false);
     assert.equal(Object.keys(contentStoreOf(armed.parent).byRef).length, 0, "CCR off: nothing stored");
-    const child = forkChild(armed, structuredClone(body));
+    const child = await forkChild(armed, structuredClone(body));
     assert.equal(child.state.blocks.length, 1, "block adoption itself still happens");
     assert.equal(child.state.blocks[0].blockId, armed.blockId);
     assert.equal(child.contentStore, undefined, "no store materialized on the child");
     assert.notEqual(child.contentStoreDirty, true, "no dirty flag, hence no envelope write");
 });
 
-test("adoption disabled leaves the fork without blocks or store (#1341)", () => {
+test("adoption disabled leaves the fork without blocks or store (#1341)", async () => {
     const body: Body = {
         model: "test-model",
         messages: [
@@ -357,7 +357,7 @@ test("adoption disabled leaves the fork without blocks or store (#1341)", () => 
     };
     const armed = armParent(body, { startId: "m00001", endId: "m00005" }, true);
     const child = getSession(sid("child"), META);
-    maybeAdoptForkBlocks({
+    await maybeAdoptForkBlocks({
         session: child,
         parentId: armed.parent.id,
         protocol: "openai",

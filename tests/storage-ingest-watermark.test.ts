@@ -591,7 +591,7 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v8 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v10 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
@@ -620,7 +620,7 @@ test("watermark: v4 database migrates to v8 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 9, "open() migrates v4 → v9");
+            assert.equal(ver.user_version, 10, "open() migrates v4 → v10");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -653,12 +653,12 @@ test("watermark: v4 database migrates to v8 additively; newer user_version no-op
         // probe version sits AT the current schema head so the no-op branch
         // still exercises after future bumps.
         const fwd = new DatabaseSync(dbPath);
-        fwd.exec("PRAGMA user_version = 9");
+        fwd.exec("PRAGMA user_version = 10");
         fwd.close();
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 9, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 10, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();

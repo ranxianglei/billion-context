@@ -68,6 +68,10 @@ export const LIVE_FILES = [
     // servers; every socket is listen(0), spawns are mocked, so the zone band
     // is belt-and-braces like #3890's — the entry is for the tripwire
     "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
+    // #4977: spawns real CLI children against listen(0) ports (zombie holds
+    // the port; the ghost row binds it); zone band is belt-and-braces like
+    // #4341's — the entry is for the SPAWN_RE tripwire
+    "tests/issue4977-present-twin-persist-gate.test.ts",
     // #4982: integration rows spawn bili children against freePort() picks and
     // follow each child's REGISTERED port (ladder-tolerant); BASE is an
     // in-memory-only value, so no zone band is needed — the entry is for the
@@ -83,6 +87,10 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #5046/B: spawns one bare `node -e` dummy child purely as a live PID
+    // holder for the lock-file fixtures — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire
+    "tests/issue5046-second-writer-degrade.test.ts",
     // #4762: in-process eval workers only (wedge probes), never bind a port -
     // the entry exists for the spawn tripwire alone, like #3890
     "tests/event-loop-watchdog.test.ts",

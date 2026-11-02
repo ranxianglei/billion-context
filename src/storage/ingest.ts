@@ -104,6 +104,11 @@ interface LogEntry {
     kind: string;
     ref: string | null;
     media?: { hash: string; bytes: string }[];
+    /** #4313: first-sight wall-clock stamp carried by the message object
+     *  (absent for pre-feature / imported payloads). Stored into the
+     *  messages.ts column verbatim; the value is NEVER part of content
+     *  (see serializeForStore). */
+    ts?: number;
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -141,6 +146,19 @@ export function toLegacyLike(s: {
     };
 }
 
+/** #4313: storage serialization of a message — ts rides the dedicated
+ *  column, NEVER the content bytes: stored content stays byte-identical to
+ *  what a pre-feature save wrote for the same logical message, so content
+ *  hash / identity / boundary probes cannot churn when stamps attach.
+ *  ts is appended last by its producers (stamper node, row hydration), so
+ *  deleting it restores the pre-feature key order exactly. */
+function serializeForStore(m: CoreMessage): string {
+    if (m.ts === undefined) return JSON.stringify(m);
+    const copy = { ...m };
+    delete copy.ts;
+    return JSON.stringify(copy);
+}
+
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
@@ -155,7 +173,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -169,7 +187,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
         return seq;
     };
     // #3301: import payload first — its rows must sit below the snapshot/tail
@@ -269,7 +287,7 @@ export function planIngestDelta(
     // at the trusted prefix's end. Identities are content-derived and
     // unique within one conversion pass, so a match proves this tail slot
     // IS the message the watermark was set from.
-    const probe = JSON.stringify(tail[trustedLen - 1]);
+    const probe = serializeForStore(tail[trustedLen - 1]);
     ingestSerializations.count++;
     // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
     // split the probe the same way so image messages verify identically.
@@ -289,7 +307,7 @@ export function planIngestDelta(
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -308,6 +326,7 @@ export function planIngestDelta(
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
             ...(split.media.length > 0 ? { media: split.media } : {}),
+            ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -353,6 +372,7 @@ function finishPlan(
         contentHash: e.hash,
         identity: e.identity,
         ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
+        ...(typeof e.ts === "number" ? { ts: e.ts } : {}),
     }));
 
     // #4316 layer 3: the ledger positions of a block's covered messages —
