@@ -163,6 +163,28 @@ entries:
     desc_zh: "客户端在轮次之间回退或改写历史时校准已折叠状态。"
     site_en: "\"off\" | \"warn\" | \"repair\" (default repair): reconcile folded state when the client rewinds or rewrites history between turns."
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
+  - key: compress.compressAtFoldPoint
+    type: boolean
+    default: "false"
+    env: BILI_COMPRESS_AT_FOLD_POINT
+    group: compress
+    id: cw.cafp
+    render: compress-row
+    desc_en: "EXPERIMENTAL, default off: move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; off = byte-identical layout."
+    desc_zh: "实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。"
+    site_en: "EXPERIMENTAL boolean (default false): relocate a visible compress call/result pair to its fold point in the outbound view so a trailing tool exchange is not mistaken for a new user command. View-only and deterministic per turn; off = byte-identical to the default layout."
+    site_zh: "实验性布尔开关（默认 false）：把可见的压缩调用/结果对移到出站视图的折叠点处，避免历史末尾的工具交换被模型误读为新命令。纯视图变换、每轮确定性重算；关闭 = 与原布局字节级一致。"
+  - key: compress.compressAtFoldPointClearThinking
+    type: boolean
+    default: "false"
+    env: BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING
+    group: compress
+    id: cw.cafct
+    render: compress-row
+    desc_en: "Second opt-in riding on compress.compressAtFoldPoint: when the pair is repositioned, also drop the contiguous run of unsigned reasoning cores immediately preceding it (the model's thinking about this very fold), so the moved pair starts clean. Inert unless the main switch is on; signed thinking blocks and strict reasoning-echo sessions are never touched (#1658/#684)."
+    desc_zh: "依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。"
+    site_en: "EXPERIMENTAL boolean (default false): together with compress.compressAtFoldPoint, clear the unsigned thinking run immediately before a relocated compress pair at the moment of repositioning. Never touches signed thinking or strict reasoning-echo sessions (#1658/#684); inert while the main switch is off."
+    site_zh: "实验性布尔开关（默认 false）：配合 compress.compressAtFoldPoint，在调用对被挪位的同时清掉其紧邻之前的未签名思考段。绝不触碰带签名的思考块与严格推理回显会话（#1658/#684）；主开关关闭时无效。"
   - key: compress.promptPack
     type: "string (builtin: \"default\", \"lean\")"
     default: "builtin \"default\""

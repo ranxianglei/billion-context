@@ -34,7 +34,7 @@ const mkHarnessEl = (): HarnessEl => ({
     querySelectorAll: () => [], querySelector: () => null,
 });
 
-const FEED = { items: [{ id: "demo", kind: "post", date: "2026-10-08", title: "Demo post", titleZh: "演示", excerpt: "ex", html: "<p>hi</p>", htmlZh: "<p>你好</p>" }] };
+const FEED = { items: [{ id: "demo", kind: "post", date: "2026-10-08", title: "Demo post", titleZh: "演示", excerpt: "ex", html: "<p>hi</p>", htmlZh: "<p>你好</p>", discussion: 123 }] };
 
 // #4957: blog slugs keep whatever the filename carried after the date prefix
 // (blogfeed.ts strips only `YYYY-MM-DD_`), so ids can contain dots, spaces and
@@ -113,6 +113,19 @@ test("#/blog/<slug> renders that single article with a back link", async () => {
     const list = r.els.get("bl-list")!;
     assert.ok(list.innerHTML.includes("post-body") && (list.innerHTML.includes("<p>hi</p>") || list.innerHTML.includes("\u4f60\u597d</p>")), "article body rendered (locale-twin aware)");
     assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link to the index present");
+    // #5396 final form: exact discussion link built from the manifest-recorded number
+    // (item.discussion) — no search guesswork; plus the in-page EN|中文 language pins.
+    assert.ok(list.innerHTML.includes('href="https://github.com/ranxianglei/billion-context/discussions/123" target="_blank" rel="noopener"'), "exact discussion-thread link from the recorded number");
+    assert.ok(list.innerHTML.includes("?lang=en#/blog/demo") && list.innerHTML.includes("?lang=zh#/blog/" + encodeURIComponent("demo")), "in-page language pins present");
+    assert.ok(list.innerHTML.includes("\u4e2d\u6587</a>"), "Chinese toggle label rendered");
+});
+
+test("#/blog/<slug> without a recorded discussion number shows no thread button", async () => {
+    const feed = { items: [{ id: "plain", kind: "post", date: "2026-10-08", title: "Plain", excerpt: "ex", html: "<p>p</p>" }] };
+    const r = await runClient("#/blog/plain", feed);
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes("post-body"), "article still renders without a recorded thread");
+    assert.ok(!list.innerHTML.includes("billion-context/discussions"), "no discussion link when the manifest recorded none");
 });
 
 test("unknown slug degrades to a back link without a crash", async () => {
