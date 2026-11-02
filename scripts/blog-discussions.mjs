@@ -378,12 +378,12 @@ async function main() {
         }
         const d = await gql(
             `mutation($input: CreateDiscussionInput!) {
-               createDiscussion(input: $input) { node { number url } }
+               createDiscussion(input: $input) { discussion { number url } }
              }`,
             { input: { repositoryId: repoIdValue, categoryId, title, body } },
         );
-        console.log(`created discussion #${d.createDiscussion.node.number}: ${title}`);
-        toRecord.push({ index, num: d.createDiscussion.node.number });
+        console.log(`created discussion #${d.createDiscussion.discussion.number}: ${title}`);
+        toRecord.push({ index, num: d.createDiscussion.discussion.number });
     }
 
     if (toRecord.length > 0) {

@@ -13,8 +13,9 @@ on:
       - "website/articles.json"
 
 permissions:
-  contents: write    # single write-back commit recording thread numbers in articles.json
-  discussions: write # creating the threads themselves
+  contents: write      # write-back commit recording thread numbers in articles.json
+  discussions: write   # creating the threads themselves
+  pull-requests: write # opening the single write-back PR for the human merge step
 
 concurrency:
   group: blog-discussions

@@ -32,7 +32,12 @@ const SLOW_MS = 1500;
 // flaked on loaded Windows runners: closed=0 after the full poll while sibling
 // cells and every other shard went green (recorded under #4599 for #4982/
 // #4774/#4683, which made the same 3s→6s move on its own branch). Doubled to 6s.
-const ABORT_TEARDOWN_BUDGET_MS = 6000;
+// Raised to 10s after 6s still flaked three consecutive runs on windows-latest
+// node22 shard 2 (master c78ecb4b + ci-fixes c49bf8b1/12b988ff, all closed=0,
+// same cell, sibling shards green — load latency, not a teardown regression;
+// recorded under #4599). If it flakes again at 10s, investigate a real teardown
+// hang instead of raising further.
+const ABORT_TEARDOWN_BUDGET_MS = 10000;
 
 async function awaitUpstreamTeardown(socketsClosed: () => number): Promise<void> {
     const deadline = Date.now() + ABORT_TEARDOWN_BUDGET_MS;

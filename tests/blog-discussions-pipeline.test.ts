@@ -110,7 +110,7 @@ const threadNodesRule = (name: string, nodes: unknown[]): Rule => ({
 const createRule = (name: string, number: number): Rule => ({
     name,
     match: (_m, _u, body) => gqlHas("createDiscussion")(_m, _u, body),
-    json: { data: { createDiscussion: { node: { number, url: `https://example.invalid/d/${number}` } } } },
+    json: { data: { createDiscussion: { discussion: { number, url: `https://example.invalid/d/${number}` } } } },
 });
 
 const wbRules = (
@@ -211,6 +211,9 @@ test("unrecorded post -> thread created; numbers land on the fixed branch + one 
     assert.match(pr.title, /^\[bili-blog-pipeline\] record discussion threads \(a→#99\)$/);
     assert.equal(pr.head, "bili-blog-pipeline-manifest");
     assert.equal(pr.base, "master");
+    const createQuery = String((bodies.find((b) => b.name === "gql-create")!.body as { query?: string })?.query ?? "");
+    assert.match(createQuery, /createDiscussion\(input: \$input\)\s*\{\s*discussion\s*\{/, "createDiscussion must select the real CreateDiscussionPayload field");
+    assert.ok(!/\{\s*node\s*\{/.test(createQuery), "must never select the non-existent node field (GitHub rejects it)");
 });
 
 test("push made only of our own write-back commits -> early no-op after reading the manifest", async () => {
