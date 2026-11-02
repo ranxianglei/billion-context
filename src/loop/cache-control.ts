@@ -66,9 +66,10 @@ export function computeAnthropicMessageMarks(
     const kept = ((session.metadata["anthropicCacheMarkIds"] as string[] | undefined) ?? []).filter((id) => liveIds.has(id));
     const lastIndex = processed.length - 1 - ephemeralTailCount;
     // #5519: one-shot ladder seed for a freshly adopted fork/resume. The flag
-    // is consumed unconditionally (a client-managed or too-short first turn
-    // must not leave it pending for a later turn to relayout mid-history —
-    // that would be exactly the byte-stability debt the design forbids).
+    // is consumed by every pass that reaches this point (seeded or not), so
+    // no later turn re-lays-out mid-history. A client-managed or too-short
+    // FIRST turn never reaches this point and leaves the flag pending — safe:
+    // the seed is a first-appearance layout, not a rewrite of stamped bytes.
     const ladderInitPending = session.metadata["cacheMarkLadderInitPending"] === true;
     delete session.metadata["cacheMarkLadderInitPending"];
     if (ladderInitPending && kept.length === 0 && lastIndex >= 3) {
