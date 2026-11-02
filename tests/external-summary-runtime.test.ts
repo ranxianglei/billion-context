@@ -237,6 +237,37 @@ test("already-folded ranges return a no-op without another paid call", async () 
     }, (_req, res) => { calls++; success(res); });
 });
 
+test("restamped stale refs fold through the external summarizer, never under a probe summary", async () => {
+    const paths: string[] = [];
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // #4797 restamp shape: the model still cites a number vacated by the
+        // ledger alignment; the map holds old-ref -> raw id (message id) of
+        // the SAME message under its current label.
+        ctx.session.restampSuperseded = new Map([["m00999", "history"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0].summary, SUMMARY);
+        assert.deepEqual(paths, ["/primary"]);
+    }, (req, res) => { paths.push(req.url ?? ""); success(res); });
+});
+
+test("dead-end restamped refs keep the specific superseded-ref refusal without a paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // The vacated number's raw id lost its mapping entirely — an honest
+        // stale cite that translation cannot repair.
+        ctx.session.restampSuperseded = new Map([["m00999", "gone"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
+        assert.equal(result.outcome, "refused");
+        assert.match(result.text, /re-numbered by the ledger alignment/);
+        assert.equal(ctx.session.state.blocks.length, 0);
+        assert.equal(calls, 0);
+    }, (_req, res) => { calls++; success(res); });
+});
+
 test("revision changes during generation discard results instead of committing a stale fold", async () => {
     let session: Session;
     await fixture(async (_base, externalSummary) => {
