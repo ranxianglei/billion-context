@@ -126,15 +126,33 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv, fileInline: boolean |
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #4912: the stage-2 media re-pricing of the direct-refusal arm, isolated so
+ *  the undecodable-body path is unit-testable without allocating a multi-GB
+ *  buffer (inject the decoder). A body past V8's max string length (~536MB;
+ *  #3128 admits up to 5GiB) makes TextDecoder.decode throw RangeError — same
+ *  class as a non-JSON body in mediaBytesOfWireBody: no media credit, the whole
+ *  body bills as core text (conservative refusal), never an exception out of
+ *  the route handler. */
+export function wireBodyMediaBytes(body: ArrayBuffer, decode: (buf: ArrayBuffer) => string = (b) => new TextDecoder().decode(b)): number {
+    try {
+        return mediaBytesOfWireBody(decode(body));
+    } catch {
+        return 0;
+    }
+}
+
 /** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
  *  (the V2 route has no takeover gate to carry it). Returns a host-visible
  *  refusal when the proxy is unavailable AND the body provably cannot fit the
  *  model's context window — the core-text floor (bytes/4) exceeds the
  *  window, and #2924's ledger evidence says real text runs ABOVE the floor
  *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
- *  model, unknown window, unreadable or absent body all return undefined and
- *  keep the documented fail-open direct send. The size is measured through a
- *  CLONE — the original Request must stay sendable (#2496 discipline). */
+ *  model, unknown window, or an unmeasurable body all return undefined and keep
+ *  the documented fail-open direct send; a measurable body whose content cannot
+ *  be decoded (past V8's max string length, #4912) gets no media credit — the
+ *  conservative all-core-text refusal instead of an escaped RangeError. The
+ *  size is measured through a CLONE — the original Request must stay sendable
+ *  (#2496 discipline). */
 async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?: UnavailableReason): Promise<Error | undefined> {
     const model = e.model;
     if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
@@ -151,7 +169,7 @@ async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?:
     const bytes = body.byteLength;
     if (Math.ceil(bytes / 4) <= window) return undefined;
     // #4121: only re-price would-refuse bodies; inline media is not text.
-    const coreBytes = Math.max(bytes - mediaBytesOfWireBody(new TextDecoder().decode(body)), 0);
+    const coreBytes = Math.max(bytes - wireBodyMediaBytes(body), 0);
     const floorTokens = Math.ceil(coreBytes / 4);
     if (floorTokens <= window) return undefined;
     // #3654: a busy-exhausted refusal must NOT claim "proxy unavailable …

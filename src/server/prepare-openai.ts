@@ -4,25 +4,27 @@ import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-ker
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
+import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
-import { storedMessagesFor } from "../fold-decomposition-lookup.js";
+import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -148,6 +150,10 @@ export async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
+        if (loopConfig.compressAtFoldPointClearThinking) {
+            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        }
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -195,7 +201,7 @@ export async function prepareOpenai(
         // #3301: stored decompositions for pre-#2644 anchors whose wire-side
         // backfill can never fire after a wire-shape flip.
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -206,9 +212,18 @@ export async function prepareOpenai(
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
         reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        // #4528: processTurn is the largest single synchronous pass over the
+        // resent history; yield before it so UI/API requests that queued during
+        // this turn are served, not frozen behind the whole turn.
+        await yieldToEventLoop();
+        // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
+        absorbAbortedTurnGrowth(session, tokenCount);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #4528: split the kernel pass from its post-processing scan passes so
+        // each is a bounded synchronous stretch rather than one long block.
+        await yieldToEventLoop();
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
@@ -330,10 +345,10 @@ export async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         let acpStandingPushed = false;
-        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-            const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
+            const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
             if (tagsOnly) { sysParts.push(tagsOnly); acpStandingPushed = true; }
         }
         // #4305: standing generation-boundary note — rides the ACP standing block,
@@ -420,6 +435,12 @@ export async function prepareOpenai(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
+        // #4521: armed-but-silent window — same carrier + rationale as the
+        // anthropic lane (ephemeral trailing user message, current refs
+        // instead of model-guessed ones).
+        if (turn.statusLine) {
+            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+        }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
@@ -450,17 +471,18 @@ export async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
-    // #2218/#2645: body-only relay affinity for plugin hosts. dsh desktop's
-    // only identity signal is the bili-internal x-bili-plugin-conversation
-    // header (already forwarded as x-session-id by buildForwardTarget);
-    // body-keyed relays (workbuddy panel) can't read headers, so stamp the
-    // conversation id into prompt_cache_key too. Stamping is default-on for
-    // EVERY destination shape (#2645 probe-and-remember — the old
-    // loopback/rewritten-route gate silently dropped the affinity key on the
-    // big remote pool populations): strict APIs that reject the field are
-    // found out at egress (the 400 A/B seam withholds the key per origin+
-    // model until proxy restart) instead of by a destination-shape guess.
-    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, modelIdOf(parsed));
+    // #2218/#2645/#5079: body-only relay affinity for plugin hosts. dsh
+    // desktop's only identity signal is the bili-internal
+    // x-bili-plugin-conversation header (already forwarded as x-session-id by
+    // buildForwardTarget); body-keyed relays (workbuddy panel) can't read
+    // headers, so stamping writes the conversation id into prompt_cache_key.
+    // #5079 gated the stamp behind promptCache.routing (default now DISABLED —
+    // most upstreams neither use nor tolerate the field): auto/enabled keep
+    // the #2645 default-on-for-every-destination behavior with the egress 400
+    // A/B seam as the rejection backstop; disabled never emits a bili-owned
+    // key but still forwards genuine client keys verbatim (and still honors
+    // an A/B ablation against them).
+    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
     if (pckDecision === "stamp") {
         rebuilt.prompt_cache_key = session.id;
     } else if (pckDecision === "drop") {
@@ -485,14 +507,16 @@ export async function prepareOpenai(
     // Title-gen side requests are skipped like the overhead row above — their
     // tiny payload would clobber the conversation's measurement.
     if (!isTitleGen) {
+        // One tree walk shared by both calibers (see the anthropic lane).
+        const imageReserve = imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
         if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
         // #4805: id-membership evidence for the settle gate (see the
@@ -502,7 +526,7 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

@@ -686,21 +686,21 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         "#2448: frame height follows the host viewport instead of a flat 640px",
     );
     const buttons = collectButtons(tree);
-    assert.equal(buttons.length, 6, "five tabs (versions included, #3719) plus the backup open-in-browser button");
+    assert.equal(buttons.length, 7, "six tabs (blog after versions, #4906 follow-up) plus the backup open-in-browser button");
     // #2448: the backup button drops the origin URL from the label (a narrow
     // host panel squeezed the hint row into a sliver) and keeps it in the
     // tooltip instead.
     const openLabel: string[] = [];
-    collectText(buttons[5], openLabel);
+    collectText(buttons[6], openLabel);
     assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
-    assert.equal(buttons[5].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
+    assert.equal(buttons[6].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
     const tabLabels: string[] = [];
-    for (const b of buttons.slice(0, 5)) {
+    for (const b of buttons.slice(0, 6)) {
         const bt: string[] = [];
         collectText(b, bt);
         tabLabels.push(bt.join(""));
     }
-    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志", "版本"], "tabs mirror the web UI nav terminology");
+    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志", "版本", "博客"], "tabs mirror the web UI nav terminology");
     // The open-in-browser action rides the TAB row (right after the logs
     // tab), not the footer below the iframe: the row div that parents the
     // logs tab also parents the action button, and the root's footer row
@@ -712,8 +712,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     });
     assert.ok(tabRow !== undefined, "logs tab has a parent row");
     const rowButtons = collectButtons(tabRow);
-    assert.equal(rowButtons.length, 6, "tab row = five tabs + the open-WebUI action");
-    assert.equal(rowButtons[5], buttons[5], "the action is the row's last child, right after the last tab");
+    assert.equal(rowButtons.length, 7, "tab row = six tabs + the open-WebUI action");
+    assert.equal(rowButtons[6], buttons[6], "the action is the row's last child, right after the last tab");
     const footerRow = (tree.children ?? []).filter((c) => c !== null && typeof c === "object").at(-1) as ElementNode;
     assert.equal(collectButtons(footerRow).length, 0, "embedded footer carries no button — the action moved up");
     // Tab click moves only the hash — the frame navigates same-document.
@@ -723,7 +723,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(frameAfterTab !== undefined);
     assert.equal(frameAfterTab.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/sessions");
     // The backup button keeps the original jump target.
-    (buttons[5].props!.onClick as () => void)();
+    (buttons[6].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
     m.runCleanups();
 
@@ -741,7 +741,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
     assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
     const bButtons = collectButtons(btree);
-    assert.equal(bButtons.length, 6, "the bundle panel offers the same tabs plus backup button");
+    assert.equal(bButtons.length, 7, "the bundle panel offers the same tabs plus backup button");
     assert.equal(
         bButtons[bButtons.length - 1].props?.title,
         "http://127.0.0.1:8787",
@@ -882,7 +882,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(frame !== undefined, "resolved origin upgrades the entry without a reload");
         assert.equal(frame.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const upButtons = collectButtons(second);
-        assert.equal(upButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(upButtons.length, 7, "the upgraded entry shows tabs plus the backup button");
         (upButtons[upButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         // #2288: resolution no longer STOPs the probe — exactly one fast probe
@@ -927,7 +927,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
         assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
         const sButtons = collectButtons(second);
-        assert.equal(sButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(sButtons.length, 7, "the upgraded entry shows tabs plus the backup button");
         (sButtons[sButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18798/__bili/"]);
         m.runCleanups();
@@ -1032,7 +1032,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(bframe !== undefined, "the bundle panel upgrades on a resolved origin");
         assert.equal(bframe.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const bUpButtons = collectButtons(second);
-        assert.equal(bUpButtons.length, 6, "the bundle panel offers tabs plus the backup button");
+        assert.equal(bUpButtons.length, 7, "the bundle panel offers tabs plus the backup button");
         (bUpButtons[bUpButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         m.runCleanups();

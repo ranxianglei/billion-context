@@ -125,12 +125,22 @@ export function adminRelayActiveInDraft(text: string): boolean {
     return (sec as Record<string, unknown>).adminRelay === true;
 }
 
+// #4906 P3: i18n bl.sub promises the feed turns over "约 1 小时一次", but the
+// panel kept its ONE fetch for the whole tab lifetime — pure staleness gate
+// for loadBlog's cache, inlined into the browser IIFE below via toString()
+// (same single-implementation discipline as the JSONC helpers above). The 1h
+// matches the server's hourly pull cadence (web/blog-refresh.ts ROUND_TTL_MS).
+export function blogCacheStale(cachedAt: number, now: number): boolean {
+    return now - cachedAt >= 60 * 60 * 1000;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
     const stripJsoncComments = ${stripJsoncComments.toString()};
     const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
+    const blogCacheStale = ${blogCacheStale.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -162,6 +172,33 @@ export const WEB_CLIENT = `(function () {
             if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
+    // #5319 (web half): resolved pack names from GET /__bili/packs — filled by
+    // loadConfig(); empty until then and the picker falls back to default+lean.
+    // #5328: per-name provenance + the user-pack dir (server authority) so the
+    // panel knows which entries 新建/编辑/删除 may touch.
+    let packNames = [];
+    let packSources = {};
+    let packUserDir = "";
+    // #5328: indirections so the inventory refresher lives at panel scope
+    // (loadConfig can call it before/after the quick-config block is built)
+    // while DOM and selection handling stay where the elements exist.
+    let packSelEl = null;
+    let rerenderQuick = null;
+    async function refreshPackInventory() {
+        try {
+            const p = await json(API_ROOT + "/packs");
+            if (!p || !Array.isArray(p.packs)) return;
+            packNames = p.packs.map((x) => String(x.name));
+            packSources = {};
+            for (const x of p.packs) packSources[String(x.name)] = String(x.source || "");
+            if (p.userDir) packUserDir = String(p.userDir) + "/";
+        } catch (e) { }
+        const prev = packSelEl ? packSelEl.value : "";
+        // Option reconstruction never fires the change listener — restore a
+        // still-present custom selection manually.
+        if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
+        if (rerenderQuick) rerenderQuick();
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
@@ -382,6 +419,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
+    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
+    // self-stamping is off by default now. Server decides active (effective
+    // routing "disabled" && not dismissed); pure builder, same test-seam
+    // convention as the banners above.
+    function bili_pckNoticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -419,8 +467,10 @@ export const WEB_CLIENT = `(function () {
             await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
+            return true;
         } catch (e) {
             toast(e.message, "err");
+            return false;
         } finally {
             busy(btn, false);
         }
@@ -443,6 +493,13 @@ export const WEB_CLIENT = `(function () {
         let i = 0;
         while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
         return (i > 0 ? n.toFixed(1) : String(Math.round(n))) + " " + units[i];
+    }
+    // #4899: USD display — 4 decimals under $1 (per-turn pennies stay visible),
+    // 2 above; negatives keep the sign (unpaid-back folds are honest).
+    function fmtUsd(n) {
+        if (n === null || n === undefined || isNaN(n)) return "—";
+        const abs = Math.abs(Number(n));
+        return (n < 0 ? "−" : "") + "$" + (abs >= 1 ? abs.toFixed(2) : abs.toFixed(4));
     }
     function timeAgo(iso) {
         if (!iso) return t("common.none");
@@ -583,9 +640,15 @@ export const WEB_CLIENT = `(function () {
         const clTip = x.coverageLostFolds
             ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
             : "";
-        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
-        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
+        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + moneySub(x) + "</td>";
+        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + moneySub(x) + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
+    }
+    // #4899: small $ line under the saved-tokens number — priced folds only
+    // (undefined when the session has no price profile: tokens only, no fake $).
+    function moneySub(x) {
+        if (x.savedUsd == null) return "";
+        return '<div class="dim small">' + (x.savedUsd >= 0 ? "≈ " : "") + "" + escapeHtml(fmtUsd(x.savedUsd)) + "</div>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
     function hitTd(s) {
@@ -874,22 +937,54 @@ function changelogCatOf(rawLine) {
     // markdown with web/markdown.ts (escaped by construction), so this side only
     // lays out cards and expands bodies. Language rides the page-level locale;
     // switching languages reloads the page, so no incremental re-render hook.
-    let blogCache = null;
+    // #4906 P3: the cache carries a timestamp and goes stale after ~1h (the
+    // cadence bl.sub promises), so a long-lived tab re-pulls instead of pinning
+    // one fetch forever. A stale hit still paints instantly from cache; the
+    // re-pull runs silently in the background and re-renders only if the blog
+    // view is still on screen — the overview poll's discipline (no blocked
+    // first paint, no toasts from background refreshes).
+    let blogCache = null; // { data, at }
+    let blogSub = null;
+    let blogRefreshBusy = false;
+    function refreshBlogInBackground() {
+        if (blogRefreshBusy) return;
+        blogRefreshBusy = true;
+        json(API_ROOT + "/blog").then(function (feed) {
+            blogCache = { data: feed, at: Date.now() };
+            if (current === "blog") loadBlog(blogSub); // cache is fresh now — no refresh loop
+        }, function () {
+            // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
+        }).then(function () { blogRefreshBusy = false; });
+    }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
-        let data = blogCache;
+        blogSub = sub || null;
+        let data = blogCache ? blogCache.data : null;
         if (!data) {
             try {
-                data = blogCache = await json(API_ROOT + "/blog");
+                data = await json(API_ROOT + "/blog");
+                blogCache = { data: data, at: Date.now() };
             } catch (e) {
                 host.innerHTML = "";
                 toast(t("toast.failed", { msg: e.message }), "err");
                 return;
             }
+        } else if (blogCacheStale(blogCache.at, Date.now())) {
+            refreshBlogInBackground();
         }
         const items = (data && Array.isArray(data.items)) ? data.items : [];
         const zhOn = locale === "zh-CN";
+        const offlineNote = data && data.error ? '<div class="card"><div class="card-b">' + escapeHtml(t("bl.offline")) + '</div></div>' : "";
         if (sub) {
             const item = items.find((x) => String(x.id) === String(sub)) || null;
             if (!item) {
@@ -899,7 +994,13 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -911,11 +1012,11 @@ function changelogCatOf(rawLine) {
             box.className = "card-b";
             box.textContent = t("bl.empty");
             wrap.appendChild(box);
-            host.innerHTML = "";
+            host.innerHTML = offlineNote;
             host.appendChild(wrap);
             return;
         }
-        host.innerHTML = '<div class="card">' + items.map((it) => {
+        host.innerHTML = offlineNote + '<div class="card">' + items.map((it) => {
             const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
             const alt = zhOn ? (it.title || "") : (it.titleZh || "");
             let kindLabel;
@@ -993,29 +1094,83 @@ function changelogCatOf(rawLine) {
             const grossEl = $("st-gross");
             grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
             grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
-            $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
+            // #4899 v5: print THE prices inside the formula lines — only when
+            // every priced session resolves identical rates; mixed fleets keep
+            // plain ≈$ amounts (never a misleading single rate).
+            const r6 = (x) => String(Math.round(x * 1e6) / 1e6);
+            const mra = o.moneyRates ? { w: r6(o.moneyRates.w), r: r6(o.moneyRates.r), q: r6(o.moneyRates.q) } : null;
+            $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "")
+                + (o.savedUsdGrossTotal
+                    ? " · " + (mra ? t("ov.gross_formula", { f: o.foldsTotal, g: fmtW(o.grossSavedTotal), r: mra.r, n: fmtUsd(o.savedUsdGrossTotal) }) : t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }))
+                    : "");
             const netEl = $("st-netsaved");
             netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
             netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
+            if (o.hasFoldData && o.savedUsdTotal) $("st-net-sub").textContent += " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdTotal) }) + (mra ? " " + t("ov.net_rates", mra) : "");
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
+            // #4899: fleet money totals — only priced sessions contribute; no
+            // price data anywhere => dash, never $0.00 (honest-output rule).
+            const spendEl = $("st-spend");
+            if (spendEl) {
+                spendEl.textContent = o.hasMoneyData ? fmtUsd(o.costUsdTotal || 0) : t("common.none");
+                $("st-spend-sub").textContent = o.hasMoneyData && (o.savedUsdTotal || 0) !== 0
+                    ? t("ov.money_saved", { n: fmtUsd(o.savedUsdTotal) })
+                    : (o.hasMoneyData ? t("ov.money_none") : "");
+            }
             const hs = $("st-hit-split");
+            // #4899 v3: compression payback — colored net plus a break-even
+            // line (green when avoided turns outrun the fold cost, red while
+            // they haven't; turns here are the fleet Σ post-fold requests).
+            const pbEl = $("st-payback");
+            if (pbEl) {
+                const pbCard = $("st-payback-card");
+                if (o.paybackUsdTotal) {
+                    const pbNet = (o.paybackUsdTotal.saved || 0) - (o.paybackUsdTotal.spent || 0);
+                    pbEl.textContent = "\u2248 " + fmtUsd(pbNet);
+                    pbEl.title = String(Math.round(pbNet * 1e4) / 1e4);
+                    pbCard.classList.remove("good", "bad");
+                    if (pbNet !== 0) pbCard.classList.add(pbNet >= 0 ? "good" : "bad");
+                    const turns = o.paybackUsdTotal.turns || 0;
+                    const avgPerTurn = turns > 0 ? (o.paybackUsdTotal.saved || 0) / turns : 0;
+                    let sub = t("ov.payback_sub", { v: fmtUsd(o.paybackUsdTotal.saved || 0), s: fmtUsd(o.paybackUsdTotal.spent || 0) });
+                    if (avgPerTurn > 0 && (o.paybackUsdTotal.spent || 0) > 0) {
+                        const be = o.paybackUsdTotal.spent / avgPerTurn;
+                        sub += " · " + (turns >= be ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(be - turns)) }));
+                    } else if (pbNet >= 0) sub += " · " + t("ov.payback_ok");
+                    if (mra) sub += " · " + t("ov.payback_rates", mra);
+                    $("st-payback-sub").textContent = sub;
+                } else {
+                    pbEl.textContent = t("common.none");
+                    pbCard.classList.remove("good", "bad");
+                    $("st-payback-sub").textContent = "";
+                }
+            }
             if (hs) {
                 const missSum = (o.missNewTotal || 0) + (o.missCompTotal || 0) + (o.missTtlTotal || 0);
                 const mi = o.missInputTotal || 0;
                 const f = (v) => fmtW(v) + (mi > 0 ? " (−" + ((v / mi) * 100).toFixed(1) + "%)" : "");
                 hs.textContent = missSum > 0 ? t("ov.miss_split", { n: f(o.missNewTotal || 0), c: f(o.missCompTotal || 0), x: f(o.missTtlTotal || 0) }) : t("common.none");
+                if (o.missSplitUsdTotal)
+                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) }) + (mra ? " " + t("ov.miss_rates", mra) : "");
             }
             $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
             $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
             $("st-output").textContent = o.outputTokens ? fmtW(o.outputTokens) : t("common.none");
+            // #4899 v3: each token card carries its own ≈$ tier — together they
+            // reconcile with the 花费 card (i + r + w + o == costUsdTotal), so
+            // every displayed token figure has a money face next to it.
+            const cu = o.costUsdSplitTotal;
+            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) + (mra ? " · " + t("ov.at_input", { v: mra.w }) : "") : "";
+            $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) + (mra ? " · " + t("ov.at_read", { v: mra.r }) : "") : "";
+            $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) + (mra ? " · " + t("ov.at_output", { v: mra.q }) : "") : "";
             const pb = $("protocol-body");
             pb.innerHTML = "";
             const rows = (o.byProtocol || []).slice().sort((a, b) => b.sessions - a.sessions || b.requests - a.requests);
             if (!rows.length) pb.innerHTML = '<tr><td colspan="8" class="dim">' + t("common.empty") + "</td></tr>";
             rows.forEach((r) => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + '</td>' + hitTd({ cacheHitPct: r.hitPct, missDropNew: r.missDropNew, missDropComp: r.missDropComp, missDropTtl: r.missDropTtl }) + '<td class="' + (r.savedNet > 0 ? "num good-num" : "num") + '"' + (r.savedNet < 0 ? ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"' : "") + '">' + (r.savedNet ? fmtW(r.savedNet) : t("common.none")) + '</td><td class="num">' + (r.folds ? fmtW(r.folds) : t("common.none")) + "</td>";
+                tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + '</td>' + hitTd({ cacheHitPct: r.hitPct, missDropNew: r.missDropNew, missDropComp: r.missDropComp, missDropTtl: r.missDropTtl }) + '<td class="' + (r.savedNet > 0 ? "num good-num" : "num") + '"' + (r.savedNet < 0 ? ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"' : "") + '">' + (r.savedNet ? fmtW(r.savedNet) : t("common.none")) + moneySub({ savedUsd: r.savedUsd }) + '</td><td class="num">' + (r.folds ? fmtW(r.folds) : t("common.none")) + "</td>";
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
@@ -1196,18 +1351,14 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
-                // the machine-global sessions dir is the supported topology —
-                // informational styling, not a corruption alarm.
-                if (sp.benign === true) {
-                    spb.classList.remove("warn");
-                    spb.classList.add("info");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
-                } else {
-                    spb.classList.remove("info");
-                    spb.classList.add("warn");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
-                }
+                // #5082: several instances opening one index.db is the
+                // supported topology — informational styling, never a
+                // corruption alarm. The real hazard (two instances writing
+                // the SAME session) has its own banner via the #3923
+                // split-brain contest.
+                spb.classList.remove("warn");
+                spb.classList.add("info");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_shared_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_shared", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
@@ -1223,10 +1374,12 @@ function changelogCatOf(rawLine) {
                 sbb.hidden = false;
                 sbb.classList.add("show");
                 const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                // #4626: .slice(0, 8) of "session-…" is literally "session-" — show enough to tell sessions apart
+                const shortSid = sb.sessionId.length > 24 ? sb.sessionId.slice(0, 24) + "…" : sb.sessionId;
                 sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
                     + escapeHtml(t("sys.split_brain", {
-                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
-                        sid: sb.sessionId.slice(0, 8),
+                        title: typeof sb.title === "string" && sb.title ? sb.title : shortSid,
+                        sid: shortSid,
                         selfPid: String(sb.self.pid),
                         selfLane: laneOf(sb.self),
                         peerPid: String(sb.peer.pid),
@@ -1343,6 +1496,21 @@ function changelogCatOf(rawLine) {
                 ab.innerHTML = "";
             }
         }
+        // #5221 phase 2 (owner ruling 2026-10-31): persistent local-resolver
+        // wedge — detection-only alarm banner beside the defect advisory.
+        const wb = $("resolver-wedge-banner");
+        if (wb) {
+            const w = d.resolverWedge;
+            if (w && w.tripped) {
+                wb.hidden = false;
+                wb.classList.add("show");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+            } else {
+                wb.hidden = true;
+                wb.classList.remove("show");
+                wb.innerHTML = "";
+            }
+        }
         const pb = $("plugin-advisory-banner");
         if (pb) {
             const advs = Array.isArray(d.pluginAdvisories) ? d.pluginAdvisories : [];
@@ -1402,6 +1570,36 @@ function changelogCatOf(rawLine) {
                 hb.hidden = true;
                 hb.classList.remove("show");
                 hb.innerHTML = "";
+            }
+        }
+        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
+        // server-side (POST /__bili/notices/dismiss) so one close silences
+        // every browser; the banner re-renders from the refetched overview.
+        const nb = $("pck-notice-banner");
+        if (nb) {
+            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
+            if (pn && pn.active === true) {
+                nb.hidden = false;
+                nb.classList.add("show");
+                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
+                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
+                            toast(t("pckoff.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                nb.hidden = true;
+                nb.classList.remove("show");
+                nb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -2579,8 +2777,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.usage") + '</span></div><div class="card-b">');
         parts.push('<div class="grid cols-4">');
         mini(parts, t("common.requests"), d.requests ? fmtW(d.requests) : null);
-        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null);
-        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
+        // #4899 v4: every token figure gets its own ≈$ face even without folds
+        // (priced sessions carry a live-estimated costUsd) — same tiers as the
+        // overview cards; unpriced sessions stay bare.
+        // #4899 v5: per-session rate args — show THE price inside each formula,
+        // same rule as the overview (only when one price actually applies).
+        const d6 = (x) => String(Math.round(x * 1e6) / 1e6);
+        const drates = d.rates ? { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) } : null;
+        const inSub = (d.costUsd ? t("ov.tier_unhit", { n: fmtUsd(d.costUsd.input) }) : "")
+            + (drates ? " · " + t("ov.at_input", { v: drates.w }) : "")
+            + (d.payback != null && d.savedUsdGross != null ? " · " + t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
+        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false, inSub);
+        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null, false,
+            d.costUsd && d.cachedTokens > 0 ? t("ov.money_eq", { n: fmtUsd(d.costUsd.cacheRead) }) + (drates ? " · " + t("ov.at_read", { v: drates.r }) : "") : "");
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
         // #2929: the headline hit-rate subline stays the three-bucket split only —
@@ -2601,12 +2810,51 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (rdRaw && (Number(rdRaw.count) > 0)) {
             hitSub += " · " + '<span style="color:#8250df" title="' + escapeHtml(t("det.attr_restart_tip")) + '">' + escapeHtml(t("det.attr_restart")) + " ×" + Number(rdRaw.count) + "</span>";
         }
-        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
-        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
+        // #4899: $ face under the missed-tokens split (current price table); tokens
+        // only when no price resolves.
+        const missLine = missArgs
+            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) + (drates ? " " + escapeHtml(t("ov.miss_rates", drates)) : "") : "")
+            : "";
+        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
+        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
+            (d.costUsd ? t("ov.money_eq", { n: fmtUsd(d.costUsd.output) }) : "")
+            + (drates ? " · " + t("ov.at_output", { v: drates.q }) : "")
+            + (d.payback != null && d.summaryCost ? " · " + t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : ""));
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
+        // #4899: money faces — saved-$ rides the saved-tokens card as the sub
+        // line; spend gets its own card with the input/cache/output breakdown.
+        const savedUsdSub = d.savedUsd != null ? t("ov.money_saved", { n: fmtUsd(d.savedUsd) }) : "";
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
-            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : savedUsdSub);
+        // #4899 v3: the honest question — did this session's folding pay back?
+        // The net reuses the same rounded faces rendered next door
+        // (gross − spent, exactly the canonical savedUsd arithmetic), so the
+        // numbers on screen reconcile by construction.
+        if (d.payback != null && d.savedUsdGross != null) {
+            const pnet = d.savedUsdGross - d.payback.spentUsd;
+            let brk = t("det.payback_brk_base", { r: fmtUsd(d.payback.replayUsd), g: fmtUsd(d.payback.sigmaUsd) });
+            if ((d.payback.creditUsd || 0) > 0) brk += " · " + t("det.payback_brk_credit", { c: fmtUsd(d.payback.creditUsd) });
+            if (d.rates) brk += " · " + escapeHtml(t("ov.payback_rates", { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) }));
+            let badge = "";
+            if (d.payback.breakevenTurns != null) {
+                const done = d.payback.actualTurns >= d.payback.breakevenTurns;
+                badge = ' <span style="color:' + (done ? "#1a7f37" : "#cf222e") + '">' + (done ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(d.payback.breakevenTurns - d.payback.actualTurns)) })) + "</span>";
+            } else if (pnet >= 0) {
+                badge = ' <span style="color:#1a7f37">' + t("ov.payback_ok") + "</span>";
+            }
+            mini(parts, t("det.payback"), "\u2248 " + fmtUsd(pnet), pnet >= 0,
+                t("det.payback_split", { s: fmtUsd(d.payback.spentUsd), brk, v: fmtUsd(d.savedUsdGross) }) + badge);
+        }
+        if (d.costUsd != null) {
+            // #4899: derived-from-price-table spend carries the same ≈ mark
+            // every other money face uses; a persisted ledger reads exact.
+            mini(parts, t("ov.spend"), (d.costUsd.estimated ? "\u2248 " : "") + fmtUsd(d.costUsd.total), false,
+                t("det.spend_sub", { i: fmtUsd(d.costUsd.input), r: fmtUsd(d.costUsd.cacheRead), w: fmtUsd(d.costUsd.cacheWrite), o: fmtUsd(d.costUsd.output) }));
+        }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
+        // #4899 v3: money faces are live estimates at current list prices — say so where they appear.
+        if (d.costUsd != null || d.savedUsd != null)
+            parts.push('<div class="dim small" style="margin-top:8px">' + escapeHtml(t("common.price_est_note")) + "</div>");
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
         // is never read as a measured value (the ghost-denominator incident).
@@ -2842,8 +3090,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else {
             // All folds in one scrollable panel (same pattern as the compression blocks):
             // numeric headers align with their columns; long lists just scroll.
-            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
-            const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
+            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + '</th><th class="num">' + t("det.fold_ra") + '</th><th class="num">' + t("det.fold_saved") + "</th>" + (d.rates ? '<th class="num">' + t("det.fold_usd") + "</th>" : "") + "</tr>";
+            const foldRow = (f, i) => {
+                // #4899 v5: make "how much × how much" concrete per fold — the
+                // later-request multiplier, its token credit, and the ≈$ when a
+                // read rate resolves.
+                const credit = ((f.S ?? 0) - (f.sigma ?? 0)) * (f.requestsAfter ?? 0);
+                return '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + '</td><td class="num">' + fmtW(f.requestsAfter ?? 0) + '</td><td class="num">' + fmtW(credit) + "</td>" + (d.rates ? '<td class="num">' + fmtUsd((credit * d.rates.r) / 1e6) + "</td>" : "") + "</tr>";
+};
             parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");
@@ -3422,7 +3676,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     async function loadConfig() {
         try {
-            const cfg = await json(API_ROOT + "/config");
+                        const cfg = await json(API_ROOT + "/config");
+            // #5319/#5328: refresh the resolved pack inventory (+ per-name
+            // source + user-pack dir) so the picker and the editor stay in
+            // sync with what is actually on disk.
+            refreshPackInventory();
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -3455,7 +3713,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             hydrateSummaryConfig(cfg);
             refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary", "save-pricing"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -3474,8 +3732,54 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             loadUpstream(cfg);
             void loadResign();
+            void loadPricing();
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    // #4899: per-model billing price editor — GET /__bili/pricing renders one
+    // row per model the panel has seen (plus existing override keys); the
+    // models.dev registry defaults prefill the placeholders; Save PUTs
+    // {billing:{prices}} through the structured config section (hot-applied).
+    let pricingModels = [];
+    function priceBadge(m) {
+        if (m.override) return '<span class="badge ok">' + t("cfg.pricing_src_config") + "</span>";
+        if (m.price) return '<span class="badge disk">' + t("cfg.pricing_src_registry") + "</span>";
+        return '<span class="badge warn">' + t("cfg.pricing_src_none") + "</span>";
+    }
+    function priceInput(m, f, label) {
+        const ov = m.override && m.override[f] != null ? m.override[f] : "";
+        const def = m.price && m.price[f] != null ? m.price[f] : "";
+        return '<label style="flex:1;min-width:110px"><span class="dim small">' + label + '</span>'
+            + '<input class="field-input mono" data-f="' + f + '" value="' + ov + '" placeholder="' + (def !== "" ? def : "—")
+            + '" inputmode="decimal" spellcheck="false"></label>';
+    }
+    function renderPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        if (!pricingModels.length) { host.innerHTML = '<span class="dim small">' + t("cfg.pricing_empty") + "</span>"; return; }
+        host.innerHTML = pricingModels.map((m) =>
+            '<div class="price-row" data-model="' + escapeHtml(m.model) + '" style="display:flex;flex-direction:column;gap:6px;padding:10px 0;border-bottom:1px solid var(--border,#e1e4e8)">'
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="mono small">' + escapeHtml(m.model) + "</span>" + priceBadge(m)
+            + '<button class="btn sm" data-del="1" title="' + escapeHtml(t("cfg.pricing_del")) + '">✕</button></div>'
+            + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+            + priceInput(m, "input", t("cfg.pricing_input"))
+            + priceInput(m, "output", t("cfg.pricing_output"))
+            + priceInput(m, "cacheRead", t("cfg.pricing_cacheread"))
+            + priceInput(m, "cacheWrite", t("cfg.pricing_cachewrite"))
+            + "</div></div>").join("");
+        const note = host.parentElement ? host.parentElement.querySelector(".cfg-dirty-note") : null;
+        if (note) note.hidden = true;
+    }
+    async function loadPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        try {
+            const data = await json(API_ROOT + "/pricing");
+            pricingModels = Array.isArray(data.models) ? data.models : [];
+            renderPricing();
+        } catch (e) {
+            host.innerHTML = '<span class="dim small">' + escapeHtml(t("toast.failed", { msg: e.message })) + "</span>";
         }
     }
     // #2090 plan A: read-only "Signed upstreams" card — every known/observed
@@ -3579,11 +3883,13 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
-            ["default", "lean"].forEach((name) => {
+            (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
                 const o = document.createElement("option");
                 o.value = name;
                 o.textContent = name;
@@ -3597,6 +3903,22 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             packSel.value = pv;
             updatePackNote();
+            const pcv = (draft.promptCache && typeof draft.promptCache === "object" && !Array.isArray(draft.promptCache) && typeof draft.promptCache.routing === "string") ? draft.promptCache.routing : "disabled";
+            while (pckSel.options.length > 0) pckSel.removeChild(pckSel.lastChild);
+            PCK_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                pckSel.appendChild(o);
+            });
+            if (!PCK_VALUES.includes(pcv)) {
+                const o = document.createElement("option");
+                o.value = pcv;
+                o.textContent = pcv + " *";
+                pckSel.appendChild(o);
+            }
+            pckSel.value = pcv;
+            updatePckNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -3712,6 +4034,46 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
+        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
+        // deletes the key so the file stays clean (mirrors the absorb row).
+        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
+        qCtrls.push(cafRow.inp);
+        cafRow.inp.addEventListener("change", () => commit((d) => {
+            if (cafRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.compressAtFoldPoint = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.compressAtFoldPoint;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const cafHint = document.createElement("span");
+        cafHint.className = "dim small";
+        cafHint.textContent = t("cfg.q_cafp_hint");
+        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -3720,18 +4082,406 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         plab.textContent = t("cfg.q_pack");
         pw.appendChild(plab);
         pw.appendChild(packSel);
+        packSelEl = packSel;
+        rerenderQuick = () => syncAll();
         box.appendChild(pw);
         const packNote = document.createElement("div");
         packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
         function updatePackNote() {
             if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
             else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else if (packSel.value === "chat") packNote.textContent = t("cfg.q_pack_chat_desc");
             else packNote.textContent = t("cfg.q_pack_custom");
         }
         box.appendChild(packNote);
+        // #5328: user-dir pack management — 新建/编辑/删除 under the dir the
+        // server reported via GET /__bili/packs (userDir). Builtin/shipped
+        // packs are read-only here; guidance says "override with a same-named
+        // file" instead of pretending they can be edited in place.
+        const pmRow = document.createElement("div");
+        pmRow.style.cssText = "margin:4px 0 2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+        const pmName = document.createElement("input");
+        pmName.type = "text";
+        pmName.className = "field-input mono";
+        pmName.placeholder = t("cfg.q_pack_name_ph");
+        pmName.style.cssText = "width:200px";
+        const pmNew = document.createElement("button");
+        pmNew.className = "btn sm";
+        pmNew.textContent = t("cfg.q_pack_new");
+        const pmEdit = document.createElement("button");
+        pmEdit.className = "btn sm";
+        pmEdit.textContent = t("cfg.q_pack_edit");
+        const pmDel = document.createElement("button");
+        pmDel.className = "btn sm";
+        pmDel.textContent = t("cfg.q_pack_del");
+        const pmStatus = document.createElement("span");
+        pmStatus.style.cssText = "flex-basis:100%;font-size:12px;color:#57606a";
+        pmRow.append(pmName, pmNew, pmEdit, pmDel, pmStatus);
+        const peBox = document.createElement("div");
+        peBox.hidden = true;
+        peBox.style.cssText = "margin:4px 0";
+        // #5344: the editor is a three-tab panel (guided form / AI assist /
+        // raw JSON); the bare-JSON box below becomes the third tab.
+        // WEB_CLIENT embedding rules: no backtick literals; runtime \n
+        // escapes are written \\n in this source file.
+        const peTabs = document.createElement("div");
+        peTabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px";
+        const PE_TAB_DEFS = [
+            { key: "form", label: t("cfg.q_pack_tab_form") },
+            { key: "ai", label: t("cfg.q_pack_tab_ai") },
+            { key: "json", label: t("cfg.q_pack_tab_json") },
+        ];
+        const peTabBtns = {};
+        for (const def of PE_TAB_DEFS) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.textContent = def.label;
+            btn.style.borderBottom = "2px solid transparent";
+            (function (key) { btn.addEventListener("click", () => showPeTab(key)); })(def.key);
+            peTabBtns[def.key] = btn;
+            peTabs.appendChild(btn);
+        }
+        function showPeTab(key) {
+            for (const def of PE_TAB_DEFS) {
+                const btn = peTabBtns[def.key];
+                btn.style.fontWeight = def.key === key ? "700" : "400";
+                btn.style.borderBottom = def.key === key ? "2px solid #0969da" : "2px solid transparent";
+            }
+            peFormPane.hidden = key !== "form";
+            peAiPane.hidden = key !== "ai";
+            peJsonPane.hidden = key !== "json";
+        }
+        const peTa = document.createElement("textarea");
+        peTa.className = "editor mono codebox";
+        peTa.spellcheck = false;
+        peTa.rows = 10;
+        peTa.placeholder = '{\\n  "promptSections": {\\n    "philosophy": "…"\\n  }\\n}';
+        const peBtns = document.createElement("div");
+        peBtns.style.cssText = "margin-top:6px;display:flex;gap:8px";
+        const peSave = document.createElement("button");
+        peSave.className = "btn sm";
+        peSave.textContent = t("cfg.q_pack_save");
+        const peCancel = document.createElement("button");
+        peCancel.className = "btn sm";
+        peCancel.textContent = t("cfg.q_pack_cancel");
+        peBtns.append(peSave, peCancel);
+        // #5344 tab 1: guided form — start from a base text, tweak, save.
+        const peFormPane = document.createElement("div");
+        const peAiPane = document.createElement("div");
+        const peJsonPane = document.createElement("div");
+        peFormPane.hidden = false;
+        peAiPane.hidden = true;
+        peJsonPane.hidden = true;
+        peJsonPane.append(peTa, peBtns);
+        const baseRow = document.createElement("div");
+        baseRow.style.cssText = "display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap";
+        const baseLab = document.createElement("label");
+        baseLab.htmlFor = "pack-base-sel";
+        baseLab.textContent = t("cfg.q_pack_base_label");
+        baseLab.style.cssText = "font-size:12px;color:#57606a";
+        const baseSel = document.createElement("select");
+        baseSel.id = "pack-base-sel";
+        baseSel.className = "field-input";
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            baseSel.appendChild(opt);
+        });
+        const btnBaseLoad = document.createElement("button");
+        btnBaseLoad.type = "button";
+        btnBaseLoad.className = "btn sm";
+        btnBaseLoad.textContent = t("cfg.q_pack_base_load");
+        baseRow.append(baseLab, baseSel, btnBaseLoad);
+        const descWrap = document.createElement("div");
+        descWrap.style.cssText = "margin:8px 0";
+        const descLab = document.createElement("div");
+        descLab.textContent = t("cfg.q_pack_desc");
+        descLab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+        const descIn = document.createElement("input");
+        descIn.type = "text";
+        descIn.className = "field-input";
+        descIn.placeholder = t("cfg.q_pack_desc_ph");
+        descIn.style.cssText = "width:100%;box-sizing:border-box";
+        descWrap.append(descLab, descIn);
+        function packSectionField(label, helpText, rows) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "margin:8px 0";
+            const lab = document.createElement("div");
+            lab.textContent = label;
+            lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+            const help = document.createElement("div");
+            help.textContent = helpText;
+            help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
+            const ta = document.createElement("textarea");
+            ta.className = "field-input mono";
+            ta.spellcheck = false;
+            ta.rows = rows;
+            ta.style.cssText = "width:100%;box-sizing:border-box";
+            wrap.append(lab, help, ta);
+            return { wrap, ta };
+        }
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
+        const taPh = phF.ta;
+        const taHc = hcF.ta;
+        const formHint = document.createElement("div");
+        formHint.textContent = t("cfg.q_pack_form_hint");
+        formHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0";
+        const btnFormSave = document.createElement("button");
+        btnFormSave.type = "button";
+        btnFormSave.className = "btn sm";
+        btnFormSave.textContent = t("cfg.q_pack_form_save");
+        peFormPane.append(baseRow, descWrap, phF.wrap, hcF.wrap, formHint, btnFormSave);
+        // #5344 tab 2: AI assist — plain-language need -> self-contained
+        // prompt -> copy to any LLM -> paste its JSON back -> fills the form.
+        const aiNeedLab = document.createElement("div");
+        aiNeedLab.textContent = t("cfg.q_pack_ai_need");
+        aiNeedLab.style.cssText = "font-size:13px;font-weight:600;margin:2px 0";
+        const aiNeed = document.createElement("textarea");
+        aiNeed.className = "field-input";
+        aiNeed.rows = 3;
+        aiNeed.placeholder = t("cfg.q_pack_ai_need_ph");
+        aiNeed.style.cssText = "width:100%;box-sizing:border-box";
+        const aiBtnRow = document.createElement("div");
+        aiBtnRow.style.cssText = "display:flex;gap:8px;margin:6px 0";
+        const btnAiGen = document.createElement("button");
+        btnAiGen.type = "button";
+        btnAiGen.className = "btn sm";
+        btnAiGen.textContent = t("cfg.q_pack_ai_gen");
+        const btnAiCopy = document.createElement("button");
+        btnAiCopy.type = "button";
+        btnAiCopy.className = "btn sm";
+        btnAiCopy.textContent = t("cfg.q_pack_ai_copy");
+        aiBtnRow.append(btnAiGen, btnAiCopy);
+        const aiOut = document.createElement("textarea");
+        aiOut.className = "editor mono codebox";
+        aiOut.readOnly = true;
+        aiOut.rows = 8;
+        aiOut.spellcheck = false;
+        aiOut.style.cssText = "width:100%;box-sizing:border-box";
+        const aiHint = document.createElement("div");
+        aiHint.textContent = t("cfg.q_pack_ai_hint");
+        aiHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0 2px";
+        const aiIn = document.createElement("textarea");
+        aiIn.className = "editor mono codebox";
+        aiIn.rows = 8;
+        aiIn.spellcheck = false;
+        aiIn.placeholder = '{"promptSections": {"philosophy": "..."}}';
+        aiIn.style.cssText = "width:100%;box-sizing:border-box";
+        const btnAiApply = document.createElement("button");
+        btnAiApply.type = "button";
+        btnAiApply.className = "btn sm";
+        btnAiApply.textContent = t("cfg.q_pack_ai_apply");
+        const aiApplyRow = document.createElement("div");
+        aiApplyRow.style.cssText = "display:flex;gap:8px;margin-top:6px";
+        aiApplyRow.append(btnAiApply);
+        peAiPane.append(aiNeedLab, aiNeed, aiBtnRow, aiOut, aiHint, aiIn, aiApplyRow);
+        async function loadBaseText() {
+            const baseName = baseSel.value;
+            if (!baseName) { descIn.value = ""; taPh.value = ""; taHc.value = ""; return; }
+            try {
+                const r = await json(API_ROOT + "/packs/templates");
+                const pk = r && r.packs ? r.packs[baseName] : null;
+                if (!pk) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+                descIn.value = typeof pk.description === "string" ? pk.description : "";
+                taPh.value = typeof pk.philosophy === "string" ? pk.philosophy : "";
+                taHc.value = typeof pk.howToCompress === "string" ? pk.howToCompress : "";
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        }
+        btnBaseLoad.addEventListener("click", () => loadBaseText());
+        // Shared pack-name normalizer (WEB_CLIENT rule: charCode, no regex
+        // with backslashes) for both save paths.
+        function packNameForSave() {
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            return (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+        }
+        btnFormSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.indexOf("..") !== -1) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            const phil = taPh.value.trim();
+            const hc = taHc.value.trim();
+            if (!phil && !hc) { pmSet(t("cfg.q_pack_form_empty"), true); return; }
+            const obj = { promptSections: {} };
+            if (phil) obj.promptSections.philosophy = phil;
+            if (hc) obj.promptSections.howToCompress = hc;
+            const desc = descIn.value.trim();
+            if (desc) obj.description = desc;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(obj, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
+        btnAiGen.addEventListener("click", () => {
+            const need = aiNeed.value.trim();
+            if (!need) { pmSet(t("cfg.q_pack_ai_need_empty"), true); return; }
+            aiOut.value = [t("cfg.q_pack_ai_p1", { need }), t("cfg.q_pack_ai_p2"), t("cfg.q_pack_ai_p3")].join("\\n\\n");
+            pmSet(t("cfg.q_pack_ai_gen_ok"));
+        });
+        btnAiCopy.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(aiOut.value); pmSet(t("cfg.q_pack_ai_copied")); }
+            catch (e) { pmSet(String(e), true); }
+        });
+        btnAiApply.addEventListener("click", () => {
+            // Tolerate markdown fences around the model's reply (build the
+            // fence from charCodes — no backtick literals here).
+            const FENCE = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);
+            let text = (aiIn.value || "").trim();
+            const lines = text.split("\\n");
+            if (lines.length > 0 && lines[0].trim().indexOf(FENCE) === 0) lines.shift();
+            if (lines.length > 0 && lines[lines.length - 1].trim() === FENCE) lines.pop();
+            text = lines.join("\\n").trim();
+            let obj = null;
+            try { obj = JSON.parse(text); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+            const ps = (obj.promptSections && typeof obj.promptSections === "object") ? obj.promptSections : {};
+            descIn.value = typeof obj.description === "string" ? obj.description : "";
+            taPh.value = typeof ps.philosophy === "string" ? ps.philosophy : "";
+            taHc.value = typeof ps.howToCompress === "string" ? ps.howToCompress : "";
+            const extra = Object.keys(obj).filter((k) => k !== "name" && k !== "version" && k !== "description" && k !== "promptSections");
+            Object.keys(ps).forEach((k) => { if (k !== "philosophy" && k !== "howToCompress") extra.push("promptSections." + k); });
+            peTa.value = JSON.stringify(obj, null, 2);
+            showPeTab("form");
+            pmSet(extra.length ? t("cfg.q_pack_ai_extra", { names: extra.join(", ") }) : t("cfg.q_pack_ai_apply_ok"));
+        });
+        peBox.append(peTabs, peFormPane, peAiPane, peJsonPane);
+        box.append(pmRow, peBox);
+        showPeTab("form");
+        let editingPack = "";   // "" = closed; otherwise the name being edited
+        let editingNew = false;
+        function pmSet(text, isError) {
+            pmStatus.textContent = text || "";
+            pmStatus.style.color = isError ? "#cf222e" : "#57606a";
+        }
+        function selectedIsUserPack(name) {
+            return packUserDir !== "" && String(packSources[name] || "").startsWith(packUserDir);
+        }
+        pmNew.addEventListener("click", () => {
+            editingPack = "";
+            editingNew = true;
+            pmName.value = "";
+            peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            baseSel.value = "";
+            descIn.value = "";
+            taPh.value = "";
+            taHc.value = "";
+            aiNeed.value = "";
+            aiOut.value = "";
+            aiIn.value = "";
+            peBox.hidden = false;
+            pmSet("");
+            showPeTab("form");
+        });
+        pmEdit.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!name || name === "default") { pmSet(t("cfg.q_pack_ro_default"), true); return; }
+            if (!selectedIsUserPack(name)) {
+                const src = String(packSources[name] || "");
+                pmSet(src.startsWith("file:") ? t("cfg.q_pack_ro_project") : t("cfg.q_pack_ro_builtin"), true);
+                return;
+            }
+            try {
+                const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
+                peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                let loadedObj = null;
+                try { loadedObj = peTa.value ? JSON.parse(peTa.value) : null; } catch (e) { loadedObj = null; }
+                const loadedPs = (loadedObj && loadedObj.promptSections && typeof loadedObj.promptSections === "object") ? loadedObj.promptSections : {};
+                descIn.value = (loadedObj && typeof loadedObj.description === "string") ? loadedObj.description : "";
+                taPh.value = (typeof loadedPs.philosophy === "string") ? loadedPs.philosophy : "";
+                taHc.value = (typeof loadedPs.howToCompress === "string") ? loadedPs.howToCompress : "";
+                editingPack = name;
+                editingNew = false;
+                pmName.value = name;
+                peBox.hidden = false;
+                pmSet("");
+                showPeTab("form");
+            } catch (e) { pmSet(String(e), true); }
+        });
+        pmDel.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!selectedIsUserPack(name)) { pmSet(t("cfg.q_pack_ro_del"), true); return; }
+            if (typeof confirm === "function" && !confirm(t("cfg.q_pack_confirm_del", { name }))) return;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), { method: "DELETE" });
+                pmSet(t("cfg.q_pack_deleted"));
+                refreshPackInventory();
+            } catch (e) { pmSet(String(e), true); }
+        });
+        peCancel.addEventListener("click", () => {
+            peBox.hidden = true;
+            editingPack = "";
+            editingNew = false;
+            pmSet("");
+        });
+        peSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            let parsed;
+            try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(parsed, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
         packSel.addEventListener("change", () => commit((d) => {
             if (!compressOf(d)) d.compress = {};
             if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
+        // #5079: prompt_cache_key self-stamping switch — the single knob that
+        // decides whether bili writes its own prompt_cache_key on egress.
+        // Values map 1:1 onto the config file (promptCache.routing), so this
+        // control and the raw JSON editor below stay in sync through commit().
+        const PCK_VALUES = ["disabled", "auto", "enabled"];
+        const pckSel = document.createElement("select");
+        pckSel.className = "field-input mono";
+        qCtrls.push(pckSel);
+        const pkw = document.createElement("div");
+        pkw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const pklab = document.createElement("label");
+        pklab.htmlFor = "quick-pck";
+        pklab.style.cssText = "flex:0 1 auto;max-width:520px";
+        pklab.textContent = t("cfg.q_pck");
+        pckSel.id = "quick-pck";
+        pkw.appendChild(pklab);
+        pkw.appendChild(pckSel);
+        box.appendChild(pkw);
+        const pckNote = document.createElement("div");
+        pckNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePckNote() {
+            if (pckSel.value === "disabled") pckNote.textContent = t("cfg.q_pck_disabled_desc");
+            else if (pckSel.value === "auto") pckNote.textContent = t("cfg.q_pck_auto_desc");
+            else if (pckSel.value === "enabled") pckNote.textContent = t("cfg.q_pck_enabled_desc");
+            else pckNote.textContent = t("cfg.q_pck_custom");
+        }
+        box.appendChild(pckNote);
+        pckSel.addEventListener("change", () => commit((d) => {
+            const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
+            if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
+            if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";
@@ -4148,7 +4898,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
-            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
+            const blg = hash.match(new RegExp("^#/blog/(.+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
@@ -4306,6 +5056,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const sf = $("save-file");
         const ss = $("save-summary");
         if (ss) ss.addEventListener("click", () => putCfg(ss, { file: $("cfg-file-edit").value }));
+        // #4899: billing price editor events — add-model, per-row delete, and
+        // Save (validates every filled field, PUTs {billing:{prices}}).
+        const addBtn = $("pricing-add-btn");
+        if (addBtn) addBtn.addEventListener("click", () => {
+            const inp = $("pricing-add-model");
+            const model = inp ? inp.value.trim() : "";
+            if (!model) { toast(t("cfg.pricing_add_ph"), "err"); return; }
+            if (pricingModels.some((m) => m.model === model)) { toast(t("cfg.pricing_dup"), "err"); return; }
+            pricingModels.push({ model, price: null, override: null });
+            inp.value = "";
+            renderPricing();
+            const note = $("pricing-fields").parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const pf = $("pricing-fields");
+        if (pf) pf.addEventListener("click", (ev) => {
+            const del = ev.target && ev.target.closest ? ev.target.closest("[data-del]") : null;
+            if (!del) return;
+            const row = del.closest(".price-row");
+            if (!row) return;
+            const model = row.getAttribute("data-model") || "";
+            pricingModels = pricingModels.filter((m) => m.model !== model);
+            renderPricing();
+        });
+        if (pf) pf.addEventListener("input", () => {
+            const note = pf.parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const spr = $("save-pricing");
+        if (spr) spr.addEventListener("click", async () => {
+            const prices = {};
+            try {
+                pf.querySelectorAll(".price-row").forEach((row) => {
+                    const model = row.getAttribute("data-model") || "";
+                    if (!model) return;
+                    const read = (f) => {
+                        const el = row.querySelector('[data-f="' + f + '"]');
+                        const v = el ? String(el.value || "").trim() : "";
+                        if (v === "") return undefined;
+                        const n = Number(v);
+                        if (!isFinite(n) || n < 0) throw new Error(model + ": " + f);
+                        return n;
+                    };
+                    const input = read("input");
+                    if (input == null) return;
+                    const entry = { input };
+                    const output = read("output");
+                    if (output != null) entry.output = output;
+                    const cacheRead = read("cacheRead");
+                    if (cacheRead != null) entry.cacheRead = cacheRead;
+                    const cacheWrite = read("cacheWrite");
+                    if (cacheWrite != null) entry.cacheWrite = cacheWrite;
+                    prices[model] = entry;
+                });
+            } catch (e) {
+                toast(t("cfg.pricing_invalid", { msg: e.message }), "err");
+                return;
+            }
+            if (await putCfg(spr, { billing: { prices } })) loadPricing();
+        });
         if (sf) sf.addEventListener("click", async () => {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";

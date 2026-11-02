@@ -7,7 +7,7 @@ import { maybeRunInvariantJudge } from "../invariant-judge.js";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, relocateCompressCarriers, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
@@ -25,12 +25,12 @@ import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
-import { conversationPromptSections, externalSummaryEnabled } from "../external-summary-surface.js";
+import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
-import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
+import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
@@ -59,6 +59,7 @@ import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUp
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -67,7 +68,8 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -563,8 +565,10 @@ async function forwardCaptured(
     // WS-tagged transport, network.httpOutboundBytes for the plain/proxy/pi-native relay
     // (no transport installed); managed non-WS transports pass through untouched
     // (#3701 Finding 1).
+    let outboundCopyRewritten = false;
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        if (shed.body !== wireBody) outboundCopyRewritten = true;
         wireBody = shed.body;
         // #4124: proactive per-prompt image-count cap — once this route PROVED a
         // count wall via an upstream rejection (learned into stats.imageCountCaps),
@@ -579,6 +583,7 @@ async function forwardCaptured(
                 resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
             });
             if (countShed.stats.changed) {
+                outboundCopyRewritten = true;
                 sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
                 log("info", `[${sess.id}] [image-count-shed] pre-send: archived ${countShed.stats.archived} oldest images to stay under the learned per-prompt cap ${imgCap} on this route (#4124) — originals stay in session storage`);
                 wireBody = countShed.body;
@@ -670,12 +675,26 @@ async function forwardCaptured(
     // (#5708/#5835 refolds) re-send near-identical image sets — first-send
     // facts stay the pairing source, same as noteForwardedBody's semantics.
     if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const nImages = countImagesInRawBody(prepared.protocol, wireBody);
+        // parsedBody (the pre-serialization object) avoids re-parsing the
+        // whole wire body here; a body that fails to parse carries no image
+        // facts to learn — skip exactly like the old raw-probe miss. When a
+        // pre-send shed rewrote the bytes, though, the pre-shed object
+        // overcounts the images actually sent — count the final string then.
+        let nImages = 0;
+        try {
+            nImages = outboundCopyRewritten
+                ? countImagesInRawBody(prepared.protocol, wireBody)
+                : countImagesInParsedBody(prepared.protocol, prepared.parsedBody ?? JSON.parse(wireBody));
+        } catch { /* unparseable — no image facts */ }
         if (nImages > 0) {
             const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
             noteForwardedImageFacts(prepared.session, {
                 nImages,
+                // Overhead against the SENT bytes: parsedBody is the pre-shed memo and
+                // would drift from wireBody once an egress shed rewrites the body; when
+                // nothing was rewritten, measuring the serialized bytes is exactly what
+                // pre-#5131 measured — one fewer branch, identical value.
                 textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
                 host: upstreamHost(learnUpstream),
                 fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
@@ -766,6 +785,9 @@ async function forwardCaptured(
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
         maybeRunInvariantJudge({
+            // #2078: reuse the seam block's single parse of sentBody instead of
+            // paying another full JSON.parse of the largest payload per turn.
+            parsed: sentParsed,
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
             // is the rendered view — reconciling the client's inbound bytes
@@ -2063,6 +2085,12 @@ async function forwardCaptured(
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+            // Experimental fold-point "thinking clear" (default OFF): install the
+            // kernel drop predicate only when BOTH switches are set; strict-echo
+            // and signed-thinking views yield none at all (#684/#1658).
+            if (loopConfig.compressAtFoldPointClearThinking) {
+                loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(prepared.originalMessages as BiliMessage[], isStrictReasoningEcho(prepared.session, targetOrigin, modelIdOf({ model: prepared.model })));
+            }
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
             // section with a plain "\n\n" (sysParts.join / injectSystem parts
@@ -2092,7 +2120,7 @@ async function forwardCaptured(
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
@@ -2134,7 +2162,19 @@ async function forwardCaptured(
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
-                    const out = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    // Fold-point carrier relocation round-2 mirror (switch A): with the
+                    // switch on, pairs sit at their fold point instead of being
+                    // tail-appended onto the re-request. Idempotent when processTurn's
+                    // node already moved them (view-only + deterministic transform).
+                    const out = loopConfig.compressAtFoldPoint
+                        ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
+                            isCompressTool: loopConfig.isCompressTool,
+                            ...(loopConfig.compressAtFoldPointClearThinking && loopConfig.reasoningDroppable
+                                ? { clearThinking: true, reasoningDroppable: loopConfig.reasoningDroppable }
+                                : {}),
+                        }) as BiliMessage[]
+                        : outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
@@ -2242,7 +2282,7 @@ async function forwardCaptured(
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2253,14 +2293,18 @@ async function forwardCaptured(
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
                     // Use the send-time capture; settlement is not another send.
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
                 } else {
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
-                if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                if (typeof out === "number") {
+                    prepared.session.stats.outputTokens += out;
+                    // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+                    billOutputUsage(prepared.session, out);
+                }
                 if (prepared.protocol === "openai") {
                     await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponseAsync(json, ctx, clientAbort.signal));
                 } else if (prepared.protocol === "responses") {

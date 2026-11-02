@@ -162,6 +162,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .stat .v small { font-size: 12px; font-weight: 400; color: var(--text-muted); margin-left: 4px; }
 .stat .s { font-size: 11.5px; color: var(--text-faint); margin-top: 4px; }
 .stat.good .v { color: var(--green); }
+.stat.bad .v { color: var(--red); }
 
 table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th {

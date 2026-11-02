@@ -206,10 +206,11 @@ test("#1502 loop: garbage args log head+tail and yield the corruption marker, no
         assert.doesNotMatch(output, /executing with \{\}/, "old degradation wording gone");
         assert.match(output, /were not parseable JSON/, "corruption marker streamed to client");
         assert.doesNotMatch(output, /carried no content at all/, "not mislabeled as empty");
-        // #4186: a failed-only round ends the turn — the corruption receipt is
-        // surfaced to the client above and NO re-request carries the ephemeral
-        // failure frame upstream (old contract asserted refetches === 1).
-        assert.equal(refetches, 0, "failed-only compress round ends the turn without a re-request");
+        // #4186→#5220: the corruption receipt is surfaced to the client above;
+        // the turn no longer ends there — ONE recovery-receipt re-request fires
+        // (this mock answers it with plain "ok" text). The ephemeral failure
+        // frame itself never rides that re-request upstream.
+        assert.equal(refetches, 1, "failed-only round re-requests once via recovery receipt (#5220)");
     } finally {
         globalThis.fetch = originalFetch;
     }

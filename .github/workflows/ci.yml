@@ -13,7 +13,16 @@ on:
     # lane or a bugfix-release/** carve-out get the CORE matrix directly;
     # backport.yml's token pushes compensate by dispatching this workflow
     # on the carry/lane ref.
-    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
+    # 2026-11-01 owner decision: drop `master` here. Post-merge re-runs had
+    # zero consumers (nothing blocks on them or reads their red; artifacts
+    # and release lanes fire on their own master-push triggers), so every
+    # merge paid full-shard minutes for a signal nobody saw. Master coverage
+    # does not lapse: the :03/:33 schedule cron below re-runs the FULL
+    # matrix whenever master moved since the last green scheduled run
+    # (bounded ~30 min window), and PR-side blocking still gates everything
+    # pre-merge. Release/bugfix push arms stay — they exist because
+    # bot-authored PR checks sit in action_required (#772).
+    branches: ["*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
     # bugfix-v*: carry PRs INTO the current patch lane (backport/carry-N)
@@ -29,8 +38,10 @@ on:
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
     types: [opened, synchronize, reopened, labeled]
-  # Three-layer CI (#3295): PRs and master pushes pay for the CORE matrix
-  # only. Every 30 minutes this cron asks the plan job whether master moved
+  # Three-layer CI (#3295): PRs pay for the CORE matrix only (master pushes
+  # stopped paying in 2026-11-01 — see the push arm above;
+  # this cron is now master's standing verifier).
+  # Every 30 minutes this cron asks the plan job whether master moved
   # since the last green scheduled run; only then does the FULL matrix run.
   # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
   # cron pattern on their own offsets.
@@ -98,6 +109,7 @@ jobs:
   # names (branch protection keys off `test (os, node, shard)`).
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -265,6 +277,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.testMatrix) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -321,6 +334,7 @@ jobs:
     needs: [plan]
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       mysql:
         image: mysql:8.0
@@ -346,7 +360,13 @@ jobs:
       # resolves it to the built dist. Same prerequisite as the main test
       # matrix (run-ci-tests pretest parity) and ci-e2e-dsh.yml.
       - run: npm --prefix kernel run build
-      - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
+      # --test-concurrency=1: every mysql lane in these files shares ONE DSN
+      # and database; node's default file parallelism (cores-1) would let two
+      # suites race on the same tables once runners grow past 2 vCPUs.
+      # storage-backend-mysql-e2e.test.ts is deliberately NOT listed: its hot-
+      # path test fails deterministically on real MySQL (pre-existing defect,
+      # not caused by any PR in flight) — tracked in #4926; re-add it there.
+      - run: node --import tsx --test --test-concurrency=1 tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts tests/issue4666-migration-dedup.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
 
@@ -362,6 +382,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.staticMatrix) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -385,6 +406,7 @@ jobs:
 
   version-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -413,6 +435,7 @@ jobs:
 
   kernel-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -473,6 +496,7 @@ jobs:
   # load-bearing core compression).
   pi-subagents-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -506,6 +530,7 @@ jobs:
   # generator goes red here. Zero-dep script: no npm install needed.
   docs-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -520,6 +545,7 @@ jobs:
   # added to src goes red here with the missing names listed.
   docs-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -534,6 +560,7 @@ jobs:
   # Not gated to pull_request so master pushes are held to the same surface.
   config-surface-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -548,6 +575,7 @@ jobs:
   # node, no install step. Not gated to pull_request, same as the guards above.
   lifecycle-ledger-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -563,6 +591,7 @@ jobs:
   # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
   lane-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -605,6 +634,7 @@ jobs:
   # plain node, no install step.
   unused-exports:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -621,6 +651,7 @@ jobs:
   # Zero-dep: plain node, no install step.
   test-import-graph:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -639,6 +670,7 @@ jobs:
   # AGENTS.md §4 rule 2 ("release commit changes ONLY version + lock if drifts").
   lock-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -665,6 +697,7 @@ jobs:
     needs: [test, static-gates]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       issues: write
       contents: read

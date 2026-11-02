@@ -19,23 +19,26 @@ import { writeOutputBudget } from "../src/server/side-request.ts";
 
 test("#2011 clampOutputBudget: fractional inputEstimate yields an INTEGER cap", () => {
     // Exact values from the 0.1.181 production log (#2011): each produced a fractional
-    // max_tokens that a strict upstream rejected. margin = max(2048, ceil(est*0.05)).
+    // max_tokens that a strict upstream rejected. #5278: the margin now sizes off the
+    // safety-inflated estimate ceil(est*1.12), not the raw estimate.
     const capA = clampOutputBudget(384_000, 85_032.5, 200_000);
     assert.ok(capA !== undefined, "must clamp");
     assert.ok(Number.isInteger(capA!), `cap must be an integer (got ${capA})`);
-    assert.equal(capA!, 110_715, "floor of exact headroom (window - input - margin)");
+    assert.equal(capA!, 100_001, "floor of exact headroom (window - safe estimate - margin)");
     assert.ok((capA ?? 0) + 85_032.5 <= 200_000, "input + clamped output never exceeds the window");
 
     const capB = clampOutputBudget(384_000, 99_364.25, 200_000);
     assert.ok(Number.isInteger(capB!), `cap must be an integer (got ${capB})`);
-    assert.equal(capB!, 95_666, "floor of exact headroom");
+    assert.equal(capB!, 83_147, "floor of exact headroom");
 });
 
 test("#2011 clampOutputBudget: integer inputEstimate is unchanged by the floor (no drift)", () => {
     // Regression guard against over-correcting: with whole-number estimates the cap must be
-    // byte-identical to the pre-fix behavior (existing #453 repro shape).
-    const margin = Math.max(2048, Math.ceil(130_000 * 0.05));
-    assert.equal(clampOutputBudget(131_072, 130_000, 262_144), 262_144 - 130_000 - margin);
+    // byte-identical to the documented formula on the #5278 safety-inflated estimate
+    // (existing #453 repro shape).
+    const safeEst = Math.ceil(130_000 * 1.12);
+    const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+    assert.equal(clampOutputBudget(131_072, 130_000, 262_144), 262_144 - safeEst - margin);
 });
 
 // ---- writeOutputBudget: the sole wire writer --------------------------------

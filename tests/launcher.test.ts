@@ -8188,7 +8188,7 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
 // first read sees nothing, so the #1753 squatter branch provably fires before
 // the handshake settles (gating on read count taken AT SPAWN, immune to
 // however many times pre-spawn discovery reads the file).
-const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin; if that never happens, kill pid 875250 or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead";
 function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
     let childToken = "";
     let preSpawnReads = -1;

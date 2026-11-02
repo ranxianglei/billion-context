@@ -63,7 +63,12 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-export const STORAGE_SCHEMA_VERSION = 8;
+//      - v10: immutable per-message local time-of-occurrence (#4313) —
+//        messages gains nullable `ts` (epoch ms, stamped once at ingest,
+//        never updated). No backfill: pre-feature rows stay NULL and keep
+//        rendering without the tag's time attribute. Same both-directions
+//        compatibility as v5 (older build ignores, newer build ALTERs).
+export const STORAGE_SCHEMA_VERSION = 10;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -144,6 +149,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash    TEXT NOT NULL REFERENCES content(hash),
     identity        TEXT NOT NULL DEFAULT '',
     retired_at      INTEGER,
+    ts              INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -369,6 +375,29 @@ export function migrateSchema(db: {
             // migration and re-OMM'd: permanently unopenable stores (#4677).
             needV8Backfill = true;
         }
+        if (from < 9) {
+            // v9 zero-ref collection index (#4796): gc()'s sweep and the
+            // dry-run count address content BY refcount — without this index
+            // every run full-scans the CAS table. Field report: 766K rows /
+            // ~20 GB, one uncommitted `DELETE ... WHERE refcount <= 0` ran
+            // 8 hours with zero committed rows, its WAL frames could never
+            // checkpoint, and the held write lock starved live proxies. The
+            // index makes candidate selection an index range scan; building
+            // it once on an already-bloated db costs about what open-time
+            // quick_check pays on EVERY open (#4175). Idempotent CREATE so a
+            // dev-window lib that already carried it re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
+        }
+        if (from < 10) {
+            // v10 (#4313): immutable message wall-clock stamp. Nullable, no
+            // backfill — pre-feature rows read NULL and render without the
+            // time attribute (legacy bytes unchanged). Probe-first like v8.
+            const tsCols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!tsCols.includes("ts")) {
+                db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
+            }
+        }
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
@@ -415,7 +444,7 @@ function migrateV8Identities(db: {
             "WHERE m.session_id = ? AND m.identity = '' AND m.seq > ? ORDER BY m.seq LIMIT ?",
     );
     const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
-    const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ?");
+    const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0");
     const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
     const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
     const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
@@ -456,7 +485,9 @@ function migrateV8Identities(db: {
             // One transaction per session: keepers get their identity, the later
             // duplicates hand their media mappings + message rows + CAS refs back
             // (delete referencing rows FIRST — the #4242 discipline; refcount may
-            // reach 0, the next gc run collects those content rows).
+            // reach 0, the next gc run collects those content rows). The > 0
+            // floor on decRef mirrors the releaseContent guards so an
+            // already-corrupt ledger cannot go negative during migration.
             db.transaction(() => {
                 for (const u of updates) upd.run(u.identity, s.session_id, u.seq);
                 for (const d of drops) {
