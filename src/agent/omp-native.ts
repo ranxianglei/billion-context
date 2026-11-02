@@ -26,6 +26,7 @@ import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -161,10 +162,18 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) { return; }
         const sid = typeof b.prompt_cache_key === "string" ? b.prompt_cache_key.trim() : "";
         if (sid.length === 0) { return; }
+        // #5403/#5418: feed the SAME proven id list into the shared watermark
+        // channel (the fetch chokepoint emits x-bili-pf-count + tail-ids; core
+        // = pf-channel.ts) on EVERY parsed model request — converting turns
+        // also ride the envelope, skipped/degraded turns ride full-resend.
+        // A failed alignment (undefined) CLEARS the stored list like every
+        // other adapter — never ride a stale one.
+        const turnMsgIds = ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]);
+        pfChannel.pfCaptureIds(sid, turnMsgIds);
         const base = state.origin;
         if (base === undefined) { return; }
         if (!(await probeIncrementalTurns(base))) { return; }
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]) });
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: turnMsgIds });
         if (plan.mode === "skip") { return; }
         const turnId = newIncrementalTurnId();
         // #3304: stash the pre-swap body under this turn's id — if the proxy
