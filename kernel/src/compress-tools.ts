@@ -176,15 +176,27 @@ export const COMPRESS_TOOL_OPENAI = {
   },
 };
 
+/** #4313 (toggle, PR #5236): timestamps-off default — the exact pre-feature ACP TAGS section; the default assembly ships these so `messageTimestamps` off renders byte-identical to pre-#4313 masters. The time-aware variants below reach hosts that enable the feature (bili selects them at the prompt-exit when compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS is on). */
+const FUNCTION_ACP_TAGS_DEFAULT = `ACP TAGS
+
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+
+export const FUNCTION_ACP_TAGS_TIMESTAMPED = `ACP TAGS
+
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+
+const TEXT_ACP_TAGS_DEFAULT = `ACP TAGS
+
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+
+export const TEXT_ACP_TAGS_TIMESTAMPED = `ACP TAGS
+
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+
 const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
 > = [
-  [
-    "acpTags",
-    `ACP TAGS
-
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`,
-  ],
+  ["acpTags", FUNCTION_ACP_TAGS_DEFAULT],
   [
     "tools",
     `TOOLS
@@ -233,12 +245,7 @@ export function buildCompressSystemPrompt(
 const TEXT_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
 > = [
-  [
-    "acpTags",
-    `ACP TAGS
-
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
-  ],
+  ["acpTags", TEXT_ACP_TAGS_DEFAULT],
   [
     "textProtocol",
     `COMPRESSION PROTOCOL (TEXT)

@@ -609,7 +609,11 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const vertexBaseUrl = claudeNativeVertexBaseUrl(origin, env);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
-    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, ...(vertexBaseUrl !== undefined ? { vertexBaseUrl } : {}) });
+    // #5095: repin may run from an older dist tree mid-upgrade; never bake a
+    // command pointing at a file that is not there.
+    const subagentHookJs = path.join(selfPackageRoot(), "dist", "claude-subagent-hook.js");
+    const subagentHookCommand = fs.existsSync(subagentHookJs) ? portableHookCommand("node", [subagentHookJs]) : undefined;
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, ...(subagentHookCommand !== undefined ? { subagentHookCommand } : {}), ...(vertexBaseUrl !== undefined ? { vertexBaseUrl } : {}) });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
 }
@@ -628,7 +632,7 @@ export function readClaudeManagedBaseUrl(env: NodeJS.ProcessEnv = process.env): 
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
  *  mutated copy plus human notes. Exported for tests. */
-export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; vertexBaseUrl?: string }): { data: Record<string, unknown>; notes: string[] } {
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; vertexBaseUrl?: string; subagentHookCommand?: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(settings);
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
@@ -672,9 +676,27 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         hooks.SessionStart = sessionStart;
         data.hooks = hooks;
         notes.push("hooks.SessionStart += bili proxy bootstrap");
-    } else if (refreshOurHookCommands(sessionStart, opts.hookCommand)) {
+    } else if (refreshOurHookCommands(sessionStart, opts.hookCommand, isOursSessionStartEntry)) {
         data.hooks = hooks;
         notes.push("hooks.SessionStart refreshed to the current hook command");
+    }
+    // #5095 (D1-C): the SubagentStart lane-token hook. Optional in opts so
+    // library callers (tests) stay unchanged; both production callers
+    // (plugin install + SessionStart repin) always pass it, so existing
+    // installs gain the hook on their next bootstrap run without a
+    // reinstall. A user's own SubagentStart entries are never touched —
+    // ours is appended only when no bili entry is present.
+    if (opts.subagentHookCommand !== undefined) {
+        const subagentStart = Array.isArray(hooks.SubagentStart) ? hooks.SubagentStart : [];
+        if (!subagentStart.some(isOursSubagentStartEntry)) {
+            subagentStart.push({ hooks: [{ type: "command", command: opts.subagentHookCommand }] });
+            hooks.SubagentStart = subagentStart;
+            data.hooks = hooks;
+            notes.push("hooks.SubagentStart += bili subagent lane token hook (#5095)");
+        } else if (refreshOurHookCommands(subagentStart, opts.subagentHookCommand, isOursSubagentStartEntry, isOurSubagentHookCommand)) {
+            data.hooks = hooks;
+            notes.push("hooks.SubagentStart refreshed to the current hook command");
+        }
     }
     return { data, notes };
 }
@@ -685,19 +707,24 @@ function isOurHookCommand(command: unknown): command is string {
     return typeof command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test(command);
 }
 
+/** #5095 (D1-C): a hook command naming our SubagentStart lane-token hook. */
+function isOurSubagentHookCommand(command: unknown): command is string {
+    return typeof command === "string" && /claude-subagent-hook\.(?:js|mjs|ts)["']?$/.test(command);
+}
+
 /** Rewrite every hook command we own to `command`, in place; true if any
  *  changed. The entry above is appended only when no bili entry is present,
  *  so without this a settings file written by an older release keeps its old
  *  command forever — and a command a client shell cannot run hangs every
  *  session with no log to say why. */
-function refreshOurHookCommands(sessionStart: unknown[], command: string): boolean {
+function refreshOurHookCommands(entries: unknown[], command: string, isOurs: (entry: unknown) => boolean, ownsCommand: (command: unknown) => boolean = isOurHookCommand): boolean {
     let changed = false;
-    for (const entry of sessionStart) {
-        if (!isOursSessionStartEntry(entry)) continue;
+    for (const entry of entries) {
+        if (!isOurs(entry)) continue;
         for (const h of (entry as { hooks: unknown[] }).hooks) {
             const hook = h as { command?: unknown };
             const cur = hook.command;
-            if (isOurHookCommand(cur) && cur !== command) {
+            if (ownsCommand(cur) && cur !== command) {
                 hook.command = command;
                 changed = true;
             }
@@ -712,6 +739,14 @@ export function isOursSessionStartEntry(entry: unknown): boolean {
     const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
     if (!Array.isArray(hooks)) return false;
     return hooks.some((h) => h !== null && typeof h === "object" && isOurHookCommand((h as { command?: unknown }).command));
+}
+
+/** #5095 (D1-C): a SubagentStart entry we wrote: any hook command naming
+ *  our lane-token hook script. */
+function isOursSubagentStartEntry(entry: unknown): boolean {
+    const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
+    if (!Array.isArray(hooks)) return false;
+    return hooks.some((h) => h !== null && typeof h === "object" && isOurSubagentHookCommand((h as { command?: unknown }).command));
 }
 
 /** Pure strip of the managed block (remove path) — returns the cleaned copy
@@ -748,6 +783,17 @@ export function stripClaudeManagedBlock(settings: Record<string, unknown>): { da
             removed.push("hooks.SessionStart entry");
             if (kept.length > 0) hooks.SessionStart = kept;
             else delete hooks.SessionStart;
+            if (Object.keys(hooks).length === 0) delete data.hooks;
+        }
+    }
+    if (hooks !== undefined && Array.isArray(hooks.SubagentStart)) {
+        // #5095 (D1-C): our lane-token hook leaves with the managed block;
+        // a user's own SubagentStart entries stay.
+        const kept = (hooks.SubagentStart as unknown[]).filter((e) => !isOursSubagentStartEntry(e));
+        if (kept.length !== (hooks.SubagentStart as unknown[]).length) {
+            removed.push("hooks.SubagentStart entry");
+            if (kept.length > 0) hooks.SubagentStart = kept;
+            else delete hooks.SubagentStart;
             if (Object.keys(hooks).length === 0) delete data.hooks;
         }
     }
@@ -871,8 +917,10 @@ function claudeInstall(): string {
     const root = selfPackageRoot();
     const mcpEntryJs = path.join(root, "dist", "claude-mcp-entry.js");
     const bootstrapJs = path.join(root, "dist", "claude-native-bootstrap.js");
+    const subagentHookJs = path.join(root, "dist", "claude-subagent-hook.js");
     requireDistFile(mcpEntryJs);
     requireDistFile(bootstrapJs);
+    requireDistFile(subagentHookJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
     // #964/#1660: the baked URL uses the explicit override
@@ -887,6 +935,8 @@ function claudeInstall(): string {
     const settings = readJson(file);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [bootstrapJs]);
+    // #5095 (D1-C): SubagentStart lane-token hook, same install lane.
+    const subagentHookCommand = portableHookCommand("node", [path.join(root, "dist", "claude-subagent-hook.js")]);
     // Both variables are baked for the SAME origin; the Vertex one only exists
     // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
     const managedOrigin = claudeNativeOrigin();
@@ -894,6 +944,7 @@ function claudeInstall(): string {
     const { data, notes } = applyClaudeManagedBlock(settings, {
         baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
         hookCommand,
+        subagentHookCommand,
         ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
     });
     writeJson(file, data);

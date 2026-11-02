@@ -35,6 +35,7 @@ interface Harness {
     turn: (t: Turn) => Promise<{ status: number; body: unknown; appliedSeq?: number }>;
     forwarded: Record<string, unknown>[];
     rows: () => { seq: number; msgId: string; content: string }[];
+    settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
@@ -52,7 +53,11 @@ async function harness(pin: boolean): Promise<Harness> {
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    // #5155: the wrap-up schedules a debounced save instead of a synchronous
+    // writeNow per turn — rows settle shortly AFTER the ack. A short debounce
+    // plus settle() keeps the row reads deterministic; the identity contracts
+    // under test are unchanged.
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 15 });
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
@@ -81,8 +86,8 @@ async function harness(pin: boolean): Promise<Harness> {
         const applied = response.headers.get("x-bili-applied-seq");
         return { status: response.status, body, appliedSeq: applied !== null && /^\d+$/.test(applied) ? Number(applied) : undefined };
     };
-    // the lane acks after its own immediate flush, so rows are on disk by
-    // the time the turn responds; message bytes live in the CAS (content
+    // #5155: the lane acks without waiting for the debounced flush — rows are
+    // on disk once it settles; message bytes live in the CAS (content
     // table) keyed by messages.content_hash — the messages table has no
     // content column (#4390 schema shape).
     const rows = (): { seq: number; msgId: string; content: string }[] => {
@@ -95,7 +100,7 @@ async function harness(pin: boolean): Promise<Harness> {
             db.close();
         }
     };
-    return { turn, forwarded, rows, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { turn, forwarded, rows, settle: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const wmsg = (text: string) => ({ role: "user", content: [{ type: "text", text: text.repeat(200) }] });
@@ -109,6 +114,7 @@ test("msgid lane flow: pin carries client ids into rows; edits append fresh rows
         const seed = await h.turn({ sinceSeq: 0, resync: true, msgIds: ["u1", "a1", "u2"], messages: [umsg("alpha"), amsg("beta"), umsg("gamma")] });
         assert.equal(seed.status, 200);
         assert.equal(seed.appliedSeq, 3);
+        await h.settle();
         let rows = h.rows();
         assert.equal(rows.length, 3, "seed lands three rows");
         assert.deepEqual(rows.map((r) => r.msgId).sort(), ["a1", "u1", "u2"], "rows carry the CLIENT ids (pin), not content hashes");
@@ -118,6 +124,7 @@ test("msgid lane flow: pin carries client ids into rows; edits append fresh rows
         const second = await h.turn({ sinceSeq: 3, resync: true, msgIds: ["u1", "a1"], messages: [umsg("alpha-edited"), amsg("beta")] });
         assert.equal(second.status, 200, "edit resync must not 409");
         assert.equal(second.appliedSeq, 2);
+        await h.settle();
         rows = h.rows();
         assert.equal(rows.length, 4, "an edit lands as a FRESH row (append-only discipline; the old generation stays)");
         const editedRow = rows.find((r) => r.msgId === "u1" && r.content.includes("alpha-edited"));
@@ -140,6 +147,7 @@ test("msgid lane flow: undo→redo with identical content revives at the origina
     try {
         const seed = await h.turn({ sinceSeq: 0, resync: true, msgIds: ["u1", "a1", "u2"], messages: [umsg("alpha"), amsg("beta"), umsg("gamma")] });
         assert.equal(seed.status, 200);
+        await h.settle();
         const rows0 = h.rows();
         assert.equal(rows0.length, 3);
 
@@ -150,6 +158,7 @@ test("msgid lane flow: undo→redo with identical content revives at the origina
         const redo = await h.turn({ sinceSeq: 1, resync: true, msgIds: ["u1", "a1", "u2"], messages: [umsg("alpha"), amsg("beta"), umsg("gamma")] });
         assert.equal(redo.status, 200);
         assert.equal(redo.appliedSeq, 3);
+        await h.settle();
         const rows2 = h.rows();
         assert.equal(rows2.length, 3, "identical content re-observed under the same ids joins the ORIGINAL rows — no duplicates (#4390 discipline)");
         assert.deepEqual(rows2.map((r) => r.seq).sort(), rows0.map((r) => r.seq).sort(), "seqs unchanged across undo→redo");
@@ -173,6 +182,7 @@ test("msgid lane flow: a delta re-claiming a live canonical id hard-fails (400),
         const good = await h.turn({ sinceSeq: 1, msgIds: ["a1", "u2"], messages: [amsg("reply"), umsg("next")] });
         assert.equal(good.status, 200);
         assert.equal(good.appliedSeq, 3);
+        await h.settle();
         const rows = h.rows();
         assert.deepEqual(rows.map((r) => r.msgId).sort(), ["a1", "u1", "u2"], "delta ids append onto the pinned canonical");
     } finally {
@@ -194,6 +204,7 @@ test("msgid lane flow: divergent resync with ids then a delta — no 409 loop (b
         const delta = await h.turn({ sinceSeq: 1, msgIds: ["u3"], messages: [umsg("carrying on")] });
         assert.equal(delta.status, 200, "no 409 loop after a divergent resync with ids");
         assert.ok((delta.appliedSeq ?? 0) >= 1, "tip is monotonic");
+        await h.settle();
         const rows = h.rows();
         assert.equal(rows.filter((r) => r.msgId === "u1").length, 2, "both u1 generations live in the durable log (historian)");
     } finally {
@@ -206,6 +217,7 @@ test("msgid lane flow: turns without msgIds stay on content-derived identities (
     try {
         const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [umsg("alpha"), amsg("beta")] });
         assert.equal(seed.status, 200);
+        await h.settle();
         const rows = h.rows();
         assert.equal(rows.length, 2);
         for (const r of rows) assert.ok(!["alpha", "beta", "u1", "a1"].includes(r.msgId), `unpinned ids stay content-derived: ${r.msgId}`);
@@ -242,6 +254,7 @@ test("msgid lane flow: multi-block wire content degrades to derived ids, never a
 
         // The dropped ids must NOT be stamped into rows (they were ambiguous);
         // the derived ids own the turn's rows.
+        await h.settle();
         const stamped = h.rows().map((r) => r.msgId);
         assert.ok(!stamped.includes("a2"), "the ambiguous client id was dropped, not misattributed");
         assert.ok(!stamped.includes("u3"), "the whole delta's ids drop together (per-message granularity is a lie mid-expansion)");
@@ -249,6 +262,7 @@ test("msgid lane flow: multi-block wire content degrades to derived ids, never a
         // Recovery: a clean 1:1 delta pins again — the lane is not poisoned.
         const after = await h.turn({ sinceSeq: next.appliedSeq ?? 0, msgIds: ["u4"], messages: [umsg("clean follow-up")] });
         assert.equal(after.status, 200);
+        await h.settle();
         assert.ok(h.rows().some((r) => r.msgId === "u4"), "subsequent clean deltas pin client ids again");
     } finally {
         await h.close();

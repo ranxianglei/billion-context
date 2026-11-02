@@ -60,6 +60,11 @@ export interface CodexConfig {
     model?: string;
     /** Top-level `model_context_window` override (if set). */
     contextWindow?: number;
+    /** Top-level `model_catalog_json` — file holding codex's live model
+     *  table (the catalog install writes ONLY this; models_cache.json may be
+     *  absent). Absolute paths stay as-is, relative resolve against
+     *  $CODEX_HOME (#5243). */
+    modelCatalogJson?: string;
     /** Top-level `model_auto_compact_token_limit` override (if set). */
     autoCompactLimit?: number;
     /** Top-level `model_max_output_tokens` override (if set) (#971). */
@@ -723,6 +728,7 @@ export function parseCodexToml(text: string): CodexConfig {
                 if (key === "model_provider") result.modelProvider = val;
                 else if (key === "openai_base_url") result.openaiBaseUrl = val;
                 else if (key === "model") codexModel = val;
+                else if (key === "model_catalog_json") result.modelCatalogJson = val;
             } else if (curProvider && key === "base_url") {
                 result.providers[curProvider].baseUrl = val;
             }
@@ -813,6 +819,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
     let provider: string | undefined;
     let openaiBaseUrl: string | undefined;
     let contextWindow: number | undefined;
+    let modelCatalogJson: string | undefined;
     let autoCompactLimit: number | undefined;
     let maxOutput: number | undefined;
     const asNumber = (raw: string): number | undefined => {
@@ -829,6 +836,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
         else if (key === "model_provider") provider = val;
         else if (key === "openai_base_url") openaiBaseUrl = val;
         else if (key === "model_context_window") contextWindow = asNumber(val);
+        else if (key === "model_catalog_json") modelCatalogJson = val.length > 0 ? val : undefined;
         else if (key === "model_auto_compact_token_limit") autoCompactLimit = asNumber(val);
         else if (key === "model_max_output_tokens") maxOutput = asNumber(val);
         else {
@@ -857,6 +865,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
     if (provider !== undefined) out.modelProvider = provider;
     if (openaiBaseUrl !== undefined) out.openaiBaseUrl = openaiBaseUrl;
     if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (modelCatalogJson !== undefined) out.modelCatalogJson = modelCatalogJson;
     if (autoCompactLimit !== undefined) out.autoCompactLimit = autoCompactLimit;
     if (maxOutput !== undefined) out.maxOutput = maxOutput;
     return out;
@@ -874,12 +883,14 @@ export function mergeCodexViews(base: CodexConfig, overlay: CodexConfig): CodexC
     }
     const model = overlay.model ?? base.model;
     const contextWindow = overlay.contextWindow ?? base.contextWindow;
+    const modelCatalogJson = overlay.modelCatalogJson ?? base.modelCatalogJson;
     const maxOutput = overlay.maxOutput ?? base.maxOutput;
     const out: CodexConfig = { providers };
     if (overlay.modelProvider !== undefined || base.modelProvider !== undefined) out.modelProvider = overlay.modelProvider ?? base.modelProvider;
     if (overlay.openaiBaseUrl !== undefined || base.openaiBaseUrl !== undefined) out.openaiBaseUrl = overlay.openaiBaseUrl ?? base.openaiBaseUrl;
     if (model !== undefined) out.model = model;
     if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (modelCatalogJson !== undefined) out.modelCatalogJson = modelCatalogJson;
     if (overlay.autoCompactLimit !== undefined || base.autoCompactLimit !== undefined) out.autoCompactLimit = overlay.autoCompactLimit ?? base.autoCompactLimit;
     if (maxOutput !== undefined) out.maxOutput = maxOutput;
     const win = toModelWindow(model, contextWindow, maxOutput);

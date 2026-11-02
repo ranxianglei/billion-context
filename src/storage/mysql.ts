@@ -39,10 +39,10 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex } from "./store.js";
+import { sha256Hex, viewPointerSeqs } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
-import type { StorageBackend } from "./backend.js";
+import type { StorageBackend, StorageReadView } from "./backend.js";
 import type {
     SessionRow,
     MessageRow,
@@ -53,6 +53,7 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
+    SessionViewRows,
 } from "./store.js";
 
 /** The mysql2/promise driver module, injected by openBackend() at open time.
@@ -64,7 +65,10 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-const MYSQL_SCHEMA_VERSION = 8;
+/** v10 (#4313): immutable per-message wall-clock stamp. Existing stamped-v9
+ *  libraries re-enter the probe-first DDL block below exactly once on first
+ *  open; pre-feature rows read NULL (no backfill). */
+const MYSQL_SCHEMA_VERSION = 10;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -82,6 +86,18 @@ const MIGRATION_LOCK_POLL_S = 30;
 /** PR #4725 N3 (mirror of store.ts): covered-seq span point queries chunk the
  *  msg_id IN (…) list at the same 500 batch size for cross-backend parity. */
 const SEQ_SPAN_QUERY_BATCH = 500;
+
+/** #4796: rows per batch of gc()'s zero-ref CAS sweep (mysql counterpart of
+ *  GC_ZERO_REF_BATCH_SIZE in store.ts): one giant DELETE holds every row
+ *  lock and all undo until commit; LIMIT-bound autocommit batches commit
+ *  independently, so a crash resumes and the lock/undo footprint stays
+ *  bounded to one batch. */
+const MYSQL_GC_ZERO_REF_BATCH = 2000;
+
+/** #4796 follow-up: statement size of the lifecycle-scoped zero-ref sweep
+ *  (collectZeroRefIn) — same rationale as the sqlite twin; chunked so each
+ *  IN-list stays a comfortable parameter count. */
+const MYSQL_ZERO_REF_SWEEP_CHUNK = 500;
 
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
@@ -121,7 +137,8 @@ CREATE TABLE IF NOT EXISTS content (
     byte_len BIGINT NOT NULL,
     refcount BIGINT NOT NULL DEFAULT 0,
     algo     VARCHAR(16) NOT NULL DEFAULT 'sha256',
-    bytes    LONGTEXT NOT NULL
+    bytes    LONGTEXT NOT NULL,
+    KEY idx_content_refcount (refcount)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -135,6 +152,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash VARCHAR(64) NOT NULL,
     identity     VARCHAR(64) NOT NULL DEFAULT '',
     retired_at   BIGINT NULL,
+    ts           BIGINT NULL,
     PRIMARY KEY (session_id, seq),
     UNIQUE KEY uq_messages_identity (session_id, msg_id, content_hash),
     KEY idx_messages_session (session_id, seq),
@@ -308,6 +326,23 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("retired_at")) {
                     await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+                }
+                // #4313 (v10): immutable message wall-clock stamp — nullable,
+                // no backfill; probe-first like the v8 columns.
+                if (!have.has("ts")) {
+                    await conn.query("ALTER TABLE messages ADD COLUMN ts BIGINT NULL");
+                }
+                // #4796 (v9): zero-ref collection index — gc()'s sweep and the
+                // dry-run count address content BY refcount; without this index
+                // every run full-scans the CAS table (field: 766K rows / ~20 GB).
+                // Same probe-first pattern as the v8 columns above; fresh
+                // installs pick the key up from the CREATE TABLE DDL.
+                const [idxRows] = (await conn.query(
+                    "SELECT INDEX_NAME AS idx FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'content'",
+                )) as unknown as Row[][];
+                const haveIdx = new Set((idxRows as unknown as { idx?: unknown }[]).map((r) => String(r.idx ?? "")));
+                if (!haveIdx.has("idx_content_refcount")) {
+                    await conn.query("ALTER TABLE content ADD INDEX idx_content_refcount (refcount)");
                 }
                 // MySQL DDL commits implicitly, so the ALTERs above are
                 // already durable when the data step starts. It streams one
@@ -691,11 +726,12 @@ export class MysqlBackend implements StorageBackend {
                 "INSERT IGNORE INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?)",
                 [s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt],
             );
+            const batchTs = Date.now(); // #4313: one sample per save batch
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
                 const [res] = (await c.query(
-                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content)],
+                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs],
                 )) as unknown as [{ affectedRows: number }, unknown];
                 if (res.affectedRows === 0) {
                     await this.releaseContent(c, hash);
@@ -1129,7 +1165,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
             for (const hash of refs) await this.releaseContent(c, hash);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection over this session's own
+            // released hashes (see collectZeroRefIn) — never the whole table.
+            await this.collectZeroRefIn(c, refs);
         });
     }
 
@@ -1252,8 +1290,8 @@ export class MysqlBackend implements StorageBackend {
             )) as unknown as Row[][];
             if (num(alreadyRows[0].n) > 0) throw new Error("cloneSessionRows: conflicting fork lineage (child already has messages)");
             await conn.query(
-                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
-                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts)
+                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts FROM messages
                  WHERE session_id = ? AND seq <= ?`,
                 [childId, parentId, throughSeq],
             );
@@ -1301,7 +1339,32 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getSessionRow(sessionId: string): Promise<SessionRow | null> {
-        const [rows] = (await this.pool.query(
+        return this.getSessionRowOn(this.pool, sessionId);
+    }
+
+    async readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T> {
+        const conn = await this.pool.getConnection();
+        try {
+            await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+            return await read({
+                getSessionRow: (id) => this.getSessionRowOn(conn, id),
+                getMessages: (id, opts) => this.getMessagesOn(conn, id, opts),
+                getBlocks: (id, opts) => this.getBlocksOn(conn, id, opts),
+                getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
+                getRefs: (id) => this.getRefsOn(conn, id),
+            });
+        } finally {
+            try {
+                await conn.rollback();
+            } finally {
+                conn.release();
+            }
+        }
+    }
+
+    private async getSessionRowOn(conn: Pool | PoolConnection, sessionId: string): Promise<SessionRow | null> {
+        const [rows] = (await conn.query(
             `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                     created_at, updated_at, next_block_id, next_run_id,
                     meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json
@@ -1336,13 +1399,63 @@ export class MysqlBackend implements StorageBackend {
         };
     }
 
-    async getMessages(sessionId: string, opts?: { includeRetired?: boolean }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+    /** #4739: bounded view bundle (messages only at tail/pluginSnapshot
+     *  pointer seqs). Per-statement reads like today's viewForAsync — no
+     *  cross-query snapshot — which is safe here because ingest writes each
+     *  session row and its pointed-at message rows in ONE transaction, so
+     *  every pointer ever read resolves to rows that already exist. The
+     *  sqlite lane carries the explicit read-transaction instead. */
+    async sessionViewRows(sessionId: string): Promise<SessionViewRows> {
+        const session = await this.getSessionRow(sessionId);
+        if (!session) return null;
+        const pointers = viewPointerSeqs(session.tailJson);
+        const messages: (MessageRow & { contentHash: string })[] = [];
+        const CHUNK = 500;
+        for (let i = 0; i < pointers.length; i += CHUNK) {
+            const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
+            if (chunk.length === 0) continue;
+            const [rows] = (await this.pool.query(
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                 WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
+                [sessionId, ...chunk],
+            )) as unknown as Row[][];
+            for (const r of rows) {
+                const contentHash = str(r.content_hash);
+                messages.push({
+                    seq: num(r.seq),
+                    msgId: str(r.msg_id),
+                    ref: nullableStr(r.ref),
+                    refNum: nullableNum(r.ref_num),
+                    role: str(r.role),
+                    kind: str(r.kind),
+                    contentHash,
+                    ts: nullableNum(r.ts),
+                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
+                });
+            }
+        }
+        messages.sort((a, b) => a.seq - b.seq);
+        return {
+            session,
+            messages,
+            blocks: await this.getBlocks(sessionId),
+            deadRefs: await this.getDeadRefs(sessionId),
+            refs: await this.getRefs(sessionId),
+        };
+    }
+
+    async getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+        return this.getMessagesOn(this.pool, sessionId, opts);
+    }
+
+    private async getMessagesOn(conn: Pool | PoolConnection, sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
         // #4390: retired rows stay out of the replay by default.
-        const [rows] = (await this.pool.query(
-            opts?.includeRetired === true
-                ? "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? ORDER BY seq"
-                : "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq",
-            [sessionId],
+        if (opts?.seqs?.length === 0) return [];
+        const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
+        const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
+        const [rows] = (await conn.query(
+            `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
+            [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
         for (const r of rows) {
@@ -1356,20 +1469,21 @@ export class MysqlBackend implements StorageBackend {
                 kind: str(r.kind),
                 contentHash,
                 retiredAt: nullableNum(r.retired_at),
-                content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
+                ts: nullableNum(r.ts),
+                content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
             });
         }
         return out;
     }
 
-    private async hydrateMediaAsync(content: string): Promise<string> {
+    private async hydrateMediaAsync(content: string, conn: Pool | PoolConnection): Promise<string> {
         let out = content;
         if (out.includes('"$media"')) {
             try {
                 const parsed = JSON.parse(out) as { imageBase64?: unknown };
                 const slot = parsed.imageBase64;
                 if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                    const bytes = await this.getContent(this.pool, (slot as { $media: string }).$media);
+                    const bytes = await this.getContent(conn, (slot as { $media: string }).$media);
                     if (typeof bytes === "string" && bytes.length > 0) {
                         parsed.imageBase64 = bytes;
                         out = JSON.stringify(parsed);
@@ -1388,7 +1502,7 @@ export class MysqlBackend implements StorageBackend {
             if (hits.length > 0) {
                 const cache = new Map<string, string | null>();
                 for (const h of new Set(hits.map((x) => x.hash))) {
-                    cache.set(h, await this.getContent(this.pool, h));
+                    cache.set(h, await this.getContent(conn, h));
                 }
                 out = out.replace(markerRe, (all: string, mime: string, hash: string) => {
                     const bytes = cache.get(hash);
@@ -1399,12 +1513,16 @@ export class MysqlBackend implements StorageBackend {
         return out;
     }
 
-    async getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
-        const [rows] = (await this.pool.query(
+    async getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+        return this.getBlocksOn(this.pool, sessionId, opts);
+    }
+
+    private async getBlocksOn(conn: Pool | PoolConnection, sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
+        const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                     supersedes_block_id, active, created_at, covered_hash, payload_json
-             FROM blocks WHERE session_id = ? ORDER BY ord`,
-            [sessionId],
+             FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,
+            [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
         const out: (BlockRow & { summaryHash: string; oneHash: string | null })[] = [];
         for (const r of rows) {
@@ -1418,8 +1536,8 @@ export class MysqlBackend implements StorageBackend {
                 tier: num(r.tier),
                 summaryHash: str(r.summary_hash),
                 oneHash: nullableStr(r.one_hash),
-                summary: (await this.getContent(this.pool, str(r.summary_hash))) ?? "",
-                one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(this.pool, str(r.one_hash))) ?? null),
+                summary: (await this.getContent(conn, str(r.summary_hash))) ?? "",
+                one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(conn, str(r.one_hash))) ?? null),
                 supersedesBlockId: nullableStr(r.supersedes_block_id),
                 active: num(r.active) === 1,
                 createdAt: num(r.created_at),
@@ -1431,7 +1549,11 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
-        const [rows] = (await this.pool.query(
+        return this.getDeadRefsOn(this.pool, sessionId);
+    }
+
+    private async getDeadRefsOn(conn: Pool | PoolConnection, sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
+        const [rows] = (await conn.query(
             "SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
@@ -1444,7 +1566,11 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getRefs(sessionId: string): Promise<RefRow[]> {
-        const [rows] = (await this.pool.query(
+        return this.getRefsOn(this.pool, sessionId);
+    }
+
+    private async getRefsOn(conn: Pool | PoolConnection, sessionId: string): Promise<RefRow[]> {
+        const [rows] = (await conn.query(
             "SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
@@ -1497,7 +1623,10 @@ export class MysqlBackend implements StorageBackend {
         const exportPath = join(opts.archiveDir, MysqlBackend.ARCHIVE_LOG_NAME);
         if (row.status === "archived") return { ok: true, exportPath };
         const q = async (sql: string): Promise<Row[]> => ((await this.pool.query(sql, [sessionId])) as unknown as Row[][])[0];
-        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq");
+        // #4665: carry the v8 row state (identity JOIN key + historian
+        // tombstone) across archive/restore — sqlite twin, same reason.
+        // #4313: ts rides along so restored rows keep their wall-clock stamps.
+        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts FROM messages WHERE session_id = ? ORDER BY seq");
         const mediaMaps = await q("SELECT seq, media_hash FROM message_media WHERE session_id = ?");
         const blocks = await q("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord");
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
@@ -1546,9 +1675,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
-            const [zero] = (await c.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
-            contentRowsDeleted = num(zero[0].n);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection (see collectZeroRefIn) —
+            // the reported count is what THIS archive collected.
+            contentRowsDeleted = await this.collectZeroRefIn(c, rel);
         });
         loggerLog("info", `[#3931] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1599,9 +1728,14 @@ export class MysqlBackend implements StorageBackend {
         await this.tx(async (c) => {
             for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
             for (const m of dump.messages) {
+                // #4665: pre-fix dumps lack both fields — recompute identity
+                // from the CAS body (same formula as the v8 migration
+                // backfill); retire state is unrecoverable there → live.
+                const stored = typeof m.content_hash === "string" ? dump.content[m.content_hash] : undefined;
+                const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
                 await c.query(
-                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, m.identity ?? ""],
+                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null, typeof m.ts === "number" ? m.ts : null],
                 );
             }
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {
@@ -1683,8 +1817,8 @@ export class MysqlBackend implements StorageBackend {
         }
         const [zero] = (await this.pool.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
         if (num(zero[0].n) > 0) {
-            await this.pool.query("DELETE FROM content WHERE refcount <= 0");
-            contentRowsDeleted += num(zero[0].n);
+            loggerLog("info", `[#4796] gc: collecting ${num(zero[0].n)} zero-ref content rows in batches of ${MYSQL_GC_ZERO_REF_BATCH}`);
+            contentRowsDeleted += await this.collectZeroRefContent(MYSQL_GC_ZERO_REF_BATCH);
         }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3931] gc: running OPTIMIZE TABLE (mysql counterpart of the sqlite full VACUUM)");
@@ -1693,6 +1827,54 @@ export class MysqlBackend implements StorageBackend {
             await this.pool.query("OPTIMIZE TABLE content");
         }
         return { archived, contentRowsDeleted };
+    }
+
+    /** #4796: batched zero-ref CAS collection — mysql counterpart of
+     *  UnifiedStore.collectZeroRefContent. Each DELETE is a standalone
+     *  autocommit statement re-filtering `refcount <= 0` under its own
+     *  latest state: a row concurrently re-referenced between batches is
+     *  skipped, not deleted. */
+    private async collectZeroRefContent(batchSize: number): Promise<number> {
+        let deleted = 0;
+        let batchNo = 0;
+        for (;;) {
+            const [result] = (await this.pool.query(
+                "DELETE FROM content WHERE refcount <= 0 LIMIT ?",
+                [batchSize],
+            )) as unknown as Array<{ affectedRows?: number }>;
+            const changes = num(result.affectedRows ?? 0);
+            if (changes === 0) break;
+            batchNo += 1;
+            deleted += changes;
+            if (batchNo % 10 === 0 || changes < batchSize) {
+                loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
+            }
+        }
+        return deleted;
+    }
+
+    /** #4796 follow-up (PR #4800 review): lifecycle-scoped zero-ref
+     *  collection — mysql counterpart of UnifiedStore.collectZeroRefIn.
+     *  deleteSession/archiveSession/deleteCheckpoint used to finish with a
+     *  full-table `DELETE ... WHERE refcount <= 0` inside their lifecycle
+     *  transaction (the same giant-commit pathology as the old gc sweep on
+     *  a bloated store). Their own releases already went through
+     *  releaseContent's delete-on-zero, so this only re-asserts the
+     *  invariant over the operation's released-hash set — bounded work,
+     *  atomicity kept. Orphans from other sources stay for gc(). */
+    private async collectZeroRefIn(c: PoolConnection | Pool, hashes: string[]): Promise<number> {
+        const list = [...new Set(hashes)];
+        let deleted = 0;
+        for (let i = 0; i < list.length; i += MYSQL_ZERO_REF_SWEEP_CHUNK) {
+            const chunk = list.slice(i, i + MYSQL_ZERO_REF_SWEEP_CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            const [result] = (await c.query(
+                `DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`,
+                chunk,
+            )) as unknown as Array<{ affectedRows?: number }>;
+            deleted += num(result.affectedRows ?? 0);
+        }
+        return deleted;
     }
 
     async contentRefCountOfBody(needle: string): Promise<number> {
@@ -1780,7 +1962,7 @@ export class MysqlBackend implements StorageBackend {
             if (rows.length === 0) return false;
             await c.query("DELETE FROM checkpoints WHERE cp_id = ?", [cpId]);
             await this.releaseContent(c, str(rows[0].state_hash));
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            await this.collectZeroRefIn(c, [str(rows[0].state_hash)]);
             return true;
         });
     }

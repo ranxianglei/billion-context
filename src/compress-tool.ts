@@ -540,9 +540,16 @@ function decodeDoubleEscapedContent(input: unknown): Record<string, unknown> | u
     return { ...input, content: decoded };
 }
 
-export function parseCompressInput(input: unknown, callId?: string) {
+// #5161: options.quiet suppresses every diagnostic log of this parse. The
+// internal #2749 scan (visibleSummaryStubs) re-parses ALL visible past compress
+// calls on every fold, and in external-summary mode a summary-less entry is
+// schema-legal there (the advertised surface makes summary optional) — its
+// rejection is expected bookkeeping, not actionable, and logging it produced
+// one false `rejected` warn per visible call per fold (~550/day).
+export function parseCompressInput(input: unknown, callId?: string, options: { quiet?: boolean } = {}) {
     const normalized = normalizeCompressInput(input);
     let parsed = parseCompressArgs(normalized, { callId });
+    const note = (message: string): void => { if (!options.quiet) loggerLog("warn", message); };
     // #3780: retry the double-escaped line form once. Adopt the result only if
     // it parses strictly MORE ranges than the undecoded attempt — a no-real-
     // newline string always yields zero ranges undecoded, so this can never
@@ -555,21 +562,21 @@ export function parseCompressInput(input: unknown, callId?: string) {
         if (decoded !== undefined) {
             const retry = parseCompressArgs(decoded, { callId });
             if (retry.ranges.length > parsed.ranges.length) {
-                loggerLog("warn", `[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
+                note(`[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
                 parsed = retry;
             }
         }
     }
     if (parsed.diagnostics.quoteSalvage === true) {
-        loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
+        note(`[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
     if (parsed.diagnostics.flatSummarySalvage === true) {
         // Flat single-range call ({content: "<summary text>", startId, endId})
         // — the two schema-advertised shapes merged — recovered by the kernel.
-        loggerLog("warn", `[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s); summary text arrived in content alongside top-level refs`);
+        note(`[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s); summary text arrived in content alongside top-level refs`);
     }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
-        loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
+        note(`[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     } else if (parsed.diagnostics.invalidItems > 0 || parsed.diagnostics.kind === "truncated") {
         // #1494: partial drop — at least one range survived, so the old
         // condition above never fired and the rejection was invisible on both
@@ -577,7 +584,7 @@ export function parseCompressInput(input: unknown, callId?: string) {
         // (gateway-stringified + cut content array) salvages the complete
         // leading entries and reports the same way — often with invalidItems=0,
         // so it needs the explicit kind arm.
-        loggerLog("warn", `[acp-compress-input] partial: ${parsed.ranges.length} range(s) applied, ${parsed.diagnostics.invalidItems} rejected (kind=${parsed.diagnostics.kind}) reasons=[${(parsed.diagnostics.invalidReasons ?? []).join(" | ")}]`);
+        note(`[acp-compress-input] partial: ${parsed.ranges.length} range(s) applied, ${parsed.diagnostics.invalidItems} rejected (kind=${parsed.diagnostics.kind}) reasons=[${(parsed.diagnostics.invalidReasons ?? []).join(" | ")}]`);
     }
     return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
 }

@@ -60,7 +60,7 @@ export function parseBillingSettings(value: unknown): BillingSettings | undefine
         for (const k of Object.keys(root)) if (k !== "prices") return undefined;
         return { prices: {} };
     }
-    if (typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
+    if (root["prices"] === null || typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
     const prices: Record<string, BillingPrice> = {};
     for (const [key, entry] of Object.entries(root["prices"] as Record<string, unknown>)) {
         if (!key || key.length > 256) return undefined;
@@ -176,6 +176,20 @@ export function stampedBillingPrice(session: Session): ResolvedBillingPrice | un
     if (input === undefined) return undefined;
     const out: ResolvedBillingPrice = { input, source: o.source === "config" ? "config" : "registry", output: nonNegNum(o.output) ?? input, cacheRead: nonNegNum(o.cacheRead) ?? input, cacheWrite: nonNegNum(o.cacheWrite) ?? input };
     return out;
+}
+
+/** #5303: validate the persisted USD spend ledger blob (`stats.costUsd`).
+ *  stats are user-editable JSON — only finite non-negative fields survive;
+ *  a partially-valid blob zero-fills missing lanes (the writer always emits
+ *  all four, init 0), an all-invalid one reads as "no ledger" instead of
+ *  poisoning the ledger. Shared by the restore path (persist.buildSession)
+ *  and the panel (sessions-data): one definition of what a ledger means. */
+export function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const input = nonNegNum(o.input), cacheRead = nonNegNum(o.cacheRead), cacheWrite = nonNegNum(o.cacheWrite), output = nonNegNum(o.output);
+    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
+    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
 /** Bill one settled usage report's input side: fresh input at the input
