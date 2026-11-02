@@ -1573,7 +1573,8 @@ async function forwardCaptured(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
+            // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
+            if (upstream.status === 400 && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
@@ -1650,6 +1651,8 @@ async function forwardCaptured(
         // it back). The dsh recall bridge does not need it (it learns at
         // beforeSend), but any client may adopt the header directly.
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
+        // #5418: the prepare lane's own success-response headers (watermark seq stamp).
+        if (prepared !== null && prepared.responseExtraHeaders !== undefined) Object.assign(respHeaders, prepared.responseExtraHeaders);
         res.writeHead(upstream.status, respHeaders);
     }
     // #4204: success-side counterpart of the non-2xx observation above — a
