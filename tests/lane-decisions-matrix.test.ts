@@ -373,3 +373,28 @@ test("lane matrix: B-class sites carry no raw lane-name gates (#3482)", { timeou
     const hpSrc = await readFile(new URL("host-profiles.ts", srcRoot), "utf8");
     assert.ok(!/^import /m.test(hpSrc), "src/host-profiles.ts must stay import-free (#3482 review)");
 });
+
+// #5418/#5403 watermark fastpath gate truth table (decision function is the
+// PURE watermarkGateAllowed in lane-decisions.ts — #3617 both-directions).
+// The verdict ladder BELOW this gate (no-stamp/ahead/head-drift/breaker …) is
+// pinned row-for-row in tests/fastpath.test.ts.
+{
+    const { watermarkGateAllowed } = await import("../src/server/lane-decisions.ts");
+    const allow = {
+        featureOn: true, pluginMode: true, titleGen: false,
+        incrementalTurn: false, breakerArmed: false,
+    };
+    const rows: Array<{ name: string; input: typeof allow; want: boolean }> = [
+        { name: "all-allow → armed", input: { ...allow }, want: true },
+        { name: "feature rollout off → off", input: { ...allow, featureOn: false }, want: false },
+        { name: "proxy mode (no plugin header) → off", input: { ...allow, pluginMode: false }, want: false },
+        { name: "title-gen sidecar turn → off", input: { ...allow, titleGen: true }, want: false },
+        { name: "incremental-lane turn (marker) → off", input: { ...allow, incrementalTurn: true }, want: false },
+        { name: "breaker armed (5 verified misses) → off", input: { ...allow, breakerArmed: true }, want: false },
+    ];
+    for (const row of rows) {
+        test(`fastpath matrix ${row.name}`, () => {
+            assert.equal(watermarkGateAllowed(row.input), row.want);
+        });
+    }
+}
