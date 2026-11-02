@@ -275,6 +275,12 @@ async function main() {
     // (observed: latest=<old candidate> for >60s after this round's publish,
     // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
     NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
+    // Pin the log-file channel: an operator-set ACP_LOG_FILE would steer
+    // bili.log out of this scratch tree while the stderr tee still mutes
+    // (the file leg proves live elsewhere) — post-boot assertions would then
+    // red off an empty proxy.log fallback. Empty string resolves to the
+    // default XDG path above (set-but-empty falls back to config/default).
+    ACP_LOG_FILE: "",
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
