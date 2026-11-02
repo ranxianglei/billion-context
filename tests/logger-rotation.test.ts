@@ -169,6 +169,35 @@ test("budget reclamation waits for the rotated stream to drain", async () => {
     }
 });
 
+test("reclamation still runs when a replaced stream closes without finishing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-drain-close-retention-"));
+    const file = path.join(dir, "bili.log");
+    const generation = path.join(dir, "bili.log.archive", "20200101T000000000-1-1", "bili.log");
+    fs.mkdirSync(path.dirname(generation), { recursive: true });
+    fs.writeFileSync(generation, "x".repeat(2 * 1024 * 1024));
+    configureLogger(file);
+    configureLogRetention({ segmentBytes: 10 * 1024 * 1024, budgetBytes: 1024 * 1024 });
+    const originalEnd = fs.WriteStream.prototype.end;
+    let held: fs.WriteStream | undefined;
+    try {
+        log("info", "seed");
+        fs.WriteStream.prototype.end = function (this: fs.WriteStream) {
+            held = this;
+        } as typeof originalEnd;
+        configureLogRetention({ segmentBytes: 1, budgetBytes: 1024 * 1024 });
+        log("info", "trigger-rotation");
+        assert.ok(fs.existsSync(generation), "gate stays closed while a drain is pending");
+        assert.ok(held, "captured the replaced stream");
+        held!.emit("close");
+        assert.ok(!fs.existsSync(generation), "'close' releases the retention gate even without 'finish'");
+    } finally {
+        fs.WriteStream.prototype.end = originalEnd;
+        await closeLogger();
+        configureLogRetention(defaultLogRetentionPolicy());
+        rmrf(dir);
+    }
+});
+
 test("internal 10MB rotation: post-rotation line lands in the fresh file", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-logger-"));
     const file = path.join(dir, "bili.log");

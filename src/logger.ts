@@ -320,12 +320,21 @@ function getStream(): WriteStream | undefined {
         }
     }
     if (stream) {
+        const replaced = stream;
         const replacedPath = logPath;
         pendingRetentionDrains++;
-        closeQuietly(stream, () => {
+        // Settle once. 'close' (always fires) backs up end() so a stream that
+        // errors without 'finish' cannot wedge the counter and kill reclamation.
+        let settled = false;
+        const settle = (): void => {
+            if (settled) return;
+            settled = true;
+            replaced.removeListener("close", settle);
             pendingRetentionDrains--;
             if (pendingRetentionDrains === 0 && replacedPath) applyLogRetention(replacedPath);
-        });
+        };
+        replaced.once("close", settle);
+        closeQuietly(replaced, settle);
     }
     stream = undefined;
     streamFd = undefined;
