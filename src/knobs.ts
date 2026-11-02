@@ -568,13 +568,13 @@ export function codexCompactMode(): CodexCompactMode {
 }
 
 /** BILI_DSH_AUTHORED_COMPACTION — #3733 bili-authored dsh client compaction.
- *  Default OFF ("0"/unset): the #1729 guard keeps refusing dsh's native
- *  compaction summarize calls, exactly as before. "1": when the session
- *  holds active fold blocks, the guard site answers the call LOCALLY with
+ *  Default ON (the #3723/#3901 flip): when the session holds active fold
+ *  blocks, the guard site answers dsh's native compaction call LOCALLY with
  *  our folded snapshot (zero egress) instead of refusing — dsh records our
- *  checkpoint and its file shrinks (#3733/#3723). Read per-request so a
- *  running proxy flips without a restart. Env-only for the rollout window;
- *  the #2028-style file/web toggle follows once adopted. */
+ *  checkpoint and its file shrinks (#3733/#3723). "0"/false is the escape
+ *  hatch back to the #1729 refusal path. Read per-request so a running proxy
+ *  flips without a restart. Env-only for the rollout window; the #2028-style
+ *  file/web toggle follows once adopted. */
 export function dshAuthoredCompactionEnabled(): boolean {
     const envRaw = process.env.BILI_DSH_AUTHORED_COMPACTION;
     if (envRaw !== undefined) return envRaw.trim() !== "0";

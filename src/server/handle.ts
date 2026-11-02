@@ -2036,23 +2036,18 @@ async function handleRequest(
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
                 log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
-            // #2490: remember the replayed envelope SIZE. The host's raw ledger is
-            // invisible to bili's folded view (folds never shrink what dsh itself
-            // counts), so the next turn's output clamp must plan against the raw
-            // scale or a monster output rides a small folded input out the door
-            // (the 384K-token/7.5MB turn-37 single-message kill chain). High-water
-            // mark, not a sum: the replay is the whole ledger every time, so the
-            // max already bounds every future re-send; a sum would compound on each
-            // retry. Write-only by design: nothing decays or clears this value —
-            // dshLedgerFloorTokens() in budget.ts documents why the mark stays
-            // sticky and consumes it.
-            const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
-            session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
             if (authored !== null) {
-                // #3733 counters + the same raw-ledger high-water as a refusal
-                // (the envelope still proves the raw scale the output clamp must
-                // plan against); NOT counted in dshCompactionRefusals.
+                // #3733 counter; NOT counted in dshCompactionRefusals.
+                // #5289: the authored answer SHRINKS dsh's raw store to the snapshot we just
+                // sent (dsh records our tagged checkpoint), so that snapshot IS the ride-out
+                // scale from now on — the planning floor follows it instead of ratcheting to
+                // the pre-answer raw peak. Ratcheting is exactly what starved small-window
+                // sessions permanently: 128K window − 93K stale floor ≈ 33K max output
+                // forever while the folded wire sat at ~49K. The refusal path below keeps
+                // the sticky high-water: there dsh's ledger really never shrinks and the
+                // #2490 monster-output protection must stay intact.
                 session.metadata["dshAuthoredCompactions"] = (typeof session.metadata["dshAuthoredCompactions"] === "number" ? session.metadata["dshAuthoredCompactions"] as number : 0) + 1;
+                session.metadata["dshCompactionRefusedBytes"] = Buffer.byteLength(authored.body);
                 markDirty(session);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                     res.writeHead(200, { "content-type": authored.contentType });
@@ -2061,6 +2056,19 @@ async function handleRequest(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
+            // #2490: on the REFUSAL path, remember the replayed envelope SIZE. The host's
+            // raw ledger is invisible to bili's folded view (folds never shrink what dsh
+            // itself counts), so the next turn's output clamp must plan against the raw
+            // scale or a monster output rides a small folded input out the door (the
+            // 384K-token/7.5MB turn-37 single-message kill chain). High-water mark, not a
+            // sum: the replay is the whole ledger every time, so the max already bounds
+            // every future re-send; a sum would compound on each retry. Sticky here by
+            // design — while compaction stays refused the ledger only grows (refused
+            // checkpoints never land); the authored path above resets to the snapshot
+            // scale instead (#5289). dshLedgerFloorTokens() in budget.ts documents
+            // consumption.
+            const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
+            session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
             session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;
             // #3013/#3022 (A3): after the once-warn above, refusals were fully
             // silent — the field storm burned 5051 refusals with zero further
