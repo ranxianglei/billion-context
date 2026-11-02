@@ -155,7 +155,7 @@ test("#5225: user input still resets a polling run (cancellation path preserved)
 const T0 = 1_000_000;
 
 test("RepetitionTracker: a prior identical call that ran >= 5s restarts the run (#5225)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     assert.equal(t.note("wait", { seconds: 10 }, "a1", T0).action, "none");
     t.complete("a1", T0 + 10_000);
     assert.equal(t.note("wait", { seconds: 10 }, "a2", T0 + 11_000).count, 1, "slow prior call restarts the run");
@@ -165,7 +165,7 @@ test("RepetitionTracker: a prior identical call that ran >= 5s restarts the run 
 });
 
 test("RepetitionTracker: fast identical calls escalate staged — final-refuse at 5, abort at 6 (fail-safe unchanged)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     let d = { action: "none" as string, count: 0 };
     for (let i = 1; i <= 5; i++) {
         d = t.note("w", {}, `f${i}`, T0 + i * 100);
@@ -179,7 +179,7 @@ test("RepetitionTracker: fast identical calls escalate staged — final-refuse a
 });
 
 test("RepetitionTracker: duration evidence without any complete() leaves count-only behavior standing", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     for (let i = 1; i <= 4; i++) {
         t.note("w", {}, `n${i}`, T0 + i * 10);
     }
@@ -188,14 +188,14 @@ test("RepetitionTracker: duration evidence without any complete() leaves count-o
 });
 
 test("RepetitionTracker: exactly-at-threshold duration counts as slow (>= boundary)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "g1", T0);
     t.complete("g1", T0 + 5000);
     assert.equal(t.note("w", {}, "g2", T0 + 6000).count, 1, "boundary: >= 5000ms resets");
 });
 
 test("RepetitionTracker: a 4999ms prior call does NOT reset (just under threshold)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     for (let i = 1; i <= 3; i++) {
         const id = `s${i}`;
         t.note("w", {}, id, T0 + i * 100);
@@ -205,7 +205,7 @@ test("RepetitionTracker: a 4999ms prior call does NOT reset (just under threshol
 });
 
 test("RepetitionTracker: duration evidence for a different fingerprint never resets the run", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "h1", T0);
     t.complete("h1", T0 + 100);
     t.note("other", { x: 1 }, "h2", T0 + 200);
@@ -216,7 +216,7 @@ test("RepetitionTracker: duration evidence for a different fingerprint never res
 });
 
 test("RepetitionTracker.reset() clears pending timing and completed evidence", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "r1", T0);
     t.complete("r1", T0 + 10_000);
     t.reset();

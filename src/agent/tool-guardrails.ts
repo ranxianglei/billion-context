@@ -198,8 +198,8 @@ interface RepetitionDecision {
     count: number;
     fingerprint: string;
     toolName: string;
-    /** Backstop count at which a hard ctx.abort() fires (abortThreshold + 4). For default
-     *  thresholds (warn=3, abort=5), backstop is 9, so hard-abort triggers on call 10. */
+    /** Count at which a hard ctx.abort() fires (abortThreshold + 5). For default
+     *  thresholds (warn=3, abort=5), backstop is 10, so hard-abort triggers on call 10. */
     backstop: number;
 }
 
@@ -208,7 +208,9 @@ export class RepetitionTracker {
     private count = 0;
     private lastCompleted: { fp: string; durationMs: number } | null = null;
     private pendingStarts = new Map<string, { fp: string; startedAt: number }>();
-    constructor(private readonly thresholds: { warn: number; abort: number }) {}
+    constructor(
+        private readonly thresholds: { warn: number; abort: number; backstopEnabled: boolean },
+    ) {}
     note(toolName: string, input: unknown, toolCallId?: string, now: number = Date.now()): RepetitionDecision {
         const fp = repetitionFingerprint(toolName, input);
         const done = this.lastCompleted;
@@ -224,8 +226,8 @@ export class RepetitionTracker {
         }
         if (toolCallId !== undefined) this.pendingStarts.set(toolCallId, { fp, startedAt: now });
         let action: RepetitionAction = "none";
-        const backstop = this.thresholds.abort + 4;
-        if (this.count >= backstop) action = "hard-abort";
+        const backstop = this.thresholds.abort + 5;
+        if (this.thresholds.backstopEnabled && this.count >= backstop) action = "hard-abort";
         else if (this.count > this.thresholds.abort) action = "abort";
         else if (this.count === this.thresholds.abort) action = "final-refuse";
         else if (this.count >= this.thresholds.warn) action = "warn";
@@ -268,19 +270,20 @@ export interface GuardrailOptions {
     /** Combined text-output byte cap per tool result. undefined = 50KB
      *  default; 0 = no cap. */
     maxBytes?: number;
-    repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number };
+    repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; backstopEnabled?: boolean };
 }
 
 function positiveInt(v: unknown, fallback: number): number {
     return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
 }
 
-function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolean; warn: number; abort: number } {
-    if (g === false) return { enabled: false, warn: REPETITION_GUARD_DEFAULTS.warn, abort: REPETITION_GUARD_DEFAULTS.abort };
+function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolean; warn: number; abort: number; backstopEnabled: boolean } {
+    if (g === false) return { enabled: false, warn: REPETITION_GUARD_DEFAULTS.warn, abort: REPETITION_GUARD_DEFAULTS.abort, backstopEnabled: false };
     const obj = g && typeof g === "object" ? g : {};
     const warn = positiveInt(obj.warn, REPETITION_GUARD_DEFAULTS.warn);
     const abort = Math.max(positiveInt(obj.abort, REPETITION_GUARD_DEFAULTS.abort), warn + 1);
-    return { enabled: obj.enabled !== false, warn, abort };
+    const backstopEnabled = (obj as { backstopEnabled?: boolean }).backstopEnabled === true;
+    return { enabled: obj.enabled !== false, warn, abort, backstopEnabled };
 }
 
 export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}): void {
@@ -291,7 +294,9 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     const maxBytes = opts.maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
 
     pi.on("tool_call", (event, rawCtx) => {
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const ctx = rawCtx as unknown as GuardrailCtx;
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const e = event as unknown as ToolCallEventLike;
         if (isBashToolCall(e)) {
             const t = resolveBashTimeout(e.input, bashTimeout);
@@ -317,10 +322,15 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         }
         if (decision.action === "hard-abort") {
             // Forced termination at the backstop — guarantees termination for
-            // non-compliant models that would otherwise loop forever.
+            // non-compliant models that would otherwise loop forever. Only fires
+            // when repetition.backstopEnabled = true (default: false).
             const msg = buildRepetitionAbortNotice(decision.toolName, decision.count, decision.backstop);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
             ctx?.abort?.();
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever. Safe: 0ms duration
+            // < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
             return { block: true, reason: msg };
         }
         if (decision.action === "abort") {
@@ -331,6 +341,10 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
             // A soft stop — no interrupted kernel state, no user-interruption
             // misclassification, no lost eval cell (#5505: graceful stuck-report
             // instead of abrupt cliff).
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever. Safe: 0ms duration
+            // < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
             return { block: true, reason: msg };
         }
         if (decision.action === "warn") {
@@ -339,7 +353,9 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     });
 
     pi.on("tool_result", (event, rawCtx) => {
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const e = event as unknown as ToolResultEventLike;
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const ctx = rawCtx as unknown as GuardrailCtx;
         trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.complete(e.toolCallId);
         const isBash = isBashToolResult(e);
@@ -364,11 +380,15 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     });
 
     pi.on("input", (event, rawCtx) => {
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const ctx = rawCtx as unknown as GuardrailCtx;
-        if ((event as unknown as { source?: string }).source === "extension") return;
+        // SAFETY: Pi passes untyped event objects via its extension API.
+        const inputEvent = event as unknown as { source?: string };
+        if (inputEvent.source === "extension") return;
         trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.reset();
     });
     pi.on("session_shutdown", (_e, rawCtx) => {
+        // SAFETY: Pi passes untyped event objects via its extension API.
         const ctx = rawCtx as unknown as GuardrailCtx;
         trackers.delete(ctx?.sessionManager?.getSessionId?.() ?? "");
     });
