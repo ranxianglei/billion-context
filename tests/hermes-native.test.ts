@@ -895,6 +895,8 @@ elif SCENARIO == "origin-death":
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
     os.environ["HTTPS_PROXY"] = "http://user-proxy.example:9999"
+    os.environ["HTTP_PROXY"] = "http://user-proxy.example:8888"
+    os.environ["NO_PROXY"] = "corp.example.com"
     mod.REGISTER_WAIT_S = 0.2
     mod.BOOTSTRAP_BUDGET_S = 8.0
     mod.FIRST_REQUEST_WAIT_S = 8.0
@@ -906,6 +908,7 @@ elif SCENARIO == "origin-death":
         ready.wait(10)
     out["death_initial_ready"] = (mod._state.get("bootstrap") or {}).get("state")
     out["death_env_routed"] = os.environ.get("HTTPS_PROXY")
+    out["death_env_routed_http"] = os.environ.get("HTTP_PROXY")
     SLOW["enabled"] = True
     def release_later():
         __import__("time").sleep(1.5)
@@ -927,6 +930,8 @@ elif SCENARIO == "origin-death":
     rec = mod._state.get("bootstrap") or {}
     out["death_final_state"] = rec.get("state")
     out["death_final_env"] = os.environ.get("HTTPS_PROXY")
+    out["death_final_http"] = os.environ.get("HTTP_PROXY")
+    out["death_final_no_proxy"] = os.environ.get("NO_PROXY")
     out["death_tools"] = sorted(ctx.tools.keys())
     out["death_register_calls"] = sum(ctx.reg_counts.values())
     out["death_warnings"] = [w for w in WARNINGS if "is gone" in w]
@@ -1068,6 +1073,10 @@ out.update({
     "pid": os.getpid(),
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
+    "env_http_proxy": os.environ.get("HTTP_PROXY"),
+    "env_http_proxy_lc": os.environ.get("http_proxy"),
+    "env_no_proxy": os.environ.get("NO_PROXY"),
+    "env_no_proxy_lc": os.environ.get("no_proxy"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
@@ -1096,6 +1105,10 @@ interface DriverOut {
     hooks: string[];
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
+    env_http_proxy?: string | null;
+    env_http_proxy_lc?: string | null;
+    env_no_proxy?: string | null;
+    env_no_proxy_lc?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1180,9 +1193,12 @@ interface DriverOut {
     exhaust_warnings_retries?: number;
     death_initial_ready?: string;
     death_env_routed?: string | null;
+    death_env_routed_http?: string | null;
     death_gap_values?: Array<string | null>;
     death_final_state?: string;
     death_final_env?: string | null;
+    death_final_http?: string | null;
+    death_final_no_proxy?: string | null;
     death_tools?: string[];
     death_register_calls?: number;
     death_warnings?: string[];
@@ -1241,6 +1257,14 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.env_https_proxy_lc, out!.origin);
+        // #5117: plain-http providers ride HTTP_PROXY (per-scheme resolution), loopback stays direct.
+        assert.equal(out!.env_http_proxy, out!.origin);
+        assert.equal(out!.env_http_proxy_lc, out!.origin);
+        assert.equal(out!.env_no_proxy_lc, out!.env_no_proxy, "both case variants written");
+        const noProxy = (out!.env_no_proxy ?? "").split(",").map((h) => h.trim().toLowerCase());
+        for (const host of ["localhost", "127.0.0.1", "::1"]) {
+            assert.ok(noProxy.includes(host), `NO_PROXY missing ${host}: ${out!.env_no_proxy}`);
+        }
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1280,6 +1304,21 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    test("#5117: a user-set NO_PROXY survives the loopback merge (preserved, hosts appended)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach", { NO_PROXY: "corp.example.com" });
+        assert.ok(out, err);
+        const np = out!.env_no_proxy ?? "";
+        assert.ok(np.includes("corp.example.com"), `user value lost: ${np}`);
+        for (const host of ["localhost", "127.0.0.1", "::1"]) {
+            assert.ok(np.includes(host), `loopback host missing: ${host} in ${np}`);
+        }
+        assert.equal(out!.env_http_proxy, out!.origin, "plain-http routing still applied");
     });
 
     // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
@@ -1684,10 +1723,14 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.equal(out!.death_initial_ready, "ready");
         assert.equal(out!.death_env_routed, out!.origin);
+        assert.equal(out!.death_env_routed_http, out!.origin, "#5117: the plain-http leg was routed too");
         assert.ok(out!.death_gap_values!.includes("http://user-proxy.example:9999"),
             "the unroute RESTORED the pre-existing user proxy instead of deleting the key");
         assert.equal(out!.death_final_state, "ready", "the watchdog re-bootstrapped a healthy origin");
         assert.equal(out!.death_final_env, out!.origin, "traffic is routed through the recovered origin again");
+        assert.equal(out!.death_final_http, out!.origin, "#5117: HTTP_PROXY re-routed through the recovered origin");
+        assert.ok((out!.death_final_no_proxy ?? "").includes("corp.example.com"),
+            "#5117: the user's NO_PROXY survives the unroute + reapply merge");
         assert.deepEqual(out!.death_tools, ["acp_status", "compress", "decompress"]);
         assert.equal(out!.death_register_calls, 3, "recovery re-arms readiness without re-registering tools");
         assert.equal(out!.death_warnings!.length, 1, "one loud warning per death episode");

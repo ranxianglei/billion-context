@@ -4,8 +4,10 @@ Installed by ``bili plugin install hermes`` — a plain ``hermes`` session then 
 billion-context client with no launcher, no env vars and no fixed port:
 
 * spawns its own bili proxy on an ephemeral port (or attaches to a healthy one) and routes
-  model traffic through it via ``HTTPS_PROXY`` + ``SSL_CERT_FILE`` (combined CA bundle) —
-  the same wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
+  model traffic through it via ``HTTPS_PROXY``/``HTTP_PROXY`` (per-scheme; #5117) +
+  ``SSL_CERT_FILE`` (combined CA bundle), loopback kept direct in ``NO_PROXY`` — the same
+  wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM for https,
+  absolute-form forward-proxy requests for plain-http);
 * registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
 * stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
   wire mode so strict backends see a clean head;
@@ -1196,12 +1198,44 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 # — runtime effects -------------------------------------------------------------
 
 # The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
-_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+_ENV_ROUTED_KEYS = (
+    "HTTPS_PROXY", "https_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "NO_PROXY", "no_proxy",
+    "HERMES_CA_BUNDLE", "SSL_CERT_FILE",
+)
+
+_LOOPBACK_NO_PROXY_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _merge_loopback_no_proxy() -> None:
+    """#5117: merge the loopback hosts into NO_PROXY/no_proxy so plain-http loopback legs
+    (local model servers, MCP endpoints) stay direct while HTTP_PROXY routes everything else
+    through bili — the same contract the dsh/kimi/mcode/jcode launcher lanes keep. Whatever the
+    user already set in either case variant is preserved; the merged value is written to both."""
+    parts: List[str] = []
+    seen: set = set()
+    for raw in (os.environ.get("NO_PROXY"), os.environ.get("no_proxy")):
+        if not isinstance(raw, str):
+            continue
+        for host in raw.split(","):
+            h = host.strip()
+            if not h or h.lower() in seen:
+                continue
+            seen.add(h.lower())
+            parts.append(h)
+    for host in _LOOPBACK_NO_PROXY_HOSTS:
+        if host.lower() not in seen:
+            seen.add(host.lower())
+            parts.append(host)
+    value = ",".join(parts)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
     """Route hermes's model traffic through the proxy. Only called once the proxy is healthy —
-    the same pair `bili hermes` sets for the launched process. Returns False when the host unloaded
+    the same env `bili hermes` sets for the launched process. Returns False when the host unloaded
     the plugin first: routing a torn-down process's traffic would outlive the unload (checked and
     applied under the lifecycle lock, so an unload cannot slip between the two)."""
     with _lifecycle_lock:
@@ -1216,6 +1250,13 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
                 _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
+        # #5117: hermes' httpx stack resolves proxy envs PER SCHEME — an http:// base_url reads
+        # HTTP_PROXY and never HTTPS_PROXY — so a plain-http provider went straight out and bili
+        # never saw it. Route it like the dsh/kimi/mcode launcher lanes do: absolute-form
+        # forward-proxy requests the server understands.
+        os.environ["HTTP_PROXY"] = origin
+        os.environ["http_proxy"] = origin
+        _merge_loopback_no_proxy()
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
