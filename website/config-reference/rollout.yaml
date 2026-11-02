@@ -59,9 +59,9 @@ entries:
     desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"
   - key: rollout.features.pluginFullResendWatermark
     type: "boolean | number"
-    default: "0 (off)"
-    default_zh: "0(关)"
+    default: "100 (on)"
+    default_zh: "100(开)"
     env: BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK
     group: behavior
-    desc_en: "Full-resend watermark fastpath (#5403/#5418): plugin-lane chat-completions turns whose previous response carried an x-bili-pf-seq stamp assert the resent prefix via the echoed count (structural scan, no full parse); on a hit the pipeline consumes stashed canonical prefix cores plus only the new tail window (byte-identical outbound provenance; ANY doubt falls back to the untouched full-parse path per turn and re-stamps, five credited misses hold the lane for one hour). Requires the client to echo the stamp back as x-bili-pf-count (dsh does; other lanes never hit). Default 0% — rollout behind §7.4 human review (trust-model change). See TECHNICAL-NOTES.md “Full-resend watermark fastpath”."
-    desc_zh: "全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(dsh 已做;其他车道不会命中)。默认 0%,放量在 §7.4 人工评审之后(信任模型变更)。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。"
+    desc_en: "Full-resend watermark fastpath (#5403/#5418): plugin-lane chat-completions turns whose previous response carried an x-bili-pf-seq stamp assert the resent prefix via the echoed count (structural scan, no full parse); on a hit the pipeline consumes stashed canonical prefix cores plus only the new tail window (byte-identical outbound provenance; ANY doubt falls back to the untouched full-parse path per turn and re-stamps, five credited misses hold the lane for one hour). Requires the client to echo the stamp back as x-bili-pf-count (dsh/pi/opencode/omp do; unadapted lanes never hit). ON by default (GA after the §7.4 human review; trust-model trade and opt-out documented in TECHNICAL-NOTES) — turn off with `false` (or a percent) / env = 0. See TECHNICAL-NOTES.md “Full-resend watermark fastpath”."
+    desc_zh: "全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。默认开(GA,§7.4 人工评审已通过;信任模型变更的代价与退出开关见 TECHNICAL-NOTES);关闭:`false`(或百分比)/ env = 0。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。"
