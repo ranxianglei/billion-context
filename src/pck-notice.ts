@@ -9,17 +9,16 @@
 // never fails a request or a page load). It is only active while the EFFECTIVE
 // routing is "disabled": users who already chose auto/enabled made the call
 // themselves and are not nagged.
+// #5548: this module is now just the shared dismissal store of the unified
+// announcement surface — known ids and the built-in declarations live in
+// notices.ts (registry), so lanes B/C register ids without touching this file.
 
 import fs from "node:fs";
 import path from "node:path";
 import { stateDir } from "./paths.js";
+import { PCK_NOTICE_ID, knownNoticeIds } from "./notices.js";
 
-export const PCK_NOTICE_ID = "pck-default-off";
-// #5403 watermark fastpath experimental-grey intro (owner ruling 2026-11-02):
-// same one-time-per-instance store, its own id so dismissal stays independent.
-export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
-
-const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
+export { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID } from "./notices.js";
 
 const DISMISS_FILE = "upgrade-notices.json";
 
@@ -43,7 +42,7 @@ export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): R
 
 /** Idempotent. Returns false only for unknown notice ids. */
 export function dismissUpgradeNotice(id: string, env: NodeJS.ProcessEnv = process.env): boolean {
-    if (!UPGRADE_NOTICE_IDS.has(id)) return false;
+    if (!knownNoticeIds().has(id)) return false;
     const set = new Set(dismissedUpgradeNotices(env));
     set.add(id);
     try {

@@ -23,7 +23,8 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
+import { dismissedUpgradeNotices, dismissUpgradeNotice } from "../pck-notice.js";
+import { visibleBuiltInNotices, type NoticeRecord } from "../notices.js";
 import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -438,8 +439,14 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     // #2861: silence a known host-side plugin notice for this environment.
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
-    // #5079: silence the prompt_cache.routing default-off upgrade notice.
+    // #5079: silence a known notice of the unified announcement surface.
     if (req.method === "POST" && req.url === "/__bili/notices/dismiss") return handleNoticeDismiss(req, res, log);
+    // #5548: unified announcement payload for non-overview consumers.
+    if (req.method === "GET" && req.url === "/__bili/notices") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ notices: visibleNoticesPayload(opts) }, null, 2));
+        return;
+    }
     // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
     if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
@@ -1302,6 +1309,20 @@ function sendResignStatus(res: http.ServerResponse): void {
     }, null, 2));
 }
 
+// #5548: unified announcement payload — every visible record (lane A built-ins
+// in P1; lanes B/C merge into this same list in later phases), priority-sorted
+// server-side. The wm intro stays visible to EVERY install on its first
+// upgrade until closed unless an explicit rollout override exists.
+function visibleNoticesPayload(opts: ProxyOptions): NoticeRecord[] {
+    return visibleBuiltInNotices(
+        {
+            promptCacheRouting: effectivePromptCacheRouting(opts.promptCache),
+            wmOverridePresent: !featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
+        },
+        { dismissed: dismissedUpgradeNotices(process.env) },
+    );
+}
+
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHost?: string): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
@@ -1338,16 +1359,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
-        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
-        wmNotice: {
-            id: WM_FASTPATH_INTRO_ID,
-            // #5403 experimental-grey intro: visible to EVERY install on its
-            // first upgrade to this build until closed — unless the user
-            // already wrote an explicit rollout override (they made the call).
-            active:
-                !dismissedUpgradeNotices(process.env).has(WM_FASTPATH_INTRO_ID) &&
-                featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
-        },
+        notices: visibleNoticesPayload(opts),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
