@@ -430,6 +430,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_pckNoticeBanner = bili_pckNoticeBanner;
+    // #5403: one-time-per-instance intro for the watermark fastpath
+    // experimental grey rollout — same server-side dismissal convention as
+    // above (own notice id, visible on every install until closed or an
+    // explicit rollout override exists); pure builder + same test seam.
+    function bili_wmNoticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm wm-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_wmNoticeBanner = bili_wmNoticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -1600,6 +1611,35 @@ function changelogCatOf(rawLine) {
                 nb.hidden = true;
                 nb.classList.remove("show");
                 nb.innerHTML = "";
+            }
+        }
+        // #5403: watermark fastpath experimental-grey intro — all installs see
+        // it on first upgrade until closed (server-side, like #5079 above).
+        const wnb = $("wm-notice-banner");
+        if (wnb) {
+            const wn = d.wmNotice && typeof d.wmNotice === "object" ? d.wmNotice : null;
+            if (wn && wn.active === true) {
+                wnb.hidden = false;
+                wnb.classList.add("show");
+                wnb.innerHTML = bili_wmNoticeBanner({ on: t("wmfast.on"), desc: t("wmfast.desc"), hint: t("wmfast.hint"), dismiss: t("wmfast.dismiss_btn") });
+                for (const btn of Array.from(wnb.querySelectorAll(".wm-notice-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof wn.id === "string" ? wn.id : "" }) });
+                            toast(t("wmfast.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                wnb.hidden = true;
+                wnb.classList.remove("show");
+                wnb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -3919,6 +3959,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             pckSel.value = pcv;
             updatePckNote();
+            const wf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.pluginFullResendWatermark : undefined;
+            let wmv = "default";
+            if (wf === true) wmv = "on"; else if (wf === false) wmv = "off";
+            while (wmSel.options.length > 0) wmSel.removeChild(wmSel.lastChild);
+            WM_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                wmSel.appendChild(o);
+            });
+            if (wf !== undefined && !WM_VALUES.includes(wmv)) {
+                const o = document.createElement("option");
+                o.value = String(wf);
+                o.textContent = String(wf) + " *";
+                wmSel.appendChild(o);
+                wmv = String(wf);
+            }
+            wmSel.value = wmv;
+            updateWmNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -4482,6 +4541,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
             if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
             if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
+        }));
+        // #5403: watermark fastpath grey-rollout switch — maps 1:1 onto
+        // rollout.features.pluginFullResendWatermark (default follows the
+        // baked percent; on/off pin it per install). salt/base untouched.
+        const WM_VALUES = ["default", "on", "off"];
+        const wmSel = document.createElement("select");
+        wmSel.className = "field-input mono";
+        qCtrls.push(wmSel);
+        const ww = document.createElement("div");
+        ww.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const wlab = document.createElement("label");
+        wlab.htmlFor = "quick-wm";
+        wlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        wlab.textContent = t("cfg.q_wm");
+        wmSel.id = "quick-wm";
+        ww.appendChild(wlab);
+        ww.appendChild(wmSel);
+        box.appendChild(ww);
+        const wmNote = document.createElement("div");
+        wmNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateWmNote() {
+            if (wmSel.value === "on") wmNote.textContent = t("cfg.q_wm_on_desc");
+            else if (wmSel.value === "off") wmNote.textContent = t("cfg.q_wm_off_desc");
+            else if (wmSel.value !== "default") wmNote.textContent = t("cfg.q_wm_custom");
+            else wmNote.textContent = t("cfg.q_wm_default_desc");
+        }
+        box.appendChild(wmNote);
+        wmSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
+            else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
+            else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";

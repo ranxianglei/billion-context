@@ -312,3 +312,21 @@ function systemOf(parsed: unknown): string | Array<Record<string, unknown>> | un
     if (typeof system === "string" || Array.isArray(system)) return system;
     return undefined;
 }
+
+/** #5418 gate — is the full-resend-watermark fastpath allowed to engage for
+ * this request? The fastpath (src/server/fastpath.ts) lets plugin-lane turns
+ * assert the re-sent prefix is unchanged via a server-measured count
+ * watermark; any miss degrades byte-identically to the legacy full-parse
+ * path. Title-gen sidecars are never stamped (fresh conversations),
+ * incremental-turn requests already send deltas, and the breaker holds the
+ * lane after repeated verified misses. Row-driven truth table:
+ * tests/lane-decisions-matrix.test.ts (watermarkGateAllowed rows). */
+export function watermarkGateAllowed(input: {
+    featureOn: boolean;
+    pluginMode: boolean;
+    titleGen: boolean;
+    incrementalTurn: boolean;
+    breakerArmed: boolean;
+}): boolean {
+    return input.featureOn && input.pluginMode && !input.titleGen && !input.incrementalTurn && !input.breakerArmed;
+}
