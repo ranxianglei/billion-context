@@ -58,8 +58,9 @@
 //                         corpus mass leaves the turn viable)
 //
 // Exit code 0 = every ran lane green. Non-zero = at least one red assertion.
-// Evidence (proxy.log, per-turn ndjson, config, corpus) stays in the scratch
-// dir on failure.
+// Evidence (bili.log — the logger's own file; proxy.log keeps only the
+// startup head since #5089 muted the stderr tee — plus per-turn ndjson,
+// config, corpus) stays in the scratch dir on failure.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -256,10 +257,13 @@ async function main() {
   // Since master's #5012 the stderr leg mutes itself once the log file proves
   // live on an undrained pipe — exactly this harness's spawn shape — so
   // post-boot lines live ONLY in bili.log. Every assertion below greps the
-  // evidence file through mark()/slice(), so resolve it per call (bili.log
-  // appends across the mid-Lane-B proxy restart, offsets stay valid).
+  // evidence file through mark()/slice(); the channel is decided ONCE on
+  // first use (sticky): bili.log is append-only and never legitimately
+  // disappears mid-run, so re-resolving per call could splice byte offsets
+  // across two different files if either file appeared or vanished late.
   const biliLog = path.join(baseDir, "xdg", "state", "billion-context", "bili.log");
-  const evidenceFile = () => (fs.existsSync(biliLog) ? biliLog : proxyLog);
+  let evidenceChannel = null;
+  const evidenceFile = () => (evidenceChannel ??= fs.existsSync(biliLog) ? biliLog : proxyLog);
   const biliConfig = path.join(baseDir, "bili.json");
 
   const childEnv = {
@@ -387,6 +391,11 @@ async function main() {
   const ctx = { workDir: path.join(baseDir, "work"), childEnv, proxyLog, port, profileEntry, sessionId: null };
   const mark = () => fs.statSync(evidenceFile()).size;
   const slice = (from, to) => { const f = evidenceFile(); if (f !== proxyLog && !fs.existsSync(f)) throw new Error(`evidence log ${f} vanished`); return fs.readFileSync(f, "utf8").slice(from, to ?? undefined); };
+  // #5524 (folded in from the sibling PR): a startup failure must say WHICH
+  // file(s) hold the evidence — bili.log present means check both, absent
+  // means the logger died before opening its file.
+  const proxyFailHint = (what) =>
+    `${what} — see ${proxyLog}${fs.existsSync(biliLog) ? ` and ${biliLog}` : ` (${biliLog} never appeared — the logger failed before opening its file)`}`;
 
   async function turn(prompt, label) {
     const r = spawnSync(
@@ -414,7 +423,7 @@ async function main() {
 
   // ---- 3. proxy up ----------------------------------------------------------
   log(`starting profile proxy on 127.0.0.1:${port} …`);
-  if (!(await startProxy(ctx))) throw new Error(`proxy did not come up — see ${proxyLog} (${fs.existsSync(biliLog) ? "" : "and no " + biliLog + " appeared"})`);
+  if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy did not come up"));
   if (!fs.existsSync(biliLog)) warn("bili.log missing after proxy boot — evidence falls back to proxy.log; post-boot assertions may red because the stderr tee mutes itself (#5012)");
 
   try {
@@ -440,7 +449,7 @@ async function main() {
       // the ~12.3k effective window with corpus now old enough to fold.
       biliConfigFor(G.smallWindow);
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m2 = mark();
       const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
@@ -477,7 +486,7 @@ async function main() {
       // also proves folded state survives a proxy restart.
       fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), cordisFor("zhipuai", G.relayModel));
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m3 = mark();
       const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
