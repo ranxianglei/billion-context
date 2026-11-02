@@ -301,6 +301,8 @@ client baseURL before:  https://api.openai.com/v1
 client baseURL after:   http://localhost:8787/bili/https://api.openai.com/v1
 ```
 
+**Scope:** `/bili/` tunnels **client API/model traffic** — point clients' baseURLs at it. It relays bytes verbatim and is NOT a browser-facing web proxy: opening an arbitrary web page in a browser through it (`…/bili/https://example.com/`) shows only the server-rendered HTML — interactive features fail, because the page's own requests to other hosts leave the browser directly (they never pass through bili) and hit CORS walls with no cookies for those sites (#5241). Fetching such a page as data (e.g. for a model to read its text) works fine.
+
 For more per-client configuration examples, see the web UI guide at [http://localhost:8787](http://localhost:8787).
 
 **Verify.** With the proxy running and your config saved, check it answers
