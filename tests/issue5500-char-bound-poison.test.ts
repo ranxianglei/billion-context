@@ -62,9 +62,9 @@ function okSse(inputTokens: number): string {
 test("unit #5500 C1: step-family models resolve a 1M window from the table", () => {
     // Field id shapes from the report: bare, relay-prefixed, and the full
     // deployment path (basename-first matching, modelRoots).
-    assert.equal(lookupContextLimit("step-5-preview-free"), 1_000_000);
-    assert.equal(lookupContextLimit("litellm/step-5-preview-free"), 1_000_000);
-    assert.equal(lookupContextLimit("nvidia_nim/stepfun-ai/step-5-preview"), 1_000_000);
+    assert.equal(lookupContextLimit("step-5-preview-free"), 1_048_576);
+    assert.equal(lookupContextLimit("litellm/step-5-preview-free"), 1_048_576);
+    assert.equal(lookupContextLimit("nvidia_nim/stepfun-ai/step-5-preview"), 1_048_576);
     // Negative controls: neighboring rows unchanged, unknowns still miss.
     assert.equal(lookupContextLimit("gpt-4o-mini"), 128_000);
     assert.equal(lookupContextLimit("kimi-k2-0711-preview"), 200_000);
