@@ -4228,7 +4228,13 @@ export async function preflightCompressIfNeeded(
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
         foldedCalibratedSize = rebuiltCalibrated;
-        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
+        // #5022: result.savedTokens is the raw meter delta while the A→B pair
+        // prints on the calibrated scale — side by side they read as two
+        // different savings in one line (605,998 vs 673,512 net in the incident
+        // log). Headline the delta of the two printed figures; the meter value
+        // stays the #3444 benefit-gate input and is untouched here.
+        const calibratedSaved = Math.max(0, tokenCount - foldedCalibratedSize);
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${calibratedSaved} tokens saved (${tokenCount} → ${foldedCalibratedSize}) in ${Date.now() - started}ms`);
         fits = unknownBaseline ? result.fitsWindow : rebuiltCalibrated < limit;
         // #1820: anchor the meter to the rebuilt payload's measured size — the
         // rebuild request's own usage report (the only sample that can supersede
