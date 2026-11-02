@@ -4,7 +4,7 @@
 // other file touches per-notice code again. Display semantics (tone color,
 // action words) come from the web layer; activity predicates live HERE so the
 // server-side judgment never scatters back into route handlers.
-import { effectivePromptCacheRouting, loadConfigFile } from "./config.js";
+import { effectivePromptCacheRouting, loadConfigFile, loadOptions } from "./config.js";
 import { featureOverrideAbsent } from "./rollout.js";
 import { PCK_NOTICE_ID, dismissedUpgradeNotices, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "./pck-notice.js";
 
@@ -23,7 +23,11 @@ export const NOTICES: readonly NoticeEntry[] = [
         id: PCK_NOTICE_ID,
         tone: "warn",
         keys: { on: "pckoff.on", desc: "pckoff.desc", hint: "pckoff.hint", dismiss: "pckoff.dismiss_btn" },
-        active: () => pckNoticeActive(effectivePromptCacheRouting(loadConfigFile().promptCache)),
+        // Read through loadOptions() (env > file), NOT loadConfigFile(): a user
+        // who set ACP_PROMPT_CACHE_ROUTING via the documented env knob has an
+        // effective routing that is not "disabled" and must not be nagged —
+        // same read as the /acp status surface (#5079).
+        active: () => pckNoticeActive(effectivePromptCacheRouting(loadOptions().promptCache)),
     },
     // #5403: watermark fastpath experimental-grey intro — visible to every
     // install until closed or an explicit rollout override exists (users who

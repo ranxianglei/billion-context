@@ -40,6 +40,19 @@ test("visibleNotices: fresh install sees both, registry order", () => {
     assert.deepEqual(v.map((n) => n.tone), ["warn", "ok"]);
 });
 
+// #5548 P1 review fix: the pck predicate must read through loadOptions()
+// (env > file), not the raw file — a user who set the documented env knob
+// ACP_PROMPT_CACHE_ROUTING=auto/enabled has an effective routing that is NOT
+// "disabled" and must not see the notice (matches the /acp status surface).
+test("visibleNotices: ACP_PROMPT_CACHE_ROUTING=auto suppresses the pck notice", () => {
+    process.env.ACP_PROMPT_CACHE_ROUTING = "auto";
+    try {
+        assert.deepEqual(visibleNotices().map((n) => n.id), [WM_FASTPATH_INTRO_ID]);
+    } finally {
+        delete process.env.ACP_PROMPT_CACHE_ROUTING;
+    }
+});
+
 test("visibleNotices: dismissing one hides only that one", () => {
     assert.equal(dismissUpgradeNotice(WM_FASTPATH_INTRO_ID, process.env), true);
     const v = visibleNotices();
