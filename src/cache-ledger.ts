@@ -678,8 +678,10 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
 // field reordering (a host that emits the same knobs in a different order must
-// NOT flip the cache-partition identity between requests).
-function canonicalJson(v: unknown): string {
+// NOT flip the cache-partition identity between requests). Exported: the
+// persist-side metadata fold gate (#5506) fingerprints with the same
+// canonicalization so live-vs-disk comparisons are like-for-like.
+export function canonicalJson(v: unknown): string {
     if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     const obj = v as Record<string, unknown>;
