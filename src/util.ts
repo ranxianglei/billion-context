@@ -642,6 +642,22 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
     );
 }
 
+// #5432: index of the first entry of the trailing run of role:"system" entries
+// (== length when nothing trails). Shared by every host path that mutates an
+// ALREADY assembled anthropic body: the kernel heal keeps a client's legal
+// trailing system run verbatim at array end, so any post-assembly user insert
+// must land BEFORE it or the request 400s ("role 'system' must precede an
+// 'assistant' message or end the array").
+export function trailingSystemRunStart(messages: readonly unknown[]): number {
+    let i = messages.length;
+    while (i > 0) {
+        const m = messages[i - 1];
+        if (!m || typeof m !== "object" || Array.isArray(m) || (m as Record<string, unknown>).role !== "system") break;
+        i--;
+    }
+    return i;
+}
+
 // #5432: Anthropic's mid-conversation system rule is TWO-sided — a non-directive
 // entry must FOLLOW a user message (or an assistant ending in a server tool
 // result) AND PRECEDE an assistant message or end the array. bili's ephemeral
@@ -656,9 +672,8 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
 // demotion logic duplicated here.
 export function insertBeforeTrailingSystemRun<T extends { role: string }>(messages: T[], additions: readonly T[]): T[] {
     if (additions.length === 0) return messages;
-    let i = messages.length;
-    while (i > 0 && messages[i - 1]!.role === "system") i--;
-    return [...messages.slice(0, i), ...additions, ...messages.slice(i)];
+    const start = trailingSystemRunStart(messages);
+    return [...messages.slice(0, start), ...additions, ...messages.slice(start)];
 }
 
 

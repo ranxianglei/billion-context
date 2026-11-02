@@ -1,19 +1,27 @@
 // #5432: Anthropic's mid-conversation system rule is TWO-sided — a non-directive
 // system entry must FOLLOW a user message AND PRECEDE an assistant message or
-// end the array. Two bili producers broke the PRECEDE side:
-//   (A) the steady path (prepare-anthropic) appends ephemeral tail users
+// end the array. Four bili producers broke the PRECEDE side whenever the
+// assembled body legally ends in a client trailing system run (Claude Code's
+// "The user hasn't heard from you…" reminder):
+//   (A) the steady path (prepare-anthropic) appended ephemeral tail users
 //       (sysNotes/nudge/decide/statusLine/retrieval notes) AFTER coreToAnthropic's
-//       position heal — when the client history ends in a legal trailing system
-//       (Claude Code's "The user hasn't heard from you…" reminder), the append
-//       puts a user after it and the request 400s ("role 'system' must precede
-//       an 'assistant' message or end the array");
+//       position heal;
 //   (B) the round-2 compress-loop adapter (adapter-anthropic) did the same with
-//       its notes.
-// Pinned here through all three layers: the ordering helper itself, the
-// adapter's buildRequest, and the REAL steady path via the hermetic server
-// harness (client history ending in a system + an armed over-limit nudge).
-// Bidirectional discipline (#3617): the no-trailing-system negative cases pin
-// that the legacy tail-append behavior is UNCHANGED when nothing follows.
+//       its notes;
+//   (C) wire-body appendTrailingUserText (fake-completion hint / degenerate-turn
+//       retry nudge) pushed a user after whatever ended the ALREADY assembled
+//       body;
+//   (D) chain-checkpoint insertCheckpointCarrier (opt-in egress stamping) had
+//       no carrier slot for a system-final body at all — the frozen contract
+//       (#1395/#1421) recognizes carriers only in the TRAILING USER run, and
+//       appending after the run was the exact 400 shape. Now returns null →
+//       relay forwards unstamped (best-effort).
+// Pinned through all layers: the ordering helper itself, the adapter's
+// buildRequest, both post-hoc body-mutation functions, and the REAL steady
+// path via the hermetic server harness (client history ending in a system + an
+// armed over-limit nudge). Bidirectional discipline (#3617): the
+// no-trailing-system negative cases pin that the legacy tail-append behavior
+// is UNCHANGED when nothing follows.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -24,7 +32,9 @@ process.env.NODE_ENV = "test";
 import { defaultConfig } from "acp-kernel";
 import { anthropicToCore } from "acp-kernel/wire";
 import { createAnthropicAdapter } from "../src/loop/index.ts";
+import { insertCheckpointCarrier } from "../src/chain-checkpoint.ts";
 import { insertBeforeTrailingSystemRun } from "../src/util.ts";
+import { appendTrailingUserText } from "../src/wire-body.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -124,6 +134,68 @@ test("#5432 adapter negative: no trailing system → note still lands dead-last 
     const msgs = req.messages;
     assert.equal(msgs[msgs.length - 1]!.role, "user");
     assert.equal(textOf(msgs[msgs.length - 1]!), "ADAPTER-NOTE");
+});
+
+// --- post-hoc body-mutation paths (fake-completion / degenerate retry) -----
+
+test("#5432 wire-body: anthropic text lands BEFORE a trailing system run, run stays verbatim and last", () => {
+    const out = appendTrailingUserText("anthropic", JSON.stringify({
+        model: "m", max_tokens: 10,
+        messages: [
+            { role: "user", content: "q" },
+            { role: "assistant", content: "a" },
+            { role: "system", content: [{ type: "text", text: "reminder" }] },
+        ],
+    }), "hint-text");
+    assert.ok(out !== null);
+    const body = JSON.parse(out!) as { messages: Msg[] };
+    assert.deepEqual(
+        body.messages.map((m) => m.role),
+        ["user", "assistant", "user", "system"],
+    );
+    assert.equal(body.messages[2]!.content, "hint-text");
+    assert.deepEqual(body.messages[3]!.content, [{ type: "text", text: "reminder" }], "the trailing system stays verbatim");
+});
+
+test("#5432 wire-body negative: no trailing system → plain append; user-final → merge (legacy contract unchanged)", () => {
+    const appended = JSON.parse(appendTrailingUserText("anthropic", JSON.stringify({
+        messages: [{ role: "user", content: "q" }, { role: "assistant", content: "a" }],
+    }), "hint-text")!) as { messages: Msg[] };
+    assert.deepEqual(appended.messages.map((m) => m.role), ["user", "assistant", "user"]);
+    const merged = JSON.parse(appendTrailingUserText("anthropic", JSON.stringify({
+        messages: [{ role: "assistant", content: "a" }, { role: "user", content: "q" }],
+    }), "more")!) as { messages: Msg[] };
+    assert.equal(merged.messages[1]!.content, "q\n\nmore");
+});
+
+test("#5432 wire-body openai pin: system-final bodies still get the plain tail append (no such rule on that wire)", () => {
+    const out = JSON.parse(appendTrailingUserText("openai", JSON.stringify({
+        model: "m",
+        messages: [{ role: "user", content: "q" }, { role: "system", content: "s" }],
+    }), "hint-text")!) as { messages: Msg[] };
+    assert.deepEqual(out.messages.map((m) => m.role), ["user", "system", "user"]);
+});
+
+// --- chain-checkpoint carrier (opt-in egress stamping) ----------------------
+
+test("#5432 chain-checkpoint: anthropic system-final body admits no carrier slot → null (stamp skipped)", () => {
+    assert.equal(insertCheckpointCarrier({
+        model: "m",
+        messages: [
+            { role: "user", content: "q" },
+            { role: "assistant", content: "a" },
+            { role: "system", content: [{ type: "text", text: "reminder" }] },
+        ],
+    }, "anthropic", "TAG"), null);
+});
+
+test("#5432 chain-checkpoint negative: assistant-final still gets the appended carrier (legacy behavior)", () => {
+    const out = insertCheckpointCarrier({
+        model: "m",
+        messages: [{ role: "user", content: "q" }, { role: "assistant", content: "a" }],
+    }, "anthropic", "TAG")! as { messages: Msg[] };
+    assert.deepEqual(out.messages.map((m) => m.role), ["user", "assistant", "user"]);
+    assert.equal(out.messages[2]!.content, "TAG");
 });
 
 // --- real steady path (hermetic server harness) ----------------------------
