@@ -106,7 +106,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
     if (work.length === 0) {
-        // #4521: an unchanged preview can be an already-covered/protected no-op
+        // #5558: an unchanged preview can be an already-covered/protected no-op
         // or a kernel refusal; the normal path supplies that truthful receipt.
         // If a probe changed state but yielded no content, never fold a hint
         // without the configured external summary.
