@@ -396,7 +396,11 @@ export async function prepareOpenai(
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
-                const stable = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                const stablePrefix = normalizeStrictEchoReasoning([...rebuiltMessages], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                // #5534: the main-body args guard below runs AFTER this branch —
+                // repair the side call's prefix here too, or a poisoned prefix
+                // 500s every decide round-trip on strict-JSON upstreams.
+                const stable = hardenOpenaiToolCallArguments(stablePrefix, log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, messages: [...stable, { role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut as OpenAITool[] | undefined, stream: false };
                 sideBody[typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens"] = decide.maxTokens;
                 delete sideBody.prompt_cache_retention;

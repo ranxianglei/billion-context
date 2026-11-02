@@ -509,9 +509,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
-                const stableItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                const normalizedItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
                     : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                // #5534: the main-body args guard below runs AFTER this branch —
+                // repair the side call's prefix here too, or a poisoned prefix
+                // 500s every decide round-trip on strict-JSON upstreams.
+                const stableItems: ResponseInputItem[] = hardenResponsesFunctionCallArguments(normalizedItems, log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
                 stripDecisionReasoningFields("responses", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
