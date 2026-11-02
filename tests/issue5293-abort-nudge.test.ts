@@ -101,6 +101,7 @@ test("#5293 unit: noteAbortedTurn / absorbAbortedTurnGrowth edge cases", async (
 
     const s1 = createSession("u-stamp");
     s1.stats.lastInputTokens = 42_000;
+    s1.stats.lastInputTokensSource = "usage"; // #5500: the stamp now requires a trustworthy meter
     noteAbortedTurn(s1);
     assert.equal(s1.transient?.abortReanchor?.anchor, 42_000, "stamp records the pre-abort anchor");
 
@@ -111,6 +112,7 @@ test("#5293 unit: noteAbortedTurn / absorbAbortedTurnGrowth edge cases", async (
 
     const s3 = createSession("u-wait");
     s3.stats.lastInputTokens = 42_000;
+    s3.stats.lastInputTokensSource = "usage"; // #5500: the stamp now requires a trustworthy meter
     noteAbortedTurn(s3);
     s3.state.nudge.lastPerMessageNudgeTokens = 40_000;
     absorbAbortedTurnGrowth(s3, 42_000);
@@ -119,6 +121,7 @@ test("#5293 unit: noteAbortedTurn / absorbAbortedTurnGrowth edge cases", async (
 
     const s4 = createSession("u-absorb");
     s4.stats.lastInputTokens = 42_000;
+    s4.stats.lastInputTokensSource = "usage"; // #5500: the stamp now requires a trustworthy meter
     noteAbortedTurn(s4);
     s4.state.nudge.lastPerMessageNudgeTokens = 40_000;
     s4.state.nudge.lastNudgeShownTokens = 41_000;
@@ -131,6 +134,7 @@ test("#5293 unit: noteAbortedTurn / absorbAbortedTurnGrowth edge cases", async (
 
     const s5 = createSession("u-max");
     s5.stats.lastInputTokens = 42_000;
+    s5.stats.lastInputTokensSource = "usage"; // #5500: the stamp now requires a trustworthy meter
     noteAbortedTurn(s5);
     s5.state.nudge.lastPerMessageNudgeTokens = 45_000;
     absorbAbortedTurnGrowth(s5, 43_000);

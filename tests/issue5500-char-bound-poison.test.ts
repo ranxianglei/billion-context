@@ -11,7 +11,9 @@ import { lookupContextLimit } from "../src/config.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions } from "../src/session.ts";
+import { _resetSessionsForTest, absorbAbortedTurnGrowth, listSessions, noteAbortedTurn } from "../src/session.ts";
+import type { Session } from "../src/session.ts";
+import { probeRequestMembership } from "../src/request-membership.ts";
 
 // #5500: two independent defects compounded into a hard non-retryable
 // preflight loop ("502 context ~N tokens exceeds the model window 150000 ...
@@ -47,6 +49,20 @@ import { listSessions } from "../src/session.ts";
 // → fail-fast ≥400; post-fix: 1M native window → trigger never fires → clean
 // forward, zero summarization calls); T4 pins that evidence-backed (usage-
 // grade) over-window rejection is UNCHANGED — C2 must not soften real 4xx walls.
+//
+// Round 2 (review finding on PR #5501): the class sweep found three MORE
+// readers of stats.lastInputTokens without the lastInputTokensSource grade
+// discipline — the same mechanism family, fixed at the reader (kill-at-reader,
+// #1839) in the same PR rather than split out:
+//   C4 src/request-membership.ts — the #4805 needle's main-scale bar now
+//      refuses estimate-grade/unprovenanced scalars (falls back to the
+//      needle's own per-request scale); T6a/b/c pin both directions.
+//   C3 src/server/prepare-responses.ts — the codex compact-intercept minted
+//      usage must not carry a char-bound arm (codex recomputes its ledger
+//      from it); T7 pins the poisoned + graded-scalar-wins directions.
+//   C5 src/session.ts noteAbortedTurn — an untrustworthy meter carries FALSE
+//      information: it would delay the #5293 re-anchor ~4x and make #5415
+//      bank phantom growth debt; T8 pins skip-on-poison + stamp-on-usage.
 
 function okSse(inputTokens: number): string {
     return (
@@ -336,4 +352,239 @@ test("e2e #5500 control: a usage-grade over-window payload is STILL rejected (C2
         upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
+});
+
+// ---------------------------------------------------------------------------
+// Round 2: the remaining ungraded readers of stats.lastInputTokens (class
+// sweep on PR #5501 review) — C4 membership needle, C3 codex forge total,
+// C5 abort re-anchor.
+
+function membershipSession(stats: Record<string, unknown>): Session {
+    return {
+        id: "issue5500-membership",
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0, ...stats } as never,
+        metadata: {},
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        pendingRetrievals: [],
+        transient: {},
+    } as never as Session;
+}
+
+test("unit #5500 C4a: an ESTIMATE-grade arm does not scale the membership needle bar", () => {
+    const s = membershipSession({ lastInputTokens: 204_046, lastInputTokensSource: "estimate" });
+    // First turn plants the needle at its own per-request scale.
+    probeRequestMembership(s, Array.from({ length: 12 }, (_, i) => `M${i}`), 100_000);
+    assert.equal(s.transient?.latestKnownMsgId, "M11", "first turn abstains and plants");
+    // A payload at 40% of the MEASURED main scale may move the needle...
+    probeRequestMembership(s, ["X1", "X2", "X3", "X4", "X5"], 40_000);
+    assert.equal(
+        s.transient?.latestKnownMsgId, "X5",
+        "reference = the needle's own 100K scale (bar 25K); pre-fix the char-bound 204K arm set the bar to 51K and kept the polluter out only by accident of caliber (#5500/#4805)",
+    );
+});
+
+test("unit #5500 C4b: a usage-grade anchor STILL scales the membership needle bar", () => {
+    const s = membershipSession({ lastInputTokens: 400_000, lastInputTokensSource: "usage" });
+    probeRequestMembership(s, Array.from({ length: 12 }, (_, i) => `P${i}`), 100_000);
+    assert.equal(s.transient?.latestKnownMsgId, "P11");
+    // 90K < 25% of the measured 400K anchor → foreign, stays gated.
+    probeRequestMembership(s, ["F1", "F2", "F3", "F4", "F5"], 90_000);
+    assert.equal(s.transient?.latestKnownMsgId, "P11", "the trustworthy scalar keeps precedence over the needle's own scale (#3617 negative direction)");
+});
+
+test("unit #5500 C4c: legacy unprovenanced meters fall back to the needle's own scale", () => {
+    const s = membershipSession({ lastInputTokens: 204_046 }); // no source field (pre-field sessions)
+    probeRequestMembership(s, Array.from({ length: 12 }, (_, i) => `L${i}`), 100_000);
+    probeRequestMembership(s, ["Y1", "Y2", "Y3"], 40_000);
+    assert.equal(s.transient?.latestKnownMsgId, "Y3", "unprovenanced = untrustworthy: same discipline as estimate-grade (#1839)");
+});
+
+function abortSession(lastInputTokens: number, source?: "usage" | "overflow-arm" | "estimate"): Session {
+    return {
+        id: "issue5500-abort",
+        stats: { lastInputTokens, ...(source ? { lastInputTokensSource: source } : {}) },
+        state: {
+            nudge: {
+                lastPerMessageNudgeTokens: 55_000,
+                lastNudgeShownTokens: 0,
+                baselineTokens: 0,
+                anchors: {},
+                lastShownByTier: {},
+            },
+        },
+        transient: {},
+    } as unknown as Session;
+}
+
+test("unit #5500 C5: noteAbortedTurn refuses untrustworthy meters (no delayed re-anchor, no phantom debt)", () => {
+    const poisoned = abortSession(204_046, "estimate");
+    noteAbortedTurn(poisoned);
+    assert.equal(poisoned.transient?.abortReanchor, undefined, "a char-bound arm carries false information — no stamp (#5500)");
+
+    const legacy = abortSession(204_046);
+    noteAbortedTurn(legacy);
+    assert.equal(legacy.transient?.abortReanchor, undefined, "unprovenanced meters are untrustworthy too");
+
+    const honest = abortSession(60_000, "usage");
+    noteAbortedTurn(honest);
+    assert.equal(honest.transient?.abortReanchor?.anchor, 60_000, "usage-grade meters still stamp");
+    absorbAbortedTurnGrowth(honest, 70_000);
+    assert.equal(honest.state.nudge.lastPerMessageNudgeTokens, 70_000, "the absorb arithmetic is intact for trustworthy anchors (#5293 shape)");
+    assert.equal(honest.state.nudge.absorbedDebt, 5_000, "...and banks exactly the skipped measured growth (60k − 55k, #5415)");
+});
+
+const CODEX_UA = "codex_cli_rs/0.1.0 (linux x86_64)";
+
+// 7 messages × ~4100 chars (~7.3K tokens by the chars/4 estimator): below the
+// 15K window so the trigger never fires on the compact request itself, and
+// the setup turn folds m00001/m00002 into an active block (mirrors
+// tests/codex-compact-e2e.test.ts conversation()).
+function codexConversation() {
+    const input: { type: string; role: string; content: string }[] = [];
+    for (let i = 0; i < 7; i++) {
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ` + `WORK_${i}_content_`.repeat(290) });
+    }
+    return input;
+}
+
+async function withCodexHarness(fn: (h: { url: string; bodies: string[] }) => Promise<void>): Promise<void> {
+    const bodies: string[] = [];
+    const sse = (type: string, data: unknown): string => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+    const completed = (inputTokens: number): string => sse("response.completed", {
+        response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: inputTokens, output_tokens: 5, total_tokens: inputTokens + 5 } },
+    });
+    const fcEvents = (callId: string, args: string): string => [
+        sse("response.output_item.added", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress" }, output_index: 0 }),
+        sse("response.function_call_arguments.delta", { item_id: `fc_${callId}`, delta: args }),
+        sse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name: "compress", arguments: args }, output_index: 0 }),
+    ].join("");
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            if (bodies.length === 1) {
+                // First turn: the model compresses the oldest pair → active block.
+                res.write(fcEvents("call_p", JSON.stringify({
+                    content: [{ startId: "m00001", endId: "m00002", topic: "setup", summary: "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK" }],
+                })));
+            }
+            res.write(completed(1000));
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    process.env.BILI_CODEX_COMPACT = "intercept";
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
+        modelContextLimit: 15_000,
+        kernelConfig: defaultConfig(15_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        await fn({ url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, bodies });
+    } finally {
+        delete process.env.BILI_CODEX_COMPACT;
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+}
+
+async function codexSetup(sessionId: string, h: { url: string; bodies: string[] }): Promise<{ afterSetup: number }> {
+    const r1 = await fetch(h.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: sessionId, instructions: "You are the test coding agent.", input: codexConversation() }),
+    });
+    assert.equal(r1.status, 200);
+    await r1.text();
+    const s = listSessions().find((x) => x.meta.label === sessionId);
+    assert.ok(s, "session exists after setup");
+    assert.ok((s!.state.blocks ?? []).some((b) => b.active), "setup created an active block");
+    return { afterSetup: h.bodies.length };
+}
+
+test("e2e #5500 C3: a poisoned arm cannot inflate the minted codex compact usage", async () => {
+    await withCodexHarness(async (h) => {
+        const { afterSetup } = await codexSetup("issue5500-codex-a", h);
+        const s = listSessions().find((x) => x.meta.label === "issue5500-codex-a")!;
+        // Poison the meter the way the #604 failure arm does: char-bound
+        // upper, estimate-grade — the exact shape from the field report.
+        s.stats.lastInputTokens = 204_046;
+        s.stats.lastInputTokensSource = "estimate";
+
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "issue5500-codex-a", instructions: "You are the test coding agent.", input: [...codexConversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200, "the compact stays intercepted");
+        const frames = (await r2.text()).split("\n\n").filter((f) => f.startsWith("data: "));
+        assert.equal(frames.length, 2, "forged 2-frame SSE");
+        const e2 = JSON.parse(frames[1]!.slice("data: ".length)) as { type: string; response: { usage: { input_tokens: number } } };
+        assert.equal(e2.type, "response.completed");
+        // Codex recomputes its ledger from this minted usage: pre-fix the
+        // forged input_tokens was 204_046 (the char-bound arm); post-fix it is
+        // the raw-body estimate (~7K).
+        assert.ok(e2.response.usage.input_tokens > 5_000 && e2.response.usage.input_tokens < 20_000, `minted input_tokens must be the raw-body estimate, not the poisoned arm (got ${e2.response.usage.input_tokens})`);
+        assert.equal(h.bodies.length, afterSetup, "upstream untouched by the intercept");
+    });
+});
+
+test("e2e #5500 C3-control: a usage-grade anchor still wins the minted codex compact usage", async () => {
+    await withCodexHarness(async (h) => {
+        const { afterSetup } = await codexSetup("issue5500-codex-b", h);
+        const s = listSessions().find((x) => x.meta.label === "issue5500-codex-b")!;
+        // A trustworthy scalar below the gate line (90% × 15K = 13.5K) and
+        // above the raw-body estimate (~7K): it must keep precedence.
+        s.stats.lastInputTokens = 12_000;
+        s.stats.lastInputTokensSource = "usage";
+
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "issue5500-codex-b", instructions: "You are the test coding agent.", input: [...codexConversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200, "the compact stays intercepted");
+        const frames = (await r2.text()).split("\n\n").filter((f) => f.startsWith("data: "));
+        assert.equal(frames.length, 2, "forged 2-frame SSE");
+        const e2 = JSON.parse(frames[1]!.slice("data: ".length)) as { type: string; response: { usage: { input_tokens: number } } };
+        assert.equal(e2.response.usage.input_tokens, 12_000, "a trustworthy scalar keeps precedence over the raw-body estimate (#3617 negative direction)");
+        assert.equal(h.bodies.length, afterSetup, "upstream untouched by the intercept");
+    });
 });
