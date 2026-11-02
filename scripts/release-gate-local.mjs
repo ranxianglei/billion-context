@@ -275,6 +275,10 @@ async function main() {
     NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
+    // #5520: an inherited ACP_LOG_FILE would move the logger's file off the
+    // scratch biliLog above and silently break evidence resolution; empty
+    // resolves to the default (src/config.ts: ACP_LOG_FILE || undefined).
+    ACP_LOG_FILE: "",
     BILI_GATE_KEY: "gate-local",
     ZHIPUAI_GATE_KEY: G.relayKey,
   };
