@@ -124,7 +124,10 @@ interface JudgeOptions {
    *  unattributable: the separator-ownership rules (insertion / carrier-drift)
    *  skip it instead of accusing the client, and it still grants NO exemption.
    *  Every non-separator check (frozen prefix, drops, rewrites, tool-pair
-   *  integrity, the count-bounded ledger) stays armed. Absent ⇒ legacy. */
+   *  integrity, the count-bounded ledger) stays armed. Both scans test EXACT
+   *  entry/exit equality (stableEqual) BEFORE this skip: an unchanged client
+   *  lookalike is fidelity evidence, never proof of producer ownership, so it
+   *  must feed the match rather than be judged absent. Absent ⇒ legacy. */
   separatorOwnershipUnknown?: boolean;
 }
 
@@ -327,8 +330,9 @@ export function judgeInboundOutbound(
   // to the client. Skipping it here suppresses exactly the ownership verdict
   // (insertion / carrier-drift for a marker), while every other element keeps
   // being judged — and it grants no exemption to anything.
+  const isUnattributableSeparator = (k: number): boolean => ownershipUnknown && isSeparatorCoreShaped(exit[k]!);
   const isProvenOrUnattributableSeparator = (k: number): boolean =>
-    (ownedSep !== undefined && ownedSep.has(k)) || (ownershipUnknown && isSeparatorCoreShaped(exit[k]!));
+    (ownedSep !== undefined && ownedSep.has(k)) || isUnattributableSeparator(k);
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
@@ -371,10 +375,17 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
-        if (isProvenOrUnattributableSeparator(k)) continue;
+        if (ownedSep !== undefined && ownedSep.has(k)) continue;
+        // #564/#2627: exact equality is fidelity evidence on its own — it says
+        // "this client element is still here, byte for byte" and never that bili
+        // produced it. So it is tested BEFORE the unknown-provenance skip: an
+        // opaque rewrite that lost producer proof must not hide an UNCHANGED
+        // client lookalike and report it as dropped/rewritten. Only an element
+        // that fails equality may be treated as unattributable.
+        if (stableEqual(e, x)) { found = k; break; }
+        if (isUnattributableSeparator(k)) continue;
         scanned++;
         if (scanned > cap) break;
-        if (stableEqual(e, x)) { found = k; break; }
         if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
       if (found < 0) {
@@ -416,10 +427,15 @@ export function judgeInboundOutbound(
         const x = exit[k];
         if (isReasoning(x)) continue;
         if (!eCarrier && isCarrier(x)) continue;
-        if (isProvenOrUnattributableSeparator(k)) continue;
+        if (ownedSep !== undefined && ownedSep.has(k)) continue;
+        // #564/#2627 (see the render-tail scan): byte equality first — an
+        // unchanged client element is fidelity evidence even when producer
+        // ownership of this send is unknown, so it may never be skipped into a
+        // false drop/rewrite finding. Ownership is never inferred from text.
+        if (stableEqual(e, x)) { found = k; break; }
+        if (isUnattributableSeparator(k)) continue;
         scanned++;
         if (scanned > maxGap) break;
-        if (stableEqual(e, x)) { found = k; break; }
         if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
 
