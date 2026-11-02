@@ -27,6 +27,14 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ### Added
 - **消息时间戳渲染默认开启（#4313 后续）**:此前 `compress.messageTimestamps` 为可选特性（默认关，线上字节与特性前逐字节一致）。生产会话的缓存审计（同会话开关前后命中率均 95.0%、无一条时间戳导致的前缀重写 miss、全部异常可归因上游 TTL 驱逐）证实存戳渲染跨轮逐字节稳定，故默认翻转为**开**：`time=` 压缩标签属性、回执指纹行 `[起 – 止]` 覆盖跨度、摘要 Occurred 行对所有人默认可见（每条消息首次出现时铸一次不可变墙钟戳，渲染只读存戳不读墙钟）。关闭方式不变：文件 `compress.messageTimestamps: false` 或 `BILI_MESSAGE_TIMESTAMPS=0`，关闭后每个出站字节与 pre-#4313 master 一致。升级用户的一次性代价：标志首次解析为开的那个重启后，每个活跃会话付一次冻结前缀缓存重写（旧消息补上 time= 属性 + 提示词变体切换），之后稳定。测试基线：tests/preload-test-env.mjs 整套件 pin 显示门控关，字节对比型金标保持特性前形态；issue4313 toggle 套件按新契约翻转并新增 message-timestamps-default-on.test.ts 钉住生产默认路径。
 
+
+### Storage — bun 运行时原生支持(`bun:sqlite`)
+
+- **在 bun 上跑 bili 不再退回 legacy**:引擎阶梯加了第 0 步 `bun:sqlite`(src/storage/driver.ts,只有 `process.versions.bun` 存在时才 require —— bun 里 `node:sqlite` 根本不存在,而 better-sqlite3 的 N-API 预编译在 bun 下必定 "Could not load the default exports from better-sqlite3",阶梯三步全落空只会得到 legacy-only)。bun 内置引擎与 better-sqlite3 同形(`Database`、同步 `run/get/all`、`.transaction()`),适配层只补三处实测差异:命名参数按 SQL 里书写的记号绑定(`:a`/`@b`/`$c`,而库内 SQL 是 better-sqlite3 风格、传裸键 `{ a: 1 }`)——按语句把裸键复制成该语句真正用到的记号形态(字面量先抹平,故字符串里的 `:name` 不会被误认);BLOB 列回裸 `Uint8Array` → 归一成 Buffer(媒体/载荷读取端按 Buffer 契约写);`run()` 的 `changes`/`lastInsertRowid` 是 BigInt → 收成 number,并补 bun 没有的 `.open` 旗标。写事务走 `.immediate()`、只读走 `.deferred()`(#2690 的写锁拓扑:延迟事务中途升级为写锁会撞 busy_timeout 救不回的 SQLITE_BUSY_SNAPSHOT),`close()` 幂等。
+- **自举与状态文案不再指错运行时**:bun 上自举直接 `not-needed`(给 bun 下载 N-API 预编译纯属浪费带宽且必加载失败);`nodeSqliteUpgradeHint` 与降级横幅在 bun 上讲 `bun:sqlite`,不再让运维去升 Node;整史后台完整性 worker 是自包含源串、不复用阶梯,也按 `process.versions.bun` 选引擎(bun 的只读选项名是 `readonly`,不是 Node 的 `readOnly`)。
+- **测试钉住契约**:tests/storage-bun-sqlite.test.ts —— 假 Database 那几组经测试缝 `setBunDatabaseFactoryForTests` 在 Node CI 上同样可跑(记号双写、字面量外只重写一次、BigInt/Uint8Array/null 归一、事务必须 `.immediate()`、阶梯第 0 步优先、被钉的 `{builtin, host}` 探针袋视为 Node 主机);真内置那几组仅在 bun 下跑(真 BEGIN 与回滚、嵌套事务不提前提交、写完锁立刻交还,以及真 UnifiedStore 端到端:开库跑 PRAGMA 阶梯 + quick_check + 迁移、命名参数插入、读回、close 触发 WAL checkpoint 后重开仍在)。
+- **既有存储套件在 bun 下实测**:7 处写死 `openSqliteDatabase(path, "node:sqlite")` 的裸句柄改为随动自动探测后,block-bounds 1/0、fork-clone-media 3/0、issue4982 18/0、unified-remap 3/0 全绿;storage-unified 从 4 通过/13 失败变成 14 通过/4 跳过/0 失败(三条只驱动 `node:sqlite` 的 leg 现按驱动探针跳过);storage-ingest-watermark 15/1、bounded-load 4/1、engine-proofs 7/5、plugin-fork 51/5、engine-bootstrap 维持 43/1。与改动前同机基线相比:多通过 24 条,零回归。剩余失败与存储引擎无关:bun 的 node:test 垫片没有 `t.mock`(oven-sh/bun#5090)、Node 专用套件顶层静态 `import("node:sqlite")`、以及子进程 harness 在 bun 下的 ERR_SERVER_NOT_RUNNING。
+
 ### #5079 — `prompt_cache_key` 自注入默认关闭,`promptCache.routing` 一个开关管住两条 wire
 
 - **行为变更(旧→新)**:此前 bili 在插件车道对一切目的地默认给请求体盖 `prompt_cache_key=<会话 id>`(#2218/#2649 定案,Responses wire 仅对 `api.openai.com` 注入)。由于大量服务见到该字段会直接拒绝、且这类服务无法枚举,**默认反转为关闭**:`promptCache.routing` 缺省值从 `"auto"` 变为 `"disabled"`(无法识别的值同样落到 `"disabled"`)。客户端自带的 key 不受影响:任何模式下都原样转发(A/B 探测记忆对已证实拒收的 origin+model 组合照常撤键)。

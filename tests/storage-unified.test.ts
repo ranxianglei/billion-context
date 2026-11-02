@@ -13,7 +13,7 @@ import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
-import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
+import { probeBuiltinSqlite, setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
  * Unified-storage acceptance (Phase 1, #2671).
@@ -200,11 +200,18 @@ function betterSqliteAvailable(): boolean {
     }
 }
 
+/** node:sqlite is a NODE builtin; bun ships `bun:sqlite` instead and cannot load
+ *  it, so the legs that drive that engine explicitly skip on a bun runtime (the
+ *  driver probe is the same test the production ladder runs). */
+function nodeSqliteAvailable(): boolean {
+    return probeBuiltinSqlite();
+}
+
 test("storage unified: corpus round-trip digests equal the legacy manifest (better-sqlite3)", { skip: !betterSqliteAvailable() && "better-sqlite3 not installed (optional native dependency)" }, () => {
     for (const name of Object.keys(CASE_META)) runCase("better-sqlite3", name);
 });
 
-test("storage unified: corpus round-trip digests equal the legacy manifest (node:sqlite)", () => {
+test("storage unified: corpus round-trip digests equal the legacy manifest (node:sqlite)", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, () => {
     for (const name of Object.keys(CASE_META)) runCase("node:sqlite", name);
 });
 
@@ -772,7 +779,7 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
 // binding per sessions row — and a dev build that already carried the
 // columns in its V1 DDL must migrate without a duplicate-column error.
 // ---------------------------------------------------------------------------
-test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", async () => {
+test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-schema-v2-"));
     try {
         const dbPath = path.join(dir, "index.db");
@@ -833,7 +840,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
 // #4313: v10 immutable first-seen time column (messages.ts)
 // ---------------------------------------------------------------------------
 
-test("schema v10: v9→v10 migration adds messages.ts without backfill; idempotent", async () => {
+test("schema v10: v9→v10 migration adds messages.ts without backfill; idempotent", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10-"));
     const dbPath = path.join(dir, "index.db");
     try {
