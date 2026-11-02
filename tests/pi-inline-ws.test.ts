@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
+import { once } from "node:events";
 import test from "node:test";
 import { WebSocket as WsClient, WebSocketServer } from "ws";
 import {
@@ -212,6 +214,61 @@ test("inline WS: plain HTTP against the bridge port is refused with 426", async 
     const response = await fetch(`${bridge.origin}/anything`);
     assert.equal(response.status, 426);
     assert.match(await response.text(), /WebSocket upgrade required/);
+});
+
+test("inline WS: context-only prewarm uses the configured upstream proxy", { timeout: TMO }, async () => {
+    const upstream = await startFakeUpstream();
+    let connects = 0;
+    const tunnels = new Set<net.Socket>();
+    const upstreamProxy = http.createServer();
+    upstreamProxy.on("connect", (req, socket, head) => {
+        connects++;
+        const destination = new URL(`http://${req.url}`);
+        const tunnel = net.connect(Number(destination.port), destination.hostname, () => {
+            socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            if (head.length) tunnel.write(head);
+            tunnel.pipe(socket);
+            socket.pipe(tunnel);
+        });
+        tunnels.add(tunnel);
+        tunnel.on("error", () => socket.destroy());
+        tunnel.on("close", () => { tunnels.delete(tunnel); socket.destroy(); });
+        socket.on("error", () => tunnel.destroy());
+        socket.on("close", () => tunnel.destroy());
+    });
+    upstreamProxy.listen(0, "127.0.0.1");
+    await once(upstreamProxy, "listening");
+    const proxyUrl = `http://127.0.0.1:${(upstreamProxy.address() as { port: number }).port}`;
+    const bridge = await startInlineWsBridge({
+        dispatchHttp: async () => { throw new Error("context-only prewarm must bypass the pipeline"); },
+        log: () => {},
+        egressProxyFor: () => proxyUrl,
+    });
+    const client = new WsClient(`${bridge.origin.replace(/^http/, "ws")}/bili/${upstream.url}`, {
+        headers: { "session-id": "conv-inline-prewarm-proxy" },
+    });
+    try {
+        const terminal = new Promise<void>((resolve, reject) => {
+            client.on("error", reject);
+            client.on("message", data => {
+                const frame = JSON.parse(data.toString()) as Frame;
+                if (frame.type === "response.completed") resolve();
+            });
+        });
+        await once(client, "open");
+        const input = [{ type: "message", role: "developer", content: [{ type: "input_text", text: "startup context" }] }];
+        client.send(JSON.stringify({ type: "response.create", model: "gpt-test", input, generate: false }));
+        await withTimeout(terminal, TMO, "prewarm response.completed");
+        assert.equal(connects, 1, "the inline prewarm tunnels through the selected upstream proxy");
+        assert.deepEqual(upstream.seen[0]?.input, input);
+        assert.equal(upstream.seen[0]?.generate, false);
+    } finally {
+        client.terminate();
+        await bridge.close();
+        for (const tunnel of tunnels) tunnel.destroy();
+        await new Promise<void>(resolve => upstreamProxy.close(() => resolve()));
+        await upstream.close();
+    }
 });
 
 test("inline WS: wsOrigin settling undefined degrades the codex lane DIRECT (warned once)", async () => {
