@@ -12,7 +12,7 @@ import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, 
 import { recordThreadTail } from "./server/thread-tracking.js";
 import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBareRefHeadText, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAssistantProse } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
@@ -1571,9 +1571,9 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
     const requestText = JSON.stringify(ctx.messages);
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;
-        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t) || (absorbArmed && containsToolCallEmissionText(t)))) {
+        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t) || containsEchoResidue(t) || containsBareRefHeadText(t) || (absorbArmed && containsToolCallEmissionText(t)))) {
             ctx.log(`[tag-echo] stripped: non-stream model output ACP echo (render tags/markers/internal artifacts): ${t.slice(0, 120).replace(/\n/g, " ")}`);
-            (blk as { text?: string }).text = stripAcpTags(t, absorbArmed, requestText);
+            (blk as { text?: string }).text = stripAssistantProse(t, absorbArmed, requestText);
         }
     }
     return body;
