@@ -68,4 +68,26 @@ describe("#4528 logRequestCost large-history guard", () => {
         assert.equal(lines.filter(([l]) => l === "warn").length, 0);
         assert.ok(lines.some(([l, m]) => l === "info" && m.includes("sess-small") && m.includes("500 msgs")));
     });
+
+    // #5481 review: pin both sides of the preserved msgs>1000 predicate (a > / >= drift would pass silently).
+    it("does not warn exactly at the threshold (1000 msgs)", () => {
+        const { lines, log } = capture();
+        logRequestCost(log, "sess-edge", 1000, 1_000_000, performance.now() - 5);
+        assert.equal(lines.filter(([l]) => l === "warn").length, 0);
+    });
+
+    it("warns just past the threshold (1001 msgs)", () => {
+        const { lines, log } = capture();
+        logRequestCost(log, "sess-edge", 1001, 1_000_000, performance.now() - 5);
+        const warns = lines.filter(([l]) => l === "warn");
+        assert.equal(warns.length, 1);
+        assert.match(warns[0][1], /large-history: 1001 msgs/);
+    });
+
+    it("never warns when the message count is unknown (passthrough lane)", () => {
+        const { lines, log } = capture();
+        logRequestCost(log, "sess-unknown", null, 1_000_000, performance.now() - 5);
+        assert.equal(lines.filter(([l]) => l === "warn").length, 0);
+        assert.ok(lines.some(([l, m]) => l === "info" && m.includes("? msgs")));
+    });
 });
