@@ -140,6 +140,17 @@ export function compressibleSpanHint(ctx: RewriteCtx): string {
     return compressionRecovery(ctx).hint;
 }
 
+// #5558/#4521: the idempotent no-op receipt, owned once so applyRanges and the
+// external-summary lane emit byte-identical text. Nothing was folded because every
+// range was already covered or protected — NOT a failure: success-shaped, reason
+// "noop", no breaker arm, plus the live recovery hint so the model stops resending.
+export function noopCompressReceipt(ctx: RewriteCtx, detail: string, warnings: readonly string[]): ProxyToolResult {
+    const warnText = warnings.length > 0 ? warnings.join(" ") : "every requested range was already folded or protected.";
+    ctx.log(`[acp-proxy: compress no-op ${detail} → 0 blocks (nothing left to fold; nothing failed)]`);
+    const recovery = compressionRecovery(ctx);
+    return compressResult(`[Compression no-op: nothing was folded and nothing failed — ${warnText}${recovery.hint} Continue your current task.]`, "applied", 0, "noop");
+}
+
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
 
 // #1001: after a client history rewrite, ref numbers are no longer monotonic
@@ -1232,17 +1243,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // driver on long sessions (live incident: session 01a18a4d, 4
             // consecutive refusals 20:09 over ranges that were 100% legal).
             if (r.errors.length === 0) {
-                const warnText = r.warnings.length > 0 ? r.warnings.join(" ") : "every requested range was already folded or protected.";
-                ctx.log(`[acp-proxy: compress no-op ${detail} → 0 blocks (nothing left to fold; nothing failed)]`);
-                // Reuse the failure-path recovery hint verbatim: a model that
-                // keeps aiming at covered/protected ranges needs the live
-                // pointer (eligible ranges, distillation target, or the explicit
-                // stop wording) — without it the no-op receipt says "do not
-                // resend" but never says what TO do, which is how the retry
-                // loops persisted (#4521). eligibilityFailure stays guarded by
-                // compressionRecovery itself (never a guessed span).
-                const recovery = compressionRecovery(ctx);
-                return compressResult(`[Compression no-op: nothing was folded and nothing failed — ${warnText}${recovery.hint} Continue your current task.]`, "applied", 0, "noop");
+                return noopCompressReceipt(ctx, detail, r.warnings);
             }
             const errs = r.errors.join("; ") || "no blocks created";
             // #2362: machine-readable failure class for the [plugin] execution

@@ -211,7 +211,10 @@ test("protected ranges cause no paid call and no fold", async () => {
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
-        assert.equal(result.outcome, "refused");
+        // #5558: a fully-protected range is an idempotent no-op, not a failure —
+        // success-shaped receipt, zero blocks, and (the point of the test) no payer.
+        assert.equal(result.outcome, "applied");
+        assert.equal(result.reason, "noop");
         assert.equal(ctx.session.state.blocks.length, 0);
         assert.equal(calls, 0);
     }, (_req, res) => { calls++; success(res); });
