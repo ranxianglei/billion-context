@@ -8,7 +8,7 @@ import { effectivePromptCacheRouting, loadConfigFile } from "./config.js";
 import { featureOverrideAbsent } from "./rollout.js";
 import { PCK_NOTICE_ID, dismissedUpgradeNotices, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "./pck-notice.js";
 
-export interface NoticeEntry {
+interface NoticeEntry {
     readonly id: string;
     readonly tone: "ok" | "warn";
     readonly keys: { on: string; desc: string; hint: string; dismiss: string };
