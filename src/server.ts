@@ -4249,9 +4249,10 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
         }
     } else {
-        fits = unknownBaseline
-            ? result.fitsWindow
-            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
+        // No block landed: judge the same prepared wire with the same scoped
+        // calibration used at entry, including its raw-body fallback. A fresh
+        // core-only estimate can reject fitting requests or admit oversized ones.
+        fits = unknownBaseline ? result.fitsWindow : payloadFitsWindow;
     }
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
