@@ -194,7 +194,7 @@ jobs:
         # then publishes (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run typecheck
           npm run build
 
