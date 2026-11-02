@@ -96,6 +96,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -1935,6 +1936,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -2129,6 +2135,10 @@ export const headroomFallbackLogged = new Set<string>();
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
 export const headroomEffectiveLogged = new Set<string>();
+/** #5191: per session|model|value dedup for the [arm-judge] line — the
+ * session overflow arm's judging wall is session-scoped evidence, unlike the
+ * config-derived [headroom] value, so the dedup key carries the session id. */
+export const armJudgingWallLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
@@ -2364,6 +2374,32 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see
@@ -3703,6 +3739,30 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
+    // #5191: handle.ts already announced "nudge/preflight judge input against
+    // ${reserved}" ([headroom]) — but when THIS session's overflow arm proved the
+    // upstream bills the completion share against the same wall (#3450), the
+    // judgments below run on min(reserved, statedWall - completionReserve),
+    // which can sit BELOW the announced window. An incident log showing two
+    // windows with no explanation sent the #5191 reporter chasing config that
+    // was never read. State the wall that actually judges, once per
+    // session|model|arm-value|headroom-value (the [headroom] number itself
+    // moves — the #3450 provider-lifetime proof clamps it later, e.g.
+    // 1,086,000 → 894,000 — and each new announcement deserves its own arm
+    // note). Reference the #4205 reserved twin, NOT config.modelContextLimit:
+    // the post-400 recovery pass reaches this code with modelContextLimit
+    // already rewritten to the armed ceiling, which would mislabel the
+    // comparison number as the [headroom] window.
+    const headroomWindow = typeof session.metadata.reservedContextLimit === "number" && session.metadata.reservedContextLimit > 0
+        ? session.metadata.reservedContextLimit
+        : config.modelContextLimit;
+    if (limit < headroomWindow) {
+        const armKey = `${session.id}|${String(model ?? "?")}|${limit}|${headroomWindow}`;
+        if (!armJudgingWallLogged.has(armKey)) {
+            armJudgingWallLogged.add(armKey);
+            log("info", `[arm-judge] upstream overflow proof (stated wall ${statedWall}, ${completionReserve} billed to completion): nudge/preflight judge input against ${limit} — BELOW the [headroom] window ${headroomWindow}; that line does not apply while this arm is live (#3450, #5191)`);
+        }
+    }
     // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
     // so bili's preflight must stay ahead of that bar to win the race — a 100%
     // trigger lets codex compact first and the ACP lane becomes a backstop.
@@ -4539,6 +4599,9 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    // #5408: this line is THE observation point — a hot-at-attach session that
+    // never produces one is silent compression loss (the incident signature).
+    noteRequest(sessionId);
     if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
         log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
     }

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
+import * as pfChannel from "../src/agent/pf-channel.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -131,6 +132,37 @@ test("install: already-routed Google-wire /bili/ request gets plugin headers re-
     assert.equal(sink[0].url, "http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse");
     assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
     assert.equal(sink[0].headers["x-bili-plugin-conversation"], "session-g");
+});
+
+test("install: direct-to-proxy model requests stamp and learn the watermark channel (#5403/#5418)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40009", ready: Promise.resolve("http://127.0.0.1:40009") };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const counts: (string | null)[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        counts.push(new Headers(init?.headers ?? {}).get("x-bili-pf-count"));
+        // Every success stamps the next turn's truth, like the real core.
+        return new Response("{}", { status: 200, headers: { "x-bili-pf-seq": "8" } });
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Seed one learned stamp the way a prior successful turn would have.
+        pfChannel.pfLearnStamp({ "x-bili-plugin-conversation": "pf-self-sid" }, 200, new Headers({ "x-bili-pf-seq": "7" }));
+        const direct = "http://127.0.0.1:40009/v1/chat/completions";
+        const header = { "x-bili-plugin-conversation": "pf-self-sid" };
+        // A self-addressed request (host dials the proxy root straight — dsh
+        // profile bundles) must carry the learned count; before 7aa43e63 this
+        // branch never stamped, so such lanes silently never seeded the channel.
+        await fetch(direct, { method: "POST", headers: header });
+        assert.equal(counts[0], "7");
+        // ...and it learns symmetrically: the stamp this response carries
+        // replaces what the next request sends.
+        await fetch(direct, { method: "POST", headers: header });
+        assert.equal(counts[1], "8");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
 });
 
 test("install: waits for a not-yet-ready proxy before rewriting", async () => {

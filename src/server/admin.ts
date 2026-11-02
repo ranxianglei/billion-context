@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { effectivePromptCacheRouting, loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -23,17 +23,18 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
+import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
+import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
-import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
 import { pckAblations } from "../pck-probe.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, handleUserPackDelete, handleUserPackGet, handleUserPackPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePackTemplatesGet, handlePricingGet, handleUserPackDelete, handleUserPackGet, handleUserPackPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
 import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
@@ -236,6 +237,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
     if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts, typeof req.headers.host === "string" ? req.headers.host : undefined);
+    // #5146: per-host upstream health (alerts + open circuits) for DSH's frame-level
+    // banner — loopback-gated like every other /__bili/* route above. The DSH
+    // renderer polls this CROSS-ORIGIN from its own web port, so echo the
+    // requesting origin as ACAO exactly like the /__bili/ shell and
+    // /__bili/plugin/status do: only origins the trusted-origin gate admitted
+    // reach this line, and the payload is a bounded in-memory snapshot.
+    if (req.method === "GET" && req.url === "/__bili/upstreams") {
+        const reqOrigin = req.headers.origin;
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (typeof reqOrigin === "string" && reqOrigin.length > 0) headers["access-control-allow-origin"] = reqOrigin;
+        res.writeHead(200, headers);
+        res.end(JSON.stringify(getUpstreamHealthReport()));
+        return;
+    }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
@@ -348,6 +363,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ packs, userDir: path.join(configDir(), "packs") }));
         return;
     }
+    // #5344: base texts for the guided pack-editor form (tri-state resolved
+    // exactly like buildCompressSystemPrompt). Read-only; same gates.
+    if (req.method === "GET" && req.url === "/__bili/packs/templates") return handlePackTemplatesGet(res);
     // #5328: user-dir pack management — GET/PUT/DELETE <configDir>/packs/
     // <name>.json. The route regex shapes the name to the pack-name charset
     // ([A-Za-z0-9][A-Za-z0-9._-]*) before dispatch; the handlers re-validate
@@ -1027,7 +1045,7 @@ async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
         return;
     }
-    log("info", `[pck] notice ${id} dismissed via web UI`);
+    log("info", `[notices] notice ${id} dismissed via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
@@ -1321,6 +1339,15 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
         pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
+        wmNotice: {
+            id: WM_FASTPATH_INTRO_ID,
+            // #5403 experimental-grey intro: visible to EVERY install on its
+            // first upgrade to this build until closed — unless the user
+            // already wrote an explicit rollout override (they made the call).
+            active:
+                !dismissedUpgradeNotices(process.env).has(WM_FASTPATH_INTRO_ID) &&
+                featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
+        },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

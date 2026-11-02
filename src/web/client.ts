@@ -430,6 +430,17 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_pckNoticeBanner = bili_pckNoticeBanner;
+    // #5403: one-time-per-instance intro for the watermark fastpath
+    // experimental grey rollout — same server-side dismissal convention as
+    // above (own notice id, visible on every install until closed or an
+    // explicit rollout override exists); pure builder + same test seam.
+    function bili_wmNoticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm wm-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_wmNoticeBanner = bili_wmNoticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -956,6 +967,15 @@ function changelogCatOf(rawLine) {
             // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
         }).then(function () { blogRefreshBusy = false; });
     }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
@@ -985,7 +1005,13 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -1585,6 +1611,35 @@ function changelogCatOf(rawLine) {
                 nb.hidden = true;
                 nb.classList.remove("show");
                 nb.innerHTML = "";
+            }
+        }
+        // #5403: watermark fastpath experimental-grey intro — all installs see
+        // it on first upgrade until closed (server-side, like #5079 above).
+        const wnb = $("wm-notice-banner");
+        if (wnb) {
+            const wn = d.wmNotice && typeof d.wmNotice === "object" ? d.wmNotice : null;
+            if (wn && wn.active === true) {
+                wnb.hidden = false;
+                wnb.classList.add("show");
+                wnb.innerHTML = bili_wmNoticeBanner({ on: t("wmfast.on"), desc: t("wmfast.desc"), hint: t("wmfast.hint"), dismiss: t("wmfast.dismiss_btn") });
+                for (const btn of Array.from(wnb.querySelectorAll(".wm-notice-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof wn.id === "string" ? wn.id : "" }) });
+                            toast(t("wmfast.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                wnb.hidden = true;
+                wnb.classList.remove("show");
+                wnb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -3868,8 +3923,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -3902,6 +3959,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             pckSel.value = pcv;
             updatePckNote();
+            const wf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.pluginFullResendWatermark : undefined;
+            let wmv = "default";
+            if (wf === true) wmv = "on"; else if (wf === false) wmv = "off";
+            while (wmSel.options.length > 0) wmSel.removeChild(wmSel.lastChild);
+            WM_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                wmSel.appendChild(o);
+            });
+            if (wf !== undefined && !WM_VALUES.includes(wmv)) {
+                const o = document.createElement("option");
+                o.value = String(wf);
+                o.textContent = String(wf) + " *";
+                wmSel.appendChild(o);
+                wmv = String(wf);
+            }
+            wmSel.value = wmv;
+            updateWmNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -4017,6 +4093,46 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
+        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
+        // deletes the key so the file stays clean (mirrors the absorb row).
+        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
+        qCtrls.push(cafRow.inp);
+        cafRow.inp.addEventListener("change", () => commit((d) => {
+            if (cafRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.compressAtFoldPoint = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.compressAtFoldPoint;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const cafHint = document.createElement("span");
+        cafHint.className = "dim small";
+        cafHint.textContent = t("cfg.q_cafp_hint");
+        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -4063,6 +4179,38 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const peBox = document.createElement("div");
         peBox.hidden = true;
         peBox.style.cssText = "margin:4px 0";
+        // #5344: the editor is a three-tab panel (guided form / AI assist /
+        // raw JSON); the bare-JSON box below becomes the third tab.
+        // WEB_CLIENT embedding rules: no backtick literals; runtime \n
+        // escapes are written \\n in this source file.
+        const peTabs = document.createElement("div");
+        peTabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px";
+        const PE_TAB_DEFS = [
+            { key: "form", label: t("cfg.q_pack_tab_form") },
+            { key: "ai", label: t("cfg.q_pack_tab_ai") },
+            { key: "json", label: t("cfg.q_pack_tab_json") },
+        ];
+        const peTabBtns = {};
+        for (const def of PE_TAB_DEFS) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.textContent = def.label;
+            btn.style.borderBottom = "2px solid transparent";
+            (function (key) { btn.addEventListener("click", () => showPeTab(key)); })(def.key);
+            peTabBtns[def.key] = btn;
+            peTabs.appendChild(btn);
+        }
+        function showPeTab(key) {
+            for (const def of PE_TAB_DEFS) {
+                const btn = peTabBtns[def.key];
+                btn.style.fontWeight = def.key === key ? "700" : "400";
+                btn.style.borderBottom = def.key === key ? "2px solid #0969da" : "2px solid transparent";
+            }
+            peFormPane.hidden = key !== "form";
+            peAiPane.hidden = key !== "ai";
+            peJsonPane.hidden = key !== "json";
+        }
         const peTa = document.createElement("textarea");
         peTa.className = "editor mono codebox";
         peTa.spellcheck = false;
@@ -4077,8 +4225,202 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         peCancel.className = "btn sm";
         peCancel.textContent = t("cfg.q_pack_cancel");
         peBtns.append(peSave, peCancel);
-        peBox.append(peTa, peBtns);
+        // #5344 tab 1: guided form — start from a base text, tweak, save.
+        const peFormPane = document.createElement("div");
+        const peAiPane = document.createElement("div");
+        const peJsonPane = document.createElement("div");
+        peFormPane.hidden = false;
+        peAiPane.hidden = true;
+        peJsonPane.hidden = true;
+        peJsonPane.append(peTa, peBtns);
+        const baseRow = document.createElement("div");
+        baseRow.style.cssText = "display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap";
+        const baseLab = document.createElement("label");
+        baseLab.htmlFor = "pack-base-sel";
+        baseLab.textContent = t("cfg.q_pack_base_label");
+        baseLab.style.cssText = "font-size:12px;color:#57606a";
+        const baseSel = document.createElement("select");
+        baseSel.id = "pack-base-sel";
+        baseSel.className = "field-input";
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            baseSel.appendChild(opt);
+        });
+        const btnBaseLoad = document.createElement("button");
+        btnBaseLoad.type = "button";
+        btnBaseLoad.className = "btn sm";
+        btnBaseLoad.textContent = t("cfg.q_pack_base_load");
+        baseRow.append(baseLab, baseSel, btnBaseLoad);
+        const descWrap = document.createElement("div");
+        descWrap.style.cssText = "margin:8px 0";
+        const descLab = document.createElement("div");
+        descLab.textContent = t("cfg.q_pack_desc");
+        descLab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+        const descIn = document.createElement("input");
+        descIn.type = "text";
+        descIn.className = "field-input";
+        descIn.placeholder = t("cfg.q_pack_desc_ph");
+        descIn.style.cssText = "width:100%;box-sizing:border-box";
+        descWrap.append(descLab, descIn);
+        function packSectionField(label, helpText, rows) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "margin:8px 0";
+            const lab = document.createElement("div");
+            lab.textContent = label;
+            lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+            const help = document.createElement("div");
+            help.textContent = helpText;
+            help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
+            const ta = document.createElement("textarea");
+            ta.className = "field-input mono";
+            ta.spellcheck = false;
+            ta.rows = rows;
+            ta.style.cssText = "width:100%;box-sizing:border-box";
+            wrap.append(lab, help, ta);
+            return { wrap, ta };
+        }
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
+        const taPh = phF.ta;
+        const taHc = hcF.ta;
+        const formHint = document.createElement("div");
+        formHint.textContent = t("cfg.q_pack_form_hint");
+        formHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0";
+        const btnFormSave = document.createElement("button");
+        btnFormSave.type = "button";
+        btnFormSave.className = "btn sm";
+        btnFormSave.textContent = t("cfg.q_pack_form_save");
+        peFormPane.append(baseRow, descWrap, phF.wrap, hcF.wrap, formHint, btnFormSave);
+        // #5344 tab 2: AI assist — plain-language need -> self-contained
+        // prompt -> copy to any LLM -> paste its JSON back -> fills the form.
+        const aiNeedLab = document.createElement("div");
+        aiNeedLab.textContent = t("cfg.q_pack_ai_need");
+        aiNeedLab.style.cssText = "font-size:13px;font-weight:600;margin:2px 0";
+        const aiNeed = document.createElement("textarea");
+        aiNeed.className = "field-input";
+        aiNeed.rows = 3;
+        aiNeed.placeholder = t("cfg.q_pack_ai_need_ph");
+        aiNeed.style.cssText = "width:100%;box-sizing:border-box";
+        const aiBtnRow = document.createElement("div");
+        aiBtnRow.style.cssText = "display:flex;gap:8px;margin:6px 0";
+        const btnAiGen = document.createElement("button");
+        btnAiGen.type = "button";
+        btnAiGen.className = "btn sm";
+        btnAiGen.textContent = t("cfg.q_pack_ai_gen");
+        const btnAiCopy = document.createElement("button");
+        btnAiCopy.type = "button";
+        btnAiCopy.className = "btn sm";
+        btnAiCopy.textContent = t("cfg.q_pack_ai_copy");
+        aiBtnRow.append(btnAiGen, btnAiCopy);
+        const aiOut = document.createElement("textarea");
+        aiOut.className = "editor mono codebox";
+        aiOut.readOnly = true;
+        aiOut.rows = 8;
+        aiOut.spellcheck = false;
+        aiOut.style.cssText = "width:100%;box-sizing:border-box";
+        const aiHint = document.createElement("div");
+        aiHint.textContent = t("cfg.q_pack_ai_hint");
+        aiHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0 2px";
+        const aiIn = document.createElement("textarea");
+        aiIn.className = "editor mono codebox";
+        aiIn.rows = 8;
+        aiIn.spellcheck = false;
+        aiIn.placeholder = '{"promptSections": {"philosophy": "..."}}';
+        aiIn.style.cssText = "width:100%;box-sizing:border-box";
+        const btnAiApply = document.createElement("button");
+        btnAiApply.type = "button";
+        btnAiApply.className = "btn sm";
+        btnAiApply.textContent = t("cfg.q_pack_ai_apply");
+        const aiApplyRow = document.createElement("div");
+        aiApplyRow.style.cssText = "display:flex;gap:8px;margin-top:6px";
+        aiApplyRow.append(btnAiApply);
+        peAiPane.append(aiNeedLab, aiNeed, aiBtnRow, aiOut, aiHint, aiIn, aiApplyRow);
+        async function loadBaseText() {
+            const baseName = baseSel.value;
+            if (!baseName) { descIn.value = ""; taPh.value = ""; taHc.value = ""; return; }
+            try {
+                const r = await json(API_ROOT + "/packs/templates");
+                const pk = r && r.packs ? r.packs[baseName] : null;
+                if (!pk) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+                descIn.value = typeof pk.description === "string" ? pk.description : "";
+                taPh.value = typeof pk.philosophy === "string" ? pk.philosophy : "";
+                taHc.value = typeof pk.howToCompress === "string" ? pk.howToCompress : "";
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        }
+        btnBaseLoad.addEventListener("click", () => loadBaseText());
+        // Shared pack-name normalizer (WEB_CLIENT rule: charCode, no regex
+        // with backslashes) for both save paths.
+        function packNameForSave() {
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            return (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+        }
+        btnFormSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.indexOf("..") !== -1) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            const phil = taPh.value.trim();
+            const hc = taHc.value.trim();
+            if (!phil && !hc) { pmSet(t("cfg.q_pack_form_empty"), true); return; }
+            const obj = { promptSections: {} };
+            if (phil) obj.promptSections.philosophy = phil;
+            if (hc) obj.promptSections.howToCompress = hc;
+            const desc = descIn.value.trim();
+            if (desc) obj.description = desc;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(obj, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
+        btnAiGen.addEventListener("click", () => {
+            const need = aiNeed.value.trim();
+            if (!need) { pmSet(t("cfg.q_pack_ai_need_empty"), true); return; }
+            aiOut.value = [t("cfg.q_pack_ai_p1", { need }), t("cfg.q_pack_ai_p2"), t("cfg.q_pack_ai_p3")].join("\\n\\n");
+            pmSet(t("cfg.q_pack_ai_gen_ok"));
+        });
+        btnAiCopy.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(aiOut.value); pmSet(t("cfg.q_pack_ai_copied")); }
+            catch (e) { pmSet(String(e), true); }
+        });
+        btnAiApply.addEventListener("click", () => {
+            // Tolerate markdown fences around the model's reply (build the
+            // fence from charCodes — no backtick literals here).
+            const FENCE = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);
+            let text = (aiIn.value || "").trim();
+            const lines = text.split("\\n");
+            if (lines.length > 0 && lines[0].trim().indexOf(FENCE) === 0) lines.shift();
+            if (lines.length > 0 && lines[lines.length - 1].trim() === FENCE) lines.pop();
+            text = lines.join("\\n").trim();
+            let obj = null;
+            try { obj = JSON.parse(text); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+            const ps = (obj.promptSections && typeof obj.promptSections === "object") ? obj.promptSections : {};
+            descIn.value = typeof obj.description === "string" ? obj.description : "";
+            taPh.value = typeof ps.philosophy === "string" ? ps.philosophy : "";
+            taHc.value = typeof ps.howToCompress === "string" ? ps.howToCompress : "";
+            const extra = Object.keys(obj).filter((k) => k !== "name" && k !== "version" && k !== "description" && k !== "promptSections");
+            Object.keys(ps).forEach((k) => { if (k !== "philosophy" && k !== "howToCompress") extra.push("promptSections." + k); });
+            peTa.value = JSON.stringify(obj, null, 2);
+            showPeTab("form");
+            pmSet(extra.length ? t("cfg.q_pack_ai_extra", { names: extra.join(", ") }) : t("cfg.q_pack_ai_apply_ok"));
+        });
+        peBox.append(peTabs, peFormPane, peAiPane, peJsonPane);
         box.append(pmRow, peBox);
+        showPeTab("form");
         let editingPack = "";   // "" = closed; otherwise the name being edited
         let editingNew = false;
         function pmSet(text, isError) {
@@ -4093,8 +4435,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             editingNew = true;
             pmName.value = "";
             peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            baseSel.value = "";
+            descIn.value = "";
+            taPh.value = "";
+            taHc.value = "";
+            aiNeed.value = "";
+            aiOut.value = "";
+            aiIn.value = "";
             peBox.hidden = false;
             pmSet("");
+            showPeTab("form");
         });
         pmEdit.addEventListener("click", async () => {
             const name = packSel.value;
@@ -4107,11 +4457,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             try {
                 const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
                 peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                let loadedObj = null;
+                try { loadedObj = peTa.value ? JSON.parse(peTa.value) : null; } catch (e) { loadedObj = null; }
+                const loadedPs = (loadedObj && loadedObj.promptSections && typeof loadedObj.promptSections === "object") ? loadedObj.promptSections : {};
+                descIn.value = (loadedObj && typeof loadedObj.description === "string") ? loadedObj.description : "";
+                taPh.value = (typeof loadedPs.philosophy === "string") ? loadedPs.philosophy : "";
+                taHc.value = (typeof loadedPs.howToCompress === "string") ? loadedPs.howToCompress : "";
                 editingPack = name;
                 editingNew = false;
                 pmName.value = name;
                 peBox.hidden = false;
                 pmSet("");
+                showPeTab("form");
             } catch (e) { pmSet(String(e), true); }
         });
         pmDel.addEventListener("click", async () => {
@@ -4131,11 +4488,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             pmSet("");
         });
         peSave.addEventListener("click", async () => {
-            // No regex literals with backslashes here (WEB_CLIENT template):
-            // strip one leading path separator via charCode instead.
-            const rawName = (editingNew ? pmName.value.trim() : editingPack);
-            const first = rawName.charCodeAt(0);
-            const name = (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+            const name = packNameForSave();
             if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
             let parsed;
             try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
@@ -4188,6 +4541,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
             if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
             if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
+        }));
+        // #5403: watermark fastpath grey-rollout switch — maps 1:1 onto
+        // rollout.features.pluginFullResendWatermark (default follows the
+        // baked percent; on/off pin it per install). salt/base untouched.
+        const WM_VALUES = ["default", "on", "off"];
+        const wmSel = document.createElement("select");
+        wmSel.className = "field-input mono";
+        qCtrls.push(wmSel);
+        const ww = document.createElement("div");
+        ww.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const wlab = document.createElement("label");
+        wlab.htmlFor = "quick-wm";
+        wlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        wlab.textContent = t("cfg.q_wm");
+        wmSel.id = "quick-wm";
+        ww.appendChild(wlab);
+        ww.appendChild(wmSel);
+        box.appendChild(ww);
+        const wmNote = document.createElement("div");
+        wmNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateWmNote() {
+            if (wmSel.value === "on") wmNote.textContent = t("cfg.q_wm_on_desc");
+            else if (wmSel.value === "off") wmNote.textContent = t("cfg.q_wm_off_desc");
+            else if (wmSel.value !== "default") wmNote.textContent = t("cfg.q_wm_custom");
+            else wmNote.textContent = t("cfg.q_wm_default_desc");
+        }
+        box.appendChild(wmNote);
+        wmSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
+            else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
+            else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";

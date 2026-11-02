@@ -1,12 +1,20 @@
-// #4313 toggle (PR #5236): message timestamps are OPT-IN, default OFF.
-// Default-off bytes must stay identical to pre-feature master — wire tags
-// carry no time= attr, compress receipts carry no [start – end] coverage
-// span, and the prompt defaults are the exact pre-feature originals. This
-// suite pins the HOST side of that contract (the kernel side lives in
+// #4313 toggle (PR #5236; default-on follow-up): message timestamps are ON
+// by default in production; the OPT-OUT bytes must stay identical to
+// pre-feature master — wire tags carry no time= attr, compress receipts
+// carry no [start – end] coverage span, and the prompt defaults are the
+// exact pre-feature originals whenever the flag resolves false (file
+// `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS="0").
+// This suite pins the HOST side of that contract (the kernel side lives in
 // kernel/tests/issue4313-message-timestamps.test.ts):
 //   - resolveMessageTimestamps env-over-file cascade (BILI_MESSAGE_TIMESTAMPS)
 //   - messageTimestampSections variant selection at the prompt exits
 //   - the compress-receipt fingerprint SPAN gate inside applyRanges
+// NOTE: setToggleLayers() deletes/re-sets process.env.BILI_MESSAGE_TIMESTAMPS
+// per case, so every assertion here drives resolution EXPLICITLY —
+// independent of the ambient suite pin (tests/preload-test-env.mjs pins "0"
+// so all OTHER suites keep their pre-feature byte baselines).
+// tests/message-timestamps-default-on.test.ts separately nails the PRODUCTION
+// default (scrubbed env + realistic config file ⇒ ON).
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -52,21 +60,32 @@ after(() => {
     rmSync(SANDBOX, { recursive: true, force: true });
 });
 
-test("resolveMessageTimestamps: env > file > default false", () => {
-    assert.equal(resolveMessageTimestamps(undefined, {}), false);
-    assert.equal(resolveMessageTimestamps({}, {}), false);
+test("resolveMessageTimestamps: env > file > default TRUE", () => {
+    // production default since the default-on follow-up: no env, absent/unset
+    // file value ⇒ ON (first-sight stamps render deterministically)
+    assert.equal(resolveMessageTimestamps(undefined, {}), true);
+    assert.equal(resolveMessageTimestamps({}, {}), true);
     assert.equal(resolveMessageTimestamps({ messageTimestamps: true }, {}), true);
+    // file opt-out stays an honest switch...
     assert.equal(resolveMessageTimestamps({ messageTimestamps: false }, {}), false);
+    // ...and the env layers are untouched:
     assert.equal(resolveMessageTimestamps(undefined, { BILI_MESSAGE_TIMESTAMPS: "1" }), true);
     assert.equal(resolveMessageTimestamps({ messageTimestamps: true }, { BILI_MESSAGE_TIMESTAMPS: "0" }), false);
     assert.equal(resolveMessageTimestamps({ messageTimestamps: false }, { BILI_MESSAGE_TIMESTAMPS: "anything" }), true);
 });
 
-test("messageTimestampSections: OFF returns the input by reference (zero divergence)", () => {
-    setToggleLayers(undefined);
+test("messageTimestampSections: explicit-off returns the input by reference (zero divergence)", () => {
+    setToggleLayers("0"); // env "0" forces the pre-feature bytes
     const sections = { howToCompress: LEAN_HOW_TO_COMPRESS };
     assert.equal(messageTimestampSections(sections), sections);
     assert.equal(messageTimestampSections(undefined), undefined);
+});
+
+test("messageTimestampSections: PRODUCTION DEFAULT selects TIMESTAMPED variants (no env, absent config)", () => {
+    setToggleLayers(undefined); // deletes the ambient pin ⇒ honest production path
+    const swapped = messageTimestampSections({ howToCompress: LEAN_HOW_TO_COMPRESS });
+    assert.equal(swapped?.acpTags, FUNCTION_ACP_TAGS_TIMESTAMPED);
+    assert.equal(swapped?.howToCompress, LEAN_HOW_TO_COMPRESS_TIMESTAMPED);
 });
 
 test("messageTimestampSections: ON selects variants without stomping overrides", () => {
@@ -131,11 +150,16 @@ function foldReceiptText(): string {
 
 const SPAN_RE = /\[\d{4}-\d{2}-\d{2}[^\]]*–[^\]]*\]/;
 
-test("receipt span GATE: default (flag off) omits the coverage span despite stamps", () => {
-    setToggleLayers(undefined);
+test("receipt span GATE: explicit-off (env 0) omits the coverage span despite stamps", () => {
+    setToggleLayers("0");
     const text = foldReceiptText();
     assert.match(text, /full summary \d+ch · head/);
     assert.doesNotMatch(text, SPAN_RE, `flag OFF must emit no local-time span:\n${text}`);
+});
+
+test("receipt span GATE: PRODUCTION DEFAULT appends the coverage span (no env, absent config)", () => {
+    setToggleLayers(undefined); // deletes the ambient pin ⇒ honest production path
+    assert.match(foldReceiptText(), SPAN_RE, "default-on must append the [start – end] span");
 });
 
 test("receipt span GATE: BILI_MESSAGE_TIMESTAMPS=1 turns the span on (env layer)", () => {

@@ -135,6 +135,16 @@ const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+
+// #5408: when the #4288 fit-forward exit judges on ESTIMATE ONLY (no usage
+// baseline backing it) and the payload estimate reaches this fraction of the
+// HARD window limit, warn: the local estimate excludes the system prompt +
+// tool definitions and provider-side counting, so "fits by our scale" can
+// still overflow upstream (the incident forwarded ~542K actual against a
+// 500K window with zero bili warnings). Observability only — the forward
+// still happens (blocking would defeat #4288); the overflow-arm rescue folds
+// next turn if upstream rejects (#1195).
+const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // #2383: entry overshoot (entryTokens / window) above which the LLM fold path
 // is PROVABLY unable to converge in this invocation — it exceeds the raised
 // budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
@@ -2193,6 +2203,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             fitExitForward = true;
             if (baselineFloor >= textTarget && !armedBaseline) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            if (!armedBaseline && baselineFloor < textTarget && result.payloadEstimate >= FIT_FORWARD_ESTIMATE_ONLY_MARGIN * limit) {
+                deps.log("warn", `[preflight] fit-forward on estimate only: ~${Math.round(result.payloadEstimate)} tok vs window ${limit} with no usage measurement backing the fit (baseline ~${Math.round(baselineFloor)}) — the local estimate excludes the system prompt + tool definitions, so upstream may still reject with context overflow; if it does, the overflow-arm rescue folds next turn (#5408/#4288)`);
             }
             break;
         }

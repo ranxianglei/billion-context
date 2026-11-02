@@ -896,12 +896,14 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
  *  Refusal only when an endpoint is a superseded key whose translation
  *  dead-ends (the message lost its mapping entirely — an honest stale cite).
  *
- *  Transitional honesty: for sessions restamped by kernels WITHOUT the
- *  superseded-liveness prune, case 1 can in principle swallow a resent
- *  pre-restart call's intent (number now owned by someone else). The replay
- *  window is seconds; the deadlock it replaces is permanent — live-first is
- *  the right trade, and the kernel prune removes the ambiguity entirely for
- *  fresh restamps. */
+ *  Transitional honesty: sessions whose restamp predates kernel #5196's
+ *  slot-retirement may still carry an ambiguity — a number restamped over a
+ *  live occupant, so case 1 can in principle swallow a resent pre-restart
+ *  call's intent. #4807 (#4797) traded that seconds-long replay window
+ *  against a permanent deadlock; live-first keeps that trade. Kernels from
+ *  #5196 onward retire every seat a mover vacates into its own seq+1, so no
+ *  freshly stamped number ever names two messages and case 1 can never
+ *  mis-engage on such data. */
 interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
