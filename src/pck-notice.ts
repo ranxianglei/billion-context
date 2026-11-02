@@ -18,8 +18,12 @@ export const PCK_NOTICE_ID = "pck-default-off";
 // #5403 watermark fastpath experimental-grey intro (owner ruling 2026-11-02):
 // same one-time-per-instance store, its own id so dismissal stays independent.
 export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
+// compressAtFoldPoint intro (owner request 2026-11-02): the OFF-by-default
+// fold-in-place feature gets its own one-time green intro banner — same
+// store/contract, its own id so dismissal stays independent.
+export const CAFP_INTRO_ID = "cafp-intro";
 
-const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
+const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, CAFP_INTRO_ID]);
 
 const DISMISS_FILE = "upgrade-notices.json";
 

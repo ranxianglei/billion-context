@@ -441,6 +441,15 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_wmNoticeBanner = bili_wmNoticeBanner;
+    // compressAtFoldPoint off-by-default intro (owner request 2026-11-02) —
+    // same server-side dismissal convention, own id + button class.
+    function bili_cafpNoticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm cafp-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_cafpNoticeBanner = bili_cafpNoticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -1640,6 +1649,33 @@ function changelogCatOf(rawLine) {
                 wnb.hidden = true;
                 wnb.classList.remove("show");
                 wnb.innerHTML = "";
+            }
+        }
+        const cnb = $("cafp-notice-banner");
+        if (cnb) {
+            const cn = d.cafNotice && typeof d.cafNotice === "object" ? d.cafNotice : null;
+            if (cn && cn.active === true) {
+                cnb.hidden = false;
+                cnb.classList.add("show");
+                cnb.innerHTML = bili_cafpNoticeBanner({ on: t("caf.on"), desc: t("caf.desc"), hint: t("caf.hint"), dismiss: t("wmfast.dismiss_btn") });
+                for (const btn of Array.from(cnb.querySelectorAll(".caf-notice-dismiss"))) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof cn.id === "string" ? cn.id : "" }) });
+                            toast(t("wmfast.dismissed"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
+            } else {
+                cnb.hidden = true;
+                cnb.classList.remove("show");
+                cnb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,

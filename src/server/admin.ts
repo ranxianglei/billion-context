@@ -23,7 +23,7 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
+import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID, CAFP_INTRO_ID } from "../pck-notice.js";
 import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -1347,6 +1347,19 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
             active:
                 !dismissedUpgradeNotices(process.env).has(WM_FASTPATH_INTRO_ID) &&
                 featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
+        },
+        cafNotice: {
+            id: CAFP_INTRO_ID,
+            // Off-by-default feature intro: visible until closed, unless the
+            // user already chose (explicit compress.compressAtFoldPoint in the
+            // JSON config or BILI_COMPRESS_AT_FOLD_POINT in env).
+            active: (() => {
+                const envRaw = (process.env.BILI_COMPRESS_AT_FOLD_POINT ?? "").trim().toLowerCase();
+                const chosen =
+                    loadConfigFile().compress?.compressAtFoldPoint !== undefined ||
+                    ["1", "true", "on", "0", "false", "off"].includes(envRaw);
+                return !dismissedUpgradeNotices(process.env).has(CAFP_INTRO_ID) && !chosen;
+            })(),
         },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
