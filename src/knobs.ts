@@ -612,6 +612,24 @@ export function dshContextTabLabel(): string | undefined {
     return s.length > 0 ? s : undefined;
 }
 
+/** BILI_DSH_KEEP_COMMAND_COMPACT > dsh.keepCommandCompact > false (#4872).
+ *  When ON, the #3354 load-time overlay disables ONLY
+ *  @deepseek-ai/dsh-compaction-basic and leaves
+ *  @deepseek-ai/dsh-command-compact armed: the explicit /compact command
+ *  survives, so third-party plugins bridging through the DSH-official
+ *  ctx.commands.find(agent, "compact") path keep working while bili owns
+ *  compression. A /compact-triggered compaction call still passes the #1729
+ *  wire guard — answered locally by #3733 authored compaction when the
+ *  session holds active blocks, refused otherwise — so no checkpoint lands
+ *  outside bili's knowledge. Default OFF = today's both-packages rule.
+ *  Resolved once at bili-native activation; changing it takes effect on the
+ *  next host restart (plugin-mode convention). */
+export function dshKeepCommandCompactEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_KEEP_COMMAND_COMPACT;
+    if (envRaw !== undefined) return !(envRaw.trim() === "0" || envRaw.trim().toLowerCase() === "false");
+    return loadConfigFile().dsh?.keepCommandCompact === true;
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);

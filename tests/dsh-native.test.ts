@@ -7,7 +7,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
-import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
+import { dshCompactionKeepCommandCompact, isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
@@ -1292,8 +1292,20 @@ test("#3354/#3662 apply(): declares lane ownership instead of registering the ov
             // that transform honors (tests/issue3662-dsh-gate-fallback.test.ts
             // pins the transform + service side).
             assert.ok(isDshCompactionActive(), "active plan must declare the lane owned");
+            // #4872: the scope flag rides the verdict — absent by default, so
+            // the transform keeps the original both-packages rule.
+            assert.equal(dshCompactionKeepCommandCompact(), false);
             assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
             assert.equal(ctx.providedServices.length, 0);
+            await _stateToolsReadyForTest();
+        });
+        // #4872: knob ON → the declaration narrows the overlay to compaction-basic
+        _resetDshCompactionVerdictForTest();
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_DSH_KEEP_COMMAND_COMPACT: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            apply(mockCtx());
+            assert.ok(isDshCompactionActive());
+            assert.equal(dshCompactionKeepCommandCompact(), true, "knob must reach the verdict at activation time");
             await _stateToolsReadyForTest();
         });
     } finally {

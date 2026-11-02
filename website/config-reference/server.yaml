@@ -358,8 +358,8 @@ entries:
     default: "{}"
     env: BILI_ALLOW_DSH_COMPACTION
     group: behavior
-    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel — are documented in the following entries."
-    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。"
+    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel, dsh.keepCommandCompact — are documented in the following entries."
+    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel、dsh.keepCommandCompact——见接下来的条目。"
   - key: dsh.authoredCompaction
     type: boolean
     default: "true (on, #3901 flip)"
@@ -380,6 +380,13 @@ entries:
     group: behavior
     desc_en: "Custom display name for the DSH top-bar Context tab (#4237), e.g. \"压缩账本\" when another plugin (dsh-context) owns the name 「上下文」. Trimmed non-empty string wins over the built-in label; blank or absent falls back to the built-in. File-only tier (display preference, no env knob per #2030). Default unset = built-in label unchanged."
     desc_zh: "DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为\"压缩账本\"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。"
+  - key: dsh.keepCommandCompact
+    type: boolean
+    default: "false"
+    env: BILI_DSH_KEEP_COMMAND_COMPACT
+    group: behavior
+    desc_en: "Keep @deepseek-ai/dsh-command-compact ENABLED under the #3354 load-time overlay: only compaction-basic gets disabled, so the explicit /compact command survives and third-party plugins bridging through the DSH-official ctx.commands.find(agent, \"compact\") path keep working while bili owns compression (#4872). A /compact-triggered compaction call still passes the #1729 wire guard — answered locally by bili's authored compaction when the session holds active fold blocks, refused otherwise — so no checkpoint lands outside bili's knowledge. Default OFF = today's both-packages rule; takes effect on the next dsh restart (resolved at bili-native activation)."
+    desc_zh: "在 #3354 加载期 overlay 下保留 @deepseek-ai/dsh-command-compact **启用**：只禁用 compaction-basic，显式 /compact 命令得以保留，通过 DSH 官方 ctx.commands.find(agent, \"compact\") 通路桥接的第三方插件在 bili 持有压缩期间继续可用（#4872）。/compact 触发的压缩调用仍经 #1729 wire guard——会话有活跃折叠块时由 bili authored compaction 本地应答，否则拒绝——因此不会有检查点落在 bili 不知情处。默认关 = 现状两包同禁；下次 dsh 重启生效（bili-native 激活时解析）。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"
